@@ -7,7 +7,7 @@
 //!   * 段落分隔 —— 段首空两格（首行缩进），不再放置任何段落标记符。
 
 use crate::app::{
-    Root, Screen, ANCIENT_TITLE_COL,
+    Root, Screen, ANCIENT_EDGE, ANCIENT_TITLE_COL,
 };
 use crate::dict;
 use crate::gloss::{Page, Piece};
@@ -34,6 +34,13 @@ pub(crate) const SHARE_BGS: [(u32, u32, u32); 5] = [
     (0x14211B, 0xDDEAE0, 0x93AE9E), // 松烟
     (0xF2EAD6, 0x2B2622, 0x8A8175), // 宣纸
 ];
+
+/// 朱砂红：笺读的落款印泥色（印在分享笺左下角）。
+pub(crate) const CINNABAR: u32 = 0xC3272D;
+
+/// 分享卡高度系数：卡片高 = 视口高 × 此值（再给控制面板让位收一档）。
+/// 「高度」滑杆已按用户要求连同代码删除，取原五档的中高档一档定值。
+pub(crate) const SHARE_CARD_H_FRAC: f32 = 0.84;
 
 /// 长按阈值：按住正文超过这么久再抬起，算「长按」——弹气泡菜单
 /// （复制 / 检索 / 字典），而不是普通的点字 / 拖选。
@@ -191,9 +198,10 @@ fn fish_tail_ink(width: f32, top: bool, color: u32) -> Div {
         )
 }
 
-/// 版心鱼尾：比目录里那枚更竖长（viewBox 24×17），贴篇题上下各一枚。
+/// 版心鱼尾：竖长粗壮的实体楔形（viewBox 24×40，高约为瓣宽 1.7 倍，
+/// 仿用户参考图「古风3」版心上下那对黑鱼尾），贴篇题上下各一枚。
 fn banxin_tail(width: f32, top: bool, color: u32) -> Div {
-    let h = width * 17.0 / 24.0;
+    let h = width * 40.0 / 24.0;
     let path = if top {
         "banxin_top.svg"
     } else {
@@ -213,6 +221,162 @@ fn banxin_tail(width: f32, top: bool, color: u32) -> Div {
                 .h(px(h))
                 .text_color(rgb(color)),
         )
+}
+
+/// 版心双鱼尾：两枚并排（刻本版心上下两端的「双鱼尾」）。
+/// 影印本里双鱼尾比单尾窄一半，两枚之间留一道细缝，整组仍收在
+/// `total_w` 以内——中缝与章题列通用。样式仿用户参考图「古风3」：
+/// 粗壮实体黑楔形，上尾宽边在上、收尖朝下，下尾反之。
+fn banxin_tails(total_w: f32, top: bool, color: u32) -> Div {
+    let gap = 2.0;
+    let each = ((total_w - gap) / 2.0).max(3.0);
+    div()
+        .w(px(total_w))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(gap))
+        .child(banxin_tail(each, top, color))
+        .child(banxin_tail(each, top, color))
+}
+
+/// 版心小印：朱砂红「箋讀」小方印，嵌在中缝的下鱼尾之下（影印本版心
+/// 下端常见的小印记）。篆字是 `app::ensure_assets()` 写出的两枚 SVG
+/// （`seal_jian.svg` / `seal_du.svg`，等粗圆头线稿），这里只用
+/// `text_color` 着朱砂色，印面自留白（朱文）。
+fn banxin_seal(w: f32, h: f32) -> Div {
+    // 每枚篆字约占印面一半高：两字竖排相叠，正好是一方竖长小印。
+    let gw = (w * 0.74).max(9.0);
+    let gh = (h - 2.0) / 2.0;
+    div()
+        .w(px(w))
+        .h(px(h))
+        .border_1()
+        .border_color(rgb(CINNABAR))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(1.0))
+        .child(
+            svg()
+                .path(SharedString::from("seal_jian.svg".to_string()))
+                .w(px(gw))
+                .h(px(gh))
+                .text_color(rgb(CINNABAR)),
+        )
+        .child(
+            svg()
+                .path(SharedString::from("seal_du.svg".to_string()))
+                .w(px(gw))
+                .h(px(gh))
+                .text_color(rgb(CINNABAR)),
+        )
+}
+
+/// 书耳：刻本贴在书脑侧版框上角的一小片「耳朵」（题签小耳，线装 / 包背装
+/// 常见）。样式参照用户给的「天 / 地 / 鱼尾 / 书脑 / 耳子」图：一片竖长
+/// 小牌，外侧带线、内侧贴住版框，紧贴左上角不放空。
+///
+/// `mirror` = true 时贴右上（右半叶的外侧在其右），否则贴左上。
+/// 耳内竖排题签（篇章名 / 卷名 / 提要，见 `types::ear_label`），
+/// 单列自适应收缩——耳片极窄，读的是个「形」与位置。
+fn book_ear(t: Theme, w: f32, h: f32, x: f32, top: f32, mirror: bool, label: &str) -> Div {
+    // 耳内小字：高出一成给行距，宽不超出耳片。
+    let fs = (w * 0.62).max(6.5).min(10.0);
+    // 耳片只有一列宽：单列自适应（字号随耳高收缩，装不下才截断缀「…」）。
+    let (efs, ecol, _cut) = crate::shelf::fit_single_column(label, h - 6.0, fs);
+    let mut e = div()
+        .absolute()
+        .top(px(top))
+        .w(px(w))
+        .h(px(h))
+        .bg(rgb(t.paper()))
+        .border_t_1()
+        .border_b_1()
+        .border_color(rgb(t.frame_ink()))
+        .flex()
+        .items_center()
+        .justify_center()
+        .overflow_hidden();
+    e = if mirror {
+        e.left(px(x))
+            .border_r_1()
+            .border_color(rgb(t.frame_ink()))
+    } else {
+        e.left(px(x))
+            .border_l_1()
+            .border_color(rgb(t.frame_ink()))
+    };
+    e.child(crate::shelf::vertical_cols(
+        &[ecol],
+        efs,
+        t.ink_soft(),
+        FontWeight::NORMAL,
+    ))
+}
+
+/// 一叶在「一张纸」里的位置：对开时两半内侧要收掉留白，才能接成一整张。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafEdge {
+    /// 独占一纸（单面阅读，或对开的最后一叶）。
+    Alone,
+    /// 左半叶：内侧是右边，右留白收掉。
+    Left,
+    /// 右半叶：内侧是左边，左留白收掉。
+    Right,
+}
+
+/// 章末统计（篇 / 章 / 字），排在该章末葉正文之后的第一片空列里。
+#[derive(Clone, Default)]
+struct ChapStat {
+    /// 篇名（章题）。
+    title: String,
+    /// 本章是全书第几章（表内「章」列，写作一二三…）。
+    index: usize,
+    /// 本章字数（去标点、去空白）。
+    chars: usize,
+}
+
+/// 正文之后的第一片空列（读序：列号自 0 递增、向右向左）。
+/// 整页排满（无空列）时返回 None —— 章末统计表便无处可落，宁可不画也不压字。
+fn first_empty_column(columns: &[Vec<Piece>], text_cols: usize) -> Option<usize> {
+    let mut last_used: Option<usize> = None;
+    for i in 0..text_cols {
+        if columns.get(i).map(|c| !c.is_empty()).unwrap_or(false) {
+            last_used = Some(i);
+        }
+    }
+    let e = last_used.map(|i| i + 1).unwrap_or(0);
+    if e < text_cols {
+        Some(e)
+    } else {
+        None
+    }
+}
+
+/// 这一叶上「收尾」的章号：本章正文到此为止（下一叶是新章首，或已是全书末叶）。
+/// 通常只有一章；短章恰好同叶收尾时，统计表就一行一篇并排列出——正是影印本
+/// 卷尾那条「篇 / 章 / 字」小表的样子。
+fn chapters_ended_at(pages: &[Page], idx: usize) -> Vec<usize> {
+    let Some(cur) = pages.get(idx) else {
+        return Vec::new();
+    };
+    // 下一叶仍出现的章：正文还没收完，统计表不赶它。
+    let carries_on: std::collections::HashSet<usize> = pages
+        .get(idx + 1)
+        .map(|p| p.glyphs.iter().map(|g| g.chapter).collect())
+        .unwrap_or_default();
+    let mut seen: Vec<usize> = Vec::new();
+    for g in &cur.glyphs {
+        if !seen.contains(&g.chapter) {
+            seen.push(g.chapter);
+        }
+    }
+    let last_leaf = idx + 1 >= pages.len();
+    seen.retain(|&c| last_leaf || !carries_on.contains(&c));
+    seen
 }
 
 /// 葉码用汉字数字：刊本叶码写作「一、二 … 十、十一 … 二十」，不用阿拉伯数字。
@@ -264,7 +428,7 @@ impl Root {
         let t = self.theme;
         // 「面 → 列 → 片」一次排好：分页与切列同源（gloss::layout_book），
         // 双行夹注的跨列流转也在这里定型，渲染侧不再重算。
-        let pages = self.layout_pages();
+        let pages = self.layout_pages_timed();
         let total = pages.len();
         if self.page >= total {
             self.page = total.saturating_sub(1);
@@ -277,17 +441,33 @@ impl Root {
         //   · 竖屏（高 ≥ 宽，手机竖持）      → 单页：一叶居中。
         // 两叶均为古籍竖排，读序自右向左。
         let stage = if self.duplex == Duplex::Facing {
-            let cur = self.page; // 当前面
-            let next = self.page + 1; // 下一面
-            let mut row = div().flex().flex_row().gap_4().items_start();
+            let cur = self.page; // 当前面（右半叶）
+            let next = self.page + 1; // 下一面（左半叶）
             // 古籍对开自右向左读：当前面（cur）在右、下一面（next）在左，读序 N → N+1。
-            // flex_row 首个子元素落在最左，故先排下一面（左）、后排当前面（右）；
-            // 左叶用纸背色（paper_back）、右叶用正面色，拟一帧真实对开。
+            // flex_row 首个子元素落在最左，故先排下一面（左）、后排当前面（右）。
+            //
+            // 对开＝**一张纸的两半**：不留缝、纸色统一（不再让左叶显纸背色）、
+            // 内侧也不留白，两半在纸心直接相接；纸心再立一道「中缝」（版心）。
+            // 这样摊开的就是一整张印张，而不是两片孤立的书叶。
+            let mut row = div().flex().flex_row().items_start();
+            let left_is_head = pages.get(next).map(|p| p.start_chapter).unwrap_or(false);
+            let cur_is_head = pages.get(cur).map(|p| p.start_chapter).unwrap_or(false);
             if next < total {
-                row = row.child(self.render_leaf(&pages, next, true, cx));
+                row = row.child(self.render_leaf(&pages, next, false, LeafEdge::Left, cx));
+                let ch = pages
+                    .get(cur)
+                    .and_then(|p| p.glyphs.first())
+                    .map(|g| g.chapter)
+                    .unwrap_or(0);
+                // 中缝常在：它把两半的版框隔开，纸心才像一道折缝而不是一道黑杠。
+                // 篇题与叶码只出现在一处：某一半叶是章首时，那一叶的「章题列」
+                // 已当了版心，中缝便只留一对鱼尾；否则中缝载篇题与叶码。
+                let detailed = !left_is_head && !cur_is_head;
+                row = row.child(self.render_gutter(ch, cur, detailed));
             }
             if cur < total {
-                row = row.child(self.render_leaf(&pages, cur, false, cx));
+                let edge = if next < total { LeafEdge::Right } else { LeafEdge::Alone };
+                row = row.child(self.render_leaf(&pages, cur, false, edge, cx));
             }
             row
         } else {
@@ -295,7 +475,7 @@ impl Root {
                 .flex()
                 .flex_row()
                 .justify_center()
-                .child(self.render_leaf(&pages, self.page, false, cx))
+                .child(self.render_leaf(&pages, self.page, false, LeafEdge::Alone, cx))
         };
 
         let toolbar = self.render_reading_toolbar(total, cx);
@@ -336,8 +516,14 @@ impl Root {
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
                         // 笔记浮层开着：在正文区松手＝保存笔记并收起浮层，不翻页。
+                        // 但「刚打开浮层那一下」要跳过：它的 mouseup 会重新命中
+                        // 正文，若在此提交空草稿，浮层会闪开即关、根本写不了。
                         if this.note_editing {
-                            this.commit_note_edit();
+                            if this.note_suppress_commit {
+                                this.note_suppress_commit = false;
+                            } else {
+                                this.commit_note_edit();
+                            }
                             this.press_at = None;
                             cx.notify();
                             return;
@@ -432,8 +618,13 @@ impl Root {
             cx.listener(|this, _event, _window, cx| {
                 // 笔记浮层开着时，点浮层以外的任何地方＝自动保存笔记；
                 // 同时「吃掉」本次按下记录，避免松手时误翻页。
+                // 打开浮层那一下的按下要放过（见 note_suppress_commit）。
                 if this.note_editing {
-                    this.commit_note_edit();
+                    if this.note_suppress_commit {
+                        this.note_suppress_commit = false;
+                    } else {
+                        this.commit_note_edit();
+                    }
                     this.press_at = None;
                 }
                 if this.popup.is_some() || this.has_selection() {
@@ -1319,19 +1510,28 @@ impl Root {
         let Some(book) = &self.book else {
             return div();
         };
-        let title = if book.cover.title.is_empty() {
-            book.title.clone()
+        // 题签文字：书名或封面题签（【】显作「」，与版面其它文字一致）。
+        let raw = if book.cover.title.is_empty() {
+            &book.title
         } else {
-            book.cover.title.clone()
+            &book.cover.title
         };
+        let title: String = raw.chars().map(crate::types::bracket_to_quote).collect();
         if title.is_empty() {
             return div();
         }
         let t = self.theme;
+        // 贴向书页左上「天头」，而不是压在顶栏上：
+        //   · 竖向落在工具栏之下（约 56px 起），让开顶栏按钮区；
+        //   · 横向贴着正文页左缘——页在正文区居中，左缘 ≈ (视口宽-内容宽)/2，
+        //     签条放在它左侧留白里，既不压字，又一眼看得出在读哪部书。
+        let page_left = ((self.viewport_w - self.content_w) / 2.0).max(0.0);
+        let left = (page_left - 62.0).max(8.0);
+        let top = 56.0;
         div()
             .absolute()
-            .top(px(10.0))
-            .left(px(10.0))
+            .top(px(top))
+            .left(px(left))
             .flex()
             .flex_col()
             .items_center()
@@ -1355,10 +1555,12 @@ impl Root {
                 }),
             )
             .child(div().w(px(18.0)).h(px(2.0)).bg(rgb(t.accent())))
+            // 宽度给到两列（≈46px）、高度 200px：长书名自动分两列竖排，
+            // 不再被单列截断缀「…」，可看到完整书名。
             .child(crate::shelf::vertical_block(
                 &title,
-                22.0,
-                176.0,
+                46.0,
+                200.0,
                 14.0,
                 t.ink(),
                 FontWeight::MEDIUM,
@@ -1483,14 +1685,6 @@ impl Root {
             }),
         ));
 
-        // 生成照片：把当前窗口截存为 PNG（macOS 下用 screencapture）。
-        bar = bar.child(small_button("生成照片", false, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _window, _, cx| {
-                this.save_photo(cx);
-            }),
-        ));
-
         bar = bar.child(div().flex_1());
 
         // 翻页：点正文区左 / 右半屏，或键盘方向键；章节跳转走「目录」。
@@ -1546,20 +1740,36 @@ impl Root {
         pages: &[Page],
         idx: usize,
         back: bool,
+        edge: LeafEdge,
         cx: &mut Context<Self>,
     ) -> Div {
         let page = pages.get(idx);
         let glyphs: Vec<Glyph> = page.map(|p| p.glyphs.clone()).unwrap_or_default();
         let start = page.map(|p| p.start_chapter).unwrap_or(false);
         let columns: Vec<Vec<Piece>> = page.map(|p| p.columns.clone()).unwrap_or_default();
+        // 章末统计：本章在此收尾（下一葉即新章首，或已是全书末葉）时，
+        // 把「篇 / 章 / 字」小表排在正文之后的第一片空列里。
+        let stats: Vec<ChapStat> = self
+            .chapters_ended_here(pages, idx)
+            .iter()
+            .filter_map(|&c| self.chapter_stat(c))
+            .collect();
         // 现只保留古籍竖笺（现代横笺已移除）：一律走竖排渲染。
-        let inner = self.render_ancient(&glyphs, &columns, back, start, idx, cx);
+        let inner = self.render_ancient(&glyphs, &columns, back, start, idx, edge, &stats, cx);
         // 最小字号保护：窄屏 + 高列数（12/14）触发最小字号后，纸面可能超出
         // 视口高度——这里把该面包进一个限高（=内容区高）的滚动容器，允许
         // 单页内上下滑动查看，而不是把字压到更小或裁掉。
         let inner = if self.grid_min_font {
             let leaf_w = if self.duplex == Duplex::Facing {
-                ((self.content_w - crate::grid::LEAF_GAP) / 2.0).max(80.0)
+                ((self.content_w
+                    - crate::grid::gutter_w(
+                        self.content_w,
+                        self.grid.columns,
+                        ANCIENT_EDGE,
+                        self.grid.margin,
+                    ))
+                    / 2.0)
+                    .max(80.0)
             } else {
                 self.content_w.max(80.0)
             };
@@ -1590,7 +1800,10 @@ impl Root {
         }
         // 牌记：书末最后一页（idx == 末页）加一枚方框，内竖排「某年某刻」，
         // 仿实体书版权页（刻本多在末叶边栏落此印记）。
-        if idx + 1 >= pages.len() && pages.len() > 0 {
+        // 只在末叶**留白够多**时落印：正文排满时硬盖上去会遮字。
+        let used_cols = columns.iter().filter(|c| !c.is_empty()).count();
+        let sparse_tail = used_cols * 3 <= columns.len().max(1);
+        if idx + 1 >= pages.len() && !pages.is_empty() && sparse_tail {
             let paper = if back {
                 self.theme.paper_back()
             } else {
@@ -1627,6 +1840,8 @@ impl Root {
         // 即可在本页天头写下感悟。
         if let Some(note) = self.notes.get(&idx) {
             if !note.trim().is_empty() {
+                // 天头眉批：竖排小字，且按繁简开关转繁体显示。
+                let note_trad: String = note.chars().map(|c| self.shown(c)).collect();
                 wrap = wrap.child(
                     div()
                         .absolute()
@@ -1639,7 +1854,7 @@ impl Root {
                         .flex_row()
                         .justify_center()
                         .child(crate::shelf::vertical_block(
-                            note,
+                            &note_trad,
                             self.content_w,
                             48.0,
                             11.0,
@@ -1652,12 +1867,32 @@ impl Root {
         wrap
     }
 
+    /// 章题（展示用）：源数据里的【】在此一律显作「」——
+    /// 章题列、中缝篇题、卷首题署、分享题识都经这一道。
     fn chapter_title(&self, chapter: usize) -> String {
         self.book
             .as_ref()
             .and_then(|b| b.chapters.get(chapter))
-            .map(|c| c.title.clone())
+            .map(|c| c.title.chars().map(crate::types::bracket_to_quote).collect())
             .unwrap_or_default()
+    }
+
+    /// 书耳题签：篇章名 → 卷名 → 提要，按本章内容自适应
+    /// （见 `types::ear_label`）：章有标题用标题；无标题的多章书用
+    /// 卷次（卷一 / 卷二……）；单章无题书摘正文开头作提要。
+    fn ear_label(&self, chapter: usize) -> String {
+        let Some(book) = self.book.as_ref() else {
+            return String::new();
+        };
+        let Some(ch) = book.chapters.get(chapter) else {
+            return String::new();
+        };
+        let opening = ch
+            .paragraphs
+            .first()
+            .map(|p| p.text.as_str())
+            .unwrap_or("");
+        crate::types::ear_label(&ch.title, book.chapters.len(), chapter, opening)
     }
 
     // ------------------------------------------------------------------
@@ -1670,6 +1905,8 @@ impl Root {
         back: bool,
         start_chapter: bool,
         idx: usize,
+        edge: LeafEdge,
+        stats: &[ChapStat],
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme;
@@ -1781,19 +2018,67 @@ impl Root {
         if start_chapter && self.chapter_inscription_reserve_rows() > 0 {
             inner = inner.child(self.render_inscription(chapter, cell_w, cell_h, fs, cx));
         }
+        // 章末统计表：排在正文末列之后的第一片空列里、贴着天头，
+        // 仿刻本卷尾的「篇—章—字」小表（版心之左、正文之尾）。
+        if !stats.is_empty() {
+            if let Some(empty) = first_empty_column(&columns, text_cols) {
+                inner = inner.child(self.render_chapter_stats(
+                    stats,
+                    empty,
+                    text_cols,
+                    cell_w,
+                    cell_h,
+                    fs,
+                ));
+            }
+        }
         let frame = div()
             .border_3()
             .border_color(rgb(t.frame_ink()))
             .p(px(3.0))
             .child(inner);
 
+        // 纸面留白：对开时内侧（贴纸心那一侧）收掉，两半才能拼成一张纸。
+        // `relative`：书耳用绝对定位挂在纸面左上 / 右上角。
+        let pad = 16.0;
         let mut sheet = div()
+            .relative()
             .flex()
             .flex_col()
             .items_center()
-            .p(px(16.0))
+            .pt(px(pad))
+            .pb(px(pad))
+            .pl(px(if edge == LeafEdge::Right { 0.0 } else { pad }))
+            .pr(px(if edge == LeafEdge::Left { 0.0 } else { pad }))
             .bg(rgb(paper))
             .child(frame);
+
+        // 书耳：贴版框上角的一小片「耳朵」（刻本书脑侧的题签小耳）。
+        // 位置随叶位走：单叶 / 左半叶贴左上（左外侧留白里），右半叶镜像到右上
+        // ——紧贴版框不放空，与用户给的「天 / 地 / 鱼尾 / 书脑 / 耳子」图同款。
+        {
+            let pad = 16.0;
+            let ear_w = (cell_w * 0.16).clamp(11.0, 14.0).min(pad - 2.0);
+            // 耳高约一格（刻本书耳只有一两字高，不是一整条边）。
+            let ear_h = (cell_h * 1.25).clamp(34.0, 150.0);
+            // 耳内题签按内容自适应：篇章名 / 卷名 / 提要（types::ear_label）。
+            let ear_label = self.ear_label(chapter);
+            let (ear_x, ear_mirror) = match edge {
+                // 右半叶：外侧在右，耳朵贴右上（右缘探进右外侧留白里）。
+                LeafEdge::Right => (grid_w + 14.0, true),
+                // 单叶 / 左半叶：外侧在左，耳朵贴左上。
+                _ => (pad - ear_w, false),
+            };
+            sheet = sheet.child(book_ear(
+                t,
+                ear_w,
+                ear_h,
+                ear_x,
+                pad,
+                ear_mirror,
+                &ear_label,
+            ));
+        }
 
         // 注文不进正文时，退回页脚注。
         if !self.notes_inline {
@@ -1863,9 +2148,9 @@ impl Root {
             .flex()
             .flex_col()
             .items_center()
-            // 乌丝栏：列间界行取墨色细线，与刻本一致（朱线只留给句读 / 划线）。
+            // 丝栏：列间界行按样式面板所选（乌 / 金 / 朱）取色。
             .border_l_1()
-            .border_color(rgb(t.rule_ink()));
+            .border_color(rgb(t.rule_by(self.rule_color)));
         let mut content = div().w_full().flex().flex_col().items_center();
         if top_skip > 0 {
             content = content.pt(px(cell_h * top_skip as f32));
@@ -1877,6 +2162,9 @@ impl Root {
                     content = content.child(self.ancient_cell(*g, cell_w, cell_h, fs, back, mark, note_index, cx))
                 }
                 Piece::Gloss(txt) => content = content.child(self.ancient_gloss(txt, cell_w, cell_h, fs, columns, back, cx)),
+                // 避头尾禁则让出的空白格：占一个整字格，不渲染任何字，
+                // 只把后续正文压到第二格（列顶避头）或留一列底空当（列底避尾）。
+                Piece::Gap => content = content.child(div().w_full().h(px(cell_h))),
             }
         }
         col.child(content)
@@ -1926,7 +2214,8 @@ impl Root {
         // 注文小字色：墨色 × 纸色自动推导（永远比正文淡一档）。
         let note_color = self.palette.z_note(t, back);
         // 注文全体（跨列流转的一段）——点它时放大显示的就是这段。
-        let note_text = text.to_string();
+        // 【】在这里也显作「」（放大卡与行内注保持同一套字）。
+        let note_text: String = text.chars().map(crate::types::bracket_to_quote).collect();
         let mut block = div()
             .w(px(cell_w))
             .h(px(rows as f32 * row_h))
@@ -1966,6 +2255,7 @@ impl Root {
             line = line.child(div().w(px(pad)).h(px(row_h)));
             for c in pair {
                 line = line.child(match c {
+                    // 注文里的【】同样显作「」（夹注不过 shown，这里单独过一道）。
                     Some(ch) => div()
                         .w(px(sub_w))
                         .h(px(row_h))
@@ -1974,7 +2264,7 @@ impl Root {
                         .justify_center()
                         .text_size(px(nfs))
                         .text_color(rgb(note_color))
-                        .child(SharedString::from(ch.to_string())),
+                        .child(SharedString::from(crate::types::bracket_to_quote(ch).to_string())),
                     None => div().w(px(sub_w)).h(px(row_h)),
                 });
             }
@@ -1983,7 +2273,7 @@ impl Root {
         block
     }
 
-    /// 章题列：照刻本「版心」的样子——天头留白、上鱼尾、竖排篇题、下鱼尾，
+    /// 章题列：照刻本「版心」的样子——天头留白、上双鱼尾、竖排篇题、下双鱼尾，
     /// 一列通高（与八列界行同高，栏线上下都顶到版框）。
     fn ancient_title_column(
         &self,
@@ -1999,6 +2289,7 @@ impl Root {
         let title = self.chapter_title(chapter);
         let col_w = cell_w * ANCIENT_TITLE_COL;
         // 篇题字号与正文齐（刻本不把篇题放大，靠独占一列区分）。
+        // 丝栏：列间界行按样式面板所选（乌 / 金 / 朱）取色。
         let mut col = div()
             .w(px(col_w))
             .h(px(cell_h * rows as f32 + foot_h))
@@ -2006,11 +2297,11 @@ impl Root {
             .flex_col()
             .items_center()
             .border_l_1()
-            .border_color(rgb(t.rule_ink()));
+            .border_color(rgb(t.rule_by(self.rule_color)));
         // 天头：留约一字高的空白，鱼尾才落在版心上部而不是贴框。
         col = col.child(div().h(px(cell_h * 1.0)));
-        // 上鱼尾：尾朝下，宽度略窄于列（影印本鱼尾不顶格）。
-        col = col.child(banxin_tail(col_w * 0.72, true, t.frame_ink()));
+        // 上双鱼尾：尾朝下，整组略窄于列（影印本鱼尾不顶格）。
+        col = col.child(banxin_tails(col_w * 0.86, true, t.frame_ink()));
         col = col.child(div().h(px(cell_h * 0.18)));
         // 篇题：一字一格，自上面下。
         for c in title.chars().take(7) {
@@ -2043,9 +2334,185 @@ impl Root {
             );
         }
         col = col.child(div().h(px(cell_h * 0.1)));
-        // 下鱼尾：尾朝上，与上鱼尾对合，夹住篇题与叶码。
-        col = col.child(banxin_tail(col_w * 0.72, false, t.frame_ink()));
+        // 下双鱼尾：尾朝上，与上鱼尾对合，夹住篇题与叶码。
+        col = col.child(banxin_tails(col_w * 0.86, false, t.frame_ink()));
         col.child(div().h(px(cell_h * 0.38)))
+    }
+
+    /// 中缝（版心）：对开时立在纸心的一道竖栏，上下双鱼尾夹住篇题与叶码，
+    /// 下端再嵌一枚朱砂小印。缝宽约等于一行字宽（`grid::gutter_w`）：
+    /// 刻本版心本就是一列字的宽度；纸面总宽不变，只是把原来「两叶之间的
+    /// 空白」换成纸心的一道版心。
+    /// 左半叶是章首时不用它——那一叶自带的「章题列」本身就是版心。
+    fn render_gutter(&self, chapter: usize, page_idx: usize, detailed: bool) -> Div {
+        let t = self.theme;
+        let fs = self.size_ancient;
+        let cell_h = self.row_h;
+        // 中缝宽＝网格引擎预留的两叶间隙（`grid::gutter_w`）：约一行字宽，
+        // 纸面总宽不变，只是把原来「两叶之间的空白」换成了纸心的一道版心。
+        let gw = crate::grid::gutter_w(
+            self.content_w,
+            self.grid.columns,
+            ANCIENT_EDGE,
+            self.grid.margin,
+        );
+        // 字号必须收在缝宽以内，否则会溢出到两侧的正文上。
+        let tfs = (gw * 0.68).min(fs * 0.72).max(8.0);
+        let small = (gw * 0.50).min(fs * 0.40).max(7.0);
+        // 地脚高与 `render_ancient` 同式，中缝才能与纸面上下对齐。
+        let foot_h = (fs * 0.36).max(9.0) + 10.0;
+        let mut col = div()
+            .w(px(gw))
+            // 与纸面同高：上下留白 16、版框双边 3+3、框内留边 3+3、内栏线 1+1，
+            // 再加行格与地脚——和 `render_ancient` 里那张纸严丝合缝。
+            .h(px(16.0 * 2.0 + 14.0 + cell_h * self.grid_rows as f32 + foot_h))
+            .flex()
+            .flex_col()
+            .items_center()
+            .overflow_hidden()
+            .pt(px(16.0 + 4.0))
+            .pb(px(16.0 + 4.0))
+            .bg(rgb(t.paper()));
+        col = col.child(div().h(px(cell_h * 0.85)));
+        // 中缝上下两端的双鱼尾：两枚并排，收在缝宽以内（缝里还立着小印，
+        // 鱼尾顶到边角会挤成一团黑）。
+        col = col.child(banxin_tails(gw * 0.86, true, t.frame_ink()));
+        col = col.child(div().h(px(cell_h * 0.16)));
+        if detailed {
+            for c in self.chapter_title(chapter).chars().take(6) {
+                col = col.child(
+                    div()
+                        .w(px(gw))
+                        .h(px(cell_h))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(tfs))
+                        .text_color(rgb(t.ink()))
+                        .child(SharedString::from(c.to_string())),
+                );
+            }
+        }
+        col = col.child(div().flex_1());
+        if detailed {
+            for c in han_num(page_idx + 1).chars() {
+                col = col.child(
+                    div()
+                        .w(px(gw))
+                        .h(px(small + 2.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(small))
+                        .text_color(rgb(t.ink_soft()))
+                        .child(SharedString::from(c.to_string())),
+                );
+            }
+        }
+        col = col.child(div().h(px(cell_h * 0.12)));
+        col = col.child(banxin_tails(gw * 0.86, false, t.frame_ink()));
+        // 朱砂小印「箋讀」：贴版心下端（影印本版心印落在下鱼尾之下）。
+        col = col.child(div().h(px(cell_h * 0.26)));
+        col.child(banxin_seal(gw * 0.80, gw * 1.60))
+    }
+
+    /// 一章的「篇 / 章 / 字」（章序与字数都写汉字数词）。
+    fn chapter_stat(&self, ci: usize) -> Option<ChapStat> {
+        let b = self.book.as_ref()?;
+        let c = b.chapters.get(ci)?;
+        let mut chars = 0usize;
+        for p in &c.paragraphs {
+            chars += p
+                .text
+                .chars()
+                .filter(|ch| !ch.is_whitespace() && !is_punct(*ch))
+                .count();
+        }
+        Some(ChapStat {
+            // 统计表里的篇名同样显「」不显【】。
+            title: c.title.chars().map(crate::types::bracket_to_quote).collect(),
+            index: ci + 1,
+            chars,
+        })
+    }
+
+    /// 这一叶上「收尾」的章：本章正文到此为止（下一叶是新章首，或已是全书末叶）。
+    /// 通常只有一章；短章恰好两、三章同叶收尾时，统计表就一行一篇并排列出
+    /// ——正是影印本卷尾那条「篇 / 章 / 字」小表的样子。
+    fn chapters_ended_here(&self, pages: &[Page], idx: usize) -> Vec<usize> {
+        chapters_ended_at(pages, idx)
+    }
+
+    /// 章末统计表：照用户给的影印本样式——三列「篇 / 章 / 字」，一行一篇，
+    /// 章序与字数都写作汉字数词（「一」「六十」），不加全书合计行。
+    /// 排在 `empty` 列（正文之后第一片空列）的天头，右缘贴住正文末列。
+    fn render_chapter_stats(
+        &self,
+        stats: &[ChapStat],
+        empty: usize,
+        text_cols: usize,
+        cell_w: f32,
+        cell_h: f32,
+        fs: f32,
+    ) -> Div {
+        let t = self.theme;
+        if stats.is_empty() {
+            return div();
+        }
+        // 正文之后还剩多少宽可用：表就缩在这段空白里，绝不压到正文上。
+        let avail = text_cols.saturating_sub(empty) as f32 * cell_w;
+        if avail < cell_w * 1.2 {
+            // 只剩不到一列出头（章末正好收在版框左缘），宁可不画。
+            return div();
+        }
+        let cw = (avail / 3.0).min(cell_w * 1.12).max(18.0);
+        let rh = (cell_h * 0.5).max(12.0);
+        let sfs = (fs * 0.40).max(8.0);
+        let tw = cw * 3.0;
+        let x = (avail - tw).max(0.0);
+        let line = t.frame_ink();
+        let cell = |s: String| -> Div {
+            // 汉字数词也是一「字」一宽（「六十」比「六」宽），按字数缩格内字号。
+            let len = s.chars().count().max(1) as f32;
+            let cfs = (cw * 0.86 / len).min(sfs).max(6.0);
+            div()
+                .w(px(cw))
+                .h(px(rh))
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .border_l_1()
+                .border_b_1()
+                .border_color(rgb(line))
+                .text_size(px(cfs))
+                .text_color(rgb(t.ink()))
+                .child(SharedString::from(s))
+        };
+        let row = |a: String, b: String, c: String| -> Div {
+            div()
+                .flex()
+                .flex_row()
+                .child(cell(a))
+                .child(cell(b))
+                .child(cell(c))
+        };
+        let mut table = div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(x))
+            .w(px(tw))
+            .border_t_1()
+            .border_r_1()
+            .border_color(rgb(line))
+            .bg(rgb(t.paper()))
+            .child(row("篇".to_string(), "章".to_string(), "字".to_string()));
+        for st in stats {
+            // 篇名过长时只留三字，宁缺毋滥。
+            let title: String = st.title.chars().take(3).collect();
+            table = table.child(row(title, han_num(st.index), han_num(st.chars)));
+        }
+        table
     }
 
     /// 卷首题署（卷端）：章首页开卷列顶部叠一卷端题名。
@@ -2093,6 +2560,9 @@ impl Root {
             .flex()
             .flex_col()
             .items_center()
+            // 题署只许占住预留带：书名 / 署名过长时裁在带内，
+            // 绝不越到带下的正文行上去（越界就成了「压字」）。
+            .overflow_hidden()
             .font_family(song);
 
         // 第一行：书名·卷次，顶格，墨色，逐字竖排。
@@ -2472,6 +2942,8 @@ impl Root {
     /// 按当前繁简开关把单字转成展示形态：繁体模式转繁，简体模式转简。
     /// 正文与小字注释据此「全部」统一为繁体或简体。
     fn shown(&self, c: char) -> char {
+        // 【】→「」先做，再按繁简开关转字（竖排古籍里没有方框括号的位置）。
+        let c = crate::types::bracket_to_quote(c);
         if self.show_traditional {
             trad::traditional_of(c).unwrap_or(c)
         } else {
@@ -2916,8 +3388,14 @@ impl Root {
         let ch = self.lookup.clone().unwrap_or_default();
         let c = ch.chars().next().unwrap_or(' ');
         let book = self.book.as_ref();
-        let def = crate::dict::define(&ch);
         let trad = trad::traditional_of(c);
+        // 词库键为繁体：先按原字查，未命中再按繁 / 简变体兜底——
+        // 无论书稿是简体还是繁体、繁简开关怎么切，点字都能查到释义。
+        let def = crate::dict::define(&ch)
+            .or_else(|| trad.and_then(|t| crate::dict::define(&t.to_string())))
+            .or_else(|| {
+                trad::simplified_of(c).and_then(|s| crate::dict::define(&s.to_string()))
+            });
         let tong = book
             .and_then(|b| trad::tongjia_of(c, &b.tongjia))
             .map(|t| t.to_string());
@@ -2964,18 +3442,32 @@ impl Root {
                 ),
         );
         if let Some(d) = def {
-            body = body.child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(t.ink_soft()))
-                    .child(SharedString::from(d)),
-            );
+            // 释义按行拆开逐行渲染（GPUI 的 SharedString 不解析 \n）；
+            // 整部《古漢語常用字字典》一条释义可能上千字，放进可滚动区，
+            // 免把查字面板撑出屏幕。
+            let mut col = div().flex().flex_col().gap_1();
+            for line in d.split('\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                col = col.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(t.ink_soft()))
+                        .child(SharedString::from(line.to_string())),
+                );
+            }
+            let mut holder = div()
+                .max_h(px((self.viewport_h * 0.58).max(220.0)))
+                .child(col);
+            holder.style().overflow.y = Some(Overflow::Scroll);
+            body = body.child(holder);
         } else {
             body = body.child(
                 div()
                     .text_size(px(12.0))
                     .text_color(rgb(t.ink_soft()))
-                    .child(SharedString::from("（字书未收此字，换个字点点看）")),
+                    .child(SharedString::from("（字典未收此字，换个字点点看）")),
             );
         }
         if let Some(tr) = trad {
@@ -3046,21 +3538,34 @@ impl Root {
         let vw = self.viewport_w;
         let vh = self.viewport_h;
 
-        // 工具条尺寸估算，用于把浮条夹在视口内。
-        let n: f32 = 5.0;
+        // 工具条尺寸估算，用于把浮条夹在视口内。按钮数必须与下面实际排布
+        // 一致（查询 / 划线 / 人名 / 地名 / 书名 / 笔记 / 复制 / 分享，共 8 个）：
+        // 早先按 5 个估算，宽度少算 150+px，靠右时右半截（含「笔记 / 复制 /
+        // 分享」）被裁到屏幕外——既显示不全，也点不到，笔记因此「做不了」。
+        let n: f32 = 8.0;
         let bw = 46.0;
         let gap = 6.0;
         let pad = 8.0;
-        let menu_w = pad * 2.0 + bw * n + gap * (n - 1.0);
+        let menu_w = pad * 2.0 + bw * n + gap * (n - 1.0); // ≈ 426
         let menu_h = 38.0;
+        let avail = (vw - 16.0).max(120.0);
+        // 窄窗放不下一整排时折行，保证每个按钮都留在屏内。
+        let wraps = menu_w > avail;
+        let est_h = if wraps { menu_h * 2.0 + 4.0 } else { menu_h };
 
-        let mut left = hit.x + 10.0;
-        let mut top = hit.y + 20.0;
-        if left + menu_w > vw {
-            left = (vw - menu_w - 10.0).max(0.0);
+        // 落在选区「左下方」：先按右缘对齐命中点向左展开，再夹进视口四边，
+        // 保证整条工具条完整可见。
+        let mut left = hit.x - menu_w;
+        if left < 8.0 {
+            left = 8.0;
         }
-        if top + menu_h > vh {
-            top = (hit.y - menu_h - 10.0).max(0.0);
+        let max_left = (vw - menu_w.min(avail) - 8.0).max(8.0);
+        if left > max_left {
+            left = max_left;
+        }
+        let mut top = hit.y + 14.0; // 选区正下方
+        if top + est_h > vh - 8.0 {
+            top = (hit.y - est_h - 14.0).max(8.0); // 下方放不下则翻到上方
         }
 
         let key = hit.key;
@@ -3161,6 +3666,8 @@ impl Root {
             .left(px(left))
             .flex()
             .flex_row()
+            .flex_wrap()
+            .max_w(px(avail))
             .items_center()
             .gap(px(gap))
             .p(px(pad))
@@ -3481,15 +3988,42 @@ impl Root {
             .collect();
 
         let (bg, ink, mute) = SHARE_BGS[self.share_bg.min(SHARE_BGS.len() - 1)];
-        // 卡片高度由「高度」滑杆控制，同时给下方控制面板留出空间。
-        let card_h = (vh * self.share_h).min(vh - 250.0).max(280.0);
-        let card_w = (card_h * 0.66).clamp(300.0, 600.0);
+        // 卡片高度按视口比例取定值（「高度」滑杆已删），并给控制面板留位。
+        let card_h = (vh * SHARE_CARD_H_FRAC).min(vh - 250.0).max(280.0);
+        // 笺是竖长书衣比例；其余版式沿用横长比例。
+        let card_w = match self.share_layout {
+            CardLayout::Note => (card_h * 0.72).clamp(260.0, 460.0),
+            _ => (card_h * 0.66).clamp(300.0, 600.0),
+        };
         let fs = (card_h / 40.0).clamp(12.0, 24.0);
         // 单字行高：GPUI 的默认行高约 1.4×字号，再加上 gap_1(4px)。
         // 少算行高会让最后几行溢出卡片（分享卡底部被裁掉半行字）。
         let line_h = fs * 1.42 + 4.0;
 
-        // ---- 正文：按版式排（竖排分列从右到左 / 横排分行 / 单列竖排）----
+        // ---- 题识列 / 日期列 / 朱印：版式共用（笺也共用同一组装）----
+        // 题识：章节 / 书名 / 作者 按开关拼接（书名仍夹 12 字）。
+        let mut sign_text = String::new();
+        if self.share_show_chapter && !chap_title.is_empty() {
+            sign_text.push_str(&format!("{} · ", chap_title));
+        }
+        if self.share_show_title {
+            sign_text.push_str(&clip_chars(&book_title, 12));
+        }
+        if self.share_show_author && !author.is_empty() {
+            sign_text.push_str(&format!(" · {}", clip_chars(&author, 8)));
+        }
+        let sign_cap = ((card_h - 56.0) / 15.0).floor().max(8.0) as usize;
+        let sign_text = clip_chars(sign_text.trim_matches([' ', '·']), sign_cap);
+        let sign = share_sign(&sign_text, mute);
+
+        // 日期角标：竖排中文日期立于最右（可关）。
+        let date_text = cn_date_from_str(&today_ymd());
+        let date_col = share_date_col(&date_text, self.share_show_date, mute);
+
+        // 朱印：题识列底部那枚 30×30 小印。
+        let seal = share_seal(t);
+
+        // ---- 正文：按版式排（笺 / 竖排分列 / 单列竖排；只要竖排）----
         let grid = match self.share_layout {
             CardLayout::Columns => {
                 // 先按高度算「一列最多几个字」，再按宽度收紧列数：
@@ -3520,25 +4054,6 @@ impl Root {
                 }
                 g
             }
-            CardLayout::Rows => {
-                let per_line = ((card_w - 76.0) / (fs + 2.0)).floor().max(6.0) as usize;
-                let mut g = div()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap_2()
-                    .w(px(card_w - 150.0));
-                for line in body.chunks(per_line) {
-                    let s: String = line.iter().collect();
-                    g = g.child(
-                        div()
-                            .text_size(px(fs))
-                            .text_color(rgb(ink))
-                            .child(SharedString::from(s)),
-                    );
-                }
-                g
-            }
             CardLayout::Single => {
                 let cap = ((card_h - 44.0) / line_h).floor().max(4.0) as usize;
                 let mut c = div().flex().flex_col().items_center().gap_1();
@@ -3552,68 +4067,12 @@ impl Root {
                 }
                 c
             }
-        };
-
-        // ---- 题识列：章节 / 书名 / 作者 按开关拼接（书名仍夹 12 字）----
-        let mut sign_text = String::new();
-        if self.share_show_chapter && !chap_title.is_empty() {
-            sign_text.push_str(&format!("{} · ", chap_title));
-        }
-        if self.share_show_title {
-            sign_text.push_str(&clip_chars(&book_title, 12));
-        }
-        if self.share_show_author && !author.is_empty() {
-            sign_text.push_str(&format!(" · {}", clip_chars(&author, 8)));
-        }
-        let sign_cap = ((card_h - 56.0) / 15.0).floor().max(8.0) as usize;
-        let sign_text = clip_chars(sign_text.trim_matches([' ', '·']), sign_cap);
-        let mut sign = div().flex().flex_col().items_center().gap_1();
-        for c in sign_text.chars() {
-            sign = sign.child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(mute))
-                    .child(SharedString::from(c.to_string())),
-            );
-        }
-
-        // ---- 日期角标：竖排中文日期立于右上（可关）----
-        let date_col = if self.share_show_date {
-            let date_text = cn_date_from_str(&today_ymd());
-            let mut date_chars = div().flex().flex_col().items_center().gap_1();
-            for c in date_text.chars() {
-                date_chars = date_chars.child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(mute))
-                        .child(SharedString::from(c.to_string())),
-                );
+            CardLayout::Note => {
+                // 笺：竖丝栏 8/10/12/14 列自适应（列数按分享内容挑最小值）。
+                // 题识列 / 日期列 / 朱印走下方通用组装，不单独成卡。
+                note_paper(card_w, card_h, &body, ink, mute)
             }
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .flex_shrink_0()
-                .h_full()
-                .child(date_chars)
-        } else {
-            div().flex_shrink_0()
         };
-
-        let seal = div()
-            .w(px(30.0))
-            .h(px(30.0))
-            .bg(rgb(t.accent()))
-            .rounded(px(2.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                div()
-                    .text_size(px(10.5))
-                    .text_color(rgb(0xF5EFE2))
-                    .child(SharedString::from("笺讀")),
-            );
 
         let card = div()
             .w(px(card_w))
@@ -3644,55 +4103,6 @@ impl Root {
             .child(grid)
             .child(date_col);
 
-        // ---- 高度滑杆（竖排五档，仿图 1 右侧的「高度」条）----
-        let steps = [0.62f32, 0.69, 0.76, 0.84, 0.92];
-        let cur_step = steps
-            .iter()
-            .position(|s| (s - self.share_h).abs() < 0.01)
-            .unwrap_or(3);
-        let mut ticks = div().flex().flex_col().items_center().gap_2();
-        ticks = ticks.child(
-            div()
-                .text_size(px(9.5))
-                .text_color(rgb(0xB9AE9C))
-                .child(SharedString::from("高")),
-        );
-        for (i, s) in steps.iter().enumerate() {
-            let on = i == cur_step;
-            let v = *s;
-            ticks = ticks.child(
-                div()
-                    .id(SharedString::from(format!("share-h-{i}")))
-                    .w(px(if on { 12.0 } else { 7.0 }))
-                    .h(px(if on { 12.0 } else { 7.0 }))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .bg(rgb(if on { t.accent() } else { 0x6B6152 }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.share_h = v;
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-        ticks = ticks.child(
-            div()
-                .text_size(px(9.5))
-                .text_color(rgb(0xB9AE9C))
-                .child(SharedString::from("度")),
-        );
-        let slider = div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .h(px(card_h))
-            .child(div().flex_1())
-            .child(ticks)
-            .child(div().flex_1());
-
         // ---- 控制面板：元素开关 / 版式 / 底色 ----
         let mut toggles = div().flex().flex_row().items_center().gap_2();
         for (label, on, act) in [
@@ -3721,13 +4131,23 @@ impl Root {
         let icon_ink = 0x2B2622;
         let mut layouts = div().flex().flex_row().items_center().gap_2();
         for (lay, label) in [
+            (CardLayout::Note, "八行笺"),
             (CardLayout::Columns, "竖排分列"),
-            (CardLayout::Rows, "横排分行"),
             (CardLayout::Single, "单列竖排"),
         ] {
             let on = self.share_layout == lay;
             let fg = if on { 0xE9E2D2 } else { icon_ink };
             let icon = match lay {
+                CardLayout::Note => div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(1.0))
+                    .child(bar(11.0, 2.0, fg))
+                    .child(bar(11.0, 2.0, fg))
+                    .child(bar(11.0, 2.0, fg))
+                    .child(bar(11.0, 2.0, fg)),
                 CardLayout::Columns => div()
                     .flex()
                     .flex_row()
@@ -3736,14 +4156,6 @@ impl Root {
                     .child(bar(2.0, 13.0, fg))
                     .child(bar(2.0, 13.0, fg))
                     .child(bar(2.0, 13.0, fg)),
-                CardLayout::Rows => div()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap_1()
-                    .child(bar(14.0, 2.0, fg))
-                    .child(bar(14.0, 2.0, fg))
-                    .child(bar(14.0, 2.0, fg)),
                 CardLayout::Single => div()
                     .w(px(13.0))
                     .h(px(13.0))
@@ -3891,9 +4303,10 @@ impl Root {
         // 卡片与面板用绝对坐标定位（而不是 flex 居中）：保存 / 分享图片
         // 要按这块矩形裁图，渲染位置必须与算式严格一致，否则截出来会偏。
         // 版式：卡片 + 12 + 控制条 88 + 12 + 按钮 36，整体垂直居中。
+        // （右侧「高度」滑杆已连同代码删除，预览行只剩卡片本身。）
         let total_h = card_h + 12.0 + 88.0 + 12.0 + 36.0;
         let top = ((vh - total_h) * 0.5).max(0.0);
-        let row_w = card_w + 12.0 + 42.0; // 卡片 + 间距 + 高度滑杆
+        let row_w = card_w;
         let left = ((vw - row_w) * 0.5).max(0.0);
         let panel_left = (left - (panel_w - row_w) * 0.5).max(0.0);
         self.share_card_rect = Some((left, top, card_w, card_h));
@@ -3938,13 +4351,6 @@ impl Root {
                     ),
             )
             .child(div().absolute().left(px(left)).top(px(top)).child(card))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(left + card_w + 12.0))
-                    .top(px(top))
-                    .child(slider),
-            )
             .child(
                 div()
                     .absolute()
@@ -4068,19 +4474,41 @@ impl Root {
         } else {
             "（这一葉还没有笔记）".to_string()
         };
+        // 笔记内容按当前繁简开关转繁／简，再竖排显示（仿古人批注）。
+        let existing_trad: String = existing.chars().map(|c| self.shown(c)).collect();
 
         // 「第 N 葉的笔记」区：静态展示已有笔记；写笔记统一走正文上方的
         // 浮层编辑框（直接盖在文本上输入，不占用面板、不遮正文）。
-        let note_box = div()
-            .w(px(328.0))
-            .p_2()
-            .bg(rgb(t.paper()))
-            .border_1()
-            .border_color(rgb(t.rule()))
-            .rounded(px(4.0))
-            .text_size(px(12.0))
-            .text_color(rgb(if existing.is_empty() { t.ink_soft() } else { t.ink() }))
-            .child(SharedString::from(shown));
+        let note_box = if existing.is_empty() {
+            div()
+                .w(px(328.0))
+                .p_2()
+                .bg(rgb(t.paper()))
+                .border_1()
+                .border_color(rgb(t.rule()))
+                .rounded(px(4.0))
+                .text_size(px(12.0))
+                .text_color(rgb(t.ink_soft()))
+                .child(SharedString::from(shown))
+        } else {
+            // 竖排繁体：按字身折列，长笔记自动成多列，overflow_hidden 防止撑破面板。
+            div()
+                .w(px(328.0))
+                .p_2()
+                .overflow_hidden()
+                .bg(rgb(t.paper()))
+                .border_1()
+                .border_color(rgb(t.rule()))
+                .rounded(px(4.0))
+                .child(crate::shelf::vertical_block(
+                    &existing_trad,
+                    300.0,
+                    132.0,
+                    13.0,
+                    t.ink(),
+                    FontWeight::NORMAL,
+                ))
+        };
 
         let mut page_btns = div()
             .flex()
@@ -4119,7 +4547,7 @@ impl Root {
             );
         }
         for (p, txt) in notes {
-            let label: String = txt.chars().take(20).collect();
+            let label: String = txt.chars().take(20).map(|c| self.shown(c)).collect();
             list = list.child(
                 div()
                     .flex()
@@ -4448,6 +4876,60 @@ impl Root {
                     );
                 }
                 sheet = sheet.child(style_row("纸色", swatches, t));
+                // 丝栏：乌 / 金 / 朱 三色界行（竖排列间那道细线）。
+                // 色块里立三道竖线，直接预览界行颜色与粗细。
+                let mut rules = div().flex().flex_row().items_end().gap_2();
+                for &rc in crate::types::RuleColor::ALL.iter() {
+                    let on = rc == self.rule_color;
+                    let rule_c = t.rule_by(rc);
+                    rules = rules.child(
+                        div()
+                            .id(SharedString::from(format!("rule-{:?}", rc)))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_1()
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .w(px(34.0))
+                                    .h(px(28.0))
+                                    .bg(rgb(t.paper()))
+                                    .border_2()
+                                    .border_color(rgb(if on { t.accent() } else { t.rule() }))
+                                    .rounded(px(3.0))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div().w(px(1.5)).h(px(15.0)).bg(rgb(rule_c)),
+                                    )
+                                    .child(
+                                        div().w(px(1.5)).h(px(15.0)).bg(rgb(rule_c)),
+                                    )
+                                    .child(
+                                        div().w(px(1.5)).h(px(15.0)).bg(rgb(rule_c)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(if on { t.accent() } else { t.ink_soft() }))
+                                    .child(SharedString::from(rc.label())),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.rule_color = rc;
+                                    cx.notify();
+                                }),
+                            ),
+                    );
+                }
+                sheet = sheet.child(style_row("丝栏", rules, t));
                 // 标注：通假 / 标点 / 生僻字 / 注释（「红色繁体小注」已删除，
                 // 繁简改由版式行的「简体 / 繁体」统一切换正文字体）。
                 let marks = self.style_chips(
@@ -4515,14 +4997,7 @@ impl Root {
             }
         }
 
-        // ---- 底部三个大按钮：保存图片 / 分享图片 / 分享文字 ----
-        let save = self.action_button("保存图片", t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.save_photo(cx);
-            }),
-        );
+        // ---- 底部两个大按钮：分享图片 / 分享文字 ----
         let share_img = self.action_button("分享图片", t).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
@@ -4545,7 +5020,6 @@ impl Root {
                 .flex_row()
                 .gap_2()
                 .mt_1()
-                .child(save)
                 .child(share_img)
                 .child(share_txt),
         );
@@ -4553,6 +5027,7 @@ impl Root {
         // 作为正文正下方的行内面板（像照片说明），宽度等于单张页面，不遮挡正文。
         sheet
     }
+
 
     /// 把分享卡截成 PNG：按渲染时记下的卡片矩形裁切，只截卡片本身。
     ///
@@ -4691,27 +5166,6 @@ impl Root {
                     .text_color(rgb(t.chrome_text()))
                     .child(SharedString::from(label)),
             )
-    }
-
-    /// 保存当前页为照片（macOS 下用 screencapture 截存桌面 PNG）。
-    pub fn save_photo(&mut self, cx: &mut Context<Self>) {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let path = format!("{home}/Desktop/jiandu-{secs}.png");
-        let ok = std::process::Command::new("screencapture")
-            .args(["-x", &path])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        self.notice = if ok {
-            format!("已生成照片：{path}")
-        } else {
-            "生成照片失败：需 macOS 桌面环境".to_string()
-        };
-        cx.notify();
     }
 
     /// 样式面板里的一组小按钮。
@@ -4965,9 +5419,243 @@ fn help_sec(title: &str, t: Theme) -> Div {
         .child(SharedString::from(title.to_string()))
 }
 
+/// 分享卡题识列：竖排一列小字（题识 = 章节 · 书名 · 作者，调用方已拼接裁好）。
+/// 题识里的【】显作「」——与阅读版面同一套字。
+fn share_sign(sign_text: &str, mute: u32) -> Div {
+    let mut sign = div().flex().flex_col().items_center().gap_1();
+    for c in sign_text.chars() {
+        sign = sign.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(mute))
+                .child(SharedString::from(
+                    crate::types::bracket_to_quote(c).to_string(),
+                )),
+        );
+    }
+    sign
+}
+
+/// 分享卡日期列：竖排中文日期立于最右（关时留一枚零宽占位，把正文推离右缘）。
+fn share_date_col(date_text: &str, show: bool, mute: u32) -> Div {
+    if !show {
+        return div().flex_shrink_0();
+    }
+    let mut date_chars = div().flex().flex_col().items_center().gap_1();
+    for c in date_text.chars() {
+        date_chars = date_chars.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(mute))
+                .child(SharedString::from(c.to_string())),
+        );
+    }
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .flex_shrink_0()
+        .h_full()
+        .child(date_chars)
+}
+
+/// 分享卡朱印：30×30 朱砂（accent）圆角小印，内「笺讀」二字，
+/// 坐在题识列底部——题跋图同款构成：题识在左、印在其下。
+fn share_seal(t: Theme) -> Div {
+    div()
+        .w(px(30.0))
+        .h(px(30.0))
+        .bg(rgb(t.accent()))
+        .rounded(px(2.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .text_size(px(10.5))
+                .text_color(rgb(0xF5EFE2))
+                .child(SharedString::from("笺讀")),
+        )
+}
+
+/// 笺面网格规划：给定笺面内尺寸与正文字数，返回 `(字号, 列数, 每列字数)`。
+/// **列数按内容自适应**：在 8/10/12/14 列里取能装下的最小列数——内容越少
+/// 列越少、字越大；内容越多列越多、字越小。都装不下时只缩字号（列数封顶
+/// 14，字号下限 8pt）。
+fn note_grid_plan(inner_w: f32, inner_h: f32, len: usize) -> (f32, usize, usize) {
+    let mut fs = 11.0f32;
+    let mut n_cols = 8usize;
+    let mut per_col = 1usize;
+    for &c in &[8usize, 10, 12, 14] {
+        // 列宽 = 笺宽 ÷ 列数；字号跟列宽走（字近方，略收一成）。
+        let f = (inner_w / c as f32 * 0.92).clamp(11.0, 30.0);
+        // 每列容量 = 笺高 ÷ 行距（GPUI 行高约 1.4×字号）。
+        let cap = ((inner_h / (f * 1.42)).floor() as usize).max(1);
+        fs = f;
+        n_cols = c;
+        per_col = cap;
+        if len <= c * cap {
+            break;
+        }
+    }
+    // 14 列仍装不下：只缩字号（列数封顶 14），字号不低于 8pt。
+    while n_cols == 14 && len > n_cols * per_col && fs - 0.5 >= 8.0 {
+        fs -= 0.5;
+        per_col = ((inner_h / (fs * 1.42)).floor() as usize).max(1);
+    }
+    (fs, n_cols, per_col.max(1))
+}
+
+/// 分享笺面（笔记 / 图片分享的笺纸样式）：仿「八行笺 / 十三行」——
+/// **竖丝栏**（乌丝栏是竖线，界在列与列之间）把笺面分成 8/10/12/14 列，
+/// 列数按分享内容自适应（`note_grid_plan`），正文竖排从右到左。
+/// 只有竖排：横排版式与右侧高度标识均已按要求删除。
+///
+/// 题识列 / 日期列 / 朱印由调用方（`render_share_sheet`）在笺面两侧组装，
+/// 三种竖排版式共用同一组装。
+fn note_paper(card_w: f32, card_h: f32, body: &[char], ink: u32, mute: u32) -> Div {
+    // 笺面在卡片内的可用尺寸：卡片内边距 32 + 题识列 ~30 + 日期列 ~13 + 列距 32。
+    let avail_w = (card_w - 108.0).max(140.0);
+    let avail_h = (card_h - 32.0).max(120.0);
+    let pad_x = 8.0;
+    let inner_w = (avail_w - pad_x * 2.0).max(56.0);
+    let inner_h = avail_h;
+
+    // ---- 网格：列数 8/10/12/14 按内容挑，字号随列宽，每列 per_col 字 ----
+    let (fs, n_cols, per_col) = note_grid_plan(inner_w, inner_h, body.len());
+    let line_pitch = fs * 1.42;
+    let col_w = inner_w / n_cols as f32;
+    let cols: Vec<Vec<char>> = body.chunks(per_col).map(|c| c.to_vec()).collect();
+
+    // ---- 竖丝栏（乌丝栏）：列界细线，通笺高（外框由卡片自带）----
+    let rule_c = (mute & 0x00FFFFFF) | 0x00000033u32;
+    let mut rules = div()
+        .absolute()
+        .top(px(0.0))
+        .left(px(pad_x))
+        .w(px(inner_w))
+        .h(px(inner_h));
+    for i in 1..n_cols {
+        rules = rules.child(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(i as f32 * col_w))
+                .w(px(1.0))
+                .h(px(inner_h))
+                .bg(rgb(rule_c)),
+        );
+    }
+
+    // ---- 正文：竖排，每列定宽 col_w（字居中），首列在最右 ----
+    let mut text = div()
+        .absolute()
+        .top(px(0.0))
+        .left(px(pad_x))
+        .w(px(inner_w))
+        .h(px(inner_h))
+        .flex()
+        .flex_row()
+        .items_start()
+        .justify_end();
+    for col in cols.iter().rev() {
+        let mut c = div().w(px(col_w)).flex().flex_col().items_center();
+        for ch in col {
+            c = c.child(
+                div()
+                    .h(px(line_pitch))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_size(px(fs))
+                            .text_color(rgb(ink))
+                            .child(SharedString::from(ch.to_string())),
+                    ),
+            );
+        }
+        text = text.child(c);
+    }
+
+    div()
+        .w(px(avail_w))
+        .h(px(avail_h))
+        .relative()
+        .child(rules)
+        .child(text)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cn_date_from_str, cn_small};
+    use super::{chapters_ended_at, cn_date_from_str, cn_small, first_empty_column, note_grid_plan};
+    use crate::gloss::{Page, Piece};
+
+    /// 「篇 / 章 / 字」只收在此叶收尾的章：跨叶未完的章不赶它，
+    /// 两章同叶收尾时两章都列（一行一篇）。
+    #[test]
+    fn stats_only_list_chapters_that_end_on_this_leaf() {
+        let page = |chapters: &[usize]| -> Page {
+            Page {
+                glyphs: chapters
+                    .iter()
+                    .map(|&c| {
+                        crate::types::Glyph {
+                            chapter: c,
+                            para: 0,
+                            offset: 0,
+                            ch: '甲',
+                            kind: crate::types::GlyphKind::Char,
+                        }
+                    })
+                    .collect(),
+                start_chapter: false,
+                columns: Vec::new(),
+            }
+        };
+        // 第 0 叶：章 0 未完（下一叶还是它） → 不收。
+        let pages = vec![page(&[0, 0]), page(&[0, 1])];
+        assert_eq!(chapters_ended_at(&pages, 0), Vec::<usize>::new());
+        // 第 1 叶：章 0 在此收尾，章 1 刚开始 → 只收章 0。
+        let pages = vec![page(&[0, 0]), page(&[0, 1]), page(&[1, 1])];
+        assert_eq!(chapters_ended_at(&pages, 1), vec![0]);
+        // 末叶：两章都收（短章同叶）。
+        let pages = vec![page(&[0]), page(&[1, 2])];
+        assert_eq!(chapters_ended_at(&pages, 1), vec![1, 2]);
+        // 越界叶：不收。
+        assert_eq!(chapters_ended_at(&pages, 9), Vec::<usize>::new());
+    }
+
+    /// 章末统计表要落在「正文之后的第一片空列」：
+    /// 整页排满时返回 None（无处可落，宁可不画），否则给下一列的下标。
+    #[test]
+    fn stats_table_lands_right_after_the_last_text_column() {
+        let text = |s: &str| -> Vec<Piece> {
+            s.chars()
+                .map(|ch| {
+                    Piece::Main(crate::types::Glyph {
+                        chapter: 0,
+                        para: 0,
+                        offset: 0,
+                        ch,
+                        kind: crate::types::GlyphKind::Char,
+                    })
+                })
+                .collect()
+        };
+        // 前两列有字，第三列起空着 → 表落在第 2 列。
+        let cols = vec![text("甲乙"), text("丙丁"), Vec::new(), Vec::new()];
+        assert_eq!(first_empty_column(&cols, 4), Some(2));
+        // 空页面（如章首尚未落字）→ 落在第 0 列。
+        let cols = vec![Vec::new(), Vec::new()];
+        assert_eq!(first_empty_column(&cols, 2), Some(0));
+        // 排满 → 无处可落。
+        let cols = vec![text("甲"), text("乙")];
+        assert_eq!(first_empty_column(&cols, 2), None);
+        // 只有一列空位时仍返回它（宽度够不够由渲染层按可用宽再判一次）。
+        let cols = vec![text("甲"), text("乙"), Vec::new()];
+        assert_eq!(first_empty_column(&cols, 3), Some(2));
+    }
 
     #[test]
     fn cn_small_numbers() {
@@ -4990,5 +5678,38 @@ mod tests {
         assert_eq!(cn_date_from_str(""), "");
         assert_eq!(cn_date_from_str("bad"), "");
         assert_eq!(cn_date_from_str("20x6-1a-2"), "");
+    }
+
+    /// 笺面列数按分享内容自适应：短内容 8 列（字大），越长列越多
+    /// （10 → 12 → 14，字随之缩小），14 列仍装不下只缩字号不加列。
+    #[test]
+    fn note_grid_columns_adapt_to_content_length() {
+        // 近似真实卡片：笺面约 256×482（380×530 的八行笺卡扣掉题识 / 日期列）。
+        let (iw, ih) = (256.0, 482.0);
+        // 20 字：8 列就装得下（每列 11 字），字号顶到列宽上限（≈29.4pt）。
+        let (fs8, cols8, per8) = note_grid_plan(iw, ih, 20);
+        assert_eq!(cols8, 8);
+        assert!((fs8 - iw / 8.0 * 0.92).abs() < 0.01);
+        assert!(per8 >= 11);
+        // 100 字：8 列（88 字）装不下 → 10 列，字号降到 24pt 上下。
+        let (_fs10, cols10, per10) = note_grid_plan(iw, ih, 100);
+        assert_eq!(cols10, 10);
+        assert!(cols10 * per10 >= 100);
+        // 300 字：一路加到 14 列（约 280 字）仍差一点 → 封顶 14 列并缩字号。
+        let (fs14, cols14, per14) = note_grid_plan(iw, ih, 300);
+        assert_eq!(cols14, 14);
+        assert!(fs14 < 24.0, "长内容应缩字号，实得 {fs14}");
+        assert!(cols14 * per14 >= 300 || fs14 <= 8.0);
+        // 列数随内容单调不减；空内容最少列数起步。
+        let cols = |n: usize| note_grid_plan(iw, ih, n).1;
+        assert_eq!(cols(0), 8);
+        assert!(cols(40) <= cols(120));
+        assert!(cols(120) <= cols(400));
+        assert!(cols(400) <= 14);
+        // 极端长文：列数绝不越过 14，字号有下限，per_col 至少 1。
+        let (fs, c, pc) = note_grid_plan(iw, ih, 100_000);
+        assert_eq!(c, 14);
+        assert!(fs >= 8.0);
+        assert!(pc >= 1);
     }
 }

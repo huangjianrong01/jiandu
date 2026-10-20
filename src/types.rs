@@ -232,24 +232,52 @@ impl ZoomLevel {
     }
 }
 
-/// 分享卡片的文字版式（对应分享面板里的三个版式图标）。
+/// 分享卡片的文字版式（对应分享面板里的版式图标）。
+/// **只要竖排**：横排版式（含图标、按钮与全部代码）已按用户要求删除。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CardLayout {
     /// 竖排分列、从右到左（古籍题跋式）
     #[default]
     Columns,
-    /// 横排分行（现代信笺式）
-    Rows,
     /// 单列竖排（长条书签式）
     Single,
+    /// 笺：竖丝栏分成 8/10/12/14 列，列数按分享内容长短自适应
+    /// （八行笺 / 十行笺……十三行式笺纸）
+    Note,
 }
 
 impl CardLayout {
     pub fn label(&self) -> &'static str {
         match self {
             CardLayout::Columns => "竖排",
-            CardLayout::Rows => "横排",
             CardLayout::Single => "单页",
+            CardLayout::Note => "八行笺",
+        }
+    }
+}
+
+/// 丝栏（竖排列间那道界行）的颜色：样式面板三选一。
+/// 影印本里三路都常见：乌丝栏（黑口本一路）、金丝栏（佳椠 / 写经）、
+/// 朱丝栏（写经体一路）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RuleColor {
+    /// 乌丝栏：墨兑水的冷灰界行。
+    #[default]
+    Wu,
+    /// 金丝栏：泥金界行。
+    Jin,
+    /// 朱丝栏：朱红界行。
+    Zhu,
+}
+
+impl RuleColor {
+    pub const ALL: [RuleColor; 3] = [RuleColor::Wu, RuleColor::Jin, RuleColor::Zhu];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            RuleColor::Wu => "乌丝栏",
+            RuleColor::Jin => "金丝栏",
+            RuleColor::Zhu => "朱丝栏",
         }
     }
 }
@@ -696,9 +724,53 @@ pub fn chapter_volume(ci: usize, title: &str) -> String {
     }
 }
 
+/// 书耳题签取提要时的字数上限：耳片只有一两字高，提要只取开头几字，
+/// 字号收缩与截断由渲染层（`shelf::fit_single_column`）负责。
+const EAR_DIGEST_CHARS: usize = 8;
+
+/// 书耳题签的内容：**按内容自适应**——篇章名 → 卷名 → 提要。
+///
+/// * 篇章名（章标题）最具体，优先；
+/// * 无篇名的多章书用卷次（卷一 / 卷二……）标识读到第几卷；
+/// * 无篇名的单章书编「卷一」没有意义，摘正文开头作提要兜底；
+/// * 章既无题也无文时仍退回卷次，书耳绝不空白。
+pub fn ear_label(title: &str, chapters: usize, ci: usize, opening: &str) -> String {
+    let t: String = title
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(bracket_to_quote)
+        .collect();
+    if !t.is_empty() {
+        return t;
+    }
+    if chapters > 1 {
+        return chapter_volume(ci, "");
+    }
+    let digest: String = opening
+        .chars()
+        .filter(|c| !c.is_whitespace() && !is_punct(*c))
+        .map(bracket_to_quote)
+        .take(EAR_DIGEST_CHARS)
+        .collect();
+    if !digest.is_empty() {
+        return digest;
+    }
+    chapter_volume(ci, "")
+}
+
+/// 方头括号【】在竖排古籍里一律显作「」：显示层 1:1 替换（源数据不动，
+/// 导出仍是原样）。正文（`shown`）、夹注、章题、中缝篇题、题署、分享题识、
+/// 书脊签、封面、书耳题签都经这一道——书本里出现的【】不露出一个。
+pub fn bracket_to_quote(c: char) -> char {
+    match c {
+        '【' => '「',
+        '】' => '」',
+        other => other,
+    }
+}
+
 /// 1..=99 的中文数字（卷次 / 叶码备用），超出则回退阿拉伯数字。
-pub fn han_small(n: usize) -> String {
-    const DIGITS: [&str; 10] = ["", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+pub fn han_small(n: usize) -> String {    const DIGITS: [&str; 10] = ["", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
     if n == 0 {
         return "零".to_string();
     }
@@ -885,6 +957,39 @@ mod tests {
         assert_eq!(chapter_volume(9, ""), "卷十");
         assert_eq!(chapter_volume(10, ""), "卷十一");
         assert_eq!(chapter_volume(21, ""), "卷二十二");
+    }
+
+    #[test]
+    fn ear_label_adapts_to_available_content() {
+        // ① 有篇章名：用篇名（周边空白滤掉，长短交给渲染层收缩）。
+        assert_eq!(ear_label("第一章", 9, 0, "天地玄黄"), "第一章");
+        assert_eq!(ear_label("  周紀一 ", 9, 3, "…"), "周紀一");
+        // 篇名里的【】同样显作「」（书本里出现的方括号不露出一个）。
+        assert_eq!(ear_label("【史記】卷", 9, 0, "…"), "「史記」卷");
+        // ② 无篇名的多章书：卷次（卷一 / 卷三 / 卷十二）。
+        assert_eq!(ear_label("", 9, 0, "天地玄黄"), "卷一");
+        assert_eq!(ear_label("", 9, 2, "天地玄黄"), "卷三");
+        assert_eq!(ear_label("", 9, 11, "天地玄黄"), "卷十二");
+        assert_eq!(ear_label("   ", 9, 0, "天地玄黄"), "卷一");
+        // ③ 无篇名的单章书：摘正文开头作提要（滤标点，至多八字）。
+        assert_eq!(ear_label("", 1, 0, "天地玄黄宇宙洪荒"), "天地玄黄宇宙洪荒");
+        assert_eq!(ear_label("", 1, 0, "天地玄黄，宇宙洪荒日月盈昃"), "天地玄黄宇宙洪荒");
+        // 提要开头带【】也换（如【題解】……）。
+        assert_eq!(ear_label("", 1, 0, "【題解】天地玄黄"), "「題解」天地玄黄");
+        // ④ 单章且无正文（或只有标点）：仍退回卷次，书耳不留空。
+        assert_eq!(ear_label("", 1, 0, ""), "卷一");
+        assert_eq!(ear_label("", 1, 0, "，。"), "卷一");
+    }
+
+    #[test]
+    fn square_brackets_render_as_corner_quotes() {
+        // 【】在竖排古籍里一律显作「」：显示层 1:1 替换，源数据不动。
+        assert_eq!(bracket_to_quote('【'), '「');
+        assert_eq!(bracket_to_quote('】'), '」');
+        // 「」本身与正文原样不动。
+        assert_eq!(bracket_to_quote('「'), '「');
+        assert_eq!(bracket_to_quote('』'), '』');
+        assert_eq!(bracket_to_quote('道'), '道');
     }
 
     #[test]

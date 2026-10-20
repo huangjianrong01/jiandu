@@ -18,8 +18,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::Script;
 
-/// 双面对开两叶之间的间隙（与 app.rs 保持一致，作为引擎的唯一来源）。
-pub const LEAF_GAP: f32 = 16.0;
+/// 双面对开两叶之间的「版心（中缝）」宽：**约等于一行字宽**。
+/// 刻本版心本就是一格字的宽度——鱼尾、篇题、叶码、朱砂小印都立在这一格
+/// 里。这里按 `compute_grid` 的同一套算式反解：令中缝宽恰等于单叶字格宽
+/// （`(content_w×k/2 - edge) / (columns + k/2)`，`k = 1 - 2×margin`），
+/// 两叶各占 `columns` 格、缝里再立一格；列数越多缝越窄，始终跟随
+/// 「一行字宽」进退。
+pub fn gutter_w(content_w: f32, columns: usize, edge: f32, margin: f32) -> f32 {
+    let c = columns.max(1) as f32;
+    let k = (1.0 - 2.0 * margin.clamp(0.0, 0.45)).max(0.1);
+    let num = (content_w * k / 2.0 - edge).max(1.0);
+    (num / (c + k / 2.0)).clamp(LEAF_GAP_MIN, LEAF_GAP_MAX)
+}
+
+/// 中缝宽下限（窄屏也立得住一对鱼尾）/ 上限（14 列时不至于宽得离谱）。
+pub const LEAF_GAP_MIN: f32 = 22.0;
+pub const LEAF_GAP_MAX: f32 = 110.0;
 
 /// 排版方向。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
@@ -131,9 +145,10 @@ pub fn compute_grid(
     foot: f32,
     extra_cols: f32,
 ) -> GridMetrics {
-    // 1) 双面对开：单叶可用宽对半（先扣两叶间隙）。
+    // 1) 双面对开：单叶可用宽对半——先扣两叶之间的版心（中缝），
+    //    中缝宽约等于一行字宽（见 `gutter_w`）。
     let per_leaf = if facing {
-        ((content_w - LEAF_GAP) / 2.0).max(60.0)
+        ((content_w - gutter_w(content_w, cfg.columns, edge, cfg.margin)) / 2.0).max(60.0)
     } else {
         content_w
     };

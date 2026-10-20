@@ -133,6 +133,21 @@ impl Theme {
         }
     }
 
+    /// 丝栏取色：按样式面板所选丝栏色给出界行颜色。
+    /// 乌 = `rule_ink`（冷灰）；朱 = `rule_red`（朱红）；
+    /// 金 = 泥金——亮纸上压一档防飘，夜读里提亮才看得见。
+    pub fn rule_by(self, rc: crate::types::RuleColor) -> u32 {
+        match rc {
+            crate::types::RuleColor::Wu => self.rule_ink(),
+            crate::types::RuleColor::Zhu => self.rule_red(),
+            crate::types::RuleColor::Jin => match self {
+                Theme::Xuan | Theme::Mi => 0xB08A3E,
+                Theme::Qing => 0x8F7A45,
+                Theme::Ye => 0xC2A25C,
+            },
+        }
+    }
+
     /// 朱色：印章、句读、当前条目。
     pub fn accent(self) -> u32 {
         match self {

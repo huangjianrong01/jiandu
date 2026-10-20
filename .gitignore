@@ -1,4 +1,6 @@
 /target
+target*/
+nohup.out
 **/*.rs.bk
 Cargo.lock.bak
 .DS_Store

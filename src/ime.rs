@@ -118,6 +118,8 @@ pub enum InputTarget {
     Search,
     /// 阅读页的浮层笔记框（划线 / 点字后直接就着正文写的那段批注）。
     Note,
+    /// 书架的搜索框（只筛书名 / 作者，用的是 `shelf_query`）。
+    ShelfSearch,
 }
 
 impl Root {
@@ -158,18 +160,31 @@ impl Root {
         )
     }
 
-    /// 此刻哪个输入框该接字：重命名框 → 笔记框 → 检索框；都没有则 None
-    /// （IME 接口收到 None 即不接管，键盘走普通 keydown）。
+    /// 此刻哪个输入框该接字：重命名框 → 笔记框 → 书架搜索 → 阅读页检索；
+    /// 都没有则 None（IME 接口收到 None 即不接管，键盘走普通 keydown）。
     pub fn input_target(&self) -> Option<InputTarget> {
         if self.rename_idx.is_some() {
             Some(InputTarget::Rename)
         } else if self.note_editing {
             Some(InputTarget::Note)
+        } else if self.shelf_searching && self.screen == crate::app::Screen::Shelf {
+            Some(InputTarget::ShelfSearch)
         } else if self.show_search {
             Some(InputTarget::Search)
         } else {
             None
         }
+    }
+
+    /// 书架搜索框：同上，走 `SEARCH_MAX` 上限。
+    pub fn shelf_query_replace_utf16(&mut self, range: Option<Range<usize>>, text: &str) -> usize {
+        replace_utf16_limited(
+            &mut self.shelf_query,
+            &mut self.shelf_query_cursor,
+            range,
+            text,
+            SEARCH_MAX,
+        )
     }
 }
 
@@ -281,6 +296,7 @@ impl EntityInputHandler for Root {
             InputTarget::Rename => utf16_slice(&self.rename_draft, range),
             InputTarget::Search => utf16_slice(&self.search_draft, range),
             InputTarget::Note => utf16_slice(&self.note_draft, range),
+            InputTarget::ShelfSearch => utf16_slice(&self.shelf_query, range),
         })
     }
 
@@ -296,6 +312,7 @@ impl EntityInputHandler for Root {
             InputTarget::Rename => char_to_utf16(&self.rename_draft, self.rename_cursor),
             InputTarget::Search => char_to_utf16(&self.search_draft, self.search_cursor),
             InputTarget::Note => char_to_utf16(&self.note_draft, self.note_cursor),
+            InputTarget::ShelfSearch => char_to_utf16(&self.shelf_query, self.shelf_query_cursor),
         };
         Some(UTF16Selection {
             range: at..at,
@@ -314,6 +331,7 @@ impl EntityInputHandler for Root {
             InputTarget::Rename => self.rename_marked.clone(),
             InputTarget::Search => self.search_marked.clone(),
             InputTarget::Note => self.note_marked.clone(),
+            InputTarget::ShelfSearch => self.shelf_query_marked.clone(),
         }
     }
 
@@ -323,6 +341,7 @@ impl EntityInputHandler for Root {
             Some(InputTarget::Rename) => self.rename_marked = None,
             Some(InputTarget::Search) => self.search_marked = None,
             Some(InputTarget::Note) => self.note_marked = None,
+            Some(InputTarget::ShelfSearch) => self.shelf_query_marked = None,
             None => {}
         }
     }
@@ -350,6 +369,10 @@ impl EntityInputHandler for Root {
             InputTarget::Note => {
                 self.note_marked = None;
                 self.note_replace_utf16(range, text);
+            }
+            InputTarget::ShelfSearch => {
+                self.shelf_query_marked = None;
+                self.shelf_query_replace_utf16(range, text);
             }
         }
         cx.notify();
@@ -395,6 +418,15 @@ impl EntityInputHandler for Root {
                 self.note_cursor = match new_selected_range {
                     Some(sel) => utf16_to_char(&self.note_draft, sel.end),
                     None => utf16_to_char(&self.note_draft, end),
+                };
+            }
+            InputTarget::ShelfSearch => {
+                let start = self.shelf_query_replace_utf16(range, new_text);
+                let end = start + utf16_len(new_text);
+                self.shelf_query_marked = Some(start..end);
+                self.shelf_query_cursor = match new_selected_range {
+                    Some(sel) => utf16_to_char(&self.shelf_query, sel.end),
+                    None => utf16_to_char(&self.shelf_query, end),
                 };
             }
         }

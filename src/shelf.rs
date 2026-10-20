@@ -1,14 +1,187 @@
-//! 书架视图：书封墙 + 封面页。
+//! 书架视图：题签网格 / 书脊列表 + 封面页。
 //!
-//! 每本书按书名散列出一个稳定主色，画成宣纸书封：竖排书名、朱印、进度条。
-//! 点封面进「封面页」，再点「翻开」进正文。
+//! 默认「题签网格」：一格一签，竖排书名最多两列，下面四行小字
+//! （作者/注者、版本或朝代、当前卷册、阅读进度）。可切「书脊列表」。
+//! 顶栏有继续阅读 / 搜索 / 排序 / 视图切换，下面一排四部 + 自定页签。
+//! 视觉：宣纸底、墨色字、朱印点缀、细线留白——不做木纹、不加纹理与动画。
 
-use crate::app::{Root, Screen, CINNABAR, FRAME, INK, PAPER};
-use crate::library::ShelfEntry;
+use crate::app::{
+    Root, Screen, ShelfSort, ShelfView, CINNABAR, FRAME, INK, PAPER,
+};
+use crate::library::{ellipsis, ShelfEntry};
 use gpui::{
     div, prelude::*, px, rgb, rgba, Context, Div, FontWeight, KeyDownEvent, MouseButton,
     ParentElement, SharedString, Styled,
 };
+
+// ---- 书架配色（宣纸 / 墨 / 朱 / 细线）----
+/// 桌面（托纸的底色，比纸面深半档）。
+const SHELF_BG: u32 = 0xF1EADA;
+/// 顶栏与页签条底色。
+const SHELF_PAPER: u32 = 0xFBF7EC;
+/// 题签纸：比桌面浅，像贴在书衣上的小签。
+const SLIP_PAPER: u32 = 0xFDFAF2;
+/// 细线（界栏 / 分隔）。
+const HAIR: u32 = 0xE0D5BE;
+/// 次级墨（作者行）。
+const INK_SOFT: u32 = 0x6B6357;
+/// 三级墨（版本 / 卷册等旁注小字）。
+const INK_FAINT: u32 = 0x9A9184;
+
+/// 题签里书名竖排可用的盒（宽 × 高）：宽只容两列。
+const SLIP_TITLE_W: f32 = 68.0;
+const SLIP_TITLE_H: f32 = 132.0;
+
+/// 一枚小按钮：`primary` 为朱底白字，否则纸底细框。
+fn shelf_button(label: &str, primary: bool) -> Div {
+    div()
+        .px(px(11.0))
+        .py(px(5.0))
+        .rounded(px(3.0))
+        .cursor_pointer()
+        .text_size(px(12.0))
+        .text_color(rgb(if primary { PAPER } else { INK_SOFT }))
+        .bg(rgb(if primary { CINNABAR } else { SLIP_PAPER }))
+        .border_1()
+        .border_color(rgb(if primary { CINNABAR } else { HAIR }))
+        .child(SharedString::from(label.to_string()))
+}
+
+/// 一枚「文字链」式的管理按钮（很轻，不抢题签的视线）。
+fn link_button(label: &str, color: u32) -> Div {
+    div()
+        .px(px(4.0))
+        .py(px(2.0))
+        .rounded(px(2.0))
+        .cursor_pointer()
+        .text_size(px(10.0))
+        .text_color(rgb(color))
+        .child(SharedString::from(label.to_string()))
+}
+
+/// 一行字。
+fn text(s: &str, size: f32, color: u32) -> Div {
+    div()
+        .text_size(px(size))
+        .text_color(rgb(color))
+        .child(SharedString::from(s.to_string()))
+}
+
+/// 一行字（按字数截断，保证不换行、不撑破卡片）。
+fn text_fit(s: &str, size: f32, color: u32, max_chars: usize) -> Div {
+    div()
+        .h(px(size + 3.0))
+        .overflow_hidden()
+        .text_size(px(size))
+        .text_color(rgb(color))
+        .child(SharedString::from(ellipsis(s, max_chars)))
+}
+
+/// 进度条 + 百分比：细线留白，只有一道朱/册色。
+fn progress_row(prog: f32, pct: i32, accent: u32) -> Div {
+    div()
+        .mt(px(8.0))
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .w_full()
+                .h(px(2.0))
+                .bg(rgb(HAIR))
+                .child(div().h(px(2.0)).w(px(136.0 * prog.clamp(0.0, 1.0))).bg(rgb(accent))),
+        )
+        .child(text(&format!("{pct}%"), 9.5, INK_FAINT))
+}
+
+/// 一个字格：定宽定高、字居中。
+///
+/// 竖排的每列是「一列 flex_col，每字一格」。GPUI 的文本行高随字体度量浮动
+/// （通常比字号大 20%~40%），不给定高时列会被撑高、溢出盒子——封面大书名、
+/// 阅读页书名签、书架题签都因此被裁过。定成 `fs + 2` 后行距可精确计算，
+/// `fit_*` 的容量估算才和实际渲染一致。
+fn glyph_box(ch: char, fs: f32, color: u32, weight: FontWeight) -> Div {
+    div()
+        .w(px(fs + 2.0))
+        .h(px(fs + 2.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(fs))
+        .font_weight(weight)
+        .text_color(rgb(color))
+        .child(SharedString::from(ch.to_string()))
+}
+
+/// 竖排的行距：一格（fs+2）+ 字间留白 4。
+fn row_pitch(fs: f32) -> f32 {
+    fs + 6.0
+}
+
+/// 把已经分好列的字排成竖排块（首列在最右，与古籍一致）。
+/// 字间距 1px：书衣题签排得紧，长书名才塞得进一列（与 `fit_single_column`
+/// 的 `fs + 3` 行距一致）。
+pub(crate) fn vertical_cols(cols: &[String], fs: f32, color: u32, weight: FontWeight) -> Div {
+    let mut row = div().flex().flex_row().items_start().gap(px(4.0));
+    for col in cols.iter().rev() {
+        let mut c = div().flex().flex_col().items_center().gap(px(1.0));
+        for ch in col.chars() {
+            c = c.child(glyph_box(ch, fs, color, weight));
+        }
+        row = row.child(c);
+    }
+    row
+}
+
+/// 竖排分列，并**限定最多几列**：题签最多两列，超出即缩字号，
+/// 缩到最小仍放不下就截断缀省略号（调用方据此给出「展开」入口）。
+/// 返回 (字号, 各列文字[首列在最右])。
+fn fit_cols(text: &str, box_w: f32, box_h: f32, base_fs: f32, max_cols: usize) -> (f32, Vec<String>) {
+    const GAP: f32 = 4.0;
+    const MIN_FS: f32 = 12.0;
+    // 竖排里字距由字格体现，空格只会排出一个空洞；先滤掉。
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut fs = base_fs.max(MIN_FS);
+    loop {
+        let per_col = ((box_h - GAP) / row_pitch(fs)).floor().max(1.0) as usize;
+        // 每列占 (fs+2) 宽 + 4 留白 = row_pitch，与竖排列宽一致。
+        let cols_by_w = (box_w / row_pitch(fs)).floor().max(1.0) as usize;
+        let cap = per_col * cols_by_w.min(max_cols.max(1));
+        if chars.len() <= cap || fs <= MIN_FS {
+            let fits = chars.len() <= cap;
+            let take_n = if fits { chars.len() } else { cap.saturating_sub(1) };
+            let mut s: String = chars.iter().take(take_n).collect();
+            if !fits {
+                s.push('…');
+            }
+            let clipped: Vec<char> = s.chars().collect();
+            let cols = clipped
+                .chunks(per_col)
+                .map(|c| c.iter().collect::<String>())
+                .collect();
+            return (fs, cols);
+        }
+        fs = (fs - 1.0).max(MIN_FS);
+    }
+}
+
+/// 单行输入框的取景窗：把光标附近 `max` 个字取出来，
+/// 返回 (是否省略了前文, 光标前文字, 光标后文字)。
+fn caret_window(draft: &str, cursor: usize, max: usize) -> (bool, String, String) {
+    let chars: Vec<char> = draft.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let max = max.max(1);
+    let start = if chars.len() > max {
+        cursor.saturating_sub(max / 2).min(chars.len() - max)
+    } else {
+        0
+    };
+    let end = (start + max).min(chars.len());
+    let cut = cursor.clamp(start, end);
+    let head: String = chars[start..cut].iter().collect();
+    let tail: String = chars[cut..end].iter().collect();
+    (start > 0, head, tail)
+}
 
 /// 横排书名按可用宽度截断：中文一字约一个字身宽、拉丁字符约半个，
 /// 排不下就缀省略号，保证不撑破卡片列宽（作者名另起一行小字号列出）。
@@ -42,8 +215,8 @@ fn fit_vertical(text: &str, box_w: f32, box_h: f32, base_fs: f32) -> (f32, Vec<S
     let chars: Vec<char> = text.chars().collect();
     let mut fs = base_fs.max(MIN_FS);
     loop {
-        let per_col = ((box_h - GAP) / (fs + GAP)).floor().max(1.0) as usize;
-        let max_cols = (box_w / (fs + GAP)).floor().max(1.0) as usize;
+        let per_col = ((box_h - GAP) / row_pitch(fs)).floor().max(1.0) as usize;
+        let max_cols = (box_w / row_pitch(fs)).floor().max(1.0) as usize;
         let cap = per_col * max_cols;
         let fits = chars.len() <= cap;
         if fits || fs <= MIN_FS {
@@ -64,6 +237,31 @@ fn fit_vertical(text: &str, box_w: f32, box_h: f32, base_fs: f32) -> (f32, Vec<S
     }
 }
 
+/// 竖排书名「单列自适应」：永远只排成一列，字号随书名长度自适应收缩，
+/// 缩到最小（8pt）仍放不下才截断缀省略号（调用方据此给「展开」入口）。
+/// 返回 (字号, 这一列的文字, 是否被截断)。用于书衣（题签 / 书脊 / 封面）
+/// ——线装书衣上的题签本就是一竖条，长书名靠缩字号而不是折成多列。
+pub(crate) fn fit_single_column(text: &str, box_h: f32, base_fs: f32) -> (f32, String, bool) {
+    const GAP: f32 = 2.0;
+    const MIN_FS: f32 = 6.0;
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut fs = base_fs.max(MIN_FS);
+    loop {
+        // 行距与 `vertical_cols` 一致：字格 fs+2、字间 1px → fs+3。
+        let per_col = ((box_h - GAP) / (fs + 3.0)).floor().max(1.0) as usize;
+        let fits = chars.len() <= per_col;
+        if fits || fs <= MIN_FS {
+            let take_n = if fits { chars.len() } else { per_col.saturating_sub(1) };
+            let mut s: String = chars.iter().take(take_n).collect();
+            if !fits {
+                s.push('…');
+            }
+            return (fs, s, !fits);
+        }
+        fs = (fs - 1.0).max(MIN_FS);
+    }
+}
+
 /// 竖排文字块：逐字换行成列，用于书封与封面页；
 /// 长书名自动分列（从右到左），不再溢出卡片。
 pub(crate) fn vertical_block(
@@ -75,18 +273,12 @@ pub(crate) fn vertical_block(
     weight: FontWeight,
 ) -> Div {
     let (fs, cols) = fit_vertical(text, box_w, box_h, base_fs);
-    let mut row = div().flex().flex_row().items_start().gap_1();
+    let mut row = div().flex().flex_row().items_start().gap(px(4.0));
     // 首列在最右：倒序添加，最后一列落在最左。
     for col in cols.iter().rev() {
-        let mut c = div().flex().flex_col().items_center().gap_1();
+        let mut c = div().flex().flex_col().items_center().gap(px(4.0));
         for ch in col.chars() {
-            c = c.child(
-                div()
-                    .text_size(px(fs))
-                    .font_weight(weight)
-                    .text_color(rgb(color))
-                    .child(SharedString::from(ch.to_string())),
-            );
+            c = c.child(glyph_box(ch, fs, color, weight));
         }
         row = row.child(c);
     }
@@ -113,192 +305,402 @@ impl Root {
         }
     }
 
-    /// 书架：书封墙。
+    /// 书架：题签网格（默认）/ 书脊列表，配分类页签、搜索、排序。
     pub(crate) fn render_shelf(&mut self, cx: &mut Context<Self>) -> Div {
-        let mut head = div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .p_3()
-            .bg(rgb(0xFEFDFC))
-            .border_b_1()
-            .border_color(rgb(0xE6E1D6))
-            .child(self.render_brand())
-            .child(div().flex_1())
-            .child(small_button("📚 导入书籍").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.import_dialog(cx)),
-            ))
-            .child(small_button("📖 书库").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.show_library = !this.show_library;
-                    cx.notify();
-                }),
-            ));
-
-        // 空书架提示
-        if self.library.books.is_empty() {
-            head = head.child(
-                div()
-                    .flex_1()
-                    .p_1()
-                    .text_size(px(12.0))
-                    .text_color(rgb(CINNABAR))
-                    .child(SharedString::from(&self.notice)),
-            );
-        }
-
-        let entries: Vec<(usize, ShelfEntry)> = self
-            .library
-            .books
-            .iter()
-            .cloned()
-            .enumerate()
-            .collect();
-
-        let mut wall = div().flex().flex_wrap().gap_6().p_6().items_start();
-        if entries.is_empty() {
-            wall = wall.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_3()
-                    .p_8()
-                    .bg(rgb(PAPER))
-                    .border_1()
-                    .border_color(rgb(FRAME))
-                    .rounded(px(4.0))
-                    .child(
-                        div()
-                            .text_size(px(15.0))
-                            .text_color(rgb(INK))
-                            .child(SharedString::from("书架还空着")),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x8A8175))
-                            .child(SharedString::from("支持 md / txt / epub / json")),
-                    )
-                    .child(small_button("导入第一本书").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.import_dialog(cx)),
-                    )),
-            );
-        }
-
-        for (idx, entry) in entries {
-            wall = wall.child(self.render_book_card(idx, &entry, cx));
-        }
+        let entries = self.shelf_filtered();
+        let counts = self.shelf_counts();
 
         let mut root = div()
             .flex()
             .flex_col()
             .size_full()
             .relative()
-            .bg(rgb(0xF4F4F6));
-        // 键盘入口统一挂在窗口根元素（见 app.rs 的 Render::render）→ Root::dispatch_key，
-        // 书架态路由到 handle_shelf_key：重命名键入 / Esc 收起书库 / 取消删除确认。
-        root = root.child(head);
-        // 「正在阅读」：读过的书按最近阅读排序横排，一键回到上次读的地方。
-        if let Some(strip) = self.render_reading_strip(cx) {
-            root = root.child(strip);
-        }
-        root = root.child(div().flex_1().overflow_hidden().child(wall));
+            .bg(rgb(SHELF_BG));
+
+        root = root.child(self.render_shelf_top(cx));
+        root = root.child(self.render_shelf_tabs(&counts, cx));
+
+        let body = if entries.is_empty() {
+            self.render_shelf_empty(cx)
+        } else {
+            match self.shelf_view {
+                ShelfView::TitleSlip => self.render_slip_grid(&entries, cx),
+                ShelfView::Spine => self.render_spine_list(&entries, cx),
+            }
+        };
+        root = root.child(div().flex_1().overflow_hidden().child(body));
         root = root.child(self.render_shelf_status());
-        // 书库浮层：内置可下载的书。
+
+        // 浮层：书库 / 重命名 / 改归类 / 展开书名。
         if self.show_library {
             root = root.child(self.render_library_panel(cx));
         }
-        // 重命名对话框。
         if self.rename_idx.is_some() {
             root = root.child(self.render_rename_dialog(cx));
         }
-        root
+        if self.shelf_recat.is_some() {
+            root = root.child(self.render_recat_sheet(cx));
+        }
+        if self.shelf_expand.is_some() {
+            root = root.child(self.render_title_expand(cx));
+        }
+
+        // 点纸面空白：收起搜索框与浮层（浮层内部各自 stop_propagation）。
+        root.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                if this.shelf_searching || this.shelf_expand.is_some() || this.shelf_recat.is_some() {
+                    this.shelf_searching = false;
+                    this.shelf_expand = None;
+                    this.shelf_recat = None;
+                    cx.notify();
+                }
+            }),
+        )
     }
 
-    /// 「正在阅读」横条：读过（有进度或有阅读时间）的书，按最近阅读排序，
-    /// 最多 6 本；没有则整条不显示。每本带迷你封面、进度与「继续」按钮。
-    fn render_reading_strip(&mut self, cx: &mut Context<Self>) -> Option<Div> {
-        let mut reading: Vec<(usize, ShelfEntry)> = self
+    /// 当前页签 + 搜索词 + 排序之后的书目；下标仍是书架里的原下标。
+    fn shelf_filtered(&self) -> Vec<(usize, ShelfEntry)> {
+        let q = self.shelf_query.trim().to_lowercase();
+        let mut v: Vec<(usize, ShelfEntry)> = self
             .library
             .books
             .iter()
             .cloned()
             .enumerate()
-            .filter(|(_, e)| e.last_read > 0 || e.last_page > 0)
+            .filter(|(_, e)| match &self.shelf_cat {
+                None => true,
+                Some(c) => e.cat_key() == c.as_str(),
+            })
+            .filter(|(_, e)| {
+                q.is_empty()
+                    || e.title.to_lowercase().contains(&q)
+                    || e.author.to_lowercase().contains(&q)
+                    || e.annotator.to_lowercase().contains(&q)
+            })
             .collect();
-        // 最近读过的排最前；没时间戳的老档案按进度兜底。
-        reading.sort_by(|a, b| {
-            b.1.last_read
-                .cmp(&a.1.last_read)
-                .then(b.1.last_page.cmp(&a.1.last_page))
-        });
-        reading.truncate(6);
-        if reading.is_empty() {
-            return None;
-        }
 
-        let mut row = div()
-            .id("reading-strip")
+        match self.shelf_sort {
+            // 最近读过的在前；没读过的（last_read=0）自然落到后面，按入架顺序。
+            ShelfSort::Recent => v.sort_by(|a, b| b.1.last_read.cmp(&a.1.last_read).then(a.0.cmp(&b.0))),
+            ShelfSort::Title => v.sort_by(|a, b| a.1.title.cmp(&b.1.title)),
+            ShelfSort::Progress => v.sort_by(|a, b| {
+                b.1.progress()
+                    .partial_cmp(&a.1.progress())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            }),
+            ShelfSort::Added => {}
+        }
+        v
+    }
+
+    /// 各页签的本数：全部 / 经 / 史 / 子 / 集 / 自定。
+    fn shelf_counts(&self) -> Vec<(&'static str, usize)> {
+        let mut v: Vec<(&'static str, usize)> = vec![
+            ("全部", self.library.books.len()),
+            ("经", 0),
+            ("史", 0),
+            ("子", 0),
+            ("集", 0),
+            ("自定", 0),
+        ];
+        for e in &self.library.books {
+            let k = e.cat_key();
+            if let Some(slot) = v.iter_mut().find(|(name, _)| *name == k) {
+                slot.1 += 1;
+            }
+        }
+        v
+    }
+
+    /// 顶栏：品牌 · 继续阅读 · 搜索 · 排序 · 视图 · 导入 · 书库。
+    fn render_shelf_top(&mut self, cx: &mut Context<Self>) -> Div {
+        let sort = self.shelf_sort;
+        let view = self.shelf_view;
+        let has_any = self
+            .library
+            .books
+            .iter()
+            .any(|e| e.last_read > 0 || e.last_page > 0);
+
+        let mut bar = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap_3()
-            .p_3()
-            .overflow_x_scroll();
-        for (idx, e) in &reading {
-            let idx = *idx;
-            let accent = e.accent;
-            let prog = e.progress();
-            let pct = (prog * 100.0).round() as i32;
-            // 迷你封面：主色块 + 竖排书名（自适应 40×60 小盒）。
-            let mini = div()
-                .w(px(46.0))
-                .h(px(64.0))
-                .flex_shrink_0()
-                .bg(rgb(accent))
-                .rounded(px(2.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(vertical_block(&e.title, 40.0, 60.0, 13.0, PAPER, FontWeight::MEDIUM));
-            let info = div()
+            .gap(px(12.0))
+            .px(px(18.0))
+            .py(px(9.0))
+            .bg(rgb(SHELF_PAPER))
+            .border_b_1()
+            .border_color(rgb(HAIR))
+            .child(self.render_brand())
+            .child(div().flex_1());
+
+        if has_any {
+            bar = bar.child(
+                shelf_button("继续阅读", true).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.shelf_continue();
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+
+        bar = bar
+            .child(self.render_shelf_search(cx))
+            .child(
+                shelf_button(&format!("排序 · {}", sort.label()), false).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.shelf_sort = this.shelf_sort.next();
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                shelf_button(&format!("视图 · {}", view.label()), false).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.shelf_view = this.shelf_view.toggled();
+                        this.shelf_expand = None;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(shelf_button("导入", false).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.import_dialog(cx)
+                }),
+            ))
+            .child(shelf_button("书库", false).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.show_library = !this.show_library;
+                    cx.notify();
+                }),
+            ));
+        bar
+    }
+
+    /// 书架搜索框：未激活时是一枚「搜索」按钮，点开后变成可接中文的输入框。
+    fn render_shelf_search(&mut self, cx: &mut Context<Self>) -> Div {
+        let active = self.shelf_searching;
+        let draft = self.shelf_query.clone();
+        let has_text = !draft.is_empty();
+
+        let mut line = div().flex().flex_row().items_center().gap(px(2.0));
+        if draft.is_empty() && !active {
+            line = line.child(text("搜书名 / 作者", 11.5, INK_FAINT));
+        } else {
+            // 单行显示：长词只留光标附近的一段，前面缀省略号。
+            let (skip, head, tail) = caret_window(&draft, self.shelf_query_cursor, 14);
+            if skip {
+                line = line.child(text("…", 12.0, INK_FAINT));
+            }
+            if !head.is_empty() {
+                line = line.child(text(&head, 12.0, INK));
+            }
+            if active {
+                line = line.child(div().w(px(1.5)).h(px(13.0)).bg(rgb(CINNABAR)));
+            }
+            if !tail.is_empty() {
+                line = line.child(text(&tail, 12.0, INK));
+            }
+        }
+
+        let body = crate::ime::InputField::new(line, self.shelf_query_focus.clone(), cx.entity());
+        let mut boxx = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(4.0))
+            .w(px(178.0))
+            .h(px(27.0))
+            .px(px(8.0))
+            .bg(rgb(0xFFFFFF))
+            .border_1()
+            .border_color(rgb(if active { CINNABAR } else { HAIR }))
+            .rounded(px(3.0))
+            .cursor_pointer()
+            .child(body)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.shelf_searching = true;
+                    cx.notify();
+                }),
+            );
+
+        if has_text {
+            boxx = boxx.child(
+                div()
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.0))
+                    .bg(rgb(HAIR))
+                    .text_size(px(9.0))
+                    .text_color(rgb(INK_SOFT))
+                    .cursor_pointer()
+                    .child(SharedString::from("✕"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.shelf_query.clear();
+                            this.shelf_query_cursor = 0;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        boxx
+    }
+
+    /// 分类页签：全部 / 经 / 史 / 子 / 集 / 自定（带本数）。
+    fn render_shelf_tabs(
+        &mut self,
+        counts: &[(&'static str, usize)],
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let cur = self.shelf_cat.clone();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(22.0))
+            .px(px(18.0))
+            .pt(px(8.0))
+            .bg(rgb(SHELF_PAPER))
+            .border_b_1()
+            .border_color(rgb(HAIR));
+
+        for (name, n) in counts.iter() {
+            let name = *name;
+            let selected = match (&cur, name) {
+                (None, "全部") => true,
+                (Some(c), _) => c == name,
+                _ => false,
+            };
+            let tab = div()
                 .flex()
                 .flex_col()
-                .gap_1()
-                .flex_1()
+                .items_center()
+                .gap(px(4.0))
+                .pb(px(6.0))
+                .cursor_pointer()
                 .child(
                     div()
-                        .text_size(px(12.5))
-                        .text_color(rgb(INK))
-                        .child(SharedString::from(clip_title_w(&e.title, 132.0, 12.5))),
+                        .flex()
+                        .flex_row()
+                        .items_end()
+                        .gap(px(4.0))
+                        .child(text(name, 13.0, if selected { CINNABAR } else { INK_SOFT }))
+                        .child(text(&n.to_string(), 9.5, INK_FAINT)),
                 )
-                .child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(rgb(0x8A8175))
-                        .child(SharedString::from(format!(
-                            "第 {} 面 · {}%",
-                            e.last_page + 1,
-                            pct
-                        ))),
-                )
-                .child(
-                    div()
-                        .w(px(72.0))
-                        .h(px(3.0))
-                        .bg(rgb(0x00000014))
-                        .child(
-                            div()
-                                .h(px(3.0))
-                                .w(px(72.0 * prog))
-                                .bg(rgb(accent)),
-                        ),
+                .child(div().w_full().h(px(2.0)).bg(rgb(if selected {
+                    CINNABAR
+                } else {
+                    SHELF_PAPER
+                })))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.shelf_cat = if name == "全部" {
+                            None
+                        } else {
+                            Some(name.to_string())
+                        };
+                        cx.notify();
+                    }),
                 );
-            let resume = small_button("继续 ▸").on_mouse_down(
+            row = row.child(tab);
+        }
+        row
+    }
+
+    /// 题签网格：一格一签。
+    fn render_slip_grid(
+        &mut self,
+        entries: &[(usize, ShelfEntry)],
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut grid = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap(px(18.0))
+            .p(px(18.0));
+        for (idx, e) in entries {
+            grid = grid.child(self.render_slip_card(*idx, e, cx));
+        }
+        div().size_full().overflow_hidden().child(grid)
+    }
+
+    /// 一枚题签：竖排书名（最多两列）+ 作者/注者、版本/朝代、当前卷册、进度。
+    fn render_slip_card(&mut self, idx: usize, e: &ShelfEntry, cx: &mut Context<Self>) -> Div {
+        // 书衣题签：竖排单列，字号随书名长度自适应（不再折成多列）。
+        let (fs, title_col, truncated) = fit_single_column(&e.title, SLIP_TITLE_H, 17.0);
+        let prog = e.progress();
+        let pct = (prog * 100.0).round() as i32;
+        let accent = e.accent;
+        let author = e.author_line();
+        let edition = e.edition_line();
+        let volume = e.volume_line();
+
+        let mut title_area = div()
+            .w_full()
+            .h(px(SLIP_TITLE_H))
+            .flex()
+            .justify_center()
+            .items_start()
+            .child(vertical_cols(&[title_col], fs, INK, FontWeight::MEDIUM));
+        if truncated {
+            // 书名放不下：点书名展开全名（点别处仍是打开书）。
+            title_area = title_area.cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.shelf_expand = Some(idx);
+                    cx.notify();
+                }),
+            );
+        }
+
+        let card = div()
+            .w(px(156.0))
+            .h(px(244.0))
+            .p(px(10.0))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(SLIP_PAPER))
+            .border_1()
+            .border_color(rgb(HAIR))
+            .rounded(px(2.0))
+            .cursor_pointer()
+            .child(title_area)
+            .child(div().w_full().h(px(1.0)).bg(rgb(HAIR)).mt(px(8.0)).mb(px(6.0)))
+            .child(text_fit(&author, 11.5, INK, 11))
+            .child(text_fit(&edition, 10.5, INK_FAINT, 12))
+            .child(text_fit(&volume, 10.5, INK_FAINT, 12))
+            .child(progress_row(prog, pct, accent))
+            .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
@@ -306,64 +708,332 @@ impl Root {
                     cx.notify();
                 }),
             );
-            let item = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .w(px(252.0))
-                .flex_shrink_0()
-                .p_2()
-                .bg(rgb(0xFEFDFC))
-                .border_1()
-                .border_color(rgb(0xE6E1D6))
-                .rounded(px(4.0))
-                .child(mini)
-                .child(info)
-                .child(resume);
-            row = row.child(item);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(card)
+            .child(self.render_card_manage(idx, cx))
+    }
+
+    /// 书脊列表：一行一册。
+    fn render_spine_list(
+        &mut self,
+        entries: &[(usize, ShelfEntry)],
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut col = div().flex().flex_col().px(px(18.0)).py(px(6.0));
+        for (idx, e) in entries {
+            col = col.child(self.render_spine_row(*idx, e, cx));
+        }
+        div().size_full().overflow_hidden().child(col)
+    }
+
+    fn render_spine_row(&mut self, idx: usize, e: &ShelfEntry, cx: &mut Context<Self>) -> Div {
+        // 书脊题名：竖排单列，字号随书名长度自适应。
+        let (fs, title_col, truncated) = fit_single_column(&e.title, 88.0, 13.0);
+        let prog = e.progress();
+        let pct = (prog * 100.0).round() as i32;
+        let accent = e.accent;
+        let author = e.author_line();
+        let edition = e.edition_line();
+        let volume = e.volume_line();
+
+        let mut title_area = div()
+            .w(px(46.0))
+            .h(px(88.0))
+            .flex()
+            .justify_center()
+            .items_start()
+            .child(vertical_cols(&[title_col], fs, INK, FontWeight::MEDIUM));
+        if truncated {
+            title_area = title_area.cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.shelf_expand = Some(idx);
+                    cx.notify();
+                }),
+            );
         }
 
-        Some(
-            div()
-                .flex()
-                .flex_col()
-                .bg(rgb(0xFEFDFC))
-                .border_b_1()
-                .border_color(rgb(0xE6E1D6))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .px_4()
-                        .pt_3()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_size(px(13.0))
-                                        .text_color(rgb(CINNABAR))
-                                        .child(SharedString::from("正在阅读")),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(10.5))
-                                        .text_color(rgb(0x8A8175))
-                                        .child(SharedString::from(format!(
-                                            "{} 本 · 点「继续」回到上次读的地方",
-                                            reading.len()
-                                        ))),
-                                ),
+        let info = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .flex_1()
+            .child(text_fit(&author, 13.0, INK, 22))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(text_fit(&edition, 10.5, INK_FAINT, 14))
+                    .child(text_fit(&volume, 10.5, INK_FAINT, 14)),
+            );
+
+        let seat = div()
+            .w(px(120.0))
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(px(4.0))
+            .child(text(&format!("{pct}%"), 11.0, CINNABAR))
+            .child(
+                div()
+                    .w(px(120.0))
+                    .h(px(2.0))
+                    .bg(rgb(HAIR))
+                    .child(div().h(px(2.0)).w(px(120.0 * prog)).bg(rgb(accent))),
+            );
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(14.0))
+            .py(px(10.0))
+            .border_b_1()
+            .border_color(rgb(HAIR))
+            .cursor_pointer()
+            // 书脊色条：一眼可辨的册色，不做木纹也不做纹理。
+            .child(div().w(px(4.0)).h(px(88.0)).bg(rgb(accent)).rounded(px(1.0)))
+            .child(title_area)
+            .child(info)
+            .child(seat)
+            .child(self.render_card_manage(idx, cx))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_book(idx);
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// 空书架：纸面上一句话 + 两枚按钮。
+    fn render_shelf_empty(&mut self, cx: &mut Context<Self>) -> Div {
+        let hint = if self.shelf_query.trim().is_empty() {
+            "书架还空着"
+        } else {
+            "没有找到这本书"
+        };
+        let sub = if self.library.books.is_empty() {
+            "支持 md / txt / epub / json"
+        } else {
+            "换个词，或把搜索清掉看看全部"
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.0))
+                    .p(px(30.0))
+                    .bg(rgb(SLIP_PAPER))
+                    .border_1()
+                    .border_color(rgb(HAIR))
+                    .rounded(px(2.0))
+                    .child(text(hint, 15.0, INK))
+                    .child(text(sub, 11.5, INK_FAINT))
+                    .child(
+                        shelf_button("导入第一本书", true).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.import_dialog(cx)
+                            }),
                         ),
-                )
-                .child(row),
-        )
+                    ),
+            )
+    }
+
+    /// 「改归类」浮层：经 / 史 / 子 / 集 / 自定书单 / 恢复自动。
+    fn render_recat_sheet(&mut self, cx: &mut Context<Self>) -> Div {
+        let idx = self.shelf_recat.unwrap_or(0);
+        let cur = self
+            .library
+            .books
+            .get(idx)
+            .map(|e| e.category.clone())
+            .unwrap_or_default();
+        let title = self
+            .library
+            .books
+            .get(idx)
+            .map(|e| e.title.clone())
+            .unwrap_or_default();
+
+        let options: [(&str, &str); 6] = [
+            ("", "按书名自动归类"),
+            ("经", "经部"),
+            ("史", "史部"),
+            ("子", "子部"),
+            ("集", "集部"),
+            ("我的书单", "自定书单"),
+        ];
+        let mut col = div().flex().flex_col().gap(px(4.0));
+        for (key, label) in options {
+            let k = key.to_string();
+            let selected = cur == k;
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .rounded(px(3.0))
+                    .bg(rgb(if selected { 0xF1E7D3 } else { SLIP_PAPER }))
+                    .cursor_pointer()
+                    .child(text(label, 12.5, if selected { CINNABAR } else { INK }))
+                    .child(text(if selected { "今在此" } else { "" }, 10.0, CINNABAR))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.recat_book(idx, &k);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+
+        let card = div()
+            .w(px(260.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .p(px(16.0))
+            .bg(rgb(SLIP_PAPER))
+            .border_1()
+            .border_color(rgb(FRAME))
+            .rounded(px(4.0))
+            .child(text(&format!("归类 · {}", ellipsis(&title, 12)), 13.0, CINNABAR))
+            .child(col)
+            .child(text("归到自定书单后，可在「自定」页签里找到", 10.0, INK_FAINT))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }));
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x14100A66))
+            .child(card)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.shelf_recat = None;
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// 展开书名：题签放不下的长名，整幅竖排看全。
+    fn render_title_expand(&mut self, cx: &mut Context<Self>) -> Div {
+        let idx = self.shelf_expand.unwrap_or(0);
+        let Some(e) = self.library.books.get(idx).cloned() else {
+            return div();
+        };
+        let (fs, cols) = fit_cols(&e.title, 300.0, 280.0, 22.0, 6);
+        let prog = e.progress();
+        let pct = (prog * 100.0).round() as i32;
+
+        let card = div()
+            .w(px(380.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(10.0))
+            .p(px(20.0))
+            .bg(rgb(SLIP_PAPER))
+            .border_1()
+            .border_color(rgb(FRAME))
+            .rounded(px(4.0))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(vertical_cols(&cols, fs, INK, FontWeight::MEDIUM)),
+            )
+            .child(div().w_full().h(px(1.0)).bg(rgb(HAIR)))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(text(&e.author_line(), 12.5, INK))
+                    .child(text(&e.edition_line(), 11.0, INK_FAINT))
+                    .child(text(&e.volume_line(), 11.0, INK_FAINT))
+                    .child(text(&format!("已读 {pct}%"), 11.0, CINNABAR)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(8.0))
+                    .child(
+                        shelf_button("翻开", true).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.shelf_expand = None;
+                                this.open_book(idx);
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        shelf_button("收起", false).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.shelf_expand = None;
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }));
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x14100A66))
+            .child(card)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.shelf_expand = None;
+                    cx.notify();
+                }),
+            )
     }
 
     /// 书库键盘处理：重命名对话框开着时，键盘全部路由给重命名框。
@@ -431,10 +1101,67 @@ impl Root {
             return;
         }
 
-        // ② Esc：收起书库浮层 / 取消删除确认。
+        // ①-b 书架搜索框：Esc 收起并清空 / ⏎ 收起但保留筛选 /
+        //      退格 · ← → · Home End · ⌘V · 可打印字符。
+        if self.shelf_searching {
+            match k {
+                "escape" | "Escape" | "esc" => {
+                    self.shelf_searching = false;
+                    self.shelf_query.clear();
+                    self.shelf_query_cursor = 0;
+                }
+                "enter" | "Enter" => self.shelf_searching = false,
+                "backspace" | "Backspace" => {
+                    crate::app::draft_backspace(&mut self.shelf_query, &mut self.shelf_query_cursor)
+                }
+                "left" | "Left" | "ArrowLeft" => {
+                    crate::app::draft_move(&self.shelf_query, &mut self.shelf_query_cursor, true)
+                }
+                "right" | "Right" | "ArrowRight" => {
+                    crate::app::draft_move(&self.shelf_query, &mut self.shelf_query_cursor, false)
+                }
+                "home" | "Home" => self.shelf_query_cursor = 0,
+                "end" | "End" => self.shelf_query_cursor = self.shelf_query.chars().count(),
+                "v" | "V" if mods.platform || mods.control => {
+                    if let Ok(o) = std::process::Command::new("pbpaste").output() {
+                        let s = String::from_utf8_lossy(&o.stdout).replace(['\n', '\r'], " ");
+                        if self.shelf_query.chars().count() < crate::ime::SEARCH_MAX {
+                            crate::app::draft_insert_str(
+                                &mut self.shelf_query,
+                                &mut self.shelf_query_cursor,
+                                &s,
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    if !mods.platform && !mods.control && !mods.alt {
+                        if let Some(s) = event.keystroke.key_char.as_deref() {
+                            if let Some(c) = s.chars().next() {
+                                if !c.is_control()
+                                    && self.shelf_query.chars().count() < crate::ime::SEARCH_MAX
+                                {
+                                    crate::app::draft_insert(
+                                        &mut self.shelf_query,
+                                        &mut self.shelf_query_cursor,
+                                        c,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        // ② Esc：收起浮层 / 清掉展开态 / 取消删除确认。
         if k == "escape" || k == "Escape" || k == "esc" {
             self.show_library = false;
             self.delete_confirm = None;
+            self.shelf_expand = None;
+            self.shelf_recat = None;
             cx.notify();
         }
     }
@@ -739,190 +1466,45 @@ impl Root {
             )
     }
 
-    /// 一本书的书封。
-    fn render_book_card(
-        &mut self,
-        idx: usize,
-        entry: &ShelfEntry,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let accent = entry.accent;
-        let prog = entry.progress();
-        let seal = if entry.seal.is_empty() {
-            "笺读".to_string()
-        } else {
-            // 印章只容两字，超出截断（印框 26px，避免长印章溢出）。
-            entry.seal.chars().take(2).collect()
-        };
-        let pct = (prog * 100.0).round() as i32;
-
-        let card = div()
-            .flex()
-            .flex_col()
-            .w(px(160.0))
-            .h(px(224.0))
-            .p_3()
-            .bg(rgb(PAPER))
-            .border_1()
-            .border_color(rgb(accent))
-            .rounded(px(2.0))
-            // 书脊线
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .size_full()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(accent))
-                            .child(SharedString::from("笺读藏本")),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .justify_center()
-                            // 竖排书名自适应卡片中部可用区域（136×148）：
-                            // 长名自动分列，从右到左，绝不溢出书封。
-                            .child(vertical_block(
-                                &entry.title,
-                                136.0,
-                                148.0,
-                                20.0,
-                                INK,
-                                FontWeight::MEDIUM,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_end()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_size(px(9.0))
-                                            .text_color(rgb(0x8A8175))
-                                            .child(SharedString::from(format!(
-                                                "{pct}% · 第{}面",
-                                                entry.last_page + 1
-                                            ))),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(70.0))
-                                            .h(px(3.0))
-                                            .bg(rgb(0x00000014))
-                                            .child(
-                                                div()
-                                                    .h(px(3.0))
-                                                    .w(px(70.0 * prog))
-                                                    .bg(rgb(accent)),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .w(px(26.0))
-                                    .h(px(26.0))
-                                    .bg(rgb(accent))
-                                    .rounded(px(2.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        div()
-                                            .text_size(px(10.0))
-                                            .text_color(rgb(PAPER))
-                                            .child(SharedString::from(seal)),
-                                    ),
-                            ),
-                    ),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.open_book(idx);
-                    cx.notify();
-                }),
-            );
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(card)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .w(px(160.0))
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(INK))
-                            .child(SharedString::from(clip_title_w(&entry.title, 158.0, 12.0))),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(0x8A8175))
-                            .child(SharedString::from(if entry.author.is_empty() {
-                                "未署名".to_string()
-                            } else {
-                                format!("〔{}〕", clip_title_w(&entry.author, 150.0, 10.0))
-                            })),
-                    ),
-            )
-            // 管理行：重命名 / 删除（删除需二次确认，防误触）。
-            .child(self.render_card_manage(idx, cx))
-    }
-
-    /// 书封下方的管理行：重命名 / 删除；点过「删除」后变为二次确认态。
+    /// 卡片下方的管理行：归类 / 改名 / 删除；点过「删除」后变为二次确认态。
+    /// 管理动作放在卡片**外面**，卡片里永远只有那五项。
     fn render_card_manage(&mut self, idx: usize, cx: &mut Context<Self>) -> Div {
         let mut row = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap_1()
-            .w(px(160.0));
+            .gap(px(2.0))
+            .w(px(156.0));
         if self.delete_confirm == Some(idx) {
-            let confirm = div()
-                .px_2()
-                .py_1()
-                .rounded(px(7.0))
-                .bg(rgb(CINNABAR))
-                .text_size(px(10.5))
-                .text_color(rgb(PAPER))
-                .cursor_pointer()
-                .child(SharedString::from("确认删除"))
-                .on_mouse_down(
+            row = row
+                .child(link_button("确认删除", CINNABAR).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.delete_book(idx);
                         cx.notify();
                     }),
-                );
-            row = row.child(confirm).child(small_button("点错了").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.delete_confirm = None;
-                    cx.notify();
-                }),
-            ));
+                ))
+                .child(link_button("点错了", INK_FAINT).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.delete_confirm = None;
+                        cx.notify();
+                    }),
+                ));
         } else {
             row = row
-                .child(small_button("重命名").on_mouse_down(
+                .child(link_button("归类", INK_FAINT).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.shelf_recat = Some(idx);
+                        this.delete_confirm = None;
+                        cx.notify();
+                    }),
+                ))
+                .child(link_button("改名", INK_FAINT).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -930,7 +1512,7 @@ impl Root {
                         cx.notify();
                     }),
                 ))
-                .child(small_button("删除").on_mouse_down(
+                .child(link_button("删除", INK_FAINT).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -954,7 +1536,7 @@ impl Root {
             .text_size(px(12.0))
             .text_color(rgb(0x6B6357))
             .child(SharedString::from(
-                "点书封开始阅读 · 封面下可重命名 / 删除 · 进度自动记住",
+                "点题签开卷 · 书名过长点书名可展开 · 归类 / 改名 / 删除在签下 · 进度自动记住",
             ))
             .child(SharedString::from(if self.notice.is_empty() {
                 String::new()
@@ -968,14 +1550,19 @@ impl Root {
         let Some(book) = &self.book else {
             return self.render_shelf(cx);
         };
-        let title = if book.cover.title.is_empty() {
-            book.title.clone()
-        } else {
-            book.cover.title.clone()
+        // 封面文字：书名 / 副题 / 作者的【】都显作「」（与阅读版面一致）。
+        let mapq = |s: &str| -> String {
+            s.chars().map(crate::types::bracket_to_quote).collect()
         };
-        let subtitle = book.cover.subtitle.clone();
+        let raw = if book.cover.title.is_empty() {
+            &book.title
+        } else {
+            &book.cover.title
+        };
+        let title = mapq(raw);
+        let subtitle = mapq(&book.cover.subtitle);
         let seal = book.cover.seal_or_default();
-        let author = book.author.clone();
+        let author = mapq(&book.author);
         let accent = self
             .library
             .books
@@ -1018,14 +1605,10 @@ impl Root {
                     .border_color(rgb(0x8A6A52))
                     .rounded(px(1.0))
                     .child(div().w(px(20.0)).h(px(2.0)).bg(rgb(0xB4453C)))
-                    .child(vertical_block(
-                        &title,
-                        42.0,
-                        196.0,
-                        23.0,
-                        0x2A241E,
-                        FontWeight::MEDIUM,
-                    )),
+                    .child({
+                        let (fs_t, tcol, _) = fit_single_column(&title, 196.0, 23.0);
+                        vertical_cols(&[tcol], fs_t, 0x2A241E, FontWeight::MEDIUM)
+                    }),
             )
             .child(
                 div()
@@ -1036,9 +1619,12 @@ impl Root {
                         clip_title_w(&title, 190.0, 11.0)
                     ))),
             )
-            // 竖排大书名自适应封面中部可用区域（312×318）：长名自动分列，
-            // 从右到左，保持古籍版式且不溢出封面。
-            .child(vertical_block(&title, 312.0, 318.0, 52.0, 0xEDE3CC, FontWeight::MEDIUM))
+            // 竖排大书名：书衣题名永远一列，字号随书名长度自适应收缩，
+            // 长名自动变小而不折列，保持古籍书衣版式且不溢出封面。
+            .child({
+                let (fs_b, bcol, _) = fit_single_column(&title, 318.0, 52.0);
+                vertical_cols(&[bcol], fs_b, 0xEDE3CC, FontWeight::MEDIUM)
+            })
             .child(
                 div()
                     .text_size(px(11.0))
@@ -1150,21 +1736,21 @@ mod tests {
 
         // 长名自动分列：每列高度不超盒高，总宽不超盒宽。
         let (fs, cols) = fit_vertical("西游记（图文珍藏版）", CARD_BOX.0, CARD_BOX.1, 20.0);
-        let per_col = ((CARD_BOX.1 - 4.0) / (fs + 4.0)).floor() as usize;
+        let per_col = ((CARD_BOX.1 - 4.0) / row_pitch(fs)).floor() as usize;
         assert!(cols.len() >= 2, "长名应分列，实际 {:?}", cols);
         assert!(cols.iter().all(|c| c.chars().count() <= per_col));
-        assert!(cols.len() as f32 * (fs + 4.0) <= CARD_BOX.0 + 0.01);
+        assert!(cols.len() as f32 * (fs + 6.0) <= CARD_BOX.0 + 0.01);
 
         // 超长名：缩到最小字号仍装不下时截断，且结果依然放得进盒子。
         let long: String = "长".repeat(100);
         let (fs, cols) = fit_vertical(&long, CARD_BOX.0, CARD_BOX.1, 20.0);
-        let per_col = ((CARD_BOX.1 - 4.0) / (fs + 4.0)).floor() as usize;
-        let max_cols = (CARD_BOX.0 / (fs + 4.0)).floor() as usize;
+        let per_col = ((CARD_BOX.1 - 4.0) / row_pitch(fs)).floor() as usize;
+        let max_cols = (CARD_BOX.0 / (fs + 6.0)).floor() as usize;
         let total: usize = cols.iter().map(|c| c.chars().count()).sum();
         assert!(total < long.chars().count(), "超长名应被截断");
         assert!(total <= per_col * max_cols);
         assert!(cols.iter().all(|c| c.chars().count() <= per_col));
-        assert!(cols.len() as f32 * (fs + 4.0) <= CARD_BOX.0 + 0.01);
+        assert!(cols.len() as f32 * (fs + 6.0) <= CARD_BOX.0 + 0.01);
         assert!(cols.last().map(|c| c.ends_with('…')).unwrap_or(false));
     }
 
@@ -1179,5 +1765,55 @@ mod tests {
         // 拉丁字符按半宽估算，同宽度下能排更多字符。
         let latin = clip_title_w("The Great Gatsby", 158.0, 12.0);
         assert_eq!(latin, "The Great Gatsby");
+    }
+
+    /// 题签盒：68×132，最多两列。
+    const SLIP: (f32, f32) = (SLIP_TITLE_W, SLIP_TITLE_H);
+
+    #[test]
+    fn slip_title_never_exceeds_two_columns() {
+        // 短名：一列，不缩字号。
+        let (fs, cols) = fit_cols("道德经", SLIP.0, SLIP.1, 17.0, 2);
+        assert_eq!(fs, 17.0);
+        assert_eq!(cols, vec!["道德经".to_string()]);
+
+        // 十个字的长名：仍限两列。
+        let (fs, cols) = fit_cols("西游记图文珍藏版全", SLIP.0, SLIP.1, 17.0, 2);
+        let per_col = ((SLIP.1 - 4.0) / row_pitch(fs)).floor() as usize;
+        assert!(cols.len() <= 2, "题签最多两列，实际 {:?}", cols);
+        assert!(cols.iter().all(|c| c.chars().count() <= per_col));
+        assert!(cols.iter().all(|c| !c.ends_with('…')), "十个字应放得下");
+
+        // 超长名：截断缀省略号，列数依旧不超两列。
+        let long: String = "长".repeat(80);
+        let (fs, cols) = fit_cols(&long, SLIP.0, SLIP.1, 17.0, 2);
+        assert!(cols.len() <= 2);
+        assert!(cols.last().map(|c| c.ends_with('…')).unwrap_or(false));
+        let total: usize = cols.iter().map(|c| c.chars().count()).sum();
+        let per_col = ((SLIP.1 - 4.0) / row_pitch(fs)).floor() as usize;
+        assert!(total <= per_col * 2);
+    }
+
+    #[test]
+    fn fit_cols_keeps_rightmost_column_first_character_order() {
+        // 分列后按「先填满第一列」切分：首列是开头几个字。
+        let (_, cols) = fit_cols("一二三四五六七八九十", SLIP.0, SLIP.1, 17.0, 2);
+        assert_eq!(cols.concat(), "一二三四五六七八九十");
+    }
+
+    #[test]
+    fn caret_window_follows_cursor_and_reports_ellipsis() {
+        // 短串：整段显示，不省略。
+        let (skip, head, tail) = caret_window("论语", 1, 14);
+        assert!(!skip);
+        assert_eq!((head.as_str(), tail.as_str()), ("论", "语"));
+        // 长串且光标在末尾：窗口贴着尾部，前面省略。
+        let long: String = "一".repeat(40);
+        let (skip, head, tail) = caret_window(&long, 40, 14);
+        assert!(skip);
+        assert!(tail.is_empty());
+        assert_eq!(head.chars().count(), 14);
+        // 光标越界不 panic。
+        let (_, _, _) = caret_window("短", 99, 14);
     }
 }

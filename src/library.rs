@@ -47,6 +47,22 @@ pub struct ShelfEntry {
     /// 用户划线的字：(chapter, para, offset)。
     #[serde(default)]
     pub underlines: Vec<(usize, usize, usize)>,
+    /// 四部分类：经 / 史 / 子 / 集；空串表示按书名自动归类，
+    /// 其它值即用户自定的书单名（「自定义书单」页签按它聚合）。
+    #[serde(default)]
+    pub category: String,
+    /// 注者（校注 / 集注 / 笺注者）；空表示无。
+    #[serde(default)]
+    pub annotator: String,
+    /// 版本或朝代（如「宋刻本」「〔宋〕」）；空表示按作者朝代 / 整理方式推。
+    #[serde(default)]
+    pub edition: String,
+    /// 全书章数（导入时记下；「当前卷册」没有记录时按进度推算）。
+    #[serde(default)]
+    pub chapters: usize,
+    /// 上次读到的卷册标题（`touch` 时写入，书架直接显示，不必再开书）。
+    #[serde(default)]
+    pub chapter_title: String,
 }
 
 fn default_script() -> String {
@@ -66,9 +82,154 @@ impl ShelfEntry {
             ((self.last_page + 1) as f32 / self.total_pages as f32).clamp(0.0, 1.0)
         }
     }
-    pub fn is_started(&self) -> bool {
-        self.last_page > 0
+    /// 归入哪一页签：用户设了经史子集就用它，没设就按书名自动归，
+    /// 自定书单（任意非四部名）统一落到「自定」页签。
+    pub fn cat_key(&self) -> &'static str {
+        match self.category.as_str() {
+            "经" => "经",
+            "史" => "史",
+            "子" => "子",
+            "集" => "集",
+            "" => auto_category(&self.title),
+            _ => "自定",
+        }
     }
+
+    /// 「作者 / 注者」行：作者串里的朝代标注另列，注者缀在后面。
+    /// 导入时截断留下的尾巴（`_ …`）一并清掉，书架不显示这种毛刺。
+    pub fn author_line(&self) -> String {
+        let (_, name) = split_dynasty(&self.author);
+        let name = name
+            .trim_end_matches(|c: char| c.is_whitespace() || c == '…' || c == '_' || c == '·')
+            .trim()
+            .to_string();
+        let mut s = if name.is_empty() {
+            "佚名".to_string()
+        } else {
+            name
+        };
+        if !self.annotator.is_empty() {
+            s = if s == "佚名" {
+                self.annotator.clone()
+            } else {
+                format!("{s} {} 注", self.annotator)
+            };
+        }
+        s
+    }
+
+    /// 「版本或朝代」行：用户填的版本优先，否则从作者串取朝代，
+    /// 都没有就按入库形态说（json 是整理本，md/txt 是钞本）。
+    pub fn edition_line(&self) -> String {
+        let e = self.edition.trim();
+        if !e.is_empty() {
+            return e.to_string();
+        }
+        let (dynasty, _) = split_dynasty(&self.author);
+        if !dynasty.is_empty() {
+            return format!("〔{dynasty}〕");
+        }
+        match self
+            .path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("json") => "整理本".to_string(),
+            Some("epub") => "排印本".to_string(),
+            _ => "钞本".to_string(),
+        }
+    }
+
+    /// 「当前卷册」行：读过就显示上次那一卷（过长截断），
+    /// 没读过但有章数就按进度估一个，全然没有则「未始读」。
+    pub fn volume_line(&self) -> String {
+        let t = self.chapter_title.trim();
+        if !t.is_empty() {
+            return ellipsis(t, 9);
+        }
+        if self.chapters > 0 && self.last_page > 0 {
+            let per = self.progress() * self.chapters as f32;
+            let idx = (per.ceil() as usize).clamp(1, self.chapters);
+            return format!("卷 {idx} / {}", self.chapters);
+        }
+        if self.last_page > 0 {
+            return format!("第 {} 面", self.last_page + 1);
+        }
+        "未始读".to_string()
+    }
+}
+
+/// 四部归类关键词：先命中先归（表内顺序即优先级）。
+/// 只收常见书，命中不了落到「集」——四部里集部最杂，做兜底最不容易错。
+const SIKU: &[(&str, &[&str])] = &[
+    (
+        "经",
+        &[
+            "论语", "孟子", "诗经", "尚书", "周易", "礼记", "春秋", "左传", "公羊", "谷梁",
+            "大学", "中庸", "孝经", "尔雅", "说文", "广韵", "千字文", "三字经", "百家姓",
+            "弟子规", "声律启蒙", "笠翁对韵", "十三经", "四书", "五经",
+        ],
+    ),
+    (
+        "史",
+        &[
+            "史记", "汉书", "后汉书", "三国志", "资治通鉴", "通鉴", "战国策", "国语", "竹书",
+            "通典", "通志", "文献通考", "明史", "宋史", "唐书", "元史", "清史", "汉书", "纪事本末",
+            "水经注", "洛阳伽蓝", "东京梦华", "徐霞客",
+        ],
+    ),
+    (
+        "子",
+        &[
+            "道德经", "老子", "庄子", "列子", "荀子", "韩非", "墨子", "孙子", "吴子", "管子",
+            "淮南", "论衡", "世说新语", "本草", "内经", "伤寒", "天工开物", "梦溪笔谈", "齐民要术",
+            "红楼梦", "西游记", "水浒", "三国演义", "儒林外史", "聊斋", "山海经", "搜神记",
+        ],
+    ),
+    (
+        "集",
+        &[
+            "楚辞", "唐诗", "宋词", "元曲", "文选", "乐府", "诗集", "文集", "全集", "古文观止",
+            "诗话", "词话", "陶渊明", "李白", "杜甫", "苏轼", "李清照", "辛弃疾",
+        ],
+    ),
+];
+
+/// 按书名自动归入四部之一。
+pub fn auto_category(title: &str) -> &'static str {
+    for (cat, keys) in SIKU {
+        if keys.iter().any(|k| title.contains(k)) {
+            return cat;
+        }
+    }
+    "集"
+}
+
+/// 从「〔宋〕朱熹」里拆出（朝代, 人名）。支持〔〕[]（）() 四种括号。
+pub fn split_dynasty(author: &str) -> (String, String) {
+    let t = author.trim();
+    for (open, close) in [('〔', '〕'), ('[', ']'), ('（', '）'), ('(', ')')] {
+        if let Some(rest) = t.strip_prefix(open) {
+            if let Some(i) = rest.find(close) {
+                let dynasty = rest[..i].trim().to_string();
+                let name = rest[i + close.len_utf8()..].trim().to_string();
+                return (dynasty, name);
+            }
+        }
+    }
+    (String::new(), t.to_string())
+}
+
+/// 按字数截断并缀省略号（不足则原样）。
+pub fn ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// 书架索引。
@@ -149,13 +310,34 @@ impl Library {
     }
 
     /// 更新一本书的阅读档案（同时记下最近阅读时间，「正在阅读」用）。
-    pub fn touch(&mut self, idx: usize, page: usize, total: usize, script: &str, duplex: &str) {
+    /// `chapter` 是当前读到的卷册标题，书架「当前卷册」直接显示它。
+    pub fn touch(
+        &mut self,
+        idx: usize,
+        page: usize,
+        total: usize,
+        script: &str,
+        duplex: &str,
+        chapter: &str,
+    ) {
         if let Some(e) = self.books.get_mut(idx) {
             e.last_page = page;
             e.total_pages = total;
             e.script = script.to_string();
             e.duplex = duplex.to_string();
             e.last_read = now_secs();
+            if !chapter.is_empty() {
+                e.chapter_title = chapter.to_string();
+            }
+        }
+        self.save();
+    }
+
+    /// 改一本书的归类。`cat` 传「经」「史」「子」「集」或自定书单名；
+    /// 传空串恢复「按书名自动归类」。
+    pub fn set_category(&mut self, idx: usize, cat: &str) {
+        if let Some(e) = self.books.get_mut(idx) {
+            e.category = cat.to_string();
         }
         self.save();
     }
@@ -286,6 +468,11 @@ impl Library {
             last_read: 0,
             notes: std::collections::HashMap::new(),
             underlines: Vec::new(),
+            category: String::new(),
+            annotator: String::new(),
+            edition: String::new(),
+            chapters: book.chapters.len(),
+            chapter_title: String::new(),
         });
         self.save();
         Ok(self.books.len() - 1)
@@ -409,10 +596,118 @@ pub(crate) mod tests {
         let mut lib = Library::load();
         let idx = lib.download("qianzi").expect("下载千字文应成功");
         assert_eq!(lib.books[idx].last_read, 0);
-        lib.touch(idx, 3, 20, "ancient", "single");
+        lib.touch(idx, 3, 20, "ancient", "single", "卷二 女诫");
         assert!(lib.books[idx].last_read > 0, "touch 应记下阅读时间");
         assert_eq!(lib.books[idx].last_page, 3);
+        // 「当前卷册」随 touch 一起落档，书架不必开书就能显示。
+        assert_eq!(lib.books[idx].chapter_title, "卷二 女诫");
+        assert_eq!(lib.books[idx].volume_line(), "卷二 女诫");
         std::env::remove_var("JIANDU_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ---- 书架五项的取值逻辑（纯函数，不需要文件系统）----
+
+    fn entry(title: &str, author: &str, category: &str) -> ShelfEntry {
+        ShelfEntry {
+            path: PathBuf::from("x.json"),
+            title: title.to_string(),
+            author: author.to_string(),
+            accent: 0,
+            seal: String::new(),
+            last_page: 0,
+            total_pages: 0,
+            script: "ancient".into(),
+            duplex: "single".into(),
+            last_read: 0,
+            notes: std::collections::HashMap::new(),
+            underlines: Vec::new(),
+            category: category.to_string(),
+            annotator: String::new(),
+            edition: String::new(),
+            chapters: 0,
+            chapter_title: String::new(),
+        }
+    }
+
+    #[test]
+    fn auto_category_covers_siku() {
+        assert_eq!(auto_category("论语"), "经");
+        assert_eq!(auto_category("资治通鉴"), "史");
+        assert_eq!(auto_category("庄子"), "子");
+        assert_eq!(auto_category("楚辞"), "集");
+        // 收不进去的落到集部兜底，而不是留空。
+        assert_eq!(auto_category("某未知名目"), "集");
+        // 千字文属小学，归经部。
+        assert_eq!(auto_category("千字文"), "经");
+    }
+
+    #[test]
+    fn category_override_wins_and_custom_lists_go_to_ziding() {
+        // 空串 = 自动归类。
+        let e = entry("论语", "", "");
+        assert_eq!(e.cat_key(), "经");
+        // 用户指定覆盖自动结果。
+        let e = entry("论语", "", "史");
+        assert_eq!(e.cat_key(), "史");
+        // 自定书单名：进「自定」页签（名字原样留在 category 里）。
+        let e = entry("论语", "", "床头常读");
+        assert_eq!(e.cat_key(), "自定");
+        assert_eq!(e.category, "床头常读");
+    }
+
+    #[test]
+    fn dynasty_is_split_out_of_author() {
+        assert_eq!(
+            split_dynasty("〔宋〕朱熹"),
+            ("宋".to_string(), "朱熹".to_string())
+        );
+        assert_eq!(
+            split_dynasty("[清]曹雪芹"),
+            ("清".to_string(), "曹雪芹".to_string())
+        );
+        assert_eq!(split_dynasty("佚名"), (String::new(), "佚名".to_string()));
+        // 括号没闭合就当没有朝代，原样留作人名，别把整串吃掉。
+        assert_eq!(
+            split_dynasty("〔宋朱熹"),
+            (String::new(), "〔宋朱熹".to_string())
+        );
+    }
+
+    #[test]
+    fn five_book_fields_have_sane_fallbacks() {
+        // 作者行：朝代标注另列；注者缀「注」。
+        let mut e = entry("论语", "〔魏〕何晏", "");
+        assert_eq!(e.author_line(), "何晏");
+        e.annotator = "朱熹".into();
+        assert_eq!(e.author_line(), "何晏 朱熹 注");
+        // 版本行：取不到版本就用朝代。
+        assert_eq!(e.edition_line(), "〔魏〕");
+        e.edition = "宋刻本".into();
+        assert_eq!(e.edition_line(), "宋刻本");
+        // 导入时截断留下的 `_ …` 尾巴要清掉，别让书架显示毛刺。
+        let e = entry("资治通鉴", "（宋）司马光 著 _ …", "");
+        assert_eq!(e.author_line(), "司马光 著");
+        // 无名无朝代的书：作者佚名、版本按入库形态（json=整理本）。
+        let e = entry("残卷", "", "");
+        assert_eq!(e.author_line(), "佚名");
+        assert_eq!(e.edition_line(), "整理本");
+        // 卷册：没读过 = 未始读。
+        assert_eq!(e.volume_line(), "未始读");
+    }
+
+    #[test]
+    fn volume_line_truncates_long_chapter_titles() {
+        let mut e = entry("某书", "", "");
+        e.chapter_title = "第一卷 序言与凡例总目提要".into();
+        let v = e.volume_line();
+        assert!(v.ends_with('…'), "过长卷名应截断：{v}");
+        assert_eq!(v.chars().count(), 9);
+        // 没记卷名但读过：按进度在总章数里估一卷。
+        let mut e = entry("某书", "", "");
+        e.chapters = 10;
+        e.last_page = 4;
+        e.total_pages = 10;
+        assert_eq!(e.volume_line(), "卷 5 / 10");
     }
 }

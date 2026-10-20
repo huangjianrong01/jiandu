@@ -19,6 +19,10 @@ use crate::types::Glyph;
 pub enum Piece {
     Main(Glyph),
     Gloss(String),
+    /// 避头尾禁则让出的空白格：占一个整字格（2 半格），不渲染任何字。
+    /// 竖排里用于「列顶避头」（闭合 / 句读标点不顶列首）、
+    /// 「列底避尾」（开合标点不落列底）时让出的那一格空位。
+    Gap,
 }
 
 /// 一面（一叶）的排版结果。
@@ -95,6 +99,17 @@ impl Filler {
         self.units >= self.cap
     }
 
+    /// 已用半格数。
+    pub fn used(&self) -> usize {
+        self.units
+    }
+
+    /// 放入一个空白格（占 2 半格，不渲染字形）——避头尾禁则让位时用。
+    /// 调用方已确认列容得下（避头时 `room() >= 2`），这里只记账、不超容。
+    pub fn push_gap(&mut self) {
+        self.units = (self.units + 2).min(self.cap);
+    }
+
     /// 预留顶部若干「行」给卷首题署（书名·卷次 + 署名）独占，
     /// 正文从预留带之下接着排。只扣「半格」账，不改列容量；
     /// 调用方已把预留行数收敛到 ≤ 列容量的一半以内，不会把整列吃空。
@@ -113,6 +128,31 @@ pub fn inscription_reserve(need: usize, rows: usize) -> usize {
         return 0;
     }
     need.min(rows - 2).min(14)
+}
+
+/// 避头（列首）禁则：下列标点 / 闭合类符号不可居一列之顶（竖排列首）。
+/// 落在此类标点前需让出一格空位，把它压到第二格。
+///
+/// 含句读（。，、；：？！）、闭合引号书名号（」』”）’）】》）与破折号、
+/// 省略号、间隔号（—…·）——皆是「跟在正文之后、不宜顶头」的收束型符号。
+pub fn is_head_prohibited(c: char) -> bool {
+    matches!(
+        c,
+        '。' | '，' | '、' | '；' | '：' | '？' | '！' | '」' | '』' | '”' | '’' | '）' | '】'
+            | '》' | '…' | '—' | '·'
+    )
+}
+
+/// 避尾（列底）禁则：下列开合类标点不可居一列之底（竖排列尾）。
+/// 落在此类标点前需提前收列，让它落到下一列列首（开合类居列首合规）。
+///
+/// 含开合引号书名号（「『“ ‘（【《）与间隔号（·）——皆是「宜领起下文、
+/// 不宜收尾」的开启型符号。
+pub fn is_tail_prohibited(c: char) -> bool {
+    matches!(
+        c,
+        '「' | '『' | '“' | '‘' | '（' | '【' | '《' | '·'
+    )
 }
 
 /// 把整卷字形流排成一面面叶子：分页（章首另起、每面列数上限）与
@@ -168,16 +208,25 @@ pub fn layout_book(
             }
             page_limit = cols.saturating_sub(1).max(1);
             start_chapter = true;
+            // 卷首题署：章首页的「开卷列」（正文第一列）顶部留出一段空白带，
+            // 渲染层在那里叠一卷端题名（书名·卷次 + 署名），正文从带下接着排。
+            //
+            // **只预留一次**，所以写在这个「章首」分支里：原先放在循环体里用
+            // `cols_filled == 0` 判断，开卷列每进一个字都会再加一遍预留，
+            // 三两个字就把整列记满，章首版心只剩寥寥几字。
+            if reserve_rows > 0 {
+                filler.reserve_rows(reserve_rows);
+            }
         }
-        // 卷首题署：章首页的「开卷列」（正文第一列）顶部留出一段空白带，
-        // 渲染层在那里叠一卷端题名（书名·卷次 + 署名），正文从带下接着排。
-        // 仅章首页（start_chapter 为真）的开卷列（cols_filled==0）预留一次。
-        if start_chapter && cols_filled == 0 && reserve_rows > 0 {
-            filler.reserve_rows(reserve_rows);
-        }
-        if filler.push_main() {
-            // 此字另起一列。**先判面尽、后开新列**——顺序反了会把刚开好的
-            // 空列封进上一面（章首页多出一列的 bug 就这么来的）。
+        // 避头尾禁则（竖排）：标点不可顶在列顶（避头）、开合标点不可落在
+        // 列底（避尾）。两者都只让出一格空位，不丢字、不截断字形。
+        let head_bad = is_head_prohibited(g.ch);
+        let tail_bad = is_tail_prohibited(g.ch);
+        // 避尾：本字恰好会填满当前列（成为列底末字）且属避尾类时，提前收列，
+        // 让它落下一列列首（开合类标点居列首合规）。仅当前列已有内容才收，
+        // 避免空列误收。
+        let force_roll = tail_bad && filler.room() == 2 && filler.used() > 0;
+        let roll = if force_roll {
             cols_filled += 1;
             if cols_filled >= page_limit {
                 seal!();
@@ -186,6 +235,39 @@ pub fn layout_book(
             } else if columns.last().map(|c| !c.is_empty()).unwrap_or(false) {
                 columns.push(Vec::new());
             }
+            filler.begin_column();
+            filler.push_main(); // 把 g 放进新列列首（开合类居列首合规，不再换列）
+            false
+        } else {
+            filler.push_main()
+        };
+        if roll {
+            // 此字另起一列。**先判面尽、后开新列**——顺序反了会把刚开好的
+            // 空列封进上一面（章首页多出一列的 bug 就这么来的）。
+            cols_filled += 1;
+            if cols_filled >= page_limit {
+                seal!();
+                page_limit = cols;
+                start_chapter = false;
+                // `seal!` 里的 `begin_column` 会把这列的账清零，可这个字已经
+                // 记进新列了——不补回去它就「免单」，整列会多塞一个字，
+                // 多出来的字溢出到版框外（阅读页底那枚挂框的字）。
+                filler.push_main();
+                // 收面时手上若没有正文（只剩注尾的极端情形），`seal!` 不会换
+                // 新 columns，这里补开一列，免得把字塞回已满的旧列。
+                if columns.last().map(|c| !c.is_empty()).unwrap_or(true) {
+                    columns.push(Vec::new());
+                }
+            } else if columns.last().map(|c| !c.is_empty()).unwrap_or(false) {
+                columns.push(Vec::new());
+            }
+        }
+        // 避头：本字若因换列成为列首（roll 触发）且属避头类，在列顶插一
+        // 空白格，把它压到第二格，避免闭合 / 句读标点顶在列顶。
+        // 列太短（容不下一个空白格 + 本字）时不强行插，退化成普通列首。
+        if roll && head_bad && filler.room() >= 2 {
+            columns.last_mut().unwrap().push(Piece::Gap);
+            filler.push_gap();
         }
         columns.last_mut().unwrap().push(Piece::Main(*g));
         glyphs.push(*g);
@@ -253,6 +335,7 @@ pub fn note_boxes_in_column(col: &[Piece], li: usize, cell_w: f32, cell_h: f32) 
     for p in col {
         match p {
             Piece::Main(_) => y += cell_h,
+            Piece::Gap => {}
             Piece::Gloss(text) => {
                 let rows = (text.chars().count() + 1) / 2;
                 let h = rows as f32 * row_h;
@@ -277,8 +360,9 @@ pub fn note_boxes_in_column(col: &[Piece], li: usize, cell_w: f32, cell_h: f32) 
 /// 与 `render_reading` 的舞台排布一致：
 ///   * 单页：水平居中，垂直方向在正文区（工具栏 44 + 状态栏 34 之下、
 ///     四边留白 44 之中）居中；
-///   * 对开（横屏）：两叶并排、中间隔 `LEAF_GAP`，整体居中——
-///     `back`（下一面）在左、当前面在右，读序自右向左；
+///   * 对开（横屏）：两叶并排、中间隔 `gap`（版心中缝，宽约一行字，
+///     见 `grid::gutter_w`），整体居中——`back`（下一面）在左、当前面
+///     在右，读序自右向左；
 ///   * 专注模式：工具栏 / 状态栏 / 留白皆 0，纸面贴屏。
 /// `paper_w` / `paper_h` 是纸面尺寸（网格引擎 `outer_w` / `outer_h`）。
 pub fn leaf_origin(
@@ -287,13 +371,14 @@ pub fn leaf_origin(
     viewport_h: f32,
     paper_w: f32,
     paper_h: f32,
+    gap: f32,
     back: bool,
     focus: bool,
 ) -> (f32, f32) {
     // 正文区高度 = 视口 - 工具栏(44) - 状态栏(34)；叶在其中垂直居中。
     let chrome_h = if focus { 0.0 } else { 44.0 + 34.0 };
     let stage_w = if facing {
-        paper_w * 2.0 + crate::grid::LEAF_GAP
+        paper_w * 2.0 + gap
     } else {
         paper_w
     };
@@ -302,7 +387,7 @@ pub fn leaf_origin(
         if back {
             left
         } else {
-            left + paper_w + crate::grid::LEAF_GAP
+            left + paper_w + gap
         }
     } else {
         ((viewport_w - stage_w) / 2.0).max(0.0)
@@ -924,25 +1009,26 @@ mod tests {
     #[test]
     fn leaf_origin_single_page_centers_and_clears_chrome() {
         // 单页：水平居中；垂直在正文区（工具栏 44 + 状态栏 34 之下）居中。
-        let (x, y) = leaf_origin(false, 700.0, 780.0, 620.0, 640.0, false, false);
+        let (x, y) = leaf_origin(false, 700.0, 780.0, 620.0, 640.0, 0.0, false, false);
         assert!((x - (700.0 - 620.0) / 2.0).abs() < 0.01);
         let body_h = 780.0 - 78.0;
         assert!((y - (78.0 + (body_h - 640.0) / 2.0)).abs() < 0.01);
         // 专注模式：贴屏，无 chrome 偏移。
-        let (fx, fy) = leaf_origin(false, 700.0, 780.0, 700.0, 780.0, false, true);
+        let (fx, fy) = leaf_origin(false, 700.0, 780.0, 700.0, 780.0, 0.0, false, true);
         assert!((fx).abs() < 0.01);
         assert!((fy).abs() < 0.01);
     }
 
     #[test]
     fn leaf_origin_facing_puts_back_on_left() {
-        // 对开：两叶并排隔 LEAF_GAP，整体居中；back（下一面）在左。
+        // 对开：两叶并排隔中缝 gap，整体居中；back（下一面）在左。
         let (pw, ph) = (560.0, 640.0);
-        let (lx, ly) = leaf_origin(true, 1200.0, 800.0, pw, ph, true, false);
-        let (rx, ry) = leaf_origin(true, 1200.0, 800.0, pw, ph, false, false);
-        let stage = pw * 2.0 + crate::grid::LEAF_GAP;
+        let gap = crate::grid::gutter_w(1200.0, 8, 50.0, 0.04);
+        let (lx, ly) = leaf_origin(true, 1200.0, 800.0, pw, ph, gap, true, false);
+        let (rx, ry) = leaf_origin(true, 1200.0, 800.0, pw, ph, gap, false, false);
+        let stage = pw * 2.0 + gap;
         assert!((lx - (1200.0 - stage) / 2.0).abs() < 0.01);
-        assert!((rx - (lx + pw + crate::grid::LEAF_GAP)).abs() < 0.01);
+        assert!((rx - (lx + pw + gap)).abs() < 0.01);
         assert_eq!(ly, ry);
         assert!(rx > lx);
     }
@@ -1230,14 +1316,124 @@ mod tests {
                     .iter()
                     .map(|c| {
                         c.iter()
-                            .map(|p| match p {
-                                Piece::Main(_) => 2,
-                                Piece::Gloss(s) => (s.chars().count() + 1) / 2,
-                            })
+                    .map(|p| match p {
+                        Piece::Main(_) => 2,
+                        Piece::Gloss(s) => (s.chars().count() + 1) / 2,
+                        Piece::Gap => 2,
+                    })
                             .sum::<usize>()
                     })
                     .sum();
                 assert!(units <= cols * 22, "{cols} 列某面半格超容");
+            }
+        }
+    }
+
+    /// 避头尾禁则：句读 / 闭合类标点不顶列首、开合类标点不落列底，
+    /// 且全程不丢字。用一段标点密集的样文在多种列数 / 行数下验证：
+    ///   * 任何列的首片不得是「避头类」标点——若本应居列首，分页会插
+    ///     一个空白格把它压到第二格（首片变成 Gap）；
+    ///   * 任何「满列」且非末列的列尾（末片）不得是「避尾类」标点——
+    ///     若本应居列底，分页会提前收列让它落下一列列首。
+    /// 任何一列的字数都不得超出该列容量（半格账）。
+    ///
+    /// 超容会让字溢出到版框外——阅读页底部那枚「挂在框外」的字就是这么来的。
+    /// 这里把「卷首题署预留」也一并试：预留只在开卷列扣一次账，绝不能按字重复扣。
+    #[test]
+    fn no_column_overflows_its_capacity() {
+        let text = "道可道，非常道。名可名，非常名。「有无相生」，难易相成；（长短相形）高下相倾。"
+            .repeat(6);
+        let mut b = Book::new("容量", "佚名");
+        for i in 0..3 {
+            b.chapters.push(Chapter {
+                title: format!("卷{}", i + 1),
+                paragraphs: vec![Paragraph::plain(&text)],
+            });
+        }
+        let flow = flow_of(&b);
+        for cols in [6usize, 8, 10, 12] {
+            for rows in [6usize, 9, 12] {
+                for reserve in [0usize, 2, 4] {
+                    let pages = layout_book(&flow, |_| None, cols, rows, reserve);
+                    for (pi, p) in pages.iter().enumerate() {
+                        for (ci, col) in p.columns.iter().enumerate() {
+                            let used: usize = col
+                                .iter()
+                                .map(|x| match x {
+                                    Piece::Main(_) => 2,
+                                    Piece::Gap => 2,
+                                    Piece::Gloss(s) => (s.chars().count() + 1) / 2,
+                                })
+                                .sum();
+                            // 失败时把这列排出来看：正文出字、· 为避头空白、[n] 为 n 字夹注。
+                            let brief: String = col
+                                .iter()
+                                .map(|x| match x {
+                                    Piece::Main(g) => g.ch.to_string(),
+                                    Piece::Gap => "·".to_string(),
+                                    Piece::Gloss(s) => format!("[{}]", s.chars().count()),
+                                })
+                                .collect();
+                            assert!(
+                                used <= rows * 2,
+                                "第 {pi} 面第 {ci} 列占 {used} 半格，超出容量 {}（{cols} 列 × {rows} 行，题署预留 {reserve}）：{brief}",
+                                rows * 2
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn line_break_rules_avoid_head_and_tail_punctuation() {
+        let text = "道可道，名可名；非常道：「甲乙」。（丙丁）《戊己》『庚辛』——壬癸！\
+子丑？寅卯、辰巳。午未……申酉「戌亥」（子丑）寅卯，辰巳！午未？申酉、戌亥。子丑……";
+        let mut b = Book::new("禁则", "佚名");
+        b.chapters.push(Chapter {
+            title: "一".into(),
+            paragraphs: vec![Paragraph::plain(text)],
+        });
+        let flow = flow_of(&b);
+        for cols in [6usize, 8, 10, 12] {
+            for rows in [6usize, 9, 12] {
+                let pages = layout_book(&flow, |_| None, cols, rows, 0);
+                // 不丢字：标点显隐开启时标点也在流里，守恒。
+                let flat: Vec<&Glyph> = pages.iter().flat_map(|p| p.glyphs.iter()).collect();
+                assert_eq!(flat.len(), flow.len(), "{cols}x{rows} 禁则丢字");
+                let cols_all: Vec<&Vec<Piece>> =
+                    pages.iter().flat_map(|p| p.columns.iter()).collect();
+                let last = cols_all.len() - 1;
+                let cap = rows * 2;
+                for (ci, col) in cols_all.iter().enumerate() {
+                    let units: usize = col
+                        .iter()
+                        .map(|p| match p {
+                            Piece::Main(_) => 2,
+                            Piece::Gloss(s) => (s.chars().count() + 1) / 2,
+                            Piece::Gap => 2,
+                        })
+                        .sum();
+                    // 避头：首片不得是避头类标点（若有让位，首片是 Gap）。
+                    if let Some(Piece::Main(g)) = col.first() {
+                        assert!(
+                            !is_head_prohibited(g.ch),
+                            "{cols}x{rows} 第{ci}列列首仍是避头标点『{}』",
+                            g.ch
+                        );
+                    }
+                    // 避尾：满列（列底无空）且非末列时，末片不得是避尾类标点。
+                    if units >= cap && ci != last {
+                        if let Some(Piece::Main(g)) = col.last() {
+                            assert!(
+                                !is_tail_prohibited(g.ch),
+                                "{cols}x{rows} 第{ci}列列底仍是避尾标点『{}』",
+                                g.ch
+                            );
+                        }
+                    }
+                }
             }
         }
     }

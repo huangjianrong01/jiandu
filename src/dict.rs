@@ -11,8 +11,35 @@ const RAW: &str = include_str!(concat!(
     "/resources/dict/guhanyu.json"
 ));
 
+/// 词库：`《古漢語常用字字典》` 的 JSON 结构是「记录数组」——
+///   `[[字, 释义段①, 释义段②, …], …]`
+/// （音项 ㈠㈡㈢ 与义项 ①②③ 各占一段）。这里把每字各段用换行连成
+/// 一条释义，保留原始分行；面板按行渲染、可滚动。旧版是 `{字: 释义}`
+/// 的 Map，只有 255 字；换成整部字典后约 3900 字。
 static DICT: Lazy<HashMap<String, String>> = Lazy::new(|| {
-    serde_json::from_str(RAW).unwrap_or_default()
+    let rows: Vec<Vec<String>> = serde_json::from_str(RAW).unwrap_or_default();
+    let mut m: HashMap<String, String> = HashMap::new();
+    for row in rows {
+        let Some((head, rest)) = row.split_first() else {
+            continue;
+        };
+        let ch = head.trim();
+        if ch.is_empty() {
+            continue;
+        }
+        let body = rest
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if body.is_empty() {
+            continue;
+        }
+        // 重复字以靠后的定义为准。
+        m.insert(ch.to_string(), body);
+    }
+    m
 });
 
 /// 查一个字的释义；未收录返回 None。
@@ -59,4 +86,21 @@ pub fn pinyin_of(c: char) -> Option<&'static str> {
 /// 生僻字表收录字数（用于状态展示）。
 pub fn rare_len() -> usize {
     RARE.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dict_is_loaded_from_guhanyu_json() {
+        // 整部《古漢語常用字字典》应加载进来（约 3900 字）。
+        assert!(len() > 1000, "dict len = {}", len());
+        let d = define("阿").expect("「阿」应收录");
+        assert!(
+            d.contains("詞頭") || d.contains("山陵"),
+            "「阿」释义异常：{}",
+            d
+        );
+    }
 }

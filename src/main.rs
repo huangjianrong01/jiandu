@@ -93,6 +93,18 @@ fn main() {
                 }
             }
         }
+        // 屏幕容得下才是好窗口：默认 1320×880 在 13 寸（逻辑宽 1280 上下）上会被
+        // 挤出屏幕，标题栏和左侧内容都被裁掉。这里按主屏可用区收一档，
+        // 并给四周留出边距（窗口不会顶到菜单栏 / Dock）。
+        if let Some(display) = cx.displays().first() {
+            let ds = display.bounds().size;
+            let unit = px(1.0);
+            let (dw, dh) = (ds.width / unit, ds.height / unit);
+            if dw > 0.0 && dh > 0.0 {
+                win_w = win_w.min((dw - 24.0).max(320.0));
+                win_h = win_h.min((dh - 90.0).max(240.0));
+            }
+        }
         let bounds = Bounds::centered(None, size(px(win_w), px(win_h)), cx);
         cx.open_window(
             WindowOptions {

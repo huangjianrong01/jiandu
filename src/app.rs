@@ -9,7 +9,7 @@ use crate::library::Library;
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
     Book, CardLayout, Duplex, FontChoice, Glyph, GlyphHit, GlyphKey, GlyphKind, MarkKind, Note,
-    NoteKind, Script, StyleTab,
+    NoteKind, RuleColor, Script, StyleTab,
 };
 use gpui::{
     div, px, rgb, AsyncApp, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
@@ -26,6 +26,62 @@ pub enum Screen {
     Cover,
     /// 正文阅读。
     Reading,
+}
+
+/// 书架视图：题签网格（默认）/ 书脊列表。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShelfView {
+    /// 一格一签：竖排书名居纸中，下缀四项小字。
+    TitleSlip,
+    /// 一行一册：左侧书脊色条 + 竖排书名，右侧四项横排。
+    Spine,
+}
+
+impl ShelfView {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TitleSlip => "题签",
+            Self::Spine => "书脊",
+        }
+    }
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::TitleSlip => Self::Spine,
+            Self::Spine => Self::TitleSlip,
+        }
+    }
+}
+
+/// 书架排序。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShelfSort {
+    /// 最近读过（没读过的按入架顺序垫底）。
+    Recent,
+    /// 书名（按字序）。
+    Title,
+    /// 阅读进度（读得多的在前）。
+    Progress,
+    /// 入架顺序。
+    Added,
+}
+
+impl ShelfSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Recent => "最近阅读",
+            Self::Title => "书名",
+            Self::Progress => "进度",
+            Self::Added => "入架顺序",
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            Self::Recent => Self::Title,
+            Self::Title => Self::Progress,
+            Self::Progress => Self::Added,
+            Self::Added => Self::Recent,
+        }
+    }
 }
 
 pub struct Root {
@@ -101,6 +157,11 @@ pub struct Root {
     pub note_marked: Option<std::ops::Range<usize>>,
     /// 浮层笔记框的锚点（窗口坐标）；None 时按视口居中偏上放置。
     pub note_pos: Option<(f32, f32)>,
+    /// 刚打开笔记框的这一次点击：抬起时不要立刻「自动保存」把它关掉。
+    /// 打开笔记的那一下，mouseup 常会重新命中正文并触发 `on_mouse_up` 里的
+    /// 自动提交——空草稿一提交，浮层就「闪开即关」，看起来像做不了笔记。
+    /// 置位后由紧随的一次自动提交消费掉（跳过），随后即恢复正常。
+    pub note_suppress_commit: bool,
     /// 重命名对话框：正在重命名书架第几本书（None 表示未打开）。
     pub rename_idx: Option<usize>,
     /// 重命名草稿与光标。
@@ -134,12 +195,12 @@ pub struct Root {
     pub share_show_author: bool,
     pub share_show_chapter: bool,
     pub share_show_date: bool,
-    /// 分享卡文字版式（竖排分列 / 横排分行 / 单列）。
+    /// 分享卡文字版式（八行笺 / 竖排分列 / 单列竖排；只要竖排，横排已删）。
     pub share_layout: CardLayout,
     /// 分享卡底色索引（见 reader::SHARE_BGS）。
     pub share_bg: usize,
-    /// 分享卡高度系数（五档，对应分享面板右侧的「高度」滑杆）。
-    pub share_h: f32,
+    /// 丝栏（竖排列间界行）颜色：乌丝栏 / 金丝栏 / 朱丝栏，样式面板可选。
+    pub rule_color: RuleColor,
     /// 分享卡在窗口内容区里的矩形 (x, y, w, h)，渲染时写入，
     /// 保存 / 分享图片时据此只截卡片，而不是整块屏幕。
     pub share_card_rect: Option<(f32, f32, f32, f32)>,
@@ -208,6 +269,31 @@ pub struct Root {
     pub search_keys: std::collections::HashSet<(usize, usize, usize)>,
     /// 当前这一处命中的跨度 `(chapter, para, start, len)`：高亮比其它命中重一档。
     pub search_cur: Option<(usize, usize, usize, usize)>,
+
+    /// 全书统计（章数, 字数）：开卷时算一次，供章末「篇·章·字」小表的
+    /// 「全書」一行使用（逐帧扫全书太贵）。
+    pub book_stat: (usize, usize),
+
+    // ---- 书架（题签网格 / 书脊列表 / 分类 / 搜索 / 排序）----
+    /// 书架视图：题签网格（默认）或书脊列表。
+    pub shelf_view: ShelfView,
+    /// 书架排序方式。
+    pub shelf_sort: ShelfSort,
+    /// 分类页签：None = 全部；Some("经"/"史"/"子"/"集"/"自定") 只显示该类。
+    pub shelf_cat: Option<String>,
+    /// 书架搜索词（空 = 不筛）。与阅读页的全文检索是两套，互不干扰。
+    pub shelf_query: String,
+    pub shelf_query_cursor: usize,
+    /// 书架搜索框焦点句柄（中文要走 IME，见 ime.rs）。
+    pub shelf_query_focus: FocusHandle,
+    /// 书架搜索框 IME 组字区间（UTF-16）。
+    pub shelf_query_marked: Option<std::ops::Range<usize>>,
+    /// 书架搜索框是否激活（决定焦点归属与 IME 目标）。
+    pub shelf_searching: bool,
+    /// 题签 / 书脊里书名被截断的那本：展开看全名（None = 未展开）。
+    pub shelf_expand: Option<usize>,
+    /// 「改归类」浮层正在改第几本（None = 未打开）。
+    pub shelf_recat: Option<usize>,
 }
 
 impl Root {
@@ -261,6 +347,7 @@ impl Root {
             note_focus: _cx.focus_handle(),
             note_marked: None,
             note_pos: None,
+            note_suppress_commit: false,
             rename_idx: None,
             rename_draft: String::new(),
             rename_cursor: 0,
@@ -275,9 +362,9 @@ impl Root {
             share_show_author: true,
             share_show_chapter: true,
             share_show_date: true,
-            share_layout: CardLayout::Columns,
+            share_layout: CardLayout::Note,
             share_bg: 0,
-            share_h: 0.84,
+            rule_color: RuleColor::Wu,
             share_card_rect: None,
             share_shot_frames: 0,
             popup: None,
@@ -311,6 +398,17 @@ impl Root {
             search_idx: 0,
             search_keys: std::collections::HashSet::new(),
             search_cur: None,
+            book_stat: (0, 0),
+            shelf_view: ShelfView::TitleSlip,
+            shelf_sort: ShelfSort::Recent,
+            shelf_cat: None,
+            shelf_query: String::new(),
+            shelf_query_cursor: 0,
+            shelf_query_focus: _cx.focus_handle(),
+            shelf_query_marked: None,
+            shelf_searching: false,
+            shelf_expand: None,
+            shelf_recat: None,
             notice: if count == 0 {
                 "书架空空，点「导入书籍」放一本进来".into()
             } else {
@@ -320,6 +418,22 @@ impl Root {
 
         // 开发用：JIANDU_AUTO_READ=1 直接进入正文，方便截图核对版式
         // （JIANDU_BOOK_IDX 可指定打开书架第几本）。
+        // 开发用：JIANDU_SHELF=list 以书脊列表开局、JIANDU_SHELF_Q=词 预填搜索、
+        // JIANDU_SHELF_CAT=史 预选分类，便于逐态截图核对书架。
+        if let Ok(v) = std::env::var("JIANDU_SHELF") {
+            if v == "list" {
+                root.shelf_view = ShelfView::Spine;
+            }
+        }
+        if let Ok(v) = std::env::var("JIANDU_SHELF_Q") {
+            root.shelf_query = v;
+            root.shelf_query_cursor = root.shelf_query.chars().count();
+        }
+        if let Ok(v) = std::env::var("JIANDU_SHELF_CAT") {
+            if !v.is_empty() {
+                root.shelf_cat = Some(v);
+            }
+        }
         if std::env::var("JIANDU_AUTO_READ").is_ok() && !root.library.books.is_empty() {
             let idx = std::env::var("JIANDU_BOOK_IDX")
                 .ok()
@@ -392,13 +506,21 @@ impl Root {
         // 开发用：指定分享卡版式 / 底色，便于逐项核对。
         if let Ok(v) = std::env::var("JIANDU_SHARE_LAYOUT") {
             root.share_layout = match v.as_str() {
-                "rows" => CardLayout::Rows,
                 "single" => CardLayout::Single,
+                "note" => CardLayout::Note,
                 _ => CardLayout::Columns,
             };
         }
         if let Ok(v) = std::env::var("JIANDU_SHARE_BG") {
             root.share_bg = v.parse().unwrap_or(0);
+        }
+        // 开发用：指定丝栏色（0 乌 / 1 金 / 2 朱），便于逐色截图核对。
+        if let Ok(v) = std::env::var("JIANDU_RULE") {
+            if let Ok(i) = v.parse::<usize>() {
+                if let Some(rc) = crate::types::RuleColor::ALL.get(i) {
+                    root.rule_color = *rc;
+                }
+            }
         }
         // 开发用：展开样式面板 / 切到字体页。
         if std::env::var("JIANDU_STYLE_OPEN").is_ok() {
@@ -473,7 +595,8 @@ impl Root {
     /// 关键：可用区域必须扣掉纸面自身的「 chrome 」——
     ///   * 古籍竖笺：sheet p_4(16×2) + border_3+border_1(8×2) + 版框双边
     ///     （`ANCIENT_EDGE` 50）、地脚鱼尾叶码（`ANCIENT_FOOT` 12，脚注模式
-    ///     再加 `ANCIENT_NOTES`）；双面对开两叶之间还有 `LEAF_GAP`(16px)。
+    ///     再加 `ANCIENT_NOTES`）；双面对开两叶之间还有一道版心中缝
+    ///     （宽约一行字，见 `crate::grid::gutter_w`）。
     ///   * 章题列占「格内一列」：章首页 = 列数-1 个正文列 + 1 个章题列，
     ///     总宽仍是 列数×col_w，不额外外扩。
     /// 少算任何一项，纸面就会超出视口被裁掉边框（双面对开尤其明显：
@@ -588,6 +711,21 @@ impl Root {
                 self.grid.dir = GridDir::Vertical;
                 // 恢复上次阅读进度。
                 self.page = entry.last_page;
+                // 全书统计（章数 / 字数）开卷时算一次：章末那张「篇·章·字」
+                // 小表要用到「全書」一行，放渲染里逐帧扫全书太贵。
+                self.book_stat = (
+                    book.chapters.len(),
+                    book.chapters
+                        .iter()
+                        .flat_map(|c| c.paragraphs.iter())
+                        .map(|p| {
+                            p.text
+                                .chars()
+                                .filter(|ch| !ch.is_whitespace() && !crate::types::is_punct(*ch))
+                                .count()
+                        })
+                        .sum(),
+                );
                 self.book = Some(book);
                 self.notes = nt;
                 self.underlines = ul.into_iter().collect();
@@ -601,6 +739,9 @@ impl Root {
                 self.rename_draft.clear();
                 self.rename_cursor = 0;
                 self.delete_confirm = None;
+                self.shelf_expand = None;
+                self.shelf_recat = None;
+                self.shelf_searching = false;
                 self.popup = None;
                 self.sel_anchor = None;
                 self.sel_focus = None;
@@ -630,7 +771,15 @@ impl Root {
             Duplex::Facing => "facing",
             Duplex::Single => "single",
         };
-        self.library.touch(idx, page, total, &script, duplex);
+        // 当前卷册：书架「当前卷册」一栏直接显示它，不必再开书。
+        let chapter = self
+            .book
+            .as_ref()
+            .and_then(|b| b.chapters.get(self.current_chapter))
+            .map(|c| c.title.clone())
+            .unwrap_or_default();
+        self.library
+            .touch(idx, page, total, &script, duplex, &chapter);
     }
 
     /// 回到书架。
@@ -638,6 +787,44 @@ impl Root {
         self.persist();
         self.screen = Screen::Shelf;
         self.book = None;
+        // 回书架时收起书的临时态；搜索词与视图/排序保留（用户偏好）。
+        self.shelf_searching = false;
+        self.shelf_expand = None;
+        self.shelf_recat = None;
+        self.delete_confirm = None;
+    }
+
+    /// 「继续阅读」：直接打开最近读过的那本；一本书都没读过则打开第一本。
+    pub fn shelf_continue(&mut self) {
+        let idx = self
+            .library
+            .books
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.last_read > 0 || e.last_page > 0)
+            .max_by_key(|(_, e)| e.last_read)
+            .map(|(i, _)| i)
+            .or(if self.library.books.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
+        if let Some(i) = idx {
+            self.open_book(i);
+        } else {
+            self.notice = "书架还是空的，先导入一本".into();
+        }
+    }
+
+    /// 改一本书的归类（书架「改归类」浮层用）。
+    pub fn recat_book(&mut self, idx: usize, cat: &str) {
+        self.library.set_category(idx, cat);
+        self.shelf_recat = None;
+        self.notice = if cat.is_empty() {
+            "已恢复按书名自动归类".to_string()
+        } else {
+            format!("已归入「{cat}」")
+        };
     }
 
     /// 把文件导入书架。
@@ -1160,6 +1347,22 @@ impl Root {
         )
     }
 
+    /// 排版耗时探针：`JIANDU_TIMING=1` 时每次分页打一行到 stderr。
+    /// 全书逐帧重排是当前引擎的**规模上限所在**，量出来才知道能装多厚的书。
+    pub fn layout_pages_timed(&self) -> Vec<crate::gloss::Page> {
+        let t0 = std::time::Instant::now();
+        let pages = self.layout_pages();
+        if std::env::var("JIANDU_TIMING").is_ok() {
+            eprintln!(
+                "[layout] {} 章 / {} 页 / {} ms",
+                self.book.as_ref().map(|b| b.chapters.len()).unwrap_or(0),
+                pages.len(),
+                t0.elapsed().as_millis()
+            );
+        }
+        pages
+    }
+
     /// 卷首题署所需字符数上限：对每章取「书名 + 卷次 + 1 行间隔 + 署名」的字符数，
     /// 取全书最大值。这个值只决定章首页开卷列顶部预留多少行，渲染层按预留带裁切。
     fn chapter_inscription_need(&self) -> usize {
@@ -1228,6 +1431,8 @@ impl Root {
     /// （注块随纸面一起滚，命中矩形同步平移）。
     pub fn note_box_at(&self, x: f32, y: f32) -> Option<&crate::gloss::NoteBox> {
         let facing = self.duplex == Duplex::Facing;
+        // 中缝宽与渲染层同源（grid::gutter_w）：对开时两叶之间隔的就是它。
+        let gap = crate::grid::gutter_w(self.content_w, self.grid.columns, ANCIENT_EDGE, self.grid.margin);
         self.note_boxes.iter().find(|b| {
             let (ox, oy) = crate::gloss::leaf_origin(
                 facing,
@@ -1235,6 +1440,7 @@ impl Root {
                 self.viewport_h,
                 self.page_w,
                 self.page_h,
+                gap,
                 b.back,
                 self.focus_mode,
             );
@@ -1303,6 +1509,7 @@ impl Root {
         self.note_pos = at;
         self.note_editing = true;
         self.note_edit_note = None; // 页眉批注
+        self.note_suppress_commit = true; // 忽略「打开这一下」点击的自动提交
         self.popup = None;
     }
 
@@ -1342,6 +1549,7 @@ impl Root {
         self.note_pos = at;
         self.note_editing = true;
         self.note_edit_note = Some(key);
+        self.note_suppress_commit = true;
         self.popup = None;
         self.note_zoom = None;
     }
@@ -1383,6 +1591,7 @@ impl Root {
         let text = std::mem::take(&mut self.note_draft);
         let target = self.note_edit_note.take();
         self.note_editing = false;
+        self.note_suppress_commit = false;
         self.note_cursor = 0;
         self.note_pos = None;
         match target {
@@ -1409,6 +1618,7 @@ impl Root {
     /// 取消编辑（丢弃草稿）。
     pub fn cancel_note_edit(&mut self) {
         self.note_editing = false;
+        self.note_suppress_commit = false;
         self.note_edit_note = None;
         self.note_draft.clear();
         self.note_cursor = 0;
@@ -1625,8 +1835,9 @@ pub fn draft_move(draft: &str, cursor: &mut usize, left: bool) {
 
 // ---- 纸面 chrome 常量（与 reader.rs 的实际渲染严格对应，改渲染须同步改这里）----
 // （现代横笺 chrome 已随「现代横笺」模式移除，只剩古籍竖笺。）
-/// 双面对开两叶之间的间距（gap_4）。
-pub const LEAF_GAP: f32 = 16.0;
+/// 双面对开两叶之间的「版心（中缝）」宽：约等于一行字宽，随列数走，
+/// 由 `grid::gutter_w(content_w, columns)` 统一算出——渲染层与引擎同源，
+/// 本文件不再另存副本（旧常量 `LEAF_GAP = 32` 已并入该函数）。
 
 /// 古文竖笺纸面 chrome（横 / 纵共用）：sheet p_4(16×2=32) + 版框双边
 /// （外 3×2 + 中缝 3×2 + 内 1×2 = 14）+ 余量 ≈ 50。
@@ -1663,15 +1874,39 @@ fn ensure_assets() {
     // 鱼尾纹：一枚朝下的实心三角，从顶边正中劈开一道窄缝，形似鱼尾（上尾朝下、下尾朝上）。
     // 注意 GPUI 只取 SVG 的 alpha 通道再用元素 text_color 上色，故 fill 必须为不透明实色。
     let top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 13\"><path d=\"M0,0 L11,0 L12,13 Z M24,0 L13,0 L12,13 Z\" fill=\"#1A150F\"/></svg>";
-    // 版心鱼尾：比目录里那枚更竖长（24×17），两瓣自顶边向中缝收成一尖，
-    // 尾尖朝下；下鱼尾是同一形状上下翻转。影印本里鱼尾近方、不扁。
+    // 版心鱼尾：竖长粗壮的实体楔形（viewBox 24×40，高约为瓣宽 1.7 倍），
+    // 两瓣自顶边向中缝收成一尖，尾尖朝下；下鱼尾是同一形状上下翻转。
+    // 样式仿用户参考图「古风3」版心上下那对黑鱼尾（GPUI 只取 SVG 的
+    // alpha 通道再用元素 text_color 上色，故 fill 必须为不透明实色）。
     let bx_top = dir.join("banxin_top.svg");
     let bx_bot = dir.join("banxin_bottom.svg");
-    let bx_top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 17\"><path d=\"M0,0 L10.4,0 L12,17 Z M24,0 L13.6,0 L12,17 Z\" fill=\"#1A150F\"/></svg>";
-    let bx_bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 17\"><path d=\"M0,17 L10.4,17 L12,0 Z M24,17 L13.6,17 L12,0 Z\" fill=\"#1A150F\"/></svg>";
+    let bx_top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 40\"><path d=\"M0,0 L10.4,0 L12,40 Z M24,0 L13.6,0 L12,40 Z\" fill=\"#1A150F\"/></svg>";
+    let bx_bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 40\"><path d=\"M0,40 L10.4,40 L12,0 Z M24,40 L13.6,40 L12,0 Z\" fill=\"#1A150F\"/></svg>";
     let _ = std::fs::write(&bx_top, bx_top_svg);
     let _ = std::fs::write(&bx_bot, bx_bot_svg);
     let bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 13\"><path d=\"M0,13 L11,13 L12,0 Z M24,13 L13,13 L12,0 Z\" fill=\"#1A150F\"/></svg>";
+    // 朱砂小印「箋讀」的小篆字稿：两枚 100×100 的等粗圆头线篆（墨色由
+    // 渲染层 text_color 换成朱砂红）。随系统没有篆体字库，索性照小篆结构
+    // （左右对称、笔势圆匀、收笔不出锋）手写成路径，缩到 20px 见方也读得出
+    // 是一方印。见 reader::banxin_seal。
+    let seal_jian = dir.join("seal_jian.svg");
+    let seal_du = dir.join("seal_du.svg");
+    // 箋：上「竹」两枚圆头个形，下「戔」两戈相叠（下戈钩向左）。
+    let jian_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\"><g fill=\"none\" stroke=\"#1A150F\" stroke-width=\"7\" stroke-linecap=\"round\" stroke-linejoin=\"round\">\
+<path d=\"M46,10 C39,18 34,26 31,32\"/><path d=\"M46,10 C47,20 45,32 43,44\"/>\
+<path d=\"M54,10 C61,18 66,26 69,32\"/><path d=\"M54,10 C53,20 55,32 57,44\"/>\
+<path d=\"M20,50 L84,50\"/><path d=\"M82,28 L80,66\"/><path d=\"M80,66 C80,74 74,78 66,78\"/><path d=\"M82,28 C74,32 66,36 58,40\"/>\
+<path d=\"M16,84 L80,84\"/><path d=\"M21,60 L23,94\"/><path d=\"M23,94 C23,98 27,99 35,99\"/><path d=\"M21,60 C29,64 37,68 45,72\"/></g></svg>";
+    // 讀：左「言」（横画 + 一口 + 中间两短横，中竖直贯），右「賣」
+    // （上士、中网目、下貝）。
+    let du_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\"><g fill=\"none\" stroke=\"#1A150F\" stroke-width=\"7\" stroke-linecap=\"round\" stroke-linejoin=\"round\">\
+<path d=\"M6,18 L40,14\"/><path d=\"M34,16 L28,92\"/>\
+<path d=\"M8,34 L40,34\"/><path d=\"M8,60 L40,60\"/><path d=\"M8,34 L8,60\"/><path d=\"M40,34 L40,60\"/><path d=\"M14,47 L34,47\"/>\
+<path d=\"M54,16 L98,16\"/><path d=\"M60,32 L92,32\"/><path d=\"M76,4 L76,32\"/>\
+<path d=\"M56,44 L96,44\"/><path d=\"M56,72 L96,72\"/><path d=\"M56,44 L56,72\"/><path d=\"M96,44 L96,72\"/><path d=\"M62,56 L90,56\"/><path d=\"M66,63 L86,63\"/>\
+<path d=\"M56,84 L96,84\"/><path d=\"M56,96 L96,96\"/><path d=\"M56,84 L56,96\"/><path d=\"M96,84 L96,96\"/><path d=\"M62,90 L90,90\"/></g></svg>";
+    let _ = std::fs::write(&seal_jian, jian_svg);
+    let _ = std::fs::write(&seal_du, du_svg);
     // 资源很小，每次启动覆盖写入，保证形状随版本更新。
     let _ = std::fs::write(&top, top_svg);
     let _ = std::fs::write(&bot, bot_svg);
@@ -1717,6 +1952,9 @@ impl Render for Root {
         let search_open = self.show_search && !self.focus_mode;
         if self.rename_idx.is_some() {
             window.focus(&self.rename_focus);
+        } else if self.shelf_searching && self.screen == Screen::Shelf {
+            // 书架搜索框同理：焦点在它身上，中文才送得进来。
+            window.focus(&self.shelf_query_focus);
         } else if search_open {
             window.focus(&self.search_focus);
         } else if self.note_editing {
@@ -1823,12 +2061,13 @@ mod tests {
 
     #[test]
     fn ancient_facing_focus_fills_screen() {
-        // 专注对开（模拟横屏 iPad）：两叶 + 间隙撑满整宽，高度不溢出。
+        // 专注对开（模拟横屏 iPad）：两叶 + 中缝撑满整宽，高度不溢出。
         let cfg = GridConfig {
             columns: 8,
             dir: GridDir::Vertical,
             margin: 0.04,
         };
+        let gap = crate::grid::gutter_w(VW, 8, ANCIENT_EDGE, cfg.margin);
         let m = compute_grid(
             VW,
             VH,
@@ -1840,9 +2079,15 @@ mod tests {
             ANCIENT_FOOT,
             0.0,
         );
-        assert!(2.0 * m.outer_w + LEAF_GAP <= VW + 0.5);
-        assert!(2.0 * m.outer_w + LEAF_GAP > VW * 0.95);
+        assert!(2.0 * m.outer_w + gap <= VW + 0.5);
+        assert!(2.0 * m.outer_w + gap > VW * 0.95);
         assert!(m.outer_h <= VH + 0.5, "对开纸高 {:.1} 超 {VH}", m.outer_h);
+        // 中缝宽约等于一行字宽（用户参考图「古风3」的要求）。
+        assert!(
+            (gap - m.col_w).abs() <= m.col_w * 0.12,
+            "中缝宽 {gap:.1} 应与一行字宽 {:.1} 相当",
+            m.col_w
+        );
     }
 
     #[test]
@@ -1857,12 +2102,13 @@ mod tests {
 
     #[test]
     fn ancient_facing_fits_two_leaves() {
-        // 古文竖笺双面对开：两叶并排 + 间隙不得超出内容宽度。
+        // 古文竖笺双面对开：两叶并排 + 中缝不得超出内容宽度。
         let (cw, _ch) = content();
         let m = grid_metrics(8, true);
+        let gap = crate::grid::gutter_w(cw, 8, ANCIENT_EDGE, 0.04);
         assert!(
-            2.0 * m.outer_w + LEAF_GAP <= cw + 0.5,
-            "古文双面纸宽 {:.1}×2 + 间隙 超 {cw}",
+            2.0 * m.outer_w + gap <= cw + 0.5,
+            "古文双面纸宽 {:.1}×2 + 中缝 超 {cw}",
             m.outer_w
         );
         // 字号不低于最小字号（不会被折半压到看不清）。
@@ -1889,7 +2135,7 @@ mod tests {
             ANCIENT_FOOT,
             0.0,
         );
-        assert!(2.0 * m.outer_w + LEAF_GAP <= cw + 0.5);
+        assert!(2.0 * m.outer_w + crate::grid::gutter_w(cw, 8, ANCIENT_EDGE, 0.04) <= cw + 0.5);
     }
 
     #[test]
