@@ -1874,14 +1874,16 @@ fn ensure_assets() {
     // 鱼尾纹：一枚朝下的实心三角，从顶边正中劈开一道窄缝，形似鱼尾（上尾朝下、下尾朝上）。
     // 注意 GPUI 只取 SVG 的 alpha 通道再用元素 text_color 上色，故 fill 必须为不透明实色。
     let top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 13\"><path d=\"M0,0 L11,0 L12,13 Z M24,0 L13,0 L12,13 Z\" fill=\"#1A150F\"/></svg>";
-    // 版心鱼尾：竖长粗壮的实体楔形（viewBox 24×40，高约为瓣宽 1.7 倍），
-    // 两瓣自顶边向中缝收成一尖，尾尖朝下；下鱼尾是同一形状上下翻转。
-    // 样式仿用户参考图「古风3」版心上下那对黑鱼尾（GPUI 只取 SVG 的
-    // alpha 通道再用元素 text_color 上色，故 fill 必须为不透明实色）。
+    // 版心鱼尾：完整照搬用户参考图「横版」中缝里那两枚——**横长黑矩形**
+    // （骑跨版心、上下各一枚：上鱼尾在篇题之上，下鱼尾在叶码之下），
+    // 上边平直满宽、下缘两角微收成浅 V；下鱼尾上下翻转同形。
+    // viewBox 24×9（宽高比约 33:12，与参考图一致）。GPUI 只取 SVG 的
+    // alpha 通道再用元素 text_color 上色，故 fill 必须为不透明实色。
+    // 见 reader::banxin_tail。
     let bx_top = dir.join("banxin_top.svg");
     let bx_bot = dir.join("banxin_bottom.svg");
-    let bx_top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 40\"><path d=\"M0,0 L10.4,0 L12,40 Z M24,0 L13.6,0 L12,40 Z\" fill=\"#1A150F\"/></svg>";
-    let bx_bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 40\"><path d=\"M0,40 L10.4,40 L12,0 Z M24,40 L13.6,40 L12,0 Z\" fill=\"#1A150F\"/></svg>";
+    let bx_top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 9\"><path d=\"M0,0 L24,0 L24,6.4 L13.5,9 L10.5,9 L0,6.4 Z\" fill=\"#1A150F\"/></svg>";
+    let bx_bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 9\"><path d=\"M0,9 L24,9 L24,2.6 L13.5,0 L10.5,0 L0,2.6 Z\" fill=\"#1A150F\"/></svg>";
     let _ = std::fs::write(&bx_top, bx_top_svg);
     let _ = std::fs::write(&bx_bot, bx_bot_svg);
     let bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 13\"><path d=\"M0,13 L11,13 L12,0 Z M24,13 L13,13 L12,0 Z\" fill=\"#1A150F\"/></svg>";

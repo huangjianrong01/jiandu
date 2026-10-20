@@ -198,10 +198,12 @@ fn fish_tail_ink(width: f32, top: bool, color: u32) -> Div {
         )
 }
 
-/// 版心鱼尾：竖长粗壮的实体楔形（viewBox 24×40，高约为瓣宽 1.7 倍，
-/// 仿用户参考图「古风3」版心上下那对黑鱼尾），贴篇题上下各一枚。
+/// 版心鱼尾：完整照搬用户参考图「横版」中缝里那两枚——**横长黑矩形**
+/// （骑跨版心：上鱼尾在篇题之上、下鱼尾在叶码之下），上边平直满宽、
+/// 下缘两角微收成浅 V；下鱼尾同一形状上下翻转。viewBox 24×9
+/// （宽高比约 33:12，与参考图一致）。
 fn banxin_tail(width: f32, top: bool, color: u32) -> Div {
-    let h = width * 40.0 / 24.0;
+    let h = width * 9.0 / 24.0;
     let path = if top {
         "banxin_top.svg"
     } else {
@@ -221,24 +223,6 @@ fn banxin_tail(width: f32, top: bool, color: u32) -> Div {
                 .h(px(h))
                 .text_color(rgb(color)),
         )
-}
-
-/// 版心双鱼尾：两枚并排（刻本版心上下两端的「双鱼尾」）。
-/// 影印本里双鱼尾比单尾窄一半，两枚之间留一道细缝，整组仍收在
-/// `total_w` 以内——中缝与章题列通用。样式仿用户参考图「古风3」：
-/// 粗壮实体黑楔形，上尾宽边在上、收尖朝下，下尾反之。
-fn banxin_tails(total_w: f32, top: bool, color: u32) -> Div {
-    let gap = 2.0;
-    let each = ((total_w - gap) / 2.0).max(3.0);
-    div()
-        .w(px(total_w))
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_center()
-        .gap(px(gap))
-        .child(banxin_tail(each, top, color))
-        .child(banxin_tail(each, top, color))
 }
 
 /// 版心小印：朱砂红「箋讀」小方印，嵌在中缝的下鱼尾之下（影印本版心
@@ -2300,8 +2284,8 @@ impl Root {
             .border_color(rgb(t.rule_by(self.rule_color)));
         // 天头：留约一字高的空白，鱼尾才落在版心上部而不是贴框。
         col = col.child(div().h(px(cell_h * 1.0)));
-        // 上双鱼尾：尾朝下，整组略窄于列（影印本鱼尾不顶格）。
-        col = col.child(banxin_tails(col_w * 0.86, true, t.frame_ink()));
+        // 上鱼尾：横长黑矩形，骑跨版心（照参考图「横版」：鱼尾在篇题之上）。
+        col = col.child(banxin_tail(col_w * 0.98, true, t.frame_ink()));
         col = col.child(div().h(px(cell_h * 0.18)));
         // 篇题：一字一格，自上面下。
         for c in title.chars().take(7) {
@@ -2334,15 +2318,16 @@ impl Root {
             );
         }
         col = col.child(div().h(px(cell_h * 0.1)));
-        // 下双鱼尾：尾朝上，与上鱼尾对合，夹住篇题与叶码。
-        col = col.child(banxin_tails(col_w * 0.86, false, t.frame_ink()));
+        // 下鱼尾：与上鱼尾对合，夹住篇题与叶码。
+        col = col.child(banxin_tail(col_w * 0.98, false, t.frame_ink()));
         col.child(div().h(px(cell_h * 0.38)))
     }
 
-    /// 中缝（版心）：对开时立在纸心的一道竖栏，上下双鱼尾夹住篇题与叶码，
-    /// 下端再嵌一枚朱砂小印。缝宽约等于一行字宽（`grid::gutter_w`）：
-    /// 刻本版心本就是一列字的宽度；纸面总宽不变，只是把原来「两叶之间的
-    /// 空白」换成纸心的一道版心。
+    /// 中缝（版心）：对开时立在纸心的一道竖栏——左右两道细框线（与页内
+    /// 界行同粗细）夹一字宽的纸带，带上鱼尾（横长黑矩形，骑跨版心）、
+    /// 篇题、叶码、朱砂小印自上而下排布。缝宽约等于一行字宽
+    /// （`grid::gutter_w`）：刻本版心本就是一列字的宽度；纸面总宽不变，
+    /// 只是把原来「两叶之间的空白」换成纸心的一道版心。
     /// 左半叶是章首时不用它——那一叶自带的「章题列」本身就是版心。
     fn render_gutter(&self, chapter: usize, page_idx: usize, detailed: bool) -> Div {
         let t = self.theme;
@@ -2372,11 +2357,16 @@ impl Root {
             .overflow_hidden()
             .pt(px(16.0 + 4.0))
             .pb(px(16.0 + 4.0))
-            .bg(rgb(t.paper()));
+            .bg(rgb(t.paper()))
+            // 版心左右框线：与页内界行同粗细（1px）、同取色（乌 / 金 / 朱
+            // 丝栏）。参考图「横版」里中缝就是两道细线夹一字宽的纸带，
+            // 鱼尾、篇题、叶码都立在这道纸带里。
+            .border_l_1()
+            .border_r_1()
+            .border_color(rgb(t.rule_by(self.rule_color)));
         col = col.child(div().h(px(cell_h * 0.85)));
-        // 中缝上下两端的双鱼尾：两枚并排，收在缝宽以内（缝里还立着小印，
-        // 鱼尾顶到边角会挤成一团黑）。
-        col = col.child(banxin_tails(gw * 0.86, true, t.frame_ink()));
+        // 上鱼尾：横长黑矩形，骑跨版心（照参考图「横版」：鱼尾在篇题之上）。
+        col = col.child(banxin_tail(gw * 0.98, true, t.frame_ink()));
         col = col.child(div().h(px(cell_h * 0.16)));
         if detailed {
             for c in self.chapter_title(chapter).chars().take(6) {
@@ -2410,7 +2400,8 @@ impl Root {
             }
         }
         col = col.child(div().h(px(cell_h * 0.12)));
-        col = col.child(banxin_tails(gw * 0.86, false, t.frame_ink()));
+        // 下鱼尾：与上鱼尾对合，夹住篇题与叶码。
+        col = col.child(banxin_tail(gw * 0.98, false, t.frame_ink()));
         // 朱砂小印「箋讀」：贴版心下端（影印本版心印落在下鱼尾之下）。
         col = col.child(div().h(px(cell_h * 0.26)));
         col.child(banxin_seal(gw * 0.80, gw * 1.60))
