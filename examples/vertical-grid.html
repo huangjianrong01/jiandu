@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>笺读 · 竖排网格引擎（界栏 / 避头尾 / 分页 / 手势 / 卷目）</title>
+<style>
+  html,body{margin:0;height:100%;background:#e9e3d2;overflow:hidden;
+    font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;-webkit-user-select:none;user-select:none;}
+  #cv{display:block;touch-action:none;}
+
+  /* ---------- 自检面板 ---------- */
+  #hud{position:fixed;left:12px;top:12px;background:rgba(250,247,238,.94);border:1px solid #c9bda2;
+    border-radius:6px;padding:10px 12px;font-size:12px;line-height:1.7;color:#3a3128;
+    box-shadow:0 2px 10px rgba(0,0,0,.12);max-width:280px;}
+  #hud h3{margin:0 0 6px;font-size:13px;font-weight:600;letter-spacing:.5px;}
+  #hud .row{display:flex;align-items:center;gap:5px;margin:3px 0;flex-wrap:wrap;}
+  #hud button{border:1px solid #b9ac90;background:#f6f1e4;color:#3a3128;border-radius:4px;
+    padding:2px 7px;font-size:12px;cursor:pointer;font-family:inherit;}
+  #hud button.on{background:#a33b2b;color:#fff5e6;border-color:#a33b2b;}
+  #hud .k{color:#8a7a5f;}
+  #hud .v{font-variant-numeric:tabular-nums;font-weight:600;}
+  #hud hr{border:0;border-top:1px dashed #cfc3a8;margin:8px 0;}
+  #hud .tip{font-size:11px;color:#7d6f55;}
+
+  /* ---------- 底部菜单栏（古风） ---------- */
+  #bar{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);display:flex;gap:2px;
+    background:rgba(27,38,45,.93);border:1px solid rgba(214,236,240,.16);border-radius:5px;
+    padding:3px;box-shadow:0 4px 16px rgba(0,0,0,.28);}
+  #bar button{appearance:none;border:0;background:transparent;color:#d6ecf0;cursor:pointer;
+    font-family:"Songti SC","STSong","Source Han Serif SC",serif;font-size:14px;letter-spacing:3px;
+    padding:6px 14px;border-radius:3px;writing-mode:vertical-rl;height:74px;}
+  #bar button:hover{background:rgba(214,236,240,.10);}
+  #bar button.hot{color:#e0655a;}
+
+  /* ---------- 卷目面板（竖排 · 右起） ---------- */
+  #mask{position:fixed;inset:0;background:rgba(20,16,12,.34);opacity:0;pointer-events:none;
+    transition:opacity .34s ease;}
+  #mask.show{opacity:1;pointer-events:auto;}
+  #toc{position:fixed;top:0;right:0;height:100%;width:min(46vw,420px);min-width:290px;
+    background:linear-gradient(100deg,#24343e 0%,#1b2a33 62%,#17232b 100%);
+    border-left:1px solid rgba(214,236,240,.20);
+    box-shadow:-14px 0 40px rgba(0,0,0,.34);
+    transform:translateX(102%);transition:transform .38s cubic-bezier(.22,.61,.36,1);
+    display:flex;flex-direction:row-reverse;align-items:stretch;padding:26px 18px;gap:14px;
+    font-family:"Songti SC","STSong","Source Han Serif SC","Noto Serif CJK SC",serif;
+    z-index:20;}
+  #toc.open{transform:translateX(0);}
+
+  /* 版框：面板内也来一道乌丝栏 */
+  #toc::after{content:"";position:absolute;inset:12px;border:1px solid rgba(214,236,240,.13);
+    pointer-events:none;}
+
+  .toc-head{writing-mode:vertical-rl;display:flex;align-items:flex-start;gap:10px;
+    border-left:1px solid rgba(214,236,240,.16);padding-left:14px;}
+  .toc-head .cap{font-size:23px;letter-spacing:8px;color:#d6ecf0;font-weight:600;}
+  .toc-head .sub{font-size:12px;letter-spacing:3px;color:rgba(214,236,240,.52);margin-top:6px;}
+
+  .toc-body{flex:1;min-width:0;display:flex;flex-direction:row-reverse;align-items:flex-start;
+    gap:12px;overflow-x:auto;overflow-y:hidden;padding:6px 4px 10px;scrollbar-width:thin;}
+  .toc-body::-webkit-scrollbar{height:6px;}
+  .toc-body::-webkit-scrollbar-thumb{background:rgba(214,236,240,.22);border-radius:3px;}
+
+  .toc-item{position:relative;appearance:none;border:0;background:transparent;cursor:pointer;
+    writing-mode:vertical-rl;text-orientation:mixed;
+    font-family:inherit;font-size:17px;letter-spacing:4px;color:#d6ecf0;
+    padding:16px 7px 10px;border-radius:2px;white-space:nowrap;
+    transition:color .18s,background .18s;flex:0 0 auto;}
+  .toc-item:hover{color:#fff;background:rgba(214,236,240,.08);}
+  /* 当前卷：朱砂红加粗 + 顶端一枚朱印 */
+  .toc-item.on{color:#e0655a;font-weight:700;background:rgba(200,72,58,.13);}
+  .toc-item.on::before{content:"";position:absolute;top:2px;left:50%;margin-left:-4px;
+    width:8px;height:8px;background:#c8483a;border-radius:1px;}
+
+  .toc-foot{writing-mode:vertical-rl;font-size:11px;letter-spacing:2px;
+    color:rgba(214,236,240,.42);border-right:1px solid rgba(214,236,240,.14);padding-right:12px;}
+  .toc-foot b{color:#e0655a;font-weight:700;}
+
+  /* ---------- 提示 ---------- */
+  #toast{position:fixed;left:50%;bottom:104px;transform:translateX(-50%) translateY(8px);
+    background:rgba(27,38,45,.95);color:#eaf2f4;padding:7px 18px;border-radius:4px;font-size:13px;
+    letter-spacing:2px;opacity:0;pointer-events:none;z-index:30;
+    transition:opacity .25s,transform .25s;
+    font-family:"Songti SC","STSong",serif;}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<div id="hud">
+  <h3>竖排网格引擎</h3>
+  <div class="row"><span class="k">每半叶列数</span>
+    <button data-cols="8">8</button><button data-cols="10">10</button>
+    <button data-cols="12">12</button><button data-cols="14">14</button>
+  </div>
+  <div class="row">
+    <button id="bRules">界栏</button><button id="bKinsoku">避头尾</button>
+    <button id="bVform">竖排引号</button><button id="bDebug">格线</button>
+  </div>
+  <hr>
+  <div><span class="k">半叶容量</span> <span class="v" id="sCap">-</span> <span class="k">字（列×行）</span></div>
+  <div><span class="k">当前叶</span> <span class="v" id="sLeaf">-</span> <span class="k">/ 共</span> <span class="v" id="sTotal">-</span></div>
+  <div><span class="k">当前卷</span> <span class="v" id="sChap">-</span></div>
+  <div><span class="k">charIndex</span> <span class="v" id="sIdx">-</span> <span class="k">/ 全文</span> <span class="v" id="sLen">-</span></div>
+  <div><span class="k">卷起点</span> <span class="v" id="sBase">-</span></div>
+  <div><span class="k">禁则违例</span> <span class="v" id="sBad">-</span> <span class="k">（应为 0）</span></div>
+  <hr>
+  <div class="tip">右→左滑／点左 1/3 ＝下一叶<br>左→右滑／点右 1/3 ＝上一叶<br><b>点中间 1/3 ＝卷目</b>　T 键也可<br>方向键 ←→ 翻叶　Esc 收面板</div>
+  <div class="row" style="margin-top:6px">
+    <button id="bLoad">载入书稿 JSON</button>
+    <input type="file" id="fJson" accept=".json,.txt" hidden>
+  </div>
+</div>
+
+<!-- 底部菜单栏 -->
+<div id="bar">
+  <button data-act="prev">上一葉</button>
+  <button data-act="toc" class="hot">卷目</button>
+  <button data-act="next">下一葉</button>
+</div>
+
+<!-- 卷目：遮罩 + 侧滑面板 -->
+<div id="mask"></div>
+<aside id="toc">
+  <div class="toc-head"><span class="cap">卷目</span><span class="sub" id="tocBook">-</span></div>
+  <div class="toc-body" id="tocBody"></div>
+  <div class="toc-foot">共 <b id="tocCount">0</b> 卷</div>
+</aside>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+/* ===========================================================================
+   笺读 · 竖排网格引擎
+   ---------------------------------------------------------------------------
+   全部坐标公式集中在一处，便于核对：
+
+   ① 版框（半叶）几何
+      innerW  = W - 2*margin                  页面去掉页边距后的宽
+      innerH  = H - 2*margin                  页面去掉页边距后的高
+      plateW  = innerW / (2 + gutterRatio)    半叶版框宽（中缝 = 半叶宽的 ratio）
+      gutter  = plateW * gutterRatio          中缝（版心）宽
+      plateH  = innerH                        半叶版框高
+
+   ② 字格
+      colW    = plateW / cols                 界栏列宽（cols = 8/10/12/14）
+      cellH   = colW                          字格取近方形（竖排一格一字）
+      rows    = floor(plateH / cellH)         每列能排多少字
+      fontSize= colW * 0.78                   字号留 11% 余量，字不顶格
+
+   ③ 字格坐标（关键：竖排从右向左，第 0 列在最右）
+      plateX(h) = h===0 ? margin + plateW + gutter   // h=0 右半叶（先读）
+                        : margin                     // h=1 左半叶（后读）
+      x  = plateX(h) + (cols - 1 - c) * colW   // c 为「读序列号」，0 = 该半叶最右列
+      y  = margin + r * cellH                  // r 为行号，0 = 最上
+      cx = x + colW / 2                        // 字心（居中）
+      cy = y + cellH / 2
+
+   ④ 界栏竖线（列与列之间的分隔，画在列右缘）
+      xRule(i) = plateX(h) + i * colW          // i = 1 .. cols-1
+
+   ⑤ 分页（注意：容量按「字」算，切片按「列」切）
+      perHalf = cols * rows                    // 半叶容量，单位是字
+      perLeaf = perHalf * 2                    // 一叶 = 左右两半叶
+      右半叶 cols 列 → 左半叶 cols 列 → 再翻下一叶
+
+   ⑥ 卷目跳转（charIndex → 重排 → 第一叶）
+      baseIdx  = 当前起始 charIndex（跳转某卷时 = 该卷 startCharIndex）
+      body     = TEXT.slice(baseIdx)           // 从该字起，一直到书末
+      cols     = layoutColumns(body, rows)     // ★ 重新计算网格排版
+      LEAVES   = paginate(cols, colsPerHalf)
+      leafIdx  = 0                             // ★ 渲染第一叶
+      绝对下标 = baseIdx + 本叶首字.idx
+      所在卷   = 满足 startCharIndex <= 绝对下标 的最后一卷
+   =========================================================================== */
+
+// ----------------------------- 配置 -----------------------------
+const CFG = {
+  cols: 10,             // 每半叶列数：8 / 10 / 12 / 14
+  margin: 30,           // 页边距
+  gutterRatio: 0.13,    // 中缝宽 = 半叶宽 × 该比例
+  fontStack: '"Songti SC","STSong","Source Han Serif SC","Noto Serif CJK SC","PingFang SC","Hiragino Mincho ProN",serif',
+  showRules: true,      // 界栏（淡竖线）
+  showFrame: true,      // 版框
+  kinsoku: true,        // 避头尾（禁则）
+  vform: true,          // 「」 竖排变形
+  showDebug: false,     // 字格辅助线
+  // 点击方向：竖排内容右→左推进，故「下一叶」在屏幕左侧。
+  // 若你想要常见的「左＝上一页」，把这里改成 false 即可。
+  tapLeftGoesNext: true,
+};
+
+const PAPER = "#f2ead6", PAPER_BACK = "#ede3c8", INK = "#2a241e",
+      RULE = "#b9ac8c", FRAME = "#6b5a44", ACCENT = "#a33b2b";
+
+// --------------------------- 标点与禁则 ---------------------------
+// 标点总集（用于「偏右上」排版）
+const PUNCT = new Set("，。、；：？！…—～·《》「」『』（）〈〉");
+// 禁则·行首：这些字绝不能出现在列的第一格
+const FORBID_HEAD = new Set("，。、；：？！…）」』》〉～");
+// 禁则·行尾：这些字绝不能出现在列的最后一格
+const FORBID_TAIL = new Set("，。、；：？！…（「『《〈");
+// 竖排变形：优先用 Unicode 竖排专用字形 U+FE41..FE44
+const VFORM = { "「": "﹁", "」": "﹂", "『": "﹃", "』": "﹄" };
+
+const isPunct = ch => PUNCT.has(ch);
+
+/* ======================= ① 数据结构：书稿 JSON → 卷目 =======================
+   书稿就是一段 JSON。两种写法都认：
+     A. 章节自带正文（text 为字符串或字符串数组）→ 累加长度推出 startCharIndex
+     B. 章节直接给 startCharIndex，正文统一放在顶层 text
+   解析产物即用户要的形状：[{ title, startCharIndex }, ...]
+   ========================================================================= */
+const BOOK_JSON = {
+  "title": "千字文",
+  "author": "周兴嗣",
+  "chapters": [
+    { "title": "卷之一 天地玄黄", "text": [
+      "天地玄黄，宇宙洪荒。日月盈昃，辰宿列张。寒来暑往，秋收冬藏。",
+      "闰余成岁，律吕调阳。云腾致雨，露结为霜。金生丽水，玉出昆冈。",
+      "剑号巨阙，珠称夜光。果珍李柰，菜重芥姜。海咸河淡，鳞潜羽翔。",
+      "龙师火帝，鸟官人皇。始制文字，乃服衣裳。推位让国，有虞陶唐。",
+      "吊民伐罪，周发殷汤。坐朝问道，垂拱平章。爱育黎首，臣伏戎羌。"] },
+    { "title": "卷之二 盖此身发", "text": [
+      "遐迩一体，率宾归王。鸣凤在竹，白驹食场。化被草木，赖及万方。",
+      "盖此身发，四大五常。恭惟鞠养，岂敢毁伤。女慕贞洁，男效才良。",
+      "知过必改，得能莫忘。罔谈彼短，靡恃己长。信使可覆，器欲难量。",
+      "墨悲丝染，诗赞羔羊。景行维贤，克念作圣。德建名立，形端表正。",
+      "空谷传声，虚堂习听。祸因恶积，福缘善庆。尺璧非宝，寸阴是竞。"] },
+    { "title": "卷之三 资父事君", "text": [
+      "资父事君，曰严与敬。孝当竭力，忠则尽命。临深履薄，夙兴温凊。",
+      "似兰斯馨，如松之盛。川流不息，渊澄取映。容止若思，言辞安定。",
+      "笃初诚美，慎终宜令。荣业所基，籍甚无竟。学优登仕，摄职从政。",
+      "存以甘棠，去而益咏。乐殊贵贱，礼别尊卑。上和下睦，夫唱妇随。",
+      "外受傅训，入奉母仪。诸姑伯叔，犹子比儿。孔怀兄弟，同气连枝。"] },
+    { "title": "卷之四 交友投分", "text": [
+      "交友投分，切磨箴规。仁慈隐恻，造次弗离。节义廉退，颠沛匪亏。",
+      "性静情逸，心动神疲。守真志满，逐物意移。坚持雅操，好爵自縻。",
+      "都邑华夏，东西二京。背邙面洛，浮渭据泾。宫殿盘郁，楼观飞惊。",
+      "图写禽兽，画彩仙灵。丙舍傍启，甲帐对楹。肆筵设席，鼓瑟吹笙。",
+      "升阶纳陛，弁转疑星。右通广内，左达承明。既集坟典，亦聚群英。"] },
+    { "title": "卷之五 杜稿钟隶", "text": [
+      "杜稿钟隶，漆书壁经。府罗将相，路侠槐卿。户封八县，家给千兵。",
+      "高冠陪辇，驱毂振缨。世禄侈富，车驾肥轻。策功茂实，勒碑刻铭。",
+      "磻溪伊尹，佐时阿衡。奄宅曲阜，微旦孰营。桓公匡合，济弱扶倾。",
+      "绮回汉惠，说感武丁。俊乂密勿，多士寔宁。晋楚更霸，赵魏困横。",
+      "假途灭虢，践土会盟。何遵约法，韩弊烦刑。起翦颇牧，用军最精。"] },
+    { "title": "卷之六 宣威沙漠", "text": [
+      "宣威沙漠，驰誉丹青。九州禹迹，百郡秦并。岳宗泰岱，禅主云亭。",
+      "雁门紫塞，鸡田赤城。昆池碣石，巨野洞庭。旷远绵邈，岩岫杳冥。",
+      "治本于农，务兹稼穑。俶载南亩，我艺黍稷。税熟贡新，劝赏黜陟。",
+      "孟轲敦素，史鱼秉直。庶几中庸，劳谦谨敕。聆音察理，鉴貌辨色。",
+      "贻厥嘉猷，勉其祗植。省躬讥诫，宠增抗极。殆辱近耻，林皋幸即。"] },
+    { "title": "卷之七 两疏见机", "text": [
+      "两疏见机，解组谁逼。索居闲处，沉默寂寥。求古寻论，散虑逍遥。",
+      "欣奏累遣，戚谢欢招。渠荷的历，园莽抽条。枇杷晚翠，梧桐蚤凋。",
+      "陈根委翳，落叶飘摇。游鹍独运，凌摩绛霄。耽读玩市，寓目囊箱。",
+      "易輶攸畏，属耳垣墙。具膳餐饭，适口充肠。饱饫烹宰，饥厌糟糠。",
+      "亲戚故旧，老少异粮。妾御绩纺，侍巾帷房。纨扇圆洁，银烛炜煌。"] },
+    { "title": "卷之八 嫡后嗣续", "text": [
+      "昼眠夕寐，蓝笋象床。弦歌酒宴，接杯举觞。矫手顿足，悦豫且康。",
+      "嫡后嗣续，祭祀烝尝。稽颡再拜，悚惧恐惶。笺牒简要，顾答审详。",
+      "骸垢想浴，执热愿凉。驴骡犊特，骇跃超骧。诛斩贼盗，捕获叛亡。",
+      "布射僚丸，嵇琴阮啸。恬笔伦纸，钧巧任钓。释纷利俗，并皆佳妙。",
+      "毛施淑姿，工颦妍笑。年矢每催，曦晖朗曜。璇玑悬斡，晦魄环照。"] },
+    { "title": "卷之九 孤陋寡闻", "text": [
+      "指薪修祜，永绥吉劭。矩步引领，俯仰廊庙。束带矜庄，徘徊瞻眺。",
+      "孤陋寡闻，愚蒙等诮。谓语助者，焉哉乎也。"] }
+  ]
+};
+
+/** 解析书稿 → { title, author, text, toc:[{title,startCharIndex}] } */
+function parseBook(src) {
+  const book = (typeof src === "string") ? JSON.parse(src) : src;
+  const raw = Array.isArray(book.chapters) ? book.chapters : [];
+  const toc = [], parts = [];
+  let acc = 0;
+  for (const c of raw) {
+    const title = String(c.title ?? "");
+    // B 式：直接给了 startCharIndex 就照用；A 式：用累加值
+    toc.push({
+      title,
+      startCharIndex: Number.isFinite(c.startCharIndex) ? c.startCharIndex : acc,
+    });
+    const t = Array.isArray(c.text) ? c.text.join("") : (typeof c.text === "string" ? c.text : "");
+    if (t) { parts.push(t); acc += t.length; }
+  }
+  // 章节不含正文时，退回顶层 text（B 式数据）
+  const text = parts.length ? parts.join("") : String(book.text ?? "");
+  return { title: String(book.title ?? "无题"), author: String(book.author ?? ""), text, toc };
+}
+
+let BOOK = parseBook(BOOK_JSON);
+let TEXT = BOOK.text;
+let TOC  = BOOK.toc;
+/** 当前起始 charIndex：跳转某卷后 = 该卷 startCharIndex；正文从此字起排版 */
+let baseIdx = 0;
+
+/** 换书稿（外部 JSON / 对象 / JSON 字符串） */
+function loadBook(src) {
+  BOOK = parseBook(src);
+  TEXT = BOOK.text; TOC = BOOK.toc;
+  baseIdx = 0; leafIdx = 0;
+  buildTocList(); render();
+}
+
+/* =========================== 排版核心 ===========================
+   layoutColumns：把一维字流切成若干「列」，途中施加避头尾。
+   每个单元记录 {ch, idx}，idx 是它在「本次排版输入串」里的下标——挤压会让
+   idx 在视觉上「回跳」（前一列的字被挪到下一列），这正是挤压的痕迹。
+   绝对下标 = baseIdx + idx。
+   ============================================================== */
+function layoutColumns(text, rows, kinsoku) {
+  const cols = [];
+  let carry = [];   // 被挤下来的字：必须排在下一列开头
+  let i = 0, guard = 0;
+
+  while (i < text.length && guard++ < 200000) {
+    let col = carry.slice();
+    carry = [];
+
+    while (col.length < rows && i < text.length) {
+      const ch = text[i];
+
+      // ---- 行首禁则：标点不能落在列首 ----
+      if (kinsoku && col.length === 0 && FORBID_HEAD.has(ch)) {
+        const prev = cols[cols.length - 1];
+        // 挤压：把前一列末尾那个汉字挪下来，和这个标点一起排在本列开头。
+        // 前一列只剩一个字时不再挤（会把整列掏空），直接照排，避免死循环。
+        if (prev && prev.length >= 2 && !FORBID_HEAD.has(prev[prev.length - 1].ch)) {
+          col.push(prev.pop());
+          col.push({ ch, idx: i++ });
+          continue;
+        }
+        col.push({ ch, idx: i++ });
+        continue;
+      }
+
+      // ---- 行尾禁则：标点不能落在列底 ----
+      // 做法即用户要的「挤压」：本列最后那个汉字连同这个标点一起挪到下一列，
+      // 本列末格留空。
+      if (kinsoku && col.length === rows - 1 && col.length > 0 && FORBID_TAIL.has(ch)) {
+        carry.push(col.pop());
+        carry.push({ ch, idx: i++ });
+        break;
+      }
+
+      col.push({ ch, idx: i++ });
+    }
+
+    cols.push(col);
+  }
+  if (carry.length) cols.push(carry.slice());
+  return cols;
+}
+
+// --------------------------- 分页 ---------------------------
+// 一叶 = 两个半叶；每半叶 `colsPerHalf` **列**（注意是列数，不是字数）。
+// 字数容量是 cols*rows，但切片要按列切。右半叶在前（先读），左半叶在后。
+function paginate(cols, colsPerHalf) {
+  const leaves = [];
+  for (let i = 0; i < cols.length; i += colsPerHalf * 2) {
+    const right = cols.slice(i, i + colsPerHalf);                       // 右半叶
+    const left = cols.slice(i + colsPerHalf, i + colsPerHalf * 2);      // 左半叶
+    leaves.push({ right, left });
+  }
+  return leaves;
+}
+
+// ---------------------- 竖排引号字形检测 ----------------------
+// 字体没有 U+FE41 等竖排字形时，回退到旋转（用私用区字做「缺字」基准）。
+function hasGlyph(ctx, ch) {
+  const w = ctx.measureText(ch).width;
+  const ref = ctx.measureText("\uE000").width;
+  return w > 0 && Math.abs(w - ref) > 0.5;
+}
+
+// ------------------------- 汉字数字 -------------------------
+const CN_D = ["零","一","二","三","四","五","六","七","八","九"];
+function cnNumber(n) {
+  if (n <= 0) return "零";
+  if (n < 10) return CN_D[n];
+  if (n < 20) return "十" + (n % 10 ? CN_D[n % 10] : "");
+  if (n < 100) return CN_D[Math.floor(n / 10)] + "十" + (n % 10 ? CN_D[n % 10] : "");
+  if (n < 1000) {
+    const h = Math.floor(n / 100), t = Math.floor(n / 10) % 10, o = n % 10;
+    let s = CN_D[h] + "百";
+    if (t === 0 && o) s += "零" + CN_D[o];
+    else if (t) s += CN_D[t] + "十" + (o ? CN_D[o] : "");
+    return s;
+  }
+  return String(n);
+}
+
+// ============================ 绘制 ============================
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+let G = null;          // 当前几何
+let LEAVES = [];       // 页
+let leafIdx = 0;
+
+function geometry(W, H) {
+  const margin = CFG.margin;
+  const innerW = Math.max(120, W - margin * 2);
+  const innerH = Math.max(120, H - margin * 2);
+  const plateW = innerW / (2 + CFG.gutterRatio);
+  const gutter = plateW * CFG.gutterRatio;
+  const plateH = innerH;
+  const colW = plateW / CFG.cols;
+  const cellH = colW;
+  const rows = Math.max(1, Math.floor(plateH / cellH));
+  const fontSize = colW * 0.78;
+  return { W, H, margin, plateW, plateH, gutter, colW, cellH, rows, fontSize,
+           perHalf: CFG.cols * rows };
+}
+const plateX = h => h === 0 ? G.margin + G.plateW + G.gutter : G.margin;
+
+function drawHalf(h, columns) {
+  const px = plateX(h);
+  const isBack = h === 1;
+
+  // 版框内的纸面（左半叶略深一档，模拟翻过来的背面）
+  ctx.fillStyle = isBack ? PAPER_BACK : PAPER;
+  ctx.fillRect(px, G.margin, G.plateW, G.plateH);
+
+  // 界栏：列与列之间的淡竖线（画在列右缘）
+  if (CFG.showRules) {
+    ctx.strokeStyle = RULE;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 1; i < CFG.cols; i++) {
+      const x = Math.round(px + i * G.colW) + 0.5;
+      ctx.moveTo(x, G.margin);
+      ctx.lineTo(x, G.margin + G.rows * G.cellH);
+    }
+    ctx.stroke();
+  }
+
+  // 字格辅助线（调试）
+  if (CFG.showDebug) {
+    ctx.strokeStyle = "rgba(200,80,60,.35)";
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    for (let r = 0; r <= G.rows; r++) {
+      const y = Math.round(G.margin + r * G.cellH) + 0.5;
+      ctx.moveTo(px, y); ctx.lineTo(px + G.plateW, y);
+    }
+    for (let i = 0; i <= CFG.cols; i++) {
+      const x = Math.round(px + i * G.colW) + 0.5;
+      ctx.moveTo(x, G.margin); ctx.lineTo(x, G.margin + G.rows * G.cellH);
+    }
+    ctx.stroke();
+  }
+
+  // 字：逐列、逐格
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (let c = 0; c < columns.length; c++) {
+    const col = columns[c];
+    for (let r = 0; r < col.length; r++) {
+      const cell = col[r];
+      const x = px + (CFG.cols - 1 - c) * G.colW;
+      const y = G.margin + r * G.cellH;
+      drawCell(cell.ch, x, y, isBack);
+    }
+  }
+
+  // 版框（四周双边）
+  if (CFG.showFrame) {
+    ctx.strokeStyle = FRAME;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(px - 1, G.margin - 1, G.plateW + 2, G.rows * G.cellH + 2);
+    ctx.lineWidth = 1;
+    ctx.strokeRect(px - 5, G.margin - 5, G.plateW + 10, G.rows * G.cellH + 10);
+  }
+}
+
+function drawCell(ch, x, y, isBack) {
+  const cx = x + G.colW / 2;
+  const cy = y + G.cellH / 2;
+  const fs = G.fontSize;
+
+  if (isPunct(ch)) {
+    // ---- 标点：偏字格右上角 ----
+    ctx.fillStyle = isBack ? "#8a7a5f" : ACCENT;
+    ctx.font = `${(fs * 0.62).toFixed(1)}px ${CFG.fontStack}`;
+    const ox = G.colW * 0.14, oy = -G.cellH * 0.20;
+    drawGlyph(ch, cx + ox, cy + oy, fs * 0.62);
+    return;
+  }
+
+  ctx.fillStyle = isBack ? "#3c332a" : INK;
+  ctx.font = `${fs.toFixed(1)}px ${CFG.fontStack}`;
+  drawGlyph(ch, cx, cy, fs);
+}
+
+// 单个字形：带「」『』竖排变形
+function drawGlyph(ch, cx, cy, fs) {
+  const vf = VFORM[ch];
+  if (vf) {
+    if (CFG.vform && hasGlyph(ctx, vf)) { ctx.fillText(vf, cx, cy); return; }
+    // 回退：把横排引号旋转 90° 立起来（方向不对可在下一行调 ±）
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText(ch, 0, 0);
+    ctx.restore();
+    return;
+  }
+  ctx.fillText(ch, cx, cy);
+}
+
+// 中缝：上下鱼尾 + 竖排汉字页码
+function drawGutter(leafNo) {
+  const gx = G.margin + G.plateW + G.gutter / 2;
+  const top = G.margin, bot = G.margin + G.rows * G.cellH;
+  const w = G.gutter * 0.62;
+
+  ctx.fillStyle = ACCENT;
+  fishTail(gx, top + G.plateH * 0.06, w, w * 0.62, true);
+  fishTail(gx, bot - G.plateH * 0.06, w, w * 0.62, false);
+
+  // 竖排页码：第N葉
+  const label = "第" + cnNumber(leafNo) + "葉";
+  const fs = Math.min(G.gutter * 0.52, 15);
+  ctx.font = `${fs.toFixed(1)}px ${CFG.fontStack}`;
+  ctx.fillStyle = INK;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const total = label.length * fs * 1.12;
+  let y = (top + bot) / 2 - total / 2 + fs * 0.56;
+  for (const ch of label) { ctx.fillText(ch, gx, y); y += fs * 1.12; }
+}
+
+// 鱼尾：一枚分叉的尾形（尖朝上/朝下），中间开叉
+function fishTail(cx, cy, w, h, pointUp) {
+  const s = pointUp ? 1 : -1;
+  const apexY = cy - s * h / 2;
+  const baseY = cy + s * h / 2;
+  ctx.beginPath();
+  ctx.moveTo(cx, apexY);
+  ctx.quadraticCurveTo(cx + w / 2, cy, cx + w / 2, baseY);
+  ctx.lineTo(cx + w * 0.10, baseY);
+  ctx.quadraticCurveTo(cx, cy + s * h * 0.16, cx - w * 0.10, baseY);
+  ctx.lineTo(cx - w / 2, baseY);
+  ctx.quadraticCurveTo(cx - w / 2, cy, cx, apexY);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// --------------------------- 主渲染 ---------------------------
+function render() {
+  const dpr = window.devicePixelRatio || 1;
+  const W = window.innerWidth, H = window.innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;   // 设宽高本身就会清空画布
+  cv.style.width = W + "px"; cv.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  ctx.fillStyle = "#e9e3d2";
+  ctx.fillRect(0, 0, W, H);
+
+  G = geometry(W, H);
+  // ★ 只从当前 charIndex 起排版（含其后全部正文，故向后翻页能一直读到书末）
+  const body = TEXT.slice(baseIdx);
+  const cols = layoutColumns(body, G.rows, CFG.kinsoku);
+  LEAVES = paginate(cols, CFG.cols);
+  if (leafIdx >= LEAVES.length) leafIdx = LEAVES.length - 1;
+  if (leafIdx < 0) leafIdx = 0;
+
+  const leaf = LEAVES[leafIdx];
+  if (leaf) {
+    drawHalf(0, leaf.right);
+    drawHalf(1, leaf.left);
+    drawGutter(leafIdx + 1);
+  }
+  updateHud(cols);
+  syncToc();
+}
+
+// --------------------------- 自检 ---------------------------
+// 统计禁则违例：任一列首格是禁首字，或末格是禁尾字，即违例。
+function countViolations(cols, rows) {
+  let bad = 0;
+  for (const col of cols) {
+    if (!col.length) continue;
+    if (FORBID_HEAD.has(col[0].ch)) bad++;
+    if (col.length === rows && FORBID_TAIL.has(col[col.length - 1].ch)) bad++;
+  }
+  return bad;
+}
+
+function updateHud(cols) {
+  const leaf = LEAVES[leafIdx];
+  let firstIdx = 0;
+  if (leaf && leaf.right[0] && leaf.right[0][0]) firstIdx = leaf.right[0][0].idx;
+  document.getElementById("sCap").textContent = G.perHalf;
+  document.getElementById("sLeaf").textContent = leafIdx + 1;
+  document.getElementById("sTotal").textContent = LEAVES.length;
+  document.getElementById("sIdx").textContent = baseIdx + firstIdx;   // 绝对 charIndex
+  document.getElementById("sLen").textContent = TEXT.length;
+  document.getElementById("sBase").textContent = baseIdx;
+  document.getElementById("sChap").textContent =
+    (TOC[chapterIndex()] || {}).title || "—";
+  const bad = CFG.kinsoku ? countViolations(cols, G.rows) : "（已关）";
+  const el = document.getElementById("sBad");
+  el.textContent = bad;
+  el.style.color = (bad === 0 || bad === "（已关）") ? "#2f6b3f" : "#a33b2b";
+}
+
+// ==================== ④ 精准跳转：charIndex → 重排 → 第一叶 ====================
+/** 当前叶首字的「绝对」下标 */
+function absCharIndex() {
+  const leaf = LEAVES[leafIdx];
+  const first = (leaf && leaf.right[0] && leaf.right[0][0]) ? leaf.right[0][0].idx : 0;
+  return baseIdx + first;
+}
+/** 当前所在卷：满足 startCharIndex <= 绝对下标 的最后一卷 */
+function chapterIndex() {
+  const p = absCharIndex();
+  let k = 0;
+  for (let i = 0; i < TOC.length; i++) if (TOC[i].startCharIndex <= p) k = i;
+  return k;
+}
+/** 跳到第 i 卷：清空画布 → charIndex 归零到该卷起点 → 重算网格 → 渲染第一叶 */
+function jumpToChapter(i) {
+  const ch = TOC[i];
+  if (!ch) return;
+
+  // ① 清空画布
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, cv.width, cv.height);
+
+  // ② charIndex 更新为该卷 startCharIndex，叶序归零
+  baseIdx = Math.min(ch.startCharIndex, Math.max(0, TEXT.length - 1));
+  leafIdx = 0;
+
+  // ③ 重新从新 charIndex 开始计算网格排版，并渲染第一叶
+  render();
+
+  closeToc();
+  toast("已跳转　" + ch.title);
+}
+
+// ==================== ③ 古风卷目面板（竖排 · 右起 · 月白 / 朱砂） ====================
+const tocEl = document.getElementById("toc");
+const maskEl = document.getElementById("mask");
+const tocBody = document.getElementById("tocBody");
+let tocOpen = false;
+
+function buildTocList() {
+  tocBody.innerHTML = "";
+  TOC.forEach((ch, i) => {
+    const b = document.createElement("button");
+    b.className = "toc-item";
+    b.dataset.i = String(i);
+    b.textContent = ch.title;                       // 竖排由 CSS writing-mode 负责
+    b.title = ch.title + "　（第 " + (ch.startCharIndex + 1) + " 字起）";
+    b.onclick = ev => { ev.stopPropagation(); jumpToChapter(i); };
+    tocBody.appendChild(b);
+  });
+  document.getElementById("tocCount").textContent = String(TOC.length);
+  document.getElementById("tocBook").textContent = BOOK.title;
+  syncToc();
+}
+
+/** 当前卷标朱砂红 + 一枚朱印 */
+function syncToc() {
+  const ci = chapterIndex();
+  tocBody.querySelectorAll(".toc-item").forEach(b => {
+    b.classList.toggle("on", +b.dataset.i === ci);
+  });
+}
+
+function openToc() {
+  if (tocOpen) return;
+  syncToc();
+  tocOpen = true;
+  tocEl.classList.add("open");
+  maskEl.classList.add("show");
+}
+function closeToc() {
+  if (!tocOpen) return;
+  tocOpen = false;
+  tocEl.classList.remove("open");   // 平滑收起靠 CSS transition
+  maskEl.classList.remove("show");
+}
+function toggleToc() { tocOpen ? closeToc() : openToc(); }
+
+// ⑤ 关闭交互：点面板外空白处收起
+maskEl.addEventListener("click", closeToc);
+
+// --------------------------- 提示条 ---------------------------
+let toastTimer = 0;
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 1600);
+}
+
+// --------------------------- 手势 ---------------------------
+let down = null;
+cv.addEventListener("pointerdown", e => {
+  down = { x: e.clientX, y: e.clientY, t: Date.now() };
+});
+cv.addEventListener("pointerup", e => {
+  if (!down) return;
+  const dx = e.clientX - down.x, dy = e.clientY - down.y;
+  const dt = Date.now() - down.t;
+  down = null;
+
+  if (Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy)) {
+    // 滑动：右→左（dx<0）= 下一叶；左→右 = 上一叶
+    go(dx < 0 ? 1 : -1);
+    return;
+  }
+  if (Math.abs(dx) < 12 && Math.abs(dy) < 12 && dt < 700) {
+    // 点击分三块：左 1/3 翻叶、右 1/3 翻叶、中间 1/3 呼出卷目
+    const W = window.innerWidth, x = e.clientX;
+    if (x > W / 3 && x < W * 2 / 3) { toggleToc(); return; }
+    const leftSide = x <= W / 3;
+    go(leftSide === CFG.tapLeftGoesNext ? 1 : -1);
+  }
+});
+
+function go(d) {
+  const n = leafIdx + d;
+  if (n >= 0 && n < LEAVES.length) { leafIdx = n; render(); return; }
+  if (n < 0) {
+    // 已在本卷首页：再往前就退回上一卷
+    const ci = chapterIndex();
+    if (ci > 0) jumpToChapter(ci - 1);
+    return;
+  }
+  // n >= LEAVES.length：已到书末
+}
+
+window.addEventListener("keydown", e => {
+  if (e.key === "ArrowRight") go(CFG.tapLeftGoesNext ? -1 : 1);
+  if (e.key === "ArrowLeft") go(CFG.tapLeftGoesNext ? 1 : -1);
+  if (e.key === "t" || e.key === "T") toggleToc();
+  if (e.key === "Escape") closeToc();
+});
+window.addEventListener("resize", render);
+
+// --------------------------- 控件 ---------------------------
+document.querySelectorAll("[data-cols]").forEach(b => {
+  b.onclick = () => {
+    CFG.cols = +b.dataset.cols;
+    document.querySelectorAll("[data-cols]").forEach(x =>
+      x.classList.toggle("on", +x.dataset.cols === CFG.cols));
+    render();
+  };
+});
+const toggle = (id, key) => {
+  const b = document.getElementById(id);
+  b.classList.toggle("on", CFG[key]);
+  b.onclick = () => { CFG[key] = !CFG[key]; b.classList.toggle("on", CFG[key]); render(); };
+};
+toggle("bRules", "showRules");
+toggle("bKinsoku", "kinsoku");
+toggle("bVform", "vform");
+toggle("bDebug", "showDebug");
+document.querySelector('[data-cols="10"]').classList.add("on");
+
+// 底部菜单栏
+document.querySelectorAll("#bar button").forEach(b => {
+  b.onclick = () => {
+    const act = b.dataset.act;
+    if (act === "prev") go(-1);
+    else if (act === "next") go(1);
+    else toggleToc();
+  };
+});
+
+// 载入外部书稿 JSON
+document.getElementById("bLoad").onclick = () => document.getElementById("fJson").click();
+document.getElementById("fJson").onchange = ev => {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => {
+    try {
+      loadBook(String(r.result));
+      toast("已载入　" + BOOK.title + "　" + TOC.length + " 卷");
+    } catch (err) {
+      toast("JSON 解析失败：" + err.message);
+    }
+  };
+  r.readAsText(f);
+  ev.target.value = "";
+};
+
+// --------------------------- 启动 ---------------------------
+buildTocList();
+render();
+
+// 供外部脚本 / 单测使用
+window.__engine = {
+  CFG, layoutColumns, paginate, countViolations, parseBook, loadBook,
+  jumpToChapter, chapterIndex, absCharIndex,
+  get TEXT() { return TEXT; }, get TOC() { return TOC; },
+  get baseIdx() { return baseIdx; }, get leafIdx() { return leafIdx; },
+  get LEAVES() { return LEAVES; }, set leafIdx(v) { leafIdx = v; },
+  cnNumber,
+};
+</script>
+</body>
+</html>

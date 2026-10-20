@@ -1,0 +1,369 @@
+//! 参数化网格排版引擎：竖排 / 横排共用同一套「格子坐标 (x, y)」与读序逻辑。
+//!
+//! 设计目标（见用户需求）：
+//!   1. 配置对象 [`GridConfig`]：列数 `columns`、方向 `dir`、四周留白比例 `margin`。
+//!   2. 动态网格计算 [`compute_grid`]：不写死像素——
+//!        colWidth = 可用宽 / 列数
+//!        fontSize = 0.75 × colWidth
+//!        rowHeight = 1.1 × colWidth
+//!        totalRows = floor(可用高 / rowHeight)
+//!   3. 一套引擎兼容横竖排：方向只改变「读序」与「坐标映射」，格子几何完全一致。
+//!        · 竖排：遍历从右向左（列），从上向下（行）；
+//!        · 横排：遍历从上向下（行），从左向右（列）；
+//!        · 共用 [`cell_origin`] 计算 (x, y)、[`reading_order`] 计算读序。
+//!   4. 边界处理：最小字号 [`GRID_FS_MIN`]（窄屏 12 列也不至于小到看不清，
+//!      触发时 `min_font_hit` 为真，由渲染层开启单页滚动）。
+
+use serde::{Deserialize, Serialize};
+
+use crate::types::Script;
+
+/// 双面对开两叶之间的间隙（与 app.rs 保持一致，作为引擎的唯一来源）。
+pub const LEAF_GAP: f32 = 16.0;
+
+/// 排版方向。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub enum GridDir {
+    /// 竖排：从右向左分列，每列自上而下（古籍式）。
+    #[default]
+    Vertical,
+    /// 横排：从上向下分行，每行自左向右（现代信笺式）。
+    Horizontal,
+}
+
+impl GridDir {
+    pub fn label(self) -> &'static str {
+        match self {
+            GridDir::Vertical => "竖排",
+            GridDir::Horizontal => "横排",
+        }
+    }
+
+    /// 方向 → 字体族（竖排用楷/宋，横排用黑体）。
+    pub fn script(self) -> Script {
+        match self {
+            GridDir::Vertical => Script::Ancient,
+            GridDir::Horizontal => Script::Modern,
+        }
+    }
+
+    /// 该方向下的「主轴线」分隔线：竖排画竖线（乌丝栏），横排画横线（横丝栏）。
+    pub fn is_vertical(self) -> bool {
+        matches!(self, GridDir::Vertical)
+    }
+}
+
+/// 列数档位：古籍新增 14 列，连同原有的 8 / 10 / 12。
+pub const GRID_COLUMN_CHOICES: [usize; 4] = [8, 10, 12, 14];
+
+/// 网格配置：参数化排版引擎的唯一输入。
+#[derive(Clone, Copy, Debug)]
+pub struct GridConfig {
+    /// 列数（竖排=竖列数；横排=每行字数）：8 / 10 / 12 / 14。
+    pub columns: usize,
+    /// 排版方向。
+    pub dir: GridDir,
+    /// 四周留白比例（相对内容区，0..1）。
+    pub margin: f32,
+}
+
+impl Default for GridConfig {
+    fn default() -> Self {
+        GridConfig {
+            columns: 8,
+            dir: GridDir::Vertical,
+            margin: 0.04,
+        }
+    }
+}
+
+/// 字号 / 行高算式系数与上下限（均来自用户给定的公式与边界要求）。
+pub const GRID_FS_RATIO: f32 = 0.75; // fontSize = colWidth × 0.75
+pub const GRID_ROW_RATIO: f32 = 1.1; // rowHeight = colWidth × 1.1
+/// 最小字号：窄屏 12/14 列也不至于小到看不清；触发后几何按「字号优先」重算，
+/// 可能超出可用宽 → 由渲染层开启单页上下（及左右）滚动。
+pub const GRID_FS_MIN: f32 = 14.0;
+/// 字号上限：专注模式撑满整屏时不被无限制放大。
+pub const GRID_FS_MAX: f32 = 220.0;
+
+/// 网格度量：由 [`compute_grid`] 算出，渲染与分页共用，不再写死任何像素。
+#[derive(Clone, Copy, Debug)]
+pub struct GridMetrics {
+    pub dir: GridDir,
+    pub columns: usize,
+    pub rows: usize,
+    /// 字格宽（竖排=列宽；横排=单字格宽）。
+    pub col_w: f32,
+    /// 字格高（竖排=单字竖高；横排=行高）。
+    pub row_h: f32,
+    /// 字号。
+    pub fs: f32,
+    /// 纯字格区宽（不含版框 / 留白）。
+    pub grid_w: f32,
+    /// 纯字格区高。
+    pub grid_h: f32,
+    /// 含版框 + 留白后的整张纸面宽。
+    pub outer_w: f32,
+    /// 含版框 + 留白后的整张纸面高。
+    pub outer_h: f32,
+    /// 是否触发了最小字号（需要单页滚动）。
+    pub min_font_hit: bool,
+}
+
+/// 计算网格。
+///
+/// * `content_w` / `content_h`：内容区（已扣工具栏 / 状态栏 / 四边留白）。
+/// * `cfg`：列数 / 方向 / 留白。
+/// * `facing`：是否双面对开（对开时单叶可用宽对半）。
+/// * `edge`：该方向版框 + 内边距的「双边」总预留（竖排≈`ANCIENT_EDGE`，横排≈`MODERN_EDGE`）。
+/// * `head` / `foot`：天头 / 地脚预留（竖排地脚有鱼尾叶码，横排有天头标题）。
+/// * `extra_cols`：`columns` **之外**的附加列宽（以 col_w 为单位计）。
+///   古籍竖笺的章题列是格内一列（章首页少排一列正文给它），已在
+///   `columns` 内，故传 0；仅有「格外再加竖条」这类需求时才传正值。
+pub fn compute_grid(
+    content_w: f32,
+    content_h: f32,
+    cfg: GridConfig,
+    facing: bool,
+    zoom: f32,
+    edge: f32,
+    head: f32,
+    foot: f32,
+    extra_cols: f32,
+) -> GridMetrics {
+    // 1) 双面对开：单叶可用宽对半（先扣两叶间隙）。
+    let per_leaf = if facing {
+        ((content_w - LEAF_GAP) / 2.0).max(60.0)
+    } else {
+        content_w
+    };
+    // 2) 四周留白（相对内容区比例），上下 / 左右同比例。
+    let mw = (per_leaf * cfg.margin).max(0.0);
+    let mh = (content_h * cfg.margin).max(0.0);
+    // 3) 字格可用区（再扣版框 + 留白）。
+    let inner_w = (per_leaf - edge - 2.0 * mw).max(40.0);
+    let inner_h = (content_h - head - foot - 2.0 * mh).max(40.0);
+
+    // 4) 用户公式：列宽 = 可用宽 / 列数。
+    let col_w_raw = inner_w / cfg.columns as f32;
+    // 5) 字号 = 0.75 × 列宽；下限保护窄屏小字。
+    let want = col_w_raw * GRID_FS_RATIO * zoom;
+    let min_hit = want < GRID_FS_MIN;
+    let fs = want.clamp(GRID_FS_MIN, GRID_FS_MAX);
+    // 触发下限时，反推列宽使字号不小于下限（宁可超出可用宽 → 渲染层滚动），
+    // 避免字比字格还宽而横向重叠。
+    let col_w = if min_hit { fs / GRID_FS_RATIO } else { col_w_raw };
+    // 6) 行高 = 1.1 × 列宽（与字号比例固定，天然保证 rowHeight > fontSize，竖排不上下重叠）。
+    let row_h = col_w * GRID_ROW_RATIO;
+    // 7) 总行数 = floor(可用高 / 行高)。
+    let rows = ((inner_h / row_h).floor()).max(1.0) as usize;
+
+    let grid_w = (cfg.columns as f32 + extra_cols) * col_w;
+    let grid_h = rows as f32 * row_h;
+    let outer_w = grid_w + edge + 2.0 * mw;
+    let outer_h = grid_h + head + foot + 2.0 * mh;
+
+    GridMetrics {
+        dir: cfg.dir,
+        columns: cfg.columns,
+        rows,
+        col_w,
+        row_h,
+        fs,
+        grid_w,
+        grid_h,
+        outer_w,
+        outer_h,
+        min_font_hit: min_hit,
+    }
+}
+
+/// 给定网格坐标 `(col, row)`，返回该格左上角的 `(x, y)`。
+///
+/// 这是横竖排共用的「格子坐标」逻辑——方向只改变 x 的映射：
+/// · 竖排：`col = 0` 落在最右，越往左 `col` 越大（中文从右读起）；
+/// · 横排：`col = 0` 落在最左，向右递增。
+///
+/// `y` 两个方向一致（从上往下）。
+pub fn cell_origin(m: &GridMetrics, col: usize, row: usize) -> (f32, f32) {
+    let x = match m.dir {
+        GridDir::Vertical => (m.columns - 1 - col) as f32 * m.col_w,
+        GridDir::Horizontal => col as f32 * m.col_w,
+    };
+    let y = row as f32 * m.row_h;
+    (x, y)
+}
+
+/// 读序：返回一个按阅读顺序排列的 `(col, row)` 序列（横竖排共用，方向决定顺序）。
+///
+/// · 竖排：先排最右一列，列内自上而下；再向左一列，直到最左（从右→左、上→下）。
+/// · 横排：先排最上一行，行内自左向右；再向下一行，直到最下（上→下、左→右）。
+pub fn reading_order(cols: usize, rows: usize, dir: GridDir) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(cols * rows);
+    match dir {
+        GridDir::Vertical => {
+            for col in (0..cols).rev() {
+                for row in 0..rows {
+                    out.push((col, row));
+                }
+            }
+        }
+        GridDir::Horizontal => {
+            for row in 0..rows {
+                for col in 0..cols {
+                    out.push((col, row));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn content() -> (f32, f32) {
+        (1320.0 - 44.0, 880.0 - 78.0 - 44.0)
+    }
+
+    #[test]
+    fn formulas_match_spec() {
+        // 竖排 8 列：col_w = 可用宽/8，fs = 0.75*col_w，row_h = 1.1*col_w。
+        // extra_cols = 0：章题列在格内，不占额外宽。
+        let (cw, ch) = content();
+        let m = compute_grid(cw, ch, GridConfig::default(), false, 1.0, 50.0, 0.0, 12.0, 0.0);
+        let inner_w = (cw - 50.0 - 2.0 * cw * 0.04).max(40.0);
+        let expect_col = inner_w / 8.0;
+        assert!((m.col_w - expect_col).abs() < 0.01, "col_w {:.2} ≠ {:.2}", m.col_w, expect_col);
+        assert!((m.fs - expect_col * 0.75).abs() < 0.01, "fs 非 0.75*col_w");
+        assert!((m.row_h - expect_col * 1.1).abs() < 0.01, "row_h 非 1.1*col_w");
+        // row_h 必大于 fs（竖排不上下重叠）。
+        assert!(m.row_h > m.fs, "row_h({}) 必须大于 fs({})", m.row_h, m.fs);
+    }
+
+    #[test]
+    fn twelve_columns_no_overflow_or_overlap() {
+        // 12 列：字格整张纸宽不超过内容区；且 row_h > fs 保证不重叠。
+        let (cw, ch) = content();
+        let m = compute_grid(
+            cw,
+            ch,
+            GridConfig {
+                columns: 12,
+                dir: GridDir::Vertical,
+                margin: 0.04,
+            },
+            false,
+            1.0,
+            50.0,
+            0.0,
+            12.0,
+            0.0,
+        );
+        assert!(m.outer_w <= cw + 0.5, "12 列纸宽 {:.1} 超内容区 {:.1}", m.outer_w, cw);
+        assert!(m.outer_h <= ch + 0.5, "12 列纸高 {:.1} 超内容区 {:.1}", m.outer_h, ch);
+        assert!(m.row_h > m.fs, "12 列 row_h 必须 > fs");
+        // 列越多字越小，12 列 fs < 8 列 fs。
+        let m8 = compute_grid(cw, ch, GridConfig::default(), false, 1.0, 50.0, 0.0, 12.0, 0.0);
+        assert!(m.fs < m8.fs, "12 列应比 8 列字小");
+    }
+
+    #[test]
+    fn fourteen_columns_still_fits() {
+        let (cw, ch) = content();
+        let m = compute_grid(
+            cw,
+            ch,
+            GridConfig {
+                columns: 14,
+                dir: GridDir::Vertical,
+                margin: 0.04,
+            },
+            false,
+            1.0,
+            50.0,
+            0.0,
+            12.0,
+            0.0,
+        );
+        assert!(m.outer_w <= cw + 0.5);
+        assert!(m.outer_h <= ch + 0.5);
+        assert!(m.row_h > m.fs);
+    }
+
+    #[test]
+    fn min_font_prevents_tiny_glyphs_on_narrow_screen() {
+        // 极窄内容区（320×640）+ 14 列：触发最小字号，fs 不应低于下限，
+        // 且 col_w 反推保证字不超格。
+        let m = compute_grid(
+            320.0,
+            640.0,
+            GridConfig {
+                columns: 14,
+                dir: GridDir::Vertical,
+                margin: 0.04,
+            },
+            false,
+            1.0,
+            50.0,
+            0.0,
+            12.0,
+            0.0,
+        );
+        assert!(m.min_font_hit, "窄屏 14 列应触发最小字号");
+        assert!(m.fs >= GRID_FS_MIN - 0.01, "fs 不得低于下限 {GRID_FS_MIN}");
+        assert!(m.col_w >= m.fs / GRID_FS_RATIO - 0.01, "col_w 须 ≥ fs/0.75，否则字超格");
+    }
+
+    #[test]
+    fn vertical_reading_order_right_to_left() {
+        // 竖排 3 列 × 2 行：读序应为 (2,0)(2,1)(1,0)(1,1)(0,0)(0,1)。
+        let order = reading_order(3, 2, GridDir::Vertical);
+        assert_eq!(
+            order,
+            vec![(2, 0), (2, 1), (1, 0), (1, 1), (0, 0), (0, 1)]
+        );
+        // 坐标：竖排 col=2 在最右（x 最小），col=0 在最左（x 最大）。
+        let m = GridMetrics {
+            dir: GridDir::Vertical,
+            columns: 3,
+            rows: 2,
+            col_w: 10.0,
+            row_h: 11.0,
+            fs: 7.5,
+            grid_w: 30.0,
+            grid_h: 22.0,
+            outer_w: 30.0,
+            outer_h: 22.0,
+            min_font_hit: false,
+        };
+        assert_eq!(cell_origin(&m, 2, 0), (0.0, 0.0));
+        assert_eq!(cell_origin(&m, 0, 0), (20.0, 0.0));
+    }
+
+    #[test]
+    fn horizontal_reading_order_top_to_bottom() {
+        // 横排 3 列 × 2 行：读序应为 (0,0)(1,0)(2,0)(0,1)(1,1)(2,1)。
+        let order = reading_order(3, 2, GridDir::Horizontal);
+        assert_eq!(
+            order,
+            vec![(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]
+        );
+        let m = GridMetrics {
+            dir: GridDir::Horizontal,
+            columns: 3,
+            rows: 2,
+            col_w: 10.0,
+            row_h: 11.0,
+            fs: 7.5,
+            grid_w: 30.0,
+            grid_h: 22.0,
+            outer_w: 30.0,
+            outer_h: 22.0,
+            min_font_hit: false,
+        };
+        assert_eq!(cell_origin(&m, 0, 0), (0.0, 0.0));
+        assert_eq!(cell_origin(&m, 2, 0), (20.0, 0.0));
+    }
+}
