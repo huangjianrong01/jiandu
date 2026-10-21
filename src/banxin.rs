@@ -157,25 +157,26 @@ pub fn fold_dashes(len: f32, dash: f32) -> (usize, f32) {
 ///                  →  4 中心凹口 (50, h·0.3)  →  5 左翼下角 (0, h·0.6)
 /// ```
 ///
-/// 下鱼尾是上鱼尾的**垂直镜像**（底边 `by = h`，凹口朝上），故整枚
-/// `y → h - y`——镜像只在这一处体现，不会再写反。
+/// 下鱼尾是上鱼尾的**垂直镜像**（底边 `by = h·TAIL_WING`，凹口朝上），
+/// 故整枚 `y → span - y`（`span = h·TAIL_WING` 是形状实际占的高度）
+/// ——镜像只在这一处体现，不会再写反。
 ///
 /// 全是 `f32` 常量运算，**绝无贝塞尔**：刻本的刀是直的，鱼尾就得是
 /// 直线多边形。要改形制动这两个骨架常量即可（`TAIL_WING` / `TAIL_APEX`）。
 pub fn fishtail_points(top: bool, h: f32) -> [(f32, f32); 5] {
-    let wing = h * TAIL_WING;
+    let span = h * TAIL_WING;
     let apex = h * TAIL_APEX;
     let up = [
-        (0.0, 0.0),   // 1 左上
-        (100.0, 0.0), // 2 右上
-        (100.0, wing), // 3 右翼下角
+        (0.0, 0.0),    // 1 左上
+        (100.0, 0.0),  // 2 右上
+        (100.0, span), // 3 右翼下角
         (50.0, apex),  // 4 中心凹口（锐角）
-        (0.0, wing),   // 5 左翼下角
+        (0.0, span),   // 5 左翼下角
     ];
     if top {
         up
     } else {
-        up.map(|(x, y)| (x, h - y))
+        up.map(|(x, y)| (x, span - y))
     }
 }
 
@@ -191,7 +192,12 @@ pub fn fishtail_points(top: bool, h: f32) -> [(f32, f32); 5] {
 pub fn fishtail_svg(top: bool, aspect: f32) -> String {
     let a = aspect.clamp(0.45, 2.6);
     let h = 100.0 * a;
-    let d: Vec<String> = fishtail_points(top, h)
+    // 折点最深只到 `cy + 基准·0.6`（下面 40% 是空的），故基准放大到
+    // `h / 0.6` 再算——整枚等比放大到**铺满 viewBox**，形状一模一样，
+    // 但不会在鱼尾下方凭空多出一截留白把书口字挤走。viewBox 内的
+    // 相对位置因此是 尾翼 1.0 / 凹口 0.5（= 0.6 : 0.3，等比）。
+    let base = h / TAIL_WING;
+    let d: Vec<String> = fishtail_points(top, base)
         .iter()
         .enumerate()
         .map(|(i, (x, y))| {
@@ -431,35 +437,26 @@ mod tests {
         assert_eq!(up, want, "上鱼尾折点偏离刻本骨架：{up:?}");
         // 凹口顶点必须比尾翼下缘**高**（浅），缺口才是锐角 V、开口朝下。
         assert!(TAIL_APEX < TAIL_WING);
-        // 下鱼尾 = 上鱼尾的垂直镜像（底边 by = h）。
+        // 下鱼尾 = 上鱼尾的垂直镜像（绕形状自身的中轴翻，底边 by = span）。
+        let span = h * TAIL_WING;
         let down = fishtail_points(false, h);
         for i in 0..5 {
             assert!((down[i].0 - want[i].0).abs() < 1e-6, "镜像不该动 x：{down:?}");
             assert!(
-                (down[i].1 - (h - want[i].1)).abs() < 1e-6,
+                (down[i].1 - (span - want[i].1)).abs() < 1e-6,
                 "下鱼尾必须是垂直镜像：{down:?}"
             );
         }
     }
 
     #[test]
-    fn both_tails_stay_inside_their_own_half() {
-        // 上鱼尾的墨全在上半、下鱼尾全在下半——中间那块空当留给书口字。
-        let h = 100.0 * FISHTAIL_ASPECT;
-        let up = fishtail_points(true, h);
-        let down = fishtail_points(false, h);
-        let max_up = up.iter().map(|(_, y)| *y).fold(0.0f32, f32::max);
-        let min_down = down.iter().map(|(_, y)| *y).fold(h, f32::min);
-        assert!(max_up <= h * TAIL_WING + 0.01, "上鱼尾探过头：{max_up}");
-        assert!(min_down >= h * (1.0 - TAIL_WING) - 0.01, "下鱼尾探过头：{min_down}");
-    }
-
-    #[test]
-    fn pair_opens_toward_each_other() {
-        // 上鱼尾的凹口在下半（顶点 y 大），下鱼尾的凹口在上半——
-        // 两枚开口相对。取中轴附近（x≈50）那一点比 y：上鱼的顶点靠上、
-        // 翻转后靠下。不按下标硬取，免得路径一改测试就假失败。
-        let apex_y = |top: bool| -> f32 {
+    fn both_tails_fill_their_own_box() {
+        // 两枚各自铺满自己的元素高（`fishtail_svg` 把基准放大到
+        // `h / TAIL_WING`）——不然鱼尾下方会凭空空出一截，把中间书口
+        // （叶码「二十三」）的地盘吃掉。
+        let h = 100.0 * FISHTAIL_ASPECT / TAIL_WING;
+        let span = h * TAIL_WING;
+        for top in [true, false] {
             let s = fishtail_svg(top, FISHTAIL_ASPECT);
             let d = s.split("d=\"").nth(1).unwrap().split('"').next().unwrap();
             let nums: Vec<f32> = d
@@ -467,18 +464,38 @@ mod tests {
                 .split_whitespace()
                 .filter_map(|v| v.parse().ok())
                 .collect();
-            let pts: Vec<(f32, f32)> = nums.chunks(2).map(|c| (c[0], c[1])).collect();
-            let mid: Vec<f32> = pts
-                .iter()
-                .filter(|(x, _)| (*x - 50.0).abs() < 1.5)
-                .map(|(_, y)| *y)
-                .collect();
-            assert!(!mid.is_empty(), "路径里找不到中轴顶点：{s}");
-            mid.iter().sum::<f32>() / mid.len() as f32
-        };
-        let up = apex_y(true);
-        let down = apex_y(false);
-        assert!(up < down, "上鱼尾凹口应在下：{up} vs {down}");
+            let ys: Vec<f32> = nums.iter().skip(1).step_by(2).copied().collect();
+            let lo = ys.iter().fold(f32::INFINITY, |a, b| a.min(*b));
+            let hi = ys.iter().fold(f32::NEG_INFINITY, |a, b| a.max(*b));
+            // 包围盒正好是 [0, viewBox 高]：0 → 100×aspect。
+            assert!(lo.abs() < 0.01, "顶边没贴住：{lo}");
+            assert!((hi - span).abs() < 0.01, "底边没铺满：{hi} / {span}");
+        }
+    }
+
+    #[test]
+    fn pair_opens_toward_each_other() {
+        // 上鱼尾：顶边一刀平直、两侧尾翼垂到下缘、中间 V 形凹口朝下；
+        // 下鱼尾是它的镜像——底边平直、尾翼向上、凹口朝上。两枚相对。
+        let h = 100.0 * FISHTAIL_ASPECT / TAIL_WING; // fishtail_svg 内部的基准
+        let span = h * TAIL_WING;
+        let up = fishtail_points(true, h);
+        let down = fishtail_points(false, h);
+        // 上鱼尾：顶边（点 1/2）在 y=0，两个翼角（点 3/5）在 y=span。
+        assert_eq!(up[0].1, 0.0, "上鱼尾顶边应贴 y=0：{up:?}");
+        assert!((up[2].1 - span).abs() < 1e-6, "上鱼尾尾翼应垂到下缘：{up:?}");
+        // 下鱼尾：底边在 y=span，两个翼角在 y=0。
+        assert!((down[0].1 - span).abs() < 1e-6, "下鱼尾底边应在 y=span：{down:?}");
+        assert!(down[2].1.abs() < 1e-6, "下鱼尾尾翼应向上：{down:?}");
+        // 两枚的凹口顶点关于水平中轴互补（一枚的深 = 另一枚的浅）。
+        assert!(
+            (up[3].1 + down[3].1 - span).abs() < 1e-6,
+            "凹口不成镜像：{:?} {:?}",
+            up,
+            down
+        );
+        // 凹口比尾翼浅，缺口才是锐角 V 而不是一条缝。
+        assert!(up[3].1 < up[2].1 && up[3].1 > 0.0, "凹口深度不对：{up:?}");
     }
 
     #[test]
