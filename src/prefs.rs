@@ -26,6 +26,9 @@ pub struct Prefs {
     pub font_ancient: usize,
     /// 现代（横笺）字体：`FontChoice::MODERN` 下标。
     pub font_modern: usize,
+    /// **批注字体**（夹注小字 / 放大注卡）：`FontChoice::NOTE` 下标。
+    #[serde(default)]
+    pub font_note: usize,
     /// 字级倍率（1.0 = 中）。
     pub zoom: f32,
     /// 每面列数（8 / 10 / 12 / 14）。
@@ -49,6 +52,7 @@ pub struct Prefs {
     /// 数字转汉字：阿拉伯数字在竖排里显示为汉字（一六二八）。
     pub han_digits: bool,
     /// 响应式单 / 双叶：按屏幕宽高比自动决定对开 / 单叶。
+    #[serde(default = "default_true")]
     pub auto_duplex: bool,
     /// 注释显示。
     pub notes: bool,
@@ -63,6 +67,7 @@ impl Default for Prefs {
             palette: 0,
             font_ancient: 0,
             font_modern: 0,
+            font_note: 0,
             zoom: 1.0,
             columns: 10,
             margin: 0.06,
@@ -79,6 +84,11 @@ impl Default for Prefs {
             sound: true,
         }
     }
+}
+
+/// 「默认开」的开关：老存档里没有这一项时按 true 回落（响应式开合是默认体验）。
+fn default_true() -> bool {
+    true
 }
 
 /// 按下标取枚举元素，越界回落到首项。
@@ -119,6 +129,9 @@ impl Prefs {
     pub fn font_modern(&self) -> FontChoice {
         pick(&FontChoice::MODERN, self.font_modern)
     }
+    pub fn font_note(&self) -> FontChoice {
+        pick(&FontChoice::NOTE, self.font_note)
+    }
 
     /// 从当前设置反向填好存档（存下标，故需反查在枚举里的位置）。
     pub fn capture(
@@ -126,7 +139,8 @@ impl Prefs {
         palette: InkPalette,
         font_ancient: FontChoice,
         font_modern: FontChoice,
-    ) -> (usize, usize, usize, usize) {
+        font_note: FontChoice,
+    ) -> (usize, usize, usize, usize, usize) {
         let idx = |all: &[Theme], v: Theme| all.iter().position(|x| *x == v).unwrap_or(0);
         let pidx =
             |all: &[InkPalette], v: InkPalette| all.iter().position(|x| *x == v).unwrap_or(0);
@@ -137,6 +151,7 @@ impl Prefs {
             pidx(&InkPalette::ALL, palette),
             fidx(&FontChoice::CLASSIC, font_ancient),
             fidx(&FontChoice::MODERN, font_modern),
+            fidx(&FontChoice::NOTE, font_note),
         )
     }
 }
@@ -174,15 +189,30 @@ mod tests {
 
     #[test]
     fn capture_maps_enums_back_to_indices() {
-        let (t, p, fa, fm) = Prefs::capture(
+        let (t, p, fa, fm, fn_) = Prefs::capture(
             Theme::Ye,
             InkPalette::Gold,
             FontChoice::SourceHanSans,
             FontChoice::SystemDefault,
+            FontChoice::LXGWWenKai,
         );
         assert_eq!(Theme::ALL[t], Theme::Ye);
         assert_eq!(InkPalette::ALL[p], InkPalette::Gold);
         assert_eq!(FontChoice::CLASSIC[fa], FontChoice::SourceHanSans);
         assert_eq!(FontChoice::MODERN[fm], FontChoice::SystemDefault);
+        assert_eq!(FontChoice::NOTE[fn_], FontChoice::LXGWWenKai);
+    }
+
+    #[test]
+    fn old_prefs_without_new_fields_still_load() {
+        // 老存档没有 `font_note` / `auto_duplex`：不能整份反序列化失败
+        // （一失败就 `unwrap_or_default()`，用户所有偏好全丢）。
+        let old = r#"{"theme":1,"palette":0,"font_ancient":0,"font_modern":0,"zoom":1.0,
+            "columns":10,"margin":0.06,"letter":false,"layout_key":"standard10",
+            "notes_inline":true,"trad":true,"tongjia":true,"punct":true,"rare":true,
+            "han_digits":false,"notes":true,"sound":true}"#;
+        let p: Prefs = serde_json::from_str(old).expect("老存档应能读进来");
+        assert!(p.auto_duplex, "响应式开合默认开");
+        assert_eq!(p.font_note(), FontChoice::NOTE[0]);
     }
 }

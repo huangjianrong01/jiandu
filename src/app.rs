@@ -111,6 +111,10 @@ pub struct Root {
     pub duplex: Duplex,
     pub font_ancient: FontChoice,
     pub font_modern: FontChoice,
+    /// **批注字体**（夹注小字 / 放大注卡专用）：楷体二选一，见
+    /// [`FontChoice::NOTE`]。与正文宋体分开，正是刻本「正文匠体、注文手写体」
+    /// 的层次；默认玄冬楷书。
+    pub font_note: FontChoice,
     pub show_traditional: bool,
     pub show_tongjia: bool,
     pub show_notes: bool,
@@ -139,6 +143,19 @@ pub struct Root {
     pub zoom: f32,
     /// 点字查字面板当前查询的字（None 表示未打开）。
     pub lookup: Option<String>,
+    /// 查字浮签的 **charIndex**：被查那个字的 `(chapter, para, offset)`。
+    ///
+    /// 长按 / 点字查义时一并记下——浮签上要显示「第几章第几段第几字」，
+    /// 以及它在全书流里的统一字符下标（`Book::flat_index`）。
+    pub lookup_key: Option<GlyphKey>,
+    /// 查字浮签上的**选中文本**：有拖选区取选区全文，单字就取那一个字。
+    /// 与 `lookup`（单字）配套——浮签要同时展示「查的是哪个字」和「选了哪段」。
+    pub lookup_text: String,
+    /// 查字**浮签**的锚点（长按处窗口坐标）。
+    ///
+    /// `Some` 表示浮签贴着长按点浮起；`None` 表示退化为右上角常驻面板
+    /// （工具条「查询」按钮走的就是这条路）。
+    pub lookup_at: Option<(f32, f32)>,
     /// 当前书的笔记：页序号 -> 正文。
     pub notes: std::collections::HashMap<usize, String>,
     /// 笔记面板是否展开。
@@ -338,8 +355,10 @@ impl Root {
             show_grid_panel: false,
             layout_key: LayoutConfig::default_key(),
             duplex: Duplex::Single,
-            font_ancient: FontChoice::SongTi,
+            // 正文首选文津宋体：大字符集、生僻字全覆盖、竖排标点挤压正确。
+            font_ancient: FontChoice::WenJinMincho,
             font_modern: FontChoice::SourceHanSans,
+            font_note: FontChoice::XuandongKaishu,
             show_traditional: true,
             show_tongjia: true,
             show_notes: true,
@@ -357,6 +376,9 @@ impl Root {
             focus_mode: false,
             zoom: 1.0,
             lookup: None,
+            lookup_key: None,
+            lookup_text: String::new(),
+            lookup_at: None,
             notes: std::collections::HashMap::new(),
             show_notes_panel: false,
             note_editing: false,
@@ -654,6 +676,48 @@ impl Root {
             Script::Ancient => self.font_ancient = c,
             Script::Modern => self.font_modern = c,
         }
+    }
+
+    /// 批注字体（楷体），与正文宋体分开。
+    pub fn note_font(&self) -> FontChoice {
+        self.font_note
+    }
+
+    pub fn set_note_font(&mut self, c: FontChoice) {
+        self.font_note = c;
+        self.persist();
+    }
+
+    /// 打开「字义浮签」：记下被查那个字的 **charIndex**、选中文本与锚点。
+    ///
+    /// `at = Some((x, y))` 时浮签贴着长按点浮起（长按查字走这条路）；
+    /// `None` 时退化为右上角常驻面板（工具条「查询」按钮走这条路）。
+    pub fn open_lookup(
+        &mut self,
+        key: GlyphKey,
+        ch: char,
+        text: String,
+        at: Option<(f32, f32)>,
+    ) {
+        self.lookup = Some(ch.to_string());
+        self.lookup_key = Some(key);
+        self.lookup_text = text;
+        self.lookup_at = at;
+    }
+
+    /// 关闭字义浮签：三件套一起清，免得下次点字还残留上次的 charIndex。
+    pub fn close_lookup(&mut self) {
+        self.lookup = None;
+        self.lookup_key = None;
+        self.lookup_text.clear();
+        self.lookup_at = None;
+    }
+
+    /// 该字在全书流里的统一字符下标（`Book::flat_index`）。
+    /// 没有书或没有记录时返回 None（浮签上就不显示这一行）。
+    pub fn lookup_flat_index(&self) -> Option<usize> {
+        let key = self.lookup_key?;
+        self.book.as_ref().map(|b| b.flat_index(key))
     }
 
     pub fn bump_font(&mut self, up: bool) {
@@ -2405,6 +2469,23 @@ impl Render for Root {
             })
             .child(screen)
     }
+}
+
+/// 用**系统默认浏览器**打开一个网址（「在线查阅」用）。
+///
+/// 不引 webbrowser 之类依赖：三个平台各一条系统命令就够了，
+/// 失败也只回个 false，由调用方在状态栏提示，绝不 panic。
+pub fn open_external(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    #[cfg(target_os = "linux")]
+    let r = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    let r: std::io::Result<std::process::Child> =
+        Err(std::io::Error::other("unsupported platform"));
+    r.is_ok()
 }
 
 #[cfg(test)]

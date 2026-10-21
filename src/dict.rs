@@ -47,6 +47,38 @@ pub fn define(ch: &str) -> Option<&'static str> {
     DICT.get(ch).map(|s| s.as_str())
 }
 
+/// 在线字书：汉典。长按浮签的「在线查阅」按钮拼这个地址。
+pub const ZDIC_BASE: &str = "https://www.zdic.net/hans/";
+
+/// 百分号编码：只放行 URL 里的「无保留字符」，其余按 UTF-8 字节转 `%XX`。
+///
+/// 汉字必须编码——直接把「阿」拼进 URL 交给 `open` 虽然多数浏览器能猜对，
+/// 但一旦字里有 `#`、`?`、`&`（生僻字不会，URL 里却常见）就会被截断。
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        let ok = matches!(
+            b,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+        );
+        if ok {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// 拼出该字在汉典的查阅地址：`https://www.zdic.net/hans/{字}`。
+///
+/// 只取**第一个字符**——查字查的是单字，拖选了整段也只查首字
+/// （浮签上另外单独显示选区全文）。
+pub fn zdic_url(ch: &str) -> String {
+    let c = ch.chars().next().unwrap_or(' ');
+    format!("{ZDIC_BASE}{}", percent_encode(&c.to_string()))
+}
+
 /// 字书收录字数（用于状态展示）。
 pub fn len() -> usize {
     DICT.len()
@@ -102,5 +134,29 @@ mod tests {
             "「阿」释义异常：{}",
             d
         );
+    }
+
+    #[test]
+    fn zdic_url_percent_encodes_the_char() {
+        // 「阿」U+963F → UTF-8 E9 98 BF。
+        assert_eq!(zdic_url("阿"), "https://www.zdic.net/hans/%E9%98%BF");
+        // 只查首字：拖选了整段也只拼第一个字。
+        assert_eq!(zdic_url("阿房宫"), zdic_url("阿"));
+        // ASCII 原样放行，不瞎编码。
+        assert_eq!(zdic_url("a"), "https://www.zdic.net/hans/a");
+        // 空串不 panic。
+        assert_eq!(zdic_url(""), "https://www.zdic.net/hans/%20");
+        // 会被 URL 截断的字符必须编码掉。
+        assert!(percent_encode("a#b?c&d").contains("%23"));
+    }
+
+    #[test]
+    fn every_dict_entry_has_a_reachable_online_url() {
+        // 释义与在线查阅必须同源：能查到释义的字，都能一键跳汉典。
+        let d = define("阿").expect("「阿」应收录");
+        assert!(!d.is_empty());
+        let url = zdic_url("阿");
+        assert!(url.starts_with(ZDIC_BASE));
+        assert!(url.len() > ZDIC_BASE.len());
     }
 }

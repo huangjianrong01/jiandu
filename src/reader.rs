@@ -663,12 +663,23 @@ impl Root {
                         if this.touched_glyph && this.sel_char.is_some() && held >= LONG_PRESS {
                             let key = this.sel_focus.or(this.sel_anchor).unwrap_or((0, 0, 0));
                             let ch = this.sel_char.unwrap_or(' ');
+                            // 长按取「字」的同时取「选中的文本」：拖选后长按取选区全文，
+                            // 单击长按就退回这一个字——浮签两样都要显示。
+                            let text = if this.has_selection() {
+                                this.selected_text()
+                            } else {
+                                ch.to_string()
+                            };
                             this.bubble = Some(GlyphHit {
                                 key,
                                 ch,
+                                text: text.clone(),
                                 x: ux,
                                 y: uy,
                             });
+                            // 长按直接呼出「字义浮签」：本地字书释义 + charIndex
+                            // + 选中文本 + 在线查阅，一步到位（复制 / 检索并入浮签底部）。
+                            this.open_lookup(key, ch, text, Some((ux, uy)));
                             this.dragging = false;
                             this.popup = None;
                             cx.notify();
@@ -689,9 +700,16 @@ impl Root {
                             // 保证「选中后一定能划线 / 复制 / 分享」。
                             if this.popup.is_none() && this.sel_anchor.is_some() {
                                 let key = this.sel_focus.or(this.sel_anchor).unwrap_or((0, 0, 0));
+                                let ch = this.sel_char.unwrap_or(' ');
+                                let text = if this.has_selection() {
+                                    this.selected_text()
+                                } else {
+                                    ch.to_string()
+                                };
                                 this.popup = Some(GlyphHit {
                                     key,
-                                    ch: this.sel_char.unwrap_or(' '),
+                                    ch,
+                                    text,
                                     x: ux,
                                     y: uy,
                                 });
@@ -763,6 +781,12 @@ impl Root {
                 }
                 // 点气泡菜单以外的任何地方：收起气泡菜单。
                 this.bubble = None;
+                // 点字义浮签以外的任何地方：收起浮签。
+                // 只收 `lookup_at` 有值的（贴着长按点浮起的那张）；右上角常驻
+                // 字书面板是点「查询」主动开出来的，须点「关闭」才收。
+                if this.lookup_at.is_some() {
+                    this.close_lookup();
+                }
                 // 点注文卡片之外：收起放大卡（卡片自身 stop_propagation，
                 // 点卡片内容不会到达这里）。
                 this.note_zoom = None;
@@ -799,8 +823,10 @@ impl Root {
             );
         }
 
-        // 点字查字浮层。
-        if self.lookup.is_some() {
+        // 点字查字浮层（右上角常驻面板）。
+        // `lookup_at` 有值说明是长按呼出的「字义浮签」（贴着长按点浮起，
+        // 由 `render_lookup_card` 画），这里不能再叠一张，否则一屏两张字书。
+        if self.lookup.is_some() && self.lookup_at.is_none() {
             root = root.child(self.render_dict_panel(cx));
         }
         // 目录浮层：竹简条（鱼尾纹）。
@@ -863,9 +889,9 @@ impl Root {
             root = root.child(self.render_glyph_menu(cx));
         }
 
-        // 长按正文弹出的气泡菜单（复制 / 检索 / 字典）。
+        // 长按正文弹出的「字义浮签」（释义 / charIndex / 选中文本 / 在线查阅）。
         if self.bubble.is_some() {
-            root = root.child(self.render_bubble_menu(cx));
+            root = root.child(self.render_lookup_card(cx));
         }
 
         // 注文放大悬浮卡：点行内夹注小字弹出，点卡片外任意处收起。
@@ -1001,7 +1027,7 @@ impl Root {
                         self.show_notes_panel = false;
                         self.show_help = false;
                         self.show_share_panel = false;
-                        self.lookup = None;
+                        self.close_lookup();
                         self.clear_selection();
                         self.popup = None;
                         self.bubble = None;
@@ -1116,14 +1142,26 @@ impl Root {
                             "g" | "G" => {
                                 let c = self
                                     .sel_char
-                                    .or_else(|| self.popup.map(|h| h.ch))
+                                    .or_else(|| self.popup.as_ref().map(|h| h.ch))
                                     .or_else(|| {
                                         self.paginate().get(self.page).and_then(|p| {
                                             p.iter().find(|g| !g.is_indent()).map(|g| g.ch)
                                         })
                                     });
                                 if let Some(c) = c {
-                                    self.lookup = Some(c.to_string());
+                                    // 连同 charIndex / 选中文本一起记下：查字面
+                                    // 板上也要显示「第几章第几段第几字」。
+                                    let key = self
+                                        .sel_focus
+                                        .or(self.sel_anchor)
+                                        .or_else(|| self.popup.as_ref().map(|h| h.key))
+                                        .unwrap_or((self.current_chapter, 0, 0));
+                                    let text = if self.has_selection() {
+                                        self.selected_text()
+                                    } else {
+                                        c.to_string()
+                                    };
+                                    self.open_lookup(key, c, text, None);
                                 }
                                 self.clear_selection();
                                 self.popup = None;
@@ -2591,13 +2629,18 @@ impl Root {
         // 注文全体（跨列流转的一段）——点它时放大显示的就是这段。
         // 【】在这里也显作「」（放大卡与行内注保持同一套字）。
         let note_text: String = text.chars().map(crate::types::bracket_to_quote).collect();
+        // 批注字体：楷体（玄冬楷书 / 霞鹜文楷），与正文宋体分开——
+        // 刻本里正是「正文匠体、注文手写体」的层次。走古文链取字，
+        // 横笺没有楷体链时才不会退化成系统黑体。
+        let note_family = crate::fonts::note_family(self.note_font());
         let mut block = div()
             .w(px(cell_w))
             .h(px(rows as f32 * row_h))
             .flex()
             .flex_col()
             .items_center()
-            .overflow_hidden();
+            .overflow_hidden()
+            .font_family(note_family.clone());
         // 用户夹注：整块垫一层极淡朱砂底衬（不抢正文，只作「这是我加的」提示）。
         if let Some(bg) = note_bg {
             block = block.bg(rgb(bg));
@@ -3437,6 +3480,11 @@ impl Root {
                                 this.popup = Some(GlyphHit {
                                     key,
                                     ch: g.ch,
+                                    text: if this.has_selection() {
+                                        this.selected_text()
+                                    } else {
+                                        g.ch.to_string()
+                                    },
                                     x: event.position.x.to_f64() as f32,
                                     y: event.position.y.to_f64() as f32,
                                 });
@@ -3796,73 +3844,252 @@ impl Root {
             .child(card)
     }
 
-    /// 长按正文弹出的气泡菜单：复制 / 检索 / 字典。
+    /// 长按正文弹出的**字义浮签**：本地字书释义 + charIndex + 选中文本 + 在线查阅。
     ///
-    /// 三件事都复用既有能力，不新造一套：
-    ///   * 复制 —— `copy_page_text`（有选区复制选区，无选区则临时选中该字）；
-    ///   * 检索 —— `search_for` 直接把选中的词喂给全文检索并跳面高亮；
-    ///   * 字典 —— 写入 `lookup`，由既有的点字查字浮层显示释义。
-    fn render_bubble_menu(&mut self, cx: &mut Context<Self>) -> Div {
+    /// 长按一步给足四样（原先只有一个三按钮气泡，释义还得再点一次「字典」）：
+    ///   * **charIndex** —— 被查字的 `(章, 段, 字)`，以及它在全书流里的统一
+    ///     字符下标（`Book::flat_index`，与目录 `start_char_index` 同一口径）；
+    ///   * **选中文本** —— 拖选后长按取选区全文（`GlyphHit::text`），
+    ///     单字长按就退回这一个字；
+    ///   * **本地释义** —— 读编译期嵌入的 `resources/dict/guhanyu.json`
+    ///     （`dict::define`），原字 → 繁体 → 简体三级兜底，零 I/O；
+    ///   * **在线查阅** —— 拼 `https://www.zdic.net/hans/{字}` 交系统浏览器打开。
+    ///
+    /// 复制 / 检索两个动作并进浮签底部，功能不减、浮层仍只有一层。
+    fn render_lookup_card(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let Some(hit) = self.bubble.clone() else {
             return div();
         };
-        let h1 = hit.clone();
-        let h2 = hit.clone();
-        let h3 = hit.clone();
+        let vw = self.viewport_w;
+        let vh = self.viewport_h;
+        let ch = hit.ch.to_string();
+        // 释义三级兜底（与点字查字面板同一套）：原字 → 繁体 → 简体。
+        let trad = trad::traditional_of(hit.ch);
+        let def = crate::dict::define(&ch)
+            .or_else(|| trad.and_then(|x| crate::dict::define(&x.to_string())))
+            .or_else(|| {
+                trad::simplified_of(hit.ch).and_then(|s| crate::dict::define(&s.to_string()))
+            })
+            .map(|s| s.to_string());
+        let flat = self.lookup_flat_index();
+
+        // 位置：贴着长按点浮起，越界就夹回视口内（不飞出屏幕）。
+        let card_w = 292.0f32;
+        let mut left = hit.x + 16.0;
+        if left + card_w > vw - 8.0 {
+            left = (hit.x - card_w - 16.0).max(8.0);
+        }
+        let max_top = (vh - 260.0).max(8.0);
+        let top = (hit.y - 12.0).clamp(8.0, max_top);
+        let body_max = (vh - top - 104.0).max(120.0);
+
+        // ── 字头：大字 + 朱框，旁列 charIndex ──────────────────────
+        let (ci, pi, oi) = hit.key;
+        let mut meta = div().flex().flex_col().gap_1();
+        meta = meta.child(
+            div()
+                .text_size(px(11.5))
+                .text_color(rgb(t.ink()))
+                .child(SharedString::from(format!(
+                    "第 {} 章 · 第 {} 段 · 第 {} 字",
+                    ci + 1,
+                    pi + 1,
+                    oi + 1
+                ))),
+        );
+        if let Some(f) = flat {
+            meta = meta.child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgb(t.accent()))
+                    .child(SharedString::from(format!("全书第 {f} 字"))),
+            );
+        }
+        meta = meta.child(
+            div()
+                .text_size(px(10.5))
+                .text_color(rgb(t.ink_soft()))
+                .child(SharedString::from(format!("charIndex ({ci}, {pi}, {oi})"))),
+        );
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(48.0))
+                    .h(px(48.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_1()
+                    .border_color(rgb(t.accent()))
+                    .rounded(px(2.0))
+                    .text_size(px(30.0))
+                    .text_color(rgb(t.ink()))
+                    .child(SharedString::from(ch.clone())),
+            )
+            .child(meta);
+
+        // ── 选中文本：拖选后长按显示选区全文 ──────────────────────
+        let sel_line = if hit.text.chars().count() > 1 {
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(t.ink_soft()))
+                        .child(SharedString::from("选中文本")),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(t.indigo()))
+                        .child(SharedString::from(hit.text.clone())),
+                )
+        } else {
+            div()
+        };
+
+        // ── 本地释义（可滚动，长释义不撑破浮签）──────────────────
+        let def_view = match def {
+            Some(d) => {
+                let mut col = div().flex().flex_col().gap_1();
+                for line in d.split('\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    col = col.child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgb(t.ink_soft()))
+                            .child(SharedString::from(line.to_string())),
+                    );
+                }
+                let mut holder = div().max_h(px(body_max)).child(col);
+                holder.style().overflow.y = Some(Overflow::Scroll);
+                holder
+            }
+            None => div()
+                .text_size(px(11.5))
+                .text_color(rgb(t.ink_soft()))
+                .child(SharedString::from(
+                    "（本地字书未收此字，可点「在线查阅」上汉典）",
+                )),
+        };
+
+        // ── 底部动作：复制 / 检索 / 在线查阅 ──────────────────────
+        let copy_key = hit.key;
+        let copy_text = hit.text.clone();
         let btn_copy = small_button("复制", false, t).on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
                 // 长按单字时没有选区：临时把这一个字设为选区再复制，
                 // 免得退化成「复制整页」。
                 if !this.has_selection() {
-                    this.sel_anchor = Some(h1.key);
-                    this.sel_focus = Some(h1.key);
+                    this.sel_anchor = Some(copy_key);
+                    this.sel_focus = Some(copy_key);
                 }
                 this.copy_page_text();
                 this.clear_selection();
                 this.bubble = None;
+                this.close_lookup();
                 cx.notify();
             }),
         );
+        let search_text = copy_text.clone();
         let btn_search = small_button("检索", false, t).on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
-                let text = if this.has_selection() {
+                cx.stop_propagation();
+                let text = if search_text.is_empty() {
                     this.selected_text()
                 } else {
-                    h2.ch.to_string()
+                    search_text.clone()
                 };
                 this.search_for(&text, cx);
                 this.bubble = None;
+                this.close_lookup();
                 cx.notify();
             }),
         );
-        let btn_dict = small_button("字典", false, t).on_mouse_down(
+        let online = crate::dict::zdic_url(&ch);
+        let online_char = ch.clone();
+        let btn_online = small_button("在线查阅", true, t).on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
-                this.lookup = Some(h3.ch.to_string());
+                cx.stop_propagation();
+                // 系统默认浏览器打开汉典该字的页面。
+                if crate::app::open_external(&online) {
+                    this.notice = format!("已用浏览器打开汉典：{online_char}");
+                } else {
+                    this.notice = "未能调用系统浏览器".to_string();
+                }
+                cx.notify();
+            }),
+        );
+        let btn_close = small_button("关闭", false, t).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
                 this.bubble = None;
+                this.close_lookup();
                 cx.notify();
             }),
         );
 
         div()
             .absolute()
-            .left(px(hit.x))
-            .top(px(hit.y))
+            .left(px(left))
+            .top(px(top))
+            .w(px(card_w))
             .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .p_1()
-            .bg(rgb(t.chrome()))
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(rgb(t.paper()))
             .border_1()
             .border_color(rgb(t.frame()))
             .rounded(px(4.0))
-            .child(btn_copy)
-            .child(btn_search)
-            .child(btn_dict)
+            // 点浮签内部不让它冒到根容器的「点别处收起」监听上去，
+            // 否则点一下「在线查阅」浮签就没了。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(t.ink_soft()))
+                            .child(SharedString::from("字書 · 长按查义")),
+                    )
+                    .child(btn_close),
+            )
+            .child(head)
+            .child(sel_line)
+            .child(def_view)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(btn_copy)
+                    .child(btn_search)
+                    .child(btn_online),
+            )
     }
 
     /// 全文检索浮层：输入一个词，全书瞬时查找，跳到那一面并用朱砂红高亮。
@@ -3963,10 +4190,13 @@ impl Root {
             )
     }
 
-    /// 点字查字浮层：所点字用大字立在朱印旁，下附释义、繁体、通假。
+    /// 点字查字浮层：所点字用大字立在朱印旁，下附 charIndex、选中文本、
+    /// 释义、繁体、通假，底部一枚「在线查阅」（汉典）。
     fn render_dict_panel(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let ch = self.lookup.clone().unwrap_or_default();
+        // 「在线查阅」的按钮闭包是 `move`，需要自己持有一份字串。
+        let ch_for_online = ch.clone();
         let c = ch.chars().next().unwrap_or(' ');
         let book = self.book.as_ref();
         let trad = trad::traditional_of(c);
@@ -4022,6 +4252,37 @@ impl Root {
                         ),
                 ),
         );
+        // charIndex：点「查询」时一并记下的 (章, 段, 字) 与全书统一字符下标。
+        if let Some((ci, pi, oi)) = self.lookup_key {
+            body = body.child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from(format!(
+                        "第 {} 章 · 第 {} 段 · 第 {} 字",
+                        ci + 1,
+                        pi + 1,
+                        oi + 1
+                    ))),
+            );
+            if let Some(f) = self.lookup_flat_index() {
+                body = body.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(t.accent()))
+                        .child(SharedString::from(format!("全书第 {f} 字"))),
+                );
+            }
+        }
+        // 选中文本：拖选后点「查询」时，把选的哪一段也标出来。
+        if self.lookup_text.chars().count() > 1 {
+            body = body.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgb(t.indigo()))
+                    .child(SharedString::from(format!("选中：{}", self.lookup_text))),
+            );
+        }
         if let Some(d) = def {
             // 释义按行拆开逐行渲染（GPUI 的 SharedString 不解析 \n）；
             // 整部《古漢語常用字字典》一条释义可能上千字，放进可滚动区，
@@ -4097,12 +4358,33 @@ impl Root {
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
-                            this.lookup = None;
+                            this.close_lookup();
                             cx.notify();
                         }),
                     )),
             )
             .child(body)
+            // 在线查阅：拼汉典地址交系统浏览器，与长按浮签同一个动作。
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .child(small_button("在线查阅", true, t).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            let url = crate::dict::zdic_url(&ch_for_online);
+                            let ch2 = ch_for_online.clone();
+                            if crate::app::open_external(&url) {
+                                this.notice = format!("已用浏览器打开汉典：{ch2}");
+                            } else {
+                                this.notice = "未能调用系统浏览器".to_string();
+                            }
+                            cx.notify();
+                        }),
+                    )),
+            )
     }
 
     /// 样式浮层：纸色、字级、版式、注文排法。
@@ -4113,7 +4395,7 @@ impl Root {
     /// 每个工具都作用于被点击的那个字。
     fn render_glyph_menu(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
-        let Some(hit) = self.popup else {
+        let Some(hit) = self.popup.clone() else {
             return div();
         };
         let vw = self.viewport_w;
@@ -4156,7 +4438,14 @@ impl Root {
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.lookup = Some(ch.to_string());
+                // 一并记下 charIndex 与选中文本：字书面板上要显示「第几章第几段
+                // 第几字」，并在底部给出「在线查阅」。
+                let text = if this.has_selection() {
+                    this.selected_text()
+                } else {
+                    ch.to_string()
+                };
+                this.open_lookup(key, ch, text, None);
                 this.popup = None;
                 this.clear_selection();
                 cx.notify();
@@ -4516,6 +4805,9 @@ impl Root {
             .border_1()
             .border_color(rgba(0xFFFFFF24))
             .shadow_lg()
+            // 放大注卡同样走**批注字体**（楷体）：卡片里读的是注文，
+            // 与行内夹注小字同一副面孔，放大后仍是「注文的字」。
+            .font_family(crate::fonts::note_family(self.note_font()))
             // 点卡片内容不冒泡到 root（否则会被当「点别处」秒关）。
             .on_mouse_down(MouseButton::Left, cx.listener(|_this, _, _, cx| {
                 cx.stop_propagation();
@@ -5967,8 +6259,11 @@ impl Root {
                 sheet = sheet.child(style_row("标注", marks, t));
             }
             StyleTab::Font => {
-                // 字体：按当前模式给出可选字体。
+                // 字体：按当前模式给出可选字体（正文宋体 / 批注楷体 / 黑体 / 西文）。
                 sheet = sheet.child(style_row("字体", self.font_choices_row(cx), t));
+                // 批注字体：楷体二选一，与正文宋体分开——
+                // 正文匠体、注文手写体，正是刻本的层次。
+                sheet = sheet.child(style_row("批注", self.note_font_row(cx), t));
                 // 字级：小 / 中 / 大 / 特大 四档（原先那条七档圆点滑块已撤销——
                 // 档位密到肉眼分不出，反而要来回试）。选中档用朱砂实底，
                 // 一眼看清自己在哪一档；右侧实时报出当前字号。
@@ -6290,6 +6585,45 @@ impl Root {
                     }),
                 );
             row = row.child(chip);
+        }
+        row
+    }
+
+    /// 字体页的**批注字体**行：楷体二选一（`FontChoice::NOTE`）。
+    ///
+    /// 与正文宋体分行陈列：正文要「生僻字全覆盖 + 竖排标点正确」，
+    /// 批注要「手写味、与正文一眼可分」，两件事的最优解不是同一个字体。
+    fn note_font_row(&self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme;
+        let cur = self.note_font();
+        let mut row = div().flex().flex_row().items_center().gap_2().py_1();
+        for choice in FontChoice::NOTE {
+            let on = cur == choice;
+            let label = choice.label();
+            // 字牌直接用该字体渲染自己的名字：选前就能看见楷体长什么样。
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("note-font-{}", label)))
+                    .px_3()
+                    .py_1()
+                    .bg(rgb(if on { t.ink() } else { t.chip() }))
+                    .border_1()
+                    .border_color(rgb(if on { t.accent() } else { t.chrome_line() }))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(crate::fonts::note_family(choice))
+                    .text_size(px(13.0))
+                    .text_color(rgb(if on { 0xF3EADA } else { t.ink() }))
+                    .child(SharedString::from(label))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.set_note_font(choice);
+                            cx.notify();
+                        }),
+                    ),
+            );
         }
         row
     }

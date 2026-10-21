@@ -155,42 +155,67 @@ pub fn key_in_range(k: GlyphKey, a: GlyphKey, b: GlyphKey) -> bool {
     k >= a && k <= b
 }
 
-/// 字体选择（按模式区分）。
+/// 字体选择。
 ///
-/// 后六款为典籍排版常用字体（图 2 的字体行）：它们都是开源字库，
-/// 随包放在 `resources/fonts/` 或装进系统后即可选中；未安装时
-/// `fonts::family_for` 会自动沿回退链落到最接近的系统字体，不会出现豆腐块。
+/// 分工（换字体方案的核心）：
+///   * **正文** —— 大字库宋体（文津宋体 / 梦源宋体）：生僻字全覆盖、
+///     竖排标点挤压正确，古籍正文只认这一类；
+///   * **批注** —— 楷体（玄冬楷书 / 霞鹜文楷）：夹注小字、放大注卡、题识；
+///   * **标题 / UI** —— 思源黑体；
+///   * **等宽 / 西文** —— 尚古等宽、西文数字（Computer Modern）。
+///
+/// 全部为开源字库，**不随包打包**（一部大字符集宋体动辄几十 MB，
+/// 会撑爆 App 体积）。放进 `resources/fonts/` 或装进系统即可选中；
+/// 未安装时 `fonts::family_for` 沿回退链落到最接近的系统字体，
+/// 不会出现豆腐块。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum FontChoice {
-    /// 古文：宋体
-    SongTi,
-    /// 古文：思源宋体
-    SourceHanSerif,
-    /// 现代：思源黑体
+    // —— 正文：大字符集宋体 ——
+    /// 文津宋体（首选：生僻字全覆盖、大陆字形、竖排标点正确）
+    WenJinMincho,
+    /// 梦源宋体（思源宋体多字重衍生，字重大、屏显厚重）
+    MengYuanSerif,
+    // —— 批注：楷体 ——
+    /// 玄冬楷书（马善政毛笔楷书衍生，含竖排特性）
+    XuandongKaishu,
+    /// 霞鹜文楷（GB 版，手写楷体、覆盖常用字）
+    LXGWWenKai,
+    // —— 标题 / UI ——
+    /// 思源黑体
     SourceHanSans,
-    /// 现代：系统默认
+    // —— 等宽 / 西文 ——
+    /// 尚古等宽
+    ShangguMono,
+    /// 西文数字（Computer Modern）
+    LatinModern,
+    /// 系统默认
     SystemDefault,
-    /// 朱雀仿宋
+
+    // —— 旧版遗留：仅为兼容旧存档与内部兜底，UI 已不再陈列 ——
+    SongTi,
+    SourceHanSerif,
     ZhuqueFangsong,
-    /// 京华老宋
     JinghuaOldSong,
-    /// 汇文明朝
     HuiwenMincho,
-    /// 汇文正楷
     HuiwenZhengkai,
-    /// 寒蝉活仿楷
     HanchanHuofang,
-    /// 寒蝉锦书宋
     HanchanJinshu,
 }
 
 impl FontChoice {
     pub fn label(&self) -> &'static str {
         match self {
+            FontChoice::WenJinMincho => "文津宋体",
+            FontChoice::MengYuanSerif => "梦源宋体",
+            FontChoice::XuandongKaishu => "玄冬楷书",
+            FontChoice::LXGWWenKai => "霞鹜文楷",
+            FontChoice::SourceHanSans => "思源黑体",
+            FontChoice::ShangguMono => "尚古等宽",
+            FontChoice::LatinModern => "西文数字",
+            FontChoice::SystemDefault => "默认字体",
+            // 旧版遗留
             FontChoice::SongTi => "宋体",
             FontChoice::SourceHanSerif => "思源宋体",
-            FontChoice::SourceHanSans => "思源黑体",
-            FontChoice::SystemDefault => "默认字体",
             FontChoice::ZhuqueFangsong => "朱雀仿宋",
             FontChoice::JinghuaOldSong => "京华老宋",
             FontChoice::HuiwenMincho => "汇文明朝",
@@ -200,21 +225,24 @@ impl FontChoice {
         }
     }
 
-    /// 全部可选的典籍字体（字体页的竖排字牌按此顺序陈列）。
-    ///
-    /// 思源黑体与思源宋体同族，一并列入——批注、题签、现代夹注里都要用黑体，
-    /// 只在「横笺」模式给就选不到。
-    pub const CLASSIC: [FontChoice; 9] = [
-        FontChoice::SongTi,
-        FontChoice::SourceHanSerif,
+    /// 正文字体组（字体页的竖排字牌按此顺序陈列）：
+    /// 两款大字库宋体打头，楷体 / 黑体 / 等宽 / 西文随后——一套字体覆盖
+    /// 正文、批注、标题、混排西文四类角色，不必再装一堆零散字库。
+    pub const CLASSIC: [FontChoice; 7] = [
+        FontChoice::WenJinMincho,
+        FontChoice::MengYuanSerif,
+        FontChoice::XuandongKaishu,
+        FontChoice::LXGWWenKai,
         FontChoice::SourceHanSans,
-        FontChoice::ZhuqueFangsong,
-        FontChoice::JinghuaOldSong,
-        FontChoice::HuiwenMincho,
-        FontChoice::HuiwenZhengkai,
-        FontChoice::HanchanHuofang,
-        FontChoice::HanchanJinshu,
+        FontChoice::ShangguMono,
+        FontChoice::LatinModern,
     ];
+
+    /// **批注字体**组：楷体二选一（玄冬楷书 / 霞鹜文楷）。
+    ///
+    /// 夹注小字与放大注卡专用——正文用宋体、批注用楷体，正是刻本里
+    /// 「正文匠体、注文手写体」的层次；两款都装了就按用户选的走。
+    pub const NOTE: [FontChoice; 2] = [FontChoice::XuandongKaishu, FontChoice::LXGWWenKai];
 
     /// 横笺用的无衬线组（思源黑体 / 系统默认）。
     pub const MODERN: [FontChoice; 2] = [FontChoice::SourceHanSans, FontChoice::SystemDefault];
@@ -642,6 +670,29 @@ impl Book {
         self.chapters.iter().map(|c| c.char_count()).sum()
     }
 
+    /// 把字键 `(chapter, para, offset)` 换算成**全书统一的字符下标**（charIndex）。
+    ///
+    /// 与 `to_flow` / `flow_chars_of` 同一口径：段首两个缩进占位也计入，
+    /// 所以这个下标和「版面流里的第几个字」一一对应——长按浮签上显示的
+    /// 「第 N 字」就是它，可直接和目录的 `start_char_index` 对照。
+    pub fn flat_index(&self, key: GlyphKey) -> usize {
+        let (ci, pi, off) = key;
+        let mut acc = 0usize;
+        for (i, ch) in self.chapters.iter().enumerate() {
+            if i == ci {
+                for (j, p) in ch.paragraphs.iter().enumerate() {
+                    if j == pi {
+                        return acc + 2 + off;
+                    }
+                    acc += p.text.chars().count() + 2;
+                }
+                return acc;
+            }
+            acc += Self::flow_chars_of(ch);
+        }
+        acc
+    }
+
     /// 没有目录时，按章节标题补一份平铺目录。
     pub fn ensure_toc(&mut self) {
         if self.toc.is_empty() {
@@ -902,12 +953,19 @@ pub fn is_punct(c: char) -> bool {
 
 /// 点字弹出的工具条所锚定的字：记录该字的归属键、字符与点击处的窗口坐标。
 /// 坐标来自 `MouseDownEvent.position`，用于在点击位置附近浮起工具条。
-#[derive(Clone, Copy)]
+// 注意：不是 `Copy`——带了选中文本（`String`）。取用一律 `.clone()` /
+// `as_ref()`，改动点集中在 `render_glyph_menu` 与 `render_lookup_card`。
+#[derive(Clone)]
 pub struct GlyphHit {
-    /// 字的归属键 (chapter, para, offset)。
+    /// 字的归属键 (chapter, para, offset)——即这个字在全书里的 charIndex。
     pub key: (usize, usize, usize),
     /// 被点击的字符。
     pub ch: char,
+    /// 选中的**文本内容**：有拖选区取选区全文，单击 / 长按单字就退回这一个字。
+    ///
+    /// 长按查字浮签要同时显示「字」与「选中文本」，所以在这里一并记下，
+    /// 免得浮层再回头重算一遍选区（算选区要重新分页，代价不小）。
+    pub text: String,
     /// 点击处窗口 x 坐标（像素）。
     pub x: f32,
     /// 点击处窗口 y 坐标（像素）。
@@ -1207,6 +1265,32 @@ mod tests {
         assert_eq!(b.search("长"), vec![(0, 0, 0), (0, 0, 1), (0, 0, 2)]);
         // 全文比词短时不命中。
         assert!(b.search("长长长长").is_empty());
+    }
+
+    #[test]
+    fn flat_index_matches_flow_order() {
+        let mut b = Book::new("下标", "佚名");
+        b.chapters.push(Chapter {
+            title: "一".into(),
+            paragraphs: vec![Paragraph::plain("道可道"), Paragraph::plain("非常道")],
+        });
+        b.chapters.push(Chapter {
+            title: "二".into(),
+            paragraphs: vec![Paragraph::plain("上善若水")],
+        });
+        // 第一章：段① 2 缩进 + 3 字；段② 2 缩进 + 3 字。
+        assert_eq!(b.flat_index((0, 0, 0)), 2);
+        assert_eq!(b.flat_index((0, 0, 2)), 4);
+        assert_eq!(b.flat_index((0, 1, 0)), 7);
+        assert_eq!(b.flat_index((0, 1, 2)), 9);
+        // 第二章接在第一章之后：(3+2)+(3+2)=10 起，再加本段 2 个缩进。
+        assert_eq!(b.flat_index((1, 0, 0)), 12);
+        // 单调递增：阅读顺序即下标顺序。
+        let keys = [(0, 0, 0), (0, 0, 1), (0, 1, 0), (1, 0, 0), (1, 0, 3)];
+        let idx: Vec<usize> = keys.iter().map(|k| b.flat_index(*k)).collect();
+        assert_eq!(idx, vec![2, 3, 7, 12, 15]);
+        // 越界键不 panic（返回累计值）。
+        assert_eq!(b.flat_index((9, 9, 9)), 10 + 6);
     }
 
     #[test]
