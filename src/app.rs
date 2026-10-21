@@ -2333,31 +2333,33 @@ fn ensure_assets() {
     // 鱼尾纹：一枚朝下的实心三角，从顶边正中劈开一道窄缝，形似鱼尾（上尾朝下、下尾朝上）。
     // 注意 GPUI 只取 SVG 的 alpha 通道再用元素 text_color 上色，故 fill 必须为不透明实色。
     let top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 13\"><path d=\"M0,0 L11,0 L12,13 Z M24,0 L13,0 L12,13 Z\" fill=\"#1A150F\"/></svg>";
-    // 版心鱼尾：完整照搬用户参考图「横版」中缝里那两枚——**横长纯黑矩形**
-    // （骑跨版心、上下各一枚：上鱼尾在篇题之上，下鱼尾在叶码之下）。
-    // 逐像素复测参考图（800×566 扫描图）：鱼尾实体 x 410..442、y 171..182
-    // （上）/ y 440..451（下），即 **33×12 的实心横矩形，四缘皆平直、无尖无 V**，
-    // 宽高比 33:12 ≈ 2.75；上下两枚同形（纯矩形上下对称）。
-    // GPUI 只取 SVG 的 alpha 通道再用元素 text_color 上色，故 fill 必须为
-    // 不透明实色。见 reader::banxin_tail。
+    // 版心「对鱼尾」：**燕尾形路径**，绝不再用 `<rect>` 画方块。
+    // 上鱼尾上缘平直略弓、下缘中央开 ∧ 形凹口、两侧拖出流线尾翼；
+    // 下鱼尾上下翻转、开口相对。比例竖长（版心窄而高），高宽比见
+    // `banxin::FISHTAIL_ASPECT`；墨色由渲染层给 `#333333` 深灰（黑鱼尾
+    // 不取纯黑）。见 reader::banxin_tail。
     let bx_top = dir.join("banxin_top.svg");
     let bx_bot = dir.join("banxin_bottom.svg");
-    let bx_top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 33 12\"><rect x=\"0\" y=\"0\" width=\"33\" height=\"12\" fill=\"#1A150F\"/></svg>";
-    let bx_bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 33 12\"><rect x=\"0\" y=\"0\" width=\"33\" height=\"12\" fill=\"#1A150F\"/></svg>";
-    let _ = std::fs::write(&bx_top, bx_top_svg);
-    let _ = std::fs::write(&bx_bot, bx_bot_svg);
-    // 信笺（14 列）模板的「对鱼尾」：照用户「信笺」参考图逐像素提取——
-    // 一枚是「上缘平直、下缘中央开 Λ 形缺口、两角拖出尖尾」的燕尾，
-    // 另一枚上下翻转、开口相对。viewBox 47×34（实测鱼尾 47 宽、34 高，
-    // 实心带宽约 17、尖尾再拖 17）；四个角与缺口边缘各留 ±0.5 的微小
-    // 抖点，缩到几十像素时正好像木刻雕版的一点点毛边，而不是矢量图
-    // 那种绝对平直的机器边。见 reader::letter_fishtail。
+    let _ = std::fs::write(
+        &bx_top,
+        crate::banxin::fishtail_svg(true, crate::banxin::FISHTAIL_ASPECT),
+    );
+    let _ = std::fs::write(
+        &bx_bot,
+        crate::banxin::fishtail_svg(false, crate::banxin::FISHTAIL_ASPECT),
+    );
+    // 信笺（14 列）模板的「对鱼尾」：同一条燕尾路径，比例取横展
+    // （照用户「信笺」参考图的 47×34 量级），见 reader::letter_fishtail。
     let yu_top = dir.join("yu_top.svg");
     let yu_bot = dir.join("yu_bottom.svg");
-    let yu_top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 47 34\"><path d=\"M0,0.5 L11,0 L23.5,0.6 L36,0 L47,0.5 L47,33.4 L38.6,34 L23.7,16.6 L23.2,16.4 L9,34 L8.4,33.4 L0,33.6 Z\" fill=\"#1A150F\"/></svg>";
-    let yu_bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 47 34\"><path d=\"M0,33.5 L11,34 L23.5,33.4 L36,34 L47,33.5 L47,0.6 L38.6,0 L23.7,17.4 L23.2,17.6 L9,0 L8.4,0.6 L0,0.4 Z\" fill=\"#1A150F\"/></svg>";
-    let _ = std::fs::write(&yu_top, yu_top_svg);
-    let _ = std::fs::write(&yu_bot, yu_bot_svg);
+    let _ = std::fs::write(
+        &yu_top,
+        crate::banxin::fishtail_svg(true, crate::banxin::LETTER_TAIL_ASPECT),
+    );
+    let _ = std::fs::write(
+        &yu_bot,
+        crate::banxin::fishtail_svg(false, crate::banxin::LETTER_TAIL_ASPECT),
+    );
     let bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 13\"><path d=\"M0,13 L11,13 L12,0 Z M24,13 L13,13 L12,0 Z\" fill=\"#1A150F\"/></svg>";
     // 朱砂小印「箋讀」的小篆字稿：两枚 100×100 的等粗圆头线篆（墨色由
     // 渲染层 text_color 换成朱砂红）。随系统没有篆体字库，索性照小篆结构

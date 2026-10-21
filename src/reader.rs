@@ -260,20 +260,21 @@ fn fish_tail_ink(width: f32, top: bool, color: u32) -> Div {
         )
 }
 
-/// 版心鱼尾：完整照搬用户参考图「横版」中缝里那两枚——**横长纯黑矩形**
-/// （骑跨版心：上鱼尾在篇题之上、下鱼尾在叶码之下）。逐像素复测参考图
-/// （800×566 扫描图）确认为 33×12 实心横矩形，四缘平直、无尖无 V，
-/// 宽高比 33:12 ≈ 2.75；上下两枚同形（纯矩形上下对称）。
-/// SVG viewBox 33×12（见 app::ensure_assets）。
-fn banxin_tail(width: f32, top: bool, color: u32) -> Div {
-    let h = width * 12.0 / 33.0;
+/// 版心「对鱼尾」（黑鱼尾）：**燕尾形路径**——上缘平直略弓、下缘中央
+/// 开 ∧ / ∨ 形凹口、两侧拖出流线尾翼，上下两枚**开口相对**。
+///
+/// 早先是两枚 `<rect>` 实心黑块（33×12），既不合刻本形制，视觉上也极
+/// 重。现在整枚由贝塞尔路径画出（`banxin::fishtail_svg`），尺寸由
+/// `banxin::banxin_tail_size` 按「宽不越界栏、高约一字半」算好传进来。
+/// 墨色渲染层给 `#333333` 深灰——黑鱼尾不取纯黑。见 app::ensure_assets。
+fn banxin_tail(w: f32, h: f32, top: bool, color: u32) -> Div {
     let path = if top {
         "banxin_top.svg"
     } else {
         "banxin_bottom.svg"
     };
     div()
-        .w(px(width))
+        .w(px(w))
         .h(px(h))
         .flex()
         .flex_row()
@@ -282,25 +283,23 @@ fn banxin_tail(width: f32, top: bool, color: u32) -> Div {
         .child(
             svg()
                 .path(SharedString::from(path.to_string()))
-                .w(px(width))
+                .w(px(w))
                 .h(px(h))
                 .text_color(rgb(color)),
         )
 }
 
-/// 信笺「对鱼尾」：照用户「信笺」参考图逐像素提取的燕尾形——
-/// 上缘平直、下缘中央开 Λ 形缺口、两角拖出尖尾（上鱼尾）；下鱼尾
-/// 上下翻转、开口相对。viewBox 47×34（宽高比 34:47），边缘留了
-/// 微小抖点，缩到几十像素时略带木刻毛边。见 app::ensure_assets。
-fn letter_fishtail(width: f32, top: bool, color: u32) -> Div {
-    let h = width * 34.0 / 47.0;
+/// 信笺「对鱼尾」：与版心同一条燕尾路径，比例取**横展**
+/// （`banxin::LETTER_TAIL_ASPECT`，照用户「信笺」参考图的 47×34 量级）。
+/// 见 app::ensure_assets。
+fn letter_fishtail(w: f32, h: f32, top: bool, color: u32) -> Div {
     let path = if top {
         "yu_top.svg"
     } else {
         "yu_bottom.svg"
     };
     div()
-        .w(px(width))
+        .w(px(w))
         .h(px(h))
         .flex()
         .flex_row()
@@ -309,10 +308,57 @@ fn letter_fishtail(width: f32, top: bool, color: u32) -> Div {
         .child(
             svg()
                 .path(SharedString::from(path.to_string()))
-                .w(px(width))
+                .w(px(w))
                 .h(px(h))
                 .text_color(rgb(color)),
         )
+}
+
+/// 版心折痕：纸**对折**的那道物理褶——0.5px、`#999999`、**虚线**，
+/// 比界行还淡一档，只作「纸的痕迹」，不抢鱼尾与书口文字。
+///
+/// GPUI 0.2.2 没有元素级 dashed 边框，故用一串短横拼出来：段长固定，
+/// 段距由 `banxin::fold_dashes` 按可用高反算，头尾严丝合缝不留残段。
+fn fold_crease(x: f32, top: f32, len: f32, color: u32) -> Div {
+    let (n, gap) = crate::banxin::fold_dashes(len, crate::banxin::FOLD_DASH);
+    let mut line = div()
+        .absolute()
+        .top(px(top))
+        .left(px(x))
+        .w(px(crate::banxin::FOLD_W))
+        .flex()
+        .flex_col()
+        .gap(px(gap));
+    for _ in 0..n {
+        line = line.child(
+            div()
+                .w(px(crate::banxin::FOLD_W))
+                .h(px(crate::banxin::FOLD_DASH))
+                .bg(rgb(color)),
+        );
+    }
+    line
+}
+
+/// 版心书口的一行文字：一字一格、居中竖排，**极小号宋体**（族名由调用
+/// 方给：走正文字体的回退链）。淡墨用于书名 / 卷次 / 叶码，正墨给篇题。
+fn banxin_vtext(line: &crate::banxin::BanxinLine, w: f32, family: &SharedString, t: Theme) -> Div {
+    let mut d = div().w(px(w)).flex().flex_col().items_center();
+    for c in line.text.chars() {
+        d = d.child(
+            div()
+                .w(px(w))
+                .h(px(line.lh))
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_family(family.clone())
+                .text_size(px(line.fs))
+                .text_color(rgb(if line.soft { t.ink_soft() } else { t.ink() }))
+                .child(SharedString::from(c.to_string())),
+        );
+    }
+    d
 }
 
 /// 版心小印：朱砂红「箋讀」小方印，嵌在中缝的下鱼尾之下（影印本版心
@@ -2749,13 +2795,24 @@ impl Root {
             .border_l_1()
             .border_color(rgb(t.rule_by(self.rule_color)));
         // 天头：留约一字高的空白，鱼尾才落在版心上部而不是贴框。
-        col = col.child(div().h(px(cell_h * 1.0)));
-        // 上鱼尾：横长纯黑矩形，骑跨版心（照参考图「横版」：鱼尾在篇题之上）。
-        // 宽取章题列的 2/3（参考图比例：鱼尾 33 : 中缝带 50）。
-        col = col.child(banxin_tail(col_w * 0.66, true, t.frame_ink()));
+        let head = cell_h * 1.0;
+        col = col.child(div().h(px(head)));
+        // 上鱼尾：与版心同一枚燕尾（深灰 `#333333`），尺寸同式。
+        let (tw, th) = crate::banxin::banxin_tail_size(col_w, cell_h);
+        col = col.child(banxin_tail(tw, th, true, t.fish_ink()));
         col = col.child(div().h(px(cell_h * 0.18)));
+        // 篇题能排几字：总高扣天头、两枚鱼尾、篇题数与几段留白，
+        // 余下全给篇题——鱼尾取了 1.5 字高后，短叶也不会溢出。
+        let nfs = (fs * 0.42).max(9.0);
+        let num_h = (nfs + 2.0) * han_num(chapter + 1).chars().count() as f32;
+        let avail = cell_h * rows as f32 + foot_h
+            - head
+            - th * 2.0
+            - num_h
+            - cell_h * (0.18 + 0.1 + 0.38);
+        let take_n = (avail / cell_h).floor().clamp(0.0, 7.0) as usize;
         // 篇题：一字一格，自上面下。
-        for c in title.chars().take(7) {
+        for c in title.chars().take(take_n) {
             col = col.child(
                 div()
                     .w(px(col_w))
@@ -2772,7 +2829,6 @@ impl Root {
         // 位序「上鱼尾 → 篇题 → 篇题数 → 下鱼尾」（参考图「横版」）。
         // 叶码不在此处：中缝（对开）与地脚（单页）另有一份。
         col = col.child(div().flex_1());
-        let nfs = (fs * 0.42).max(9.0);
         for c in han_num(chapter + 1).chars() {
             col = col.child(
                 div()
@@ -2787,8 +2843,8 @@ impl Root {
             );
         }
         col = col.child(div().h(px(cell_h * 0.1)));
-        // 下鱼尾：与上鱼尾对合，夹住篇题与篇题数（同宽同形，纯黑横矩形）。
-        col = col.child(banxin_tail(col_w * 0.66, false, t.frame_ink()));
+        // 下鱼尾：与上鱼尾对合，夹住篇题与篇题数（同形，开口相对）。
+        col = col.child(banxin_tail(tw, th, false, t.fish_ink()));
         col.child(div().h(px(cell_h * 0.38)))
     }
 
@@ -2802,6 +2858,7 @@ impl Root {
     fn render_letter_gutter(&self, cell_w: f32, cell_h: f32, rows: usize, foot_h: f32) -> Div {
         let t = self.theme;
         let gw = cell_w;
+        let (tw, th) = crate::banxin::letter_tail_size(gw, cell_h);
         let mut col = div()
             .w(px(gw))
             .h(px(cell_h * rows as f32 + foot_h))
@@ -2812,25 +2869,46 @@ impl Root {
             .border_l_1()
             .border_color(rgb(t.rule_by(self.rule_color)))
             .bg(rgb(t.paper()))
+            .relative()
             // 地脚那一段不参与「垂直居中」，对鱼尾才落在正文区的正中。
             .pb(px(foot_h));
+        // 折痕：纸对折的物理褶，落在中缝正中（极细虚线，见 `fold_crease`）。
+        col = col.child(fold_crease(
+            gw * 0.5 - crate::banxin::FOLD_W * 0.5,
+            0.0,
+            cell_h * rows as f32,
+            t.fold_ink(),
+        ));
         col = col.child(div().flex_1());
-        // 上鱼尾：Λ 口朝下（开口相对）。
-        col = col.child(letter_fishtail(gw * 0.96, true, t.frame_ink()));
+        // 上鱼尾：∧ 口朝下（开口相对）。
+        col = col.child(letter_fishtail(tw, th, true, t.fish_ink()));
         // 尾间空约三格（参考图实测 157px ≈ 3 个列宽）。
         col = col.child(div().h(px(cell_h * 3.0)));
-        // 下鱼尾：V 口朝上。
-        col = col.child(letter_fishtail(gw * 0.96, false, t.frame_ink()));
+        // 下鱼尾：∨ 口朝上。
+        col = col.child(letter_fishtail(tw, th, false, t.fish_ink()));
         col.child(div().flex_1())
     }
 
     /// 中缝（版心）：对开时立在纸心的一道竖栏——左缘一条细线（与页内
     /// 界行同粗细、与内框同起止）夹一字宽的纸带，右缘那条由右半叶最左
-    /// 一列的界行充当（两线间距恰为一列字宽，与左右丝栏等距延续）；
-    /// 带上鱼尾（横长纯黑矩形，骑跨版心）、篇题、叶码、朱砂小印自上而下
-    /// 排布。缝宽约等于一行字宽（`grid::gutter_w`）：刻本版心本就是一列
-    /// 字的宽度；纸面总宽不变，只是把原来「两叶之间的空白」换成纸心的
-    /// 一道版心。
+    /// 一列的界行充当（两线间距恰为一列字宽，与左右丝栏等距延续）。
+    /// 带内自上而下排布：
+    ///
+    /// ```text
+    ///   上鱼尾（∧ 口朝下）
+    ///   书名   宋词三百首     ← 极小号宋体，竖排
+    ///   卷次   卷五十一
+    ///   篇题   （余量有多少排多少）
+    ///          ⋯⋯
+    ///   叶码   五十
+    ///   下鱼尾（∨ 口朝上）
+    ///   朱印
+    /// ```
+    ///
+    /// 正中另有一道**极细虚线**（0.5px、`#999999`）作纸对折的折痕。
+    /// 缝宽约等于一行字宽（`grid::gutter_w`）：刻本版心本就是一列字的
+    /// 宽度；文字的高度账由 `banxin::layout` 按优先级分（叶码 → 卷次 →
+    /// 书名 → 篇题），分不够就截字，绝不溢出、绝不压字。
     /// 左半叶是章首时不用它——那一叶自带的「章题列」本身就是版心。
     fn render_gutter(&self, chapter: usize, page_idx: usize, detailed: bool) -> Div {
         let t = self.theme;
@@ -2844,16 +2922,37 @@ impl Root {
             ANCIENT_EDGE,
             self.grid.margin,
         );
-        // 字号必须收在缝宽以内，否则会溢出到两侧的正文上。
-        let tfs = (gw * 0.68).min(fs * 0.72).max(8.0);
-        let small = (gw * 0.50).min(fs * 0.40).max(7.0);
         // 地脚高与 `render_ancient` 同式，中缝才能与纸面上下对齐。
         let foot_h = (fs * 0.36).max(9.0) + 10.0;
+        // 与纸面同高：上下留白 16、版框双边 3+3、框内留边 3+3、内栏线 1+1，
+        // 再加行格与地脚——和 `render_ancient` 里那张纸严丝合缝。
+        let h = 16.0 * 2.0 + 14.0 + cell_h * self.grid_rows as f32 + foot_h;
+        // 天头：留约三成字高，上鱼尾才落在版心上部而不是贴着内框。
+        let head = cell_h * 0.30;
+        // 书口文字：书名（去括号）、卷次「卷五十一」、叶码「五十」。
+        let book = self.book_title();
+        let juan = format!("卷{}", han_num(chapter + 1));
+        let page = han_num(page_idx + 1);
+        let lay = crate::banxin::layout(crate::banxin::BanxinOpts {
+            gutter_w: gw,
+            // 可用高 = 纸高 − 上下留白(20×2) − 天头；`banxin::layout`
+            // 再扣两枚鱼尾与朱印，剩下的才是文字。
+            band_h: (h - 40.0 - head).max(40.0),
+            cell_h,
+            fs,
+            book: &book,
+            juan: &juan,
+            page: &page,
+            chapter_title: &self.chapter_title(chapter),
+            detailed,
+            seal: true,
+        });
+        // 书口小字**极小号宋体**：走正文字体（默认文津宋体）的回退链，
+        // 横笺里也不会退化成黑体。
+        let family = crate::fonts::family_for(self.current_font(), Script::Ancient);
         let mut col = div()
             .w(px(gw))
-            // 与纸面同高：上下留白 16、版框双边 3+3、框内留边 3+3、内栏线 1+1，
-            // 再加行格与地脚——和 `render_ancient` 里那张纸严丝合缝。
-            .h(px(16.0 * 2.0 + 14.0 + cell_h * self.grid_rows as f32 + foot_h))
+            .h(px(h))
             .flex()
             .flex_col()
             .items_center()
@@ -2865,7 +2964,7 @@ impl Root {
             .pt(px(16.0 + 4.0))
             .pb(px(16.0 + 4.0))
             .bg(rgb(t.paper()));
-        // 版心细线：与左右叶的**内框**（border_1）同起同止——参考图
+        // 版心细线（界栏）：与左右叶的**内框**（border_1）同起同止——参考图
         // 「横版」里中缝线不顶纸缘、也不碰外粗框。线位 = 纸面顶 + 留白16
         // + 外框3 + 框内留边3 = 22（col 与纸面同高同顶，故 absolute
         // top/bottom 取 22，即内框上/下沿），头尾与内框严丝合缝。
@@ -2882,6 +2981,14 @@ impl Root {
             .w(px(1.0))
             .bg(rgb(t.rule_by(self.rule_color)));
         col = col.child(rule_lines);
+        // 折痕：纸**对折**的那一道物理褶，落在版心正中——0.5px、`#999999`、
+        // 虚线，只作「纸的痕迹」，比界行还淡，不抢鱼尾与书口文字。
+        col = col.child(fold_crease(
+            gw * 0.5 - crate::banxin::FOLD_W * 0.5,
+            22.0,
+            (h - 44.0).max(0.0),
+            t.fold_ink(),
+        ));
         // 纸心头顶 / 脚底的框线贯通：对开两叶拼成**一张平铺的整纸**，
         // 外框粗线与内框细线必须横贯全页、全封闭——左叶的上下框只画到
         // 纸心左缘、右叶只从纸心右缘起，若不在这里补上中缝那一段，
@@ -2912,49 +3019,49 @@ impl Root {
         // 下外框粗线 / 下内框细线
         col = col.child(edge(false, 3.0, 16.0));
         col = col.child(edge(false, 1.0, 22.0));
-        col = col.child(div().h(px(cell_h * 0.85)));
-        // 上鱼尾：横长纯黑矩形，骑跨版心（照参考图「横版」：鱼尾在篇题之上）。
-        // 宽度取中缝的 2/3——参考图鱼尾 33px 对中缝带 50px，正是这个比例；
-        // 居中于纸心，不顶两边的细线。
-        col = col.child(banxin_tail(gw * 0.66, true, t.frame_ink()));
-        col = col.child(div().h(px(cell_h * 0.16)));
-        if detailed {
-            for c in self.chapter_title(chapter).chars().take(6) {
-                col = col.child(
-                    div()
-                        .w(px(gw))
-                        .h(px(cell_h))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(tfs))
-                        .text_color(rgb(t.ink()))
-                        .child(SharedString::from(c.to_string())),
-                );
-            }
+        col = col.child(div().h(px(head)));
+        // 上鱼尾：∧ 口朝下（燕尾路径，深灰 `#333333`，见 `banxin_tail`）。
+        // 尺寸由 `banxin::layout` 按「宽不越界栏、高约一字半」算好。
+        col = col.child(banxin_tail(lay.tail_w, lay.tail_h, true, t.fish_ink()));
+        col = col.child(div().h(px(lay.gap)));
+        // 书名 → 卷次 → 篇题（极小号宋体，一字一格竖排）。
+        for line in &lay.above {
+            col = col.child(banxin_vtext(line, gw, &family, t));
         }
+        // 余量全给中间：书名卷次贴着上鱼尾、叶码贴着下鱼尾，两枚鱼尾
+        // 「夹」住书口文字，正是刻本版心的样子。
         col = col.child(div().flex_1());
-        if detailed {
-            for c in han_num(page_idx + 1).chars() {
-                col = col.child(
-                    div()
-                        .w(px(gw))
-                        .h(px(small + 2.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(small))
-                        .text_color(rgb(t.ink_soft()))
-                        .child(SharedString::from(c.to_string())),
-                );
-            }
+        // 叶码。
+        for line in &lay.below {
+            col = col.child(banxin_vtext(line, gw, &family, t));
         }
-        col = col.child(div().h(px(cell_h * 0.12)));
-        // 下鱼尾：与上鱼尾对合，夹住篇题与叶码（同宽同形，纯黑横矩形）。
-        col = col.child(banxin_tail(gw * 0.66, false, t.frame_ink()));
+        col = col.child(div().h(px(lay.gap)));
+        // 下鱼尾：∨ 口朝上，与上鱼尾开口相对。
+        col = col.child(banxin_tail(lay.tail_w, lay.tail_h, false, t.fish_ink()));
         // 朱砂小印「箋讀」：贴版心下端（影印本版心印落在下鱼尾之下）。
-        col = col.child(div().h(px(cell_h * 0.26)));
-        col.child(banxin_seal(gw * 0.80, gw * 1.60))
+        // 版面太挤时 `banxin::layout` 会把印砍掉（叶码优先）。
+        if lay.seal_h > 0.0 {
+            col = col.child(div().h(px(lay.gap)));
+            col = col.child(banxin_seal(gw * 0.80, gw * 1.60));
+        }
+        col
+    }
+
+    /// 书名（版心书口用）：去《》【】「」等括号与空白，只留题名——
+    /// 版心只有一格宽，题名外的符号一律不排。
+    fn book_title(&self) -> String {
+        self.book
+            .as_ref()
+            .map(|b| {
+                b.title
+                    .chars()
+                    .filter(|c| {
+                        !matches!(c, '《' | '》' | '〈' | '〉' | '【' | '】' | '「' | '」' | '『' | '』')
+                            && !c.is_whitespace()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// 一章的「篇 / 章 / 字」（章序与字数都写汉字数词）。

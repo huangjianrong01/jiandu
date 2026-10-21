@@ -197,6 +197,32 @@ impl Theme {
         self.paper_theme().border
     }
 
+    /// **黑鱼尾**的墨色：深灰 `#333333`，不是纯黑——纯黑在纸面上太跳，
+    /// 会盖过正文的墨。深底（夜读）反过来取「淡墨」：黑纸上的黑鱼尾
+    /// 与纸只剩十来个单位的亮度差，看上去像一枚脏印；改用纸→墨的方向
+    /// 兑到六成，才是一枚看得清、又不抢正文的灰鱼尾。
+    pub fn fish_ink(self) -> u32 {
+        let p = self.paper_theme();
+        if p.is_dark() {
+            mix(p.paper, self.ink(), 0.62)
+        } else {
+            crate::banxin::FISH_INK
+        }
+    }
+
+    /// 版心折痕：极淡的灰 `#999999`——纸对折的物理褶，不是界栏，
+    /// 故比界行再淡一档（深底上略压暗，免得亮成一道白线）。
+    pub fn fold_ink(self) -> u32 {
+        let p = self.paper_theme();
+        if p.is_dark() {
+            // 深底：折痕只在纸上比底色亮一点点（界行 0x4A4D4F 已够淡，
+            // 折痕必须更淡，否则中缝会亮成一道灯管）。
+            mix(p.paper, crate::banxin::FOLD_INK, 0.30)
+        } else {
+            crate::banxin::FOLD_INK
+        }
+    }
+
     /// 丝栏取色：按样式面板所选丝栏色给出界行颜色。
     /// 乌 = `rule_ink`（冷灰）；朱 = `rule_red`（朱红）；
     /// 金 = 泥金——亮纸上压一档防飘，夜读里提亮才看得见。
@@ -555,6 +581,37 @@ mod tests {
         assert!(!PaperTheme::by_id("xuanzhi").is_dark());
         // 未知 id 回落首项（配置损坏不崩）。
         assert_eq!(PaperTheme::by_id("nope").id, "xuanzhi");
+    }
+
+    #[test]
+    fn fish_ink_is_dark_grey_not_black_and_visible_on_every_paper() {
+        // 黑鱼尾：浅纸上就是 #333333（不取纯黑，纯黑太跳）。
+        assert_eq!(Theme::Xuan.fish_ink(), crate::banxin::FISH_INK);
+        assert_eq!(crate::banxin::FISH_INK, 0x333333);
+        // 深底（夜读）兑淡：鱼尾不能因为纸黑就整枚消失。
+        let ye = Theme::Ye.fish_ink();
+        assert_ne!(ye, crate::banxin::FISH_INK);
+        assert!(luma(ye) > luma(Theme::Ye.paper()), "夜读的鱼尾应比纸亮");
+        // 任何纸上鱼尾与纸色都要有可辨的对比。
+        for t in Theme::ALL {
+            let d = (luma(t.fish_ink()) - luma(t.paper())).abs();
+            assert!(d > 25.0, "{} 的鱼尾与纸对比不足：{d:.1}", t.label());
+        }
+    }
+
+    #[test]
+    fn fold_ink_stays_faint_but_readable() {
+        // 折痕是「纸的褶」，必须比界行再淡一档。
+        for t in Theme::ALL {
+            let f = t.fold_ink();
+            let d = (luma(f) - luma(t.paper())).abs();
+            assert!(d > 8.0, "{} 的折痕看不见：{d:.1}", t.label());
+            assert!(
+                d < (luma(t.rule_ink()) - luma(t.paper())).abs(),
+                "{} 的折痕不该比界行还重",
+                t.label()
+            );
+        }
     }
 
     #[test]

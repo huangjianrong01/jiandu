@@ -8,6 +8,7 @@
 //!   * 单面 / 双面对开阅读。
 
 mod app;
+mod banxin;
 mod content;
 mod dict;
 mod exporter;
