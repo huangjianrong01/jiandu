@@ -4049,7 +4049,9 @@ impl Root {
         // 字体：正文（字头 / 释义）与西文（拼音）各按角色取，不写字族名。
         let main_family = self.main_family();
         let latin_family = crate::fonts::family_for_role(crate::fonts::FontRole::Latin);
-        let inner_h = (m.h - 40.0).max(60.0);
+        // 内容区高：扣双线框 + 内边距 + 页眉一行 + 页脚两行（与 `card_metrics`
+        // 预留的 56 同源）。
+        let inner_h = (m.h - 56.0).max(60.0);
         // 竖排的**行距由格子高显式给死**（不是靠字体行高）：每字一个
         // `line_h` 高的格子，`per_col` 个字正好铺满 `inner_h`——字体行高
         // 偏大偏小都不会溢出卡片，也不会在底部留一截空白。
@@ -4267,19 +4269,21 @@ impl Root {
             .child(cols)
             .child(py_col)
             .child(head_col);
+        // 页脚分两行：上行 charIndex（可截断），下行按钮右对齐——
+        // 挤成一行时脚注会把「考據原典」压扁，窄卡片上尤其难看。
         let bar = div()
             .w_full()
             .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap_1()
+            .flex_col()
+            .gap(px(3.0))
             .child(foot)
             .child(
                 div()
+                    .w_full()
                     .flex()
                     .flex_row()
                     .items_center()
+                    .justify_end()
                     .gap_1()
                     .child(btn_zdic)
                     .child(btn_copy)

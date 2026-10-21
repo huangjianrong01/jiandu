@@ -474,8 +474,9 @@ pub fn card_metrics(gloss_len: usize, vw: f32, vh: f32) -> CardMetrics {
     let gloss_fs = 13.0f32;
     let line = gloss_fs * 1.16;
     // 高度上限：视口六成（再高就成了半屏，失去「小纸条」的轻）。
-    let max_h = (vh * 0.62).clamp(200.0, (vh - CARD_PAD * 2.0).max(200.0));
-    let inner_max = (max_h - 34.0).max(60.0); // 扣双线框 + 内边距 + 页脚按钮行
+    let max_h = (vh * 0.62).clamp(220.0, (vh - CARD_PAD * 2.0).max(220.0));
+    // 扣双线框 + 内边距 + 页眉 + **两行页脚**（charIndex 一行、按钮一行）。
+    let inner_max = (max_h - 56.0).max(60.0);
     let per_col_limit = ((inner_max / line).floor() as usize).max(6);
     // 列数：按「一列最多 per_col_limit 字」铺开；最多 6 列（再多就成条幅了）。
     let cols = if gloss_len == 0 {
@@ -491,10 +492,10 @@ pub fn card_metrics(gloss_len: usize, vw: f32, vh: f32) -> CardMetrics {
     };
     // 高度随内容收缩：短释义就是一张矮纸条，不硬撑到六成屏。
     let content_h = per_col as f32 * line;
-    let h = (content_h + 34.0).clamp(120.0, max_h);
-    // 宽：字头列 40 + 拼音列 18 + 释义 n 列（每列 = 字号 × 1.5）+ 内边距。
-    let w = 40.0 + 18.0 + cols as f32 * gloss_fs * 1.5 + 30.0;
-    let w = w.clamp(200.0, (vw - CARD_PAD * 2.0).max(200.0));
+    let h = (content_h + 56.0).clamp(140.0, max_h);
+    // 宽：字头列 40 + 拼音列 18 + 释义 n 列（每列 = 字号 × 1.6）+ 内边距。
+    let w = 40.0 + 18.0 + cols as f32 * gloss_fs * 1.6 + 30.0;
+    let w = w.clamp(240.0, (vw - CARD_PAD * 2.0).max(240.0));
     CardMetrics {
         w,
         h,
@@ -720,7 +721,7 @@ mod tests {
         assert!(m.h < long.h, "短释义卡片应更矮：{} vs {}", m.h, long.h);
         // 极窄屏也不至于给出比屏还宽的卡片（宽高各有下限，只断言不崩、不越界）。
         let tiny = card_metrics(400, 320.0, 500.0);
-        assert!(tiny.w >= 200.0 - 0.01 && tiny.h >= 120.0 - 0.01);
+        assert!(tiny.w >= 240.0 - 0.01 && tiny.h >= 140.0 - 0.01);
         assert!(tiny.w <= 320.0 - 2.0 * CARD_PAD + 0.01);
     }
 
