@@ -5,13 +5,25 @@
 //! 字整段送回应用。没有 InputHandler 时，组好的字无处可去：表现就是
 //! 「重命名时打不进中文，退格也像失灵」。
 //!
-//! 本模块做两件事：
+//! 本模块做三件事：
 //!   ① `InputField`：把「草稿串 + 字符光标」的自绘输入框包成可聚焦元素，
 //!      paint 阶段注册 `handle_input`，焦点落在本元素时平台才把 IME 送进来；
-//!   ② `impl EntityInputHandler for Root`：把输入法回传的文字写进重命名草稿。
+//!   ② `impl EntityInputHandler for Root`：把输入法回传的文字写进各草稿；
+//!   ③ 组字区间的正解（`replace_and_mark_text_in_range` /
+//!      `replace_text_in_range`）：输入法传 NSNotFound（GPUI 转成 `None`）时，
+//!      要替换的是**当前标记区间**，没有标记区间才落在光标处。
 //!
-//! 直接键入（英文 / 数字 / 标点）仍走原来的 keydown 路径
-//! （见 `shelf::handle_shelf_key`），两条路互补、不会重复插入。
+//! 关于文字输入的总架构——**可打印字符一律不 keydown 直插**：
+//! GPUI 0.2.2 的派发顺序是「先 keydown 回调、后送输入法上下文」，而
+//! inputContext 对**所有**输入源（ABC / 拼音 / 双拼 / Rime）都会回调
+//! `insertText:` / `setMarkedText:`（实测 ABC 下每个可打印键都触发
+//! insertText）。所以 keydown 直插与 InputHandler 回落必叠字——
+//! 修复前实测：Squirrel 小鹤双拼敲 `nihao`，草稿得到
+//! `nnnnnn n i h a o haoh`（21 字而非「你好」）；ABC 敲 `qwe`
+//! 得 `qqwwee`。修法：文字只走 InputHandler 一条路（与 NSTextField
+//! 架构一致），keydown 只处理编辑键（Esc / ⏎ / ← → / Home / End /
+//! ⌘V / 未组字时的退格）——见 `reader::handle_reading_key` 与
+//! `shelf::handle_shelf_key`。
 
 use crate::app::Root;
 use gpui::{
@@ -60,6 +72,20 @@ pub const SEARCH_MAX: usize = 64;
 
 /// 笔记字数上限：一段批注的合理长度（与 keydown 路径的 500 字口径一致）。
 pub const NOTE_MAX: usize = 500;
+
+/// 输入法替换区间的正解：`range` 为 `None`（macOS 传 NSNotFound，
+/// GPUI 转成 None）时，替换目标是**当前标记区间**；没有标记区间
+/// 才落在光标处。
+///
+/// 这条语义是叠字事故的另一半：组字期间输入法每步都传 NSNotFound，
+/// 若按「插到光标」处理，第二步就会把新拼音叠在旧拼音后面——
+/// 实测 Squirrel 双拼敲 `nihao`，草稿滚成 `nninih…`。
+pub fn effective_replace_range(
+    range: Option<Range<usize>>,
+    marked: &Option<Range<usize>>,
+) -> Option<Range<usize>> {
+    range.or_else(|| marked.clone())
+}
 
 /// 把草稿 `draft` 里 `range`（UTF-16 区间；None = 当前光标处，零长度）
 /// 替换成 `text`，并把光标 `cursor` 落到插入内容之后；返回替换处的
@@ -347,6 +373,10 @@ impl EntityInputHandler for Root {
     }
 
     /// 输入法把字「上屏」：替换区间（或光标处）并落定光标。
+    ///
+    /// 同 `replace_and_mark_text_in_range`：`range` 为 None（NSNotFound）时
+    /// 替换当前标记区间——上屏的汉字应该顶掉未上屏的拼音串，
+    /// 而不是插在它后面（否则草稿里拼音汉字并存）。
     fn replace_text_in_range(
         &mut self,
         range: Option<Range<usize>>,
@@ -357,22 +387,32 @@ impl EntityInputHandler for Root {
         let Some(target) = self.input_target() else {
             return;
         };
+        if std::env::var("JIANDU_IME_DEBUG").is_ok() {
+            eprintln!(
+                "[ime-commit] target={:?} range={:?} text={:?}",
+                target, range, text
+            );
+        }
         match target {
             InputTarget::Rename => {
+                let eff = effective_replace_range(range, &self.rename_marked);
                 self.rename_marked = None;
-                self.rename_replace_utf16(range, text);
+                self.rename_replace_utf16(eff, text);
             }
             InputTarget::Search => {
+                let eff = effective_replace_range(range, &self.search_marked);
                 self.search_marked = None;
-                self.search_replace_utf16(range, text);
+                self.search_replace_utf16(eff, text);
             }
             InputTarget::Note => {
+                let eff = effective_replace_range(range, &self.note_marked);
                 self.note_marked = None;
-                self.note_replace_utf16(range, text);
+                self.note_replace_utf16(eff, text);
             }
             InputTarget::ShelfSearch => {
+                let eff = effective_replace_range(range, &self.shelf_query_marked);
                 self.shelf_query_marked = None;
-                self.shelf_query_replace_utf16(range, text);
+                self.shelf_query_replace_utf16(eff, text);
             }
         }
         cx.notify();
@@ -380,6 +420,11 @@ impl EntityInputHandler for Root {
 
     /// 输入法「组字中」：先把候选拼音写进草稿并标记区间，
     /// 用户确认后由 `replace_text_in_range` 替换成最终汉字。
+    ///
+    /// NSTextInputClient 语义：`range` 为 None 时（输入法传 NSNotFound），
+    /// 要替换的是**当前标记区间**，没有标记区间才落在光标处——
+    /// 否则第二次组字会把新拼音插在旧拼音后面，草稿滚成
+    /// "nninih…"（实测 Squirrel 双拼敲 nihao，29 字而非「你好」）。
     fn replace_and_mark_text_in_range(
         &mut self,
         range: Option<Range<usize>>,
@@ -391,9 +436,24 @@ impl EntityInputHandler for Root {
         let Some(target) = self.input_target() else {
             return;
         };
+        if std::env::var("JIANDU_IME_DEBUG").is_ok() {
+            eprintln!(
+                "[ime-mark] target={:?} range={:?} marked={:?} text={:?}",
+                target,
+                range,
+                match target {
+                    InputTarget::Rename => &self.rename_marked,
+                    InputTarget::Search => &self.search_marked,
+                    InputTarget::Note => &self.note_marked,
+                    InputTarget::ShelfSearch => &self.shelf_query_marked,
+                },
+                new_text
+            );
+        }
         match target {
             InputTarget::Rename => {
-                let start = self.rename_replace_utf16(range, new_text);
+                let eff = effective_replace_range(range, &self.rename_marked);
+                let start = self.rename_replace_utf16(eff, new_text);
                 let end = start + utf16_len(new_text);
                 self.rename_marked = Some(start..end);
                 // 光标跟着输入法给的选区走；没给就落在标记文字末尾。
@@ -403,7 +463,8 @@ impl EntityInputHandler for Root {
                 };
             }
             InputTarget::Search => {
-                let start = self.search_replace_utf16(range, new_text);
+                let eff = effective_replace_range(range, &self.search_marked);
+                let start = self.search_replace_utf16(eff, new_text);
                 let end = start + utf16_len(new_text);
                 self.search_marked = Some(start..end);
                 self.search_cursor = match new_selected_range {
@@ -412,7 +473,8 @@ impl EntityInputHandler for Root {
                 };
             }
             InputTarget::Note => {
-                let start = self.note_replace_utf16(range, new_text);
+                let eff = effective_replace_range(range, &self.note_marked);
+                let start = self.note_replace_utf16(eff, new_text);
                 let end = start + utf16_len(new_text);
                 self.note_marked = Some(start..end);
                 self.note_cursor = match new_selected_range {
@@ -421,7 +483,8 @@ impl EntityInputHandler for Root {
                 };
             }
             InputTarget::ShelfSearch => {
-                let start = self.shelf_query_replace_utf16(range, new_text);
+                let eff = effective_replace_range(range, &self.shelf_query_marked);
+                let start = self.shelf_query_replace_utf16(eff, new_text);
                 let end = start + utf16_len(new_text);
                 self.shelf_query_marked = Some(start..end);
                 self.shelf_query_cursor = match new_selected_range {
@@ -555,5 +618,62 @@ mod tests {
         // IME 偶尔会夹带换行 / 回车，书名里应当被滤掉。
         replace_utf16(&mut draft, &mut cursor, None, "道德\r\n经");
         assert_eq!(draft, "道德经");
+    }
+
+    #[test]
+    fn effective_range_falls_back_to_marked() {
+        // 输入法显式给了区间：以它为准。
+        assert_eq!(effective_replace_range(Some(3..7), &Some(0..2)), Some(3..7));
+        // NSNotFound（None）：替换当前标记区间——这是叠字事故的另一半。
+        assert_eq!(effective_replace_range(None, &Some(0..2)), Some(0..2));
+        // 没有标记区间：才落在光标处（None = 插到光标）。
+        assert_eq!(effective_replace_range(None, &None), None);
+    }
+
+    #[test]
+    fn ime_composition_replaces_marked_each_step() {
+        // 复现并锁死「Squirrel 双拼敲 nihao」的修复：
+        // 输入法每步都传 NSNotFound（None），草稿必须逐级替换标记区间，
+        // 而不是把新拼音叠在旧拼音后面（修复前得到 21 字而非「你好」）。
+        let mut draft = String::new();
+        let mut cursor = 0usize;
+        let mut marked: Option<Range<usize>> = None;
+        for preedit in ["n", "ni", "nih", "niha", "nihao"] {
+            let eff = effective_replace_range(None, &marked);
+            let start = replace_utf16_limited(&mut draft, &mut cursor, eff, preedit, NOTE_MAX);
+            marked = Some(start..start + utf16_len(preedit));
+        }
+        assert_eq!(draft, "nihao");
+        assert_eq!(marked, Some(0..5));
+        // 上屏：汉字顶掉整段拼音，而不是插在它后面。
+        let eff = effective_replace_range(None, &marked);
+        replace_utf16_limited(&mut draft, &mut cursor, eff, "你好", NOTE_MAX);
+        assert_eq!(draft, "你好");
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn ime_second_word_appends_after_first() {
+        // 第一个词上屏后标记清零，第二个词从光标处接续——
+        // 不会把第二个词的拼音叠到第一个词后面。
+        let mut draft = String::new();
+        let mut cursor = 0usize;
+        let mut marked: Option<Range<usize>> = None;
+        let eff = effective_replace_range(None, &marked);
+        let start = replace_utf16_limited(&mut draft, &mut cursor, eff, "nihao", NOTE_MAX);
+        marked = Some(start..start + utf16_len("nihao"));
+        let eff = effective_replace_range(None, &marked);
+        replace_utf16_limited(&mut draft, &mut cursor, eff, "你好", NOTE_MAX);
+        marked = None;
+        // 第二个词
+        for preedit in ["shi", "shi'jie"] {
+            let eff = effective_replace_range(None, &marked);
+            let start = replace_utf16_limited(&mut draft, &mut cursor, eff, preedit, NOTE_MAX);
+            marked = Some(start..start + utf16_len(preedit));
+        }
+        assert_eq!(draft, "你好shi'jie");
+        let eff = effective_replace_range(None, &marked);
+        replace_utf16_limited(&mut draft, &mut cursor, eff, "世界", NOTE_MAX);
+        assert_eq!(draft, "你好世界");
     }
 }

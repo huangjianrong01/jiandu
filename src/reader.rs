@@ -825,12 +825,23 @@ impl Root {
 
                     // ① 笔记编辑态：键盘全部路由给浮层笔记框。
                     //    Esc 取消 / ⏎ 保存 / 退格删字 / ← → 移光标 /
-                    //    ⌘V 粘贴中文 / 可打印字符直接键入（英文 / 数字 / 标点）。
+                    //    ⌘V 粘贴中文。
+                    //    可打印字符**不在此插入**——无论 ABC 还是中文输入法，
+                    //    inputContext 都会回调 insertText / setMarkedText
+                    //    （实测 ABC 下每个键都触发 insertText），keydown
+                    //    直插必与回落叠字。文字只走 InputHandler 一条路，
+                    //    与 NSTextField 的架构一致（见 ime.rs 架构说明）。
                     if self.note_editing {
                         match k {
                             "escape" | "Escape" | "esc" => self.cancel_note_edit(),
                             "enter" | "Enter" => self.commit_note_edit(),
-                            "backspace" | "Backspace" => self.note_backspace(),
+                            // 组字期间退格由输入法自己消化（删的是未上屏的
+                            // 拼音串），应用再删就是双重删除。
+                            "backspace" | "Backspace" => {
+                                if self.note_marked.is_none() {
+                                    self.note_backspace();
+                                }
+                            }
                             "left" | "Left" | "ArrowLeft" => {
                                 crate::app::draft_move(
                                     &self.note_draft,
@@ -850,25 +861,19 @@ impl Root {
                                 self.note_cursor = self.note_draft.chars().count()
                             }
                             "v" | "V" if mods.platform || mods.control => self.note_paste(),
-                            _ => {
-                                if !mods.platform && !mods.control && !mods.alt {
-                                    if let Some(s) = event.keystroke.key_char.as_deref() {
-                                        if let Some(c) = s.chars().next() {
-                                            if !c.is_control() {
-                                                self.note_input_char(c);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            // 可打印键：交给输入法（insertText / setMarkedText
+                            // 经 InputHandler 回落），此处直插只会叠字。
+                            _ => {}
                         }
                         cx.notify();
                         return;
                     }
 
                     // ①′ 检索框：面板开着时键盘先给它。
-                    //     中文走 IME（`InputTarget::Search`，见 ime.rs），
-                    //     这里只管英文 / 数字的直接键入与几个编辑键。
+                    //      ⏎ 检索 / Esc 收起 / 退格 / ← →。
+                    //      可打印字符不在此插入——中文与英文都经
+                    //      InputHandler 回落（insertText / setMarkedText），
+                    //      keydown 直插会与回落叠字（见 ime.rs 架构说明）。
                     if self.show_search {
                         match k {
                             "enter" | "Enter" => self.run_search(cx),
@@ -876,7 +881,11 @@ impl Root {
                                 self.show_search = false;
                                 self.clear_search();
                             }
-                            "backspace" | "Backspace" => self.search_backspace(),
+                            "backspace" | "Backspace" => {
+                                if self.search_marked.is_none() {
+                                    self.search_backspace();
+                                }
+                            }
                             "left" | "Left" | "ArrowLeft" => {
                                 crate::app::draft_move(
                                     &self.search_draft,
@@ -891,15 +900,8 @@ impl Root {
                                     false,
                                 );
                             }
-                            _ => {
-                                if !mods.platform && !mods.control && !mods.alt {
-                                    if let Some(s) = event.keystroke.key_char.as_deref() {
-                                        if let Some(c) = s.chars().next() {
-                                            self.search_input_char(c);
-                                        }
-                                    }
-                                }
-                            }
+                            // 可打印键交给输入法回落，不直插。
+                            _ => {}
                         }
                         cx.notify();
                         return;

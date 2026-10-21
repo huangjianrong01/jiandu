@@ -1054,13 +1054,19 @@ impl Root {
         }
 
         // ① 重命名对话框：Esc 取消 / ⏎ 保存 / 退格 / ← → 移光标 /
-        //    Home End 首尾 / ⌘V 粘贴 / 可打印字符键入。
+        //    Home End 首尾 / ⌘V 粘贴。
+        //    可打印字符**不在此插入**——中文与英文都经 InputHandler
+        //    回落（insertText / setMarkedText），keydown 直插会与回落
+        //    叠字（见 ime.rs 架构说明）。
         if self.rename_idx.is_some() {
             match k {
                 "escape" | "Escape" | "esc" => self.cancel_rename(),
                 "enter" | "Enter" => self.commit_rename(),
+                // 组字期间退格由输入法消化（删的是未上屏的拼音串）。
                 "backspace" | "Backspace" => {
-                    crate::app::draft_backspace(&mut self.rename_draft, &mut self.rename_cursor)
+                    if self.rename_marked.is_none() {
+                        crate::app::draft_backspace(&mut self.rename_draft, &mut self.rename_cursor)
+                    }
                 }
                 "left" | "Left" | "ArrowLeft" => {
                     crate::app::draft_move(&self.rename_draft, &mut self.rename_cursor, true)
@@ -1080,29 +1086,17 @@ impl Root {
                         );
                     }
                 }
-                _ => {
-                    if !mods.platform && !mods.control && !mods.alt {
-                        if let Some(s) = event.keystroke.key_char.as_deref() {
-                            if let Some(c) = s.chars().next() {
-                                // 书名上限 12 字（与导入时的自动识别一致）。
-                                if !c.is_control() && self.rename_draft.chars().count() < 12 {
-                                    crate::app::draft_insert(
-                                        &mut self.rename_draft,
-                                        &mut self.rename_cursor,
-                                        c,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                // 可打印键交给输入法回落，不直插。
+                _ => {}
             }
             cx.notify();
             return;
         }
 
         // ①-b 书架搜索框：Esc 收起并清空 / ⏎ 收起但保留筛选 /
-        //      退格 · ← → · Home End · ⌘V · 可打印字符。
+        //      退格 · ← → · Home End · ⌘V。
+        //      可打印字符不在此插入——经 InputHandler 回落，keydown
+        //      直插会与回落叠字（见 ime.rs 架构说明）。
         if self.shelf_searching {
             match k {
                 "escape" | "Escape" | "esc" => {
@@ -1112,7 +1106,9 @@ impl Root {
                 }
                 "enter" | "Enter" => self.shelf_searching = false,
                 "backspace" | "Backspace" => {
-                    crate::app::draft_backspace(&mut self.shelf_query, &mut self.shelf_query_cursor)
+                    if self.shelf_query_marked.is_none() {
+                        crate::app::draft_backspace(&mut self.shelf_query, &mut self.shelf_query_cursor)
+                    }
                 }
                 "left" | "Left" | "ArrowLeft" => {
                     crate::app::draft_move(&self.shelf_query, &mut self.shelf_query_cursor, true)
@@ -1134,23 +1130,8 @@ impl Root {
                         }
                     }
                 }
-                _ => {
-                    if !mods.platform && !mods.control && !mods.alt {
-                        if let Some(s) = event.keystroke.key_char.as_deref() {
-                            if let Some(c) = s.chars().next() {
-                                if !c.is_control()
-                                    && self.shelf_query.chars().count() < crate::ime::SEARCH_MAX
-                                {
-                                    crate::app::draft_insert(
-                                        &mut self.shelf_query,
-                                        &mut self.shelf_query_cursor,
-                                        c,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                // 可打印键交给输入法回落，不直插。
+                _ => {}
             }
             cx.notify();
             return;
