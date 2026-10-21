@@ -17,6 +17,92 @@
 /// 一个汉字格内容纳的西文字符数：两个数字 / 字母占一格。
 pub const WEST_PER_CELL: usize = 2;
 
+/// 一个阿拉伯数字占的**半格数**：半格 = `cell_h / 2`。
+///
+/// 数字串整体横躺时，纵向占高 = `字数 × 半格`，故三个数字（`223`）占
+/// `1.5` 个汉字高——既不溢出、也不与邻字重叠。
+pub const DIGIT_UNITS: usize = 1;
+
+/// 是否数字（半角 / 全角）。与 `numcn` 同源，避免两处判定不一致。
+pub fn is_digit(c: char) -> bool {
+    crate::numcn::is_digit(c)
+}
+
+/// 从 `chars[0]` 起取出一个**完整数字串**，返回它在 `chars` 里的字符数（0 = 不是数字串）。
+///
+/// 容错（防呆的核心）：EPUB 常在数字间插入零宽空格（`&#8203;`）、千分位、
+/// 连字符，若逐个看字符就会把 `223` 判成三段。这里允许：
+/// * 零宽字符（`U+200B` / `U+FEFF` / `U+00AD` …）——直接吞掉，不算位数；
+/// * 小数点 / 千分位 / 连字符——**后面还跟着数字**才并入（`3.14` 是小数，`14.` 的句点不吞）。
+///
+/// 收尾拖着的分隔符一律还给正文。
+pub fn scan_digit_run(chars: &[char]) -> usize {
+    if chars.is_empty() || !is_digit(chars[0]) {
+        return 0;
+    }
+    let mut end = 1usize;
+    while end < chars.len() {
+        let c = chars[end];
+        if is_digit(c) || crate::numcn::is_transparent(c) {
+            end += 1;
+        } else if (is_west_dot(c) || is_west_hyphen(c) || matches!(c, ',' | '，' | ' '))
+            && chars[end..].iter().skip(1).any(|&x| is_digit(x))
+        {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    // 收尾的分隔符不算进串里。
+    while end > 1 {
+        let last = chars[end - 1];
+        if is_digit(last) {
+            break;
+        }
+        end -= 1;
+    }
+    end
+}
+
+/// `c` 是否属于「已经开了头的数字串」（串中的零宽字符也算在内）。
+///
+/// 分页把零宽字符一并计入数字串（它夹在数字中间、账上占半格），反查与渲染
+/// 必须用同一口径分组，否则列高对不上、点字就点偏。
+pub fn in_digit_run(c: char, started: bool) -> bool {
+    is_digit(c) || (started && crate::numcn::is_transparent(c))
+}
+
+/// 数字串的**半格账**：每个数字 [`DIGIT_UNITS`] 个半格，小数点 / 分隔符 0。
+pub fn digit_units<I: IntoIterator<Item = char>>(chars: I) -> usize {
+    chars
+        .into_iter()
+        .filter(|c| is_digit(*c))
+        .map(|_| DIGIT_UNITS)
+        .sum()
+}
+
+/// 数字串旋转后占的**汉字格高**（可含小数）：`3` 个数字 → `1.5` 格。
+pub fn digit_height_cells(units: usize) -> f32 {
+    units as f32 * DIGIT_UNITS as f32 / WEST_PER_CELL as f32
+}
+
+/// 数字串的字号：纵向只占半格，故以 `cell_h / 2` 为上限，再与列宽、正文字号收敛。
+///
+/// 下限 6px（再小就糊成一团墨点）。
+pub fn digit_font_size(cell_w: f32, cell_h: f32, body_fs: f32) -> f32 {
+    (cell_h * 0.46).min(cell_w * 0.80).min(body_fs * 0.70).max(6.0)
+}
+
+/// 数字串「整体顺时针转 90°」后的逐字槽位（与 [`rotated_slots`] 同一套几何，
+/// 只是说明语义换成数字串）。
+///
+/// 每个数字纵向占 `cell_h / 2`（半格），第 `j` 个数字的中心在
+/// `y = j * cell_h/2 + cell_h/4`，旋转中心在列宽中线——整串横躺后
+/// 总高 = `字数 × cell_h / 2`，与 [`digit_height_cells`] 逐字对齐。
+pub fn digit_slots(chars: &[char], cell_w: f32, cell_h: f32, size: f32) -> Vec<WestSlot> {
+    rotated_slots(chars, cell_w, cell_h, size)
+}
+
 /// 是否 CJK（含假名 / 谚文）：用来把「西文」与「汉字」分开。
 pub fn is_cjk(c: char) -> bool {
     matches!(
@@ -291,6 +377,60 @@ mod tests {
         }
         // 槽位总高恰为两格 = run_cells(4) * cell_h。
         assert!((slots.last().unwrap().cy + ch * 0.25 - 2.0 * ch).abs() < 0.01);
+    }
+
+    // ── 数字串兜底（防呆）──────────────────────────────────────────
+    #[test]
+    fn digit_run_never_splits() {
+        let c: Vec<char> = "223年".chars().collect();
+        assert_eq!(scan_digit_run(&c), 3);
+        let c: Vec<char> = "1980".chars().collect();
+        assert_eq!(scan_digit_run(&c), 4);
+        // 零宽空格夹在中间也仍是一串（EPUB 常见；返回的是消耗的字符数，含零宽）。
+        let c: Vec<char> = "2\u{200B}23".chars().collect();
+        assert_eq!(scan_digit_run(&c), 4);
+        assert_eq!(digit_units(c.iter().copied()), 3);
+        // 小数：点后有数字才吞。
+        let c: Vec<char> = "3.14".chars().collect();
+        assert_eq!(scan_digit_run(&c), 4);
+        let c: Vec<char> = "14。".chars().collect();
+        assert_eq!(scan_digit_run(&c), 2);
+        // 全角数字同样成串。
+        let c: Vec<char> = "２７６３７".chars().collect();
+        assert_eq!(scan_digit_run(&c), 5);
+        // 非数字开头 → 不是数字串。
+        let c: Vec<char> = "年223".chars().collect();
+        assert_eq!(scan_digit_run(&c), 0);
+    }
+
+    #[test]
+    fn digit_height_is_half_cell_each() {
+        // 3 个数字 → 1.5 个汉字高；4 个 → 2 格（用户给的 223 / 1980 两例）。
+        assert_eq!(digit_units("223".chars()), 3);
+        assert_eq!(digit_height_cells(3), 1.5);
+        assert_eq!(digit_units("1980".chars()), 4);
+        assert_eq!(digit_height_cells(4), 2.0);
+    }
+
+    #[test]
+    fn digit_slots_pack_half_cells_without_overlap() {
+        let chars: Vec<char> = "223".chars().collect();
+        let (cw, ch) = (30.0, 30.0);
+        let size = digit_font_size(cw, ch, 24.0);
+        // 字号必须塞得进半格，否则相邻数字会叠在一起。
+        assert!(size <= ch * 0.46 + 0.01, "数字字号超出半格：{size}");
+        let slots = digit_slots(&chars, cw, ch, size);
+        assert_eq!(slots.len(), 3);
+        // 三个槽位连续铺半格：末槽中心 = 1.5 格 - 半格的半 = 1.25 格。
+        assert!((slots[0].cy - ch * 0.25).abs() < 0.01);
+        assert!((slots[2].cy - ch * 1.25).abs() < 0.01);
+        assert!((slots.last().unwrap().cy + ch * 0.25 - digit_height_cells(3) * ch).abs() < 0.01);
+        for s in &slots {
+            assert_eq!(s.angle_deg, 90.0);
+            let (x, y, w, h) = s.rect();
+            assert!(x >= -0.01 && x + w <= cw + 0.01);
+            assert!(y >= -0.01 && y + h <= 1.5 * ch + 0.01);
+        }
     }
 
     #[test]

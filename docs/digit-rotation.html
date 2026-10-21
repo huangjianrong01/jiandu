@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<title>笺读 · 竖排数字串旋转渲染（Canvas 演示）</title>
+<style>
+:root{
+  --bg:#121A26;--panel:#1E2A3C;--moon:#E8EEF2;--dim:#9FB0C4;
+  --vermilion:#D0634E;--line:#33445C;
+  --f-song:"文津宋体","Songti SC","STSong",serif;
+  --f-kai:"霞鹜文楷","Kaiti SC",serif;
+  --f-mono:"SF Mono","Menlo",monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;padding:24px;background:var(--bg);color:var(--moon);
+  font-family:var(--f-song);line-height:1.8}
+h2{font-size:16px;margin:0 0 4px}
+p.sub{font-family:var(--f-kai);font-size:12px;color:var(--dim);margin:0 0 16px}
+.row{display:flex;gap:20px;flex-wrap:wrap}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:14px}
+canvas{display:block;background:#F3ECD9;border-radius:2px}
+.cap{font-size:11.5px;color:var(--dim);margin-top:8px}
+.bad{color:#7FC08A}.good{color:var(--vermilion)}
+pre{font-family:var(--f-mono);font-size:11.5px;color:var(--dim);
+  background:#18222F;border:1px solid var(--line);border-radius:3px;
+  padding:10px 12px;overflow:auto;margin:10px 0 0}
+b{color:var(--moon)}
+</style>
+</head>
+<body>
+<h2>竖排引擎 · 连续数字串的旋转渲染</h2>
+<p class="sub">上：未修复（逐字占格，读成 2 / 2 / 3）　下：修复后（整串顺时针 90° 横躺，3 位 = 1.5 格高）</p>
+
+<div class="row">
+  <div class="card">
+    <canvas id="c1" width="260" height="360"></canvas>
+    <div class="cap">用例一：<b>223年</b> —— 3 位数字 → 占 <b>1.5</b> 个汉字高</div>
+  </div>
+  <div class="card">
+    <canvas id="c2" width="260" height="360"></canvas>
+    <div class="cap">用例二：<b>1980</b> —— 4 位数字 → 占 <b>2</b> 个汉字高</div>
+  </div>
+</div>
+
+<pre id="log"></pre>
+
+<script>
+/* ==========================================================================
+   一、数据清洗（对应 Rust src/numcn.rs）
+   ========================================================================== */
+const CN_DIGIT = ['〇','一','二','三','四','五','六','七','八','九'];
+
+/** 全角 / 半角数字 → 数值 */
+function asciiDigit(c){
+  if (c >= '0' && c <= '9') return c.charCodeAt(0) - 48;
+  if (c >= '０' && c <= '９') return c.charCodeAt(0) - 0xFF10;
+  return null;
+}
+const isDigit = c => asciiDigit(c) !== null;
+/** 零宽 / 不可见字符：EPUB 常在数字间插入，不能算作断开 */
+const isTransparent = c => ['\u200B','\u200C','\u200D','\uFEFF','\u00AD','\u2060'].includes(c);
+const isPoint = c => c === '.' || c === '．' || c === '·';
+const isSep   = c => c === ',' || c === '，' || c === '-' || c === ' ';
+
+/** 四位数一节的数值读法：223 → 二百二十三 */
+function fourDigits(n, lowest){
+  const D = ['零','一','二','三','四','五','六','七','八','九'];
+  const th=(n/1000)|0, h=((n%1000)/100)|0, t=((n%100)/10)|0, o=n%10;
+  let s='', zero=false;
+  if (th>0) s += D[th]+'千';
+  if (h>0)  s += D[h]+'百';
+  else if (th>0 && (t>0||o>0)) zero=true;
+  if (t>0){
+    if (zero){ s+='零'; zero=false; }
+    if (!(t===1 && s==='' && lowest)) s += D[t];
+    s += '十';
+  } else if ((th>0||h>0) && o>0) zero=true;
+  if (o>0){ if (zero) s+='零'; s += D[o]; }
+  return s;
+}
+/** 数值读法：15→十五、1980→一千九百八十 */
+function numToCn(n){
+  if (n === 0) return '零';
+  const yi=(n/1e8)|0, rest=n%1e8, wan=(rest/1e4)|0, low=rest%1e4;
+  let out='';
+  if (yi>0)  out += fourDigits(yi,false)+'亿';
+  if (wan>0){ if (yi>0 && wan<1000) out+='零'; out += fourDigits(wan,false)+'万'; }
+  if (low>0){ if ((yi>0||wan>0) && low<1000) out+='零'; out += fourDigits(low,true); }
+  return out || '零';
+}
+/** 逐字读：223 → 二二三（纪年 / 编号） */
+const numToCnDigits = s => [...s].map(asciiDigit).filter(d=>d!==null).map(d=>CN_DIGIT[d]).join('');
+
+/** 从 i 起取完整数字串，返回消耗的字符数 */
+function scanDigitRun(chars, i){
+  if (i >= chars.length || !isDigit(chars[i])) return 0;
+  let end = i + 1;
+  while (end < chars.length){
+    const c = chars[end];
+    if (isDigit(c) || isTransparent(c)) end++;
+    else if ((isPoint(c) || isSep(c)) && chars.slice(end+1).some(isDigit)) end++;
+    else break;
+  }
+  while (end > i+1 && !isDigit(chars[end-1])) end--;   // 收尾分隔符还给正文
+  return end - i;
+}
+
+/** 后接「年 / 年代 / 年度」且 ≤4 位 → 纪年 */
+function isYearContext(tail, digits){
+  if (!digits || digits > 4) return false;
+  return /^年(代|間|间|度|份|末|初)?/.test(tail) || /^載|^载/.test(tail);
+}
+
+/** 全文清洗：/ [0-9]+ /g → 汉字 */
+function normalizeNumbers(text, {yearStyle='digit', generalStyle='value'}={}){
+  const chars = [...text];
+  let out = '', i = 0;
+  while (i < chars.length){
+    if (!isDigit(chars[i])){ out += chars[i++]; continue; }
+    const len = scanDigitRun(chars, i);
+    const raw = chars.slice(i, i+len);
+    const digits = raw.filter(isDigit).length;
+    const tail = chars.slice(i+len, i+len+3).join('');
+    // 与字母粘连（ISBN 978 / A4）或超长流水号 → 放过
+    const prev = chars.slice(0,i).reverse().find(c=>!/\s/.test(c) && !isTransparent(c));
+    const next = chars.slice(i+len).find(c=>!/\s/.test(c) && !isTransparent(c));
+    const skip = digits > 6
+      || (prev && /[A-Za-z]/.test(prev)) || (next && /[A-Za-z]/.test(next))
+      || (prev && '#/*@_+=@'.includes(prev));
+    if (skip){ out += raw.join(''); i += len; continue; }
+
+    const year = isYearContext(tail, digits);
+    const hasPoint = raw.some(isPoint);
+    let style = (year || hasPoint || digits > 4) ? 'digit'
+              : (year ? yearStyle : generalStyle);
+    if (year && yearStyle === 'value' && !hasPoint) style = 'value';
+    if (style === 'value'){
+      out += numToCn(parseInt(raw.filter(isDigit).join(''), 10));
+    } else if (hasPoint){
+      let s='', dot=false;
+      for (const c of raw){
+        const d = asciiDigit(c);
+        if (d !== null) s += CN_DIGIT[d];
+        else if (isPoint(c) && s && !dot){ s += '点'; dot = true; }
+      }
+      out += s;
+    } else {
+      out += numToCnDigits(raw.filter(isDigit).join(''));
+    }
+    i += len;
+  }
+  return out;
+}
+
+/* ==========================================================================
+   二、Canvas 竖排渲染：数字串整块旋转 90°（对应 Rust src/west.rs 的槽位）
+   ========================================================================== */
+const CELL = 32, HALF = CELL / 2, PAD = 18;   // 一格 = 32px，半格 = 16px
+const FONT_MAIN = '22px "Songti SC","STSong",serif';
+const FONT_LATIN = '15px "CMU Serif","Times New Roman",serif';
+
+/**
+ * 竖排渲染一叶。
+ * @param fixed true = 启用数字串成组旋转；false = 旧行为（逐字占格，用于对照）
+ */
+function drawColumn(ctx, text, x0, y0, cols, rows, fixed){
+  ctx.save();
+  ctx.font = FONT_MAIN; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#1A150F';
+  // 版框与界行（朱丝栏）
+  ctx.strokeStyle = 'rgba(208,99,78,.45)'; ctx.lineWidth = 1;
+  for (let c = 0; c <= cols; c++){
+    const x = x0 + c * CELL + .5;
+    ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y0 + rows * CELL); ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(26,21,15,.25)';
+  ctx.strokeRect(x0 + .5, y0 + .5, cols * CELL, rows * CELL);
+
+  let col = cols - 1, row = 0;                 // 竖排右起：首列在最右
+  const chars = [...text];
+  for (let i = 0; i < chars.length; i++){
+    const ch = chars[i];
+    if (col < 0) break;
+    const cx = x0 + col * CELL + CELL / 2;
+    const cyTop = y0 + row * CELL;
+
+    // ── 数字串：整块提取 → 旋转 90° 横躺 → 纵向占「字数 × 半格」 ──
+    if (fixed && isDigit(ch)){
+      const n = scanDigitRun(chars, i);
+      const run = chars.slice(i, i + n).filter(isDigit).join('');
+      const hCells = run.length / 2;            // 3 位 = 1.5 格，4 位 = 2 格
+      const hPx = hCells * CELL;
+      // 列尾放不下就换列（半格粒度，绝不溢出格宽、不与邻字重叠）
+      if (row * CELL + hPx > rows * CELL + 0.01){ col--; row = 0; i--; continue; }
+
+      ctx.save();
+      ctx.translate(cx, cyTop + hPx / 2);       // 旋转中心 = 整串的几何中心
+      ctx.rotate(Math.PI / 2);                  // 顺时针 90°：字头朝右
+      ctx.font = FONT_LATIN;                    // 数字走衬线西文字体
+      ctx.fillStyle = '#1A150F';
+      ctx.fillText(run, 0, 0);                  // 横向写的整串，转完即竖排横躺
+      ctx.restore();
+
+      // 标注这一块的高度（调试用）
+      ctx.save();
+      ctx.strokeStyle = 'rgba(208,99,78,.55)'; ctx.setLineDash([3,3]);
+      ctx.strokeRect(x0 + col*CELL + 3.5, cyTop + .5, CELL - 7, hPx);
+      ctx.restore();
+
+      row += hCells;                            // 推进「字数 × 半格」
+      i += n - 1;
+      ctx.font = FONT_MAIN;
+      continue;
+    }
+
+    // ── 汉字：一格一字 ──
+    if (row >= rows){ col--; row = 0; i--; continue; }
+    ctx.fillText(ch, cx, cyTop + CELL / 2);
+    row += 1;
+
+    // 未修复对照：数字也一格一个地竖着摞（这就是 Bug 的样子）
+    if (!fixed && isDigit(ch)){ /* 已画，无需额外处理 */ }
+  }
+  ctx.restore();
+}
+
+/* ==========================================================================
+   三、两个用例：223年 / 1980
+   ========================================================================== */
+function render(id, text, label){
+  const cv = document.getElementById(id);
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = 260 * dpr; cv.height = 360 * dpr;
+  cv.style.width = '260px'; cv.style.height = '360px';
+  const ctx = cv.getContext('2d');
+  ctx.scale(dpr, dpr);
+  // 上半：未修复；下半：修复后
+  ctx.font = '11px "Songti SC",serif'; ctx.textAlign = 'left'; ctx.fillStyle = '#7FC08A';
+  ctx.fillText('未修复', PAD, 14);
+  drawColumn(ctx, text, PAD, 22, 6, 4, false);
+  ctx.fillStyle = '#D0634E';
+  ctx.fillText('修复后（整串横躺）', PAD, 22 + 4*CELL + 26);
+  drawColumn(ctx, text, PAD, 22 + 4*CELL + 32, 6, 4, true);
+  return label;
+}
+
+const t1 = '建安223年，策为尚书郎。';
+const t2 = '全书1980页，重印于1980年。';
+render('c1', t1);
+render('c2', t2);
+
+document.getElementById('log').textContent =
+`// ── 一、数据清洗（导入期）────────────────────────────
+normalizeNumbers('${t1}')
+  → ${normalizeNumbers(t1)}          // 223年 → 二二三年（纪年逐字读）
+normalizeNumbers('${t2}')
+  → ${normalizeNumbers(t2)}
+normalizeNumbers('共15卷')      → ${normalizeNumbers('共15卷')}
+normalizeNumbers('圆周率3.14')  → ${normalizeNumbers('圆周率3.14')}
+normalizeNumbers('ISBN 978-7')  → ${normalizeNumbers('ISBN 978-7')}      // 编号放过
+
+// ── 二、渲染兜底（旋转坐标）──────────────────────────
+const n = scanDigitRun(chars, i);                 // 223 → 3（零宽 / 千分位不断串）
+const hCells = n / 2;                             // 3 → 1.5 格；1980 → 2 格
+ctx.translate(cx, cyTop + hCells * CELL / 2);     // 中心 = 半格 × 字数
+ctx.rotate(Math.PI / 2);                          // 顺时针 90° 横躺
+ctx.fillText(run, 0, 0);
+row += hCells;                                    // 推进 1.5 格，不溢出、不重叠
+`;
+</script>
+</body>
+</html>

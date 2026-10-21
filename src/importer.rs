@@ -275,12 +275,13 @@ pub fn book_from_plaintext(fallback_title: &str, text: &str) -> Book {
                 }
             }
             current = Some(Chapter {
-                title: line.trim_start_matches('#').trim().to_string(),
+                title: crate::numcn::normalize_numbers(line.trim_start_matches('#').trim()),
                 paragraphs: Vec::new(),
             });
             continue;
         }
-        para.push(line.to_string());
+        // 与 EPUB 同一套清洗：纯文本里的阿拉伯数字也先转成汉字。
+        para.push(crate::numcn::normalize_numbers(line));
     }
     flush_para(&mut para, &mut current, &mut book);
     if let Some(c) = current.take() {
@@ -1176,7 +1177,12 @@ fn html_to_text(html: &str) -> String {
             cleaned.push('\n');
         }
     }
-    cleaned
+    // ── 源头治理：阿拉伯数字 → 汉字 ────────────────────────────────
+    // EPUB 正文里的 `223年`、`1980` 若原样入库，竖排引擎会把每个数字当成
+    // 独立字符、一格一个地竖着摞成「2 / 2 / 3」，读起来断成三截。这里在
+    // 「HTML → 纯文本」的最后一步整体换成汉字（`二二三年` / `一千九百八十`），
+    // 从源头断绝被拆散的可能（渲染侧另有数字串兜底，见 `west::scan_digit_run`）。
+    crate::numcn::normalize_numbers(&cleaned)
 }
 
 fn remove_block(s: &str, open: &str, close: &str) -> String {
@@ -1235,6 +1241,26 @@ mod tests {
         let b = parse_json_book(j, "fb").unwrap();
         assert_eq!(b.chapters[0].paragraphs[0].text, "甲乙");
         assert_eq!(b.cover.title, "T");
+    }
+
+    // ---- 数字清洗（源头治理）----
+
+    #[test]
+    fn plaintext_import_converts_digits_to_han() {
+        // EPUB / 纯文本导入时数字一律转汉字：竖排不会再被拆成「2 / 2 / 3」。
+        let b = book_from_plaintext("测试", "第一章\n建安223年，策为尚书郎。\n\n全书1980页，共15卷。");
+        let got = &b.chapters[0].paragraphs[0].text;
+        assert_eq!(got, "建安二二三年，策为尚书郎。");
+        assert_eq!(&b.chapters[0].paragraphs[1].text, "全书一千九百八十页，共十五卷。");
+    }
+
+    #[test]
+    fn epub_html_text_converts_digits() {
+        // 与 import_epub 同一条清洗链（html_to_text 的最后一步）。
+        let html = "<html><body><p>公元223年</p><p>1980页</p></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("二二三年"), "{text}");
+        assert!(text.contains("一千九百八十页"), "{text}");
     }
 
     // ---- 数据适配器：兼容各种不规范导入 ----

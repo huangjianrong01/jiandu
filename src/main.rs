@@ -17,6 +17,7 @@ mod grid;
 mod gloss;
 mod hit;
 mod note_inject;
+mod numcn;
 mod ime;
 mod importer;
 mod library;

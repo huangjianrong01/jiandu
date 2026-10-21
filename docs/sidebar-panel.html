@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<title>笺读 · 侧边栏重构稿（目录 / 朱批）</title>
+<style>
+/* ============================================================
+   笺读侧边栏 · 古风化重构
+   设计原则：侧栏是「纸面的一部分」，不是后台管理面板。
+   1) 字体统一：正文宋体、提示楷体，数字也是宋体，不再有系统黑体；
+   2) 摘录竖排繁体（vertical-rl），朱砂圈点领起，像天头眉批；
+   3) 控件隐形：关闭只是一枚淡「✕」，滚动条一律隐藏。
+   ============================================================ */
+:root{
+  /* 夜读配色（与 App 侧栏一致） */
+  --panel:#1E2A3C;      /* 面板底 */
+  --panel-2:#223146;    /* 表头 / 当前卷 */
+  --col-bg:#18222F;     /* 朱批栏底，比面板更深一档 */
+  --moon:#E8EEF2;       /* 月白：正文 */
+  --moon-dim:#9FB0C4;   /* 月白兑暗：小字 / 叶码 / 提示 */
+  --vermilion:#D0634E;  /* 朱砂 */
+  --line:#33445C;       /* 分隔线 */
+  --chip-line:#3A4A61;  /* 卷页标识的淡边框 */
+
+  /* 字体四角色（与 App 的 fonts.rs 对齐） */
+  --f-song:"文津宋体","Source Han Serif SC","Songti SC","STSong",serif;
+  --f-kai :"霞鹜文楷","LXGW WenKai","Kaiti SC","STKaiti",serif;
+  --f-hei :"思源黑体","Source Han Sans SC","PingFang SC",sans-serif;
+  --f-latin:"CMU Serif","Latin Modern Roman","Times New Roman",serif;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  min-height:100vh;background:#121A26;color:var(--moon);
+  font-family:var(--f-song);display:flex;align-items:center;justify-content:center;
+  padding:24px;
+}
+
+/* ---------- 侧栏骨架：右侧滑入的抽屉 ---------- */
+.sidebar{
+  width:520px;max-width:100%;height:640px;
+  display:flex;flex-direction:column;
+  background:var(--panel);
+  border-left:1px solid var(--line);
+  overflow:hidden;
+}
+.head{
+  display:flex;align-items:center;justify-content:space-between;
+  height:52px;padding:0 16px;flex:0 0 auto;
+  background:var(--panel-2);border-bottom:1px solid var(--line);
+}
+.head .title{font-size:14px;color:var(--moon);letter-spacing:.18em}
+.head .count{font-size:10.5px;color:var(--moon-dim);font-family:var(--f-song)}
+/* 隐形关闭钮：没有底色 / 边框 / 圆角，只一枚淡到几近无色的 ✕ */
+.ghost-close{
+  font-family:var(--f-song);font-size:13px;color:var(--moon-dim);
+  background:none;border:0;padding:0 2px;cursor:pointer;line-height:1;
+  opacity:.55;transition:opacity .18s ease;
+}
+.ghost-close:hover{opacity:1;color:var(--moon)}
+
+.body{display:flex;flex:1 1 auto;min-height:0}
+
+/* ---------- 左：目录竹简（横向滚动） ---------- */
+.toc{
+  flex:1 1 auto;display:flex;flex-direction:row-reverse;align-items:flex-end;
+  gap:8px;padding:12px;overflow-x:auto;overflow-y:hidden;
+}
+.toc::-webkit-scrollbar,.marks::-webkit-scrollbar{width:0;height:0}   /* 滚动条隐形 */
+.toc,.marks{scrollbar-width:none;-ms-overflow-style:none}
+
+.strip{
+  flex:0 0 auto;width:44px;height:100%;
+  display:flex;flex-direction:column;align-items:center;
+  padding-bottom:8px;background:var(--panel);
+  border:1px solid var(--line);border-radius:3px;cursor:pointer;
+}
+.strip.cur{border:2px solid var(--vermilion);background:var(--panel-2)}
+.strip .name{
+  display:flex;flex-direction:column;align-items:center;gap:1px;
+  padding-top:12px;font-family:var(--f-song);font-size:16px;color:var(--moon);
+}
+.strip.cur .name{color:var(--vermilion);font-weight:600}
+.strip .spacer{flex:1 1 auto}
+
+/* ---------- 卷页标识：极小宋体 + 淡边框 + 起首微符号 ---------- */
+.leaf-chip{
+  display:inline-flex;align-items:center;gap:2px;
+  padding:.5px 2.5px;margin-top:1px;
+  border:1px solid var(--chip-line);border-radius:1.5px;
+  font-family:var(--f-song);font-size:9.5px;color:var(--moon-dim);
+  white-space:nowrap;
+}
+.leaf-chip::before{
+  content:"";width:1.5px;height:6px;background:#6C7C93;display:block;
+}
+.leaf-chip.cur{color:var(--vermilion)}
+.leaf-chip.cur::before{background:var(--vermilion)}
+
+/* ---------- 右：朱批栏 ---------- */
+.marks{
+  flex:0 0 220px;height:100%;display:flex;flex-direction:column;
+  background:var(--col-bg);border-left:1px solid var(--line);
+  overflow-y:auto;padding:12px;gap:14px;
+}
+.marks-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding-bottom:8px;border-bottom:1px solid var(--line);
+  font-family:var(--f-song);
+}
+.marks-head .t{font-size:12.5px;color:var(--vermilion)}
+.marks-head .hint{font-size:9.5px;color:var(--moon-dim)}
+
+/* 空态：极简楷体小字 */
+.empty{
+  font-family:var(--f-kai);font-size:11px;line-height:1.9;color:var(--moon-dim);
+}
+
+/* 一条朱批：标记 + 竖排摘录 + 卷页标识 */
+.mark{display:flex;flex-direction:column;gap:6px;cursor:pointer}
+.mark-row{display:flex;flex-direction:row;align-items:flex-start;gap:6px}
+/* 眉批标记：空心朱砂小圈领起，下引一道极细朱线 */
+.mark-dot{
+  width:6px;display:flex;flex-direction:column;align-items:center;gap:3px;flex:0 0 6px;
+}
+.mark-dot i{
+  width:5px;height:5px;border-radius:50%;
+  border:1px solid var(--vermilion);display:block;
+}
+.mark-dot s{flex:1 1 auto;width:1px;background:rgba(208,99,78,.42);display:block}
+
+/* 摘录：繁体 + 竖排（自右向左成列），字体与正文同源 */
+.excerpt{
+  writing-mode:vertical-rl;           /* 竖排右起 */
+  text-orientation:upright;           /* 数字 / 拉丁直立不倒 */
+  font-family:var(--f-song);          /* 与正文同一款宋体 */
+  font-size:12.5px;line-height:15px;  /* 行高 = 半格账里的「一格」 */
+  color:var(--moon);max-height:135px; /* 9 字一列，最多两列 */
+  letter-spacing:.02em;
+}
+.mark-foot{display:flex;flex-direction:column;gap:3px}
+.note{font-family:var(--f-kai);font-size:9.5px;color:var(--moon-dim)}
+
+/* ---------- 说明区 ---------- */
+.notes{margin-left:24px;max-width:420px;font-size:12px;line-height:1.9;color:#8FA0B6}
+.notes h3{font-family:var(--f-song);font-size:14px;color:var(--moon);margin-bottom:8px}
+.notes code{font-family:var(--f-latin);color:var(--vermilion)}
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <!-- 表头：宋体「目 錄」+ 极小计数 + 隐形关闭 -->
+  <div class="head">
+    <div style="display:flex;gap:12px;align-items:center">
+      <span class="title">目 錄</span>
+      <button class="ghost-close" title="收起">✕</button>
+    </div>
+    <span class="count">共 8 卷目</span>
+  </div>
+
+  <div class="body">
+    <!-- 目录竹简：自右向左（首卷最右） -->
+    <div class="toc">
+      <div class="strip cur">
+        <div class="name"><span>道</span><span>經</span></div>
+        <div class="spacer"></div>
+        <span class="leaf-chip cur">第27637葉</span>
+      </div>
+      <div class="strip">
+        <div class="name"><span>德</span><span>經</span></div>
+        <div class="spacer"></div>
+        <span class="leaf-chip">第19280葉</span>
+      </div>
+      <div class="strip">
+        <div class="name"><span>卷</span><span>三</span></div>
+        <div class="spacer"></div>
+        <span class="leaf-chip">第1042葉</span>
+      </div>
+      <div class="strip">
+        <div class="name"><span>卷</span><span>四</span></div>
+        <div class="spacer"></div>
+        <span class="leaf-chip">第15葉</span>
+      </div>
+    </div>
+
+    <!-- 朱批栏 -->
+    <div class="marks">
+      <div class="marks-head">
+        <span class="t">朱批 3</span>
+        <span class="hint">点选可跃</span>
+      </div>
+
+      <!-- 一条朱批 -->
+      <div class="mark">
+        <div class="mark-row">
+          <div class="excerpt">道可道非常道名可名非常名</div>
+          <div class="mark-dot"><i></i><s></s></div>
+        </div>
+        <div class="mark-foot">
+          <span class="leaf-chip">第27637葉</span>
+          <span class="note">朱批：此句當讀斷</span>
+        </div>
+      </div>
+
+      <div class="mark">
+        <div class="mark-row">
+          <div class="excerpt">上善若水水善利萬物而不爭</div>
+          <div class="mark-dot"><i></i><s></s></div>
+        </div>
+        <div class="mark-foot">
+          <span class="leaf-chip">第19280葉</span>
+        </div>
+      </div>
+
+      <div class="mark">
+        <div class="mark-row">
+          <div class="excerpt">知人者智自知者明</div>
+          <div class="mark-dot"><i></i><s></s></div>
+        </div>
+        <div class="mark-foot">
+          <span class="leaf-chip">第1042葉</span>
+          <span class="note">朱批：勝人者有力</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 空态单独演示 -->
+<div class="sidebar" style="margin-left:16px">
+  <div class="head">
+    <div style="display:flex;gap:12px;align-items:center">
+      <span class="title">目 錄</span>
+      <button class="ghost-close">✕</button>
+    </div>
+    <span class="count">共 8 卷目</span>
+  </div>
+  <div class="body">
+    <div class="toc"><div class="strip cur"><div class="name"><span>道</span><span>經</span></div><div class="spacer"></div><span class="leaf-chip cur">第27637葉</span></div></div>
+    <div class="marks">
+      <div class="marks-head"><span class="t">朱批 0</span><span class="hint">点选可跃</span></div>
+      <p class="empty">尚无朱批。<br>框选正文，点选上方工具之「朱批」，起笔处将落一朱点。</p>
+    </div>
+  </div>
+</div>
+
+<div class="notes">
+  <h3>改动要点</h3>
+  1. <b>字体统一</b>：标题 / 计数 / 叶码 / 提示全部 <code>--f-song</code> 或 <code>--f-kai</code>，数字同样是宋体，不再出现系统默认黑体。<br>
+  2. <b>文案古风化</b>：划线 → <b>朱批</b>；「點一條即跳」→「<b>点选可跃</b>」；空态改为楷体小字「尚无朱批。框选正文，点选上方工具之「朱批」，起笔处将落一朱点。」<br>
+  3. <b>摘录竖排</b>：<code>writing-mode:vertical-rl</code> + 繁体 + 与正文同款宋体；前列右起，与古籍眉批读序一致。<br>
+  4. <b>眉批标记</b>：一枚空心朱砂小圈 + 一道极细朱线（<code>.mark-dot i / s</code>），不用现代列表符号。<br>
+  5. <b>控件隐形</b>：关闭钮只剩一枚淡「✕」（<code>.ghost-close</code>）；滚动条 <code>scrollbar-width:none</code> + <code>::-webkit-scrollbar{width:0}</code>。<br>
+  6. <b>卷页标识</b>：<code>.leaf-chip</code> —— 极小宋体 + 1px 淡边框 + 起首 1.5×6px 的微小墨签竖线；数字仍用阿拉伯写法以保精准定位。
+</div>
+
+</body>
+</html>

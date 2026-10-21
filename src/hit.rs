@@ -98,6 +98,30 @@ pub fn column_spans(items: &[Piece], cell_h: f32, west_mode: bool) -> Vec<Span> 
     let mut i = 0usize;
     while i < items.len() {
         match &items[i] {
+            // 数字串（防呆）：整串成组，纵向每字半格（`223` → 1.5 格），
+            // 与分页（半格账）和渲染（整串横躺）同源。
+            Piece::Main(g) if west_mode && crate::west::is_digit(g.ch) => {
+                let mut j = i;
+                let mut chars: Vec<Glyph> = Vec::new();
+                while j < items.len() {
+                    match &items[j] {
+                        Piece::Main(g2) if crate::west::in_digit_run(g2.ch, true) => {
+                            chars.push(*g2);
+                            j += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                let h = chars.len() as f32 * half;
+                out.push(Span {
+                    index: i,
+                    y,
+                    h,
+                    kind: SpanKind::West(chars),
+                });
+                y += h;
+                i = j;
+            }
             Piece::Main(g) if west_mode && crate::west::is_west(g.ch) => {
                 let mut j = i;
                 let mut chars: Vec<Glyph> = Vec::new();

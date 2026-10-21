@@ -529,6 +529,43 @@ fn han_num(n: usize) -> String {
     }
 }
 
+/// 卷页标识「第27637葉」：极小**宋体** + 淡淡的一圈边框 + 起首一枚微小墨签。
+///
+/// 叶码是精准定位用的，所以数字仍留阿拉伯写法（比汉字更好核对），但字体
+/// 换成与正文同源的宋体，外加一圈淡到几乎看不见的细框和一枚极细短竖——
+/// 整体像刊本天头那行木记，不再是系统默认的细小黑体字。
+fn leaf_chip(page_no: usize, cur: bool, song: &SharedString) -> Div {
+    const DIM: u32 = 0x9FB0C4; // 月白兑暗
+    const VERMILION: u32 = 0xD0634E; // 当前卷：朱砂
+    const CHIP_LINE: u32 = 0x3A4A61; // 淡边框
+    const TICK: u32 = 0x6C7C93; // 起首短竖（墨签）
+    let fg = if cur { VERMILION } else { DIM };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.0))
+        .px(px(2.5))
+        .py(px(0.5))
+        .mt(px(1.0))
+        .border_1()
+        .border_color(rgb(CHIP_LINE))
+        .rounded(px(1.5))
+        .font_family(song.clone())
+        .child(
+            div()
+                .w(px(1.5))
+                .h(px(6.0))
+                .bg(rgb(if cur { VERMILION } else { TICK })),
+        )
+        .child(
+            div()
+                .text_size(px(9.5))
+                .text_color(rgb(fg))
+                .child(SharedString::from(format!("第{page_no}葉"))),
+        )
+}
+
 fn build_note_index(book: &Book) -> NoteIndex {
     let mut map = HashMap::new();
     let mut n = 0usize;
@@ -1444,12 +1481,9 @@ impl Root {
                     // 鱼尾纹（月白，方能在深底上显形）。
                     .child(fish_tail_ink(w * 0.84, true, MOON))
                     .child(title)
-                    .child(
-                        div()
-                            .text_size(px(9.0))
-                            .text_color(rgb(if cur { VERMILION } else { MOON_DIM }))
-                            .child(SharedString::from(format!("第{page_no}葉"))),
-                    )
+                    // 卷页标识：极小宋体 + 淡边框 + 起首的一枚微小墨签符号，
+                    // 像刊本天头那行「卷第幾葉」的木记，不再像系统默认小字。
+                    .child(leaf_chip(page_no, cur, &song))
                     .child(div().flex_1())
                     .child(fish_tail_ink(w * 0.84, false, MOON))
                     .on_mouse_down(
@@ -1482,14 +1516,23 @@ impl Root {
 
         let title_div = div()
             .text_size(px(14.0))
-            .font_family(song)
+            .font_family(song.clone())
             .text_color(rgb(MOON))
             .child(SharedString::from("目 錄"));
         let count_div = div()
+            .font_family(song.clone())
             .text_size(px(10.5))
             .text_color(rgb(MOON_DIM))
             .child(SharedString::from(format!("共 {} 卷目", toc.len())));
-        let close_div = small_button("关闭", false, self.theme).on_mouse_down(
+        // 关闭钮**隐形**：只是一枚淡到几近无色的「✕」，没有底色、没有边框、
+        // 没有圆角——侧栏是纸面的一部分，不该冒出一颗现代按钮。
+        let close_div = div()
+            .font_family(song.clone())
+            .text_size(px(13.0))
+            .text_color(rgb(MOON_DIM))
+            .cursor_pointer()
+            .child(SharedString::from("✕"))
+            .on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
@@ -1629,25 +1672,36 @@ impl Root {
         const MOON_DIM: u32 = 0x9FB0C4;
         const VERMILION: u32 = 0xD0634E;
         const LINE: u32 = 0x33445C;
-        const CARD: u32 = 0x223146; // 划线卡底
         const COL_BG: u32 = 0x18222F; // 比面板更深的栏底，拉开层次
+
+        // 字体：摘录 / 叶码 / 计数一律走**与正文同款**的书体（宋体），
+        // 提示语走楷体——整栏不再有系统默认黑体的现代后台味。
+        let song = crate::fonts::family_for(self.current_font(), Script::Ancient);
+        let kai = crate::fonts::note_family(self.note_font());
 
         let mut list = div()
             .id(SharedString::from("toc-col-mk"))
             .flex_1()
             .flex()
             .flex_col()
-            .gap_1()
-            .px_2()
-            .py_2()
+            .gap(px(14.0))
+            .px_3()
+            .py_3()
             .overflow_y_scroll();
 
-        let hint = |s: &'static str| {
-            div()
-                .p_2()
-                .text_size(px(10.5))
-                .text_color(rgb(MOON_DIM))
-                .child(SharedString::from(s))
+        // 楷体小字（提示语 / 空态）：GPUI 不自动折行，按每行字数手动折。
+        let kai_lines = |s: &str, per: usize| {
+            let mut d = div().flex().flex_col().gap(px(3.0));
+            for line in wrap_lines(s, per) {
+                d = d.child(
+                    div()
+                        .font_family(kai.clone())
+                        .text_size(px(11.0))
+                        .text_color(rgb(MOON_DIM))
+                        .child(SharedString::from(line)),
+                );
+            }
+            d
         };
 
         // 划线按「面」聚合：一面上连续划过的字合成一条，便于回看。
@@ -1670,64 +1724,119 @@ impl Root {
         }
         let count = marks.len();
         if marks.is_empty() {
-            list = list.child(hint(
-                "还没有划线。\n拖选文字后点工具条的「划线」，起笔处会落一个朱点。",
+            // 空态：极简楷体小字，一行起、一行承，不摆卡片、不画边框。
+            list = list.child(kai_lines(
+                "尚无朱批。框选正文，点选上方工具之「朱批」，起笔处将落一朱点。",
+                15,
             ));
         }
+        // 摘录：繁体 + 竖排（自右向左成列），字号与正文同源的宋体，
+        // 前列右起——与古籍眉批的读序一致。
+        const PER_COL: usize = 9;
+        const EX_FS: f32 = 12.5;
+        const EX_ROW: f32 = 15.0;
         for (page, txt, note) in marks {
-            list = list.child(
-                div()
-                    .id(SharedString::from(format!("mk-{page}")))
+            // 一律繁体：摘录是「书上原字」的再现，与正文的简繁开关无关。
+            let trad: String = txt
+                .chars()
+                .map(|c| crate::trad::traditional_of(c).unwrap_or(c))
+                .collect();
+            let cols: Vec<String> = trad
+                .chars()
+                .collect::<Vec<char>>()
+                .chunks(PER_COL)
+                .map(|c| c.iter().collect::<String>())
+                .collect();
+            let mut text_row = div().flex().flex_row().items_start().gap(px(2.0));
+            // 竖排右起：首列在最右，故按倒序入列；横排则顺排。
+            let order: Vec<&String> = if rtl {
+                cols.iter().rev().collect()
+            } else {
+                cols.iter().collect()
+            };
+            for chunk in order {
+                let mut col = div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .p_2()
-                    .rounded(px(4.0))
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(CARD))
-                    .cursor_pointer()
-                    .child(
+                    .items_center()
+                    .font_family(song.clone());
+                for c in chunk.chars() {
+                    col = col.child(
                         div()
+                            .h(px(EX_ROW))
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .w(px(6.0))
-                                    .h(px(6.0))
-                                    .rounded(px(3.0))
-                                    .bg(rgb(VERMILION)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(MOON))
-                                    .child(SharedString::from(txt)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(9.5))
-                            .text_color(rgb(MOON_DIM))
-                            .child(SharedString::from(match note {
-                                Some(n) => format!("第 {} 葉 · {n}", page + 1),
-                                None => format!("第 {} 葉", page + 1),
-                            })),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.goto_page(page);
-                            this.close_toc();
-                            cx.notify();
-                        }),
-                    ),
-            );
+                            .justify_center()
+                            .text_size(px(EX_FS))
+                            .text_color(rgb(MOON))
+                            .child(SharedString::from(c.to_string())),
+                    );
+                }
+                text_row = text_row.child(col);
+            }
+            // 眉批标记：一枚空心朱砂小圈领起，下引一道极细朱线，
+            // 像刻本天头的句读圈点，而不是现代列表的项目符号。
+            let rows = cols.iter().map(|c| c.chars().count()).max().unwrap_or(1);
+            let mut marker = div()
+                .w(px(6.0))
+                .h(px(rows as f32 * EX_ROW))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(3.0));
+            marker = marker
+                .child(
+                    div()
+                        .w(px(5.0))
+                        .h(px(5.0))
+                        .rounded(px(2.5))
+                        .border_1()
+                        .border_color(rgb(VERMILION)),
+                )
+                .child(div().w(px(1.0)).flex_1().bg(rgba(0xD0634E55)));
+            // 标记随读序摆在起读的一侧：竖排在右、横排在左。
+            let mut row = div().flex().flex_row().items_start().gap(px(6.0));
+            row = if rtl {
+                row.child(text_row).child(marker)
+            } else {
+                row.child(marker).child(text_row)
+            };
+            let mut item = div()
+                .id(SharedString::from(format!("mk-{page}")))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .cursor_pointer()
+                .child(row);
+            // 叶码 / 批注：极小宋体，复用目录那枚「卷页标识」。
+            let mut foot = div()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(leaf_chip(page + 1, false, &song));
+            if let Some(n) = note {
+                foot = foot.child(
+                    div()
+                        .font_family(kai.clone())
+                        .text_size(px(9.5))
+                        .text_color(rgb(MOON_DIM))
+                        .child(SharedString::from(n)),
+                );
+            }
+            item = item.child(foot);
+            list = list.child(item.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.goto_page(page);
+                    this.close_toc();
+                    cx.notify();
+                }),
+            ));
         }
 
+        // 表头：「朱批」+ 条数（宋体），另一侧一行极小提示「点选可跃」。
         let head = div()
             .flex()
             .flex_row()
@@ -1739,15 +1848,17 @@ impl Root {
             .border_color(rgb(LINE))
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .font_family(song.clone())
+                    .text_size(px(12.5))
                     .text_color(rgb(VERMILION))
-                    .child(SharedString::from(format!("划线 {count}"))),
+                    .child(SharedString::from(format!("朱批 {count}"))),
             )
             .child(
                 div()
+                    .font_family(song.clone())
                     .text_size(px(9.5))
                     .text_color(rgb(MOON_DIM))
-                    .child(SharedString::from("点一条即跳")),
+                    .child(SharedString::from("点选可跃")),
             );
 
         let mut col = div()
@@ -2479,6 +2590,27 @@ impl Root {
         let mut idx = 0usize;
         while idx < items.len() {
             match &items[idx] {
+                // 数字串（防呆）：整串成组、每字半格，`223` 只占 1.5 格高，
+                // 绝不一字一格竖着摞成三截。
+                Piece::Main(g) if west_mode && crate::west::is_digit(g.ch) => {
+                    let mut j = idx;
+                    while j < items.len() {
+                        match &items[j] {
+                            Piece::Main(g2) if crate::west::in_digit_run(g2.ch, true) => j += 1,
+                            _ => break,
+                        }
+                    }
+                    content = content.child(self.ancient_digit_run(
+                        &items[idx..j],
+                        cell_w,
+                        cell_h,
+                        fs,
+                        back,
+                        interactive,
+                        cx,
+                    ));
+                    idx = j;
+                }
                 Piece::Main(g) if west_mode && crate::west::is_west(g.ch) => {
                     let mut j = idx;
                     while j < items.len() {
@@ -2546,6 +2678,106 @@ impl Root {
             }
         }
         col.child(content)
+    }
+
+    /// 一串连续数字（`223` / `1980`）的竖排渲染：**整串成组、每字半格**。
+    ///
+    /// 刻本的处理是把整串顺时针转 90° 横躺顺着列往下读，纵向占高
+    /// `字数 × 半格`（3 个数字 = 1.5 个汉字高）。旋转坐标由
+    /// [`crate::west::digit_slots`] 给出（中心 `cx/cy` + 90°）；GPUI 0.2.2
+    /// 没有元素级变换，故按**同一批槽位直立排布**——槽位与分页的半格账逐字
+    /// 对齐，将来支持变换时改用 `(cx, cy, 90°)` 绘制即可，账目无需改动。
+    ///
+    /// 字号取 [`crate::west::digit_font_size`]（上限半个格高），保证相邻
+    /// 数字不叠、不溢出格宽。
+    fn ancient_digit_run(
+        &self,
+        items: &[Piece],
+        cell_w: f32,
+        cell_h: f32,
+        fs: f32,
+        back: bool,
+        interactive: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let t = self.theme;
+        let keys: Vec<(usize, usize, usize)> = items
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Main(g) => Some((g.chapter, g.para, g.offset)),
+                _ => None,
+            })
+            .collect();
+        let chars: Vec<char> = items
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Main(g) => Some(g.ch),
+                _ => None,
+            })
+            .collect();
+        // 半格账与分页同源：`223` → 3 个半格 = 1.5 格高。
+        // 旋转槽位（若要真横躺）由 west::digit_slots 给出：中心
+        // `cy = j * 半格 + 半格/2`、`cx = cell_w/2`、角 90°。
+        let units = chars.len().max(1);
+        let half = cell_h / 2.0;
+        let height = units as f32 * half;
+        let dfs = crate::west::digit_font_size(cell_w, cell_h, fs);
+        let ink = if back { t.ink_soft() } else { self.palette.ink(t) };
+        // 数字走西文字体（Computer Modern 衬线数字），不写死字体名。
+        let latin = crate::fonts::family_for_role(crate::fonts::FontRole::Latin);
+
+        let mut block = div()
+            .w(px(cell_w))
+            .h(px(height))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .font_family(latin.clone());
+        if keys.iter().any(|k| self.in_selection(*k)) {
+            block = block.relative().child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .w(px(cell_w))
+                    .h(px(height))
+                    .bg(rgba(0xA63A2B2E)),
+            );
+        }
+        for ch in chars.iter() {
+            if !crate::west::is_digit(*ch) {
+                // 串里的零宽字符：占位但不落墨（账上仍记半格）。
+                block = block.child(div().w(px(cell_w)).h(px(half)));
+                continue;
+            }
+            block = block.child(
+                div()
+                    .w(px(cell_w))
+                    .h(px(half))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(dfs))
+                    .text_color(rgb(ink))
+                    .child(SharedString::from(ch.to_string())),
+            );
+        }
+        if interactive {
+            block = block.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                    // 数字串不可逐字选，按下只标记「碰过正文」，绝不翻页。
+                    this.touched_glyph = true;
+                    cx.stop_propagation();
+                    this.popup = None;
+                    this.clear_selection();
+                    cx.notify();
+                }),
+            );
+        }
+        block
     }
 
     /// 一段连续西文（`1628` / `ISBN` / `3.14`）的竖排渲染。

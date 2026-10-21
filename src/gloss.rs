@@ -323,6 +323,43 @@ pub fn layout_book_from_opts(
             }
         }
 
+        // ── 数字串兜底（防呆）：整串成组、一个数字占半格 ─────────────
+        // 即便清洗漏了（`1980` 原样入库），也绝不能逐字一格竖着摞成四截。
+        // 这里把连续数字当成一个 **Block**：账上每数字记 1 个半格
+        // （`223` → 1.5 格），渲染侧整串横躺（旋转 90°），高宽与账同源。
+        //
+        // 放在西文分支**之前**：数字走更细的半格账，字母仍走「两字一格」。
+        if west_mode && crate::west::is_digit(g.ch) {
+            // 只看后面有限几个字：够取完整数字串，又不至于每次都扫到卷尾。
+            let look_end = (i + 40).min(flow.len());
+            let look: Vec<char> = flow[i..look_end].iter().map(|x| x.ch).collect();
+            let mut n = crate::west::scan_digit_run(&look);
+            // 章边界不容跨越：跨章的数字串在这里断开。
+            while n > 0 && flow[i + n - 1].chapter != g.chapter {
+                n -= 1;
+            }
+            if n == 0 {
+                n = 1;
+            }
+            if filler.room() < crate::west::DIGIT_UNITS {
+                roll_column!();
+                continue;
+            }
+            // 半格粒度：列尾放不下整串时，能吃几个吃几个，余下续到下一列列首
+            // （与西文串跨列续排同一套规矩，绝不丢字）。
+            let take = n.min(filler.room() / crate::west::DIGIT_UNITS).max(1);
+            filler.push_cells(take * crate::west::DIGIT_UNITS);
+            for gg in &flow[i..i + take] {
+                columns.last_mut().unwrap().push(Piece::Main(*gg));
+                glyphs.push(*gg);
+            }
+            i += take;
+            if i < flow.len() && crate::west::is_digit(flow[i].ch) {
+                roll_column!();
+            }
+            continue;
+        }
+
         // ── 西文串：整串成组、两个字符占一格 ─────────────────────────
         // `1628` 不再「一 digit 一格」竖着摞成四格，而是成组占两格（竖排
         // 横躺的压缩账）。宽度账走 `west` 模块，与渲染层同源：
@@ -1275,6 +1312,27 @@ mod tests {
             })
             .collect();
         assert_eq!(all, "甲乙丙1628");
+    }
+
+    #[test]
+    fn digit_run_takes_half_a_cell_each() {
+        // 防呆：即便清洗漏了（`223` 原样入库），也整串成组——每字半格，
+        // 3 位 = 1.5 格高，绝不是一字一格竖着摞成三截。
+        let flow = west_flow_of("223");
+        let pages = layout_book_from_opts(&flow, |_| None, 8, 8, 0, true, true);
+        let col = &pages[0].columns[0];
+        let spans = crate::hit::column_spans(col, 30.0, true);
+        assert_eq!(spans.len(), 1, "223 应合成一块");
+        assert!(
+            (spans[0].h - 45.0).abs() < 0.01,
+            "223 应占 1.5 格 = 45px，实得 {}",
+            spans[0].h
+        );
+        // 1980：4 位 = 2 格。
+        let flow = west_flow_of("1980");
+        let pages = layout_book_from_opts(&flow, |_| None, 8, 8, 0, true, true);
+        let spans = crate::hit::column_spans(&pages[0].columns[0], 30.0, true);
+        assert!((spans[0].h - 60.0).abs() < 0.01, "1980 应占 2 格 = 60px");
     }
 
     #[test]
