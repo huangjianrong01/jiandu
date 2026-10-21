@@ -21,11 +21,13 @@ mod library;
 mod lines;
 mod prefs;
 mod reader;
+mod ruby;
 mod shelf;
 mod sound;
 mod theme;
 mod trad;
 mod types;
+mod west;
 
 use app::Root;
 use anyhow::Result;

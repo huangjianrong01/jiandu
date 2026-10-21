@@ -96,6 +96,14 @@ impl Filler {
         }
     }
 
+    /// 直接记若干半格（西文串成组入列时用）。
+    ///
+    /// 西文按「两个字符占一格」记账：调用方用 `west::run_cells` 折算格数，
+    /// 再乘 2 传入，保证「分页算的格数」与「渲染排的高度」逐格一致。
+    pub fn push_cells(&mut self, units: usize) {
+        self.units = (self.units + units).min(self.cap);
+    }
+
     /// 开新列（账目清零）。不一定由 `push_main` 触发——夹注跨列也会用到。
     pub fn begin_column(&mut self) {
         self.units = 0;
@@ -196,6 +204,34 @@ pub fn layout_book_from(
     reserve_rows: usize,
     start_as_chapter: bool,
 ) -> Vec<Page> {
+    layout_book_from_opts(
+        flow,
+        gloss,
+        cols,
+        rows,
+        reserve_rows,
+        start_as_chapter,
+        true,
+    )
+}
+
+/// `layout_book_from` 的可配置版本。
+///
+/// `west_mode`：
+/// * `true`  —— 西文串整串成组，**两个字符占一格**（竖排横躺压缩）；
+/// * `false` —— 每个西文字符各占一格（配合「数字转汉字」开关：转成汉字后
+///   就是一个字一格，不能再按两字一格记账，否则会挤成一团）。
+///
+/// 分页与渲染必须取同一个 `west_mode`，否则列高对不上（多字 / 溢出）。
+pub fn layout_book_from_opts(
+    flow: &[Glyph],
+    gloss: impl Fn(&Glyph) -> Option<GlossPayload>,
+    cols: usize,
+    rows: usize,
+    reserve_rows: usize,
+    start_as_chapter: bool,
+    west_mode: bool,
+) -> Vec<Page> {
     let col_units = rows * 2;
     let mut pages: Vec<Page> = Vec::new();
     let mut glyphs: Vec<Glyph> = Vec::new();
@@ -229,7 +265,24 @@ pub fn layout_book_from(
         }};
     }
 
-    for (i, g) in flow.iter().enumerate() {
+    // 换列（西文串拆分 / 跨列续排时复用）：计列数、面尽则收面、再开新列。
+    macro_rules! roll_column {
+        () => {{
+            cols_filled += 1;
+            if cols_filled >= page_limit {
+                seal!();
+                page_limit = cols;
+                start_chapter = false;
+            } else if columns.last().map(|c| !c.is_empty()).unwrap_or(false) {
+                columns.push(Vec::new());
+            }
+            filler.begin_column();
+        }};
+    }
+
+    let mut i = 0usize;
+    while i < flow.len() {
+        let g = &flow[i];
         // 首面是否当章首由 `start_as_chapter` 决定；后续真·章边界仍正常触发。
         let chapter_start = (i == 0 && start_as_chapter)
             || (i > 0 && flow[i - 1].chapter != g.chapter);
@@ -249,6 +302,61 @@ pub fn layout_book_from(
                 filler.reserve_rows(reserve_rows);
             }
         }
+
+        // ── 西文串：整串成组、两个字符占一格 ─────────────────────────
+        // `1628` 不再「一 digit 一格」竖着摞成四格，而是成组占两格（竖排
+        // 横躺的压缩账）。宽度账走 `west` 模块，与渲染层同源：
+        // 渲染按 `west::pack_cells` 切行，高度恰为 `run_cells * cell_h`。
+        //
+        // 串跨列时在列尾拆开（余下部分续到下一列列首），小数点不落列首。
+        if west_mode && crate::west::is_west(g.ch) {
+            let mut end = i + 1;
+            while end < flow.len()
+                && flow[end].chapter == g.chapter
+                && crate::west::is_run_tail(flow[end].ch, true)
+            {
+                end += 1;
+            }
+            let run = &flow[i..end];
+            let mut k = 0usize;
+            while k < run.len() {
+                if filler.room() < 2 {
+                    roll_column!();
+                    continue;
+                }
+                let cap = (filler.room() / 2) * 2; // 只用整格
+                let mut units = 0usize;
+                let mut stop = k;
+                while stop < run.len() && units < cap {
+                    let u = crate::west::char_units(run[stop].ch);
+                    if units + u > cap {
+                        break;
+                    }
+                    units += u;
+                    stop += 1;
+                }
+                if stop == k {
+                    stop = k + 1; // 兜底：至少吃一个，绝不空转
+                }
+                // 小数点跟随前一组，不留在下一列列首。
+                while stop < run.len() && crate::west::is_west_dot(run[stop].ch) {
+                    stop += 1;
+                }
+                let cells = crate::west::run_cells(run[k..stop].iter().map(|g| g.ch));
+                filler.push_cells(cells * crate::west::WEST_PER_CELL);
+                for gg in &run[k..stop] {
+                    columns.last_mut().unwrap().push(Piece::Main(*gg));
+                    glyphs.push(*gg);
+                }
+                k = stop;
+                if k < run.len() {
+                    roll_column!();
+                }
+            }
+            i = end;
+            continue;
+        }
+
         // 避头尾禁则（竖排）：标点不可顶在列顶（避头）、开合标点不可落在
         // 列底（避尾）。两者都只让出一格空位，不丢字、不截断字形。
         let head_bad = is_head_prohibited(g.ch);
@@ -303,7 +411,10 @@ pub fn layout_book_from(
         columns.last_mut().unwrap().push(Piece::Main(*g));
         glyphs.push(*g);
         // 夹注：本列能放几行放几行，放不下的排下一列列首。
-        let Some((txt, src, host)) = gloss(g) else { continue };
+        let Some((txt, src, host)) = gloss(g) else {
+            i += 1;
+            continue;
+        };
         let all: Vec<char> = txt.chars().collect();
         let mut rest: &[char] = &all;
         while !rest.is_empty() {
@@ -328,6 +439,7 @@ pub fn layout_book_from(
                 filler.begin_column();
             }
         }
+        i += 1;
     }
     if !glyphs.is_empty()
         || !columns.iter().all(|c| c.is_empty())
@@ -358,15 +470,43 @@ pub const NOTE_PAD_RATIO: f32 = 1.0 / 6.0;
 /// 自上而下累计（与分页同源的半格账）。
 /// bbox 同步左侧留白（见 `NOTE_PAD_RATIO`）：命中区只覆盖真正
 /// 排了小字的部分，空白纸面不误触。
-pub fn note_boxes_in_column(col: &[Piece], li: usize, cell_w: f32, cell_h: f32) -> Vec<NoteBox> {
+/// `west_mode` 必须与分页 / 渲染取同一个值：西文成组时一段数字只占
+/// `run_cells` 格，逐字算会把下面的注块命中区整体下移。
+pub fn note_boxes_in_column(
+    col: &[Piece],
+    li: usize,
+    cell_w: f32,
+    cell_h: f32,
+    west_mode: bool,
+) -> Vec<NoteBox> {
     let row_h = cell_h / 2.0;
     let pad = cell_w * NOTE_PAD_RATIO;
     let mut y = 0.0f32;
     let mut out = Vec::new();
-    for p in col {
-        match p {
-            Piece::Main(_) => y += cell_h,
-            Piece::Gap => {}
+    let mut idx = 0usize;
+    while idx < col.len() {
+        match &col[idx] {
+            Piece::Main(g) if west_mode && crate::west::is_west(g.ch) => {
+                // 连续西文成组：按「两字一格」累计高度（与渲染同源）。
+                let mut j = idx;
+                let mut chars = Vec::new();
+                while j < col.len() {
+                    match &col[j] {
+                        Piece::Main(g2) if crate::west::is_west(g2.ch) => {
+                            chars.push(g2.ch);
+                            j += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                y += crate::west::run_cells(chars) as f32 * cell_h;
+                idx = j;
+            }
+            Piece::Main(_) => {
+                y += cell_h;
+                idx += 1;
+            }
+            Piece::Gap => idx += 1,
             Piece::Gloss(text, src, host) => {
                 let rows = (text.chars().count() + 1) / 2;
                 let h = rows as f32 * row_h;
@@ -384,6 +524,7 @@ pub fn note_boxes_in_column(col: &[Piece], li: usize, cell_w: f32, cell_h: f32) 
                     key: (host.chapter, host.para, host.offset),
                 });
                 y += h;
+                idx += 1;
             }
         }
     }
@@ -469,6 +610,9 @@ pub struct NoteZoom {
     pub y: f32,
     /// 注文所在的叶（0 基，卡片「来源」行用）。
     pub page: usize,
+    /// 注音的拼音：`Some` 表示这是**生僻字注音浮签**（大字显示拼音），
+    /// `None` 表示夹注放大卡（可重录）。
+    pub pinyin: Option<String>,
 }
 
 /// 右键 / 长按**用户自加夹注**弹出的「修改 / 删除」菜单状态。
@@ -1017,6 +1161,70 @@ mod tests {
         }
     }
 
+    /// 测试用字形流（字符串直造）：同一章同一段，offset 递增。
+    fn west_flow_of(s: &str) -> Vec<Glyph> {
+        s.chars()
+            .enumerate()
+            .map(|(i, c)| Glyph {
+                chapter: 0,
+                para: 0,
+                offset: i,
+                ch: c,
+                kind: GlyphKind::Char,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn west_run_occupies_half_the_cells() {
+        // 4 汉字 + 4 位数字 + 2 汉字 = 4 + 2 + 2 = 8 格，每列 8 行 → 一列放完。
+        // 若数字还「一 digit 一格」（旧病）就要 10 格、必须溢出到第二列。
+        let flow = west_flow_of("甲乙丙丁1628戊己");
+        let pages = layout_book(&flow, |_| None, 8, 8, 0);
+        assert_eq!(pages[0].columns.len(), 1, "数字不该再各占一格");
+        let got: String = pages[0].columns[0]
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Main(g) => Some(g.ch),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, "甲乙丙丁1628戊己");
+        assert_eq!(crate::west::run_cells("1628".chars()), 2);
+    }
+
+    #[test]
+    fn west_run_splits_across_columns_without_dropping_glyphs() {
+        // 每列 3 行：4 位数字在列尾放不下时跨列续排，一个字都不丢。
+        let flow = west_flow_of("甲乙丙1628");
+        let pages = layout_book(&flow, |_| None, 8, 3, 0);
+        let all: String = pages
+            .iter()
+            .flat_map(|p| p.columns.iter())
+            .flat_map(|c| c.iter())
+            .filter_map(|p| match p {
+                Piece::Main(g) => Some(g.ch),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(all, "甲乙丙1628");
+    }
+
+    #[test]
+    fn han_digits_mode_gives_each_digit_its_own_cell() {
+        // 数字转汉字开关打开（west_mode=false）：每个数字独立一格 → 两列。
+        let flow = west_flow_of("1628");
+        let pages = layout_book_from_opts(&flow, |_| None, 8, 2, 0, true, false);
+        let n = pages[0]
+            .columns
+            .iter()
+            .flat_map(|c| c.iter())
+            .filter(|p| matches!(p, Piece::Main(_)))
+            .count();
+        assert_eq!(n, 4);
+        assert_eq!(crate::west::digits_to_han("1628", false), "一六二八");
+    }
+
     #[test]
     fn note_boxes_stack_top_down_in_column() {
         // 列内：正文每字一个 cell_h，注块 = ceil(n/2) 个半格，自上而下累计。
@@ -1026,7 +1234,7 @@ mod tests {
             main_glyph(),
             Piece::Gloss("丙丁戊己".into(), NoteSource::Original, ghost()), // 4 字 → 2 行 → cell_h
         ];
-        let boxes = note_boxes_in_column(&col, 2, 46.0, 51.0);
+        let boxes = note_boxes_in_column(&col, 2, 46.0, 51.0, true);
         assert_eq!(boxes.len(), 2);
         // 第一个注块：正文一字之后。
         assert!((boxes[0].y - 51.0).abs() < 0.01);
@@ -1051,8 +1259,8 @@ mod tests {
         let col = vec![Piece::Gloss("注".into(), NoteSource::Original, ghost())];
         let (cell_w, cell_h) = (50.0, 55.0);
         let text_cols = 4;
-        let rightmost = note_boxes_in_column(&col, text_cols - 1 - 0, cell_w, cell_h);
-        let leftmost = note_boxes_in_column(&col, text_cols - 1 - 3, cell_w, cell_h);
+        let rightmost = note_boxes_in_column(&col, text_cols - 1 - 0, cell_w, cell_h, true);
+        let leftmost = note_boxes_in_column(&col, text_cols - 1 - 3, cell_w, cell_h, true);
         let pad = cell_w * NOTE_PAD_RATIO;
         assert!((rightmost[0].x - (3.0 * cell_w + pad)).abs() < 0.01);
         assert!((leftmost[0].x - pad).abs() < 0.01);
@@ -1062,7 +1270,7 @@ mod tests {
     #[test]
     fn note_boxes_empty_when_no_gloss() {
         let col = vec![main_glyph(), main_glyph()];
-        assert!(note_boxes_in_column(&col, 0, 40.0, 44.0).is_empty());
+        assert!(note_boxes_in_column(&col, 0, 40.0, 44.0, true).is_empty());
     }
 
     #[test]

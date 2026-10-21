@@ -11,4 +11,6 @@ pub mod gloss;
 pub mod grid;
 pub mod importer;
 pub mod library;
+pub mod ruby;
 pub mod types;
+pub mod west;

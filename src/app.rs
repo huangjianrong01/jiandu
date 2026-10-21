@@ -4,7 +4,7 @@
 //! 每本书的阅读档案（第几面、模式、字体、标注开关）会即时写回 library.json。
 
 use crate::fonts;
-use crate::grid::{compute_grid, GridConfig, GridDir, GRID_COLUMN_CHOICES};
+use crate::grid::{compute_grid, GridConfig, GridDir, LayoutConfig};
 use crate::library::Library;
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
@@ -105,11 +105,9 @@ pub struct Root {
     pub grid_min_font: bool,
     /// 版式控制面板（列数 / 方向 / 留白）是否展开。
     pub show_grid_panel: bool,
-    /// 信笺模式（「信笺（14列）」模板）：单张平铺稿纸——14 格版心里
-    /// 中缝占两格（左右各 6 格正文），中缝立「对鱼尾」（上下两枚黑鱼尾
-    /// 开口相对），四周文武边栏、界栏通内框。开启时强制单页（不对开）、
-    /// 列数锁 14；关闭回到古籍竖笺的 8/10/12/14 自适应。
-    pub letter_mode: bool,
+    /// 当前版式配置键：数据驱动排版引擎的句柄（见 [`crate::grid::LAYOUT_CONFIGS`]）。
+    /// 取代原先散落的 `letter_mode` 布尔——所有版式只是注册表里的一条记录。
+    pub layout_key: &'static str,
     pub duplex: Duplex,
     pub font_ancient: FontChoice,
     pub font_modern: FontChoice,
@@ -243,6 +241,9 @@ pub struct Root {
     pub show_punct: bool,
     /// 生僻字显示：true 时给生僻字标注读音。
     pub show_rare: bool,
+    /// 数字转汉字：true 时阿拉伯数字在竖排里显示为汉字（一六二八），
+    /// 每个汉字独占一格（不再按「两字一格」压缩）。默认关闭——保留原貌。
+    pub han_digits: bool,
     /// 书库面板是否展开（书架上下载更多书）。
     pub show_library: bool,
     /// 窗口内容区尺寸（每帧由 render 写入，供铺满屏计算）。
@@ -332,7 +333,7 @@ impl Root {
             grid_rows: 11,
             grid_min_font: false,
             show_grid_panel: false,
-            letter_mode: false,
+            layout_key: LayoutConfig::default_key(),
             duplex: Duplex::Single,
             font_ancient: FontChoice::SongTi,
             font_modern: FontChoice::SourceHanSans,
@@ -396,6 +397,7 @@ impl Root {
             style_tab: StyleTab::Style,
             show_punct: true,
             show_rare: false,
+            han_digits: false,
             show_library: false,
             viewport_w: 1280.0,
             viewport_h: 860.0,
@@ -558,7 +560,7 @@ impl Root {
         }
         // 开发用：直接进「信笺（14 列）」模板，便于截图核对。
         if std::env::var("JIANDU_LETTER").is_ok() {
-            root.letter_mode = true;
+            root.layout_key = "letter14";
             root.grid.columns = 14;
             root.duplex = Duplex::Single;
         }
@@ -576,6 +578,7 @@ impl Root {
                         x,
                         y,
                         page: root.page,
+                        pinyin: None,
                     });
                 }
             }
@@ -687,7 +690,7 @@ impl Root {
         let notes_foot = self.show_notes && !self.notes_inline;
         // 信笺（14 列）模板：单张平铺稿纸，按 23×34cm（2:3）铺排，
         // 14 个正文列 + 1 个中缝列。与普通过开 / 单页是两条独立的几何路径。
-        if self.letter_mode {
+        if self.current_layout().is_letter() {
             self.fit_letter(content_w, content_h, notes_foot);
             return;
         }
@@ -782,23 +785,41 @@ impl Root {
         self.duplex = Duplex::Single;
     }
 
-    /// 切换「信笺（14 列）」模板：保当前页首字锚点，重排后仍停在同一处
-    /// （用户要求「点击后无缝重排当前页面」，不回到卷首）。
-    pub fn set_letter_mode(&mut self, on: bool) {
-        if self.letter_mode == on {
-            return;
+    /// 当前版式配置：数据驱动的唯一数据源（见 [`crate::grid::LAYOUT_CONFIGS`]）。
+    pub fn current_layout(&self) -> &'static crate::grid::LayoutConfig {
+        crate::grid::LayoutConfig::by_key(self.layout_key)
+            .unwrap_or_else(crate::grid::LayoutConfig::default)
+    }
+
+    /// 是否「信笺」模板（独占 2:3 平铺几何与对鱼尾）。
+    pub fn is_letter_mode(&self) -> bool {
+        self.current_layout().is_letter()
+    }
+
+    /// 统一的版式切换入口（数据驱动）：按配置键换版式，**保持当前阅读进度**
+    /// （首字锚点 = charIndex）不丢失，切换瞬间重排当前页。
+    ///
+    /// 取代原先散落的 `set_letter_mode` / `set_columns` 两套分支——它们都收敛
+    /// 到这里，UI 也只调这一处。新增版式（如 16 列）只需在注册表加一行，
+    /// 这里与 UI 零改动。
+    pub fn set_layout(&mut self, key: &str) {
+        let cfg = match crate::grid::LayoutConfig::by_key(key) {
+            Some(c) => c,
+            None => return,
+        };
+        if self.layout_key == cfg.key {
+            return; // 同一档，跳过无谓重排
         }
+        // 锚点：当前页第一个字（段首缩进占位也算），切版前后都用它定位。
         let anchor = self
             .layout_pages()
             .get(self.page)
             .and_then(|p| p.glyphs.first())
             .map(|g| (g.chapter, g.para, g.offset));
-        self.letter_mode = on;
-        if on {
-            // 信笺模板锁 14 列（14 个正文列 + 1 中缝列），并强制单页。
-            self.grid.columns = 14;
-            self.duplex = Duplex::Single;
-        }
+        self.layout_key = cfg.key;
+        self.grid.columns = cfg.columns;
+        self.grid.dir = cfg.dir;
+        self.grid.margin = cfg.margin;
         self.fit_sizes();
         if let Some((c, pa, o)) = anchor {
             if let Some(pi) = self.layout_pages().iter().position(|pg| {
@@ -812,13 +833,25 @@ impl Root {
         self.sync_current_chapter();
     }
 
-    /// 设列数（8 / 10 / 12 / 14）；越界值忽略。改列数会重排，回到首页。
+    /// 切「信笺（14 列）」模板（便捷封装；内部走 [`set_layout`]）。
+    pub fn set_letter_mode(&mut self, on: bool) {
+        let key = if on {
+            "letter14"
+        } else {
+            crate::grid::LayoutConfig::default_key()
+        };
+        self.set_layout(key);
+    }
+
+    /// 设列数（8 / 10 / 12 / 14）：列数档位全部来自配置，统一走 [`set_layout`]，
+    /// 因此同样保持阅读进度、不跳回卷首。
     pub fn set_columns(&mut self, n: usize) {
-        if GRID_COLUMN_CHOICES.contains(&n) && self.grid.columns != n {
-            self.grid.columns = n;
-            self.page = 0;
-            self.sync_current_chapter();
-        }
+        let key = crate::grid::LAYOUT_CONFIGS
+            .iter()
+            .find(|c| c.columns == n)
+            .map(|c| c.key)
+            .unwrap_or_else(crate::grid::LayoutConfig::default_key);
+        self.set_layout(key);
     }
 
     /// 设四周留白比例（0..1，近似四边同留白）。
@@ -1502,7 +1535,9 @@ impl Root {
         // 卷首题署：章首页开卷列顶部预留的空白带行数（0 = 不预留）。
         let reserve = crate::gloss::inscription_reserve(self.chapter_inscription_need(), rows);
         // 只保留古籍竖笺：一律按竖排分页。
-        crate::gloss::layout_book(
+        // `west_mode`：数字转汉字开启时，每个数字是独立汉字格，不能再按
+        // 「两字一格」记账，否则分页与渲染的列高对不上（会溢出一格）。
+        crate::gloss::layout_book_from_opts(
             &flow,
             |g| {
                 if self.notes_inline {
@@ -1517,6 +1552,8 @@ impl Root {
             cols,
             rows,
             reserve,
+            true,              // start_as_chapter：整书从首面排起
+            !self.han_digits,  // west_mode：西文成组压缩
         )
     }
 
@@ -1588,9 +1625,13 @@ impl Root {
             for (i, col) in pg.columns.iter().enumerate() {
                 // 竖排：读序列号 i=0 在最右；flex_row 从左数的位置 li = tc-1-i。
                 let li = tc.saturating_sub(1).saturating_sub(i);
-                for mut b in
-                    crate::gloss::note_boxes_in_column(col, li, self.col_w, self.row_h)
-                {
+                for mut b in crate::gloss::note_boxes_in_column(
+                    col,
+                    li,
+                    self.col_w,
+                    self.row_h,
+                    !self.han_digits,
+                ) {
                     b.page = idx;
                     b.back = back;
                     self.note_boxes.push(b);
@@ -2624,7 +2665,7 @@ mod tests {
         }
         let flow = b.to_flow(true);
         // 任意列数（8/10/12/14）都不丢字、每面不超渲染侧列上限。
-        for cols in GRID_COLUMN_CHOICES {
+        for cols in crate::grid::GRID_COLUMN_CHOICES {
             let rows = 11;
             let pages = crate::gloss::layout_book(&flow, |_| None, cols, rows, 0);
             let flat: Vec<&Glyph> = pages.iter().flat_map(|p| p.glyphs.iter()).collect();

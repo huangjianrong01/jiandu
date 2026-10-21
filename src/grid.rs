@@ -68,7 +68,80 @@ impl GridDir {
 }
 
 /// 列数档位：古籍新增 14 列，连同原有的 8 / 10 / 12。
+/// （保留以供分页一致性测试遍历；UI 与状态切换已改走 [`LAYOUT_CONFIGS`]。）
 pub const GRID_COLUMN_CHOICES: [usize; 4] = [8, 10, 12, 14];
+
+/// 版框样式。渲染层只按这个值分支，不写死「信笺才文武」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BorderStyle {
+    /// 单线：一根细框，普通古籍竖笺。
+    Single,
+    /// 文武边栏：外粗内细，信笺 / 讲究的刻本用。
+    Double,
+}
+
+impl BorderStyle {
+    /// 边框样式标签（UI / 调试用）。
+    pub fn label(self) -> &'static str {
+        match self {
+            BorderStyle::Single => "单线",
+            BorderStyle::Double => "文武",
+        }
+    }
+}
+
+/// 版式配置：数据驱动排版引擎的**唯一数据源**。
+///
+/// 取代原先散落的 `letter_mode` 布尔、`GRID_COLUMN_CHOICES` 硬编码与
+/// 「信笺（14列）」特例——所有版式（标准 8 / 10 / 12 列、信笺 14 列）都只是
+/// 这张表里的一条记录。列数 / 边框样式 / 鱼尾开关 / 方向 / 留白全部声明于此，
+/// 渲染与几何只消费配置，不再写 `if cfg.columns == 14` 这类判定。
+#[derive(Clone, Copy, Debug)]
+pub struct LayoutConfig {
+    /// 配置键（数据驱动切换的句柄，见 [`LAYOUT_CONFIGS`]）。
+    pub key: &'static str,
+    /// 按钮 / 菜单上显示的标签（UI 直接读它，不写死文案）。
+    pub label: &'static str,
+    /// 每面列数（竖排=竖列数）：8 / 10 / 12 / 14。
+    pub columns: usize,
+    /// 排版方向（沿用既有方向枚举）。
+    pub dir: GridDir,
+    /// 四周留白比例。
+    pub margin: f32,
+    /// 版框样式：单线（standard）/ 文武（信笺）。
+    pub border_style: BorderStyle,
+    /// 是否在版心（中缝）绘制上下相对的「对鱼尾」。
+    pub show_fish_tail: bool,
+}
+
+/// 版式配置注册表：有序数组即「单一数据源」。新增版式（如 16 列）只需在此
+/// 追加一行，UI / 渲染 / 几何自动适配——零 if-else 扩散。
+pub const LAYOUT_CONFIGS: &[LayoutConfig] = &[
+    LayoutConfig { key: "standard8",  label: "标准 8 列",  columns: 8,  dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Single, show_fish_tail: false },
+    LayoutConfig { key: "standard10", label: "标准 10 列", columns: 10, dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Single, show_fish_tail: false },
+    LayoutConfig { key: "standard12", label: "标准 12 列", columns: 12, dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Single, show_fish_tail: false },
+    // 信笺：四周文武边栏 + 中缝对鱼尾，独占 2:3 平铺稿纸几何（见 `fit_letter`）。
+    LayoutConfig { key: "letter14",   label: "信笺 14 列", columns: 14, dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Double, show_fish_tail: true },
+];
+
+impl LayoutConfig {
+    /// 按配置键取配置；未知键回落默认。
+    pub fn by_key(key: &str) -> Option<&'static LayoutConfig> {
+        LAYOUT_CONFIGS.iter().find(|c| c.key == key)
+    }
+    /// 默认版式（首启 / 配置损坏时的回落）。
+    pub fn default() -> &'static LayoutConfig {
+        Self::by_key("standard10").unwrap_or(&LAYOUT_CONFIGS[1])
+    }
+    /// 默认配置键。
+    pub fn default_key() -> &'static str {
+        Self::default().key
+    }
+    /// 是否「信笺」模板：独占 2:3 平铺几何与对鱼尾，与普通对开 / 单页是两条路径。
+    pub fn is_letter(&self) -> bool {
+        self.key == "letter14"
+    }
+}
 
 /// 网格配置：参数化排版引擎的唯一输入。
 #[derive(Clone, Copy, Debug)]
@@ -94,9 +167,10 @@ impl Default for GridConfig {
 /// 字号 / 行高算式系数与上下限（均来自用户给定的公式与边界要求）。
 pub const GRID_FS_RATIO: f32 = 0.75; // fontSize = colWidth × 0.75
 pub const GRID_ROW_RATIO: f32 = 1.1; // rowHeight = colWidth × 1.1
-/// 最小字号：窄屏 12/14 列也不至于小到看不清；触发后几何按「字号优先」重算，
-/// 可能超出可用宽 → 由渲染层开启单页上下（及左右）滚动。
-pub const GRID_FS_MIN: f32 = 14.0;
+/// 最小字号保护阈值（用户指定 12px）：窄屏 12/14 列也不至于小到看不清；
+/// 触发后几何按「字号优先」重算，可能超出可用宽 → 由渲染层开启单页
+/// 上下（及左右）滚动，绝不把字挤成一团黑疙瘩。
+pub const GRID_FS_MIN: f32 = 12.0;
 /// 字号上限：专注模式撑满整屏时不被无限制放大。
 pub const GRID_FS_MAX: f32 = 220.0;
 
@@ -309,10 +383,10 @@ mod tests {
 
     #[test]
     fn min_font_prevents_tiny_glyphs_on_narrow_screen() {
-        // 极窄内容区（320×640）+ 14 列：触发最小字号，fs 不应低于下限，
+        // 极窄内容区（200×640）+ 14 列：触发最小字号，fs 不应低于下限，
         // 且 col_w 反推保证字不超格。
         let m = compute_grid(
-            320.0,
+            200.0,
             640.0,
             GridConfig {
                 columns: 14,
@@ -380,5 +454,54 @@ mod tests {
         };
         assert_eq!(cell_origin(&m, 0, 0), (0.0, 0.0));
         assert_eq!(cell_origin(&m, 2, 0), (20.0, 0.0));
+    }
+
+    #[test]
+    fn layout_configs_are_the_single_source_of_truth() {
+        // 注册表恰好覆盖用户指定的四个档位，键 / 标签 / 列数一一对应。
+        assert_eq!(LAYOUT_CONFIGS.len(), 4);
+        let keys: Vec<&str> = LAYOUT_CONFIGS.iter().map(|c| c.key).collect();
+        assert_eq!(keys, vec!["standard8", "standard10", "standard12", "letter14"]);
+        // 标准三档是单线、无鱼尾；信笺是文武边栏 + 对鱼尾。
+        for c in LAYOUT_CONFIGS.iter().filter(|c| !c.is_letter()) {
+            assert_eq!(c.border_style, BorderStyle::Single, "{} 应为单线", c.key);
+            assert!(!c.show_fish_tail, "{} 不应有鱼尾", c.key);
+        }
+        let letter = LayoutConfig::by_key("letter14").unwrap();
+        assert_eq!(letter.border_style, BorderStyle::Double);
+        assert!(letter.show_fish_tail);
+        assert_eq!(letter.columns, 14);
+        // 默认档是 standard10。
+        assert_eq!(LayoutConfig::default().key, "standard10");
+        // 注册表是精确查表：未知键查不到（`None`），回落由调用方
+        // （`current_layout` / `set_layout`）统一处理，从而 `set_layout`
+        // 能在解析失败时安全返回，不污染状态。
+        assert!(LayoutConfig::by_key("nope").is_none());
+    }
+
+    #[test]
+    fn columns_derive_from_config_not_hardcode() {
+        // 列数全部来自配置，引擎不写死 8/10/12/14 的 if-else。
+        for c in LAYOUT_CONFIGS {
+            let m = compute_grid(
+                1320.0 - 44.0,
+                880.0 - 78.0 - 44.0,
+                GridConfig {
+                    columns: c.columns,
+                    dir: c.dir,
+                    margin: c.margin,
+                },
+                false,
+                1.0,
+                50.0,
+                0.0,
+                12.0,
+                0.0,
+            );
+            // 四档都不溢出内容区，且不重叠（比例约束恒成立）。
+            assert!(m.outer_w <= 1320.0 - 44.0 + 0.5, "{} 纸宽溢出", c.key);
+            assert!(m.outer_h <= 880.0 - 78.0 - 44.0 + 0.5, "{} 纸高溢出", c.key);
+            assert!(m.row_h > m.fs, "{} row_h 必须 > fs", c.key);
+        }
     }
 }

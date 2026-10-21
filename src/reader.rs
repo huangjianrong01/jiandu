@@ -11,7 +11,7 @@ use crate::app::{
 };
 use crate::dict;
 use crate::gloss::{Page, Piece};
-use crate::grid::GRID_COLUMN_CHOICES;
+use crate::grid::BorderStyle;
 use crate::lines;
 use crate::theme::{InkPalette, Theme};
 use crate::trad;
@@ -65,8 +65,10 @@ pub(crate) struct LeafGeo {
     pub rows: usize,
     /// 正文字号 = cell_w × `GRID_FS_RATIO`（收敛在[min,max]）。
     pub fs: f32,
+    /// 版框样式：单线 / 文武（外粗内细），由当前 `LayoutConfig` 决定。
+    pub border_style: BorderStyle,
     /// 信笺模板：叶内第 7/8 列之间插一列宽中缝（对鱼尾）。
-    pub letter: bool,
+    pub show_fish_tail: bool,
     /// 夹注行内显示（双行小字夹注）；false = 页脚注横排列表。
     pub notes_inline: bool,
     /// 字格 / 注块是否挂鼠标交互（晒本预览关掉：纯展示，不弹工具条）。
@@ -75,13 +77,16 @@ pub(crate) struct LeafGeo {
 
 impl LeafGeo {
     /// 当前阅读视图的几何（与 `fit_sizes` / `fit_letter` 算出的同源）。
+    /// 边框样式与鱼尾开关直接从当前 `LayoutConfig` 取，不再读 `letter_mode` 布尔。
     pub(crate) fn current(r: &Root) -> Self {
+        let cfg = r.current_layout();
         Self {
             cell_w: r.col_w,
             cell_h: r.row_h,
             rows: r.grid_rows,
             fs: r.size_ancient,
-            letter: r.letter_mode,
+            border_style: cfg.border_style,
+            show_fish_tail: cfg.show_fish_tail,
             notes_inline: r.notes_inline,
             interactive: true,
         }
@@ -495,7 +500,7 @@ impl Root {
     fn meixin_band(&self, total: usize) -> Option<(f32, f32)> {
         crate::types::meixin_band(
             self.viewport_w,
-            self.letter_mode,
+            self.is_letter_mode(),
             self.duplex == Duplex::Facing,
             // 中缝渲染条件：对开且下一面（左半叶）存在。
             self.page + 1 < total,
@@ -697,6 +702,7 @@ impl Root {
                                 x: ux,
                                 y: uy,
                                 page,
+                                pinyin: None,
                             });
                             cx.notify();
                         } else if let Some(fwd) = fwd {
@@ -1917,7 +1923,7 @@ impl Root {
                 .flex_col()
                 .items_center();
             sc.style().overflow.y = Some(Overflow::Scroll);
-            if self.letter_mode {
+            if self.is_letter_mode() {
                 // 信笺 14 列在窄屏上可能横向也放不下：允许左右滚动，
                 // 而不是把字继续压小（最小字号保护的另一半）。
                 sc.style().overflow.x = Some(Overflow::Scroll);
@@ -2092,7 +2098,7 @@ impl Root {
             }
             // 信笺模板在列间插了一道「一列宽」的中缝：地脚叶码 / 书耳
             // 的定位要把这一列也算进纸面宽度，才不至于偏到一边。
-            + if geo.letter { cell_w } else { 0.0 };
+            + if geo.show_fish_tail { cell_w } else { 0.0 };
 
         // 界行（乌丝栏）：从右往左先排正文——`i = text_cols-1` 落在最左，
         // `i = 0` 落在最右，正是竖排的读序。每列左缘一道通高细线，
@@ -2107,7 +2113,7 @@ impl Root {
             // 章首页最右多一个章题列（也算一列），分割点随之前移一列，
             // 左右两边仍各是 7 列。
             let split_i = if start_chapter { 5 } else { 6 };
-            if geo.letter && i == split_i {
+            if geo.show_fish_tail && i == split_i {
                 grid = grid.child(self.render_letter_gutter(cell_w, cell_h, rows, foot_h));
             }
             grid = grid.child(self.ancient_column(
@@ -2159,21 +2165,24 @@ impl Root {
                     .child(SharedString::from(han_num(idx + 1))),
             );
 
-        // 版框：四周双边——外粗内细，中间留一线空隙（刻本双边的样子）。
-        // 对开拼合时**内侧（贴中缝那一侧）不设框线**：左右两叶拼成一整
-        // 张纸，外粗框 / 内细框只围整页外缘（参考图「横版」即如此——
-        // 中缝是两道细线，不碰内外框）；单叶（Alone）才四边全封闭。
-        // 内层 `relative`：地脚 / 卷首题署都用绝对定位叠在行格之上。
+        // 版框：由配置驱动——single = 单线；double = 外粗内细（文武边栏）。
+        // 文武的内层细线只在 double 时画；single 只需最外一根。对开拼合时
+        // **内侧（贴中缝那一侧）不设框线**：左右两叶拼成一整张纸，外框只围
+        // 整页外缘；单叶（Alone）才四边全封闭。内层 `relative`：地脚 / 卷首
+        // 题署都用绝对定位叠在行格之上。
         let mut inner = div()
             .relative()
             .border_color(rgb(t.frame_ink()))
             .child(grid)
             .child(foot);
-        inner = match edge {
-            LeafEdge::Left => inner.border_t_1().border_b_1().border_l_1(),
-            LeafEdge::Right => inner.border_t_1().border_b_1().border_r_1(),
-            LeafEdge::Alone => inner.border_1(),
-        };
+        // 文武边栏的内层细线（single 不画，避免两根细线并行像伪双边）。
+        if geo.border_style == BorderStyle::Double {
+            inner = match edge {
+                LeafEdge::Left => inner.border_t_1().border_b_1().border_l_1(),
+                LeafEdge::Right => inner.border_t_1().border_b_1().border_r_1(),
+                LeafEdge::Alone => inner.border_1(),
+            };
+        }
         // 卷首题署（卷端）：章首页开卷列顶部叠一卷端题名——
         // 第一行（顶格）写书名·卷次，第二行（低几格）写署名；
         // 落在 layout_book 预留的空白带上，与正文互不遮挡。
@@ -2198,10 +2207,15 @@ impl Root {
             .border_color(rgb(t.frame_ink()))
             .p(px(3.0))
             .child(inner);
-        frame = match edge {
-            LeafEdge::Left => frame.border_t_3().border_b_3().border_l_3(),
-            LeafEdge::Right => frame.border_t_3().border_b_3().border_r_3(),
-            LeafEdge::Alone => frame.border_3(),
+        // 外层框线：single = 1px 单线；double = 3px 粗框（与内层细线夹 3px 间隙
+        // 形成外粗内细的文武边栏）。对开内侧仍留空，两半拼合不打架。
+        frame = match (edge, geo.border_style) {
+            (LeafEdge::Left, BorderStyle::Double) => frame.border_t_3().border_b_3().border_l_3(),
+            (LeafEdge::Right, BorderStyle::Double) => frame.border_t_3().border_b_3().border_r_3(),
+            (LeafEdge::Alone, BorderStyle::Double) => frame.border_3(),
+            (LeafEdge::Left, BorderStyle::Single) => frame.border_t_1().border_b_1().border_l_1(),
+            (LeafEdge::Right, BorderStyle::Single) => frame.border_t_1().border_b_1().border_r_1(),
+            (LeafEdge::Alone, BorderStyle::Single) => frame.border_1(),
         };
 
         // 纸面留白：对开时内侧（贴纸心那一侧）收掉，两半才能拼成一张纸。
@@ -2323,8 +2337,32 @@ impl Root {
         if top_skip > 0 {
             content = content.pt(px(cell_h * top_skip as f32));
         }
-        for p in items {
-            match p {
+        // 逐片渲染。连续西文（`1628` / `ISBN`）在这里**成组**：
+        // 每两字占一格，组高 = `run_cells * cell_h`，与分页的半格账同源。
+        // 「数字转汉字」开启时不分组——每个汉字独立一格，与分页一致。
+        let west_mode = !self.han_digits;
+        let mut idx = 0usize;
+        while idx < items.len() {
+            match &items[idx] {
+                Piece::Main(g) if west_mode && crate::west::is_west(g.ch) => {
+                    let mut j = idx;
+                    while j < items.len() {
+                        match &items[j] {
+                            Piece::Main(g2) if crate::west::is_west(g2.ch) => j += 1,
+                            _ => break,
+                        }
+                    }
+                    content = content.child(self.ancient_west_run(
+                        &items[idx..j],
+                        cell_w,
+                        cell_h,
+                        fs,
+                        back,
+                        interactive,
+                        cx,
+                    ));
+                    idx = j;
+                }
                 Piece::Main(g) => {
                     let mark = self.mark_kind(*g);
                     content = content.child(self.ancient_cell(
@@ -2337,7 +2375,8 @@ impl Root {
                         note_index,
                         interactive,
                         cx,
-                    ))
+                    ));
+                    idx += 1;
                 }
                 Piece::Gloss(txt, src, host) => {
                     content = content.child(self.ancient_gloss(
@@ -2351,14 +2390,135 @@ impl Root {
                         back,
                         interactive,
                         cx,
-                    ))
+                    ));
+                    idx += 1;
                 }
                 // 避头尾禁则让出的空白格：占一个整字格，不渲染任何字，
                 // 只把后续正文压到第二格（列顶避头）或留一列底空当（列底避尾）。
-                Piece::Gap => content = content.child(div().w_full().h(px(cell_h))),
+                Piece::Gap => {
+                    content = content.child(div().w_full().h(px(cell_h)));
+                    idx += 1;
+                }
             }
         }
         col.child(content)
+    }
+
+    /// 一段连续西文（`1628` / `ISBN` / `3.14`）的竖排渲染。
+    ///
+    /// **宽度账**：两个字符占一个汉字格（[`crate::west::run_cells`]），
+    /// 与分页的半格账同源；组高 = `格数 × cell_h`，整组在列中垂直居中。
+    ///
+    /// **旋转坐标**：传统刻本是整串顺时针转 90° 横躺（字头朝右）；
+    /// 旋转后的逐字槽位由 [`crate::west::rotated_slots`] 给出（中心 / 原点 /
+    /// 角度）。当前 GPUI 0.2.2 没有元素级旋转变换（`TransformationMatrix`
+    /// 只在内部 sprite 上、`paint_glyph` 固定单位矩阵），故渲染退化为
+    /// **同槽位并排直立**：每格两字并排、逐格向下，读序仍是自上而下，
+    /// 宽度与分页完全一致。将来 GPUI 支持变换时，把这里换成按
+    /// `rotated_slots` 的 `(cx, cy, angle)` 绘制即可，账目无需改动。
+    ///
+    /// 小数点（`.`）零宽：缩成一个小墨点贴在前一数字右下，不占独立格。
+    fn ancient_west_run(
+        &self,
+        items: &[Piece],
+        cell_w: f32,
+        cell_h: f32,
+        fs: f32,
+        back: bool,
+        interactive: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let t = self.theme;
+        let keys: Vec<(usize, usize, usize)> = items
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Main(g) => Some((g.chapter, g.para, g.offset)),
+                _ => None,
+            })
+            .collect();
+        let chars: Vec<char> = items
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Main(g) => Some(crate::west::vertical_glyph(g.ch)),
+                _ => None,
+            })
+            .collect();
+        let groups = crate::west::pack_cells(&chars);
+        let rows = groups.len().max(1);
+        let wfs = crate::west::west_font_size(cell_w, fs);
+        let ink = if back { t.ink_soft() } else { self.palette.ink(t) };
+
+        let mut block = div()
+            .w(px(cell_w))
+            .h(px(rows as f32 * cell_h))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center();
+        // 选区高亮：西文已无逐字框，整组垫一层朱底作提示。
+        if keys.iter().any(|k| self.in_selection(*k)) {
+            block = block.relative().child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .w(px(cell_w))
+                    .h(px(rows as f32 * cell_h))
+                    .bg(rgba(0xA63A2B2E)),
+            );
+        }
+        for group in &groups {
+            let mut row = div()
+                .w(px(cell_w))
+                .h(px(cell_h))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center();
+            for ch in group.chars() {
+                if crate::west::is_west_dot(ch) {
+                    // 小数点：小墨点贴在数字右下角，不占宽。
+                    row = row.child(
+                        div()
+                            .w(px(wfs * 0.42))
+                            .h(px(cell_h))
+                            .flex()
+                            .items_end()
+                            .justify_center()
+                            .pb(px(cell_h * 0.20))
+                            .child(
+                                div()
+                                    .w(px((wfs * 0.16).max(1.5)))
+                                    .h(px((wfs * 0.16).max(1.5)))
+                                    .rounded(px(wfs * 0.08))
+                                    .bg(rgb(ink)),
+                            ),
+                    );
+                } else {
+                    row = row.child(
+                        div()
+                            .text_size(px(wfs))
+                            .text_color(rgb(ink))
+                            .child(SharedString::from(ch.to_string())),
+                    );
+                }
+            }
+            block = block.child(row);
+        }
+        if interactive {
+            block = block.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                    // 西文组不可逐字选，按下只标记「碰过正文」，绝不翻页。
+                    this.touched_glyph = true;
+                    cx.stop_propagation();
+                    this.popup = None;
+                    this.clear_selection();
+                    cx.notify();
+                }),
+            );
+        }
+        block
     }
 
     /// 双行小字夹注：一条注文排成两个半宽小列（先右列后左列），
@@ -2455,6 +2615,7 @@ impl Root {
                             x: event.position.x.to_f64() as f32,
                             y: event.position.y.to_f64() as f32,
                             page: this.page,
+                            pinyin: None,
                         });
                         cx.notify();
                     }),
@@ -3063,21 +3224,61 @@ impl Root {
                 );
             }
         }
+        // 正文墨色：带注音的字略调暗（提示「此处有信息」），其余用常规墨色。
+        let base_ink = if back { t.ink_soft() } else { self.palette.ink(t) };
+        let ink = if rare_py.is_some() {
+            crate::theme::mix(
+                base_ink,
+                if back { t.paper_back() } else { t.paper() },
+                0.22,
+            )
+        } else {
+            base_ink
+        };
+
+        // ── 竖排注音（生僻字拼音）──────────────────────────────────
+        // 一字母一行、贴字格右上角；字号 30%，长拼音自动降号（下限 18%）。
+        // 横向排会撑破一格宽、压到左边下一列——这正是必须修的病根。
         if let Some(py) = rare_py {
-            cell = cell.child(
-                div()
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(0.0))
-                    .w(px(cell_w))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px((fs * 0.28).max(6.0)))
-                    .text_color(rgb(self.palette.note(t)))
-                    .child(SharedString::from(py)),
-            );
+            let rl = crate::ruby::layout(py, fs, cell_w, cell_h);
+            let mut ruby = div()
+                .absolute()
+                .top(px(rl.top))
+                .right(px(0.0))
+                .w(px(rl.block_w))
+                .flex()
+                .flex_col()
+                .items_center();
+            for ch in py.chars() {
+                ruby = ruby.child(
+                    div()
+                        .w_full()
+                        .h(px(rl.line_h))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(rl.fs))
+                        .text_color(rgb(self.palette.note(t)))
+                        .child(SharedString::from(ch.to_string())),
+                );
+            }
+            cell = cell.child(ruby);
+            // 极细「虚」线：三点短横（GPUI 0.2.2 无 dashed 边框），
+            // 贴字格下缘右侧，只作提示、不抢正文。
+            let dots = 3usize;
+            let dw = (cell_w * 0.34) / (dots as f32 * 1.9);
+            let mut hint = div()
+                .absolute()
+                .bottom(px(cell_h * 0.055))
+                .right(px(cell_w * 0.10))
+                .flex()
+                .flex_row()
+                .gap(px(dw * 0.9));
+            for _ in 0..dots {
+                hint = hint
+                    .child(div().w(px(dw)).h(px(1.0)).bg(rgb(self.palette.note(t))));
+            }
+            cell = cell.child(hint);
         }
         if let Some((txt, color)) = self.annotation_of(g) {
             cell = cell.child(
@@ -3087,7 +3288,17 @@ impl Root {
                     .child(SharedString::from(txt)),
             );
         }
-        if is_punct(g.ch) {
+        if let Some(vp) = crate::west::vertical_paren(g.ch) {
+            // 括号换竖排专用字形 ︵ / ︶：本身已横躺，在列中上下相接，
+            // 贴合汉字基线（不再用右下角小字的句读摆法）。
+            let pf = (fs * 0.88).max(8.0).min(cell_h);
+            cell = cell.child(
+                div()
+                    .text_size(px(pf))
+                    .text_color(rgb(ink))
+                    .child(SharedString::from(vp.to_string())),
+            );
+        } else if is_punct(g.ch) {
             // 句读（标点）单独绘制：用「相对坐标」置在字格右下角，距右下
             // 各 `fontSize*0.3`；字号随字号缩放但被字格收敛，行高压小时
             // 也不会溢出到下一个字格（避头尾 / 拥挤问题的根因）。
@@ -3107,16 +3318,27 @@ impl Root {
                     .text_color(rgb(t.accent()))
                     .child(SharedString::from(self.shown(g.ch).to_string())),
             );
+        } else if crate::west::is_west_hyphen(g.ch) {
+            // 单独出现的连字符：竖排里旋转成一道竖线（丨）。
+            cell = cell.child(
+                div()
+                    .text_size(px((fs * 0.92).min(cell_h)))
+                    .text_color(rgb(ink))
+                    .child(SharedString::from("丨")),
+            );
         } else {
+            // 数字转汉字（可选）：`1628` → `一六二八`，保持古籍的纯粹感。
+            let shown = self.shown(g.ch).to_string();
+            let shown = if self.han_digits {
+                crate::west::digits_to_han(&shown, false)
+            } else {
+                shown
+            };
             cell = cell.child(
                 div()
                     .text_size(px(fs))
-                    .text_color(rgb(if back {
-                        t.ink_soft()
-                    } else {
-                        self.palette.ink(t)
-                    }))
-                    .child(SharedString::from(self.shown(g.ch).to_string())),
+                    .text_color(rgb(ink))
+                    .child(SharedString::from(shown)),
             );
         }
         // 脚注模式下补圈号角标。
@@ -3188,6 +3410,23 @@ impl Root {
                             if this.sel_anchor.is_some() {
                                 this.dragging = false;
                                 this.sel_focus = Some(key);
+                                // 单击（未拖选）带注音的字：直接呼出「注音浮签」，
+                                // 大字显示拼音与本字；拖选仍走原来的选区工具条。
+                                if this.sel_anchor == this.sel_focus {
+                                    if let Some(py) = rare_py {
+                                        this.popup = None;
+                                        this.note_zoom = Some(crate::gloss::NoteZoom {
+                                            text: g.ch.to_string(),
+                                            pinyin: Some(py.to_string()),
+                                            x: event.position.x.to_f64() as f32,
+                                            y: event.position.y.to_f64() as f32,
+                                            page: this.page,
+                                        });
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                        return;
+                                    }
+                                }
                                 this.popup = Some(GlyphHit {
                                     key,
                                     ch: g.ch,
@@ -4068,10 +4307,16 @@ impl Root {
         let text_w = card_w - pad * 2.0;
         let per_line = ((text_w / body_fs).floor() as usize).max(8);
         let lines = wrap_lines(&zoom.text, per_line);
+        // 注音浮签（`pinyin` 有值）：卡片内容换成「大字拼音 + 本字」，
+        // 高度按固定行算（39 拼音 + 36 本字 + 24 释义行）。
+        let is_ruby = zoom.pinyin.is_some();
         let head_h = 20.0;
         let foot_h = 16.0;
-        let card_h =
-            pad * 2.0 + head_h + 8.0 + lines.len() as f32 * line_h + 6.0 + foot_h;
+        let card_h = if is_ruby {
+            pad * 2.0 + head_h + 8.0 + 39.0 + 36.0 + 24.0 + foot_h
+        } else {
+            pad * 2.0 + head_h + 8.0 + lines.len() as f32 * line_h + 6.0 + foot_h
+        };
 
         // 锚点右侧下方优先，贴边时向左 / 向上翻，始终夹在视口内。
         let mut left = zoom.x + 14.0;
@@ -4163,7 +4408,11 @@ impl Root {
                         div()
                             .text_size(px(12.0))
                             .text_color(rgb(0xFFFFFFC0))
-                            .child(SharedString::from("夹注重录")),
+                            .child(SharedString::from(if is_ruby {
+                                "注音浮签"
+                            } else {
+                                "夹注重录"
+                            })),
                     ),
             )
             .child(
@@ -4172,21 +4421,55 @@ impl Root {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(edit)
+                    // 注音浮签没有「重录」——拼音来自生僻字表，不可改写。
+                    .when(!is_ruby, |d| d.child(edit))
                     .child(close),
             );
 
         let mut body = div().flex().flex_col().gap(px(2.0));
-        for line in &lines {
-            body = body.child(
-                div()
-                    .h(px(line_h))
-                    .flex()
-                    .items_center()
-                    .text_size(px(body_fs))
-                    .text_color(rgb(0xFFFFFFFF))
-                    .child(SharedString::from(line.clone())),
-            );
+        if is_ruby {
+            // 注音浮签：拼音 26px 大字 + 本字 22px + 释义行（横排，卡片里读横最清楚）。
+            let py = zoom.pinyin.clone().unwrap_or_default();
+            body = body
+                .child(
+                    div()
+                        .h(px(39.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(26.0))
+                        .text_color(rgb(0xFFFFFFFF))
+                        .child(SharedString::from(py)),
+                )
+                .child(
+                    div()
+                        .h(px(36.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(22.0))
+                        .text_color(rgb(0xFFFFFFB0))
+                        .child(SharedString::from(zoom.text.clone())),
+                )
+                .child(
+                    div()
+                        .h(px(24.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xFFFFFF90))
+                        .child(SharedString::from("生僻字 · 竖排注音")),
+                );
+        } else {
+            for line in &lines {
+                body = body.child(
+                    div()
+                        .h(px(line_h))
+                        .flex()
+                        .items_center()
+                        .text_size(px(body_fs))
+                        .text_color(rgb(0xFFFFFFFF))
+                        .child(SharedString::from(line.clone())),
+                );
+            }
         }
 
         let foot = div()
@@ -4198,10 +4481,11 @@ impl Root {
                 div()
                     .text_size(px(11.0))
                     .text_color(rgb(0xFFFFFF90))
-                    .child(SharedString::from(format!(
-                        "第 {} 葉 · 原注双行小字，此处已放大",
-                        zoom.page + 1
-                    ))),
+                    .child(SharedString::from(if is_ruby {
+                        format!("第 {} 葉 · 生字注音", zoom.page + 1)
+                    } else {
+                        format!("第 {} 葉 · 原注双行小字，此处已放大", zoom.page + 1)
+                    })),
             )
             .child(
                 div()
@@ -4510,7 +4794,8 @@ impl Root {
         // ② 续排：列数减一（长图更竖）；信笺保持 14 列（中缝列照旧）。
         //    夹注经 gloss 闭包行内化——晒本一律带注，与 notes_inline 无关，
         //    但尊重「显示注释」总开关（note_chars_with_source 内部已判）。
-        let cols2 = if self.letter_mode {
+        let cfg = self.current_layout();
+        let cols2 = if cfg.is_letter() {
             self.grid.columns
         } else {
             self.grid.columns.saturating_sub(1).max(3)
@@ -4539,7 +4824,7 @@ impl Root {
         let ratio = crate::grid::GRID_ROW_RATIO; // 1.1
         let fs_ratio = crate::grid::GRID_FS_RATIO; // 0.75
         // 信笺多一列中缝；非信笺章首页的章题列已含在 cols2 里（limit+1）。
-        let cols_total = if self.letter_mode { cols2 + 1 } else { cols2 } as f32;
+        let cols_total = if cfg.is_letter() { cols2 + 1 } else { cols2 } as f32;
         let by_w = (box_w - 46.0) / cols_total;
         let by_h = (box_h - 56.0) / (rows2 as f32 * ratio + 0.36 * fs_ratio);
         let mut cell_w = by_w.min(by_h).max(8.0);
@@ -4570,7 +4855,8 @@ impl Root {
             cell_h,
             rows: rows2,
             fs,
-            letter: self.letter_mode,
+            border_style: cfg.border_style,
+            show_fish_tail: cfg.show_fish_tail,
             notes_inline: true,
             interactive: false,
         };
@@ -5339,7 +5625,6 @@ impl Root {
     /// 单页 / 双面对开由屏幕方向自动决定（横屏对开、竖屏单页），不在此调整。
     fn render_grid_panel(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
-        let cols = self.grid.columns;
         let margin = self.grid.margin;
 
         let mut panel = div()
@@ -5374,21 +5659,22 @@ impl Root {
                     )),
             );
 
-        // 列数行：8 / 10 / 12 / 14（引擎按列数动态算列宽 / 字号 / 行数）。
-        let mut col_row = div().flex().flex_row().items_center().gap_2().flex_wrap();
-        for n in GRID_COLUMN_CHOICES {
-            let s = format!("{n} 列");
-            // 信笺模板锁 14 列，此时普通列数档不点亮。
-            let on = cols == n && !self.letter_mode;
-            col_row = col_row.child(small_button(s.as_str(), on, t).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    // 点普通列数档即退出信笺模板（回到 8/10/12/14 自适应）。
-                    this.set_letter_mode(false);
-                    this.set_columns(n);
-                    cx.notify();
-                }),
-            ));
+        // 版式档位：直接遍历配置注册表自动生成按钮——新增档位（如 16 列）
+        // 只需在 `LAYOUT_CONFIGS` 加一行，此处零改动。按钮文案读 `cfg.label`，
+        // 点亮态比对 `self.layout_key`，点击统一走 `set_layout`（保持阅读进度重排）。
+        let mut layout_row = div().flex().flex_row().items_center().gap_2().flex_wrap();
+        for cfg in crate::grid::LAYOUT_CONFIGS {
+            let key = cfg.key;
+            let on = self.layout_key == key;
+            layout_row = layout_row.child(
+                small_button(cfg.label, on, t).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_layout(key);
+                        cx.notify();
+                    }),
+                ),
+            );
         }
         panel = panel.child(
             div()
@@ -5399,35 +5685,9 @@ impl Root {
                     div()
                         .text_size(px(11.0))
                         .text_color(rgb(t.ink_soft()))
-                        .child(SharedString::from("列数")),
+                        .child(SharedString::from("版式")),
                 )
-                .child(col_row),
-        );
-
-        // 模板行：信笺（14 列）——单张平铺稿纸，14 个正文列 + 一列宽中缝，
-        // 中缝立「对鱼尾」，四周文武边栏、界栏通内框。点一下即重排当前页。
-        panel = panel.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(t.ink_soft()))
-                        .child(SharedString::from("模板")),
-                )
-                .child(
-                    div().flex().flex_row().items_center().gap_2().child(
-                        small_button("信笺（14列）", self.letter_mode, t).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.set_letter_mode(true);
-                                cx.notify();
-                            }),
-                        ),
-                    ),
-                ),
+                .child(layout_row),
         );
 
         // 留白行：窄 / 中 / 宽（四周同比例留白）。
@@ -5466,9 +5726,7 @@ impl Root {
                     self.col_w,
                     self.size_ancient,
                     self.grid_rows,
-                    if self.letter_mode {
-                        "信笺（14列）"
-                    } else if self.duplex == Duplex::Facing {
+                    if self.duplex == Duplex::Facing {
                         "对开（横屏）"
                     } else {
                         "单页（竖屏）"
@@ -5656,6 +5914,7 @@ impl Root {
                         ("通假", self.show_tongjia, StyleAct::Tong),
                         ("标点", self.show_punct, StyleAct::Punct),
                         ("生僻字", self.show_rare, StyleAct::Rare),
+                        ("数字汉字", self.han_digits, StyleAct::Han),
                         ("注释", self.show_notes, StyleAct::Notes),
                     ],
                     cx,
@@ -5930,6 +6189,12 @@ impl Root {
                             StyleAct::Notes => this.show_notes = !this.show_notes,
                             StyleAct::Punct => this.show_punct = !this.show_punct,
                             StyleAct::Rare => this.show_rare = !this.show_rare,
+                            // 数字转汉字：改它要重排（格数账变了），
+                            // 走 `set_layout` 同级路径保持阅读进度。
+                            StyleAct::Han => {
+                                this.han_digits = !this.han_digits;
+                                this.fit_sizes();
+                            }
                         }
                         cx.notify();
                     }),
@@ -6100,6 +6365,8 @@ enum StyleAct {
     Notes,
     Punct,
     Rare,
+    /// 数字转汉字（`1628` → `一六二八`）。
+    Han,
 }
 
 /// 样式面板的一行：左侧标签，右侧一组控件。

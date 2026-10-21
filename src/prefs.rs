@@ -34,6 +34,8 @@ pub struct Prefs {
     pub margin: f32,
     /// true = 信笺（14列）模板：单张平铺稿纸，中缝占两格、立对鱼尾。
     pub letter: bool,
+    /// 当前版式配置键（见 `crate::grid::LAYOUT_CONFIGS`）：数据驱动切换的句柄。
+    pub layout_key: String,
     /// true = 双行夹注；false = 页脚注。
     pub notes_inline: bool,
     /// true = 繁体。
@@ -44,6 +46,8 @@ pub struct Prefs {
     pub punct: bool,
     /// 生僻字注音。
     pub rare: bool,
+    /// 数字转汉字：阿拉伯数字在竖排里显示为汉字（一六二八）。
+    pub han_digits: bool,
     /// 注释显示。
     pub notes: bool,
     /// 翻页音效。
@@ -61,11 +65,13 @@ impl Default for Prefs {
             columns: 10,
             margin: 0.06,
             letter: false,
+            layout_key: "standard10".to_string(),
             notes_inline: true,
             trad: true,
             tongjia: true,
             punct: true,
             rare: true,
+            han_digits: false,
             notes: true,
             sound: true,
         }
