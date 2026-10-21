@@ -525,6 +525,7 @@ impl Root {
             root.share_layout = match v.as_str() {
                 "single" => CardLayout::Single,
                 "note" => CardLayout::Note,
+                "scroll" | "sunben" => CardLayout::Scroll,
                 _ => CardLayout::Columns,
             };
         }
@@ -1531,7 +1532,7 @@ impl Root {
 
     /// 卷首题署所需字符数上限：对每章取「书名 + 卷次 + 1 行间隔 + 署名」的字符数，
     /// 取全书最大值。这个值只决定章首页开卷列顶部预留多少行，渲染层按预留带裁切。
-    fn chapter_inscription_need(&self) -> usize {
+    pub fn chapter_inscription_need(&self) -> usize {
         let Some(b) = &self.book else {
             return 0;
         };

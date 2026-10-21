@@ -287,6 +287,10 @@ pub enum CardLayout {
     /// 笺：竖丝栏分成 8/10/12/14 列，列数按分享内容长短自适应
     /// （八行笺 / 十行笺……十三行式笺纸）
     Note,
+    /// 晒本：当前叶（含夹注）按真实版式重排成一张竖长纸——
+    /// 版框双边、乌丝栏、双行小字夹注、章题列 / 书耳 / 地脚叶码一应俱全，
+    /// 保存即导出 PNG（`render_ancient` + 几何覆盖，非简化文本卡）。
+    Scroll,
 }
 
 impl CardLayout {
@@ -295,6 +299,7 @@ impl CardLayout {
             CardLayout::Columns => "竖排",
             CardLayout::Single => "单页",
             CardLayout::Note => "八行笺",
+            CardLayout::Scroll => "晒本",
         }
     }
 }

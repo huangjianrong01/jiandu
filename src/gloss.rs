@@ -1666,4 +1666,114 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn sunben_slice_relayout_keeps_every_glyph() {
+        // 晒本长图的内容链路：从字形流里切出「当前叶」那一段，以
+        // 「减一列 × 多行」续排（layout_book_from，行数递增直到一面
+        // 收完）——必须一字不丢、首尾不漂。这正是 reader::sunben_sheet
+        // 的排版核心（此处按同一算法锚定，渲染侧只换几何）。
+        let mut b = Book::new("曬本書", "佚名");
+        for ci in 0..2 {
+            b.chapters.push(Chapter {
+                title: format!("第{ci}章"),
+                paragraphs: vec![Paragraph::plain("道可道非常道明明亦其名可名非常名".repeat(4))],
+            });
+        }
+        let flow = flow_of(&b);
+        // 原书 8 列 × 4 行（小面，好多页——才有「中叶」可切）。
+        let pages = layout_book(&flow, |_| None, 8, 4, 0);
+        assert!(pages.len() >= 3, "样书面数太少，测不到中叶");
+        // 与 reader::same_glyph 同判据：位置 + 字 + 种类（段首缩进两两全同）。
+        let same = |a: &Glyph, b: &Glyph| {
+            a.chapter == b.chapter
+                && a.para == b.para
+                && a.offset == b.offset
+                && a.ch == b.ch
+                && a.kind == b.kind
+        };
+        for pi in 0..pages.len() {
+            let cur = &pages[pi];
+            // 段首缩进占位每段两个、字段全同，切它定位会歧义——跳过
+            // （真实阅读里页面以缩进开头也极少；晒本对这类叶走占位卡）。
+            if matches!(cur.glyphs.first().map(|g| g.kind), Some(GlyphKind::Indent)) {
+                continue;
+            }
+            // ① 切片：首字定位 + 整段逐字校验。
+            let i0 = flow.iter().position(|g| same(g, &cur.glyphs[0])).unwrap();
+            let n = cur.glyphs.len();
+            assert!(
+                cur.glyphs.iter().enumerate().all(|(k, g)| same(&flow[i0 + k], g)),
+                "第 {pi} 面在流里不连续"
+            );
+            let slice = &flow[i0..i0 + n];
+            // ② 减一列续排：行数从 4 递增到刚好一面收完。
+            let mut rows2 = 4usize;
+            let laid = loop {
+                let ps = layout_book_from(slice, |_| None, 7, rows2, 0, cur.start_chapter);
+                if ps.len() <= 1 || rows2 >= 60 {
+                    break ps.into_iter().next().unwrap();
+                }
+                rows2 += 1;
+            };
+            // ③ 一字不丢、首尾不漂、章首属性不变、列数不超（竖长的来源）。
+            assert_eq!(laid.glyphs.len(), n, "第 {pi} 面晒本重排丢字");
+            assert!(same(&laid.glyphs[0], &cur.glyphs[0]), "第 {pi} 面首字漂移");
+            assert!(
+                same(laid.glyphs.last().unwrap(), cur.glyphs.last().unwrap()),
+                "第 {pi} 面末字漂移"
+            );
+            assert_eq!(laid.start_chapter, cur.start_chapter);
+            assert!(
+                laid.columns.len() <= 7,
+                "第 {pi} 面列数 {} 超过 7",
+                laid.columns.len()
+            );
+        }
+    }
+
+    #[test]
+    fn sunben_slice_relayout_keeps_notes() {
+        // 晒本「带注」：切片续排后，闭区分出来的夹注必须一片不少
+        // （含跨列流转的注尾拼接），注源也不能丢。
+        let mut b = Book::new("曬本注", "佚名");
+        b.chapters.push(Chapter {
+            title: "一".into(),
+            paragraphs: vec![Paragraph::plain("一二三四五六七八九十十一十二".repeat(2))],
+        });
+        let gloss_fn = |g: &Glyph| {
+            (g.kind == GlyphKind::Char && g.offset == 1)
+                .then(|| ("註文一節稍長些跨列流轉".to_string(), NoteSource::User, *g))
+        };
+        let flow = flow_of(&b);
+        let pages = layout_book(&flow, gloss_fn, 8, 4, 0);
+        // 取第 0 面（章首页）的正文作切片——晒本即「半叶减列重排」。
+        let cur = &pages[0];
+        let slice = &flow[0..cur.glyphs.len()];
+        // 减一列、行高 4 续排：11 字注文超过一列 8 半格，必跨列流转。
+        let laid = layout_book_from(slice, gloss_fn, 7, 4, 0, cur.start_chapter);
+        // 注文总量守恒：切片内每个宿主字的注文都完整落进长图，
+        // 跨列拼接的注尾一份不丢、也不许多（重复排注）。
+        let want: String = slice
+            .iter()
+            .filter(|g| g.kind == GlyphKind::Char && g.offset == 1)
+            .flat_map(|_| "註文一節稍長些跨列流轉".chars())
+            .collect();
+        let joined: String = laid
+            .iter()
+            .flat_map(|p| p.columns.iter().flatten())
+            .filter_map(|p| match p {
+                Piece::Gloss(s, ..) => Some(s.chars()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(joined, want, "晒本重排注文不守恒");
+        assert!(!want.is_empty(), "切片里应至少有一条注文");
+        // 用户注在长图里仍是用户注（深朱砂红的来源不能丢）。
+        assert!(laid
+            .iter()
+            .flat_map(|p| p.columns.iter().flatten())
+            .any(|p| matches!(p, Piece::Gloss(_, NoteSource::User, _))));
+    }
 }

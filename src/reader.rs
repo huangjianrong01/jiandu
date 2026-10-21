@@ -52,6 +52,42 @@ const USER_NOTE_BG_FADE: f32 = 0.88;
 /// 「高度」滑杆已按用户要求连同代码删除，取原五档的中高档一档定值。
 pub(crate) const SHARE_CARD_H_FRAC: f32 = 0.84;
 
+/// 一叶的渲染几何与模式：默认取自当前阅读视图（`LeafGeo::current`）；
+/// **晒本长图**按卡片可用面积另算一套传进来（`render_ancient` 的
+/// 全部几何读这一份，不再各自读 `self`——两处渲染才能同帧共存）。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LeafGeo {
+    /// 字格宽（列宽）。
+    pub cell_w: f32,
+    /// 字格高（行高）= cell_w × `GRID_ROW_RATIO`。
+    pub cell_h: f32,
+    /// 每列行数。
+    pub rows: usize,
+    /// 正文字号 = cell_w × `GRID_FS_RATIO`（收敛在[min,max]）。
+    pub fs: f32,
+    /// 信笺模板：叶内第 7/8 列之间插一列宽中缝（对鱼尾）。
+    pub letter: bool,
+    /// 夹注行内显示（双行小字夹注）；false = 页脚注横排列表。
+    pub notes_inline: bool,
+    /// 字格 / 注块是否挂鼠标交互（晒本预览关掉：纯展示，不弹工具条）。
+    pub interactive: bool,
+}
+
+impl LeafGeo {
+    /// 当前阅读视图的几何（与 `fit_sizes` / `fit_letter` 算出的同源）。
+    pub(crate) fn current(r: &Root) -> Self {
+        Self {
+            cell_w: r.col_w,
+            cell_h: r.row_h,
+            rows: r.grid_rows,
+            fs: r.size_ancient,
+            letter: r.letter_mode,
+            notes_inline: r.notes_inline,
+            interactive: true,
+        }
+    }
+}
+
 /// 长按阈值：按住正文超过这么久再抬起，算「长按」——弹气泡菜单
 /// （复制 / 检索 / 字典），而不是普通的点字 / 拖选。
 const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(450);
@@ -141,6 +177,17 @@ fn clip_chars(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+/// 两个字在字形流里是否同一位置：章节 / 段 / 偏移 / 字 / 种类全同。
+/// 段首缩进占位每段两个、字段全同，所以必须连 `kind` 一起比对——
+/// 晒本长图靠它在流里定当前叶的切片起点（见 `Root::sunben_sheet`）。
+fn same_glyph(a: &Glyph, b: &Glyph) -> bool {
+    a.chapter == b.chapter
+        && a.para == b.para
+        && a.offset == b.offset
+        && a.ch == b.ch
+        && a.kind == b.kind
 }
 
 /// 把草稿按每行字符数折行（GPUI 文本不自动换行，显示侧手动折）。
@@ -1835,7 +1882,17 @@ impl Root {
             .filter_map(|&c| self.chapter_stat(c))
             .collect();
         // 现只保留古籍竖笺（现代横笺已移除）：一律走竖排渲染。
-        let inner = self.render_ancient(&glyphs, &columns, back, start, idx, edge, &stats, cx);
+        let inner = self.render_ancient(
+            &glyphs,
+            &columns,
+            back,
+            start,
+            idx,
+            edge,
+            &stats,
+            LeafGeo::current(self),
+            cx,
+        );
         // 最小字号保护：窄屏 + 高列数（12/14）触发最小字号后，纸面可能超出
         // 视口高度——这里把该面包进一个限高（=内容区高）的滚动容器，允许
         // 单页内上下滑动查看，而不是把字压到更小或裁掉。
@@ -1992,16 +2049,18 @@ impl Root {
         idx: usize,
         edge: LeafEdge,
         stats: &[ChapStat],
+        // 渲染几何（当前视图 / 晒本长图各算一套；全部几何读这一份）。
+        geo: LeafGeo,
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme;
-        let fs = self.size_ancient; // == 网格引擎字号（self.grid_settings 驱动）
+        let fs = geo.fs; // == 网格引擎字号（self.grid_settings 驱动）
         // 字格宽 / 高来自网格引擎：竖排列宽 = col_w，单字竖高 = row_h。
-        let cell_w = self.col_w;
-        let cell_h = self.row_h;
+        let cell_w = geo.cell_w;
+        let cell_h = geo.cell_h;
         let paper = if back { t.paper_back() } else { t.paper() };
         let chapter = glyphs.first().map(|g| g.chapter).unwrap_or(0);
-        let note_index = if !self.notes_inline && self.show_notes {
+        let note_index = if !geo.notes_inline && self.show_notes {
             self.book.as_ref().map(build_note_index).unwrap_or_default()
         } else {
             HashMap::new()
@@ -2015,7 +2074,10 @@ impl Root {
         } else {
             total_cols
         };
-        let rows = self.grid_rows;
+        let rows = geo.rows;
+        // 卷首题署预留行数：与 layout_book 收到的 reserve_rows 同源
+        // （按本帧实际行数算——晒本长图行数与阅读视图不同）。
+        let reserve = crate::gloss::inscription_reserve(self.chapter_inscription_need(), rows);
         // 列已由 gloss::layout_book 切好（含双行夹注的跨列流转），直接排。
 
         // 地脚高度：先算出来，交给每一列一起加高——界行（乌丝栏）才能
@@ -2030,7 +2092,7 @@ impl Root {
             }
             // 信笺模板在列间插了一道「一列宽」的中缝：地脚叶码 / 书耳
             // 的定位要把这一列也算进纸面宽度，才不至于偏到一边。
-            + if self.letter_mode { cell_w } else { 0.0 };
+            + if geo.letter { cell_w } else { 0.0 };
 
         // 界行（乌丝栏）：从右往左先排正文——`i = text_cols-1` 落在最左，
         // `i = 0` 落在最右，正是竖排的读序。每列左缘一道通高细线，
@@ -2040,13 +2102,12 @@ impl Root {
             let items: &[Piece] = columns.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
             // 章首页的开卷列（i==0，紧邻版心）：顶部预留一段空白带给卷首题署，
             // 正文从带下接着排（带高 = chapter_inscription_reserve_rows）。
-            let top_skip =
-                if start_chapter && i == 0 { self.chapter_inscription_reserve_rows() } else { 0 };
+            let top_skip = if start_chapter && i == 0 { reserve } else { 0 };
             // 信笺模板：在第 7、8 个正文列之间插一道一列宽的中缝。
             // 章首页最右多一个章题列（也算一列），分割点随之前移一列，
             // 左右两边仍各是 7 列。
             let split_i = if start_chapter { 5 } else { 6 };
-            if self.letter_mode && i == split_i {
+            if geo.letter && i == split_i {
                 grid = grid.child(self.render_letter_gutter(cell_w, cell_h, rows, foot_h));
             }
             grid = grid.child(self.ancient_column(
@@ -2060,6 +2121,7 @@ impl Root {
                 back,
                 top_skip,
                 &note_index,
+                geo.interactive,
                 cx,
             ));
         }
@@ -2115,7 +2177,7 @@ impl Root {
         // 卷首题署（卷端）：章首页开卷列顶部叠一卷端题名——
         // 第一行（顶格）写书名·卷次，第二行（低几格）写署名；
         // 落在 layout_book 预留的空白带上，与正文互不遮挡。
-        if start_chapter && self.chapter_inscription_reserve_rows() > 0 {
+        if start_chapter && reserve > 0 {
             inner = inner.child(self.render_inscription(chapter, cell_w, cell_h, fs, cx));
         }
         // 章末统计表：排在正文末列之后的第一片空列里、贴着天头，
@@ -2185,7 +2247,7 @@ impl Root {
         }
 
         // 注文不进正文时，退回页脚注。
-        if !self.notes_inline {
+        if !geo.notes_inline {
             let notes = self.page_footnotes(glyphs, &note_index);
             if !notes.is_empty() {
                 let mut area = div()
@@ -2241,6 +2303,8 @@ impl Root {
         // 顶部预留给卷首题署的空白行数（0 = 不预留，普通列）。
         top_skip: usize,
         note_index: &NoteIndex,
+        // 字格 / 注块是否挂鼠标交互（晒本预览传 false：纯展示）。
+        interactive: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme;
@@ -2263,12 +2327,31 @@ impl Root {
             match p {
                 Piece::Main(g) => {
                     let mark = self.mark_kind(*g);
-                    content = content.child(self.ancient_cell(*g, cell_w, cell_h, fs, back, mark, note_index, cx))
+                    content = content.child(self.ancient_cell(
+                        *g,
+                        cell_w,
+                        cell_h,
+                        fs,
+                        back,
+                        mark,
+                        note_index,
+                        interactive,
+                        cx,
+                    ))
                 }
                 Piece::Gloss(txt, src, host) => {
-                    content = content.child(
-                        self.ancient_gloss(txt, *src, *host, cell_w, cell_h, fs, columns, back, cx),
-                    )
+                    content = content.child(self.ancient_gloss(
+                        txt,
+                        *src,
+                        *host,
+                        cell_w,
+                        cell_h,
+                        fs,
+                        columns,
+                        back,
+                        interactive,
+                        cx,
+                    ))
                 }
                 // 避头尾禁则让出的空白格：占一个整字格，不渲染任何字，
                 // 只把后续正文压到第二格（列顶避头）或留一列底空当（列底避尾）。
@@ -2305,6 +2388,8 @@ impl Root {
         fs: f32,
         columns: usize,
         back: bool,
+        // 是否挂鼠标交互（晒本预览传 false：注块不可点）。
+        interactive: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme;
@@ -2353,46 +2438,48 @@ impl Root {
         // 两个监听器各持一份文本副本（闭包是 `move`，且都要独立存活）。
         let zoom_text = note_text.clone();
         let menu_text = note_text.clone();
-        block = block
-            // 可点注块：命中范围 = 整个夹注块矩形（Canvas 级 bbox 命中
-            // 的另一入口，元素级事件更准——滚动容器里也贴着视觉位置）。
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                    // 碰过正文：松手时不翻页；并收起字工具条 / 拖选。
-                    this.touched_glyph = true;
-                    this.popup = None;
-                    this.clear_selection();
-                    this.note_zoom = Some(crate::gloss::NoteZoom {
-                        text: zoom_text.clone(),
-                        x: event.position.x.to_f64() as f32,
-                        y: event.position.y.to_f64() as f32,
-                        page: this.page,
-                    });
-                    cx.notify();
-                }),
-            );
-        // 右键（桌面）/ 长按（移动）：**仅用户自加夹注**弹「修改 / 删除」菜单。
-        // 古籍原本的夹注不可改删——那是底本的一部分，动了就失真。
-        if is_user {
-            let host_key = (host.chapter, host.para, host.offset);
-            block = block.on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                    this.touched_glyph = true;
-                    this.popup = None;
-                    this.clear_selection();
-                    this.note_menu = Some(crate::gloss::NoteMenu {
-                        key: host_key,
-                        text: menu_text.clone(),
-                        x: event.position.x.to_f64() as f32,
-                        y: event.position.y.to_f64() as f32,
-                    });
-                    cx.notify();
-                }),
-            );
+        if interactive {
+            block = block
+                // 可点注块：命中范围 = 整个夹注块矩形（Canvas 级 bbox 命中
+                // 的另一入口，元素级事件更准——滚动容器里也贴着视觉位置）。
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                        // 碰过正文：松手时不翻页；并收起字工具条 / 拖选。
+                        this.touched_glyph = true;
+                        this.popup = None;
+                        this.clear_selection();
+                        this.note_zoom = Some(crate::gloss::NoteZoom {
+                            text: zoom_text.clone(),
+                            x: event.position.x.to_f64() as f32,
+                            y: event.position.y.to_f64() as f32,
+                            page: this.page,
+                        });
+                        cx.notify();
+                    }),
+                );
+            // 右键（桌面）/ 长按（移动）：**仅用户自加夹注**弹「修改 / 删除」菜单。
+            // 古籍原本的夹注不可改删——那是底本的一部分，动了就失真。
+            if is_user {
+                let host_key = (host.chapter, host.para, host.offset);
+                block = block.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                        this.touched_glyph = true;
+                        this.popup = None;
+                        this.clear_selection();
+                        this.note_menu = Some(crate::gloss::NoteMenu {
+                            key: host_key,
+                            text: menu_text.clone(),
+                            x: event.position.x.to_f64() as f32,
+                            y: event.position.y.to_f64() as f32,
+                        });
+                        cx.notify();
+                    }),
+                );
+            }
         }
         for r in 0..rows {
             // 右列读在前、左列续后，所以先排左列字、后排右列字。
@@ -2864,6 +2951,8 @@ impl Root {
         back: bool,
         mark: Option<MarkKind>,
         note_index: &NoteIndex,
+        // 是否挂鼠标交互（晒本预览传 false：字格不可点）。
+        interactive: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme;
@@ -3058,66 +3147,69 @@ impl Root {
         // 单击弹工具条作用于单字；拖选后工具条的「划线 / 复制」作用于整段选区。
         // 关键修复：任何字格（含标点 / 缩进 / 空格）按下都算「碰过正文」，
         // 杜绝「竖排划线 / 点字时误翻下一页」。
-        cell = cell.on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                // 任意字格按下都先标记「碰过正文」，拦下翻页。
-                this.touched_glyph = true;
-                cx.stop_propagation();
-                if g.kind == GlyphKind::Char && !is_punct(g.ch) {
-                    // 正文可点击字：起锚、进入拖选、收起旧工具条。
-                    this.sel_anchor = Some(key);
-                    this.sel_focus = Some(key);
-                    this.dragging = true;
-                    this.sel_char = Some(g.ch);
-                    this.popup = None;
-                } else {
-                    // 标点 / 缩进 / 空格：碰过正文，绝不翻页；并收起既有工具条 / 选区。
-                    this.popup = None;
-                    this.clear_selection();
-                }
-                cx.notify();
-            }),
-        );
+        // 晒本预览（interactive=false）不挂任何监听：纯展示，点它不影响阅读状态。
+        if interactive {
+            cell = cell.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                    // 任意字格按下都先标记「碰过正文」，拦下翻页。
+                    this.touched_glyph = true;
+                    cx.stop_propagation();
+                    if g.kind == GlyphKind::Char && !is_punct(g.ch) {
+                        // 正文可点击字：起锚、进入拖选、收起旧工具条。
+                        this.sel_anchor = Some(key);
+                        this.sel_focus = Some(key);
+                        this.dragging = true;
+                        this.sel_char = Some(g.ch);
+                        this.popup = None;
+                    } else {
+                        // 标点 / 缩进 / 空格：碰过正文，绝不翻页；并收起既有工具条 / 选区。
+                        this.popup = None;
+                        this.clear_selection();
+                    }
+                    cx.notify();
+                }),
+            );
 
-        if g.kind == GlyphKind::Char && !is_punct(g.ch) {
-            cell = cell
-                .on_mouse_move(cx.listener(
-                    move |this, _event: &MouseMoveEvent, _window, cx| {
-                        if this.dragging && this.sel_focus != Some(key) {
-                            this.sel_focus = Some(key);
-                            this.sel_char = Some(g.ch);
-                            cx.notify();
-                        }
-                    },
-                ))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
-                        if this.sel_anchor.is_some() {
-                            this.dragging = false;
-                            this.sel_focus = Some(key);
-                            this.popup = Some(GlyphHit {
-                                key,
-                                ch: g.ch,
-                                x: event.position.x.to_f64() as f32,
-                                y: event.position.y.to_f64() as f32,
-                            });
-                            cx.stop_propagation();
-                            cx.notify();
-                        }
-                    }),
-                )
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
-                        // 拖到字格外松开：结束拖拽，保留已选选区。
-                        if this.dragging {
-                            this.dragging = false;
-                            cx.notify();
-                        }
-                    }),
-                );
+            if g.kind == GlyphKind::Char && !is_punct(g.ch) {
+                cell = cell
+                    .on_mouse_move(cx.listener(
+                        move |this, _event: &MouseMoveEvent, _window, cx| {
+                            if this.dragging && this.sel_focus != Some(key) {
+                                this.sel_focus = Some(key);
+                                this.sel_char = Some(g.ch);
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
+                            if this.sel_anchor.is_some() {
+                                this.dragging = false;
+                                this.sel_focus = Some(key);
+                                this.popup = Some(GlyphHit {
+                                    key,
+                                    ch: g.ch,
+                                    x: event.position.x.to_f64() as f32,
+                                    y: event.position.y.to_f64() as f32,
+                                });
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
+                            // 拖到字格外松开：结束拖拽，保留已选选区。
+                            if this.dragging {
+                                this.dragging = false;
+                                cx.notify();
+                            }
+                        }),
+                    );
+            }
         }
         cell
     }
@@ -4350,6 +4442,152 @@ impl Root {
     }
 
     /// 分享卡片：深底竖排正文 + 落款朱印（参照 02 图），可存为 PNG。
+    /// 晒本占位卡：无书 / 空页 / 切片校验失败时的一块素纸一句提示
+    /// （面积固定，控制条照常可用）。
+    fn sunben_placeholder(t: Theme) -> Div {
+        div()
+            .w(px(400.0))
+            .h(px(300.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(t.paper()))
+            .border_1()
+            .border_color(rgb(t.frame_ink()))
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from("打开一本书，再来晒本")),
+            )
+    }
+
+    /// 晒本长图：把**当前叶**的内容（含夹注）按真实版式重排成一张竖长纸。
+    ///
+    /// 与分享卡其它版式（纯文字卡）根本不同：这里走 `render_ancient`
+    /// 全量渲染——版框双边、乌丝栏、竖排正文、双行小字夹注（用户注深朱砂）、
+    /// 章首页的章题列与卷首题署、书耳、地脚叶码，一应俱全。
+    ///
+    /// 三步（内容与阅读视图严格同源，只改几何）：
+    ///   1. 从全书字形流里切出当前叶那一段（首字 → 末字，逐字校验）；
+    ///   2. `layout_book_from` 以「减一列 × 多行」续排这段——避头尾 /
+    ///      夹注跨列流转都由真引擎重算，行数从 4 试到刚好一面收完，
+    ///      长图因此比原叶更竖长；
+    ///   3. 按卡片可用面积解字格（同时受卡宽 / 卡高约束，地脚随字格变，
+    ///      一并代入），以 `LeafGeo` 覆盖几何渲染；预览不可交互、
+    ///      夹注强制行内（晒本一律带注）。
+    ///
+    /// 返回 `(纸面 Div, 纸宽, 纸高)`；无书 / 空页 / 切片校验失败返回 `None`。
+    fn sunben_sheet(
+        &self,
+        box_w: f32,
+        box_h: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<(Div, f32, f32)> {
+        let book = self.book.as_ref()?;
+        let pages = self.layout_pages();
+        let cur = pages.get(self.page)?;
+        let first = cur.glyphs.first()?;
+        let last = cur.glyphs.last()?;
+        let flow = book.to_flow(self.show_punct);
+        // ① 切片：当前叶首字在流里的位置（整段逐字校验——段首缩进占位
+        // 两两全同，必须连 kind 一起比对才能定准）。
+        let i0 = flow.iter().position(|g| same_glyph(g, first))?;
+        let n = cur.glyphs.len();
+        if i0 + n > flow.len() {
+            return None;
+        }
+        if !cur
+            .glyphs
+            .iter()
+            .enumerate()
+            .all(|(k, g)| same_glyph(&flow[i0 + k], g))
+        {
+            return None;
+        }
+        let slice = &flow[i0..i0 + n];
+
+        // ② 续排：列数减一（长图更竖）；信笺保持 14 列（中缝列照旧）。
+        //    夹注经 gloss 闭包行内化——晒本一律带注，与 notes_inline 无关，
+        //    但尊重「显示注释」总开关（note_chars_with_source 内部已判）。
+        let cols2 = if self.letter_mode {
+            self.grid.columns
+        } else {
+            self.grid.columns.saturating_sub(1).max(3)
+        };
+        let gloss = |g: &Glyph| -> Option<crate::gloss::GlossPayload> {
+            self.note_chars_with_source(*g)
+                .map(|(s, src)| (s.to_string(), src, *g))
+        };
+        let mut rows2 = 4usize;
+        let laid = loop {
+            let reserve = if cur.start_chapter {
+                crate::gloss::inscription_reserve(self.chapter_inscription_need(), rows2)
+            } else {
+                0
+            };
+            let ps = crate::gloss::layout_book_from(slice, &gloss, cols2, rows2, reserve, cur.start_chapter);
+            if ps.len() <= 1 || rows2 >= 60 {
+                break ps.into_iter().next();
+            }
+            rows2 += 1;
+        }?;
+
+        // ③ 几何：纸宽 = 纸边 46（16×2 留白 + 框 3×4 + 内框 1×2）+ 列总宽；
+        //    纸高 = 46 + 行数×行高 + 地脚。字格同时受卡宽 / 卡高约束取小，
+        //    地脚里随字号伸缩的那部分（0.36×字号比）一并代入高度约束。
+        let ratio = crate::grid::GRID_ROW_RATIO; // 1.1
+        let fs_ratio = crate::grid::GRID_FS_RATIO; // 0.75
+        // 信笺多一列中缝；非信笺章首页的章题列已含在 cols2 里（limit+1）。
+        let cols_total = if self.letter_mode { cols2 + 1 } else { cols2 } as f32;
+        let by_w = (box_w - 46.0) / cols_total;
+        let by_h = (box_h - 56.0) / (rows2 as f32 * ratio + 0.36 * fs_ratio);
+        let mut cell_w = by_w.min(by_h).max(8.0);
+        // 最小字号保护：字被压到下限时放大字格（与 compute_grid 同策）。
+        if cell_w * fs_ratio < crate::grid::GRID_FS_MIN {
+            cell_w = crate::grid::GRID_FS_MIN / fs_ratio;
+        }
+        let fs = (cell_w * fs_ratio).clamp(crate::grid::GRID_FS_MIN, crate::grid::GRID_FS_MAX);
+        let cell_h = cell_w * ratio;
+        let foot_h = (fs * 0.36).max(9.0) + 10.0;
+        let sheet_w = 46.0 + cols_total * cell_w;
+        let sheet_h = 46.0 + rows2 as f32 * cell_h + foot_h;
+
+        // ④ 渲染：单叶（四边全封闭，如单独一叶刻纸）；叶码用当前叶号；
+        //    章末统计表按「切片之后是否紧跟新章」判（与原页的
+        //    chapters_ended_here 同果——切片末尾即原叶末尾）。
+        let ends_chapter = match flow.get(i0 + n) {
+            Some(g) => g.chapter != last.chapter,
+            None => true,
+        };
+        let stats: Vec<ChapStat> = if ends_chapter {
+            self.chapter_stat(last.chapter).into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        let geo = LeafGeo {
+            cell_w,
+            cell_h,
+            rows: rows2,
+            fs,
+            letter: self.letter_mode,
+            notes_inline: true,
+            interactive: false,
+        };
+        let sheet = self.render_ancient(
+            &laid.glyphs,
+            &laid.columns,
+            false,
+            laid.start_chapter,
+            self.page,
+            LeafEdge::Alone,
+            &stats,
+            geo,
+            cx,
+        );
+        Some((sheet, sheet_w, sheet_h))
+    }
+
     fn render_share_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let vw = self.viewport_w;
@@ -4374,14 +4612,31 @@ impl Root {
             .map(|g| self.shown(g.ch))
             .collect();
 
+        // 晒本：卡片 = 当前叶（含夹注）按真实版式重排的竖长纸，尺寸由
+        // 内容与可用面积定（下面文字卡的固定比例不适用）。
+        let scroll = self.share_layout == CardLayout::Scroll;
+        let sunben: Option<(Div, f32, f32)> = if scroll {
+            let box_w = (vw - 60.0).max(280.0);
+            let box_h = (vh - 200.0).max(260.0);
+            Some(
+                self.sunben_sheet(box_w, box_h, cx)
+                    .unwrap_or_else(|| (Self::sunben_placeholder(t), 400.0, 300.0)),
+            )
+        } else {
+            None
+        };
+
         let (bg, ink, mute) = SHARE_BGS[self.share_bg.min(SHARE_BGS.len() - 1)];
         // 卡片高度按视口比例取定值（「高度」滑杆已删），并给控制面板留位。
-        let card_h = (vh * SHARE_CARD_H_FRAC).min(vh - 250.0).max(280.0);
+        let card_h = sunben
+            .as_ref()
+            .map(|s| s.2)
+            .unwrap_or_else(|| (vh * SHARE_CARD_H_FRAC).min(vh - 250.0).max(280.0));
         // 笺是竖长书衣比例；其余版式沿用横长比例。
-        let card_w = match self.share_layout {
+        let card_w = sunben.as_ref().map(|s| s.1).unwrap_or_else(|| match self.share_layout {
             CardLayout::Note => (card_h * 0.72).clamp(260.0, 460.0),
             _ => (card_h * 0.66).clamp(300.0, 600.0),
-        };
+        });
         let fs = (card_h / 40.0).clamp(12.0, 24.0);
         // 单字行高：GPUI 的默认行高约 1.4×字号，再加上 gap_1(4px)。
         // 少算行高会让最后几行溢出卡片（分享卡底部被裁掉半行字）。
@@ -4411,7 +4666,9 @@ impl Root {
         let seal = share_seal(t);
 
         // ---- 正文：按版式排（笺 / 竖排分列 / 单列竖排；只要竖排）----
+        // 晒本的「正文」是真实版面长图（sunben），不在此列。
         let grid = match self.share_layout {
+            CardLayout::Scroll => div(),
             CardLayout::Columns => {
                 // 先按高度算「一列最多几个字」，再按宽度收紧列数：
                 // 卡片宽度有限，题识列与日期列又必须留位置，否则 flex 会把
@@ -4461,34 +4718,39 @@ impl Root {
             }
         };
 
-        let card = div()
-            .w(px(card_w))
-            .h(px(card_h))
-            .flex()
-            .flex_row()
-            .justify_center()
-            .items_start()
-            .gap_4()
-            .p_4()
-            .bg(rgb(bg))
-            .border_1()
-            .border_color(rgb(0x5A4A38))
-            .rounded(px(3.0))
-            .overflow_hidden()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_between()
-                    .flex_shrink_0()
-                    .h_full()
-                    .child(div())
-                    .child(sign)
-                    .child(seal),
-            )
-            .child(grid)
-            .child(date_col);
+        // 晒本：纸面即卡片（自带纸色 / 版框 / 界行 / 夹注，不套文字卡外壳）。
+        let card = if let Some((sheet, _, _)) = sunben {
+            sheet
+        } else {
+            div()
+                .w(px(card_w))
+                .h(px(card_h))
+                .flex()
+                .flex_row()
+                .justify_center()
+                .items_start()
+                .gap_4()
+                .p_4()
+                .bg(rgb(bg))
+                .border_1()
+                .border_color(rgb(0x5A4A38))
+                .rounded(px(3.0))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_between()
+                        .flex_shrink_0()
+                        .h_full()
+                        .child(div())
+                        .child(sign)
+                        .child(seal),
+                )
+                .child(grid)
+                .child(date_col)
+        };
 
         // ---- 控制面板：元素开关 / 版式 / 底色 ----
         let mut toggles = div().flex().flex_row().items_center().gap_2();
@@ -4521,6 +4783,7 @@ impl Root {
             (CardLayout::Note, "八行笺"),
             (CardLayout::Columns, "竖排分列"),
             (CardLayout::Single, "单列竖排"),
+            (CardLayout::Scroll, "晒本"),
         ] {
             let on = self.share_layout == lay;
             let fg = if on { 0xE9E2D2 } else { icon_ink };
@@ -4549,6 +4812,20 @@ impl Root {
                     .border_2()
                     .border_color(rgb(fg))
                     .rounded(px(1.0)),
+                // 晒本：一张竖长纸，纸上两道字列。
+                CardLayout::Scroll => div()
+                    .w(px(11.0))
+                    .h(px(14.0))
+                    .border_2()
+                    .border_color(rgb(fg))
+                    .rounded(px(1.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(1.5))
+                    .child(bar(1.5, 8.0, fg))
+                    .child(bar(1.5, 8.0, fg)),
             };
             layouts = layouts.child(
                 div()
@@ -4599,58 +4876,82 @@ impl Root {
             );
         }
 
-        let controls = div()
+        // 控制条高度：晒本只要一行（版式 chips + 一句说明），其余版式两行。
+        let controls_h = if scroll { 34.0 } else { 88.0 };
+        // 第一行：普通版式 = 元素开关 + 版式；晒本 = 一句说明 + 版式。
+        let row_top = if scroll {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(0xB9AE9C))
+                        .child(SharedString::from(format!(
+                            "第 {} 葉 · 晒本（含夹注）· 保存即导出 PNG",
+                            self.page + 1
+                        ))),
+                )
+                .child(layouts)
+        } else {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(toggles)
+                .child(layouts)
+        };
+        // 第二行：底色 + 葉号（晒本无此需要——纸色即主题纸色）。
+        let row_bottom = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(0xB9AE9C))
+                            .child(SharedString::from("底色")),
+                    )
+                    .child(swatches),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(0xB9AE9C))
+                    .child(SharedString::from(format!(
+                        "第 {} 葉 · {}",
+                        self.page + 1,
+                        self.share_layout.label()
+                    ))),
+            );
+
+        let mut controls = div()
             .flex()
             .flex_col()
             .gap_2()
-            .h(px(88.0))
+            .h(px(controls_h))
             .w(px((card_w + 92.0).min(vw * 0.92)))
             .p_3()
             .rounded(px(8.0))
             .bg(rgb(0x1C1915))
             .border_1()
             .border_color(rgb(0x3A332B))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(toggles)
-                    .child(layouts),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(rgb(0xB9AE9C))
-                                    .child(SharedString::from("底色")),
-                            )
-                            .child(swatches),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(0xB9AE9C))
-                            .child(SharedString::from(format!(
-                                "第 {} 葉 · {}",
-                                self.page + 1,
-                                self.share_layout.label()
-                            ))),
-                    ),
-            );
+            .child(row_top);
+        if !scroll {
+            controls = controls.child(row_bottom);
+        }
 
         // ---- 三个动作：保存图片 / 分享图片 / 分享文字（与样式面板同一排）----
         let save = self.action_button("保存图片", t).on_mouse_down(
@@ -4689,9 +4990,9 @@ impl Root {
 
         // 卡片与面板用绝对坐标定位（而不是 flex 居中）：保存 / 分享图片
         // 要按这块矩形裁图，渲染位置必须与算式严格一致，否则截出来会偏。
-        // 版式：卡片 + 12 + 控制条 88 + 12 + 按钮 36，整体垂直居中。
-        // （右侧「高度」滑杆已连同代码删除，预览行只剩卡片本身。）
-        let total_h = card_h + 12.0 + 88.0 + 12.0 + 36.0;
+        // 版式：卡片 + 12 + 控制条（晒本 34 / 其余 88）+ 12 + 按钮 36，
+        // 整体垂直居中。
+        let total_h = card_h + 12.0 + controls_h + 12.0 + 36.0;
         let top = ((vh - total_h) * 0.5).max(0.0);
         let row_w = card_w;
         let left = ((vw - row_w) * 0.5).max(0.0);
@@ -5525,14 +5826,22 @@ impl Root {
         }
     }
 
-    /// 保存分享卡：截卡片到桌面 PNG，并收起面板。
+    /// 保存分享卡 / 晒本：截卡片到桌面 PNG，并收起面板。
     fn save_share_image(&mut self, window: &Window, cx: &mut Context<Self>) {
         // 先截再收面板：截屏是同步的，先关面板会让画面在下一帧才更新，
         // 虽然大概率仍截到卡片，但顺序反了容易截到「已消失」的界面。
-        let shot = self.capture_card_png(window, "jiandu-card");
+        let sunben = self.share_layout == CardLayout::Scroll;
+        let prefix = if sunben { "jiandu-sunben" } else { "jiandu-card" };
+        let shot = self.capture_card_png(window, prefix);
         self.show_share_panel = false;
         self.notice = match shot {
-            Ok(p) => format!("已保存分享卡：{p}"),
+            Ok(p) => {
+                if sunben {
+                    format!("已保存晒本：{p}")
+                } else {
+                    format!("已保存分享卡：{p}")
+                }
+            }
             Err(e) => e,
         };
         cx.notify();
@@ -5540,7 +5849,9 @@ impl Root {
 
     /// 分享图片：把截下的卡片直接放进系统剪贴板，可在微信 / 备忘录里 ⌘V 粘贴。
     fn share_image_to_clipboard(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let shot = self.capture_card_png(window, "jiandu-share");
+        let sunben = self.share_layout == CardLayout::Scroll;
+        let prefix = if sunben { "jiandu-sunben" } else { "jiandu-share" };
+        let shot = self.capture_card_png(window, prefix);
         self.show_share_panel = false;
         match shot {
             Ok(p) => {
@@ -5553,7 +5864,11 @@ impl Root {
                     .map(|s| s.success())
                     .unwrap_or(false);
                 self.notice = if ok {
-                    "分享图已复制到剪贴板，可直接粘贴".to_string()
+                    if sunben {
+                        "晒本已复制到剪贴板，可直接粘贴".to_string()
+                    } else {
+                        "分享图已复制到剪贴板，可直接粘贴".to_string()
+                    }
                 } else {
                     format!("图片已保存到 {p}（剪贴板不可用）")
                 };
