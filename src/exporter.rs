@@ -7,7 +7,7 @@
 //!   * txt  —— 顶部先列目录，正文按章分节；注释以〔注〕形式随文附在段后；
 //!   * md   —— 标题用 `#` / `##` 表达层级，便于再导入或被别的工具读取。
 
-use crate::types::{Book, NoteKind};
+use crate::types::{Book, Note, NoteKind};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -65,6 +65,9 @@ pub fn to_txt(book: &Book) -> String {
                     NoteKind::Person => "人名",
                     NoteKind::Place => "地名",
                     NoteKind::Book => "书名",
+                    // 着重（导入时 `**加粗**` 转来的朱砂圈点）：导出还原成
+                    // markdown 的加粗，round-trip 不丢标记。
+                    NoteKind::Emph => "着重",
                 };
                 out.push_str(&format!("〔{tag}〕{}\n", n.text));
             }
@@ -92,8 +95,32 @@ pub fn to_markdown(book: &Book) -> String {
     for ch in &book.chapters {
         out.push_str(&format!("## {}\n\n", ch.title));
         for p in &ch.paragraphs {
-            out.push_str(&p.text);
+            out.push_str(&emph_to_bold(&p.text, &p.notes));
             out.push_str("\n\n");
+        }
+    }
+    out
+}
+
+/// 导出 markdown 时把着重还原成 `**加粗**`：导入 → 导出走一圈不丢标记。
+fn emph_to_bold(text: &str, notes: &[Note]) -> String {
+    let emph: Vec<(usize, usize)> = notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Emph && n.len > 0)
+        .map(|n| (n.at, n.at + n.len))
+        .collect();
+    if emph.is_empty() {
+        return text.to_string();
+    }
+    let cs: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    for (i, c) in cs.iter().enumerate() {
+        if emph.iter().any(|(a, _)| *a == i) {
+            out.push_str("**");
+        }
+        out.push(*c);
+        if emph.iter().any(|(_, b)| *b == i + 1) {
+            out.push_str("**");
         }
     }
     out

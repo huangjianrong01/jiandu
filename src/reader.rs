@@ -3640,6 +3640,10 @@ impl Root {
                 )
             })
         };
+        // 着重（导入管线里 `**加粗**` / `<strong>` 转来的 `[高亮]…[/高亮]`）：
+        // 刻本不用西式「加粗」，而是在字旁点一枚**朱砂圈点**（着重号）。
+        // 竖排里点落在字右侧，与左侧的专名线分列两边，互不干扰。
+        let emph = !is_punct(g.ch) && self.emph_at(g);
         // 检索命中：朱砂红衬底，当前那一处更重、其余较淡（用 `mix` 兑出
         // 半透感，不依赖 opacity —— 深色主题下也稳）。
         let hit = if g.kind == GlyphKind::Char {
@@ -3654,7 +3658,7 @@ impl Root {
             .flex_row()
             .items_center()
             .justify_center();
-        if marked || rare_py.is_some() || mark_line.is_some() || hit.is_some() {
+        if marked || rare_py.is_some() || mark_line.is_some() || hit.is_some() || emph {
             cell = cell.relative();
         }
         if let Some(is_cur) = hit {
@@ -3675,6 +3679,20 @@ impl Root {
         // 线与字面之间不留缝（刻本里线贴着字，不嵌在字上）。
         if let Some(line) = mark_line {
             cell = cell.child(line);
+        }
+        if emph {
+            // 着重圈点：一枚实心朱砂小圆，点径随字号但保底可见（2.2~5px）。
+            let d = (fs * 0.13).clamp(2.2, 5.0);
+            cell = cell.child(
+                div()
+                    .absolute()
+                    .right(px(2.0))
+                    .top(px(cell_h * 0.5 - d * 0.5))
+                    .w(px(d))
+                    .h(px(d))
+                    .rounded(px(d / 2.0))
+                    .bg(rgb(t.accent())),
+            );
         }
         if marked {
             // 朱线贯穿划线各字：画在字格内侧（离右边的朱丝栏 4px），

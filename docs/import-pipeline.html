@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>笺读 · 统一导入与古籍化清洗管线（演示）</title>
+<style>
+  :root{
+    --paper:#F3ECD9;      /* 宣纸 */
+    --paper-2:#FBF7EF;    /* 笺纸 */
+    --ink:#2A2620;        /* 墨 */
+    --ink-faint:#8A8175;  /* 淡墨 */
+    --cinnabar:#C0503C;   /* 朱砂 */
+    --cloth:#2F4858;      /* 瓷青书衣 */
+    --hair:#DCD5C4;       /* 极细墨线 */
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;padding:28px 32px;background:var(--paper);color:var(--ink);
+    font-family:"Songti SC","STSong","Source Han Serif SC","Noto Serif CJK SC",serif;
+    line-height:1.7;
+  }
+  h1{font-size:20px;margin:0 0 4px;letter-spacing:2px}
+  h1 span{color:var(--cinnabar)}
+  .sub{font-size:12px;color:var(--ink-faint);margin-bottom:20px}
+  .bar{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+  button{
+    font-family:inherit;font-size:12.5px;color:var(--ink);
+    background:transparent;border:1px solid var(--hair);border-radius:2px;
+    padding:5px 12px;cursor:pointer;
+  }
+  button:hover{border-color:var(--cinnabar);color:var(--cinnabar)}
+  button.on{background:var(--cinnabar);border-color:var(--cinnabar);color:#FBF7EF}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .card{background:var(--paper-2);border:1px solid var(--hair);border-radius:2px;padding:14px}
+  .card h2{font-size:13px;margin:0 0 10px;color:var(--ink-faint);letter-spacing:1px;font-weight:normal}
+  textarea{
+    width:100%;height:340px;font-family:"Songti SC","STSong",serif;font-size:13px;
+    line-height:1.8;color:var(--ink);background:#FFFDF8;border:0;outline:none;
+    border-bottom:1px solid var(--hair);resize:vertical;padding:4px 2px;
+  }
+  pre{
+    margin:0;height:340px;overflow:auto;font-size:12px;line-height:1.75;
+    font-family:"CMU Serif","Menlo","Courier New",monospace;white-space:pre-wrap;
+  }
+  .ch{border-bottom:1px dashed var(--hair);padding:8px 0}
+  .ch:last-child{border-bottom:0}
+  .t{color:var(--cinnabar);font-size:13px;letter-spacing:1px}
+  .c{color:var(--ink);font-size:13px;margin-top:3px}
+  .c b{color:var(--cinnabar);font-weight:normal}          /* 着重 [高亮] */
+  .c i{color:var(--ink-faint);font-style:normal;font-size:11.5px} /* 夹注 [注] */
+  .tag{font-size:11px;color:var(--ink-faint);margin-left:6px}
+  .foot{margin-top:16px;font-size:11.5px;color:var(--ink-faint)}
+  code{background:#EFE9DC;padding:1px 4px;border-radius:2px;font-size:11.5px}
+</style>
+</head>
+<body>
+<h1>笺读 · <span>统一导入与古籍化清洗管线</span></h1>
+<div class="sub">parseToJianDuFormat(file) → [{ title, content }] —— txt / md / html / xml 同一进同一出</div>
+
+<div class="bar">
+  <button data-sample="txt">样例：TXT（GBK / 无章节 / 半角标点）</button>
+  <button data-sample="md">样例：Markdown（引用 · 加粗 · 代码块）</button>
+  <button data-sample="html">样例：HTML（script/nav 降噪 · em · strong）</button>
+  <button id="run" class="on">解析</button>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>输入（原始文件）</h2>
+    <textarea id="in" spellcheck="false"></textarea>
+  </div>
+  <div class="card">
+    <h2>输出（标准章数组 · 已古籍化）</h2>
+    <pre id="out"></pre>
+  </div>
+</div>
+<div class="foot">
+  说明：<code>[注]…[/注]</code> 在排版引擎里展开为双行夹注；<code>[高亮]…[/高亮]</code> 在字右点一枚朱砂圈点（着重号）。
+  阿拉伯数字已按纪年 / 数值两种读法转汉字，半角标点转全角。
+</div>
+
+<script src="import-pipeline.js"></script>
+<script>
+const SAMPLES = {
+txt: `道德经
+第一章 体道
+道可道,非常道.名可名,非常名.
+无名天地之始;有名万物之母.
+
+第二章 养身
+天下皆知美之为美,斯恶已.
+建安223年,策为尚书郎.全书1980页,共15卷.`,
+
+md: `# 道德经
+
+## 第一章 体道
+
+道可道，非常道。
+
+> 王弼曰：此二者同出而异名。
+> 同谓之玄。
+
+名可名，**非常名**。
+
+\`\`\`rust
+fn main() { println!("这段不该出现"); }
+\`\`\`
+
+![封面](cover.png)
+
+见[维基](https://zh.wikipedia.org/wiki/道德經)所说。`,
+
+html: `<!DOCTYPE html>
+<html><head><title>道德经</title></head><body>
+<script>var track=1;</script>
+<style>p{color:red}</style>
+<nav>首页 | 目录</nav>
+<h1>卷一 体道</h1>
+<p>道可<em>非常</em>道，<span class="note">王弼注：可道之道非常道</span>也。</p>
+<p>此<strong>要紧</strong>处，须留意。&nbsp;&mdash;&ldquo;玄&rdquo;</p>
+<h2>第二节</h2>
+<p>公元223年，无名天地之始&#12298;。</p>
+</body></html>`
+};
+
+const ta = document.getElementById('in');
+const out = document.getElementById('out');
+
+function render(chapters){
+  // 把标记可视化：夹注用淡墨小字，着重用朱色 —— 与 App 里的呈现一致
+  const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const fmt = s => esc(s)
+    .replace(/\[注\]([\s\S]*?)\[\/注\]/g, '<i>[$1]</i>')
+    .replace(/\[高亮\]([\s\S]*?)\[\/高亮\]/g, '<b>$1</b>');
+  out.innerHTML = chapters.map(c =>
+    `<div class="ch"><div class="t">${esc(c.title)}<span class="tag">${
+      [...c.content].length} 字</span></div><div class="c">${
+      fmt(c.content).replace(/\n/g,'<br>') || '<i>（空）</i>'}</div></div>`
+  ).join('') || '<i>（没有解析出内容）</i>';
+}
+
+function run(){
+  const name = document.querySelector('button[data-sample].on')?.dataset.sample === 'html'
+    ? 'demo.html' : (document.querySelector('button[data-sample].on')?.dataset.sample === 'md' ? 'demo.md' : 'demo.txt');
+  const bytes = new TextEncoder().encode(ta.value);
+  const chapters = JianDuPipeline.parseToJianDuFormatSync(name, bytes);
+  render(chapters);
+  console.log('管线输出：', chapters);
+}
+
+document.querySelectorAll('button[data-sample]').forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll('button[data-sample]').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+    ta.value = SAMPLES[b.dataset.sample];
+    run();
+  };
+});
+document.getElementById('run').onclick = run;
+
+// 首屏：TXT 样例
+document.querySelector('button[data-sample="txt"]').classList.add('on');
+ta.value = SAMPLES.txt;
+run();
+</script>
+</body>
+</html>

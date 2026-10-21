@@ -25,11 +25,12 @@ pub fn import_from_path(path: &Path) -> Result<Book> {
     let mut book = match ext.as_str() {
         "txt" | "text" => import_txt(path)?,
         "md" | "markdown" => import_md(path)?,
+        "html" | "htm" | "xhtml" | "xml" => import_html(path)?,
         "json" => import_json(path)?,
         "epub" => import_epub(path)?,
         other => {
             return Err(anyhow!(
-                "不支持的格式：.{other}（支持 md / txt / epub / json）"
+                "不支持的格式：.{other}（支持 md / txt / html / xml / epub / json）"
             ))
         }
     };
@@ -224,7 +225,7 @@ pub fn parse_inline_marks(line: &str) -> (String, Vec<Note>) {
 }
 
 /// 把纯文本行转成段落（解析行内标记）。
-fn para_of(line: &str) -> Paragraph {
+pub(crate) fn para_of(line: &str) -> Paragraph {
     let (text, notes) = parse_inline_marks(line.trim());
     Paragraph { text, notes }
 }
@@ -233,8 +234,9 @@ fn para_of(line: &str) -> Paragraph {
 // txt
 // ---------------------------------------------------------------------------
 pub fn import_txt(path: &Path) -> Result<Book> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("读取 txt 失败: {}", path.display()))?;
+    // 走管线：先解码（UTF-8 / GBK），再切章、全角化、数字转汉字。
+    let bytes = std::fs::read(path).with_context(|| format!("读取 txt 失败: {}", path.display()))?;
+    let text = crate::pipeline::decode_bytes(&bytes);
     Ok(book_from_plaintext(&file_stem(path), &text))
 }
 
@@ -247,53 +249,26 @@ fn is_heading(l: &str) -> bool {
 
 /// 纯文本 -> Book。书名自动识别（正文首行），识别不到回退文件名；
 /// 书名与作者名统一夹到 12 字以内（书架 / 封面竖排区域有限）。
+///
+/// 切章与清洗统一交给 [`crate::pipeline::parse_txt`]：认「第 X 章/回/卷/节」，
+/// 通篇无标题且超长按 3000 字切卷，标点转全角、数字转汉字。
 pub fn book_from_plaintext(fallback_title: &str, text: &str) -> Book {
     let (detected, author) = detect_title_author(text);
+    let chapters = crate::pipeline::parse_txt(text);
+    let mut book = crate::pipeline::chapters_to_book(fallback_title, &author, chapters);
+    // 书名：正文首行识别出来的优先，其次文件名。
     let title = if detected.is_empty() {
         fallback_title.to_string()
     } else {
         detected
     };
-    let title = clip_chars(&title, 12);
-    let author = clip_chars(&author, 12);
-    let mut book = Book::new(&title, &author);
-    let normalized = text.replace('\r', "");
-    let mut current: Option<Chapter> = None;
-    let mut para: Vec<String> = Vec::new();
-
-    for raw in normalized.lines() {
-        let line = raw.trim();
-        if line.is_empty() {
-            flush_para(&mut para, &mut current, &mut book);
-            continue;
-        }
-        if is_heading(line) {
-            flush_para(&mut para, &mut current, &mut book);
-            if let Some(c) = current.take() {
-                if !c.paragraphs.is_empty() {
-                    book.chapters.push(c);
-                }
-            }
-            current = Some(Chapter {
-                title: crate::numcn::normalize_numbers(line.trim_start_matches('#').trim()),
-                paragraphs: Vec::new(),
-            });
-            continue;
-        }
-        // 与 EPUB 同一套清洗：纯文本里的阿拉伯数字也先转成汉字。
-        para.push(crate::numcn::normalize_numbers(line));
-    }
-    flush_para(&mut para, &mut current, &mut book);
-    if let Some(c) = current.take() {
-        if !c.paragraphs.is_empty() {
-            book.chapters.push(c);
-        }
-    }
-
+    book.title = clip_chars(&title, 12);
+    book.cover.title = book.title.clone();
+    book.author = clip_chars(&author, 12);
     if book.chapters.is_empty() {
         book.chapters.push(Chapter {
             title: "正文".into(),
-            paragraphs: vec![para_of(&normalized)],
+            paragraphs: vec![para_of(text)],
         });
     }
     book
@@ -327,69 +302,40 @@ fn flush_para(para: &mut Vec<String>, chap: &mut Option<Chapter>, book: &mut Boo
 // markdown
 // ---------------------------------------------------------------------------
 pub fn import_md(path: &Path) -> Result<Book> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("读取 markdown 失败: {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("读取 markdown 失败: {}", path.display()))?;
+    let text = crate::pipeline::decode_bytes(&bytes);
     Ok(book_from_markdown(&file_stem(path), &text))
 }
 
-/// Markdown -> Book：`#` 标题切章（首个一级标题作书名），空行分段。
+/// Markdown -> Book：走统一管线（`#` 切章、`>` 转夹注、`**` 转着重、
+/// 代码块与图片丢弃）。首个一级标题若独占一章则由管线提升为书名。
 pub fn book_from_markdown(fallback_title: &str, md: &str) -> Book {
-    let mut book = Book::new(fallback_title, "");
-    let mut current: Option<Chapter> = None;
-    let mut para: Vec<String> = Vec::new();
-    let mut title_taken = false;
-
-    for raw in md.replace('\r', "").lines() {
-        let line = raw.trim();
-        if line.is_empty() {
-            flush_para(&mut para, &mut current, &mut book);
-            continue;
-        }
-        // 标题
-        if line.starts_with('#') {
-            flush_para(&mut para, &mut current, &mut book);
-            let level = line.chars().take_while(|c| *c == '#').count();
-            let heading = strip_md_inline(line.trim_start_matches('#').trim());
-            if level == 1 && !title_taken && book.chapters.is_empty() {
-                book.title = heading.clone();
-                book.cover.title = heading;
-                title_taken = true;
-                continue;
-            }
-            if let Some(c) = current.take() {
-                if !c.paragraphs.is_empty() {
-                    book.chapters.push(c);
-                }
-            }
-            current = Some(Chapter {
-                title: heading,
-                paragraphs: Vec::new(),
-            });
-            continue;
-        }
-        // 分隔线 / 引用标记
-        if line.chars().all(|c| c == '-' || c == '*' || c == '_') {
-            flush_para(&mut para, &mut current, &mut book);
-            continue;
-        }
-        para.push(strip_md_inline(line));
-    }
-    flush_para(&mut para, &mut current, &mut book);
-    if let Some(c) = current.take() {
-        if !c.paragraphs.is_empty() {
-            book.chapters.push(c);
-        }
-    }
-    if book.chapters.is_empty() {
-        book.chapters.push(Chapter {
-            title: "正文".into(),
-            paragraphs: Vec::new(),
-        });
-    }
+    let chapters = crate::pipeline::parse_markdown(md);
+    let mut book = crate::pipeline::chapters_to_book(fallback_title, "", chapters);
     if book.cover.title.is_empty() {
         book.cover.title = book.title.clone();
     }
     book
+}
+
+// ---------------------------------------------------------------------------
+// html / xml
+// ---------------------------------------------------------------------------
+pub fn import_html(path: &Path) -> Result<Book> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("读取 html 失败: {}", path.display()))?;
+    let text = crate::pipeline::decode_bytes(&bytes);
+    let chapters = crate::pipeline::parse_html(&text);
+    // 书名优先取 <title> / <h1>，取不到才回退文件名。
+    let title = extract_html_title(&text)
+        .map(|t| clip_chars(&t, 12))
+        .unwrap_or_else(|| file_stem(path));
+    let mut book = crate::pipeline::chapters_to_book(&title, "", chapters);
+    if book.cover.title.is_empty() {
+        book.cover.title = book.title.clone();
+    }
+    Ok(book)
 }
 
 /// 去掉行内 Markdown 标记（保留 〖〗 ≪≫ 注释标记）。
@@ -663,8 +609,10 @@ pub fn import_epub(path: &Path) -> Result<Book> {
     for raw_href in ordered {
         let file_key = normalize_href(&raw_href);
         if let Ok(html) = read_zip_text(&mut zip, &file_key) {
-            let text = html_to_text(&html);
-            if text.trim().is_empty() {
+            // 与 md / txt 同一条管线：一个 spine 文件里的 <h2> 也能切成多章，
+            // `<em>` 变夹注、`<strong>` 变着重、script/style/nav 一并降噪。
+            let subs = crate::pipeline::parse_html(&html);
+            if subs.iter().all(|c| c.content.trim().is_empty()) {
                 continue;
             }
             // 章名先用 HTML 里的 <title> / <h1>，之后目录会覆盖。
@@ -675,19 +623,33 @@ pub fn import_epub(path: &Path) -> Result<Book> {
                     .unwrap_or("章")
                     .to_string()
             });
-            let mut chapter = Chapter {
-                title: guessed,
-                paragraphs: Vec::new(),
-            };
-            for line in text.lines() {
-                let l = line.trim();
-                if !l.is_empty() {
-                    chapter.paragraphs.push(para_of(l));
+            let mut first_idx: Option<usize> = None;
+            for c in subs {
+                // 管线没从 <h?> 取到标题时（整篇无标题），用 <title> 兜底。
+                let title = if c.title == "正文" {
+                    guessed.clone()
+                } else {
+                    c.title.clone()
+                };
+                let mut chapter = Chapter {
+                    title,
+                    paragraphs: Vec::new(),
+                };
+                for line in c.content.lines() {
+                    let l = line.trim();
+                    if !l.is_empty() {
+                        chapter.paragraphs.push(crate::pipeline::paragraph_of(l));
+                    }
+                }
+                if !chapter.paragraphs.is_empty() {
+                    if first_idx.is_none() {
+                        first_idx = Some(book.chapters.len());
+                    }
+                    book.chapters.push(chapter);
                 }
             }
-            if !chapter.paragraphs.is_empty() {
-                file_to_chapter.insert(file_key.clone(), book.chapters.len());
-                book.chapters.push(chapter);
+            if let Some(i) = first_idx {
+                file_to_chapter.insert(file_key.clone(), i);
             }
         }
     }
@@ -1125,80 +1087,27 @@ fn extract_spine_ids(opf: &str) -> Vec<String> {
     ids
 }
 
+/// HTML → 纯文本（旧接口，测试与兜底用）。
+///
+/// 真正的活儿已交给 [`crate::pipeline::parse_html`]：剥 script/style/nav、
+/// `<h?>` 切章、`<em>` 转夹注、实体还原、数字转汉字，一并在管线里做完；
+/// 这里只把各章正文接成一段文本。
 fn html_to_text(html: &str) -> String {
-    let mut s = html.to_string();
-    s = remove_block(&s, "<script", "</script>");
-    s = remove_block(&s, "<style", "</style>");
-    s = remove_block(&s, "<head", "</head>");
-
-    for (a, b) in [
-        ("</p>", "\n"),
-        ("</div>", "\n"),
-        ("</h1>", "\n"),
-        ("</h2>", "\n"),
-        ("</h3>", "\n"),
-        ("<br/>", "\n"),
-        ("<br />", "\n"),
-        ("<br>", "\n"),
-    ] {
-        s = s.replace(a, b);
-    }
-
+    let chapters = crate::pipeline::parse_html(html);
     let mut out = String::new();
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    let out = out
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'");
-
-    let mut cleaned = String::new();
-    let mut blank = 0;
-    for line in out.lines() {
-        let l = line.trim();
-        if l.is_empty() {
-            blank += 1;
-            if blank <= 1 {
-                cleaned.push('\n');
-            }
-        } else {
-            blank = 0;
-            cleaned.push_str(l);
-            cleaned.push('\n');
-        }
-    }
-    // ── 源头治理：阿拉伯数字 → 汉字 ────────────────────────────────
-    // EPUB 正文里的 `223年`、`1980` 若原样入库，竖排引擎会把每个数字当成
-    // 独立字符、一格一个地竖着摞成「2 / 2 / 3」，读起来断成三截。这里在
-    // 「HTML → 纯文本」的最后一步整体换成汉字（`二二三年` / `一千九百八十`），
-    // 从源头断绝被拆散的可能（渲染侧另有数字串兜底，见 `west::scan_digit_run`）。
-    crate::numcn::normalize_numbers(&cleaned)
-}
-
-fn remove_block(s: &str, open: &str, close: &str) -> String {
-    let mut out = String::new();
-    let mut rest = s;
-    while let Some(i) = rest.find(open) {
-        out.push_str(&rest[..i]);
-        match rest[i..].find(close) {
-            Some(j) => rest = &rest[i + j + close.len()..],
-            None => {
-                rest = "";
-                break;
+    for c in &chapters {
+        for line in c.content.lines() {
+            let l = line.trim();
+            if !l.is_empty() {
+                out.push_str(l);
+                out.push('\n');
             }
         }
     }
-    out.push_str(rest);
+    if out.trim().is_empty() {
+        // 一个标签都没解析出来：退回「去标签」的老办法。
+        out = crate::pipeline::decode_entities(&crate::pipeline::strip_tags(html));
+    }
     out
 }
 

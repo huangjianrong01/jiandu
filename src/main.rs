@@ -18,6 +18,7 @@ mod gloss;
 mod hit;
 mod note_inject;
 mod numcn;
+mod pipeline;
 mod ime;
 mod importer;
 mod library;

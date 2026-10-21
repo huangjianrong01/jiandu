@@ -592,6 +592,10 @@ impl Root {
             }
         };
         root = root.child(div().flex_1().overflow_hidden().child(body));
+        // 批量管理：底部浮出一条操作栏（全选 / 删除所选 / 退出）。
+        if self.shelf_manage {
+            root = root.child(self.render_batch_bar(cx));
+        }
         root = root.child(self.render_shelf_status());
 
         // 浮层：书库 / 重命名 / 改归类 / 展开书名。
@@ -686,6 +690,7 @@ impl Root {
             .books
             .iter()
             .any(|e| e.last_read > 0 || e.last_page > 0);
+        let managing = self.shelf_manage;
 
         let mut bar = div()
             .flex()
@@ -734,6 +739,18 @@ impl Root {
                         cx.stop_propagation();
                         this.shelf_view = this.shelf_view.toggled();
                         this.shelf_expand = None;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                // 批量管理：进去后点书衣是勾选，底部浮出「全选 / 删除所选」。
+                // 开着的时候按钮转朱色，免得忘了自己还在勾选态。
+                shelf_button(if managing { "批量 · 开" } else { "批量" }, managing).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_shelf_manage();
                         cx.notify();
                     }),
                 ),
@@ -901,7 +918,105 @@ impl Root {
     }
 
     /// 书衣网格：一格一书。
-    fn render_slip_grid(
+        /// 批量管理的底部操作栏：已选册数 · 全选 / 反选 · 删除所选 · 退出。
+    ///
+    /// 控件一律走「极小字 + 朱砂」，不做灰底胶囊——与书衣同一套古风语汇。
+    fn render_batch_bar(&mut self, cx: &mut Context<Self>) -> Div {
+        let n = self.shelf_picked.len();
+        let confirm = self.shelf_batch_confirm;
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(16.0))
+            .px(px(18.0))
+            .py(px(7.0))
+            .bg(rgb(SHELF_PAPER))
+            .border_t_1()
+            .border_color(rgb(HAIR));
+
+        bar = bar.child(text(
+            &format!("已选 {} 册", n),
+            12.0,
+            if n > 0 { CINNABAR } else { INK_FAINT },
+        ));
+        bar = bar.child(link_button("全选 / 反选", INK_FAINT).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                let entries = this.shelf_filtered();
+                this.pick_all(&entries);
+                cx.notify();
+            }),
+        ));
+        bar = bar.child(div().flex_1());
+
+        if confirm {
+            // 删多本不可逆：二次确认，朱色字，旁边留一枚「点错了」。
+            bar = bar
+                .child(link_button(&format!("确认删除 {n} 册"), CINNABAR).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.delete_picked();
+                        cx.notify();
+                    }),
+                ))
+                .child(link_button("点错了", INK_FAINT).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.shelf_batch_confirm = false;
+                        cx.notify();
+                    }),
+                ));
+        } else {
+            bar = bar.child(
+                link_button("删除所选", CINNABAR).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        if this.shelf_picked.is_empty() {
+                            this.notice = "请先勾选要删除的书".to_string();
+                        } else {
+                            this.shelf_batch_confirm = true;
+                        }
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        bar = bar.child(link_button("退出批量", INK_FAINT).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_shelf_manage();
+                cx.notify();
+            }),
+        ));
+        bar
+    }
+
+    /// 勾选框：一枚方形小印——未选是淡框，已选是朱砂底 + 宣纸白心。
+    /// 不用「✓」：那枚符号是系统字形的西式控件语汇，在书衣上很跳。
+    fn pick_box(picked: bool) -> Div {
+        let mut b = div()
+            .w(px(16.0))
+            .h(px(16.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(1.0))
+            .border_1()
+            .border_color(rgb(if picked { CINNABAR } else { SLIP_EDGE }))
+            .bg(rgba(if picked { 0xC0503CEE } else { 0x14100A66 }));
+        if picked {
+            b = b.child(div().w(px(7.0)).h(px(7.0)).bg(rgb(SLIP_PAPER)));
+        }
+        b
+    }
+
+fn render_slip_grid(
         &mut self,
         entries: &[(usize, ShelfEntry)],
         cx: &mut Context<Self>,
@@ -939,6 +1054,9 @@ impl Root {
         let pct = (prog * 100.0).round() as i32;
         let author = e.author_line();
         let volume = e.volume_line();
+        // 批量管理态：点书衣是「勾选」，不是「翻书」。
+        let manage = self.shelf_manage;
+        let picked = manage && self.is_picked(idx);
 
         // 题签里的书名：中文竖排单列（长名自动缩字号），西文横排折行。
         let (title_inner, truncated) = slip_title(
@@ -968,7 +1086,8 @@ impl Root {
             .overflow_hidden()
             .bg(rgb(CLOTH))
             .border_1()
-            .border_color(rgb(CLOTH_EDGE))
+            // 选中：书衣收一道朱边，一眼看出勾了哪几本。
+            .border_color(rgb(if picked { CINNABAR } else { CLOTH_EDGE }))
             .rounded(px(2.0))
             .shadow(book_shadow())
             .cursor_pointer()
@@ -982,6 +1101,16 @@ impl Root {
                     .h_full()
                     .bg(rgb(CLOTH_SPINE)),
             )
+            // 勾选框：右上角一枚方形小印。
+            .when(manage, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(8.0))
+                        .right(px(8.0))
+                        .child(Self::pick_box(picked)),
+                )
+            })
             // 题签：左上角一枚淡淡的宣纸小签。
             .child(
                 div()
@@ -1031,7 +1160,11 @@ impl Root {
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.open_book(idx);
+                    if manage {
+                        this.toggle_pick(idx);
+                    } else {
+                        this.open_book(idx);
+                    }
                     cx.notify();
                 }),
             );
@@ -1039,7 +1172,9 @@ impl Root {
         let hovered = self.shelf_hover == Some(idx);
         let confirming = self.delete_confirm == Some(idx);
         let mut outer = div().relative().w(px(CARD_W)).h(px(CARD_H)).child(card);
-        if hovered || confirming {
+        // 批量管理态不浮「归类 / 改名 / 删除」：那三条是单本操作，
+        // 会和勾选抢点击。
+        if (hovered || confirming) && !manage {
             let bar = self.render_manage_bar(idx, cx);
             let seq = self.shelf_hover_seq;
             // 换 ElementId（带上悬停序号）才能让淡入动画重新起一段；
@@ -1148,6 +1283,9 @@ impl Root {
         let hovered = self.shelf_hover == Some(idx);
         let confirming = self.delete_confirm == Some(idx);
         let manage = self.manage_row(idx, cx, INK_FAINT, CINNABAR);
+        // 批量管理态：行首一枚方形小印，点行即勾选。
+        let batch = self.shelf_manage;
+        let picked = batch && self.is_picked(idx);
 
         div()
             .flex()
@@ -1158,18 +1296,30 @@ impl Root {
             .border_b_1()
             .border_color(rgb(HAIR))
             .cursor_pointer()
+            .when(batch, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(Self::pick_box(picked)),
+                )
+            })
             // 书脊色条：一眼可辨的册色，不做木纹也不做纹理。
             .child(div().w(px(4.0)).h(px(88.0)).bg(rgb(accent)).rounded(px(1.0)))
             .child(title_area)
             .child(info)
             .child(seat)
-            // 管理动作默认不露面，悬停（或等确认删除）时才出现。
-            .when(hovered || confirming, |d| d.child(manage))
+            // 管理动作默认不露面，悬停（或等确认删除）时才出现；批量态不露。
+            .when((hovered || confirming) && !batch, |d| d.child(manage))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.open_book(idx);
+                    if batch {
+                        this.toggle_pick(idx);
+                    } else {
+                        this.open_book(idx);
+                    }
                     cx.notify();
                 }),
             )
@@ -1915,9 +2065,11 @@ impl Root {
             .border_color(rgb(0xE6E1D6))
             .text_size(px(12.0))
             .text_color(rgb(0x6B6357))
-            .child(SharedString::from(
-                "点题签开卷 · 书名过长点书名可展开 · 归类 / 改名 / 删除在签下 · 进度自动记住",
-            ))
+            .child(SharedString::from(if self.shelf_manage {
+                "批量管理：点书衣勾选 · 底部「全选 / 删除所选」一次清架 · 退出回到翻书"
+            } else {
+                "点题签开卷 · 书名过长点书名可展开 · 归类 / 改名 / 删除在签下 · 批量管理在顶栏 · 进度自动记住"
+            }))
             .child(SharedString::from(if self.notice.is_empty() {
                 String::new()
             } else {

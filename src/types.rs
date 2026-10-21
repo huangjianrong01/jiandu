@@ -458,6 +458,10 @@ pub enum NoteKind {
     Place,
     /// 书名标记：画书名线（波浪线）。
     Book,
+    /// **着重**：导入管线里 markdown 的 `**加粗**` / HTML 的 `<strong>`
+    /// 转来的 `[高亮]…[/高亮]`。刻本里不用「加粗」这种西式强调，而是
+    /// 在字旁加**朱砂圈点**（着重号），故渲染为字右侧的一枚小朱点。
+    Emph,
 }
 
 /// 专名线 / 书名线的种类：人名、地名同画实线；书名画波浪线。
@@ -588,6 +592,15 @@ impl Paragraph {
                 NoteKind::Book => Some(MarkKind::Book),
                 _ => None,
             }
+        })
+    }
+    /// 某偏移是否在**着重**（`[高亮]…[/高亮]`）的跨度内。
+    ///
+    /// 与 `mark_at` 分开：专名 / 书名是「线」，着重是「点」，视觉与语义都不同，
+    /// 混在一起会把 `**加粗**` 画成一条专名线，读起来就成了人名。
+    pub fn emph_at(&self, offset: usize) -> bool {
+        self.notes.iter().any(|n| {
+            n.kind == NoteKind::Emph && n.len > 0 && offset >= n.at && offset < n.at + n.len
         })
     }
 }

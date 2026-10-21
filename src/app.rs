@@ -348,6 +348,13 @@ pub struct Root {
     /// 换 id 才能让 `with_animation` 重新起一段动画（否则同一 id 的动画
     /// 已跑完，再浮现就是「啪」地出现）。
     pub shelf_hover_seq: u32,
+    /// **批量管理**态：开启后点书衣是「勾选」而不是「翻书」。
+    /// 纯交互态，不进 prefs——重开程序不该还停在勾选态。
+    pub shelf_manage: bool,
+    /// 已勾选的书（书架里的原下标，升序）。
+    pub shelf_picked: Vec<usize>,
+    /// 批量删除的二次确认（删多本是不可逆的，必须再问一句）。
+    pub shelf_batch_confirm: bool,
 }
 
 impl Root {
@@ -477,6 +484,9 @@ impl Root {
             shelf_recat: None,
             shelf_hover: None,
             shelf_hover_seq: 0,
+            shelf_manage: false,
+            shelf_picked: Vec::new(),
+            shelf_batch_confirm: false,
             notice: if count == 0 {
                 "书架空空，点「导入书籍」放一本进来".into()
             } else {
@@ -1320,9 +1330,14 @@ impl Root {
                     .spawn(async {
                         rfd::FileDialog::new()
                             .set_title("导入书籍到书架")
+                            // 统一管线支持的所有格式都在这里列上：html / xml
+                            // 走同一条清洗链（剥 script/nav、em 转夹注）。
                             .add_filter(
-                                "书籍 (md / txt / epub / json)",
-                                &["md", "markdown", "txt", "epub", "json"],
+                                "书籍 (md / txt / html / xml / epub / json)",
+                                &[
+                                    "md", "markdown", "txt", "html", "htm", "xhtml", "xml",
+                                    "epub", "json",
+                                ],
                             )
                             .add_filter("全部文件", &["*"])
                             .pick_files()
@@ -1513,6 +1528,25 @@ impl Root {
         let book = self.book.as_ref()?;
         let p = book.chapters.get(g.chapter)?.paragraphs.get(g.para)?;
         p.mark_at(g.offset)
+    }
+
+    /// 某字是否落在**着重**（导入管线由 `**加粗**` / `<strong>` 转来的
+    /// `[高亮]…[/高亮]`）的跨度内。渲染侧据此在字旁点一枚朱砂圈点。
+    pub fn emph_at(&self, g: Glyph) -> bool {
+        if g.kind != GlyphKind::Char {
+            return false;
+        }
+        let Some(book) = self.book.as_ref() else {
+            return false;
+        };
+        let Some(p) = book
+            .chapters
+            .get(g.chapter)
+            .and_then(|c| c.paragraphs.get(g.para))
+        else {
+            return false;
+        };
+        p.emph_at(g.offset)
     }
 
     /// 把当前拖选区间标记为人名 / 地名 / 书名：写入书稿段落并回写 JSON，
@@ -2313,6 +2347,111 @@ impl Root {
                 self.notice = format!("已重命名为：{title}");
             }
             Err(e) => self.notice = format!("重命名失败：{e}"),
+        }
+    }
+
+    // ---- 批量管理（勾选 → 全选 / 反选 / 批量删除）----
+
+    /// 进出批量管理态：进去时清掉旧勾选与确认态，出来时一并清空。
+    pub fn toggle_shelf_manage(&mut self) {
+        self.shelf_manage = !self.shelf_manage;
+        self.shelf_picked.clear();
+        self.shelf_batch_confirm = false;
+        self.delete_confirm = None;
+        self.notice = if self.shelf_manage {
+            "批量管理：点书衣勾选，底部可一次清架".to_string()
+        } else {
+            String::new()
+        };
+    }
+
+    /// 勾选 / 取消勾选第 idx 本（保持升序，便于「已选 N 册」与删除时的下标修正）。
+    pub fn toggle_pick(&mut self, idx: usize) {
+        match self.shelf_picked.iter().position(|i| *i == idx) {
+            Some(pos) => {
+                self.shelf_picked.remove(pos);
+            }
+            None => {
+                self.shelf_picked.push(idx);
+                self.shelf_picked.sort_unstable();
+            }
+        }
+        // 勾选变了，旧的「确认删除」不该继续有效。
+        self.shelf_batch_confirm = false;
+    }
+
+    pub fn is_picked(&self, idx: usize) -> bool {
+        self.shelf_picked.contains(&idx)
+    }
+
+    /// 全选 / 全不选：按**当前筛选后的书目**勾选（看得见的才选）。
+    pub fn pick_all(&mut self, entries: &[(usize, crate::library::ShelfEntry)]) {
+        let all: Vec<usize> = entries.iter().map(|(i, _)| *i).collect();
+        let all_picked = !all.is_empty() && all.iter().all(|i| self.shelf_picked.contains(i));
+        if all_picked {
+            self.shelf_picked.retain(|i| !all.contains(i));
+        } else {
+            for i in all {
+                if !self.shelf_picked.contains(&i) {
+                    self.shelf_picked.push(i);
+                }
+            }
+            self.shelf_picked.sort_unstable();
+        }
+        self.shelf_batch_confirm = false;
+    }
+
+    /// 批量删除：从大到小删，下标才不会被前面的删除带偏。
+    pub fn delete_picked(&mut self) {
+        let mut picked = std::mem::take(&mut self.shelf_picked);
+        if picked.is_empty() {
+            self.notice = "还没勾选要删除的书".to_string();
+            return;
+        }
+        picked.sort_unstable();
+        picked.dedup();
+        let n = picked.len();
+        let mut titles: Vec<String> = Vec::new();
+        let mut failed = 0usize;
+        for idx in picked.iter().rev() {
+            let title = self
+                .library
+                .books
+                .get(*idx)
+                .map(|b| b.title.clone())
+                .unwrap_or_default();
+            match self.library.remove(*idx) {
+                Ok(()) => {
+                    if titles.len() < 3 {
+                        titles.push(title);
+                    }
+                    // 修正「当前书」下标：删的是当前书就回书架。
+                    if self.current == *idx {
+                        self.book = None;
+                        self.screen = Screen::Shelf;
+                        self.current = 0;
+                    } else if self.current > *idx {
+                        self.current -= 1;
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    self.notice = format!("删除失败：{e}");
+                }
+            }
+        }
+        self.shelf_batch_confirm = false;
+        self.delete_confirm = None;
+        if failed == 0 {
+            let who = titles.join("》《");
+            self.notice = if n > 3 {
+                format!("已删除 {n} 本（《{who}》等）")
+            } else {
+                format!("已删除 {n} 本：《{who}》")
+            };
+            if self.library.books.is_empty() {
+                self.notice = "书架已空，去「书库」挑一本吧".to_string();
+            }
         }
     }
 
