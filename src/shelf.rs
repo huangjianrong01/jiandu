@@ -1022,8 +1022,10 @@ impl Root {
                     .flex_row()
                     .items_start()
                     .gap(px(6.0))
-                    .child(vertical_mini(&volume, 150.0, 9.0, CLOTH_FAINT))
-                    .child(vertical_mini(&format!("{pct}%"), 150.0, 9.0, 0xC98174)),
+                    // 竖排自右向左读：卷册在右、进度在左（flex_row 是左→右
+                    // 排，故先给进度、再给卷册）。
+                    .child(vertical_mini(&format!("{pct}%"), 150.0, 9.0, 0xC98174))
+                    .child(vertical_mini(&volume, 150.0, 9.0, CLOTH_FAINT)),
             )
             .on_mouse_down(
                 MouseButton::Left,
