@@ -880,6 +880,13 @@ pub enum GlyphKind {
     Char,
     /// 段首缩进占位（空一格，渲染为空白字格）。
     Indent,
+    /// **挤压标点**：本列已排满、紧随末字之后的收束型句读（。，、；？！」…）。
+    ///
+    /// 它不独占一格（半格账记 0），由渲染层叠画在**前一个字格的右下角**，
+    /// 故绝不另起一列占列首格。只出现在 `gloss::layout_book*` 产出的
+    /// `Piece::Main` 里；`Page::glyphs` 的读序里它仍是 `Char`（保 charIndex
+    /// 与检索、注文锚点一致）。见 [`crate::punct`]。
+    Hang,
 }
 
 /// 版面流里的一个字（带归属信息，便于查注释）。
@@ -898,6 +905,10 @@ pub struct Glyph {
 impl Glyph {
     pub fn is_indent(&self) -> bool {
         self.kind == GlyphKind::Indent
+    }
+    /// 挤在前一字格右下角的句读（不独占一格）。
+    pub fn is_hang(&self) -> bool {
+        self.kind == GlyphKind::Hang
     }
 }
 
@@ -946,13 +957,21 @@ pub fn ear_label(title: &str, chapters: usize, ci: usize, opening: &str) -> Stri
     chapter_volume(ci, "")
 }
 
-/// 方头括号【】在竖排古籍里一律显作「」：显示层 1:1 替换（源数据不动，
-/// 导出仍是原样）。正文（`shown`）、夹注、章题、中缝篇题、题署、分享题识、
-/// 书脊签、封面、书耳题签都经这一道——书本里出现的【】不露出一个。
+/// 竖排古籍只用**直角引号**：方头括号【】与西式弯引号 “”‘’ 在显示层
+/// 1:1 换成 「」『』（源数据不动，导出仍是原样）。
+///
+/// 弯引号是横排铅字的形制，竖排里它的开口朝上下、方向整个是错的；直角
+/// 引号「」的开口朝左右，正是竖排该有的样子——故不必旋转 90° 兜底，
+/// 直接换字即可。
+///
+/// 正文（`shown`）、夹注、章题、中缝篇题、题署、分享题识、书脊签、封面、
+/// 书耳题签都经这一道——书本里露出的引号只有直角形。
 pub fn bracket_to_quote(c: char) -> char {
     match c {
-        '【' => '「',
-        '】' => '」',
+        '【' | '“' => '「',
+        '】' | '”' => '」',
+        '‘' => '『',
+        '’' => '』',
         other => other,
     }
 }
@@ -1232,6 +1251,18 @@ mod tests {
         assert_eq!(bracket_to_quote('「'), '「');
         assert_eq!(bracket_to_quote('』'), '』');
         assert_eq!(bracket_to_quote('道'), '道');
+    }
+
+    #[test]
+    fn western_quotes_become_corner_quotes() {
+        // 西式弯引号开口朝上下、竖排里方向是错的：一律换成直角引号。
+        assert_eq!(bracket_to_quote('“'), '「');
+        assert_eq!(bracket_to_quote('”'), '」');
+        assert_eq!(bracket_to_quote('‘'), '『');
+        assert_eq!(bracket_to_quote('’'), '』');
+        // 一整句：引号成对翻转，正文不动。
+        let s: String = "子曰：“學而時習之。”".chars().map(bracket_to_quote).collect();
+        assert_eq!(s, "子曰：「學而時習之。」");
     }
 
     #[test]

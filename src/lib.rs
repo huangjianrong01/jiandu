@@ -10,6 +10,7 @@ pub mod dict;
 pub mod gloss;
 pub mod grid;
 pub mod hit;
+pub mod punct;
 pub mod importer;
 pub mod library;
 pub mod ruby;

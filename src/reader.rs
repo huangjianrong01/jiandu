@@ -2499,6 +2499,15 @@ impl Root {
                     idx = j;
                 }
                 Piece::Main(g) => {
+                    // 挤压标点：紧随其后的 `Hang` 字与**本字同格**——列排满
+                    // 时排不下的句读挂在末字右下角，不另起一列占列首格。
+                    // 渲染必须与分页同源：分页把它排在本字之后，这里就把
+                    // 它叠进本字那一格（`idx` 一次吃掉两片）。
+                    let hang = match items.get(idx + 1) {
+                        Some(Piece::Main(h)) if h.kind == GlyphKind::Hang => Some(*h),
+                        _ => None,
+                    };
+                    idx += if hang.is_some() { 2 } else { 1 };
                     let mark = self.mark_kind(*g);
                     content = content.child(self.ancient_cell(
                         *g,
@@ -2509,9 +2518,9 @@ impl Root {
                         mark,
                         note_index,
                         interactive,
+                        hang,
                         cx,
                     ));
-                    idx += 1;
                 }
                 Piece::Gloss(txt, src, host) => {
                     content = content.child(self.ancient_gloss(
@@ -3307,6 +3316,39 @@ impl Root {
         block
     }
 
+    /// 一枚句读的落位：**字号 × 0.5、起点偏移到字格右下角、色取淡朱**。
+    ///
+    /// 竖排里「右」是上一列那一侧、「下」是读序前进的方向，故右下角正是
+    /// 刻本句读的位置——它跟着读序贴在字的行进前方，既不挡字也不占位。
+    ///
+    /// 几何全在 `punct::place`（纯函数，字号与偏移的唯一来源）：
+    /// `fs = 正文 × 0.5`、`dx = 格宽 × 0.3`、`dy = 格高 × 0.3`。
+    /// 颜色是「朱砂兑纸色」的淡朱（比正文轻，却仍是句读的朱意），两套
+    /// 深浅主题都稳——用兑色而非 opacity，不依赖底色透出来。
+    fn punct_overlay(&self, ch: char, cell_w: f32, cell_h: f32, fs: f32, back: bool) -> Div {
+        let t = self.theme;
+        let pb = crate::punct::place(fs, cell_w, cell_h);
+        let paper = if back { t.paper_back() } else { t.paper() };
+        let ink = crate::theme::mix(paper, t.accent(), crate::punct::INK_MIX);
+        div()
+            .absolute()
+            .left(px(pb.dx))
+            .top(px(pb.dy))
+            .w(px(pb.w))
+            .h(px(pb.h))
+            .flex()
+            .flex_row()
+            // 盒自 (dx, dy) 铺到格右 / 下缘，字面**靠右下对齐**：
+            // 字体把句读的墨迹放在 em box 的左下（。，、）或正中（？！），
+            // 靠右下对齐后两种情形的墨迹都落在格子的右下角——若靠左上
+            // 对齐，。，、 的墨点会飘回格子中间（旧版看着像「居中」）。
+            .items_end()
+            .justify_end()
+            .text_size(px(pb.fs))
+            .text_color(rgb(ink))
+            .child(SharedString::from(self.shown(ch).to_string()))
+    }
+
     /// 正文单字格：主字 + 旁注（繁体/通假）+ 句读朱点。
     fn ancient_cell(
         &self,
@@ -3319,6 +3361,8 @@ impl Root {
         note_index: &NoteIndex,
         // 是否挂鼠标交互（晒本预览传 false：字格不可点）。
         interactive: bool,
+        // 挤进本格右下角的句读（列排满时排不下的那枚），`None` 为常规字格。
+        hang: Option<Glyph>,
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme;
@@ -3504,25 +3548,12 @@ impl Root {
                     .child(SharedString::from(vp.to_string())),
             );
         } else if is_punct(g.ch) {
-            // 句读（标点）单独绘制：用「相对坐标」置在字格右下角，距右下
-            // 各 `fontSize*0.3`；字号随字号缩放但被字格收敛，行高压小时
-            // 也不会溢出到下一个字格（避头尾 / 拥挤问题的根因）。
-            let pf = (fs * 0.42).max(8.0).min(cell_h);
-            let off = (fs * 0.3).max(2.0);
-            cell = cell.relative().child(
-                div()
-                    .absolute()
-                    .left(px(off))
-                    .top(px(off))
-                    .w(px((cell_w - 2.0 * off).max(off)))
-                    .h(px((cell_h - 2.0 * off).max(off)))
-                    .flex()
-                    .items_end()
-                    .justify_end()
-                    .text_size(px(pf))
-                    .text_color(rgb(t.accent()))
-                    .child(SharedString::from(self.shown(g.ch).to_string())),
-            );
+            // 句读（标点）：**正文字号 × 0.5**，起点偏移到字格右下角
+            // （x + 格宽×0.3、y + 格高×0.3），格心整个让给正文。
+            // 几何全在 `punct::place`（纯函数、有单测），这里只照抄。
+            cell = cell
+                .relative()
+                .child(self.punct_overlay(g.ch, cell_w, cell_h, fs, back));
         } else if crate::west::is_west_hyphen(g.ch) {
             // 单独出现的连字符：竖排里旋转成一道竖线（丨）。
             cell = cell.child(
@@ -3545,6 +3576,13 @@ impl Root {
                     .text_color(rgb(ink))
                     .child(SharedString::from(shown)),
             );
+        }
+        // 挤压标点（列排满时排不下的那枚句读）：挂在**本格**右下角，与末字
+        // 同格、共用一格。它半格账记 0，故绝不会另起一列占列首格。
+        if let Some(h) = hang {
+            cell = cell
+                .relative()
+                .child(self.punct_overlay(h.ch, cell_w, cell_h, fs, back));
         }
         // 脚注模式下补圈号角标。
         if !self.notes_inline && self.show_notes {

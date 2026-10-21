@@ -22,6 +22,7 @@ mod importer;
 mod library;
 mod lines;
 mod prefs;
+mod punct;
 mod reader;
 mod ruby;
 mod shelf;

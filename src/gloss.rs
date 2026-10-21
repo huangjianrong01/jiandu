@@ -12,11 +12,16 @@
 //! `layout_book`：一次排出「面 → 列 → 片」整棵树，两边结构同源，
 //! 不会再出现「分页算得下、渲染放不下」的丢字 / 错位。
 
-use crate::types::{Glyph, NoteSource};
+use crate::types::{Glyph, GlyphKind, NoteSource};
 
 /// 一列里的一段内容：一个正文字，或一段双行小字夹注（跨列流转时是注尾）。
 #[derive(Clone, Debug)]
 pub enum Piece {
+    /// 一个正文格。
+    ///
+    /// `GlyphKind::Hang` 时是**挤压标点**：与**前一个** `Main` 同格，
+    /// 半格账记 0（见 [`piece_units`]），渲染层把它叠画在前一格的右下角
+    /// （[`crate::punct`]）——列满时句读不另起一列占列首格。
     Main(Glyph),
     /// 双行小字夹注：一条注文的一段（本列放不下会流转到下一列列首）。
     /// 携带注文来源（`NoteSource::User` 为用户自加，深朱砂红、可改删）
@@ -130,6 +135,21 @@ impl Filler {
     /// 调用方已把预留行数收敛到 ≤ 列容量的一半以内，不会把整列吃空。
     pub fn reserve_rows(&mut self, rows: usize) {
         self.units = (self.units + rows * 2).min(self.cap);
+    }
+}
+
+/// 一片在列内的纵向占位（半格账）。
+///
+/// **挤压标点（`GlyphKind::Hang`）记 0** —— 它挤在前一字的格里、不占高度，
+/// 账上若按 2 记，它后面的注块包围盒会整体下移一格（点注文就点不准），
+/// 且列会「超容」溢出到版框外。渲染（`ancient_column` 的 look-ahead）、
+/// 反查（`hit::column_spans`）与这里三处同源，缺一即错位。
+pub fn piece_units(p: &Piece) -> usize {
+    match p {
+        Piece::Main(g) if g.is_hang() => 0,
+        Piece::Main(_) => 2,
+        Piece::Gap => 2,
+        Piece::Gloss(s, ..) => (s.chars().count() + 1) / 2,
     }
 }
 
@@ -361,6 +381,34 @@ pub fn layout_book_from_opts(
         // 列底（避尾）。两者都只让出一格空位，不丢字、不截断字形。
         let head_bad = is_head_prohibited(g.ch);
         let tail_bad = is_tail_prohibited(g.ch);
+
+        // ── 悬挂 / 挤压：句读绝不在新列列首 ───────────────────────────
+        // 本列已排满（`room() < 2`，再放一个正字就得换列）而紧随其后的是
+        // 收束型句读（。，、；：？！」』…）：**不换列**，把它挤进本列末字
+        // 那一格（渲染层叠画在右下角），一格两字、读序不变。
+        //
+        // 旧行为是换列 + 列顶插一格空白再放它——句读白白吃掉一整格，且
+        // 列首那格空着，版面上凭空多一个豁口。
+        //
+        // 条件：末片必须是个正文字（夹注块 / 空白格上无处可挤），且该格
+        // 尚未挤过（末片本身是 Hang 就不再叠，否则两枚标点会叠在一起）。
+        let squeeze = head_bad
+            && !tail_bad
+            && filler.room() < 2
+            && columns
+                .last()
+                .and_then(|c| c.last())
+                .map(|p| matches!(p, Piece::Main(g) if g.kind == GlyphKind::Char))
+                .unwrap_or(false);
+        if squeeze {
+            let mut hang = *g;
+            hang.kind = GlyphKind::Hang;
+            columns.last_mut().unwrap().push(Piece::Main(hang));
+            // 读序里仍是正文字（`Char`）：charIndex、检索、注文锚点都不变。
+            glyphs.push(*g);
+            i += 1;
+            continue;
+        }
         // 避尾：本字恰好会填满当前列（成为列底末字）且属避尾类时，提前收列，
         // 让它落下一列列首（开合类标点居列首合规）。仅当前列已有内容才收，
         // 避免空列误收。
@@ -502,8 +550,11 @@ pub fn note_boxes_in_column(
                 y += crate::west::run_cells(chars) as f32 * cell_h;
                 idx = j;
             }
-            Piece::Main(_) => {
-                y += cell_h;
+            Piece::Main(g) => {
+                // 挤压标点不占高度（与前一字同格），见 `piece_units`。
+                if !g.is_hang() {
+                    y += cell_h;
+                }
                 idx += 1;
             }
             // 避头尾空位在渲染里确确实实占了一整格（`ancient_column` 也
@@ -1615,11 +1666,7 @@ mod tests {
                     .iter()
                     .map(|c| {
                         c.iter()
-                    .map(|p| match p {
-                        Piece::Main(_) => 2,
-                        Piece::Gloss(s, ..) => (s.chars().count() + 1) / 2,
-                        Piece::Gap => 2,
-                    })
+                    .map(|p| piece_units(p))
                             .sum::<usize>()
                     })
                     .sum();
@@ -1658,11 +1705,7 @@ mod tests {
                         for (ci, col) in p.columns.iter().enumerate() {
                             let used: usize = col
                                 .iter()
-                                .map(|x| match x {
-                                    Piece::Main(_) => 2,
-                                    Piece::Gap => 2,
-                                    Piece::Gloss(s, ..) => (s.chars().count() + 1) / 2,
-                                })
+                                .map(|x| piece_units(x))
                                 .sum();
                             // 失败时把这列排出来看：正文出字、· 为避头空白、[n] 为 n 字夹注。
                             let brief: String = col
@@ -1708,11 +1751,7 @@ mod tests {
                 for (ci, col) in cols_all.iter().enumerate() {
                     let units: usize = col
                         .iter()
-                        .map(|p| match p {
-                            Piece::Main(_) => 2,
-                            Piece::Gloss(s, ..) => (s.chars().count() + 1) / 2,
-                            Piece::Gap => 2,
-                        })
+                        .map(|p| piece_units(p))
                         .sum();
                     // 避头：首片不得是避头类标点（若有让位，首片是 Gap）。
                     if let Some(Piece::Main(g)) = col.first() {
@@ -1735,6 +1774,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 列排满时紧跟的句读：**挤进末字那一格**，绝不另起一列占列首格。
+    ///
+    /// 旧行为是换列 + 列顶让出一格空白再放它——版面上凭空多一个豁口，
+    /// 句读还白吃一整格。现在它是 `GlyphKind::Hang`：半格账记 0，
+    /// 渲染层叠画在前一字的右下角（见 `crate::punct`）。
+    #[test]
+    fn full_column_hangs_the_punctuation_with_the_last_glyph() {
+        let mut b = Book::new("悬挂", "佚名");
+        b.chapters.push(Chapter {
+            title: "一".into(),
+            paragraphs: vec![Paragraph::plain("甲乙丙丁。戊己庚辛")],
+        });
+        let flow = flow_of(&b);
+        // 3 行 → 每列 6 半格 = 3 格：第 2 列「乙丙丁」正好排满，紧跟句号。
+        let pages = layout_book(&flow, |_| None, 8, 3, 0);
+        let brief = |c: &Vec<Piece>| -> String {
+            c.iter()
+                .map(|p| match p {
+                    Piece::Main(g) => g.ch.to_string(),
+                    Piece::Gap => "·".to_string(),
+                    Piece::Gloss(s, ..) => format!("[{}]", s.chars().count()),
+                })
+                .collect()
+        };
+        let col1 = &pages[0].columns[1];
+        assert_eq!(brief(col1), "乙丙丁。", "句号应与末字同格：{}", brief(col1));
+        assert!(
+            matches!(col1.last(), Some(Piece::Main(g)) if g.is_hang() && g.ch == '。'),
+            "末片应是挤压标点：{}",
+            brief(col1)
+        );
+        // 挤压后本列半格账不变（句读不占格），任何列都不超容。
+        assert_eq!(
+            col1.iter().map(piece_units).sum::<usize>(),
+            6,
+            "挤压标点不该占半格：{}",
+            brief(col1)
+        );
+        for pg in &pages {
+            for c in &pg.columns {
+                assert!(
+                    c.iter().map(piece_units).sum::<usize>() <= 6,
+                    "列超容：{}",
+                    brief(c)
+                );
+            }
+        }
+        // 列首绝不出现句读（挤压的、让位的都不许顶头）。
+        for pg in &pages {
+            for c in &pg.columns {
+                if let Some(Piece::Main(g)) = c.first() {
+                    assert!(!g.is_hang(), "列首是挤压标点：{}", brief(c));
+                    assert!(!is_head_prohibited(g.ch), "列首是避头标点『{}』", g.ch);
+                }
+            }
+        }
+        // 一字不丢：读序里它仍是正文字。
+        assert_eq!(pages.iter().map(|p| p.glyphs.len()).sum::<usize>(), flow.len());
     }
 
     // ---- Z 字型流转引擎：溢出 / 同页流转 / 跨页 pendingNote ----

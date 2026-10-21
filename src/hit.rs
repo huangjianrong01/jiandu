@@ -121,6 +121,17 @@ pub fn column_spans(items: &[Piece], cell_h: f32, west_mode: bool) -> Vec<Span> 
                 y += h;
                 i = j;
             }
+            // 挤压标点：与前一个字同格，纵向**不占位**（h = 0）。
+            // 记成 cell_h 会把它后面所有片整体下移一格 → 点字点偏。
+            Piece::Main(g) if g.is_hang() => {
+                out.push(Span {
+                    index: i,
+                    y,
+                    h: 0.0,
+                    kind: SpanKind::Main(*g),
+                });
+                i += 1;
+            }
             Piece::Main(g) => {
                 out.push(Span {
                     index: i,
@@ -173,7 +184,9 @@ pub fn glyph_boxes_in_column(
     for sp in column_spans(items, cell_h, west_mode) {
         match sp.kind {
             SpanKind::Main(g) => {
-                if g.kind == GlyphKind::Indent {
+                // 缩进占位不渲染；挤压标点与前一字同格，它的命中区就是
+                // 前一字那一格（由前一字的盒覆盖），不再另出盒。
+                if g.kind == GlyphKind::Indent || g.kind == GlyphKind::Hang {
                     continue;
                 }
                 out.push(GlyphBox {
@@ -268,7 +281,8 @@ pub fn glyph_at(page: &Page, x: f32, y: f32, f: &LeafFrame) -> Option<GlyphBox> 
             }
             match &sp.kind {
                 SpanKind::Main(g) => {
-                    if g.kind == GlyphKind::Indent {
+                    // 缩进占位 / 挤压标点不单独命中：前者无字，后者归前一字那格。
+                    if g.kind == GlyphKind::Indent || g.kind == GlyphKind::Hang {
                         return None;
                     }
                     return Some(GlyphBox {
