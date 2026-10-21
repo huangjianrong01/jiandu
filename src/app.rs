@@ -2490,11 +2490,12 @@ fn ensure_assets() {
     // 鱼尾纹：一枚朝下的实心三角，从顶边正中劈开一道窄缝，形似鱼尾（上尾朝下、下尾朝上）。
     // 注意 GPUI 只取 SVG 的 alpha 通道再用元素 text_color 上色，故 fill 必须为不透明实色。
     let top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 13\"><path d=\"M0,0 L11,0 L12,13 Z M24,0 L13,0 L12,13 Z\" fill=\"#1A150F\"/></svg>";
-    // 版心「对鱼尾」：**燕尾形路径**，绝不再用 `<rect>` 画方块。
-    // 上鱼尾上缘平直略弓、下缘中央开 ∧ 形凹口、两侧拖出流线尾翼；
-    // 下鱼尾上下翻转、开口相对。比例竖长（版心窄而高），高宽比见
-    // `banxin::FISHTAIL_ASPECT`；墨色由渲染层给 `#333333` 深灰（黑鱼尾
-    // 不取纯黑）。见 reader::banxin_tail。
+    // 版心「对鱼尾」（黑鱼尾）：**直线五边形**，既不用 `<rect>` 画方块，
+    // 也不用贝塞尔（那会画成圆滚滚的黑桃 / 蝙蝠翅膀）。
+    // 上鱼尾：顶边平直 → 右翼竖直下垂 → 中轴凹口（锐角）→ 左翼竖直下垂；
+    // 下鱼尾是它的垂直镜像，两枚开口相对。比例竖长（版心窄而高），
+    // 高宽比见 `banxin::FISHTAIL_ASPECT`；墨色由渲染层给 `#333333` 深灰
+    // （黑鱼尾不取纯黑）。见 reader::banxin_tail。
     let bx_top = dir.join("banxin_top.svg");
     let bx_bot = dir.join("banxin_bottom.svg");
     let _ = std::fs::write(
@@ -2505,7 +2506,7 @@ fn ensure_assets() {
         &bx_bot,
         crate::banxin::fishtail_svg(false, crate::banxin::FISHTAIL_ASPECT),
     );
-    // 信笺（14 列）模板的「对鱼尾」：同一条燕尾路径，比例取横展
+    // 信笺（14 列）模板的「对鱼尾」：同一条直线五边形路径，比例取横展
     // （照用户「信笺」参考图的 47×34 量级），见 reader::letter_fishtail。
     let yu_top = dir.join("yu_top.svg");
     let yu_bot = dir.join("yu_bottom.svg");

@@ -5,31 +5,47 @@
 //! （与 `west.rs` / `ruby.rs` 同路数），渲染层只负责把算好的尺寸与文字
 //! 摆上去，方便单测与回归。
 //!
-//! ## 一、鱼尾：燕尾形，不是矩形
+//! ## 一、鱼尾：**黑鱼尾**是直线几何，不是圆滚滚的桃形
 //!
-//! 早先直接 `fillRect` 两枚实心黑块，既不符合刻本形制，视觉上也极重。
-//! 现在用**路径**（`M` = moveTo、`L` = lineTo、`C` = 三次贝塞尔）画真正的
-//! 燕尾（对鱼尾）：
+//! 宋刻本、明刻本里的「黑鱼尾」是刀刻出来的**锐利几何图形**：顶边一
+//! 刀平直，两侧竖直下垂成一对尾翼，中央劈出一道 V 形凹口——**通体直
+//! 线，没有一处圆润的曲线**。早先用 `<rect>` 画两枚实心黑块（不合形制），
+//! 中间一度改用贝塞尔画「燕尾」（画成了黑桃 / 蝙蝠翅膀，圆滚滚的，
+//! 更错）。现在严格按刻本的五个折点画**多边形**，只有 `M` / `L` / `Z`，
+//! 严禁任何 `C`（贝塞尔）：
 //!
 //! ```text
-//!       上鱼尾（∧ 口朝下）            下鱼尾（∨ 口朝上）
-//!     ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄          ▄▄            ▄▄
-//!     ██████████████████         ████          ████
-//!     ████▄▄▄▄▄▄▄▄▄▄████        ██████▄▄  ▄▄██████
-//!      ████  ▝▀▀▘  ████           ▀████▄▄▄▄████▀
-//!       ▀██         ██▀              ▀███▄▄███▀
+//!             cx-w/2        cx        cx+w/2
+//!   上鱼尾  ████████████████████████████   y = cy          顶边（贴版框）
+//!          ████████████████████████████
+//!          ████████████        ████████   y = cy+h·0.3     凹口顶点（锐角）
+//!          ████████                ████
+//!          ████                    ████   y = cy+h·0.6     尾翼下缘
+//!
+//!   下鱼尾  ████                    ████   y = by-h·0.6     尾翼上缘
+//!          ████████                ████
+//!          ████████████        ████████   y = by-h·0.3     凹口顶点（锐角）
+//!          ████████████████████████████
+//!          ████████████████████████████   y = by           底边
 //! ```
 //!
-//! * 上缘平直略弓（贴版框的一边），两侧外缘下行为**肩**（最宽处）；
-//! * 自肩收出一对**流线尾翼**，翼尖略向内倾，形似鱼尾分叉；
-//! * 中央开一道**凹口**（上鱼尾 Λ、下鱼尾 V），两枚**开口相对**；
-//! * 全部坐标走贝塞尔，另加 ±0.7 的确定性抖点，缩到几十像素时略带
-//!   木刻毛边，不是矢量图那种绝对平直的机器边。
+//! 折点（上鱼尾，`cx` 中缝中线、`cy` 顶边、`w` 宽、`h` 高）：
+//!
+//! 1. 左上 `(cx-w/2, cy)` → 2. 右上 `(cx+w/2, cy)` → 3. 右翼下角
+//!    `(cx+w/2, cy+h·0.6)` → 4. 中心凹口 `(cx, cy+h·0.3)` → 5. 左翼下角
+//!    `(cx-w/2, cy+h·0.6)` → 闭合。下鱼尾是它的**垂直镜像**（底边 `by`）。
+//!
+//! * 顶边贴版框，两侧外缘**竖直**下垂——刀刻的行刀，不是手绘的弧；
+//! * 中央凹口的顶点在中轴上（`(cx, cy+h·0.3)`），比两侧尾翼下缘
+//!   （`cy+h·0.6`）高一截，于是缺口是**开口朝下的锐角 V**；
+//! * 两枚上下相对（上鱼尾凹口朝下、下鱼尾凹口朝上），中间那块空当
+//!   正是书口文字（书名 / 卷次 / 叶码「二十三」）的地盘；
+//! * **不加抖点**：毛边加在直线上只会看成锯齿，锐利才是刻本的味道。
 //!
 //! > 尺寸上的硬约束：鱼尾宽不得超过一格字宽（界栏）。宽定在版心的
-//! > 0.78（两侧各留一点余白），高按 **1.5 字**给（`FISHTAIL_H_CHARS`），
-//! > 再用高宽比 1.75 封住——两道约束一起把鱼尾压在「一列宽、一字半高」
-//! > 的刻本尺度里，既不像原先的黑方块那样压纸，也不会拉成两条竖杠。
+//! > 0.78（两侧各留一点余白），高按 **1.2 字**给（`FISHTAIL_H_CHARS`），
+//! > 再用高宽比封住——两道约束一起把鱼尾压在「一列宽、一字二高」的
+//! > 刻本尺度里，既不像黑方块那样压纸，也给中间的书口字留出足够的空当。
 //! > 要更大 / 更小改这两个数即可，渲染层不用动。
 //!
 //! ## 二、折痕：极细虚线
@@ -44,36 +60,28 @@
 //! 朱印，再按「叶码 → 卷次 → 书名 → 篇题」的优先级把剩余高度分下去，
 //! 分不够就截字（篇题至少要两个字才肯露面），绝不溢出、绝不压字。
 
-/// 鱼尾宽 / 版心宽：不超过界栏，两侧各留一点余白。
+/// 鱼尾宽 / 版心宽：约一列字宽的八成（用户定的 `w ≈ 列宽 × 0.8`），
+/// 且不超过界栏——两侧各留一点余白。
 pub const FISHTAIL_W_RATIO: f32 = 0.78;
 /// 信笺（14 列）的鱼尾更宽：它独占一列，照参考图几乎顶满。
 pub const LETTER_TAIL_W_RATIO: f32 = 0.92;
-/// 版心鱼尾的**高 / 宽**：竖长的燕尾。刻意略低于「1.5 字」的上限：
-/// 39 宽 × 1.65 ≈ 64 ≈ 1.43 字——再拉高（1.9）两枚尾翼就细成獠牙，
-/// 反而比原先的黑方块更刺眼。
-pub const FISHTAIL_ASPECT: f32 = 1.65;
+/// 版心鱼尾的**高 / 宽**：竖长的黑鱼尾。
+pub const FISHTAIL_ASPECT: f32 = 1.55;
 /// 信笺鱼尾的高 / 宽：横展（照用户「信笺」参考图的比例）。
 pub const LETTER_TAIL_ASPECT: f32 = 0.78;
-/// 鱼尾高的目标值与硬上限（以「字高」为单位，用户定的 1.5 ~ 2 字）。
-/// 实际值受 `FISHTAIL_ASPECT` 的宽度封顶约束，通常落在 1.0~1.2 字。
-pub const FISHTAIL_H_CHARS: f32 = 1.5;
+/// 鱼尾高（以「字高」为单位）：用户定的 **1.2 倍行高**，另留 2.0 的硬上限。
+/// 实际值还受 `FISHTAIL_ASPECT` 的宽度封顶约束。
+pub const FISHTAIL_H_CHARS: f32 = 1.2;
 pub const FISHTAIL_H_MAX_CHARS: f32 = 2.0;
-/// 骨架：上缘 / 肩 / 凹口顶点 / 尾尖的**相对高**（0 = 上缘，1 = 底）。
-pub const Y_TOP: f32 = 0.06;
-pub const Y_SHOULDER: f32 = 0.24;
-pub const Y_APEX: f32 = 0.40;
-pub const Y_TIP: f32 = 0.97;
-/// 骨架：右半的四个关键 x（左半一律取 `100 - x`，镜像不会再写反）。
-pub const X_TIP: f32 = 76.0;
-pub const X_INNER: f32 = 65.0;
-pub const X_OUTER: f32 = 92.0;
-/// 信笺鱼尾不追求 1.5 字高（那会把横展的燕尾拉成竖条）。
+/// **骨架**（高的相对比例，0 = 顶边）：两侧尾翼下缘的深度。
+pub const TAIL_WING: f32 = 0.60;
+/// **骨架**：中央凹口顶点的深度——比尾翼下缘浅，缺口因此是锐角 V。
+pub const TAIL_APEX: f32 = 0.30;
+/// 信笺鱼尾不追求 1.2 字高（那会把横展的鱼尾拉成竖条）。
 pub const LETTER_TAIL_H_CHARS: f32 = 1.2;
 /// 下限：再窄的屏也认得出这是枚鱼尾。
 pub const FISHTAIL_W_MIN: f32 = 9.0;
 pub const FISHTAIL_H_MIN: f32 = 10.0;
-/// 抖点幅度（viewBox 100 单位下 ±0.7）：木刻毛边。
-pub const JITTER: f32 = 1.4;
 
 /// **黑鱼尾**的墨色：深灰 `#333333`，不是纯黑——纯黑在纸面上太跳，
 /// 也压过了正文的墨色。深底（夜读）时向纸色兑淡，否则整枚看不见。
@@ -88,9 +96,10 @@ pub const FOLD_GAP: f32 = 4.0;
 
 /// 鱼尾尺寸：给定版心宽、字高与比例，算出（宽, 高）。
 ///
-/// 高取 `字高 × FISHTAIL_H_CHARS`，再用「宽 × 比例」封顶——鱼尾再想要
-/// 1.5 字高，也不能长得比版心宽还离谱（那会变成两条竖杠）；下限保护
-/// 窄屏。要更大 / 更小改上面四个常量即可，渲染层不用动。
+/// 高取 `字高 × FISHTAIL_H_CHARS`（用户定的 1.2 倍行高），再用
+/// 「宽 × 比例」封顶——鱼尾再想要 1.2 字高，也不能长得比版心宽还离谱
+/// （那会变成两条竖杠）；下限保护窄屏。要更大 / 更小改上面四个常量
+/// 即可，渲染层不用动。
 pub fn tail_size(gutter_w: f32, cell_h: f32, w_ratio: f32, aspect: f32, max_chars: f32) -> (f32, f32) {
     let w = (gutter_w * w_ratio)
         .min((gutter_w - 2.0).max(FISHTAIL_W_MIN))
@@ -139,93 +148,62 @@ pub fn fold_dashes(len: f32, dash: f32) -> (usize, f32) {
     (n, gap.max(0.5))
 }
 
-/// 生成一枚鱼尾的 SVG（`top = true` 上鱼尾，开口朝下；`false` 下鱼尾，
-/// 开口朝上——两枚相对成「对鱼尾」）。
+/// 一枚鱼尾的**五个折点**（viewBox 坐标：宽 100、高 `h`）。
+///
+/// 上鱼尾（`top = true`，顶边在 y=0、凹口朝下）：
+///
+/// ```text
+///   1 左上 (0, 0)  →  2 右上 (100, 0)  →  3 右翼下角 (100, h·0.6)
+///                  →  4 中心凹口 (50, h·0.3)  →  5 左翼下角 (0, h·0.6)
+/// ```
+///
+/// 下鱼尾是上鱼尾的**垂直镜像**（底边 `by = h`，凹口朝上），故整枚
+/// `y → h - y`——镜像只在这一处体现，不会再写反。
+///
+/// 全是 `f32` 常量运算，**绝无贝塞尔**：刻本的刀是直的，鱼尾就得是
+/// 直线多边形。要改形制动这两个骨架常量即可（`TAIL_WING` / `TAIL_APEX`）。
+pub fn fishtail_points(top: bool, h: f32) -> [(f32, f32); 5] {
+    let wing = h * TAIL_WING;
+    let apex = h * TAIL_APEX;
+    let up = [
+        (0.0, 0.0),   // 1 左上
+        (100.0, 0.0), // 2 右上
+        (100.0, wing), // 3 右翼下角
+        (50.0, apex),  // 4 中心凹口（锐角）
+        (0.0, wing),   // 5 左翼下角
+    ];
+    if top {
+        up
+    } else {
+        up.map(|(x, y)| (x, h - y))
+    }
+}
+
+/// 生成一枚鱼尾的 SVG（`top = true` 上鱼尾，凹口朝下；`false` 下鱼尾，
+/// 凹口朝上——两枚相对成「对鱼尾」）。
 ///
 /// `aspect` 是 高/宽：版心用 `FISHTAIL_ASPECT`（竖长），信笺用
 /// `LETTER_TAIL_ASPECT`（横展）。viewBox 恒为 `100 × 100×aspect`。
 ///
-/// **绝不用 `<rect>`**：整枚由一条闭合路径构成——上缘 `C` 略弓、两侧
-/// 外缘 `C` 下行、尾翼内外缘 `C` 收成流线、中央 `C` 拐出凹口顶点。
-/// GPUI 只取 SVG 的 alpha 通道再用元素 text_color 上色，故 fill 必须
-/// 是不透明实色。
+/// **绝不用 `<rect>`，也绝不用 `C`（贝塞尔）**：整枚是 `fishtail_points`
+/// 五个折点连成的闭合多边形，只有 `M` / `L` / `Z`。GPUI 只取 SVG 的
+/// alpha 通道再用元素 text_color 上色，故 fill 必须是不透明实色。
 pub fn fishtail_svg(top: bool, aspect: f32) -> String {
     let a = aspect.clamp(0.45, 2.6);
     let h = 100.0 * a;
-    // 归一化骨架（宽 100、高 100×aspect）。右半四个关键 x 由常量给，
-    // 左半一律 `100 - x`——镜像只在这一处体现，不会再写反。
-    let y_top = h * Y_TOP;
-    let y_sh = h * Y_SHOULDER;
-    let y_ax = h * Y_APEX;
-    let y_tip = h * Y_TIP;
-    let mut pen = Pen { h, top, n: 0 };
-    let mut t: Vec<String> = Vec::new();
-    t.push(format!("M{}", pen.p(3.0, y_top)));
-    // 上缘：一条略向上弓的横线（刻本里鱼尾的上缘贴着版框，微微鼓起）。
-    t.push("C".into());
-    t.push(pen.p(32.0, y_top - h * 0.030));
-    t.push(pen.p(68.0, y_top - h * 0.030));
-    t.push(pen.p(97.0, y_top));
-    // 右外缘：贴边下行到肩（最宽处）。
-    t.push("C".into());
-    t.push(pen.p(100.0, y_top + (y_sh - y_top) * 0.50));
-    t.push(pen.p(100.0, y_sh - (y_sh - y_top) * 0.35));
-    t.push(pen.p(99.0, y_sh));
-    // 右外缘：自肩收向尾尖（尾翼外缘，先外凸后内收的流线）。
-    t.push("C".into());
-    t.push(pen.p(99.0, y_sh + (y_tip - y_sh) * 0.40));
-    t.push(pen.p(X_OUTER, y_sh + (y_tip - y_sh) * 0.80));
-    t.push(pen.p(X_TIP, y_tip));
-    // 右尾内缘：尾尖回升到凹口顶点——横坐标一路内收，凹口的 V 壁
-    // 因此是弧而不是直边（「优美的凹陷」全在这一段）。
-    t.push("C".into());
-    t.push(pen.p(X_INNER, y_ax + (y_tip - y_ax) * 0.58));
-    t.push(pen.p(X_INNER - 6.0, y_ax + (y_tip - y_ax) * 0.22));
-    t.push(pen.p(50.0, y_ax));
-    // 左尾内缘：顶点下行到左尾尖（镜像）。
-    t.push("C".into());
-    t.push(pen.p(100.0 - X_INNER + 6.0, y_ax + (y_tip - y_ax) * 0.22));
-    t.push(pen.p(100.0 - X_INNER, y_ax + (y_tip - y_ax) * 0.58));
-    t.push(pen.p(100.0 - X_TIP, y_tip));
-    // 左外缘：自左尾尖回升到肩，再回到上缘。
-    t.push("C".into());
-    t.push(pen.p(100.0 - X_OUTER, y_sh + (y_tip - y_sh) * 0.80));
-    t.push(pen.p(1.0, y_sh + (y_tip - y_sh) * 0.40));
-    t.push(pen.p(1.0, y_sh));
-    t.push("C".into());
-    t.push(pen.p(0.0, y_sh - (y_sh - y_top) * 0.35));
-    t.push(pen.p(0.0, y_top + (y_sh - y_top) * 0.50));
-    t.push(pen.p(3.0, y_top));
-    t.push("Z".into());
+    let d: Vec<String> = fishtail_points(top, h)
+        .iter()
+        .enumerate()
+        .map(|(i, (x, y))| {
+            let cmd = if i == 0 { 'M' } else { 'L' };
+            format!("{}{:.2} {:.2}", cmd, x, y)
+        })
+        .collect();
     format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 {:.1}\"><path d=\"{}\" fill=\"#333333\"/></svg>",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 {:.1}\"><path d=\"{} Z\" fill=\"#333333\"/></svg>",
         h,
-        t.join(" ")
+        d.join(" ")
     )
-}
-
-/// 画路径用的小笔：负责「下鱼尾 = 上鱼尾上下翻转」与确定性抖点。
-struct Pen {
-    h: f32,
-    top: bool,
-    n: usize,
-}
-
-impl Pen {
-    /// 取一个点：`top = false` 时整枚沿水平中轴翻转（开口朝上，与
-    /// 上鱼尾相对）；每个坐标再加一个由序号决定的微小抖点（木刻毛边）。
-    fn p(&mut self, x: f32, y: f32) -> String {
-        self.n += 1;
-        let j = |i: usize| -> f32 {
-            let v = (i.wrapping_mul(2_654_435_761) % 997) as f32;
-            (v / 997.0 - 0.5) * JITTER
-        };
-        let y = if self.top { y } else { self.h - y };
-        // 抖点后夹回 viewBox，免得边缘被裁出一段不该有的直边。
-        let x = (x + j(self.n)).clamp(0.0, 100.0);
-        let y = (y + j(self.n + 61)).clamp(0.0, self.h);
-        format!("{:.1} {:.1}", x, y)
-    }
 }
 
 /// 版心的一行竖排文字（书名 / 卷次 / 篇题 / 叶码同型）。
@@ -408,9 +386,11 @@ mod tests {
     fn tail_never_wider_than_the_gutter() {
         let (w, h) = banxin_tail_size(GW, CH);
         assert!(w <= GW, "鱼尾宽 {w} 超过界栏 {GW}");
-        // 高按 1.5 字高起算，但封顶在「宽 × 比例」——不会长成两条竖杠。
+        // 高按 1.2 倍行高起算，但封顶在「宽 × 比例」——不会长成两条竖杠。
         assert!(h <= CH * FISHTAIL_H_MAX_CHARS + 0.01, "鱼尾高 {h} 超过 2 字");
         assert!(h >= CH * 1.0, "鱼尾高 {h} 不足 1 字高（太瘦弱）");
+        // 高约 1.2 字：再多就把中间书口（叶码「二十三」）的地盘吃掉了。
+        assert!(h <= CH * 1.35, "鱼尾高 {h} 超过 1.2 字，中间放不下叶码");
     }
 
     #[test]
@@ -426,12 +406,52 @@ mod tests {
             let s = fishtail_svg(top, FISHTAIL_ASPECT);
             assert!(!s.contains("<rect"), "不许再用矩形：{s}");
             assert!(s.contains("<path d=\"M"), "必须是路径：{s}");
-            // 贝塞尔：一枚燕尾至少七段 C（上缘 / 两侧外缘 / 两侧内缘 / 两肩）。
-            assert!(s.matches("C").count() >= 7, "曲线段太少：{s}");
-            // viewBox 高 = 100 × 高宽比（1.30 → 130.0）。
+            // **严禁贝塞尔**：黑鱼尾是刀刻的直线几何，一处 C 都不能有。
+            assert!(!s.contains('C'), "不许用贝塞尔曲线（要锐利的直线）：{s}");
+            // 一枚五边形：1 个起点 + 4 段 lineTo。
+            assert_eq!(s.matches('L').count(), 4, "折点数不对：{s}");
+            // viewBox 高 = 100 × 高宽比。
             let want = format!("viewBox=\"0 0 100 {:.1}\"", 100.0 * FISHTAIL_ASPECT);
             assert!(s.contains(&want), "viewBox 错（应为 {want}）：{s}");
         }
+    }
+
+    #[test]
+    fn fishtail_follows_the_five_point_skeleton() {
+        let h = 100.0 * FISHTAIL_ASPECT;
+        // 上鱼尾：左上 → 右上 → 右翼下角 → 中心凹口 → 左翼下角。
+        let up = fishtail_points(true, h);
+        let want = [
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, h * TAIL_WING),
+            (50.0, h * TAIL_APEX),
+            (0.0, h * TAIL_WING),
+        ];
+        assert_eq!(up, want, "上鱼尾折点偏离刻本骨架：{up:?}");
+        // 凹口顶点必须比尾翼下缘**高**（浅），缺口才是锐角 V、开口朝下。
+        assert!(TAIL_APEX < TAIL_WING);
+        // 下鱼尾 = 上鱼尾的垂直镜像（底边 by = h）。
+        let down = fishtail_points(false, h);
+        for i in 0..5 {
+            assert!((down[i].0 - want[i].0).abs() < 1e-6, "镜像不该动 x：{down:?}");
+            assert!(
+                (down[i].1 - (h - want[i].1)).abs() < 1e-6,
+                "下鱼尾必须是垂直镜像：{down:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_tails_stay_inside_their_own_half() {
+        // 上鱼尾的墨全在上半、下鱼尾全在下半——中间那块空当留给书口字。
+        let h = 100.0 * FISHTAIL_ASPECT;
+        let up = fishtail_points(true, h);
+        let down = fishtail_points(false, h);
+        let max_up = up.iter().map(|(_, y)| *y).fold(0.0f32, f32::max);
+        let min_down = down.iter().map(|(_, y)| *y).fold(h, f32::min);
+        assert!(max_up <= h * TAIL_WING + 0.01, "上鱼尾探过头：{max_up}");
+        assert!(min_down >= h * (1.0 - TAIL_WING) - 0.01, "下鱼尾探过头：{min_down}");
     }
 
     #[test]
@@ -443,7 +463,7 @@ mod tests {
             let s = fishtail_svg(top, FISHTAIL_ASPECT);
             let d = s.split("d=\"").nth(1).unwrap().split('"').next().unwrap();
             let nums: Vec<f32> = d
-                .replace(['M', 'C', 'Z'], " ")
+                .replace(['M', 'L', 'Z'], " ")
                 .split_whitespace()
                 .filter_map(|v| v.parse().ok())
                 .collect();
@@ -466,15 +486,15 @@ mod tests {
         for aspect in [FISHTAIL_ASPECT, LETTER_TAIL_ASPECT] {
             for top in [true, false] {
                 let s = fishtail_svg(top, aspect);
-                assert!(s.contains("Z\""), "路径未闭合：{s}");
+                assert!(s.contains('Z'), "路径未闭合：{s}");
                 let d = s.split("d=\"").nth(1).unwrap().split('"').next().unwrap();
                 let nums: Vec<f32> = d
-                    .replace(['M', 'C', 'Z'], " ")
+                    .replace(['M', 'L', 'Z'], " ")
                     .split_whitespace()
                     .filter_map(|v| v.parse().ok())
                     .collect();
-                // 1 个起点 + 7 段 × 3 个控制点 = 22 个点。
-                assert_eq!(nums.len(), 44, "点数不对：{}", nums.len() / 2);
+                // 一枚五边形 = 5 个折点 = 10 个数。
+                assert_eq!(nums.len(), 10, "点数不对：{}", nums.len() / 2);
                 let h = 100.0 * aspect;
                 for c in nums.chunks(2) {
                     assert!((-0.01..=100.01).contains(&c[0]), "x 越界：{}", c[0]);

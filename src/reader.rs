@@ -260,13 +260,15 @@ fn fish_tail_ink(width: f32, top: bool, color: u32) -> Div {
         )
 }
 
-/// 版心「对鱼尾」（黑鱼尾）：**燕尾形路径**——上缘平直略弓、下缘中央
-/// 开 ∧ / ∨ 形凹口、两侧拖出流线尾翼，上下两枚**开口相对**。
+/// 版心「对鱼尾」（黑鱼尾）：**直线几何多边形**——顶边一刀平直、两侧
+/// 竖直下垂成尾翼、中央劈出 V 形凹口，上下两枚**开口相对**。
 ///
 /// 早先是两枚 `<rect>` 实心黑块（33×12），既不合刻本形制，视觉上也极
-/// 重。现在整枚由贝塞尔路径画出（`banxin::fishtail_svg`），尺寸由
-/// `banxin::banxin_tail_size` 按「宽不越界栏、高约一字半」算好传进来。
-/// 墨色渲染层给 `#333333` 深灰——黑鱼尾不取纯黑。见 app::ensure_assets。
+/// 重；中间一度改用贝塞尔画「燕尾」，画成了圆滚滚的黑桃 / 蝙蝠翅膀。
+/// 现在整枚只有 `M` / `L` / `Z`（`banxin::fishtail_svg`），尺寸由
+/// `banxin::banxin_tail_size` 按「宽不越界栏、高约 1.2 倍行高」算好
+/// 传进来。墨色渲染层给 `#333333` 深灰——黑鱼尾不取纯黑。见
+/// app::ensure_assets。
 fn banxin_tail(w: f32, h: f32, top: bool, color: u32) -> Div {
     let path = if top {
         "banxin_top.svg"
@@ -289,7 +291,7 @@ fn banxin_tail(w: f32, h: f32, top: bool, color: u32) -> Div {
         )
 }
 
-/// 信笺「对鱼尾」：与版心同一条燕尾路径，比例取**横展**
+/// 信笺「对鱼尾」：与版心同一条直线多边形路径，比例取**横展**
 /// （`banxin::LETTER_TAIL_ASPECT`，照用户「信笺」参考图的 47×34 量级）。
 /// 见 app::ensure_assets。
 fn letter_fishtail(w: f32, h: f32, top: bool, color: u32) -> Div {
@@ -3056,8 +3058,8 @@ impl Root {
         col = col.child(edge(false, 3.0, 16.0));
         col = col.child(edge(false, 1.0, 22.0));
         col = col.child(div().h(px(head)));
-        // 上鱼尾：∧ 口朝下（燕尾路径，深灰 `#333333`，见 `banxin_tail`）。
-        // 尺寸由 `banxin::layout` 按「宽不越界栏、高约一字半」算好。
+        // 上鱼尾：凹口朝下（直线多边形，深灰 `#333333`，见 `banxin_tail`）。
+        // 尺寸由 `banxin::layout` 按「宽不越界栏、高约 1.2 倍行高」算好。
         col = col.child(banxin_tail(lay.tail_w, lay.tail_h, true, t.fish_ink()));
         col = col.child(div().h(px(lay.gap)));
         // 书名 → 卷次 → 篇题（极小号宋体，一字一格竖排）。
