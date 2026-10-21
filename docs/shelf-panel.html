@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>笺读 · 书架版式结构稿（书衣 / 题签 / 悬停操作栏）</title>
+<style>
+/* ============================================================
+   笺读书架 · 版式结构稿
+   色调：宣纸米黄的桌面 + 瓷青（暗青）的书衣
+   四角色字体与 App 的 fonts::FONT_CONFIGS 一一对应
+   ============================================================ */
+:root{
+  /* —— 纸与墨 —— */
+  --desk:        #EDE4D0;  /* 桌面：宣纸米黄，托住一本本暗青书衣 */
+  --paper:       #F7F1E3;  /* 顶栏 / 页签条 */
+  --ink:         #2B2622;  /* 正文墨 */
+  --ink-soft:    #6B6357;  /* 次级墨（页签名 / 按钮字） */
+  --ink-faint:   #9A9184;  /* 三级墨（本数等旁注小字） */
+  --hair:        #C9BDA6;  /* 极细墨线 */
+  /* —— 书衣 —— */
+  --cloth:       #2F4858;  /* 瓷青布面 */
+  --cloth-spine: #1B2B36;  /* 书脊线（比书衣再深一档） */
+  --cloth-edge:  #44607A;  /* 布面压出的棱 */
+  --cloth-faint: #A9B6BD;  /* 书衣上的浅字 */
+  /* —— 题签 —— */
+  --slip:        #F3ECD9;  /* 宣纸题签 */
+  --slip-edge:   #8A6A52;  /* 签边那道浅褐 */
+  --slip-ink:    #2A241E;  /* 签上墨字 */
+  /* —— 朱 —— */
+  --cinnabar:    #A63A2B;
+  --cinnabar-lt: #C98174;  /* 暗底上的淡朱（进度） */
+
+  /* 四角色字体：与 App 的 FontRole::{Main,Note,Ui,Latin} 同序 */
+  --font-main:  "WenJin Mincho","Noto Serif SC",serif;      /* 正文·题名 */
+  --font-note:  "LXGW WenKai","KaiTi",serif;                /* 批注·管理栏 */
+  --font-ui:    "Source Han Sans SC","PingFang SC",sans-serif;
+  --font-latin: "CMU Serif",serif;                          /* 西文与数字 */
+}
+
+*{box-sizing:border-box;}
+body{
+  margin:0; background:var(--desk); color:var(--ink);
+  font-family:var(--font-ui);
+  -webkit-font-smoothing:antialiased;
+}
+.note{font-family:var(--font-note); font-size:11px; color:var(--ink-faint);
+      line-height:1.9; max-width:820px; margin:18px auto 0; padding:0 20px;}
+
+/* ===================== 顶栏 ===================== */
+.topbar{
+  display:flex; align-items:center; gap:14px;
+  padding:7px 18px; background:var(--paper);
+  border-bottom:1px solid var(--hair);
+}
+.brand{font-family:var(--font-main); font-size:16px; color:var(--cinnabar);}
+.brand small{font-family:var(--font-ui); font-size:11px; color:#8A8175; margin-left:6px;}
+.spacer{flex:1;}
+
+/* 朱砂印章：方印、朱底白字、字竖排。古印是方的，不做胶囊。 */
+.seal{
+  width:34px; height:34px; border-radius:2px; background:var(--cinnabar);
+  display:flex; align-items:center; justify-content:center;
+  cursor:pointer; transition:filter .18s ease;
+}
+.seal span{
+  writing-mode:vertical-rl;              /* 竖排两字 */
+  font-family:var(--font-main);
+  font-size:14px; letter-spacing:1px;
+  color:#F7F1E3;                          /* 纸色的字，不是纯白 */
+}
+.seal:hover{filter:brightness(1.08);}     /* GPUI 无 transform，App 里改用提亮表达 */
+
+/* 毛笔下划线输入框：没有灰底、没有边框、没有圆角，只有一道墨线 */
+.search{width:156px; cursor:pointer;}
+.search .row{display:flex; align-items:center; justify-content:space-between; height:22px; gap:6px;}
+.search input{
+  flex:1; min-width:0; border:0; outline:0; background:transparent;
+  font-family:var(--font-main); font-size:12px; color:var(--ink);
+  padding:0;
+}
+.search input::placeholder{color:var(--ink-faint);}
+.search .clear{font-size:10px; color:var(--ink-faint); cursor:pointer;}
+.search .stroke{height:1px; background:var(--hair); transition:background .18s ease;}
+.search:focus-within .stroke,
+.search.on .stroke{background:var(--cinnabar);}   /* 落笔转朱 */
+
+/* 墨字 + 下划线按钮（顶栏次要动作） */
+.inkbtn{display:flex; flex-direction:column; align-items:center; gap:3px; cursor:pointer;}
+.inkbtn b{font-family:var(--font-main); font-size:12px; font-weight:400; color:var(--ink-soft);}
+.inkbtn i{display:block; width:100%; height:1px; background:var(--hair);}
+.inkbtn.strong b{color:var(--cinnabar);}
+.inkbtn.strong i{background:var(--cinnabar);}
+
+/* ===================== 四部页签 ===================== */
+.tabs{display:flex; align-items:center; gap:22px; padding:8px 18px 0;
+      background:var(--paper); border-bottom:1px solid var(--hair);}
+.tab{display:flex; flex-direction:column; align-items:center; gap:4px;
+     padding-bottom:6px; cursor:pointer;}
+.tab .name{display:flex; align-items:flex-end; gap:4px;}
+.tab .name b{font-family:var(--font-main); font-size:13px; font-weight:400; color:var(--ink-soft);}
+.tab .name em{font-family:var(--font-latin); font-style:normal; font-size:9.5px; color:var(--ink-faint);}
+.tab.on .name b{color:var(--cinnabar);}
+/* 选中：极细朱线（1px）。未选：虚墨线（2 实 2 虚） */
+.tab .rule{width:100%; height:1px; background:var(--cinnabar);}
+.tab:not(.on) .rule{
+  width:44px; background:transparent;
+  background-image:linear-gradient(to right, var(--ink-faint) 0 2px, transparent 2px 4px);
+  background-size:4px 1px; background-repeat:repeat-x;
+}
+
+/* ===================== 书衣网格 ===================== */
+.grid{display:flex; flex-wrap:wrap; gap:18px; padding:18px;}
+
+/* 一张书衣：156 × 244 */
+.book{position:relative; width:156px; height:244px;}
+.face{
+  position:relative; width:100%; height:100%; overflow:hidden;
+  background:var(--cloth);
+  border:1px solid var(--cloth-edge);
+  border-radius:2px;
+  /* 右下角**微小**投影：偏移小、模糊小、spread 为负（收在书衣里） */
+  box-shadow:3px 4px 9px -2px rgba(0,0,0,.28);
+  cursor:pointer;
+}
+/* 书脊线：竖排自右向左翻，书脊在右 */
+.face .spine{position:absolute; top:0; right:0; width:4px; height:100%; background:var(--cloth-spine);}
+
+/* 题签：左上角一枚淡淡的宣纸小签 */
+.slip{
+  position:absolute; top:16px; left:14px; width:58px;
+  display:flex; flex-direction:column; align-items:center; gap:6px;
+  padding:7px 4px 8px;
+  background:var(--slip);
+  border:1px solid var(--slip-edge);
+  border-radius:1px;
+}
+/* 顶端朱丝短线：题签的压印收头 */
+.slip .thread{width:14px; height:2px; background:var(--cinnabar); flex:0 0 auto;}
+.slip .title{
+  writing-mode:vertical-rl;              /* 书名竖排 */
+  font-family:var(--font-main);
+  font-size:17px; line-height:1.06; letter-spacing:1px;
+  color:var(--slip-ink); white-space:nowrap;
+  max-height:132px;
+}
+/* 西文书名：**横排**（不竖排拉长），字号更小、排满折行 */
+.slip .title.latin{
+  writing-mode:horizontal-tb;
+  font-family:var(--font-latin);
+  font-size:10px; line-height:1.34; letter-spacing:0;
+  text-align:center; white-space:normal;
+  max-width:46px; max-height:132px; overflow:hidden;
+}
+/* 备选：Web 版可以真的转 90° 横躺（GPUI 0.2.2 无元素级 transform，做不到）
+.slip .title.latin{ transform:rotate(90deg); transform-origin:left top; } */
+
+/* 角上极小的竖排小字：作者 / 卷册 / 进度 */
+.mini{
+  writing-mode:vertical-rl;
+  font-family:var(--font-main);
+  font-size:9.5px; line-height:1.24; letter-spacing:.5px;
+  color:var(--cloth-faint); white-space:nowrap;
+}
+.face .author{position:absolute; left:16px; bottom:14px; max-height:52px; overflow:hidden;}
+.face .meta{
+  position:absolute; right:24px; top:30px;
+  display:flex; flex-direction:row-reverse; gap:6px;   /* 右起先是卷册 */
+  max-height:150px; overflow:hidden;
+}
+.face .meta .pct{color:var(--cinnabar-lt);}
+
+/* ===================== 悬停操作栏（淡入） ===================== */
+.manage{
+  position:absolute; left:4px; bottom:4px; width:148px; height:26px;
+  display:flex; align-items:center; justify-content:center;
+  border-radius:2px;
+  background:rgba(20,16,10,.80);
+  /* 半透明 + 淡入：默认 opacity 0 且微微下沉，hover 时浮上来 */
+  opacity:0; transform:translateY(4px);
+  transition:opacity .18s ease, transform .18s ease;
+  pointer-events:none;
+}
+.book:hover .manage{opacity:1; transform:translateY(0); pointer-events:auto;}
+.manage a{
+  font-family:var(--font-note);            /* 极小楷体 */
+  font-size:9px; color:#D8CFC0; text-decoration:none;
+  padding:2px 5px; cursor:pointer;
+}
+.manage a.warn{color:#E0867A;}
+.manage a:hover{color:#FFF8EA;}
+</style>
+</head>
+<body>
+
+<!-- ===================== 顶栏 ===================== -->
+<div class="topbar">
+  <span class="brand">笺读<small>JianDu · 为阅读创造环境</small></span>
+  <span class="spacer"></span>
+
+  <!-- 继续阅读：朱砂印章（替代原来的现代胶囊按钮） -->
+  <div class="seal" title="继续阅读"><span>续读</span></div>
+
+  <!-- 搜索：毛笔下划线输入框（无灰底 / 无边框 / 无圆角） -->
+  <label class="search">
+    <div class="row">
+      <input placeholder="搜书名 / 作者" />
+    </div>
+    <div class="stroke"></div>
+  </label>
+
+  <!-- 次要动作：墨字 + 一道极细下划线 -->
+  <div class="inkbtn"><b>排序 · 最近</b><i></i></div>
+  <div class="inkbtn"><b>视图 · 书衣</b><i></i></div>
+  <div class="inkbtn"><b>导入</b><i></i></div>
+  <div class="inkbtn"><b>书库</b><i></i></div>
+</div>
+
+<!-- ===================== 四部页签 ===================== -->
+<div class="tabs">
+  <div class="tab on"><div class="name"><b>全部</b><em>12</em></div><div class="rule"></div></div>
+  <div class="tab"><div class="name"><b>经</b><em>3</em></div><div class="rule"></div></div>
+  <div class="tab"><div class="name"><b>史</b><em>4</em></div><div class="rule"></div></div>
+  <div class="tab"><div class="name"><b>子</b><em>2</em></div><div class="rule"></div></div>
+  <div class="tab"><div class="name"><b>集</b><em>3</em></div><div class="rule"></div></div>
+  <div class="tab"><div class="name"><b>自定</b><em>0</em></div><div class="rule"></div></div>
+</div>
+
+<!-- ===================== 书衣网格 ===================== -->
+<div class="grid">
+
+  <!-- 中文书名：题签内竖排 -->
+  <div class="book">
+    <div class="face">
+      <div class="spine"></div>
+      <div class="slip">
+        <div class="thread"></div>
+        <div class="title">王右丞集</div>
+      </div>
+      <div class="mini author">王维 著</div>
+      <div class="meta">
+        <div class="mini">卷之三</div>
+        <div class="mini pct">42%</div>
+      </div>
+    </div>
+    <!-- 悬停才浮现（此处强制显示以便目检） -->
+    <div class="manage" style="opacity:1;transform:none;pointer-events:auto;">
+      <a>归类</a><a>改名</a><a class="warn">删除</a>
+    </div>
+  </div>
+
+  <!-- 西文书名：题签内横排 + 更小字号，绝不竖排拉长 -->
+  <div class="book">
+    <div class="face">
+      <div class="spine"></div>
+      <div class="slip">
+        <div class="thread"></div>
+        <div class="title latin">Selected Poems of Wang Wei</div>
+      </div>
+      <div class="mini author">佚名</div>
+      <div class="meta">
+        <div class="mini">未始读</div>
+        <div class="mini pct">0%</div>
+      </div>
+    </div>
+    <div class="manage">
+      <a>归类</a><a>改名</a><a class="warn">删除</a>
+    </div>
+  </div>
+
+  <!-- 长中文书名：自动缩字号，不溢出题签 -->
+  <div class="book">
+    <div class="face">
+      <div class="spine"></div>
+      <div class="slip">
+        <div class="thread"></div>
+        <div class="title" style="font-size:12px;">史记三家注本</div>
+      </div>
+      <div class="mini author">司马迁</div>
+      <div class="meta">
+        <div class="mini">卷十二</div>
+        <div class="mini pct">8%</div>
+      </div>
+    </div>
+    <div class="manage">
+      <a>归类</a><a>改名</a><a class="warn">删除</a>
+    </div>
+  </div>
+
+  <!-- 短书名 -->
+  <div class="book">
+    <div class="face">
+      <div class="spine"></div>
+      <div class="slip">
+        <div class="thread"></div>
+        <div class="title">道德经</div>
+      </div>
+      <div class="mini author">老子</div>
+      <div class="meta">
+        <div class="mini">第一章</div>
+        <div class="mini pct">100%</div>
+      </div>
+    </div>
+    <div class="manage">
+      <a>归类</a><a>改名</a><a class="warn">删除</a>
+    </div>
+  </div>
+
+</div>
+
+<p class="note">
+  说明：本稿是 App 书架版式的结构参照，鼠标悬到书衣上即可看到底部那条半透明管理栏淡入（第一张为常显以便目检）。<br />
+  1 · 书衣的立体感只来自「右下角 3/4 偏移 + 9 模糊 − 2 扩散」的一道投影，不用大团弥散阴影。<br />
+  2 · 右侧 4px 深灰竖线即书脊——竖排自右向左翻，书脊在右。<br />
+  3 · 西文书名在 App 里走横排小字号而非旋转：GPUI 0.2.2 无元素级旋转变换；Web 端可用上面注释里的 <code>transform:rotate(90deg)</code> 做「整体横躺」。<br />
+  4 · 管理栏默认 <code>opacity:0</code>，仅在 <code>.book:hover</code> 时淡入，字体是极小楷体（<code>--font-note</code>）。<br />
+  5 · 未选中页签的那道虚线在 App 里用「若干 1px 短横」排出来（GPUI 无 dashed 边框），CSS 里用 <code>linear-gradient</code> 的 2/2 段实现。
+</p>
+
+</body>
+</html>

@@ -341,6 +341,13 @@ pub struct Root {
     pub shelf_expand: Option<usize>,
     /// 「改归类」浮层正在改第几本（None = 未打开）。
     pub shelf_recat: Option<usize>,
+    /// 鼠标正悬停在第几本上（决定卡片底部的管理栏是否浮现）。
+    /// 纯交互态，**不进 prefs**——重开程序不该还记得鼠标在哪。
+    pub shelf_hover: Option<usize>,
+    /// 悬停序号：每换一次悬停目标就 +1，用作淡入动画的 ElementId 后缀。
+    /// 换 id 才能让 `with_animation` 重新起一段动画（否则同一 id 的动画
+    /// 已跑完，再浮现就是「啪」地出现）。
+    pub shelf_hover_seq: u32,
 }
 
 impl Root {
@@ -468,6 +475,8 @@ impl Root {
             shelf_searching: false,
             shelf_expand: None,
             shelf_recat: None,
+            shelf_hover: None,
+            shelf_hover_seq: 0,
             notice: if count == 0 {
                 "书架空空，点「导入书籍」放一本进来".into()
             } else {

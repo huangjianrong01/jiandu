@@ -1,60 +1,163 @@
-//! 书架视图：题签网格 / 书脊列表 + 封面页。
+//! 书架视图：书衣网格 / 书脊列表 + 封面页。
 //!
-//! 默认「题签网格」：一格一签，竖排书名最多两列，下面四行小字
-//! （作者/注者、版本或朝代、当前卷册、阅读进度）。可切「书脊列表」。
-//! 顶栏有继续阅读 / 搜索 / 排序 / 视图切换，下面一排四部 + 自定页签。
-//! 视觉：宣纸底、墨色字、朱印点缀、细线留白——不做木纹、不加纹理与动画。
+//! 默认「书衣网格」：一格一书，书是**瓷青布面**的线装本——右下角一道
+//! 微小投影、右侧一条书脊线；左上角贴一枚宣纸**题签**，书名在签内竖排；
+//! 作者与进度是极小的竖排小字，分踞左下角与右下角。可切「书脊列表」。
+//! 顶栏有朱砂印章式的「继续阅读」、毛笔下划线的搜索框，下面一排四部
+//! + 自定页签，选中的那道是极细墨线、未选的是虚墨线。
+//! 归类 / 改名 / 删除默认不露面，鼠标悬停到书衣上才在底部淡入一条
+//! 半透明操作栏（极小楷体）。
+//!
+//! 视觉：宣纸米黄的桌面 + 暗青的书衣，墨线与朱印点缀，不加纹理。
 
 use crate::app::{
     Root, Screen, ShelfSort, ShelfView, CINNABAR, FRAME, INK, PAPER,
 };
+use crate::fonts::FontRole;
 use crate::library::{ellipsis, ShelfEntry};
 use gpui::{
-    div, prelude::*, px, rgb, rgba, Context, Div, FontWeight, KeyDownEvent, MouseButton,
-    ParentElement, SharedString, Styled,
+    div, prelude::*, px, rgb, rgba, Animation, AnimationExt, BoxShadow, Context, Div, FontWeight,
+    KeyDownEvent, MouseButton, MouseMoveEvent, ParentElement, SharedString, Styled,
 };
+use std::time::Duration;
 
-// ---- 书架配色（宣纸 / 墨 / 朱 / 细线）----
-/// 桌面（托纸的底色，比纸面深半档）。
-const SHELF_BG: u32 = 0xF1EADA;
-/// 顶栏与页签条底色。
-const SHELF_PAPER: u32 = 0xFBF7EC;
-/// 题签纸：比桌面浅，像贴在书衣上的小签。
-const SLIP_PAPER: u32 = 0xFDFAF2;
-/// 细线（界栏 / 分隔）。
-const HAIR: u32 = 0xE0D5BE;
-/// 次级墨（作者行）。
+// ---- 书架配色（宣纸米黄的桌面 + 暗青的书衣）----
+/// 桌面：宣纸米黄，比纸面深半档，托住一本本暗青书衣。
+const SHELF_BG: u32 = 0xEDE4D0;
+/// 顶栏与页签条：宣纸本色。
+const SHELF_PAPER: u32 = 0xF7F1E3;
+/// 书衣：瓷青布面（暗青）——线装书衣的本色，与题签的米黄成对。
+const CLOTH: u32 = 0x2F4858;
+/// 书脊线：比书衣再深一档的灰蓝。竖排在右，书脊就在右。
+const CLOTH_SPINE: u32 = 0x1B2B36;
+/// 布面压出的棱线（书衣边框）。
+const CLOTH_EDGE: u32 = 0x44607A;
+/// 题签纸：宣纸米黄，贴在书衣左上角。
+const SLIP_PAPER: u32 = 0xF3ECD9;
+/// 题签的边框：旧纸边上那道浅褐。
+const SLIP_EDGE: u32 = 0x8A6A52;
+/// 题签上的墨字。
+const SLIP_INK: u32 = 0x2A241E;
+/// 书衣上的浅字（作者 / 卷册 / 进度）。
+const CLOTH_FAINT: u32 = 0xA9B6BD;
+/// 细线（界栏 / 分隔 / 下划线）。
+const HAIR: u32 = 0xC9BDA6;
+/// 次级墨（页签名）。
 const INK_SOFT: u32 = 0x6B6357;
-/// 三级墨（版本 / 卷册等旁注小字）。
+/// 三级墨（本数等旁注小字）。
 const INK_FAINT: u32 = 0x9A9184;
 
-/// 题签里书名竖排可用的盒（宽 × 高）：宽只容两列。
-const SLIP_TITLE_W: f32 = 68.0;
+// ---- 书衣几何 ----
+/// 书衣（一张卡片）的宽 × 高。
+pub(crate) const CARD_W: f32 = 156.0;
+pub(crate) const CARD_H: f32 = 244.0;
+/// 书脊线宽：右侧那一条。
+const SPINE_W: f32 = 4.0;
+/// 题签：左上角，宽 58、内里书名竖排可用高 132。
+const SLIP_W: f32 = 58.0;
 const SLIP_TITLE_H: f32 = 132.0;
+/// 角上竖排小字（作者 / 进度）的字号与可用高。
+const MINI_FS: f32 = 9.5;
+const MINI_H: f32 = 52.0;
 
-/// 一枚小按钮：`primary` 为朱底白字，否则纸底细框。
-fn shelf_button(label: &str, primary: bool) -> Div {
+/// 书衣的右下角微小投影：只往右下偏一点点、模糊很小——「微弱立体感」，
+/// 不是现代 UI 那种大团弥散阴影。`spread` 取负让影子收在书衣里面。
+fn book_shadow() -> Vec<BoxShadow> {
+    vec![BoxShadow {
+        color: gpui::hsla(0.0, 0.0, 0.0, 0.28),
+        offset: gpui::point(px(3.0), px(4.0)),
+        blur_radius: px(9.0),
+        spread_radius: px(-2.0),
+    }]
+}
+
+/// 虚墨线：GPUI 0.2.2 没有 dashed 边框，用「若干 1px 短横」排出来。
+/// 步长 4（2 实 2 虚），比实线轻，用来标**未选中**的页签。
+fn hair_dashed(w: f32, color: u32) -> Div {
+    const DASH: f32 = 2.0;
+    const GAP: f32 = 2.0;
+    let n = (w / (DASH + GAP)).floor().max(1.0) as usize;
+    let mut row = div().flex().flex_row().items_center();
+    for i in 0..n {
+        row = row.child(div().w(px(DASH)).h(px(1.0)).bg(rgb(color)));
+        if i + 1 < n {
+            row = row.child(div().w(px(GAP)).h(px(1.0)));
+        }
+    }
+    row
+}
+
+/// 顶栏的一枚「墨字 + 下划线」按钮：没有底色、没有边框、没有圆角——
+/// 只是一行小字压在一道极细墨线上（水墨下划线），像书签上的题名。
+/// `strong` 为朱色字（用于主要动作），否则次级墨色。
+fn shelf_button(label: &str, strong: bool) -> Div {
     div()
-        .px(px(11.0))
-        .py(px(5.0))
-        .rounded(px(3.0))
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(3.0))
         .cursor_pointer()
-        .text_size(px(12.0))
-        .text_color(rgb(if primary { PAPER } else { INK_SOFT }))
-        .bg(rgb(if primary { CINNABAR } else { SLIP_PAPER }))
-        .border_1()
-        .border_color(rgb(if primary { CINNABAR } else { HAIR }))
-        .child(SharedString::from(label.to_string()))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(if strong { CINNABAR } else { INK_SOFT }))
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(hair_line_full(if strong { CINNABAR } else { HAIR }))
+}
+
+/// 撑满父宽的一根极细线（按钮下划线用；父级定宽后它跟着走）。
+fn hair_line_full(color: u32) -> Div {
+    div().w_full().h(px(1.0)).bg(rgb(color))
+}
+
+/// **朱砂印章**：一枚方印，白字（纸色）压在朱底上，字竖排。
+/// 古印是方的，不做胶囊；`34×34` 在顶栏里正好一行高。
+/// 悬停时整枚轻轻加深（GPUI 0.2.2 无元素级 transform，改不了尺寸缩放，
+/// 只能换色表达「按下去」的意思）。
+pub(crate) fn seal_chip(words: &str, size: f32) -> Div {
+    // 每个字占一枚固定高的字格（size 的 46%），两字加间隙刚好落在印面里；
+    // 定高才不会随字体行高浮动、把字挤出印面。
+    let cell = size * 0.46;
+    let mut inner = div().flex().flex_col().items_center().gap(px(1.0));
+    for ch in words.chars() {
+        inner = inner.child(
+            div()
+                .w(px(cell))
+                .h(px(cell))
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .text_size(px(size * 0.40))
+                .text_color(rgb(PAPER))
+                .font_family(crate::fonts::family_for_role(FontRole::Main))
+                .child(SharedString::from(ch.to_string())),
+        );
+    }
+    div()
+        .w(px(size))
+        .h(px(size))
+        .flex()
+        .items_center()
+        .justify_center()
+        .overflow_hidden()
+        .bg(rgb(CINNABAR))
+        .rounded(px(2.0))
+        .cursor_pointer()
+        .child(inner)
 }
 
 /// 一枚「文字链」式的管理按钮（很轻，不抢题签的视线）。
+/// 走**批注字体**（楷体）且字号极小——现代黑体的管理按钮一出现，
+/// 古籍的气质就散了。
 fn link_button(label: &str, color: u32) -> Div {
     div()
-        .px(px(4.0))
+        .px(px(5.0))
         .py(px(2.0))
-        .rounded(px(2.0))
         .cursor_pointer()
-        .text_size(px(10.0))
+        .text_size(px(9.0))
+        .font_family(crate::fonts::family_for_role(FontRole::Note))
         .text_color(rgb(color))
         .child(SharedString::from(label.to_string()))
 }
@@ -75,23 +178,6 @@ fn text_fit(s: &str, size: f32, color: u32, max_chars: usize) -> Div {
         .text_size(px(size))
         .text_color(rgb(color))
         .child(SharedString::from(ellipsis(s, max_chars)))
-}
-
-/// 进度条 + 百分比：细线留白，只有一道朱/册色。
-fn progress_row(prog: f32, pct: i32, accent: u32) -> Div {
-    div()
-        .mt(px(8.0))
-        .flex()
-        .flex_col()
-        .gap(px(4.0))
-        .child(
-            div()
-                .w_full()
-                .h(px(2.0))
-                .bg(rgb(HAIR))
-                .child(div().h(px(2.0)).w(px(136.0 * prog.clamp(0.0, 1.0))).bg(rgb(accent))),
-        )
-        .child(text(&format!("{pct}%"), 9.5, INK_FAINT))
 }
 
 /// 一个字格：定宽定高、字居中。
@@ -262,6 +348,183 @@ pub(crate) fn fit_single_column(text: &str, box_h: f32, base_fs: f32) -> (f32, S
     }
 }
 
+/// 西文题名判定：拉丁字母（含数字）过半即按西文排。
+///
+/// 竖排里一个拉丁字母要占一格，`Poetry` 六个字母就是六格高——把英文
+/// 书名强行竖排，一列排下去能拉出整张卡片那么长，正是要禁止的样子。
+pub(crate) fn is_latin_title(s: &str) -> bool {
+    let all: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if all.is_empty() {
+        return false;
+    }
+    let latin = all.iter().filter(|c| c.is_ascii_alphanumeric()).count();
+    latin * 2 >= all.len()
+}
+
+/// 断词：ASCII 连成一个词（中间的 `' - . , &` 也算词内），
+/// 其余（中日韩文字与标点）一字一token——中英混排也能断得开。
+fn latin_tokens(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let flush = |out: &mut Vec<String>, buf: &mut String| {
+        if !buf.is_empty() {
+            out.push(std::mem::take(buf));
+        }
+    };
+    for c in s.chars() {
+        if c.is_whitespace() {
+            flush(&mut out, &mut buf);
+        } else if c.is_ascii_alphanumeric() || matches!(c, '\'' | '-' | '.' | ',' | '&') {
+            buf.push(c);
+        } else {
+            flush(&mut out, &mut buf);
+            out.push(c.to_string());
+        }
+    }
+    flush(&mut out, &mut buf);
+    out
+}
+
+/// 一个字的排宽：拉丁约 0.55 字身，其余一个字身（与 `clip_title_w` 同口径，
+/// 三处估算必须一致，否则「算得下、排不下」）。
+fn char_w(c: char) -> f32 {
+    if c.is_ascii() {
+        0.55
+    } else {
+        1.0
+    }
+}
+
+/// 一个词（token）的排宽。
+fn token_w(tok: &str, fs: f32) -> f32 {
+    tok.chars().map(|c| char_w(c) * fs).sum()
+}
+
+/// 按给定宽度把西文（或中西混排）题名**横排折行**。
+/// 词间补一个窄空格，汉字之间不补——中文连排才不散。
+/// 单词本身比一行还宽时按字硬断（只在字号已缩到最小仍放不下时发生，
+/// `fit_latin_block` 会先试着缩字号让整词落下）。
+fn wrap_latin(text: &str, box_w: f32, fs: f32) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut used = 0.0f32;
+    for tok in latin_tokens(text) {
+        let tw = token_w(&tok, fs);
+        // 整词就超出一行：按字硬断。
+        if tw > box_w {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+                used = 0.0;
+            }
+            for c in tok.chars() {
+                let cw = char_w(c) * fs;
+                if used + cw > box_w && !cur.is_empty() {
+                    lines.push(std::mem::take(&mut cur));
+                    used = 0.0;
+                }
+                cur.push(c);
+                used += cw;
+            }
+            continue;
+        }
+        // 只有「两边都是拉丁」才补空格；汉字连排不补。
+        let join = !cur.is_empty()
+            && cur.chars().last().map(char_w).unwrap_or(1.0) < 1.0
+            && tok.chars().next().map(char_w).unwrap_or(1.0) < 1.0;
+        let gap = if join { fs * 0.30 } else { 0.0 };
+        if !cur.is_empty() && used + gap + tw > box_w {
+            lines.push(std::mem::take(&mut cur));
+            used = 0.0;
+        } else if join {
+            cur.push(' ');
+            used += gap;
+        }
+        cur.push_str(&tok);
+        used += tw;
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// 西文题名：**横排**，字号按盒宽自适应收缩、排满一行就折行。
+///
+/// 用户给的「整体旋转 90° 横躺」在 GPUI 0.2.2 里做不到——没有元素级
+/// 旋转变换（`TransformationMatrix` 只在内部 sprite 用）。故取其第二个
+/// 方案：**不竖排拉长，改横排 + 更小字号**，视觉上就是洋装书横排的题签。
+/// 返回 (字号, 各行文字, 是否被截断)。
+pub(crate) fn fit_latin_block(
+    text: &str,
+    box_w: f32,
+    box_h: f32,
+    base_fs: f32,
+) -> (f32, Vec<String>, bool) {
+    const MIN_FS: f32 = 8.0;
+    const LINE_RATIO: f32 = 1.34; // 行距：西文小字排紧一点
+    let mut fs = base_fs.max(MIN_FS);
+    loop {
+        let lines = wrap_latin(text, box_w, fs);
+        // 两道约束：① 最长的那个词要能整词落在一行里（否则先缩字号，
+        //    不急着把单词切断）；② 折行后的总高不超盒高。
+        let word_fits = latin_tokens(text)
+            .iter()
+            .all(|t| token_w(t, fs) <= box_w + 0.01);
+        let height_fits = lines.len() as f32 * fs * LINE_RATIO <= box_h;
+        if (word_fits && height_fits) || fs <= MIN_FS {
+            let max_lines = (box_h / (fs * LINE_RATIO)).floor().max(1.0) as usize;
+            let fits = lines.len() <= max_lines;
+            let mut out = lines;
+            if !fits {
+                out.truncate(max_lines.max(1));
+                // 末行缀省略号，告知「名字没排完」。
+                if let Some(last) = out.last_mut() {
+                    last.push('…');
+                }
+            }
+            return (fs, out, !fits);
+        }
+        fs = (fs - 0.5).max(MIN_FS);
+    }
+}
+
+/// 题签里的书名：中文竖排（单列自适应缩字号），**西文一律横排**。
+/// `truncated` 为真时调用方给出「点开看全名」的入口。
+pub(crate) fn slip_title(
+    title: &str,
+    box_w: f32,
+    box_h: f32,
+    base_fs: f32,
+    color: u32,
+) -> (Div, bool) {
+    if is_latin_title(title) {
+        let (fs, lines, cut) = fit_latin_block(title, box_w, box_h, base_fs.min(13.0));
+        let mut col = div().flex().flex_col().items_center().gap(px(1.0));
+        for ln in &lines {
+            col = col.child(
+                div()
+                    .text_size(px(fs))
+                    .text_color(rgb(color))
+                    .child(SharedString::from(ln.clone())),
+            );
+        }
+        (col, cut)
+    } else {
+        let (fs, s, cut) = fit_single_column(title, box_h, base_fs);
+        (vertical_cols(&[s], fs, color, FontWeight::MEDIUM), cut)
+    }
+}
+
+/// 极小号的**竖排**小字（书衣左下角的作者、右下角的卷册与进度）。
+/// 横排的现代小字一出现就破功，故一律竖排，字号 9.5 上下。
+fn vertical_mini(text: &str, box_h: f32, fs: f32, color: u32) -> Div {
+    let (fs, s, _) = fit_single_column(text, box_h, fs);
+    vertical_cols(&[s], fs, color, FontWeight::NORMAL)
+}
+
 /// 竖排文字块：逐字换行成列，用于书封与封面页；
 /// 长书名自动分列（从右到左），不再溢出卡片。
 pub(crate) fn vertical_block(
@@ -428,9 +691,9 @@ impl Root {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(12.0))
+            .gap(px(14.0))
             .px(px(18.0))
-            .py(px(9.0))
+            .py(px(7.0))
             .bg(rgb(SHELF_PAPER))
             .border_b_1()
             .border_color(rgb(HAIR))
@@ -438,8 +701,10 @@ impl Root {
             .child(div().flex_1());
 
         if has_any {
+            // 「继续阅读」是一枚**朱砂印章**（方印、朱底白字、竖排两字），
+            // 不是带底色的现代胶囊按钮。
             bar = bar.child(
-                shelf_button("继续阅读", true).on_mouse_down(
+                seal_chip("续读", 34.0).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
@@ -518,21 +783,43 @@ impl Root {
         }
 
         let body = crate::ime::InputField::new(line, self.shelf_query_focus.clone(), cx.entity());
-        let mut boxx = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap(px(4.0))
-            .w(px(178.0))
-            .h(px(27.0))
-            .px(px(8.0))
-            .bg(rgb(0xFFFFFF))
-            .border_1()
-            .border_color(rgb(if active { CINNABAR } else { HAIR }))
-            .rounded(px(3.0))
+
+        // 清除：一枚极小的墨色「✕」，不做圆形灰底（那也是现代控件）。
+        let clear = div()
+            .text_size(px(10.0))
+            .text_color(rgb(INK_FAINT))
             .cursor_pointer()
-            .child(body)
+            .child(SharedString::from("✕"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.shelf_query.clear();
+                    this.shelf_query_cursor = 0;
+                    cx.notify();
+                }),
+            );
+
+        // **毛笔下划线输入框**：没有灰底、没有边框、没有圆角，只有底下
+        // 一道极细墨线（落笔时转朱砂），像在纸上写下一行。
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .w(px(156.0))
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .h(px(22.0))
+                    .child(body)
+                    .when(has_text, |d| d.child(clear)),
+            )
+            .child(hair_line_full(if active { CINNABAR } else { HAIR }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -540,34 +827,7 @@ impl Root {
                     this.shelf_searching = true;
                     cx.notify();
                 }),
-            );
-
-        if has_text {
-            boxx = boxx.child(
-                div()
-                    .w(px(14.0))
-                    .h(px(14.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(7.0))
-                    .bg(rgb(HAIR))
-                    .text_size(px(9.0))
-                    .text_color(rgb(INK_SOFT))
-                    .cursor_pointer()
-                    .child(SharedString::from("✕"))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.shelf_query.clear();
-                            this.shelf_query_cursor = 0;
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-        boxx
+            )
     }
 
     /// 分类页签：全部 / 经 / 史 / 子 / 集 / 自定（带本数）。
@@ -595,6 +855,9 @@ impl Root {
                 (Some(c), _) => c == name,
                 _ => false,
             };
+            // 页签下的那道线：选中是**极细朱线**，未选是**虚墨线**——
+            // 原来不分选中与否都是一根 2px 实线，那是现代 tab 的样子。
+            let line_w = name.chars().count() as f32 * 13.0 + 18.0;
             let tab = div()
                 .flex()
                 .flex_col()
@@ -611,11 +874,15 @@ impl Root {
                         .child(text(name, 13.0, if selected { CINNABAR } else { INK_SOFT }))
                         .child(text(&n.to_string(), 9.5, INK_FAINT)),
                 )
-                .child(div().w_full().h(px(2.0)).bg(rgb(if selected {
-                    CINNABAR
+                .child(if selected {
+                    hair_line_full(CINNABAR)
                 } else {
-                    SHELF_PAPER
-                })))
+                    div()
+                        .w(px(line_w))
+                        .flex()
+                        .justify_center()
+                        .child(hair_dashed(line_w, INK_FAINT))
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
@@ -633,7 +900,7 @@ impl Root {
         row
     }
 
-    /// 题签网格：一格一签。
+    /// 书衣网格：一格一书。
     fn render_slip_grid(
         &mut self,
         entries: &[(usize, ShelfEntry)],
@@ -649,29 +916,41 @@ impl Root {
         for (idx, e) in entries {
             grid = grid.child(self.render_slip_card(*idx, e, cx));
         }
-        div().size_full().overflow_hidden().child(grid)
+        div()
+            .size_full()
+            .overflow_hidden()
+            .child(grid)
+            // 鼠标落在书与书之间的空当：撤掉悬停。书衣自己会
+            // stop_propagation，故悬在书上时这一条不会执行。
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                if this.shelf_hover.is_some() {
+                    this.shelf_hover = None;
+                    this.shelf_hover_seq = this.shelf_hover_seq.wrapping_add(1);
+                    cx.notify();
+                }
+            }))
     }
 
-    /// 一枚题签：竖排书名（最多两列）+ 作者/注者、版本/朝代、当前卷册、进度。
+    /// 一枚**书衣**：瓷青布面，右侧一条书脊线，左上角贴宣纸题签
+    /// （书名竖排；西文书名横排），左下角竖排作者、右侧竖排卷册与进度。
+    /// 悬停时底部淡入半透明的管理栏。
     fn render_slip_card(&mut self, idx: usize, e: &ShelfEntry, cx: &mut Context<Self>) -> Div {
-        // 书衣题签：竖排单列，字号随书名长度自适应（不再折成多列）。
-        let (fs, title_col, truncated) = fit_single_column(&e.title, SLIP_TITLE_H, 17.0);
         let prog = e.progress();
         let pct = (prog * 100.0).round() as i32;
-        let accent = e.accent;
         let author = e.author_line();
-        let edition = e.edition_line();
         let volume = e.volume_line();
 
-        let mut title_area = div()
-            .w_full()
-            .h(px(SLIP_TITLE_H))
-            .flex()
-            .justify_center()
-            .items_start()
-            .child(vertical_cols(&[title_col], fs, INK, FontWeight::MEDIUM));
+        // 题签里的书名：中文竖排单列（长名自动缩字号），西文横排折行。
+        let (title_inner, truncated) = slip_title(
+            &e.title,
+            SLIP_W - 12.0,
+            SLIP_TITLE_H,
+            17.0,
+            SLIP_INK,
+        );
+        let mut title_area = div().flex().justify_center().child(title_inner);
         if truncated {
-            // 书名放不下：点书名展开全名（点别处仍是打开书）。
+            // 书名放不下：点题签上的书名展开全名（点别处仍是打开书）。
             title_area = title_area.cursor_pointer().on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -683,23 +962,69 @@ impl Root {
         }
 
         let card = div()
-            .w(px(156.0))
-            .h(px(244.0))
-            .p(px(10.0))
-            .flex()
-            .flex_col()
+            .relative()
+            .w(px(CARD_W))
+            .h(px(CARD_H))
             .overflow_hidden()
-            .bg(rgb(SLIP_PAPER))
+            .bg(rgb(CLOTH))
             .border_1()
-            .border_color(rgb(HAIR))
+            .border_color(rgb(CLOTH_EDGE))
             .rounded(px(2.0))
+            .shadow(book_shadow())
             .cursor_pointer()
-            .child(title_area)
-            .child(div().w_full().h(px(1.0)).bg(rgb(HAIR)).mt(px(8.0)).mb(px(6.0)))
-            .child(text_fit(&author, 11.5, INK, 11))
-            .child(text_fit(&edition, 10.5, INK_FAINT, 12))
-            .child(text_fit(&volume, 10.5, INK_FAINT, 12))
-            .child(progress_row(prog, pct, accent))
+            // 书脊线：右侧一条深灰竖线。竖排自右向左翻，书脊就在右。
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .w(px(SPINE_W))
+                    .h_full()
+                    .bg(rgb(CLOTH_SPINE)),
+            )
+            // 题签：左上角一枚淡淡的宣纸小签。
+            .child(
+                div()
+                    .absolute()
+                    .top(px(16.0))
+                    .left(px(14.0))
+                    .w(px(SLIP_W))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .pt(px(7.0))
+                    .pb(px(8.0))
+                    .px(px(4.0))
+                    .gap(px(6.0))
+                    .bg(rgb(SLIP_PAPER))
+                    .border_1()
+                    .border_color(rgb(SLIP_EDGE))
+                    .rounded(px(1.0))
+                    // 顶端一道朱丝短线：题签的压印收头。
+                    .child(div().w(px(14.0)).h(px(2.0)).bg(rgb(CINNABAR)))
+                    .child(title_area),
+            )
+            // 左下角：竖排极小作者名。
+            .child(
+                div()
+                    .absolute()
+                    .left(px(16.0))
+                    .bottom(px(14.0))
+                    .child(vertical_mini(&author, MINI_H, MINI_FS, CLOTH_FAINT)),
+            )
+            // 右侧：竖排极小的卷册与进度（两列，右起先是卷册）。
+            .child(
+                div()
+                    .absolute()
+                    .right(px(24.0))
+                    .top(px(30.0))
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(6.0))
+                    .child(vertical_mini(&volume, 150.0, 9.0, CLOTH_FAINT))
+                    .child(vertical_mini(&format!("{pct}%"), 150.0, 9.0, 0xC98174)),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -709,12 +1034,30 @@ impl Root {
                 }),
             );
 
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .child(card)
-            .child(self.render_card_manage(idx, cx))
+        let hovered = self.shelf_hover == Some(idx);
+        let confirming = self.delete_confirm == Some(idx);
+        let mut outer = div().relative().w(px(CARD_W)).h(px(CARD_H)).child(card);
+        if hovered || confirming {
+            let bar = self.render_manage_bar(idx, cx);
+            let seq = self.shelf_hover_seq;
+            // 换 ElementId（带上悬停序号）才能让淡入动画重新起一段；
+            // 用同一个 id 的话动画早跑完了，再浮现就是硬生生地出现。
+            outer = outer.child(bar.with_animation(
+                SharedString::from(format!("shelf-manage-{idx}-{seq}")),
+                Animation::new(Duration::from_millis(180)),
+                |bar, delta| bar.opacity(delta),
+            ));
+        }
+        // 悬停登记：卡片吞掉这次 mouse_move（stop_propagation），
+        // 网格容器那条「落在空当就撤掉悬停」的处理器便不会执行。
+        outer.on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+            if this.shelf_hover != Some(idx) {
+                this.shelf_hover = Some(idx);
+                this.shelf_hover_seq = this.shelf_hover_seq.wrapping_add(1);
+                cx.notify();
+            }
+            cx.stop_propagation();
+        }))
     }
 
     /// 书脊列表：一行一册。
@@ -727,7 +1070,18 @@ impl Root {
         for (idx, e) in entries {
             col = col.child(self.render_spine_row(*idx, e, cx));
         }
-        div().size_full().overflow_hidden().child(col)
+        div()
+            .size_full()
+            .overflow_hidden()
+            .child(col)
+            // 落在行外的空当：撤掉悬停（行自己会 stop_propagation）。
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                if this.shelf_hover.is_some() {
+                    this.shelf_hover = None;
+                    this.shelf_hover_seq = this.shelf_hover_seq.wrapping_add(1);
+                    cx.notify();
+                }
+            }))
     }
 
     fn render_spine_row(&mut self, idx: usize, e: &ShelfEntry, cx: &mut Context<Self>) -> Div {
@@ -789,6 +1143,10 @@ impl Root {
                     .child(div().h(px(2.0)).w(px(120.0 * prog)).bg(rgb(accent))),
             );
 
+        let hovered = self.shelf_hover == Some(idx);
+        let confirming = self.delete_confirm == Some(idx);
+        let manage = self.manage_row(idx, cx, INK_FAINT, CINNABAR);
+
         div()
             .flex()
             .flex_row()
@@ -803,7 +1161,8 @@ impl Root {
             .child(title_area)
             .child(info)
             .child(seat)
-            .child(self.render_card_manage(idx, cx))
+            // 管理动作默认不露面，悬停（或等确认删除）时才出现。
+            .when(hovered || confirming, |d| d.child(manage))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -812,6 +1171,14 @@ impl Root {
                     cx.notify();
                 }),
             )
+            .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                if this.shelf_hover != Some(idx) {
+                    this.shelf_hover = Some(idx);
+                    this.shelf_hover_seq = this.shelf_hover_seq.wrapping_add(1);
+                    cx.notify();
+                }
+                cx.stop_propagation();
+            }))
     }
 
     /// 空书架：纸面上一句话 + 两枚按钮。
@@ -1447,18 +1814,19 @@ impl Root {
             )
     }
 
-    /// 卡片下方的管理行：归类 / 改名 / 删除；点过「删除」后变为二次确认态。
-    /// 管理动作放在卡片**外面**，卡片里永远只有那五项。
-    fn render_card_manage(&mut self, idx: usize, cx: &mut Context<Self>) -> Div {
+    /// 管理动作：归类 / 改名 / 删除；点过「删除」后变为二次确认态。
+    /// 极小**楷体**（`FontRole::Note`），默认不露面——见 `render_manage_bar`。
+    /// `ink` 是常态字色、`warn` 是「确认删除」的朱色——书衣上的管理栏压在
+    /// 深色半透明底上，得用浅字；书脊列表行在纸上，得用深字。
+    fn manage_row(&mut self, idx: usize, cx: &mut Context<Self>, ink: u32, warn: u32) -> Div {
         let mut row = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(2.0))
-            .w(px(156.0));
+            .gap(px(2.0));
         if self.delete_confirm == Some(idx) {
             row = row
-                .child(link_button("确认删除", CINNABAR).on_mouse_down(
+                .child(link_button("确认删除", warn).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -1466,7 +1834,7 @@ impl Root {
                         cx.notify();
                     }),
                 ))
-                .child(link_button("点错了", INK_FAINT).on_mouse_down(
+                .child(link_button("点错了", ink).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -1476,7 +1844,7 @@ impl Root {
                 ));
         } else {
             row = row
-                .child(link_button("归类", INK_FAINT).on_mouse_down(
+                .child(link_button("归类", ink).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -1485,7 +1853,7 @@ impl Root {
                         cx.notify();
                     }),
                 ))
-                .child(link_button("改名", INK_FAINT).on_mouse_down(
+                .child(link_button("改名", ink).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -1493,7 +1861,7 @@ impl Root {
                         cx.notify();
                     }),
                 ))
-                .child(link_button("删除", INK_FAINT).on_mouse_down(
+                .child(link_button("删除", ink).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -1503,6 +1871,35 @@ impl Root {
                 ));
         }
         row
+    }
+
+    /// 悬停时**浮现在书衣底部**的半透明管理栏：内嵌 `manage_row`，
+    /// 底是半透明的近黑（宣纸上的书衣本来就是暗的，压一层影子即可），
+    /// 淡入动画由调用方的 `with_animation` 给。
+    fn render_manage_bar(&mut self, idx: usize, cx: &mut Context<Self>) -> Div {
+        let row = self.manage_row(idx, cx, 0xD8CFC0, 0xE0867A);
+        div()
+            .absolute()
+            .left(px(4.0))
+            .bottom(px(4.0))
+            .w(px(CARD_W - 8.0))
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(2.0))
+            .bg(rgba(0x14100ACC))
+            .child(row)
+            // 栏内点空白不该顺下去把书翻开。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(|_, _: &MouseMoveEvent, _, cx| {
+                cx.stop_propagation();
+            }))
     }
 
     fn render_shelf_status(&self) -> Div {
@@ -1749,7 +2146,7 @@ mod tests {
     }
 
     /// 题签盒：68×132，最多两列。
-    const SLIP: (f32, f32) = (SLIP_TITLE_W, SLIP_TITLE_H);
+    const SLIP: (f32, f32) = (68.0, SLIP_TITLE_H);
 
     #[test]
     fn slip_title_never_exceeds_two_columns() {
@@ -1780,6 +2177,114 @@ mod tests {
         // 分列后按「先填满第一列」切分：首列是开头几个字。
         let (_, cols) = fit_cols("一二三四五六七八九十", SLIP.0, SLIP.1, 17.0, 2);
         assert_eq!(cols.concat(), "一二三四五六七八九十");
+    }
+
+    /// 一排字的宽度（与 `char_w` 同口径）。
+    fn line_w(s: &str, fs: f32) -> f32 {
+        s.chars().map(|c| char_w(c) * fs).sum()
+    }
+
+    #[test]
+    fn latin_titles_are_not_forced_into_a_vertical_column() {
+        // 纯西文：按西文排（横排，绝不竖排拉长）。
+        assert!(is_latin_title("Poetry"));
+        assert!(is_latin_title("Selected Poems"));
+        assert!(is_latin_title("The Great Gatsby"));
+        // 纯中文：照旧竖排。
+        assert!(!is_latin_title("道德经"));
+        assert!(!is_latin_title("王右丞集"));
+        // 空串不当西文（走竖排，渲染出来是空的，不会误判成横排空行）。
+        assert!(!is_latin_title(""));
+        // 拉丁不过半仍按中文竖排（四个汉字夹两个字母）。
+        assert!(!is_latin_title("王右丞集 v2"));
+    }
+
+    #[test]
+    fn latin_block_wraps_and_stays_inside_the_slip() {
+        // 题签内宽 46（SLIP_W 58 减左右内边距与边框），可用高 132。
+        let (fs, lines, cut) = fit_latin_block("Selected Poems of Wang Wei", 46.0, 132.0, 13.0);
+        assert!(fs < 13.0, "「Selected」一行放不下，应缩字号：{fs}");
+        assert!(lines.len() >= 2, "该折行，实际 {lines:?}");
+        assert!(!cut, "这个长度应排得下：{lines:?}");
+        for ln in &lines {
+            assert!(line_w(ln, fs) <= 46.0 + 0.01, "行宽溢出：{ln:?} @ {fs}");
+        }
+        assert!(
+            lines.len() as f32 * fs * 1.34 <= 132.0 + 0.01,
+            "折行后总高溢出：{lines:?} @ {fs}"
+        );
+    }
+
+    #[test]
+    fn long_latin_title_shrinks_instead_of_overflowing() {
+        let long = "The Complete Anthology of Classical Chinese Poetry and Prose";
+        let (fs, lines, _) = fit_latin_block(long, 46.0, 132.0, 13.0);
+        assert!(fs <= 13.0, "长名只能缩字号：{fs}");
+        for ln in &lines {
+            assert!(line_w(ln, fs) <= 46.0 + 0.01, "行宽溢出：{ln:?} @ {fs}");
+        }
+        assert!(
+            lines.len() as f32 * fs * 1.34 <= 132.0 + 0.01,
+            "总高溢出：{lines:?} @ {fs}"
+        );
+    }
+
+    #[test]
+    fn absurd_latin_title_ellipsizes_at_the_floor_size() {
+        // 长到字号缩到底仍排不完：截断并缀省略号。
+        let absurd: String = std::iter::repeat_n("Anthology ", 40).collect();
+        let (fs, lines, cut) = fit_latin_block(&absurd, 46.0, 132.0, 13.0);
+        assert_eq!(fs, 8.0, "应缩到最小字号：{fs}");
+        assert!(cut, "这么长必然排不下");
+        assert!(lines.last().map(|l| l.ends_with('…')).unwrap_or(false));
+        assert!(lines.len() as f32 * fs * 1.34 <= 132.0 + 0.01);
+    }
+
+    #[test]
+    fn long_cjk_title_shrinks_font_size_instead_of_overflowing() {
+        // 长中文书名：缩字号，绝不放任溢出题签。
+        let (fs, col, _) = fit_single_column("一二三四五六七八九十十一十二十三", SLIP_TITLE_H, 17.0);
+        assert!(fs < 17.0, "应缩字号：{fs}");
+        let need = col.chars().count() as f32 * (fs + 3.0);
+        assert!(need <= SLIP_TITLE_H, "竖排总高溢出：{need} > {SLIP_TITLE_H}");
+    }
+
+    #[test]
+    fn book_shadow_falls_to_the_bottom_right() {
+        let s = book_shadow();
+        assert_eq!(s.len(), 1, "只一道投影，多了就是现代 UI 的大团阴影");
+        let sh = &s[0];
+        // 右下角：两个分量都为正。
+        assert!(sh.offset.x > px(0.0), "投影应偏右");
+        assert!(sh.offset.y > px(0.0), "投影应偏下");
+        // 微小：偏移不超 5、模糊不超 12、扩散为负（收在书衣里面）。
+        assert!(sh.offset.x <= px(5.0) && sh.offset.y <= px(5.0));
+        assert!(sh.blur_radius <= px(12.0));
+        assert!(sh.spread_radius < px(0.0), "spread 取负才收得住");
+    }
+
+    #[test]
+    fn wrap_latin_breaks_between_words_not_inside_them() {
+        // 盒宽 60 容得下整个 "Selected"（57.2），故不该把词切断。
+        let lines = wrap_latin("Selected Poems", 60.0, 13.0);
+        assert_eq!(lines.join(" "), "Selected Poems");
+        assert_eq!(lines.len(), 2, "应折成两行：{lines:?}");
+        for ln in &lines {
+            for tok in ln.split_whitespace() {
+                assert!(tok == "Selected" || tok == "Poems", "词被切断了：{lines:?}");
+            }
+        }
+        // 汉字之间不补空格。
+        let cjk = wrap_latin("王右丞集", 60.0, 13.0);
+        assert_eq!(cjk.concat(), "王右丞集");
+        assert!(!cjk[0].contains(' '));
+        // 单词比盒还宽时按字硬断，且断出来的每行都不超盒宽。
+        let narrow = wrap_latin("Anthology", 20.0, 8.0);
+        assert!(narrow.len() >= 2, "窄盒应硬断：{narrow:?}");
+        for ln in &narrow {
+            assert!(line_w(ln, 8.0) <= 20.0 + 0.01, "硬断后仍溢出：{ln:?}");
+        }
+        assert_eq!(narrow.concat(), "Anthology");
     }
 
     #[test]
