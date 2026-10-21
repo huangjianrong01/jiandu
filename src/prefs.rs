@@ -32,6 +32,8 @@ pub struct Prefs {
     pub columns: usize,
     /// 四边留白比例。
     pub margin: f32,
+    /// true = 信笺（14列）模板：单张平铺稿纸，中缝占两格、立对鱼尾。
+    pub letter: bool,
     /// true = 双行夹注；false = 页脚注。
     pub notes_inline: bool,
     /// true = 繁体。
@@ -58,6 +60,7 @@ impl Default for Prefs {
             zoom: 1.0,
             columns: 10,
             margin: 0.06,
+            letter: false,
             notes_inline: true,
             trad: true,
             tongjia: true,

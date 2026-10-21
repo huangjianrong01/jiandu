@@ -198,16 +198,44 @@ fn fish_tail_ink(width: f32, top: bool, color: u32) -> Div {
         )
 }
 
-/// 版心鱼尾：完整照搬用户参考图「横版」中缝里那两枚——**横长黑矩形**
-/// （骑跨版心：上鱼尾在篇题之上、下鱼尾在叶码之下），上边平直满宽、
-/// 下缘两角微收成浅 V；下鱼尾同一形状上下翻转。viewBox 24×9
-/// （宽高比约 33:12，与参考图一致）。
+/// 版心鱼尾：完整照搬用户参考图「横版」中缝里那两枚——**横长纯黑矩形**
+/// （骑跨版心：上鱼尾在篇题之上、下鱼尾在叶码之下）。逐像素复测参考图
+/// （800×566 扫描图）确认为 33×12 实心横矩形，四缘平直、无尖无 V，
+/// 宽高比 33:12 ≈ 2.75；上下两枚同形（纯矩形上下对称）。
+/// SVG viewBox 33×12（见 app::ensure_assets）。
 fn banxin_tail(width: f32, top: bool, color: u32) -> Div {
-    let h = width * 9.0 / 24.0;
+    let h = width * 12.0 / 33.0;
     let path = if top {
         "banxin_top.svg"
     } else {
         "banxin_bottom.svg"
+    };
+    div()
+        .w(px(width))
+        .h(px(h))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .child(
+            svg()
+                .path(SharedString::from(path.to_string()))
+                .w(px(width))
+                .h(px(h))
+                .text_color(rgb(color)),
+        )
+}
+
+/// 信笺「对鱼尾」：照用户「信笺」参考图逐像素提取的燕尾形——
+/// 上缘平直、下缘中央开 Λ 形缺口、两角拖出尖尾（上鱼尾）；下鱼尾
+/// 上下翻转、开口相对。viewBox 47×34（宽高比 34:47），边缘留了
+/// 微小抖点，缩到几十像素时略带木刻毛边。见 app::ensure_assets。
+fn letter_fishtail(width: f32, top: bool, color: u32) -> Div {
+    let h = width * 34.0 / 47.0;
+    let path = if top {
+        "yu_top.svg"
+    } else {
+        "yu_bottom.svg"
     };
     div()
         .w(px(width))
@@ -1764,6 +1792,11 @@ impl Root {
                 .flex_col()
                 .items_center();
             sc.style().overflow.y = Some(Overflow::Scroll);
+            if self.letter_mode {
+                // 信笺 14 列在窄屏上可能横向也放不下：允许左右滚动，
+                // 而不是把字继续压小（最小字号保护的另一半）。
+                sc.style().overflow.x = Some(Overflow::Scroll);
+            }
             sc.child(inner)
         } else {
             inner
@@ -1926,7 +1959,10 @@ impl Root {
                 cell_w * ANCIENT_TITLE_COL
             } else {
                 0.0
-            };
+            }
+            // 信笺模板在列间插了一道「一列宽」的中缝：地脚叶码 / 书耳
+            // 的定位要把这一列也算进纸面宽度，才不至于偏到一边。
+            + if self.letter_mode { cell_w } else { 0.0 };
 
         // 界行（乌丝栏）：从右往左先排正文——`i = text_cols-1` 落在最左，
         // `i = 0` 落在最右，正是竖排的读序。每列左缘一道通高细线，
@@ -1938,6 +1974,13 @@ impl Root {
             // 正文从带下接着排（带高 = chapter_inscription_reserve_rows）。
             let top_skip =
                 if start_chapter && i == 0 { self.chapter_inscription_reserve_rows() } else { 0 };
+            // 信笺模板：在第 7、8 个正文列之间插一道一列宽的中缝。
+            // 章首页最右多一个章题列（也算一列），分割点随之前移一列，
+            // 左右两边仍各是 7 列。
+            let split_i = if start_chapter { 5 } else { 6 };
+            if self.letter_mode && i == split_i {
+                grid = grid.child(self.render_letter_gutter(cell_w, cell_h, rows, foot_h));
+            }
             grid = grid.child(self.ancient_column(
                 items,
                 cell_w,
@@ -1961,14 +2004,14 @@ impl Root {
                 rows,
                 foot_h,
                 fs,
-                idx,
             ));
         }
 
-        // 地脚：章首页的叶码已并入版心（章题列），此处只给正文页（无版心）
-        // 居中补一枚小字叶码，免得地脚整条空着；不再另缀鱼尾（鱼尾成对
-        // 只出现在版心里，地脚单独再放一枚会显得重复、位置也对不齐）。
-        // 用绝对定位而非另起一行：地脚不占行格，界行才能贯通到版框底。
+        // 地脚：章首页的叶码在中缝（对开）/ 居中（单页），此处不重复；
+        // 地脚叶码：每一叶都补一枚小字叶码（居中）——章题列里放的是
+        // **篇题数**（本篇第几章），叶码改由地脚与中缝分担，免得章首页
+        // 丢了叶码。用绝对定位而非另起一行：地脚不占行格，界行才能
+        // 贯通到版框底。
         let foot = div()
             .absolute()
             .left(px(0.0))
@@ -1979,23 +2022,28 @@ impl Root {
             .flex_row()
             .items_center()
             .justify_center()
-            .child(if start_chapter {
-                div()
-            } else {
+            .child(
                 div()
                     .text_size(px(small))
                     .text_color(rgb(t.ink_soft()))
-                    .child(SharedString::from(han_num(idx + 1)))
-            });
+                    .child(SharedString::from(han_num(idx + 1))),
+            );
 
         // 版框：四周双边——外粗内细，中间留一线空隙（刻本双边的样子）。
+        // 对开拼合时**内侧（贴中缝那一侧）不设框线**：左右两叶拼成一整
+        // 张纸，外粗框 / 内细框只围整页外缘（参考图「横版」即如此——
+        // 中缝是两道细线，不碰内外框）；单叶（Alone）才四边全封闭。
         // 内层 `relative`：地脚 / 卷首题署都用绝对定位叠在行格之上。
         let mut inner = div()
             .relative()
-            .border_1()
             .border_color(rgb(t.frame_ink()))
             .child(grid)
             .child(foot);
+        inner = match edge {
+            LeafEdge::Left => inner.border_t_1().border_b_1().border_l_1(),
+            LeafEdge::Right => inner.border_t_1().border_b_1().border_r_1(),
+            LeafEdge::Alone => inner.border_1(),
+        };
         // 卷首题署（卷端）：章首页开卷列顶部叠一卷端题名——
         // 第一行（顶格）写书名·卷次，第二行（低几格）写署名；
         // 落在 layout_book 预留的空白带上，与正文互不遮挡。
@@ -2016,11 +2064,15 @@ impl Root {
                 ));
             }
         }
-        let frame = div()
-            .border_3()
+        let mut frame = div()
             .border_color(rgb(t.frame_ink()))
             .p(px(3.0))
             .child(inner);
+        frame = match edge {
+            LeafEdge::Left => frame.border_t_3().border_b_3().border_l_3(),
+            LeafEdge::Right => frame.border_t_3().border_b_3().border_r_3(),
+            LeafEdge::Alone => frame.border_3(),
+        };
 
         // 纸面留白：对开时内侧（贴纸心那一侧）收掉，两半才能拼成一张纸。
         // `relative`：书耳用绝对定位挂在纸面左上 / 右上角。
@@ -2257,8 +2309,9 @@ impl Root {
         block
     }
 
-    /// 章题列：照刻本「版心」的样子——天头留白、上双鱼尾、竖排篇题、下双鱼尾，
-    /// 一列通高（与八列界行同高，栏线上下都顶到版框）。
+    /// 章题列：照刻本「版心」的样子——天头留白、上鱼尾、竖排篇题、
+    /// **篇题数**（本篇第几章）、下鱼尾，一列通高（与八列界行同高，
+    /// 栏线上下都顶到版框）。位序与样式照用户参考图「横版」。
     fn ancient_title_column(
         &self,
         chapter: usize,
@@ -2267,7 +2320,6 @@ impl Root {
         rows: usize,
         foot_h: f32,
         fs: f32,
-        idx: usize,
     ) -> Div {
         let t = self.theme;
         let title = self.chapter_title(chapter);
@@ -2284,8 +2336,9 @@ impl Root {
             .border_color(rgb(t.rule_by(self.rule_color)));
         // 天头：留约一字高的空白，鱼尾才落在版心上部而不是贴框。
         col = col.child(div().h(px(cell_h * 1.0)));
-        // 上鱼尾：横长黑矩形，骑跨版心（照参考图「横版」：鱼尾在篇题之上）。
-        col = col.child(banxin_tail(col_w * 0.98, true, t.frame_ink()));
+        // 上鱼尾：横长纯黑矩形，骑跨版心（照参考图「横版」：鱼尾在篇题之上）。
+        // 宽取章题列的 2/3（参考图比例：鱼尾 33 : 中缝带 50）。
+        col = col.child(banxin_tail(col_w * 0.66, true, t.frame_ink()));
         col = col.child(div().h(px(cell_h * 0.18)));
         // 篇题：一字一格，自上面下。
         for c in title.chars().take(7) {
@@ -2301,10 +2354,12 @@ impl Root {
                     .child(SharedString::from(c.to_string())),
             );
         }
-        // 叶码：小字，竖排压在下鱼尾之上（宋版版心「篇题—叶码—下鱼尾」的次序）。
+        // 篇题数（本篇第几章，汉字数词）：小字，竖排压在下鱼尾之上——
+        // 位序「上鱼尾 → 篇题 → 篇题数 → 下鱼尾」（参考图「横版」）。
+        // 叶码不在此处：中缝（对开）与地脚（单页）另有一份。
         col = col.child(div().flex_1());
         let nfs = (fs * 0.42).max(9.0);
-        for c in han_num(idx + 1).chars() {
+        for c in han_num(chapter + 1).chars() {
             col = col.child(
                 div()
                     .w(px(col_w))
@@ -2318,16 +2373,50 @@ impl Root {
             );
         }
         col = col.child(div().h(px(cell_h * 0.1)));
-        // 下鱼尾：与上鱼尾对合，夹住篇题与叶码。
-        col = col.child(banxin_tail(col_w * 0.98, false, t.frame_ink()));
+        // 下鱼尾：与上鱼尾对合，夹住篇题与篇题数（同宽同形，纯黑横矩形）。
+        col = col.child(banxin_tail(col_w * 0.66, false, t.frame_ink()));
         col.child(div().h(px(cell_h * 0.38)))
     }
 
-    /// 中缝（版心）：对开时立在纸心的一道竖栏——左右两道细框线（与页内
-    /// 界行同粗细）夹一字宽的纸带，带上鱼尾（横长黑矩形，骑跨版心）、
-    /// 篇题、叶码、朱砂小印自上而下排布。缝宽约等于一行字宽
-    /// （`grid::gutter_w`）：刻本版心本就是一列字的宽度；纸面总宽不变，
-    /// 只是把原来「两叶之间的空白」换成纸心的一道版心。
+    /// 信笺模板的中缝：**一列宽**的一道纸带，立在 14 个正文列的正中
+    /// （第 7、8 列之间）。左缘一条细线（本栏 `border_l`），右缘那条由
+    /// 右邻列的界行充当——两条线与页内丝栏同粗细、同起止，上下通到
+    /// 内框，正是参考图里「双细线夹一字宽纸带」的样子。
+    /// 带内正中立「对鱼尾」：上鱼尾 Λ 口朝下、下鱼尾 V 口朝上，开口
+    /// 相对，尾间空约三格；参考图的中缝除这枚对鱼尾外是空的
+    /// （信笺不印篇题 / 叶码 / 朱印）。
+    fn render_letter_gutter(&self, cell_w: f32, cell_h: f32, rows: usize, foot_h: f32) -> Div {
+        let t = self.theme;
+        let gw = cell_w;
+        let mut col = div()
+            .w(px(gw))
+            .h(px(cell_h * rows as f32 + foot_h))
+            .flex()
+            .flex_col()
+            .items_center()
+            // 左缘细线；右缘由右邻列（正文列或章题列）的 border_l 提供。
+            .border_l_1()
+            .border_color(rgb(t.rule_by(self.rule_color)))
+            .bg(rgb(t.paper()))
+            // 地脚那一段不参与「垂直居中」，对鱼尾才落在正文区的正中。
+            .pb(px(foot_h));
+        col = col.child(div().flex_1());
+        // 上鱼尾：Λ 口朝下（开口相对）。
+        col = col.child(letter_fishtail(gw * 0.96, true, t.frame_ink()));
+        // 尾间空约三格（参考图实测 157px ≈ 3 个列宽）。
+        col = col.child(div().h(px(cell_h * 3.0)));
+        // 下鱼尾：V 口朝上。
+        col = col.child(letter_fishtail(gw * 0.96, false, t.frame_ink()));
+        col.child(div().flex_1())
+    }
+
+    /// 中缝（版心）：对开时立在纸心的一道竖栏——左缘一条细线（与页内
+    /// 界行同粗细、与内框同起止）夹一字宽的纸带，右缘那条由右半叶最左
+    /// 一列的界行充当（两线间距恰为一列字宽，与左右丝栏等距延续）；
+    /// 带上鱼尾（横长纯黑矩形，骑跨版心）、篇题、叶码、朱砂小印自上而下
+    /// 排布。缝宽约等于一行字宽（`grid::gutter_w`）：刻本版心本就是一列
+    /// 字的宽度；纸面总宽不变，只是把原来「两叶之间的空白」换成纸心的
+    /// 一道版心。
     /// 左半叶是章首时不用它——那一叶自带的「章题列」本身就是版心。
     fn render_gutter(&self, chapter: usize, page_idx: usize, detailed: bool) -> Div {
         let t = self.theme;
@@ -2354,19 +2443,66 @@ impl Root {
             .flex()
             .flex_col()
             .items_center()
+            // `relative`：版心细线用绝对定位锚在本栏内（GPUI 的 absolute
+            // 子元素以最近的 positioned 祖先为定位上下文，缺了它线会飘到
+            // 根节点上去）。
+            .relative()
             .overflow_hidden()
             .pt(px(16.0 + 4.0))
             .pb(px(16.0 + 4.0))
-            .bg(rgb(t.paper()))
-            // 版心左右框线：与页内界行同粗细（1px）、同取色（乌 / 金 / 朱
-            // 丝栏）。参考图「横版」里中缝就是两道细线夹一字宽的纸带，
-            // 鱼尾、篇题、叶码都立在这道纸带里。
-            .border_l_1()
-            .border_r_1()
-            .border_color(rgb(t.rule_by(self.rule_color)));
+            .bg(rgb(t.paper()));
+        // 版心细线：与左右叶的**内框**（border_1）同起同止——参考图
+        // 「横版」里中缝线不顶纸缘、也不碰外粗框。线位 = 纸面顶 + 留白16
+        // + 外框3 + 框内留边3 = 22（col 与纸面同高同顶，故 absolute
+        // top/bottom 取 22，即内框上/下沿），头尾与内框严丝合缝。
+        // 只画**左缘一条**：右缘那条由右半叶最左一列的界行（丝栏）充当
+        // ——否则 col 右线与右叶第一根界行只隔几像素，中缝靠右就像
+        // 并排的两条竖线（用户实测指出）。左右两线因此分居中缝两侧、
+        // 与左右叶的界行等距延续（间距恰为一列字宽）。
+        // 取色与页内界行同源（乌 / 金 / 朱丝栏）。
+        let rule_lines = div()
+            .absolute()
+            .top(px(22.0))
+            .bottom(px(22.0))
+            .left(px(0.0))
+            .w(px(1.0))
+            .bg(rgb(t.rule_by(self.rule_color)));
+        col = col.child(rule_lines);
+        // 纸心头顶 / 脚底的框线贯通：对开两叶拼成**一张平铺的整纸**，
+        // 外框粗线与内框细线必须横贯全页、全封闭——左叶的上下框只画到
+        // 纸心左缘、右叶只从纸心右缘起，若不在这里补上中缝那一段，
+        // 上框 / 下框就在纸心断成两截（用户指出「头尾没有封闭」）。
+        // 位置与 `render_ancient` 的版框逐层对齐：纸面顶下 16（留白）=
+        // 外框粗线（3px，与左右叶 frame 的 border_t_3 同粗同位），
+        // 再下 3px（框内留边）= 内框细线（1px，与 inner 的 border_t_1
+        // 同位）；底边对称（bottom 16 = 粗线、bottom 22 = 细线）。
+        // 列数（8/10/12/14）只改缝宽 gw，这几条线的位置恒定不动。
+        let frame_col = t.frame_ink();
+        let edge = |top: bool, thick: f32, inset: f32| -> Div {
+            let mut e = div()
+                .absolute()
+                .left(px(0.0))
+                .right(px(0.0))
+                .h(px(thick))
+                .bg(rgb(frame_col));
+            e = if top {
+                e.top(px(inset))
+            } else {
+                e.bottom(px(inset))
+            };
+            e
+        };
+        // 上外框粗线 / 上内框细线
+        col = col.child(edge(true, 3.0, 16.0));
+        col = col.child(edge(true, 1.0, 22.0));
+        // 下外框粗线 / 下内框细线
+        col = col.child(edge(false, 3.0, 16.0));
+        col = col.child(edge(false, 1.0, 22.0));
         col = col.child(div().h(px(cell_h * 0.85)));
-        // 上鱼尾：横长黑矩形，骑跨版心（照参考图「横版」：鱼尾在篇题之上）。
-        col = col.child(banxin_tail(gw * 0.98, true, t.frame_ink()));
+        // 上鱼尾：横长纯黑矩形，骑跨版心（照参考图「横版」：鱼尾在篇题之上）。
+        // 宽度取中缝的 2/3——参考图鱼尾 33px 对中缝带 50px，正是这个比例；
+        // 居中于纸心，不顶两边的细线。
+        col = col.child(banxin_tail(gw * 0.66, true, t.frame_ink()));
         col = col.child(div().h(px(cell_h * 0.16)));
         if detailed {
             for c in self.chapter_title(chapter).chars().take(6) {
@@ -2400,8 +2536,8 @@ impl Root {
             }
         }
         col = col.child(div().h(px(cell_h * 0.12)));
-        // 下鱼尾：与上鱼尾对合，夹住篇题与叶码。
-        col = col.child(banxin_tail(gw * 0.98, false, t.frame_ink()));
+        // 下鱼尾：与上鱼尾对合，夹住篇题与叶码（同宽同形，纯黑横矩形）。
+        col = col.child(banxin_tail(gw * 0.66, false, t.frame_ink()));
         // 朱砂小印「箋讀」：贴版心下端（影印本版心印落在下鱼尾之下）。
         col = col.child(div().h(px(cell_h * 0.26)));
         col.child(banxin_seal(gw * 0.80, gw * 1.60))
@@ -4681,10 +4817,13 @@ impl Root {
         let mut col_row = div().flex().flex_row().items_center().gap_2().flex_wrap();
         for n in GRID_COLUMN_CHOICES {
             let s = format!("{n} 列");
-            let on = cols == n;
+            // 信笺模板锁 14 列，此时普通列数档不点亮。
+            let on = cols == n && !self.letter_mode;
             col_row = col_row.child(small_button(s.as_str(), on, t).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
+                    // 点普通列数档即退出信笺模板（回到 8/10/12/14 自适应）。
+                    this.set_letter_mode(false);
                     this.set_columns(n);
                     cx.notify();
                 }),
@@ -4702,6 +4841,32 @@ impl Root {
                         .child(SharedString::from("列数")),
                 )
                 .child(col_row),
+        );
+
+        // 模板行：信笺（14 列）——单张平铺稿纸，14 个正文列 + 一列宽中缝，
+        // 中缝立「对鱼尾」，四周文武边栏、界栏通内框。点一下即重排当前页。
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(t.ink_soft()))
+                        .child(SharedString::from("模板")),
+                )
+                .child(
+                    div().flex().flex_row().items_center().gap_2().child(
+                        small_button("信笺（14列）", self.letter_mode, t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.set_letter_mode(true);
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+                ),
         );
 
         // 留白行：窄 / 中 / 宽（四周同比例留白）。
@@ -4740,7 +4905,9 @@ impl Root {
                     self.col_w,
                     self.size_ancient,
                     self.grid_rows,
-                    if self.duplex == Duplex::Facing {
+                    if self.letter_mode {
+                        "信笺（14列）"
+                    } else if self.duplex == Duplex::Facing {
                         "对开（横屏）"
                     } else {
                         "单页（竖屏）"

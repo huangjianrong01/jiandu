@@ -105,6 +105,11 @@ pub struct Root {
     pub grid_min_font: bool,
     /// 版式控制面板（列数 / 方向 / 留白）是否展开。
     pub show_grid_panel: bool,
+    /// 信笺模式（「信笺（14列）」模板）：单张平铺稿纸——14 格版心里
+    /// 中缝占两格（左右各 6 格正文），中缝立「对鱼尾」（上下两枚黑鱼尾
+    /// 开口相对），四周文武边栏、界栏通内框。开启时强制单页（不对开）、
+    /// 列数锁 14；关闭回到古籍竖笺的 8/10/12/14 自适应。
+    pub letter_mode: bool,
     pub duplex: Duplex,
     pub font_ancient: FontChoice,
     pub font_modern: FontChoice,
@@ -318,6 +323,7 @@ impl Root {
             grid_rows: 11,
             grid_min_font: false,
             show_grid_panel: false,
+            letter_mode: false,
             duplex: Duplex::Single,
             font_ancient: FontChoice::SongTi,
             font_modern: FontChoice::SourceHanSans,
@@ -538,6 +544,12 @@ impl Root {
         if std::env::var("JIANDU_FACING").is_ok() {
             root.duplex = Duplex::Facing;
         }
+        // 开发用：直接进「信笺（14 列）」模板，便于截图核对。
+        if std::env::var("JIANDU_LETTER").is_ok() {
+            root.letter_mode = true;
+            root.grid.columns = 14;
+            root.duplex = Duplex::Single;
+        }
         if std::env::var("JIANDU_FONT_TAB").is_ok() {
             root.style_tab = StyleTab::Font;
         }
@@ -617,6 +629,12 @@ impl Root {
         self.content_w = content_w;
         self.content_h = content_h;
         let notes_foot = self.show_notes && !self.notes_inline;
+        // 信笺（14 列）模板：单张平铺稿纸，按 23×34cm（2:3）铺排，
+        // 14 个正文列 + 1 个中缝列。与普通过开 / 单页是两条独立的几何路径。
+        if self.letter_mode {
+            self.fit_letter(content_w, content_h, notes_foot);
+            return;
+        }
         // 双面对开 / 单页由屏幕方向驱动：横屏（宽 > 高，平板 / iPad 横持）
         // 走双面对开；竖屏走单页。两者都渲染古籍竖笺。
         let facing = self.viewport_w > self.viewport_h;
@@ -653,6 +671,89 @@ impl Root {
         self.row_h = m.row_h;
         self.grid_rows = m.rows;
         self.grid_min_font = m.min_font_hit;
+    }
+
+    /// 信笺（14 列）模板的几何：单张平铺稿纸，宽高比照参考图 23×34cm
+    /// （≈2:3）。纸宽 = `columns` 个正文列 + 1 个中缝列（中缝与一列同宽），
+    /// 两侧再加版框预留 `ANCIENT_EDGE`；行数未知，故枚举行数，取
+    /// 「纸面宽高比最接近 2:3」且能完整塞进内容区的那一档，再据此反算
+    /// 列宽 / 字号 / 行高——14 列下字仍居中、不溢出。
+    fn fit_letter(&mut self, content_w: f32, content_h: f32, notes_foot: bool) {
+        let aspect = 34.0 / 23.0;
+        let edge = ANCIENT_EDGE;
+        let head = ANCIENT_HEAD;
+        let foot = ANCIENT_FOOT + if notes_foot { ANCIENT_NOTES } else { 0.0 };
+        // 正文列 + 1 个中缝列。
+        let cols_total = self.grid.columns as f32 + 1.0;
+        let row_ratio = crate::grid::GRID_ROW_RATIO;
+        let mut best_rows = 10usize;
+        let mut best_err = f32::MAX;
+        let mut best_cw = 8.0f32;
+        for rows in 6..=44usize {
+            let by_w = (content_w - edge) / cols_total;
+            let by_h =
+                (content_h - edge - head - foot) / (rows as f32 * row_ratio);
+            let cw = by_w.min(by_h);
+            if cw < 3.0 {
+                continue;
+            }
+            let w = cols_total * cw + edge;
+            let h = rows as f32 * row_ratio * cw + edge + head + foot;
+            let err = (h / w - aspect).abs();
+            if err < best_err {
+                best_err = err;
+                best_rows = rows;
+                best_cw = cw;
+            }
+        }
+        // 字号 = 0.75 × 列宽；窄屏触底则反推列宽（宁可纸面略宽 → 渲染层滚动），
+        // 保证 14 列时字仍不小于可读下限、也不与字格重叠。
+        let mut fs = best_cw * crate::grid::GRID_FS_RATIO * self.zoom;
+        let min_hit = fs < crate::grid::GRID_FS_MIN;
+        fs = fs.clamp(crate::grid::GRID_FS_MIN, crate::grid::GRID_FS_MAX);
+        let col_w = if min_hit { fs / crate::grid::GRID_FS_RATIO } else { best_cw };
+        let row_h = col_w * row_ratio;
+        self.size_ancient = fs;
+        self.size_modern = fs;
+        self.line_modern = row_h;
+        self.page_w = cols_total * col_w + edge;
+        self.page_h = best_rows as f32 * row_h + edge + head + foot;
+        self.col_w = col_w;
+        self.row_h = row_h;
+        self.grid_rows = best_rows;
+        self.grid_min_font = min_hit;
+        // 信笺是**一张平铺的纸**，不对开。
+        self.duplex = Duplex::Single;
+    }
+
+    /// 切换「信笺（14 列）」模板：保当前页首字锚点，重排后仍停在同一处
+    /// （用户要求「点击后无缝重排当前页面」，不回到卷首）。
+    pub fn set_letter_mode(&mut self, on: bool) {
+        if self.letter_mode == on {
+            return;
+        }
+        let anchor = self
+            .layout_pages()
+            .get(self.page)
+            .and_then(|p| p.glyphs.first())
+            .map(|g| (g.chapter, g.para, g.offset));
+        self.letter_mode = on;
+        if on {
+            // 信笺模板锁 14 列（14 个正文列 + 1 中缝列），并强制单页。
+            self.grid.columns = 14;
+            self.duplex = Duplex::Single;
+        }
+        self.fit_sizes();
+        if let Some((c, pa, o)) = anchor {
+            if let Some(pi) = self.layout_pages().iter().position(|pg| {
+                pg.glyphs
+                    .iter()
+                    .any(|g| (g.chapter, g.para, g.offset) == (c, pa, o))
+            }) {
+                self.page = pi;
+            }
+        }
+        self.sync_current_chapter();
     }
 
     /// 设列数（8 / 10 / 12 / 14）；越界值忽略。改列数会重排，回到首页。
@@ -1874,18 +1975,31 @@ fn ensure_assets() {
     // 鱼尾纹：一枚朝下的实心三角，从顶边正中劈开一道窄缝，形似鱼尾（上尾朝下、下尾朝上）。
     // 注意 GPUI 只取 SVG 的 alpha 通道再用元素 text_color 上色，故 fill 必须为不透明实色。
     let top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 13\"><path d=\"M0,0 L11,0 L12,13 Z M24,0 L13,0 L12,13 Z\" fill=\"#1A150F\"/></svg>";
-    // 版心鱼尾：完整照搬用户参考图「横版」中缝里那两枚——**横长黑矩形**
-    // （骑跨版心、上下各一枚：上鱼尾在篇题之上，下鱼尾在叶码之下），
-    // 上边平直满宽、下缘两角微收成浅 V；下鱼尾上下翻转同形。
-    // viewBox 24×9（宽高比约 33:12，与参考图一致）。GPUI 只取 SVG 的
-    // alpha 通道再用元素 text_color 上色，故 fill 必须为不透明实色。
-    // 见 reader::banxin_tail。
+    // 版心鱼尾：完整照搬用户参考图「横版」中缝里那两枚——**横长纯黑矩形**
+    // （骑跨版心、上下各一枚：上鱼尾在篇题之上，下鱼尾在叶码之下）。
+    // 逐像素复测参考图（800×566 扫描图）：鱼尾实体 x 410..442、y 171..182
+    // （上）/ y 440..451（下），即 **33×12 的实心横矩形，四缘皆平直、无尖无 V**，
+    // 宽高比 33:12 ≈ 2.75；上下两枚同形（纯矩形上下对称）。
+    // GPUI 只取 SVG 的 alpha 通道再用元素 text_color 上色，故 fill 必须为
+    // 不透明实色。见 reader::banxin_tail。
     let bx_top = dir.join("banxin_top.svg");
     let bx_bot = dir.join("banxin_bottom.svg");
-    let bx_top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 9\"><path d=\"M0,0 L24,0 L24,6.4 L13.5,9 L10.5,9 L0,6.4 Z\" fill=\"#1A150F\"/></svg>";
-    let bx_bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 9\"><path d=\"M0,9 L24,9 L24,2.6 L13.5,0 L10.5,0 L0,2.6 Z\" fill=\"#1A150F\"/></svg>";
+    let bx_top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 33 12\"><rect x=\"0\" y=\"0\" width=\"33\" height=\"12\" fill=\"#1A150F\"/></svg>";
+    let bx_bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 33 12\"><rect x=\"0\" y=\"0\" width=\"33\" height=\"12\" fill=\"#1A150F\"/></svg>";
     let _ = std::fs::write(&bx_top, bx_top_svg);
     let _ = std::fs::write(&bx_bot, bx_bot_svg);
+    // 信笺（14 列）模板的「对鱼尾」：照用户「信笺」参考图逐像素提取——
+    // 一枚是「上缘平直、下缘中央开 Λ 形缺口、两角拖出尖尾」的燕尾，
+    // 另一枚上下翻转、开口相对。viewBox 47×34（实测鱼尾 47 宽、34 高，
+    // 实心带宽约 17、尖尾再拖 17）；四个角与缺口边缘各留 ±0.5 的微小
+    // 抖点，缩到几十像素时正好像木刻雕版的一点点毛边，而不是矢量图
+    // 那种绝对平直的机器边。见 reader::letter_fishtail。
+    let yu_top = dir.join("yu_top.svg");
+    let yu_bot = dir.join("yu_bottom.svg");
+    let yu_top_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 47 34\"><path d=\"M0,0.5 L11,0 L23.5,0.6 L36,0 L47,0.5 L47,33.4 L38.6,34 L23.7,16.6 L23.2,16.4 L9,34 L8.4,33.4 L0,33.6 Z\" fill=\"#1A150F\"/></svg>";
+    let yu_bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 47 34\"><path d=\"M0,33.5 L11,34 L23.5,33.4 L36,34 L47,33.5 L47,0.6 L38.6,0 L23.7,17.4 L23.2,17.6 L9,0 L8.4,0.6 L0,0.4 Z\" fill=\"#1A150F\"/></svg>";
+    let _ = std::fs::write(&yu_top, yu_top_svg);
+    let _ = std::fs::write(&yu_bot, yu_bot_svg);
     let bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 13\"><path d=\"M0,13 L11,13 L12,0 Z M24,13 L13,13 L12,0 Z\" fill=\"#1A150F\"/></svg>";
     // 朱砂小印「箋讀」的小篆字稿：两枚 100×100 的等粗圆头线篆（墨色由
     // 渲染层 text_color 换成朱砂红）。随系统没有篆体字库，索性照小篆结构
