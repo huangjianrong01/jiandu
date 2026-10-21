@@ -193,6 +193,12 @@ pub struct GridConfig {
     pub dir: GridDir,
     /// 四周留白比例（相对内容区，0..1）。
     pub margin: f32,
+    /// **行高缩放**（`lineHeightScale`）：行高 = 列宽 × `GRID_ROW_RATIO` × 它。
+    ///
+    /// 不同字体的 em box 大小不同——思源系列字面偏大，同样字号下竖排
+    /// 上下两字容易贴住。按当前正文字体给一点余量（宋体 1.05、楷体 1.12），
+    /// 字形才紧凑而不重叠。见 `fonts::line_height_scale`。
+    pub line_scale: f32,
 }
 
 impl Default for GridConfig {
@@ -200,7 +206,7 @@ impl Default for GridConfig {
         GridConfig {
             columns: 8,
             dir: GridDir::Vertical,
-            margin: 0.04,
+            margin: 0.04, line_scale: 1.0,
         }
     }
 }
@@ -214,6 +220,11 @@ pub const GRID_ROW_RATIO: f32 = 1.1; // rowHeight = colWidth × 1.1
 pub const GRID_FS_MIN: f32 = 12.0;
 /// 字号上限：专注模式撑满整屏时不被无限制放大。
 pub const GRID_FS_MAX: f32 = 220.0;
+/// 行高缩放的中性值：不放大也不压缩（旧存档 / 未指定字体时取它）。
+pub const LINE_SCALE_BASE: f32 = 1.0;
+/// 行高缩放的合理区间（夹住异常值，免得行气散掉或字压成一团）。
+pub const LINE_SCALE_MIN: f32 = 0.85;
+pub const LINE_SCALE_MAX: f32 = 1.6;
 
 /// 网格度量：由 [`compute_grid`] 算出，渲染与分页共用，不再写死任何像素。
 #[derive(Clone, Copy, Debug)]
@@ -283,8 +294,15 @@ pub fn compute_grid(
     // 触发下限时，反推列宽使字号不小于下限（宁可超出可用宽 → 渲染层滚动），
     // 避免字比字格还宽而横向重叠。
     let col_w = if min_hit { fs / GRID_FS_RATIO } else { col_w_raw };
-    // 6) 行高 = 1.1 × 列宽（与字号比例固定，天然保证 rowHeight > fontSize，竖排不上下重叠）。
-    let row_h = col_w * GRID_ROW_RATIO;
+    // 6) 行高 = 1.1 × 列宽 × 行高缩放（与字号比例固定，天然保证
+    //    rowHeight > fontSize，竖排不上下重叠）。缩放由当前正文字体定
+    //    （思源系字面大 → 松开一点余量），见 `fonts::line_height_scale`。
+    let scale = if cfg.line_scale > 0.0 {
+        cfg.line_scale.clamp(LINE_SCALE_MIN, LINE_SCALE_MAX)
+    } else {
+        LINE_SCALE_BASE
+    };
+    let row_h = col_w * GRID_ROW_RATIO * scale;
     // 7) 总行数 = floor(可用高 / 行高)。
     let rows = ((inner_h / row_h).floor()).max(1.0) as usize;
 
@@ -382,7 +400,7 @@ mod tests {
             GridConfig {
                 columns: 12,
                 dir: GridDir::Vertical,
-                margin: 0.04,
+                margin: 0.04, line_scale: 1.0,
             },
             false,
             1.0,
@@ -408,7 +426,7 @@ mod tests {
             GridConfig {
                 columns: 14,
                 dir: GridDir::Vertical,
-                margin: 0.04,
+                margin: 0.04, line_scale: 1.0,
             },
             false,
             1.0,
@@ -432,7 +450,7 @@ mod tests {
             GridConfig {
                 columns: 14,
                 dir: GridDir::Vertical,
-                margin: 0.04,
+                margin: 0.04, line_scale: 1.0,
             },
             false,
             1.0,
@@ -564,6 +582,7 @@ mod tests {
                     columns: c.columns,
                     dir: c.dir,
                     margin: c.margin,
+                    line_scale: 1.0,
                 },
                 false,
                 1.0,
@@ -577,5 +596,42 @@ mod tests {
             assert!(m.outer_h <= 880.0 - 78.0 - 44.0 + 0.5, "{} 纸高溢出", c.key);
             assert!(m.row_h > m.fs, "{} row_h 必须 > fs", c.key);
         }
+    }
+
+    #[test]
+    fn line_height_scale_loosens_rows_and_keeps_glyphs_apart() {
+        let grid = |scale: f32| {
+            compute_grid(
+                800.0,
+                600.0,
+                GridConfig {
+                    columns: 8,
+                    dir: GridDir::Vertical,
+                    margin: 0.04,
+                    line_scale: scale,
+                },
+                false,
+                1.0,
+                50.0,
+                0.0,
+                12.0,
+                0.0,
+            )
+        };
+        let base = grid(1.0);
+        let kai = grid(1.12);
+        // 行高随缩放放大 → 每列能排的行数相应减少（分页与渲染同源，不溢出）。
+        assert!(kai.row_h > base.row_h, "{} vs {}", kai.row_h, base.row_h);
+        assert!(kai.rows <= base.rows);
+        // 无论怎么缩放，行高始终大于字号：竖排绝不会上下重叠。
+        assert!(kai.row_h > kai.fs);
+        assert!(base.row_h > base.fs);
+        // 中性值 = 不缩放。
+        assert!((grid(crate::grid::LINE_SCALE_BASE).row_h - base.row_h).abs() < 0.01);
+        // 异常值被夹住，行气不至于散掉或压成一团。
+        let wild = grid(9.0);
+        assert!(wild.row_h <= base.row_h * crate::grid::LINE_SCALE_MAX + 0.01);
+        let tiny = grid(0.01);
+        assert!(tiny.row_h >= base.row_h * crate::grid::LINE_SCALE_MIN - 0.01);
     }
 }

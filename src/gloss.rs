@@ -506,7 +506,13 @@ pub fn note_boxes_in_column(
                 y += cell_h;
                 idx += 1;
             }
-            Piece::Gap => idx += 1,
+            // 避头尾空位在渲染里确确实实占了一整格（`ancient_column` 也
+            // 给它 cell_h）：账上必须同记，否则它后面的注块包围盒会整体
+            // 偏上——点注文就点不准了。与 `hit::column_spans` 同源。
+            Piece::Gap => {
+                y += cell_h;
+                idx += 1;
+            }
             Piece::Gloss(text, src, host) => {
                 let rows = (text.chars().count() + 1) / 2;
                 let h = rows as f32 * row_h;

@@ -47,6 +47,133 @@ pub fn define(ch: &str) -> Option<&'static str> {
     DICT.get(ch).map(|s| s.as_str())
 }
 
+// ----------------------------------------------------------------------
+// 词条：拼音 + 词性 + 释义（浮签要按「字 / 拼音 / 释义」三列竖排）
+// ----------------------------------------------------------------------
+//
+// 字书那部 `guhanyu.json` 只有释义，没有拼音与词性；浮签的第二列（拼音）
+// 与「词性」标签得有专门的表。这里放一份**轻量本地词条**：词组取自
+// `resources/dict/phrases.json`（长安、曰、天下…），单字的拼音另有一张
+// 常用字表，两者拼成同一枚 `Entry`，浮签不必关心它从哪来。
+
+/// 一枚词条：浮签的三列就是它。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// 词（单字或词组）。
+    pub word: String,
+    /// 拼音（词组带空格分隔）。
+    pub pinyin: String,
+    /// 词性（名 / 动 / 形 / 连 ……）；单字无可考时给「字」。
+    pub pos: String,
+    /// 释义。
+    pub gloss: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawPhrase {
+    word: String,
+    pinyin: String,
+    pos: String,
+    gloss: String,
+}
+
+const PHRASE_RAW: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/dict/phrases.json"
+));
+
+/// 词组表（编译期嵌入，运行时零 I/O）。
+static PHRASES: Lazy<Vec<RawPhrase>> =
+    Lazy::new(|| serde_json::from_str(PHRASE_RAW).unwrap_or_default());
+
+/// 常用字拼音表（文言高频字；生僻字另见 `RARE`）。
+static PINYIN: Lazy<HashMap<char, &'static str>> = Lazy::new(|| {
+    let entries: &[(char, &str)] = &[
+        ('曰', "yuē"), ('之', "zhī"), ('乎', "hū"), ('者', "zhě"), ('也', "yě"),
+        ('其', "qí"), ('而', "ér"), ('以', "yǐ"), ('于', "yú"), ('是', "shì"),
+        ('不', "bù"), ('人', "rén"), ('天', "tiān"), ('下', "xià"), ('子', "zǐ"),
+        ('君', "jūn"), ('长', "cháng"), ('安', "ān"), ('山', "shān"), ('水', "shuǐ"),
+        ('风', "fēng"), ('月', "yuè"), ('日', "rì"), ('年', "nián"), ('心', "xīn"),
+        ('生', "shēng"), ('死', "sǐ"), ('道', "dào"), ('德', "dé"), ('仁', "rén"),
+        ('义', "yì"), ('礼', "lǐ"), ('智', "zhì"), ('信', "xìn"), ('学', "xué"),
+        ('行', "xíng"), ('言', "yán"), ('文', "wén"), ('书', "shū"), ('诗', "shī"),
+        ('國', "guó"), ('国', "guó"), ('家', "jiā"), ('春', "chūn"), ('秋', "qiū"),
+        ('江', "jiāng"), ('河', "hé"), ('花', "huā"), ('草', "cǎo"), ('木', "mù"),
+        ('金', "jīn"), ('玉', "yù"), ('王', "wáng"), ('侯', "hóu"), ('将', "jiàng"),
+        ('士', "shì"), ('女', "nǚ"), ('夫', "fū"), ('母', "mǔ"), ('父', "fù"),
+    ];
+    let mut m = HashMap::new();
+    for (c, p) in entries {
+        m.insert(*c, *p);
+    }
+    m
+});
+
+/// 查一个字的拼音：常用字表 → 生僻字表。
+pub fn pinyin_for(ch: char) -> Option<&'static str> {
+    PINYIN.get(&ch).copied().or_else(|| pinyin_of(ch))
+}
+
+/// 查词组（**最长匹配**）：在词条表里找 `text` 开头的词。
+///
+/// 浮签拖选了「长安」就出「长安」这一条，而不是「长」+「安」两条——
+/// 查词嘛，自然是成词优先。
+pub fn phrase(text: &str) -> Option<Entry> {
+    let chars: Vec<char> = text.chars().collect();
+    let max = chars.len().min(4);
+    if max < 2 {
+        return None;
+    }
+    for n in (2..=max).rev() {
+        let head: String = chars[..n].iter().collect();
+        if let Some(p) = PHRASES.iter().find(|p| p.word == head) {
+            return Some(Entry {
+                word: p.word.clone(),
+                pinyin: p.pinyin.clone(),
+                pos: p.pos.clone(),
+                gloss: p.gloss.clone(),
+            });
+        }
+    }
+    None
+}
+
+/// 查单字：释义取字书（原字 → 繁体 → 简体），拼音取拼音表。
+pub fn entry_of(ch: char) -> Option<Entry> {
+    let s = ch.to_string();
+    let gloss = crate::dict::define(&s)
+        .or_else(|| {
+            crate::trad::traditional_of(ch).and_then(|t| crate::dict::define(&t.to_string()))
+        })
+        .or_else(|| {
+            crate::trad::simplified_of(ch).and_then(|t| crate::dict::define(&t.to_string()))
+        })?;
+    Some(Entry {
+        word: s,
+        pinyin: pinyin_for(ch).unwrap_or("—").to_string(),
+        // 单字不标词性：古汉语一字兼类太常见，标了反而误导。
+        pos: "字".to_string(),
+        gloss: gloss.to_string(),
+    })
+}
+
+/// **浮签的统一入口**：先试成词，再退到单字。
+///
+/// `text` 是长按 / 拖选得到的文本（可能一整段）：只取开头去匹配，
+/// 匹配不上就查首字。查不到返回 `None`（浮签上给出「可点考据原典」）。
+pub fn lookup(text: &str) -> Option<Entry> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    phrase(t).or_else(|| t.chars().next().and_then(entry_of))
+}
+
+/// 词条表收录条数（状态展示用）。
+pub fn phrase_len() -> usize {
+    PHRASES.len()
+}
+
 /// 在线字书：汉典。长按浮签的「在线查阅」按钮拼这个地址。
 pub const ZDIC_BASE: &str = "https://www.zdic.net/hans/";
 
@@ -148,6 +275,52 @@ mod tests {
         assert_eq!(zdic_url(""), "https://www.zdic.net/hans/%20");
         // 会被 URL 截断的字符必须编码掉。
         assert!(percent_encode("a#b?c&d").contains("%23"));
+    }
+
+    #[test]
+    fn phrase_lookup_prefers_the_longest_word() {
+        // 「长安」成词：拖选它不能拆成「长」+「安」。
+        let e = lookup("长安").expect("「长安」应收录");
+        assert_eq!(e.word, "长安");
+        assert_eq!(e.pinyin, "cháng ān");
+        assert!(!e.pos.is_empty());
+        // 「长安道」仍先命中「长安」（最长匹配，但不越过 4 字）。
+        assert_eq!(lookup("长安道上").map(|e| e.word), Some("长安".to_string()));
+        // 单字「曰」：拼音与词性齐全。
+        let y = lookup("曰").expect("「曰」应收录");
+        assert_eq!(y.pinyin, "yuē");
+        assert_eq!(y.pos, "字");
+        assert!(!y.gloss.is_empty());
+    }
+
+    #[test]
+    fn single_char_falls_back_to_the_character_book() {
+        // 词组表里没有的字，退到字书（拼音表没有就给「—」）。
+        let e = lookup("阿").expect("「阿」字书有收");
+        assert_eq!(e.word, "阿");
+        assert_eq!(e.pos, "字");
+        // 拼音表收了「天」。
+        assert_eq!(pinyin_for('天'), Some("tiān"));
+        // 生僻字表兜底。
+        assert_eq!(pinyin_for('窈'), Some("yǎo"));
+        // 空串 / 空白不 panic，也不出条目。
+        assert!(lookup("").is_none());
+        assert!(lookup("   ").is_none());
+    }
+
+    #[test]
+    fn phrase_table_is_loaded_and_well_formed() {
+        assert!(phrase_len() >= 10, "词条太少：{}", phrase_len());
+        for p in PHRASES.iter() {
+            // 单字（「曰」）与词组（「长安」）都收：古汉语里一字即一词。
+            assert!(!p.word.is_empty(), "词条缺词");
+            assert!(!p.pinyin.is_empty(), "{} 缺拼音", p.word);
+            assert!(!p.pos.is_empty(), "{} 缺词性", p.word);
+            assert!(!p.gloss.is_empty(), "{} 缺释义", p.word);
+        }
+        // 用户点名的两条测试数据必须在。
+        assert!(PHRASES.iter().any(|p| p.word == "长安"));
+        assert!(PHRASES.iter().any(|p| p.word == "曰"));
     }
 
     #[test]

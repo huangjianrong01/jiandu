@@ -248,6 +248,67 @@ impl FontChoice {
     pub const MODERN: [FontChoice; 2] = [FontChoice::SourceHanSans, FontChoice::SystemDefault];
 }
 
+/// **排版字体**（设置面板那一行）：刻本宋体 ↔ 手写楷体。
+///
+/// 一个是「匠体」、一个是「写体」——刻本正文都是匠体宋字，而手写楷体
+/// 是稿本 / 写本的味道。切换时正文与批注**一起换**，但两者始终不同体
+/// （见 `main_choice` / `note_choice`），层次感不丢。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum FontPreset {
+    /// 刻本宋体：正文文津宋体、批注霞鹜文楷（默认）。
+    Song,
+    /// 手写楷体：正文霞鹜文楷、批注玄冬楷书。
+    Kai,
+}
+
+impl FontPreset {
+    pub const ALL: [FontPreset; 2] = [FontPreset::Song, FontPreset::Kai];
+
+    /// 面板上的名字。
+    pub fn label(&self) -> &'static str {
+        match self {
+            FontPreset::Song => "刻本宋体",
+            FontPreset::Kai => "手写楷体",
+        }
+    }
+
+    /// 面板上的副题：写清正文明用哪一款。
+    pub fn hint(&self) -> &'static str {
+        match self {
+            FontPreset::Song => "文津宋体 · 注用霞鹜文楷",
+            FontPreset::Kai => "霞鹜文楷 · 注用玄冬楷书",
+        }
+    }
+
+    /// 该预设的**正文**字体。
+    pub fn main_choice(&self) -> FontChoice {
+        match self {
+            FontPreset::Song => FontChoice::WenJinMincho,
+            FontPreset::Kai => FontChoice::LXGWWenKai,
+        }
+    }
+
+    /// 该预设的**批注**字体（永远与正文不同款）。
+    pub fn note_choice(&self) -> FontChoice {
+        match self {
+            FontPreset::Song => FontChoice::LXGWWenKai,
+            FontPreset::Kai => FontChoice::XuandongKaishu,
+        }
+    }
+
+    /// 存档用的下标（与 `ALL` 同源，越界回落首项）。
+    pub fn index(self) -> usize {
+        FontPreset::ALL
+            .iter()
+            .position(|p| *p == self)
+            .unwrap_or(0)
+    }
+
+    pub fn from_index(i: usize) -> FontPreset {
+        FontPreset::ALL.get(i).copied().unwrap_or(FontPreset::Song)
+    }
+}
+
 /// 字级四档：小 / 中 / 大 / 特大。
 ///
 /// 取代原先那条七档圆点滑块——档位太多，相邻两档肉眼几乎分不出来，

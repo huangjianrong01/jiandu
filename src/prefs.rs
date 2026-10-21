@@ -12,7 +12,7 @@
 
 use crate::library::Library;
 use crate::theme::{InkPalette, Theme};
-use crate::types::FontChoice;
+use crate::types::{FontChoice, FontPreset};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -29,6 +29,9 @@ pub struct Prefs {
     /// **批注字体**（夹注小字 / 放大注卡）：`FontChoice::NOTE` 下标。
     #[serde(default)]
     pub font_note: usize,
+    /// **排版字体**（刻本宋体 / 手写楷体）：`FontPreset::ALL` 下标。
+    #[serde(default)]
+    pub font_preset: usize,
     /// 字级倍率（1.0 = 中）。
     pub zoom: f32,
     /// 每面列数（8 / 10 / 12 / 14）。
@@ -68,6 +71,7 @@ impl Default for Prefs {
             font_ancient: 0,
             font_modern: 0,
             font_note: 0,
+            font_preset: 0,
             zoom: 1.0,
             columns: 10,
             margin: 0.06,
@@ -131,6 +135,10 @@ impl Prefs {
     }
     pub fn font_note(&self) -> FontChoice {
         pick(&FontChoice::NOTE, self.font_note)
+    }
+    /// 排版字体（刻本宋体 / 手写楷体）。
+    pub fn font_preset(&self) -> FontPreset {
+        pick(&FontPreset::ALL, self.font_preset)
     }
 
     /// 从当前设置反向填好存档（存下标，故需反查在枚举里的位置）。
@@ -205,8 +213,8 @@ mod tests {
 
     #[test]
     fn old_prefs_without_new_fields_still_load() {
-        // 老存档没有 `font_note` / `auto_duplex`：不能整份反序列化失败
-        // （一失败就 `unwrap_or_default()`，用户所有偏好全丢）。
+        // 老存档没有 `font_note` / `auto_duplex` / `font_preset`：不能整份
+        // 反序列化失败（一失败就 `unwrap_or_default()`，用户所有偏好全丢）。
         let old = r#"{"theme":1,"palette":0,"font_ancient":0,"font_modern":0,"zoom":1.0,
             "columns":10,"margin":0.06,"letter":false,"layout_key":"standard10",
             "notes_inline":true,"trad":true,"tongjia":true,"punct":true,"rare":true,
@@ -214,5 +222,18 @@ mod tests {
         let p: Prefs = serde_json::from_str(old).expect("老存档应能读进来");
         assert!(p.auto_duplex, "响应式开合默认开");
         assert_eq!(p.font_note(), FontChoice::NOTE[0]);
+        assert_eq!(p.font_preset(), FontPreset::Song);
+    }
+
+    #[test]
+    fn font_preset_round_trips() {
+        // 排版字体：默认「刻本宋体」，切到「手写楷体」后存回来还是它。
+        let mut p = Prefs::default();
+        assert_eq!(p.font_preset(), FontPreset::Song);
+        p.font_preset = FontPreset::Kai.index();
+        assert_eq!(p.font_preset(), FontPreset::Kai);
+        assert_eq!(FontPreset::from_index(p.font_preset), FontPreset::Kai);
+        // 越界回落首项，不 panic。
+        assert_eq!(FontPreset::from_index(99), FontPreset::Song);
     }
 }

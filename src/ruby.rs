@@ -96,7 +96,7 @@ mod tests {
             GridConfig {
                 columns: cols,
                 dir: GridDir::Vertical,
-                margin: 0.04,
+                margin: 0.04, line_scale: 1.0,
             },
             false,
             1.0,

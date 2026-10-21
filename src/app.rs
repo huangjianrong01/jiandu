@@ -8,8 +8,8 @@ use crate::grid::{compute_grid, GridConfig, GridDir, LayoutConfig};
 use crate::library::Library;
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
-    Book, CardLayout, Duplex, FontChoice, Glyph, GlyphHit, GlyphKey, GlyphKind, MarkKind, Note,
-    NoteKind, NoteSource, RuleColor, Script, StyleTab,
+    Book, CardLayout, Duplex, FontChoice, FontPreset, Glyph, GlyphHit, GlyphKey, GlyphKind,
+    MarkKind, Note, NoteKind, NoteSource, RuleColor, Script, StyleTab,
 };
 use gpui::{
     div, px, rgb, AsyncApp, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
@@ -115,6 +115,12 @@ pub struct Root {
     /// [`FontChoice::NOTE`]。与正文宋体分开，正是刻本「正文匠体、注文手写体」
     /// 的层次；默认玄冬楷书。
     pub font_note: FontChoice,
+    /// **排版字体**（设置面板那一行）：刻本宋体 ↔ 手写楷体。
+    ///
+    /// 它是一对字体的**组合句柄**——切一次同时换正文与批注（见
+    /// `set_font_preset`）。字体名本身不在这儿：`fonts::FONT_CONFIGS`
+    /// 才是唯一数据源，UI 与渲染都只认角色。
+    pub font_preset: FontPreset,
     pub show_traditional: bool,
     pub show_tongjia: bool,
     pub show_notes: bool,
@@ -156,6 +162,12 @@ pub struct Root {
     /// `Some` 表示浮签贴着长按点浮起；`None` 表示退化为右上角常驻面板
     /// （工具条「查询」按钮走的就是这条路）。
     pub lookup_at: Option<(f32, f32)>,
+    /// 被查那个字**在屏幕上的矩形**（窗口坐标）：浮签据此避让——
+    /// 展开方向要让开它，绝不能把查的字压在浮签底下。
+    ///
+    /// 由长按的**坐标反查**（`glyph_hit_at`）量出来，和 `lookup_at`
+    /// （手指落点）不是一回事：落点可能偏在字格边缘，而要让开的是整个字。
+    pub lookup_rect: Option<(f32, f32, f32, f32)>,
     /// 当前书的笔记：页序号 -> 正文。
     pub notes: std::collections::HashMap<usize, String>,
     /// 笔记面板是否展开。
@@ -359,6 +371,7 @@ impl Root {
             font_ancient: FontChoice::WenJinMincho,
             font_modern: FontChoice::SourceHanSans,
             font_note: FontChoice::XuandongKaishu,
+            font_preset: FontPreset::Song,
             show_traditional: true,
             show_tongjia: true,
             show_notes: true,
@@ -379,6 +392,7 @@ impl Root {
             lookup_key: None,
             lookup_text: String::new(),
             lookup_at: None,
+            lookup_rect: None,
             notes: std::collections::HashMap::new(),
             show_notes_panel: false,
             note_editing: false,
@@ -463,6 +477,9 @@ impl Root {
 
         // 开发用：JIANDU_AUTO_READ=1 直接进入正文，方便截图核对版式
         // （JIANDU_BOOK_IDX 可指定打开书架第几本）。
+        // 行高缩放随**当前正文字体**定：默认「刻本宋体」（文津宋体）取 1.05。
+        // 不设的话是中性值 1.0，切一次排版字体后行高会突然变——一开局就对齐。
+        root.grid.line_scale = crate::fonts::preset_line_scale(root.font_preset);
         // 开发用：JIANDU_SHELF=list 以书脊列表开局、JIANDU_SHELF_Q=词 预填搜索、
         // JIANDU_SHELF_CAT=史 预选分类，便于逐态截图核对书架。
         if let Ok(v) = std::env::var("JIANDU_SHELF") {
@@ -688,6 +705,36 @@ impl Root {
         self.persist();
     }
 
+    /// **切换排版字体**（刻本宋体 ↔ 手写楷体）——重绘链在这里闭合。
+    ///
+    /// 字体不是「换个族名就完了」：不同字体的 em box 不同，行高一变，
+    /// 每列能排几行就变、整本书的分页也就变。所以一次切换要走完四步：
+    ///   1. 换**正文**字体（`main_choice`）；
+    ///   2. 换**批注**字体（`note_choice`，永远与正文不同款，层次不丢）；
+    ///   3. 换**行高缩放**（`fonts::preset_line_scale`：楷体笔势舒展，
+    ///      行间要更松，否则上下两字粘连）；
+    ///   4. **重算尺寸**（`fit_sizes`）——行高 / 行数 / 字号全部重算。
+    /// 分页是每帧按新尺寸重排的（`layout_pages`），故不必显式重排；
+    /// 渲染下一帧自会拿新的 `font_preset` 取族名。
+    pub fn set_font_preset(&mut self, p: FontPreset) {
+        self.font_preset = p;
+        self.font_ancient = p.main_choice();
+        self.font_note = p.note_choice();
+        self.grid.line_scale = crate::fonts::preset_line_scale(p);
+        self.fit_sizes();
+        self.persist();
+    }
+
+    /// 当前正文字体族名（渲染层唯一入口）。
+    pub fn main_family(&self) -> gpui::SharedString {
+        crate::fonts::family_for(self.font_ancient, self.script)
+    }
+
+    /// 当前批注（夹注 / 放大注卡）字体族名。
+    pub fn note_family(&self) -> gpui::SharedString {
+        crate::fonts::note_family(self.font_note)
+    }
+
     /// 打开「字义浮签」：记下被查那个字的 **charIndex**、选中文本与锚点。
     ///
     /// `at = Some((x, y))` 时浮签贴着长按点浮起（长按查字走这条路）；
@@ -698,11 +745,13 @@ impl Root {
         ch: char,
         text: String,
         at: Option<(f32, f32)>,
+        rect: Option<(f32, f32, f32, f32)>,
     ) {
         self.lookup = Some(ch.to_string());
         self.lookup_key = Some(key);
         self.lookup_text = text;
         self.lookup_at = at;
+        self.lookup_rect = rect;
     }
 
     /// 关闭字义浮签：三件套一起清，免得下次点字还残留上次的 charIndex。
@@ -711,6 +760,114 @@ impl Root {
         self.lookup_key = None;
         self.lookup_text.clear();
         self.lookup_at = None;
+        self.lookup_rect = None;
+    }
+
+    // ------------------------------------------------------------------
+    // 坐标反查：只用 (x, y) 反推「查的是哪个字」
+    // ------------------------------------------------------------------
+    //
+    // 元素级事件（每个字格挂 `on_mouse_down`）能回答「点了哪个字」，但
+    // 落在格子缝隙、夹注块上、或拖选结束那一下，元素不一定命中。这里走
+    // 几何：窗口坐标 → 叶 → 列 → 列内半格账 → 字。与渲染同源（列序、
+    // 夹注半格、西文成组、卷首题署预留带都对齐），见 `crate::hit`。
+
+    /// 从 `key` 起向后取 `n` 个字符（查词用：词组最长匹配）。
+    ///
+    /// 长按一个字，光知道「这是哪个字」不够——「长安」要当一条词来查。
+    /// 这里从命中字的 `offset` 起取几个字交给 `dict::lookup` 做最长匹配，
+    /// 命中就出词条，不命中自然退回单字。
+    pub fn text_from(&self, key: GlyphKey, n: usize) -> String {
+        let Some(b) = &self.book else {
+            return String::new();
+        };
+        let (ci, pi, off) = key;
+        let Some(ch) = b.chapters.get(ci) else {
+            return String::new();
+        };
+        let Some(p) = ch.paragraphs.get(pi) else {
+            return String::new();
+        };
+        p.text.chars().skip(off).take(n).collect()
+    }
+
+    /// 当前叶的几何（反查用，与 `render_ancient` 同源）。
+    pub fn leaf_frame(&self, pg: &crate::gloss::Page) -> crate::hit::LeafFrame {
+        let total = self.grid.columns;
+        // 章首页最右一列让给章题，正文列数少一列（与渲染同源）。
+        let text_cols = if pg.start_chapter {
+            total.saturating_sub(1)
+        } else {
+            total
+        };
+        let cfg = self.current_layout();
+        crate::hit::LeafFrame {
+            cell_w: self.col_w,
+            cell_h: self.row_h,
+            rows: self.grid_rows,
+            text_cols,
+            start_chapter: pg.start_chapter,
+            title_cols: ANCIENT_TITLE_COL,
+            show_fish_tail: cfg.show_fish_tail,
+            // 信笺中缝插在第 7、8 个正文列之间；章首页多一个章题列，
+            // 分割点随之前移一列（与渲染的 `split_i` 同一条规则）。
+            gutter_at: if pg.start_chapter { 5 } else { 6 },
+            reserve: self.chapter_inscription_reserve_rows(),
+            west_mode: !self.han_digits,
+        }
+    }
+
+    /// 窗口坐标 → 字（含它在屏幕上的矩形）。
+    ///
+    /// 命中的是**当前可见的叶**：对开先试右叶（当前面）、再试左叶（下一面），
+    /// 与 `render_reading` 的舞台排布一致。返回的字用**窗口坐标**，浮签
+    /// 避让可直接拿去算。
+    pub fn glyph_hit_at(&self, x: f32, y: f32) -> Option<crate::hit::GlyphBox> {
+        let pages = self.layout_pages();
+        if pages.is_empty() {
+            return None;
+        }
+        let facing = self.duplex == Duplex::Facing;
+        let mut leaves: Vec<(usize, bool)> = Vec::new();
+        if facing {
+            if self.page < pages.len() {
+                leaves.push((self.page, false)); // 右叶 = 当前面
+            }
+            if self.page + 1 < pages.len() {
+                leaves.push((self.page + 1, true)); // 左叶 = 下一面
+            }
+        } else if self.page < pages.len() {
+            leaves.push((self.page, false));
+        }
+        let gap = crate::grid::gutter_w(
+            self.content_w,
+            self.grid.columns,
+            ANCIENT_EDGE,
+            self.grid.margin,
+        );
+        let right_align = !facing && crate::grid::is_narrow(self.viewport_w, self.viewport_h);
+        for (idx, back) in leaves {
+            let Some(pg) = pages.get(idx) else { continue };
+            let (ox, oy) = crate::gloss::leaf_origin(
+                facing,
+                self.viewport_w,
+                self.viewport_h,
+                self.page_w,
+                self.page_h,
+                gap,
+                back,
+                self.focus_mode,
+                right_align,
+            );
+            if let Some(mut gb) = crate::hit::glyph_at(pg, x - ox, y - oy, &self.leaf_frame(pg)) {
+                // 纸面坐标 → 窗口坐标。
+                gb.x += ox;
+                gb.y += oy;
+                return Some(gb);
+            }
+            // 这一叶没命中（点在别的叶上）：继续试下一叶。
+        }
+        None
     }
 
     /// 该字在全书流里的统一字符下标（`Book::flat_index`）。
@@ -2509,7 +2666,7 @@ mod tests {
         let cfg = GridConfig {
             columns,
             dir: GridDir::Vertical,
-            margin: 0.04,
+            margin: 0.04, line_scale: 1.0,
         };
         compute_grid(
             cw,
@@ -2530,7 +2687,7 @@ mod tests {
         let cfg = GridConfig {
             columns: 8,
             dir: GridDir::Vertical,
-            margin: 0.04,
+            margin: 0.04, line_scale: 1.0,
         };
         let m = compute_grid(
             VW,
@@ -2558,7 +2715,7 @@ mod tests {
         let cfg = GridConfig {
             columns: 8,
             dir: GridDir::Vertical,
-            margin: 0.04,
+            margin: 0.04, line_scale: 1.0,
         };
         let gap = crate::grid::gutter_w(VW, 8, ANCIENT_EDGE, cfg.margin);
         let m = compute_grid(
@@ -2615,7 +2772,7 @@ mod tests {
         let cfg = GridConfig {
             columns: 8,
             dir: GridDir::Vertical,
-            margin: 0.04,
+            margin: 0.04, line_scale: 1.0,
         };
         let m = compute_grid(
             cw,
