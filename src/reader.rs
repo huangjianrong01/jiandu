@@ -441,6 +441,28 @@ impl Root {
     // ------------------------------------------------------------------
     // 阅读视图
     // ------------------------------------------------------------------
+    /// 眉心（版心）水平点击带：`Some((左缘, 右缘))`（视口坐标）。
+    /// 几何与渲染同源（`render_gutter` / `render_letter_gutter`），
+    /// 纯函数在 `types::meixin_band`（含单测）。对开末页没有左半叶、
+    /// 中缝不渲染，返回 `None`——那一屏点中间照旧翻页。
+    fn meixin_band(&self, total: usize) -> Option<(f32, f32)> {
+        crate::types::meixin_band(
+            self.viewport_w,
+            self.letter_mode,
+            self.duplex == Duplex::Facing,
+            // 中缝渲染条件：对开且下一面（左半叶）存在。
+            self.page + 1 < total,
+            crate::grid::gutter_w(
+                self.content_w,
+                self.grid.columns,
+                ANCIENT_EDGE,
+                self.grid.margin,
+            ),
+            self.col_w,
+            self.grid.columns,
+        )
+    }
+
     pub fn render_reading(&mut self, cx: &mut Context<Self>) -> Div {
         if self.book.is_none() {
             return self.render_shelf(cx);
@@ -631,12 +653,16 @@ impl Root {
                             });
                             cx.notify();
                         } else if let Some(fwd) = fwd {
-                            // 全程在纸面且是单击：按落点左右半屏翻页——
-                            // 但「屏幕中间区域」视为呼出目录（而非翻页），
-                            // 避免与左右半屏翻页抢手势。
-                            let mid_lo = this.viewport_w * 0.34;
-                            let mid_hi = this.viewport_w * 0.66;
-                            if ux > mid_lo && ux < mid_hi {
+                            // 全程在纸面且是单击：眉心（版心）那道一字宽的
+                            // 纸带——鱼尾 / 篇题 / 叶码都立于此——点它才呼出
+                            // 目录；带外照旧按落点左右半屏翻页。单页古籍
+                            // 没有中缝（没有眉心），点中间仍翻页；对开末页
+                            // 没有左半叶、中缝不渲染，同样没有眉心。
+                            let in_meixin = this
+                                .meixin_band(total)
+                                .map(|(lo, hi)| ux >= lo && ux <= hi)
+                                .unwrap_or(false);
+                            if in_meixin {
                                 this.dragging = false;
                                 this.open_toc();
                                 cx.notify();

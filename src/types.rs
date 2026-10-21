@@ -65,6 +65,49 @@ pub fn tap_turns_page(
     Some(up.0 >= half)
 }
 
+/// 眉心（版心）水平点击带：返回 `Some((左缘, 右缘))`（视口坐标）。
+///
+/// 中缝是两叶之间 / 信笺纸心那道一字宽的版心——鱼尾、篇题、叶码、
+/// 朱砂小印都立在这条带上。点它才呼出目录；带外照旧按左右半屏翻页。
+///
+/// 几何与渲染同源（`reader::render_gutter` / `render_letter_gutter`）：
+///   · 对开：舞台（左叶 + 中缝 + 右叶）在正文区居中且左右对称，
+///     中缝恰落在视口水平中心，宽 `gutter_w`（约一字宽）；
+///   · 信笺：整张纸居中，中缝列位于纸面左起
+///     「纸边16 + 外框3 + 框边3 + 内框1 + 左侧若干正文列 + 半列」处，
+///     宽一列（`col_w`）；信笺锁 14 列，中缝左侧恒为 7 个正文列；
+///   · 单页古籍没有中缝 → `None`（没有眉心，点中间照旧翻页）。
+///
+/// `present` 传入中缝此刻是否真的渲染出来了：对开末页没有左半叶，
+/// 中缝不渲染——那一屏没有眉心，点中间应当翻页而不是呼目录。
+pub fn meixin_band(
+    viewport_w: f32,
+    letter: bool,
+    facing: bool,
+    present: bool,
+    gutter_w: f32,
+    col_w: f32,
+    columns: usize,
+) -> Option<(f32, f32)> {
+    // 命中容差：中缝约一字宽（≈57px），±4px 让边缘也好点。
+    const TOL: f32 = 4.0;
+    if letter {
+        // 叶宽 = (列数+1)×列宽 + 纸边16×2 + 外框3×2 + 框边3×2 + 内框1×2。
+        let leaf_w = (columns as f32 + 1.0) * col_w + 46.0;
+        let stage_left = ((viewport_w - leaf_w) / 2.0).max(0.0);
+        // 中缝列左缘 = 纸边16 + 外框3 + 框边3 + 内框1 + 左侧正文列
+        // （信笺 14 列时恒为 7 列；列数变化时与渲染同式：列数-7）。
+        let left_cols = columns.saturating_sub(7) as f32;
+        let center = stage_left + 23.0 + (left_cols + 0.5) * col_w;
+        Some((center - col_w * 0.5 - TOL, center + col_w * 0.5 + TOL))
+    } else if facing && present {
+        let center = viewport_w * 0.5;
+        Some((center - gutter_w * 0.5 - TOL, center + gutter_w * 0.5 + TOL))
+    } else {
+        None
+    }
+}
+
 /// 方向键 → 翻页方向：`→ / ↓` 下一页（Some(true)），`← / ↑` 上一页（Some(false)），
 /// 其它键不翻页（None）。macOS 下 `keystroke.key` 为全小写命名（left/right/…），
 /// 这里同时兼容旧写法与带前缀写法，避免键名差异让快捷键静默失效。
@@ -911,6 +954,53 @@ mod tests {
         );
         // 没有按下记录（按下点在工具栏 / 浮层上）：不翻页。
         assert_eq!(tap_turns_page(false, false, None, (900.0, 300.0), half), None);
+    }
+
+    #[test]
+    fn meixin_band_facing_centered_on_viewport() {
+        // 对开：中缝恰在视口中心，宽 = gutter_w（+4px 容差）。
+        let (lo, hi) = meixin_band(1200.0, false, true, true, 57.0, 0.0, 14).unwrap();
+        assert!((lo - (600.0 - 57.0 / 2.0 - 4.0)).abs() < 0.01);
+        assert!((hi - (600.0 + 57.0 / 2.0 + 4.0)).abs() < 0.01);
+        // 带比中缝略宽：带外左右各留至少 1px 的翻页区。
+        assert!(lo < 600.0 - 57.0 / 2.0 && hi > 600.0 + 57.0 / 2.0);
+    }
+
+    #[test]
+    fn meixin_band_facing_absent_on_last_spread() {
+        // 对开末页：没有左半叶 → 中缝不渲染 → 没有眉心（None），
+        // 点中间照旧按左右半屏翻页。
+        assert_eq!(meixin_band(1200.0, false, true, false, 57.0, 0.0, 14), None);
+    }
+
+    #[test]
+    fn meixin_band_single_ancient_has_none() {
+        // 单页古籍没有中缝：没有眉心。
+        assert_eq!(meixin_band(800.0, false, false, false, 57.0, 0.0, 8), None);
+    }
+
+    #[test]
+    fn meixin_band_letter_gutter_at_paper_heart() {
+        // 信笺 14 列：col_w = (content_w - 50)/15，content_w = vw - 44。
+        // 与渲染同源重算：叶宽 = 15×col_w + 46，
+        // 中缝心 = (vw - 叶宽)/2 + 23 + 7.5×col_w。
+        let vw = 1202.0;
+        let col_w = (vw - 44.0 - 50.0) / 15.0;
+        let (lo, hi) = meixin_band(vw, true, false, false, 0.0, col_w, 14).unwrap();
+        let leaf_w = 15.0 * col_w + 46.0;
+        let center = (vw - leaf_w) / 2.0 + 23.0 + 7.5 * col_w;
+        assert!((lo - (center - col_w / 2.0 - 4.0)).abs() < 0.01);
+        assert!((hi - (center + col_w / 2.0 + 4.0)).abs() < 0.01);
+        // 常规窗口下中缝几乎正落在视口中心（纸面近满宽，偏差 < 2px）。
+        assert!((center - vw * 0.5).abs() < 2.0);
+    }
+
+    #[test]
+    fn meixin_band_letter_narrow_window_stays_positive() {
+        // 极窄窗：纸宽超过视口时 stage_left 兜底为 0，带不跑出负坐标。
+        let (lo, hi) = meixin_band(320.0, true, false, false, 0.0, 30.0, 14).unwrap();
+        assert!(lo > 0.0 && hi > lo);
+        assert!(hi <= 320.0 + 30.0);
     }
 
     #[test]
