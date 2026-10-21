@@ -14,6 +14,7 @@ mod exporter;
 mod fonts;
 mod grid;
 mod gloss;
+mod note_inject;
 mod ime;
 mod importer;
 mod library;

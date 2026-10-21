@@ -339,6 +339,18 @@ impl NoteKind {
     }
 }
 
+/// 夹注来源：用于区分「古籍原本夹注」与「用户自加夹注」，并据此决定
+/// 渲染配色（用户注深朱砂红）与是否允许右键修改 / 删除（原本注不可删）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NoteSource {
+    /// 古籍原本夹注（浅墨 / 朱编号，用户不可删除）。
+    #[default]
+    Original,
+    /// 用户自己添加的夹注（深朱砂红，可右键修改 / 删除）。
+    User,
+}
+
 /// 一条注释 / 标记。`at` 是段内字符偏移（从 0 起）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Note {
@@ -351,6 +363,9 @@ pub struct Note {
     /// 普通夹注恒为 1。缺省按 1 兼容旧书稿。
     #[serde(default = "one_len")]
     pub len: usize,
+    /// 夹注来源：原本注 / 用户注。缺省为原本注，兼容旧书稿（无此字段）。
+    #[serde(default)]
+    pub source: NoteSource,
 }
 
 fn one_len() -> usize {
@@ -365,6 +380,18 @@ impl Note {
             kind,
             text: text.into(),
             len: 1,
+            source: NoteSource::Original,
+        }
+    }
+
+    /// 用户自加夹注（单字夹注，标记为可改删的深朱砂红来源）。
+    pub fn user(at: usize, kind: NoteKind, text: impl Into<String>) -> Self {
+        Self {
+            at,
+            kind,
+            text: text.into(),
+            len: 1,
+            source: NoteSource::User,
         }
     }
 
@@ -375,6 +402,7 @@ impl Note {
             kind,
             text: text.into(),
             len: len.max(1),
+            source: NoteSource::Original,
         }
     }
 }

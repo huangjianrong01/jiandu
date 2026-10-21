@@ -17,7 +17,7 @@ use crate::theme::{InkPalette, Theme};
 use crate::trad;
 use crate::types::{
     is_punct, underline_run_start, Book, CardLayout, Duplex, FontChoice, Glyph, GlyphHit,
-    GlyphKind, MarkKind, NoteKind, Script, StyleTab, TocEntry,
+    GlyphKind, MarkKind, NoteKind, NoteSource, Script, StyleTab, TocEntry,
 };
 use gpui::{
     div, prelude::*, px, rgb, rgba, svg, Context, Div, FontWeight, KeyDownEvent,
@@ -37,6 +37,16 @@ pub(crate) const SHARE_BGS: [(u32, u32, u32); 5] = [
 
 /// 朱砂红：笺读的落款印泥色（印在分享笺左下角）。
 pub(crate) const CINNABAR: u32 = 0xC3272D;
+
+/// 用户自加夹注的**深朱砂红**字色（#C62828）。
+///
+/// 与古籍原本的夹注（墨色兑淡）区分开：用户注用朱砂系，一眼可辨，
+/// 且可右键 / 长按改删。比落款印泥色 `CINNABAR` 略深一档，避免二者混同。
+pub(crate) const USER_NOTE_INK: u32 = 0xC62828;
+
+/// 用户夹注底衬：深朱砂向纸色兑淡的比例（0.88 ≈ 只剩一成多朱砂）。
+/// 要求「极其微弱」——只作可辨识的淡红提示，不抢正文。
+const USER_NOTE_BG_FADE: f32 = 0.88;
 
 /// 分享卡高度系数：卡片高 = 视口高 × 此值（再给控制面板让位收一档）。
 /// 「高度」滑杆已按用户要求连同代码删除，取原五档的中高档一档定值。
@@ -549,6 +559,28 @@ impl Root {
                         // 判在「抬起」而非「按下」，避免和拖选取字打架：
                         // 只有确实按住了一段时间、且落在一个正文字符上才算长按。
                         let held = this.press_time.take().map(|t| t.elapsed()).unwrap_or_default();
+                        // 长按**用户自加夹注** → 弹「修改 / 删除」菜单（≡ 右键）。
+                        // 判在「抬起」且先于正文长按：注块按下时也会置
+                        // `touched_glyph`，若让正文长按先命中就永远弹不到菜单。
+                        // 古籍原本的夹注不弹——只有 `NoteSource::User` 可改删。
+                        if held >= LONG_PRESS {
+                            if let Some(b) = this.note_box_at(ux, uy) {
+                                if matches!(b.source, NoteSource::User) {
+                                    let (key, text) = (b.key, b.text.clone());
+                                    this.note_menu = Some(crate::gloss::NoteMenu {
+                                        key,
+                                        text,
+                                        x: ux,
+                                        y: uy,
+                                    });
+                                    this.note_zoom = None;
+                                    this.dragging = false;
+                                    this.popup = None;
+                                    cx.notify();
+                                    return;
+                                }
+                            }
+                        }
                         if this.touched_glyph && this.sel_char.is_some() && held >= LONG_PRESS {
                             let key = this.sel_focus.or(this.sel_anchor).unwrap_or((0, 0, 0));
                             let ch = this.sel_char.unwrap_or(' ');
@@ -648,6 +680,8 @@ impl Root {
                 // 点注文卡片之外：收起放大卡（卡片自身 stop_propagation，
                 // 点卡片内容不会到达这里）。
                 this.note_zoom = None;
+                // 点夹注菜单之外：收起「修改 / 删除」菜单（同理）。
+                this.note_menu = None;
                 cx.notify();
             }),
         );
@@ -751,6 +785,11 @@ impl Root {
         // 注文放大悬浮卡：点行内夹注小字弹出，点卡片外任意处收起。
         if self.note_zoom.is_some() {
             root = root.child(self.render_note_zoom(cx));
+        }
+
+        // 用户自加夹注的「修改 / 删除」菜单：右键 / 长按弹出，点别处收起。
+        if self.note_menu.is_some() {
+            root = root.child(self.render_note_menu(cx));
         }
 
         // 浮层笔记框：划线 / 点字后直接盖在文本上写笔记——
@@ -879,6 +918,7 @@ impl Root {
                         self.popup = None;
                         self.bubble = None;
                         self.note_zoom = None;
+                        self.note_menu = None;
                         cx.notify();
                         return;
                     }
@@ -2197,7 +2237,11 @@ impl Root {
                     let mark = self.mark_kind(*g);
                     content = content.child(self.ancient_cell(*g, cell_w, cell_h, fs, back, mark, note_index, cx))
                 }
-                Piece::Gloss(txt) => content = content.child(self.ancient_gloss(txt, cell_w, cell_h, fs, columns, back, cx)),
+                Piece::Gloss(txt, src, host) => {
+                    content = content.child(
+                        self.ancient_gloss(txt, *src, *host, cell_w, cell_h, fs, columns, back, cx),
+                    )
+                }
                 // 避头尾禁则让出的空白格：占一个整字格，不渲染任何字，
                 // 只把后续正文压到第二格（列顶避头）或留一列底空当（列底避尾）。
                 Piece::Gap => content = content.child(div().w_full().h(px(cell_h))),
@@ -2226,6 +2270,8 @@ impl Root {
     fn ancient_gloss(
         &self,
         text: &str,
+        source: NoteSource,
+        host: Glyph,
         cell_w: f32,
         cell_h: f32,
         fs: f32,
@@ -2234,6 +2280,7 @@ impl Root {
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme;
+        let is_user = matches!(source, NoteSource::User);
         let chars: Vec<char> = text.chars().collect();
         let rows = (chars.len() + 1) / 2;
         let row_h = cell_h / 2.0;
@@ -2248,7 +2295,19 @@ impl Root {
         let pad = cell_w * crate::gloss::NOTE_PAD_RATIO;
         let sub_w = (cell_w - pad) / 2.0;
         // 注文小字色：墨色 × 纸色自动推导（永远比正文淡一档）。
-        let note_color = self.palette.z_note(t, back);
+        // **用户自加夹注例外**：改深朱砂红（#C62828），与原本夹注一眼可辨。
+        let note_color = if is_user {
+            USER_NOTE_INK
+        } else {
+            self.palette.z_note(t, back)
+        };
+        // 用户夹注的底衬：深朱砂向纸色兑到「极其微弱」，只作可辨识提示。
+        let note_bg = if is_user {
+            let paper = if back { t.paper_back() } else { t.paper() };
+            Some(crate::theme::mix(USER_NOTE_INK, paper, USER_NOTE_BG_FADE))
+        } else {
+            None
+        };
         // 注文全体（跨列流转的一段）——点它时放大显示的就是这段。
         // 【】在这里也显作「」（放大卡与行内注保持同一套字）。
         let note_text: String = text.chars().map(crate::types::bracket_to_quote).collect();
@@ -2258,7 +2317,15 @@ impl Root {
             .flex()
             .flex_col()
             .items_center()
-            .overflow_hidden()
+            .overflow_hidden();
+        // 用户夹注：整块垫一层极淡朱砂底衬（不抢正文，只作「这是我加的」提示）。
+        if let Some(bg) = note_bg {
+            block = block.bg(rgb(bg));
+        }
+        // 两个监听器各持一份文本副本（闭包是 `move`，且都要独立存活）。
+        let zoom_text = note_text.clone();
+        let menu_text = note_text.clone();
+        block = block
             // 可点注块：命中范围 = 整个夹注块矩形（Canvas 级 bbox 命中
             // 的另一入口，元素级事件更准——滚动容器里也贴着视觉位置）。
             .on_mouse_down(
@@ -2270,7 +2337,7 @@ impl Root {
                     this.popup = None;
                     this.clear_selection();
                     this.note_zoom = Some(crate::gloss::NoteZoom {
-                        text: note_text.clone(),
+                        text: zoom_text.clone(),
                         x: event.position.x.to_f64() as f32,
                         y: event.position.y.to_f64() as f32,
                         page: this.page,
@@ -2278,6 +2345,27 @@ impl Root {
                     cx.notify();
                 }),
             );
+        // 右键（桌面）/ 长按（移动）：**仅用户自加夹注**弹「修改 / 删除」菜单。
+        // 古籍原本的夹注不可改删——那是底本的一部分，动了就失真。
+        if is_user {
+            let host_key = (host.chapter, host.para, host.offset);
+            block = block.on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    this.touched_glyph = true;
+                    this.popup = None;
+                    this.clear_selection();
+                    this.note_menu = Some(crate::gloss::NoteMenu {
+                        key: host_key,
+                        text: menu_text.clone(),
+                        x: event.position.x.to_f64() as f32,
+                        y: event.position.y.to_f64() as f32,
+                    });
+                    cx.notify();
+                }),
+            );
+        }
         for r in 0..rows {
             // 右列读在前、左列续后，所以先排左列字、后排右列字。
             let pair = [chars.get(r + rows).copied(), chars.get(r).copied()];
@@ -3666,10 +3754,10 @@ impl Root {
         let vh = self.viewport_h;
 
         // 工具条尺寸估算，用于把浮条夹在视口内。按钮数必须与下面实际排布
-        // 一致（查询 / 划线 / 人名 / 地名 / 书名 / 笔记 / 复制 / 分享，共 8 个）：
-        // 早先按 5 个估算，宽度少算 150+px，靠右时右半截（含「笔记 / 复制 /
-        // 分享」）被裁到屏幕外——既显示不全，也点不到，笔记因此「做不了」。
-        let n: f32 = 8.0;
+        // 一致（查询 / 划线 / 人名 / 地名 / 书名 / 夹注 / 笔记 / 复制 / 分享，
+        // 共 9 个）：早先按 5 个估算，宽度少算 150+px，靠右时右半截（含
+        // 「笔记 / 复制 / 分享」）被裁到屏幕外——既显示不全，也点不到。
+        let n: f32 = 9.0;
         let bw = 46.0;
         let gap = 6.0;
         let pad = 8.0;
@@ -3756,6 +3844,33 @@ impl Root {
                 cx.notify();
             }),
         );
+        // 夹注：在**这个字**上加一条双行小字夹注（深朱砂红、可右键改删）。
+        // 与「笔记」不同：笔记是页眉批注（整页一条），夹注是嵌在正文列里
+        // 的双行小字，且**挂在字形上、不进正文流**——注入后只从当前半叶
+        // 起点局部重排（`relayout_from_halfleaf`），绝不重排全书。
+        let existing_note = self
+            .book
+            .as_ref()
+            .and_then(|b| {
+                b.chapters
+                    .get(key.0)?
+                    .paragraphs
+                    .get(key.1)?
+                    .notes
+                    .iter()
+                    .find(|n| n.at == key.2 && n.kind == NoteKind::Note)
+            })
+            .map(|n| n.text.clone())
+            .unwrap_or_default();
+        let btn_gloss = small_button("夹注", false, t).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                // 已有夹注则预填（算改写），没有则从空白起。
+                this.start_note_inject(key, &existing_note, Some((hit.x, hit.y)));
+                cx.notify();
+            }),
+        );
         // 笔记：在点击处直接浮出笔记框，盖在文本上输入；不另开面板、
         // 不推开正文，Esc 取消 / ⏎ 保存 / 点别处自动保存。
         let btn_note = small_button("笔记", false, t).on_mouse_down(
@@ -3807,6 +3922,7 @@ impl Root {
             .child(btn_person)
             .child(btn_place)
             .child(btn_bookm)
+            .child(btn_gloss)
             .child(btn_note)
             .child(btn_copy)
             .child(btn_share)
@@ -3996,6 +4112,122 @@ impl Root {
             .child(head)
             .child(body)
             .child(foot)
+    }
+
+    /// 右键 / 长按**用户自加夹注**弹出的「修改 / 删除」菜单。
+    ///
+    /// 只有 `NoteSource::User` 的注文会走到这里（见 `ancient_gloss`）：
+    /// 古籍原本的夹注是底本的一部分，不可改删。
+    ///   * 修改 → 复用既有浮层编辑栏，预填原文本，保存时写回书稿 JSON；
+    ///   * 删除 → 从书稿移除该条注文并回写 JSON；引擎下一帧按新注文集重排，
+    ///     释放的半格让后续字上移回流（只重排当前半叶之后，绝不重排全书）。
+    fn render_note_menu(&self, cx: &mut Context<Self>) -> Div {
+        let Some(menu) = self.note_menu.clone() else {
+            return div();
+        };
+        let vw = self.viewport_w;
+        let vh = self.viewport_h;
+        let card_w = 188.0;
+        let row_h = 34.0;
+        let card_h = 30.0 + row_h * 2.0 + 8.0;
+
+        // 锚点右下方优先，贴边时向左 / 向上翻，始终夹在视口内。
+        let mut left = menu.x + 6.0;
+        if left + card_w > vw - 8.0 {
+            left = (menu.x - card_w - 6.0).max(8.0);
+        }
+        let mut top = menu.y + 6.0;
+        if top + card_h > vh - 8.0 {
+            top = (menu.y - card_h - 6.0).max(8.0);
+        }
+        left = left.min((vw - card_w - 8.0).max(8.0));
+        top = top.min((vh - card_h - 8.0).max(8.0));
+
+        let key = menu.key;
+        let mtext = menu.text.clone();
+        let mpos = (menu.x, menu.y);
+
+        let mut card = div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(card_w))
+            .flex()
+            .flex_col()
+            .p(px(6.0))
+            .gap(px(4.0))
+            .rounded(px(10.0))
+            .bg(rgba(0x121216F0))
+            .border_1()
+            .border_color(rgba(0xFFFFFF26))
+            .shadow_lg()
+            // 点菜单不冒泡到 root（否则会被当「点别处」秒关）。
+            .on_mouse_down(MouseButton::Left, cx.listener(|_this, _, _, cx| {
+                cx.stop_propagation();
+            }))
+            .child(
+                div()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .pl(px(4.0))
+                    .text_size(px(11.0))
+                    .text_color(rgba(0xFFFFFF80))
+                    .child(SharedString::from("自加夹注")),
+            );
+
+        // 修改：预填原文本进入浮层编辑栏，保存时写回书稿。
+        let edit_text = mtext.clone();
+        card = card.child(
+            div()
+                .id("note-menu-edit")
+                .w_full()
+                .h(px(row_h))
+                .flex()
+                .items_center()
+                .pl(px(10.0))
+                .rounded(px(7.0))
+                .text_size(px(13.0))
+                .text_color(rgb(USER_NOTE_INK))
+                .cursor_pointer()
+                .child(SharedString::from("修改"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.note_menu = None;
+                        this.start_annotation_edit(key, &edit_text, Some(mpos));
+                        cx.notify();
+                    }),
+                ),
+        );
+
+        // 删除：数据移除 + 回写 JSON；下一帧按新注文集重排（局部）。
+        card = card.child(
+            div()
+                .id("note-menu-delete")
+                .w_full()
+                .h(px(row_h))
+                .flex()
+                .items_center()
+                .pl(px(10.0))
+                .rounded(px(7.0))
+                .text_size(px(13.0))
+                .text_color(rgb(USER_NOTE_INK))
+                .cursor_pointer()
+                .child(SharedString::from("删除"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.note_menu = None;
+                        // 删掉的是书稿里那条注文；正文流不变，后续字上移回流。
+                        this.delete_user_note_at(key);
+                        cx.notify();
+                    }),
+                ),
+        );
+        card
     }
 
     /// 复制当前页正文（或拖选选区的文字）到系统剪贴板。

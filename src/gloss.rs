@@ -12,18 +12,25 @@
 //! `layout_book`：一次排出「面 → 列 → 片」整棵树，两边结构同源，
 //! 不会再出现「分页算得下、渲染放不下」的丢字 / 错位。
 
-use crate::types::Glyph;
+use crate::types::{Glyph, NoteSource};
 
 /// 一列里的一段内容：一个正文字，或一段双行小字夹注（跨列流转时是注尾）。
 #[derive(Clone, Debug)]
 pub enum Piece {
     Main(Glyph),
-    Gloss(String),
+    /// 双行小字夹注：一条注文的一段（本列放不下会流转到下一列列首）。
+    /// 携带注文来源（`NoteSource::User` 为用户自加，深朱砂红、可改删）
+    /// 与宿主字形（右键改删时据此定位书稿里的那条注文）。
+    Gloss(String, NoteSource, Glyph),
     /// 避头尾禁则让出的空白格：占一个整字格（2 半格），不渲染任何字。
     /// 竖排里用于「列顶避头」（闭合 / 句读标点不顶列首）、
     /// 「列底避尾」（开合标点不落列底）时让出的那一格空位。
     Gap,
 }
+
+/// `gloss` 闭包的返回值：注文文本 + 来源（决定渲染配色）+ 宿主字形
+/// （右键改删时据此定位书稿里那条注文）。
+pub type GlossPayload = (String, NoteSource, Glyph);
 
 /// 一面（一叶）的排版结果。
 #[derive(Clone, Debug)]
@@ -163,13 +170,31 @@ pub fn is_tail_prohibited(c: char) -> bool {
 ///   * 夹注本列放不下 → 余下部分排下一列**列首**（注尾在前、正文随后）；
 ///   * 本面列尽 → 收面，注尾随下一面首列继续；
 ///   * 新章另起一面，且章首页只排 `cols-1` 列正文（第 `cols` 列是章题列）。
+///
+/// 默认 `start_as_chapter = true`（整书从首面排起）。**局部重排**从半叶中段
+/// 续排时须传 `false`，否则后缀首面会被误判为章首页（少一列 + 误加题署带）。
 pub fn layout_book(
     flow: &[Glyph],
-    gloss: impl Fn(&Glyph) -> Option<String>,
+    gloss: impl Fn(&Glyph) -> Option<GlossPayload>,
     cols: usize,
     rows: usize,
     // 章首页开卷列顶部预留给卷首题署的行数（0 = 不预留，按普通列排）。
     reserve_rows: usize,
+) -> Vec<Page> {
+    layout_book_from(flow, gloss, cols, rows, reserve_rows, true)
+}
+
+/// `layout_book` 的可续排版本：`start_as_chapter` 控制**首面**是否当作章首页
+/// （决定列上限 `cols-1` 还是 `cols`、是否施加题署预留带）。流内部后续遇到
+/// 真正的章边界仍会正常另起章首页——只有首面这一处受该开关约束，故可安全
+/// 用于「从前半叶起点切片续排」而得到与整书重排逐面一致的结果。
+pub fn layout_book_from(
+    flow: &[Glyph],
+    gloss: impl Fn(&Glyph) -> Option<GlossPayload>,
+    cols: usize,
+    rows: usize,
+    reserve_rows: usize,
+    start_as_chapter: bool,
 ) -> Vec<Page> {
     let col_units = rows * 2;
     let mut pages: Vec<Page> = Vec::new();
@@ -180,8 +205,12 @@ pub fn layout_book(
     // 当前面的正文列上限——它是「面」的属性：章首页 `cols-1`（章题列），
     // 续面 `cols`。不能按当前字算：章首页最后一列边界落在普通字上时
     // 才取 limit 会退化成 `cols` 列，多出的字不会被渲染。
-    let mut page_limit = cols.saturating_sub(1).max(1);
-    let mut start_chapter = true;
+    let mut page_limit = if start_as_chapter {
+        cols.saturating_sub(1).max(1)
+    } else {
+        cols
+    };
+    let mut start_chapter = start_as_chapter;
 
     // 收面：并入手上的列，重开一面。手里没有正文时只重置列状态、
     // 不产出空面（夹注注尾恰好跨到章首那种极端情况）。
@@ -201,7 +230,9 @@ pub fn layout_book(
     }
 
     for (i, g) in flow.iter().enumerate() {
-        let chapter_start = i == 0 || flow[i - 1].chapter != g.chapter;
+        // 首面是否当章首由 `start_as_chapter` 决定；后续真·章边界仍正常触发。
+        let chapter_start = (i == 0 && start_as_chapter)
+            || (i > 0 && flow[i - 1].chapter != g.chapter);
         if chapter_start {
             if !glyphs.is_empty() {
                 seal!();
@@ -272,14 +303,14 @@ pub fn layout_book(
         columns.last_mut().unwrap().push(Piece::Main(*g));
         glyphs.push(*g);
         // 夹注：本列能放几行放几行，放不下的排下一列列首。
-        let Some(txt) = gloss(g) else { continue };
+        let Some((txt, src, host)) = gloss(g) else { continue };
         let all: Vec<char> = txt.chars().collect();
         let mut rest: &[char] = &all;
         while !rest.is_empty() {
             let take = filler.push_note(rest.len());
             if take > 0 {
                 let piece: String = rest[..take].iter().collect();
-                columns.last_mut().unwrap().push(Piece::Gloss(piece));
+                columns.last_mut().unwrap().push(Piece::Gloss(piece, src, host));
                 rest = &rest[take..];
             }
             if !rest.is_empty() {
@@ -336,7 +367,7 @@ pub fn note_boxes_in_column(col: &[Piece], li: usize, cell_w: f32, cell_h: f32) 
         match p {
             Piece::Main(_) => y += cell_h,
             Piece::Gap => {}
-            Piece::Gloss(text) => {
+            Piece::Gloss(text, src, host) => {
                 let rows = (text.chars().count() + 1) / 2;
                 let h = rows as f32 * row_h;
                 out.push(NoteBox {
@@ -347,6 +378,10 @@ pub fn note_boxes_in_column(col: &[Piece], li: usize, cell_w: f32, cell_h: f32) 
                     text: text.clone(),
                     page: 0,
                     back: false,
+                    // 来源与宿主字：Canvas 级长按 / 命中据此判断「能否改删」
+                    // （只有 `NoteSource::User` 可改删）并定位书稿里那条注文。
+                    source: *src,
+                    key: (host.chapter, host.para, host.offset),
                 });
                 y += h;
             }
@@ -418,6 +453,10 @@ pub struct NoteBox {
     pub page: usize,
     /// 是否对开里的左叶（屏幕左侧那叶）。
     pub back: bool,
+    /// 注文来源：`User` 为读者自加（可改删），`Original` 为古籍原本。
+    pub source: NoteSource,
+    /// 宿主字键 `(chapter, para, offset)`：改 / 删时据此定位书稿里那条注文。
+    pub key: (usize, usize, usize),
 }
 
 /// 点注文弹出的放大卡片（悬浮窗）状态。
@@ -430,6 +469,21 @@ pub struct NoteZoom {
     pub y: f32,
     /// 注文所在的叶（0 基，卡片「来源」行用）。
     pub page: usize,
+}
+
+/// 右键 / 长按**用户自加夹注**弹出的「修改 / 删除」菜单状态。
+///
+/// 只有 `NoteSource::User` 的夹注会弹——古籍原本的夹注是底本的一部分，
+/// 不可改删（动了就失真）。
+#[derive(Clone, Debug)]
+pub struct NoteMenu {
+    /// 宿主字的键 `(chapter, para, offset)`：据此在书稿里定位那条注文。
+    pub key: (usize, usize, usize),
+    /// 当前注文文本（菜单上显示，供「修改」预填）。
+    pub text: String,
+    /// 菜单锚点（点击处的窗口坐标）。
+    pub x: f32,
+    pub y: f32,
 }
 
 // ------------------------------------------------------------------
@@ -940,7 +994,7 @@ impl ZFlowBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Book, Chapter, GlyphKind, Paragraph};
+    use crate::types::{Book, Chapter, Glyph, GlyphKind, NoteSource, Paragraph};
 
     fn flow_of(book: &Book) -> Vec<Glyph> {
         book.to_flow(true)
@@ -949,13 +1003,18 @@ mod tests {
     // ---- 注文包围盒（Canvas 命中测试 / 卡片定位）----
 
     fn main_glyph() -> Piece {
-        Piece::Main(Glyph {
+        Piece::Main(ghost())
+    }
+
+    /// 测试用占位宿主字形（夹注片段仅用于包围盒计算，宿主键无关紧要）。
+    fn ghost() -> Glyph {
+        Glyph {
             chapter: 0,
             para: 0,
             offset: 0,
             ch: '一',
             kind: GlyphKind::Char,
-        })
+        }
     }
 
     #[test]
@@ -963,9 +1022,9 @@ mod tests {
         // 列内：正文每字一个 cell_h，注块 = ceil(n/2) 个半格，自上而下累计。
         let col = vec![
             main_glyph(),                 // 占 0..cell_h
-            Piece::Gloss("甲乙".into()),   // 4 字 → 1 行 → cell_h/2
+            Piece::Gloss("甲乙".into(), NoteSource::Original, ghost()),   // 4 字 → 1 行 → cell_h/2
             main_glyph(),
-            Piece::Gloss("丙丁戊己".into()), // 4 字 → 2 行 → cell_h
+            Piece::Gloss("丙丁戊己".into(), NoteSource::Original, ghost()), // 4 字 → 2 行 → cell_h
         ];
         let boxes = note_boxes_in_column(&col, 2, 46.0, 51.0);
         assert_eq!(boxes.len(), 2);
@@ -989,7 +1048,7 @@ mod tests {
         // 竖排读序列号 i=0 在最右 → flex_row 从左数的 li = text_cols-1-i，
         // 渲染侧传进来的 li 越大 x 越大：最右列 x = (text_cols-1)*cell_w
         //（再往后偏一个左侧留白）。
-        let col = vec![Piece::Gloss("注".into())];
+        let col = vec![Piece::Gloss("注".into(), NoteSource::Original, ghost())];
         let (cell_w, cell_h) = (50.0, 55.0);
         let text_cols = 4;
         let rightmost = note_boxes_in_column(&col, text_cols - 1 - 0, cell_w, cell_h);
@@ -1170,7 +1229,7 @@ mod tests {
         let flow = flow_of(&b);
         let pages = layout_book(
             &flow,
-            |g| (g.offset == 1).then(|| "甲乙丙丁戊己庚辛壬癸".to_string()),
+            |g| (g.offset == 1).then(|| ("甲乙丙丁戊己庚辛壬癸".to_string(), NoteSource::Original, *g)),
             3,
             2,
             0,
@@ -1184,7 +1243,7 @@ mod tests {
             .flat_map(|p| p.columns.iter())
             .flatten()
             .filter_map(|p| match p {
-                Piece::Gloss(s) => Some(s.as_str()),
+                Piece::Gloss(s, ..) => Some(s.as_str()),
                 _ => None,
             })
             .collect();
@@ -1193,7 +1252,7 @@ mod tests {
         let gloss_first = pages
             .iter()
             .flat_map(|p| p.columns.iter())
-            .any(|c| matches!(c.first(), Some(Piece::Gloss(_))));
+            .any(|c| matches!(c.first(), Some(Piece::Gloss(_, ..))));
         assert!(gloss_first, "长注应跨列流转：下一列列首应是注尾");
     }
 
@@ -1209,7 +1268,8 @@ mod tests {
         let flow = flow_of(&b);
         let pages = layout_book(
             &flow,
-            |g| (g.kind == GlyphKind::Char && g.offset == 0).then(|| "注".repeat(30)),
+            |g| (g.kind == GlyphKind::Char && g.offset == 0)
+                .then(|| ("注".repeat(30), NoteSource::Original, *g)),
             2,
             2,
             0,
@@ -1218,7 +1278,7 @@ mod tests {
             .flat_map(|p| p.columns.iter())
             .flatten()
             .filter_map(|p| match p {
-                Piece::Gloss(s) => Some(s.as_str()),
+                Piece::Gloss(s, ..) => Some(s.as_str()),
                 _ => None,
             })
             .collect();
@@ -1297,7 +1357,8 @@ mod tests {
         for cols in crate::grid::GRID_COLUMN_CHOICES {
         let pages = layout_book(
             &flow,
-            |g| (g.offset % 2 == 0 && g.kind == GlyphKind::Char).then(|| "夹注夹注".to_string()),
+            |g| (g.offset % 2 == 0 && g.kind == GlyphKind::Char)
+                .then(|| ("夹注夹注".to_string(), NoteSource::Original, *g)),
             cols,
             11,
             0,
@@ -1318,7 +1379,7 @@ mod tests {
                         c.iter()
                     .map(|p| match p {
                         Piece::Main(_) => 2,
-                        Piece::Gloss(s) => (s.chars().count() + 1) / 2,
+                        Piece::Gloss(s, ..) => (s.chars().count() + 1) / 2,
                         Piece::Gap => 2,
                     })
                             .sum::<usize>()
@@ -1362,7 +1423,7 @@ mod tests {
                                 .map(|x| match x {
                                     Piece::Main(_) => 2,
                                     Piece::Gap => 2,
-                                    Piece::Gloss(s) => (s.chars().count() + 1) / 2,
+                                    Piece::Gloss(s, ..) => (s.chars().count() + 1) / 2,
                                 })
                                 .sum();
                             // 失败时把这列排出来看：正文出字、· 为避头空白、[n] 为 n 字夹注。
@@ -1371,7 +1432,7 @@ mod tests {
                                 .map(|x| match x {
                                     Piece::Main(g) => g.ch.to_string(),
                                     Piece::Gap => "·".to_string(),
-                                    Piece::Gloss(s) => format!("[{}]", s.chars().count()),
+                                    Piece::Gloss(s, ..) => format!("[{}]", s.chars().count()),
                                 })
                                 .collect();
                             assert!(
@@ -1411,7 +1472,7 @@ mod tests {
                         .iter()
                         .map(|p| match p {
                             Piece::Main(_) => 2,
-                            Piece::Gloss(s) => (s.chars().count() + 1) / 2,
+                            Piece::Gloss(s, ..) => (s.chars().count() + 1) / 2,
                             Piece::Gap => 2,
                         })
                         .sum();

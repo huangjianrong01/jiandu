@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>笺读 · 拖拽选区 + 用户夹注区分 + 右键改删</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #e9e0cb; }
+  body { display: flex; flex-direction: column; align-items: center;
+         font-family: "Songti SC", "STSong", "SimSun", serif; color: #2b2620; }
+  #cv { background: #f3ecd8; margin-top: 16px; box-shadow: 0 4px 18px rgba(0,0,0,.18); cursor: text; }
+  #hud { margin: 12px; padding: 10px 14px; background: #fffaf0; border: 1px solid #d8cba8;
+         border-radius: 8px; font-size: 14px; line-height: 1.7; min-width: 360px; }
+  #hud b { color: #9c3b2e; }
+  .k { display:inline-block; min-width: 92px; color:#6b5d3f; }
+  #banner { margin: 4px 12px; min-height: 20px; font-size: 13px; color: #9c3b2e; }
+  #notes { margin: 4px 12px 14px; width: 420px; font-size: 13px; line-height: 1.6; }
+  #notes .un { color: #C62828; background: rgba(198,40,40,.06);
+               border-left: 3px solid #C62828; padding: 3px 8px; margin: 3px 0; border-radius: 3px; }
+  #notes .on { color: #6b5d3f; border-left: 3px solid #b9a878;
+               padding: 3px 8px; margin: 3px 0; }
+
+  /* 浮动夹注输入框 */
+  #noteInput { position: fixed; z-index: 10; width: 260px; display: none;
+               background: #fffdf7; border: 1px solid #c9b98c; border-radius: 10px;
+               box-shadow: 0 8px 28px rgba(0,0,0,.22); padding: 12px; }
+  #noteInput.show { display: block; }
+  #noteInput .ni-title { font-weight: 700; color: #7a3326; margin-bottom: 4px; }
+  #noteInput .ni-range { font-size: 12px; color: #6b5d3f; margin-bottom: 8px; }
+  #noteInput textarea { width: 100%; box-sizing: border-box; height: 64px; resize: none;
+                        font-family: inherit; font-size: 14px; padding: 6px;
+                        border: 1px solid #c9b98c; border-radius: 6px; }
+  #noteInput .ni-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+  #noteInput button { font-family: inherit; font-size: 13px; padding: 6px 14px;
+                      border-radius: 6px; border: 1px solid #c9b98c; cursor: pointer; }
+  #noteInput #niOk { background: #9c3b2e; color: #fff; border-color: #9c3b2e; }
+  #noteInput #niCancel { background: #fffdf7; color: #6b5d3f; }
+
+  /* 右键菜单 */
+  #ctxMenu { position: fixed; z-index: 20; display: none; background: #fffdf7;
+             border: 1px solid #c9b98c; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.25);
+             overflow: hidden; min-width: 92px; }
+  #ctxMenu.show { display: block; }
+  #ctxMenu button { display: block; width: 100%; text-align: left; border: none;
+                    background: transparent; font-family: inherit; font-size: 14px;
+                    padding: 9px 16px; cursor: pointer; color: #2b2620; }
+  #ctxMenu button:hover { background: #f1e6cf; }
+  #ctxMenu #ctxDelete:hover { background: #f6d9d3; color: #b3261e; }
+</style>
+</head>
+<body>
+  <canvas id="cv"></canvas>
+  <div id="hud">在画布上<b>按住拖拽</b>选字 → 松开弹框插入<b>用户夹注</b>（深朱砂红）。<b>右键 / 长按</b>用户夹注可<b>修改 / 删除</b>。原注为浅墨，不可改删。</div>
+  <div id="banner"></div>
+  <div id="notes"></div>
+
+  <div id="noteInput">
+    <div class="ni-title">为选区插入夹注</div>
+    <div class="ni-range" id="niRange"></div>
+    <textarea id="niText" placeholder="输入注释文本…"></textarea>
+    <div class="ni-btns">
+      <button id="niCancel">取消</button>
+      <button id="niOk">注入并重排</button>
+    </div>
+  </div>
+
+  <div id="ctxMenu">
+    <button id="ctxEdit">修改</button>
+    <button id="ctxDelete">删除</button>
+  </div>
+
+<script>
+/* =========================================================================
+ * 竖排网格：拖拽选区 + 用户夹注视觉区分 + 右键改删（局部重排）
+ *
+ * 数据节点：notes[] = { at, end, text, type }
+ *   type: 'userNote'  → 用户自加夹注：深朱砂红 #C62828 + 极淡红底框，可改删
+ *   type: 'origNote'  → 古籍原本夹注：浅墨，不可改删
+ * 坐标约定：竖排、从右往左读、从上往下排
+ *   readCol = COLS - 1 - colFromLeft ; charIndex = readCol * ROWS + row
+ * ========================================================================= */
+
+const COLS = 8, ROWS = 16, COL_W = 48, ROW_H = 48;
+const GRID_LEFT = 70, GRID_TOP = 70, MARGIN = 24;
+const INK = '#2b2620', PAPER = '#f3ecd8';
+const CINNABAR = 'rgba(205, 96, 80, 0.9)';
+const DEEP_CINNABAR = '#C62828';   // 用户夹注：深朱砂红
+const ORIG_COLOR   = '#6b5d3f';    // 原本夹注：浅墨
+
+const SAMPLE = '道可道非常道名可名非常名无名天地之始有名万物之母故常无欲以观其妙';
+const text = SAMPLE.slice(0, COLS * ROWS);
+
+// 夹注数据节点（含几条原本夹注用于演示视觉区分）
+const notes = [
+  { at: 0,  end: 0,  text: '道：宇宙万物的本原，兼指其运行规律。', type: 'origNote' },
+  { at: 8,  end: 8,  text: '名：事物的名称与称谓。',           type: 'origNote' },
+  { at: 20, end: 20, text: '（王弼《道德经注》原文小字夹注）',  type: 'origNote' },
+];
+
+// ---- 坐标反算 ----
+function hitTest(px, py) {
+  const dx = px - GRID_LEFT, dy = py - GRID_TOP;
+  const W = COLS * COL_W, H = ROWS * ROW_H;
+  if (dx < 0 || dx >= W || dy < 0 || dy >= H) return null;
+  const colFromLeft = Math.floor(dx / COL_W);
+  const readCol     = COLS - 1 - colFromLeft;
+  const row         = Math.floor(dy / ROW_H);
+  const charIndex   = readCol * ROWS + row;
+  return { readCol, row, charIndex, colFromLeft,
+           cellLeft: GRID_LEFT + colFromLeft * COL_W, cellTop: GRID_TOP + row * ROW_H };
+}
+function cellOf(readCol, row) {
+  const colFromLeft = COLS - 1 - readCol;
+  return { x: GRID_LEFT + colFromLeft * COL_W, y: GRID_TOP + row * ROW_H };
+}
+
+// ---- 画布 ----
+const canvas = document.getElementById('cv');
+const ctx = canvas.getContext('2d');
+const dpr = window.devicePixelRatio || 1;
+const CSS_W = GRID_LEFT + COLS * COL_W + MARGIN;
+const CSS_H = GRID_TOP  + ROWS * ROW_H + MARGIN;
+canvas.style.width = CSS_W + 'px'; canvas.style.height = CSS_H + 'px';
+canvas.width = Math.round(CSS_W * dpr); canvas.height = Math.round(CSS_H * dpr);
+ctx.scale(dpr, dpr);
+
+let sel = null;            // 拖拽选区 { active, start:hit, end:hit }
+let editTarget = null;     // 正在修改的已有用户夹注（null=新建）
+let ctxTarget = null;      // 右键菜单对应的用户夹注
+
+function roundRect(x, y, w, h, r) {
+  if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+  else { ctx.beginPath(); ctx.rect(x, y, w, h); }
+}
+
+// ---- 绘制 ----
+function draw() {
+  ctx.clearRect(0, 0, CSS_W, CSS_H);
+  ctx.fillStyle = PAPER; ctx.fillRect(0, 0, CSS_W, CSS_H);
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 3; ctx.strokeRect(GRID_LEFT - 6, GRID_TOP - 6, COLS*COL_W + 12, ROWS*ROW_H + 12);
+  ctx.lineWidth = 1; ctx.strokeRect(GRID_LEFT - 2, GRID_TOP - 2, COLS*COL_W + 4,  ROWS*ROW_H + 4);
+  ctx.lineWidth = 1;
+  for (let c = 0; c <= COLS; c++) { const x = GRID_LEFT + c*COL_W;
+    ctx.beginPath(); ctx.moveTo(x, GRID_TOP); ctx.lineTo(x, GRID_TOP + ROWS*ROW_H); ctx.stroke(); }
+  for (let r = 0; r <= ROWS; r++) { const y = GRID_TOP + r*ROW_H;
+    ctx.beginPath(); ctx.moveTo(GRID_LEFT, y); ctx.lineTo(GRID_LEFT + COLS*COL_W, y); ctx.stroke(); }
+
+  // 正文
+  ctx.fillStyle = INK;
+  ctx.font = `${Math.round(ROW_H*0.7)}px "Songti SC","STSong","SimSun",serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (let i = 0; i < text.length; i++) {
+    const p = cellOf(Math.floor(i/ROWS), i%ROWS);
+    ctx.fillText(text[i], p.x + COL_W/2, p.y + ROW_H/2);
+  }
+
+  drawNotes();        // 夹注角标（按 type 配色）
+  drawSelection();    // 拖拽高亮（半透明淡朱砂竖条）
+  drawCaret();        // 端点闪烁光标
+  updateNotesPanel(); // 侧栏夹注清单
+}
+
+/* 渲染夹注角标：userNote 深朱砂红 + 极淡红底框；origNote 浅墨无框 */
+function drawNotes() {
+  notes.forEach(n => {
+    const p = cellOf(Math.floor(n.at/ROWS), n.at%ROWS);
+    const bx = p.x + COL_W - 16, by = p.y + 2, bw = 14, bh = 14;
+    if (n.type === 'userNote') {
+      ctx.fillStyle = 'rgba(198, 40, 40, 0.10)';      // 极淡红底框
+      roundRect(bx, by, bw, bh, 3); ctx.fill();
+      ctx.fillStyle = DEEP_CINNABAR;                  // 深朱砂红
+    } else {
+      ctx.fillStyle = ORIG_COLOR;
+    }
+    ctx.font = `${Math.round(ROW_H*0.3)}px serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('注', bx + bw/2, by + bh/2);
+  });
+}
+
+function drawSelection() {
+  if (!sel || !sel.start || !sel.end) return;
+  const lo = Math.min(sel.start.charIndex, sel.end.charIndex);
+  const hi = Math.max(sel.start.charIndex, sel.end.charIndex);
+  ctx.fillStyle = 'rgba(205, 96, 80, 0.30)';
+  let prevCol = null, ra = 0, rb = 0;
+  const flush = (a, b, col) => {
+    const c0 = cellOf(col, a), c1 = cellOf(col, b);
+    ctx.fillRect(c0.x + 2, c0.y + 2, COL_W - 4, (c1.y - c0.y) + ROW_H - 4);
+  };
+  for (let i = lo; i <= hi; i++) {
+    const col = Math.floor(i/ROWS), row = i%ROWS;
+    if (prevCol === null)     { prevCol = col; ra = row; rb = row; }
+    else if (col === prevCol) { rb = row; }
+    else { flush(ra, rb, prevCol); prevCol = col; ra = row; rb = row; }
+  }
+  if (prevCol !== null) flush(ra, rb, prevCol);
+}
+
+function drawCaret() {
+  if (!sel || !sel.end) return;
+  const t = (Date.now() % 1000) / 1000;
+  const a = 0.35 + 0.55 * (0.5 + 0.5 * Math.sin(t * Math.PI * 2));
+  ctx.strokeStyle = CINNABAR.replace(/[\d.]+\)$/, a.toFixed(2) + ')');
+  ctx.lineWidth = 2;
+  const x = sel.end.cellLeft + COL_W - 1.5;
+  ctx.beginPath(); ctx.moveTo(x, sel.end.cellTop + 3); ctx.lineTo(x, sel.end.cellTop + ROW_H - 3); ctx.stroke();
+}
+
+function escapeHtml(s){ return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function updateNotesPanel() {
+  const el = document.getElementById('notes');
+  if (notes.length === 0) { el.innerHTML = '<span style="color:#9aa">（暂无夹注）</span>'; return; }
+  el.innerHTML = notes.map(n => {
+    const cls = n.type === 'userNote' ? 'un' : 'on';
+    const tag = n.type === 'userNote' ? '用户' : '原注';
+    return `<div class="${cls}"><b>[${tag}]</b> ${escapeHtml(n.text)}</div>`;
+  }).join('');
+}
+
+// ---- 鼠标交互 ----
+function pos(e) { const r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
+
+canvas.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;                 // 仅左键开始拖拽；右键交给 contextmenu
+  const { x, y } = pos(e); const h = hitTest(x, y); if (!h) return;
+  sel = { active: true, start: h, end: h };
+  hideInput(); hideCtxMenu(); updateHud(); draw();
+});
+canvas.addEventListener('mousemove', e => {
+  if (!sel || !sel.active) return;
+  const { x, y } = pos(e); const h = hitTest(x, y); if (!h) return;
+  sel.end = h; updateHud(); draw();
+});
+window.addEventListener('mouseup', e => {
+  if (!sel || !sel.active) return;
+  sel.active = false; draw();
+  const lo = Math.min(sel.start.charIndex, sel.end.charIndex);
+  const hi = Math.max(sel.start.charIndex, sel.end.charIndex);
+  showInput(lo, hi);                          // 新建：弹框注入
+});
+
+// 右键菜单（仅用户夹注可改删）
+canvas.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  const { x, y } = pos(e);
+  const n = userNoteAt(x, y);
+  if (n) showCtxMenu(e.clientX, e.clientY, n);
+  else hideCtxMenu();
+});
+
+// 触摸：拖拽 + 长按出菜单
+let lpTimer = null, lpStart = null;
+function touchPos(t) { const r = canvas.getBoundingClientRect();
+  return { x: t.clientX - r.left, y: t.clientY - r.top }; }
+canvas.addEventListener('touchstart', e => {
+  const t = e.touches[0]; const { x, y } = touchPos(t); const h = hitTest(x, y);
+  if (!h) return; e.preventDefault();
+  sel = { active: true, start: h, end: h }; hideInput(); hideCtxMenu(); updateHud(); draw();
+  lpStart = { x, y };
+  lpTimer = setTimeout(() => {
+    const n = userNoteAt(lpStart.x, lpStart.y);
+    if (n) { sel = null; draw();
+      const r = canvas.getBoundingClientRect();
+      showCtxMenu(r.left + lpStart.x, r.top + lpStart.y, n); }   // 长按 = 右键
+  }, 500);
+}, { passive: false });
+canvas.addEventListener('touchmove', e => {
+  if (lpTimer) clearTimeout(lpTimer), lpTimer = null;
+  if (!sel || !sel.active) return; e.preventDefault();
+  const t = e.touches[0]; const { x, y } = touchPos(t); const h = hitTest(x, y);
+  if (!h) return; sel.end = h; updateHud(); draw();
+}, { passive: false });
+window.addEventListener('touchend', () => {
+  if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
+  if (!sel || !sel.active) return;
+  sel.active = false; draw();
+  const lo = Math.min(sel.start.charIndex, sel.end.charIndex);
+  const hi = Math.max(sel.start.charIndex, sel.end.charIndex);
+  showInput(lo, hi);
+});
+
+// 命中某用户夹注的宿主格
+function userNoteAt(x, y) {
+  for (const n of notes) {
+    if (n.type !== 'userNote') continue;
+    const p = cellOf(Math.floor(n.at/ROWS), n.at%ROWS);
+    if (x >= p.x && x < p.x + COL_W && y >= p.y && y < p.y + ROW_H) return n;
+  }
+  return null;
+}
+
+// ---- 浮动夹注输入框（新建 / 修改共用） ----
+const niBox = document.getElementById('noteInput');
+function showInput(lo, hi, note = null) {
+  const endIdx = hi;
+  const p = cellOf(Math.floor(endIdx/ROWS), endIdx%ROWS);
+  const r = canvas.getBoundingClientRect();
+  let left = r.left + p.x + COL_W/2 - 130;
+  let top  = r.top  + p.y + ROW_H + 8;
+  left = Math.max(8, Math.min(left, window.innerWidth  - 290));
+  top  = Math.max(8, Math.min(top,  window.innerHeight - 200));
+  niBox.style.left = left + 'px'; niBox.style.top = top + 'px';
+  const editing = !!note;
+  niBox.querySelector('.ni-title').textContent = editing ? '修改夹注' : '为选区插入夹注';
+  document.getElementById('niRange').textContent =
+    editing ? `修改用户夹注（charIndex ${note.at}）`
+            : `选区：charIndex ${lo} ‥ ${hi}（共 ${hi - lo + 1} 字）`;
+  document.getElementById('niText').value = editing ? note.text : '';
+  editTarget = editing ? note : null;
+  niBox.classList.add('show');
+  document.getElementById('niText').focus();
+}
+function hideInput() { niBox.classList.remove('show'); editTarget = null; }
+
+document.getElementById('niCancel').addEventListener('click', () => { hideInput(); sel = null; draw(); });
+document.getElementById('niOk').addEventListener('click', () => {
+  const txt = document.getElementById('niText').value.trim();
+  if (!txt) { banner('未输入注文，已取消。'); hideInput(); sel = null; draw(); return; }
+  if (editTarget) {                                  // —— 修改已有用户夹注 ——
+    editTarget.text = txt;                            // 仅更新文本，type 仍是 userNote
+    banner(`已修改用户夹注为「${txt}」。`);
+    hideInput(); sel = null; draw(); return;
+  }
+  const lo = Math.min(sel.start.charIndex, sel.end.charIndex);
+  const hi = Math.max(sel.start.charIndex, sel.end.charIndex);
+  applyInjection(lo, hi, txt);                        // —— 新建用户夹注 ——
+  hideInput();
+});
+
+/* 新建注入：数据节点 type:'userNote'，并接 relayout_from_halfleaf 续排当前半叶
+ * 真实引擎接线点：
+ *   Root::inject_note(lo, text)  —— 写 Note{ at, kind:Note, text, source:User }
+ *   Root::relayout_tail(lo)      —— relayout_from_halfleaf(...) 仅续排后缀，绝不全书重排
+ */
+function applyInjection(lo, hi, txt) {
+  notes.push({ at: lo, end: hi, text: txt, type: 'userNote' });
+  banner(`已注入用户夹注「${txt}」于 ${lo}‥${hi}，接 relayout_from_halfleaf 续排当前半叶。`);
+  sel = null; draw();
+}
+
+// ---- 右键菜单：修改 / 删除 ----
+const ctxMenu = document.getElementById('ctxMenu');
+function showCtxMenu(cx, cy, note) {
+  ctxTarget = note;
+  let left = Math.max(8, Math.min(cx, window.innerWidth  - 120));
+  let top  = Math.max(8, Math.min(cy, window.innerHeight - 90));
+  ctxMenu.style.left = left + 'px'; ctxMenu.style.top = top + 'px';
+  ctxMenu.classList.add('show');
+}
+function hideCtxMenu() { ctxMenu.classList.remove('show'); ctxTarget = null; }
+document.addEventListener('mousedown', e => {
+  if (!ctxMenu.contains(e.target)) hideCtxMenu();
+});
+
+document.getElementById('ctxEdit').addEventListener('click', () => {
+  const n = ctxTarget; if (!n) return;
+  hideCtxMenu();
+  showInput(n.at, n.end, n);          // 进入修改模式（输入框预填）
+});
+document.getElementById('ctxDelete').addEventListener('click', () => {
+  const n = ctxTarget; if (!n) return;
+  const i = notes.indexOf(n); if (i >= 0) notes.splice(i, 1);
+  hideCtxMenu(); ctxTarget = null; sel = null; draw();
+  // 删除后再次局部重排（真实引擎：remove_user_note(at) + relayout_from_halfleaf）
+  banner(`已删除用户夹注「${n.text}」，接 relayout_from_halfleaf 从半叶 ${Math.floor(n.at/ROWS)} 起续排。`);
+});
+
+// ---- HUD / Banner ----
+function updateHud() {
+  const el = document.getElementById('hud');
+  if (!sel || !sel.start || !sel.end) {
+    el.innerHTML = '在画布上<b>按住拖拽</b>选字 → 松开弹框插入<b>用户夹注</b>（深朱砂红）。<b>右键 / 长按</b>用户夹注可<b>修改 / 删除</b>。原注为浅墨，不可改删。';
+    return;
+  }
+  const lo = Math.min(sel.start.charIndex, sel.end.charIndex);
+  const hi = Math.max(sel.start.charIndex, sel.end.charIndex);
+  const s = sel.start, e = sel.end;
+  el.innerHTML =
+    `<span class="k">起点</span> <b>${s.charIndex}</b>（读列${s.readCol+1}·行${s.row+1}）<br>` +
+    `<span class="k">终点</span> <b>${e.charIndex}</b>（读列${e.readCol+1}·行${e.row+1}）<br>` +
+    `<span class="k">选区</span> [${lo}, ${hi}]，共 <b>${hi - lo + 1}</b> 字（读序）`;
+}
+let bannerTimer = null;
+function banner(msg) {
+  const el = document.getElementById('banner');
+  el.textContent = msg;
+  if (bannerTimer) clearTimeout(bannerTimer);
+  bannerTimer = setTimeout(() => { el.textContent = ''; }, 6000);
+}
+
+(function loop() { draw(); requestAnimationFrame(loop); })();
+</script>
+</body>
+</html>

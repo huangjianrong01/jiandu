@@ -9,7 +9,7 @@ use crate::library::Library;
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
     Book, CardLayout, Duplex, FontChoice, Glyph, GlyphHit, GlyphKey, GlyphKind, MarkKind, Note,
-    NoteKind, RuleColor, Script, StyleTab,
+    NoteKind, NoteSource, RuleColor, Script, StyleTab,
 };
 use gpui::{
     div, px, rgb, AsyncApp, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
@@ -151,6 +151,13 @@ pub struct Root {
     /// 改的是书稿里的夹注 / 注释（保存时写回书稿 JSON）；
     /// `None` 表示改的是页眉批注（`notes[page]`，既有行为）。
     pub note_edit_note: Option<(usize, usize, usize)>,
+    /// 编辑栏正在**新建**一条用户自加夹注（宿主字键）。
+    ///
+    /// 与 `note_edit_note` 的区别：那个是「改已有注文」（找不到就不写），
+    /// 这个是「在该字上加一条夹注」（没有就注入一条 `NoteSource::User` 的）。
+    /// 保存时走 `inject_user_note_at`，注入后正文流长度与所有字的全局下标
+    /// 都不变，只需从当前半叶起点局部重排（`relayout_from_halfleaf`）。
+    pub note_inject_key: Option<(usize, usize, usize)>,
     /// 笔记编辑栏的当前草稿（未保存的输入缓冲）。
     pub note_draft: String,
     /// 笔记草稿的光标位置（字符下标，0..=len）。
@@ -250,6 +257,8 @@ pub struct Root {
     pub note_boxes: Vec<crate::gloss::NoteBox>,
     /// 点注文弹出的放大卡片（None 表示未弹出）。
     pub note_zoom: Option<crate::gloss::NoteZoom>,
+    /// 右键 / 长按**用户自加夹注**弹出的「修改 / 删除」菜单（None 表示未弹出）。
+    pub note_menu: Option<crate::gloss::NoteMenu>,
     /// 现代横笺的行高（由 fit_sizes 按可用高度均分 12 行算出，用来纵向铺满）。
     pub line_modern: f32,
     pub notice: String,
@@ -348,6 +357,7 @@ impl Root {
             show_notes_panel: false,
             note_editing: false,
             note_edit_note: None,
+            note_inject_key: None,
             note_draft: String::new(),
             note_cursor: 0,
             note_focus: _cx.focus_handle(),
@@ -393,6 +403,7 @@ impl Root {
             page_h: 480.0,
             note_boxes: Vec::new(),
             note_zoom: None,
+            note_menu: None,
             line_modern: 26.0,
             rename_test_done: false,
             show_search: false,
@@ -564,6 +575,50 @@ impl Root {
                         x,
                         y,
                         page: root.page,
+                    });
+                }
+            }
+        }
+
+        // 开发用：JIANDU_USER_NOTE=offset 在首章首段第 offset 字挂一条
+        // 「用户自加夹注」，便于截图核对深朱砂红 + 淡红底框渲染（以及
+        // 右键改删菜单的命中演示）。文本用道德经风格短注。
+        if let Ok(v) = std::env::var("JIANDU_USER_NOTE") {
+            if let Ok(off) = v.trim().parse::<usize>() {
+                crate::note_inject::inject_inline_note_at_key(
+                    root.book.as_mut().unwrap(),
+                    0,
+                    0,
+                    off,
+                    "道可道，非常道。此为用户自加夹注，色作深朱砂，可与原注相辨。",
+                    crate::types::NoteSource::User,
+                );
+            }
+        }
+
+        // 开发用：JIANDU_NOTE_MENU=x,y 在给定窗口坐标直接弹出「自加夹注」
+        // 改删菜单（模拟右键命中注文块；合成鼠标右键同样被 TCC 拦）。
+        // 宿主字取首章首段第一个正文字，与 JIANDU_USER_NOTE 配合可端到端
+        // 核对「朱砂注 → 右键菜单 → 改/删」链路。
+        if let Ok(v) = std::env::var("JIANDU_NOTE_MENU") {
+            if let Some((xs, ys)) = v.split_once(',') {
+                if let (Ok(x), Ok(y)) = (xs.trim().parse::<f32>(), ys.trim().parse::<f32>()) {
+                    let key = root
+                        .book
+                        .as_ref()
+                        .map(|b| {
+                            b.to_flow(true)
+                                .iter()
+                                .find(|g| g.kind == GlyphKind::Char)
+                                .map(|g| (g.chapter, g.para, g.offset))
+                        })
+                        .flatten()
+                        .unwrap_or((0, 0, 0));
+                    root.note_menu = Some(crate::gloss::NoteMenu {
+                        key,
+                        text: "道可道，非常道。此为用户自加夹注。".into(),
+                        x,
+                        y,
                     });
                 }
             }
@@ -1140,7 +1195,9 @@ impl Root {
     }
 
     /// 取某个字上挂的注文（夹注只认 `Note` 一类，通假另走旁注）。
-    pub fn note_chars(&self, g: Glyph) -> Option<&str> {
+    /// 某字上的夹注文本 **与来源**（`NoteSource::User` = 用户自加，深朱砂红）。
+    /// 供 `layout_book` 的 `gloss` 闭包取用，来源随注文一路带到渲染层做视觉区分。
+    pub fn note_chars_with_source(&self, g: Glyph) -> Option<(&str, NoteSource)> {
         if !self.show_notes || g.kind != GlyphKind::Char {
             return None;
         }
@@ -1149,7 +1206,12 @@ impl Root {
         p.notes
             .iter()
             .find(|n| n.at == g.offset && n.kind == NoteKind::Note)
-            .map(|n| n.text.as_str())
+            .map(|n| (n.text.as_str(), n.source))
+    }
+
+    /// 只要夹注文本（不关心来源）。
+    pub fn note_chars(&self, g: Glyph) -> Option<&str> {
+        self.note_chars_with_source(g).map(|(s, _)| s)
     }
 
     /// 某字是否落在划线标记（人名 / 地名 / 书名）的跨度内，
@@ -1437,7 +1499,10 @@ impl Root {
             &flow,
             |g| {
                 if self.notes_inline {
-                    self.note_chars(*g).map(|s| s.to_string())
+                    // 带上来源与宿主字形：来源决定渲染配色（用户注深朱砂红），
+                    // 宿主字形用于右键/长按定位书稿里那条注文（改 / 删）。
+                    self.note_chars_with_source(*g)
+                        .map(|(s, src)| (s.to_string(), src, *g))
                 } else {
                     None
                 }
@@ -1610,8 +1675,32 @@ impl Root {
         self.note_pos = at;
         self.note_editing = true;
         self.note_edit_note = None; // 页眉批注
+        self.note_inject_key = None;
         self.note_suppress_commit = true; // 忽略「打开这一下」点击的自动提交
         self.popup = None;
+    }
+
+    /// 在宿主字 `key` 上**新建**一条用户自加夹注：打开浮层编辑栏，
+    /// 预填该字已有的夹注（有则算改写），保存时走 `inject_user_note_at`。
+    ///
+    /// 这是「点字 → 加夹注」的入口，配合 `note_inject.rs` 的局部重排：
+    /// 夹注挂在字形上、不进正文流，所以注入后**不用重排全书**。
+    pub fn start_note_inject(
+        &mut self,
+        key: (usize, usize, usize),
+        existing: &str,
+        at: Option<(f32, f32)>,
+    ) {
+        self.note_draft = existing.replace(['\n', '\r'], " ");
+        self.note_cursor = self.note_draft.chars().count();
+        self.note_pos = at;
+        self.note_editing = true;
+        self.note_edit_note = None;
+        self.note_inject_key = Some(key);
+        self.note_suppress_commit = true;
+        self.popup = None;
+        self.note_zoom = None;
+        self.note_menu = None;
     }
 
     /// 按文本反查注文位置：全书里第一条正文与 `text` 相同的注释。
@@ -1650,9 +1739,130 @@ impl Root {
         self.note_pos = at;
         self.note_editing = true;
         self.note_edit_note = Some(key);
+        self.note_inject_key = None;
         self.note_suppress_commit = true;
         self.popup = None;
         self.note_zoom = None;
+    }
+
+    /// 在宿主字 `key` 上注入一条**用户自加夹注**，并回写书稿 JSON。
+    ///
+    /// 与古籍原本夹注的区别只在 `NoteSource::User`：渲染侧据此染深朱砂红、
+    /// 垫极淡朱砂底衬，并允许右键 / 长按改删。
+    /// 夹注是挂在字形上的、不进正文流，所以注入**不改变任何字的全局下标**，
+    /// 后续只需从当前半叶起点局部重排（`relayout_from_halfleaf`），绝不重排全书。
+    pub fn inject_user_note_at(&mut self, key: (usize, usize, usize), text: &str) {
+        let (c, p, o) = key;
+        let done = if let Some(book) = self.book.as_mut() {
+            crate::note_inject::inject_inline_note_at_key(
+                book,
+                c,
+                p,
+                o,
+                text,
+                NoteSource::User,
+            );
+            true
+        } else {
+            false
+        };
+        if done {
+            self.persist_book_json();
+            // 只从宿主字所在半叶续排，把视图锚回原来在读的那一叶。
+            self.reanchor_after_note_edit(key);
+            self.notice = if text.trim().is_empty() {
+                "夹注已清空".to_string()
+            } else {
+                format!("已加夹注「{}」", text.chars().take(10).collect::<String>())
+            };
+        }
+    }
+
+    /// 删除宿主字 `key` 上的「用户自加夹注」并回写 JSON。
+    ///
+    /// 古籍原本的夹注**删不掉**（`remove_user_note_at_key` 只匹配
+    /// `NoteSource::User`）——那是底本的一部分，动了就失真。
+    /// 删除后释放该注所占的半格，后续字上移回流（局部重排由调用方触发）。
+    pub fn delete_user_note_at(&mut self, key: (usize, usize, usize)) -> bool {
+        let (c, p, o) = key;
+        let removed = match self.book.as_mut() {
+            Some(book) => crate::note_inject::remove_user_note_at_key(book, c, p, o),
+            None => false,
+        };
+        if removed {
+            self.persist_book_json();
+            // 释放的半格让后续字上移回流：同样只续排后缀、把视图锚回去。
+            self.reanchor_after_note_edit(key);
+            self.notice = "夹注已删除".to_string();
+        } else {
+            self.notice = "此处没有可删除的自加夹注".to_string();
+        }
+        removed
+    }
+
+    /// 宿主字键 `(chapter, para, offset)` → 全局流下标。
+    fn flow_index_of_key(&self, key: (usize, usize, usize)) -> Option<usize> {
+        let book = self.book.as_ref()?;
+        let flow = book.to_flow(self.show_punct);
+        flow.iter()
+            .position(|g| g.chapter == key.0 && g.para == key.1 && g.offset == key.2)
+    }
+
+    /// 夹注增删后把视图锚回宿主字所在的半叶——**只从该半叶起点续排**。
+    ///
+    /// 夹注挂在字形上、不进正文流，所以正文的下标一个都没变；变的是
+    /// 半格账（注文占半格，会把后续字往后面的叶推）。这里用
+    /// `relayout_from_halfleaf`：前 N−1 面**原样复用、零重算**，只把第 N 面
+    /// 之后续排一遍（已由单测证明逐面 == 全书重排，无漂移），据此把
+    /// `self.page` 锚到宿主字现在所在的叶，避免增删注文后视图漂走。
+    fn reanchor_after_note_edit(&mut self, key: (usize, usize, usize)) {
+        let Some(idx) = self.flow_index_of_key(key) else {
+            return;
+        };
+        let Some(book) = self.book.as_ref() else {
+            return;
+        };
+        let flow = book.to_flow(self.show_punct);
+        let cols = self.grid.columns;
+        let rows = self.grid_rows;
+        let reserve = crate::gloss::inscription_reserve(self.chapter_inscription_need(), rows);
+        // 改动前的分页：定位半叶 N 与其起点、并原样复用前 N−1 面。
+        let old = self.layout_pages();
+        let new_pages = if self.notes_inline {
+            crate::note_inject::relayout_from_halfleaf(&old, &flow, |g| {
+                self.note_chars_with_source(*g)
+                    .map(|(s, src)| (s.to_string(), src, *g))
+            }, cols, rows, reserve, idx)
+        } else {
+            crate::note_inject::relayout_from_halfleaf(&old, &flow, |_| None, cols, rows, reserve, idx)
+        };
+        if new_pages.is_empty() {
+            return;
+        }
+        // 宿主字现在落在第几叶 → 视图锚过去（防止增删注文后页码漂移）。
+        let mut acc = 0usize;
+        let mut target = 0usize;
+        for (i, p) in new_pages.iter().enumerate() {
+            let n = p.glyphs.len();
+            if acc <= idx && idx < acc + n {
+                target = i;
+                break;
+            }
+            acc += n;
+            target = i;
+        }
+        self.page = target.min(new_pages.len() - 1);
+        self.sync_current_chapter();
+    }
+
+    /// 把当前书稿回写进 JSON（下次打开仍在）。抽出来供注入 / 删除共用。
+    fn persist_book_json(&mut self) {
+        let Some(path) = self.library.books.get(self.current).map(|e| e.path.clone()) else {
+            return;
+        };
+        if let Some(book) = self.book.as_ref() {
+            let _ = crate::importer::write_book_json(book, &path);
+        }
     }
 
     /// 把草稿写进书稿里那条注文（并按原通道回写 JSON，下次打开仍在）。
@@ -1681,9 +1891,10 @@ impl Root {
             false
         };
         if edited {
-            if let Some(path) = self.library.books.get(self.current).map(|e| e.path.clone()) {
-                let _ = crate::importer::write_book_json(self.book.as_ref().unwrap(), &path);
-            }
+            self.persist_book_json();
+            // 注文变长 / 变短 → 半格账变 → 后续字推走或回流；
+            // 只续排后缀并把视图锚回原来在读的那一叶。
+            self.reanchor_after_note_edit(key);
         }
     }
 
@@ -1691,10 +1902,22 @@ impl Root {
     pub fn commit_note_edit(&mut self) {
         let text = std::mem::take(&mut self.note_draft);
         let target = self.note_edit_note.take();
+        let inject = self.note_inject_key.take();
         self.note_editing = false;
         self.note_suppress_commit = false;
         self.note_cursor = 0;
         self.note_pos = None;
+        // 「新建夹注」优先：在该字上挂一条 `NoteSource::User` 的注文。
+        // 夹注挂在字形上、不进正文流，所以只从当前半叶起点局部重排即可。
+        // 空输入视为放弃（不注入空注，避免留一条看不见的夹注占位）。
+        if let Some(key) = inject {
+            if text.trim().is_empty() {
+                self.notice = "已取消加夹注".to_string();
+            } else {
+                self.inject_user_note_at(key, &text);
+            }
+            return;
+        }
         match target {
             Some(key) => {
                 // 改的是书稿里的注文：写回段落并回写 JSON。
@@ -1721,6 +1944,7 @@ impl Root {
         self.note_editing = false;
         self.note_suppress_commit = false;
         self.note_edit_note = None;
+        self.note_inject_key = None;
         self.note_draft.clear();
         self.note_cursor = 0;
         self.note_pos = None;
@@ -2307,7 +2531,8 @@ mod tests {
         // 奇数字挂 4 字夹注：成本变化也不得丢字、不得超 8 列。
         let pages = crate::gloss::layout_book(
             &flow,
-            |g| (g.kind == GlyphKind::Char && g.offset % 2 == 0).then(|| "夹注四字".to_string()),
+            |g| (g.kind == GlyphKind::Char && g.offset % 2 == 0)
+                .then(|| ("夹注四字".to_string(), NoteSource::Original, *g)),
             cols,
             rows,
             0,
@@ -2324,7 +2549,7 @@ mod tests {
             .flat_map(|p| p.columns.iter())
             .flatten()
             .filter_map(|p| match p {
-                crate::gloss::Piece::Gloss(s) => Some(s.as_str()),
+                crate::gloss::Piece::Gloss(s, _, _) => Some(s.as_str()),
                 _ => None,
             })
             .collect();
@@ -2357,7 +2582,8 @@ mod tests {
                 &flow,
                 |g| {
                     if inline {
-                        (g.offset % 7 == 0).then(|| "注".to_string())
+                        (g.offset % 7 == 0)
+                            .then(|| ("注".to_string(), NoteSource::Original, *g))
                     } else {
                         None
                     }
