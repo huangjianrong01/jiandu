@@ -35,6 +35,47 @@ pub fn gutter_w(content_w: f32, columns: usize, edge: f32, margin: f32) -> f32 {
 pub const LEAF_GAP_MIN: f32 = 22.0;
 pub const LEAF_GAP_MAX: f32 = 110.0;
 
+// ── 响应式单 / 双叶 ─────────────────────────────────────────────────
+/// 双叶对开所需的最小宽高比：低于此值按「竖屏 / 近方屏」处理 → 单叶。
+pub const FACING_MIN_ASPECT: f32 = 1.15;
+/// 双叶时单叶的最小可读宽：再窄两叶就成两条细缝，不如单叶。
+pub const FACING_MIN_LEAF_W: f32 = 300.0;
+/// 双叶时单叶字号的可读下限：挤到这个字号以下宁可退回单叶——
+/// 「保证字号足够大」优先于「铺两叶」。
+pub const FACING_MIN_FS: f32 = 14.0;
+/// 响应式估算用的四边留白与两叶间中缝（与渲染同源的量级）。
+pub const RESP_MARGIN: f32 = 16.0;
+pub const RESP_GUTTER: f32 = 24.0;
+
+/// 是否窄屏（竖屏 / 近方屏）：单叶模式，版心贴屏幕右边缘。
+pub fn is_narrow(viewport_w: f32, viewport_h: f32) -> bool {
+    if viewport_w <= 1.0 || viewport_h <= 1.0 {
+        return true;
+    }
+    viewport_w / viewport_h < FACING_MIN_ASPECT
+}
+
+/// 响应式单 / 双叶判断。
+///
+/// * 宽屏（平板横持 / 电脑）：**双叶对开**，两叶等宽、中缝落在屏幕正中；
+/// * 窄屏（手机竖持）：**单叶**，只排当前叶，纸面贴右边缘，
+///   整幅宽都给这一叶 —— 字号自然翻倍，不挤占阅读空间。
+///
+/// 判据不只看宽高比：双叶还要保证单叶宽与字号都过得去，
+/// 否则（超多列 + 小字级）宽屏也退回单叶。
+pub fn should_face(viewport_w: f32, viewport_h: f32, columns: usize, zoom: f32) -> bool {
+    if is_narrow(viewport_w, viewport_h) {
+        return false;
+    }
+    let content_w = (viewport_w - 2.0 * RESP_MARGIN).max(1.0);
+    let per_leaf = (content_w - RESP_GUTTER) / 2.0;
+    if per_leaf < FACING_MIN_LEAF_W {
+        return false;
+    }
+    let fs = (per_leaf / columns.max(1) as f32) * GRID_FS_RATIO * zoom;
+    fs >= FACING_MIN_FS
+}
+
 /// 排版方向。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 pub enum GridDir {
@@ -454,6 +495,39 @@ mod tests {
         };
         assert_eq!(cell_origin(&m, 0, 0), (0.0, 0.0));
         assert_eq!(cell_origin(&m, 2, 0), (20.0, 0.0));
+    }
+
+    #[test]
+    fn portrait_phone_renders_single_leaf() {
+        // 手机竖屏 390×844：宽高比 0.46 → 单叶（版心贴右边缘）。
+        assert!(is_narrow(390.0, 844.0));
+        assert!(!should_face(390.0, 844.0, 10, 1.0));
+    }
+
+    #[test]
+    fn landscape_tablet_renders_facing_pair() {
+        // 平板横屏 1194×834：宽高比 1.43，单叶宽 569 → 双叶对开。
+        assert!(!is_narrow(1194.0, 834.0));
+        assert!(should_face(1194.0, 834.0, 10, 1.0));
+        assert!(should_face(1440.0, 900.0, 12, 1.0));
+    }
+
+    #[test]
+    fn facing_falls_back_when_font_would_be_too_small() {
+        // 宽屏但「14 列 + 极小字级」：双叶每叶字号 < 14px → 退回单叶，
+        // 宁可只排一叶也要保证字号够大。
+        assert!(should_face(1194.0, 834.0, 14, 1.0));
+        assert!(!should_face(1194.0, 834.0, 14, 0.3));
+    }
+
+    #[test]
+    fn narrow_single_leaf_keeps_the_whole_width() {
+        // 窄屏单叶：整幅宽都给这一叶，列宽约为双叶时的两倍。
+        let vw = 420.0;
+        let single_w = vw - 2.0 * RESP_MARGIN;
+        let facing_w = (vw - 2.0 * RESP_MARGIN - RESP_GUTTER) / 2.0;
+        assert!(single_w > facing_w * 1.9);
+        assert!(!should_face(vw, 900.0, 10, 1.0));
     }
 
     #[test]

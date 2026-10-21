@@ -541,6 +541,12 @@ pub fn note_boxes_in_column(
 ///     在右，读序自右向左；
 ///   * 专注模式：工具栏 / 状态栏 / 留白皆 0，纸面贴屏。
 /// `paper_w` / `paper_h` 是纸面尺寸（网格引擎 `outer_w` / `outer_h`）。
+/// 窄屏单叶时纸面与屏幕右缘之间留的一丝边（版心贴右，但不出血）。
+pub const LEAF_RIGHT_EDGE: f32 = 8.0;
+
+/// `right_align`：窄屏（手机竖持）单叶模式——纸面**贴屏幕右边缘**。
+/// 竖排自右向左读，右缘正是「当前叶」所在；左侧留出的空地是下一段的
+/// 去处，纸面因此不必居中、整幅宽都给这一叶（字号最大化）。
 pub fn leaf_origin(
     facing: bool,
     viewport_w: f32,
@@ -550,6 +556,7 @@ pub fn leaf_origin(
     gap: f32,
     back: bool,
     focus: bool,
+    right_align: bool,
 ) -> (f32, f32) {
     // 正文区高度 = 视口 - 工具栏(44) - 状态栏(34)；叶在其中垂直居中。
     let chrome_h = if focus { 0.0 } else { 44.0 + 34.0 };
@@ -559,12 +566,15 @@ pub fn leaf_origin(
         paper_w
     };
     let x = if facing {
+        // 双叶对开：两叶 + 中缝整体居中 → **中缝正落在屏幕正中**。
         let left = ((viewport_w - stage_w) / 2.0).max(0.0);
         if back {
             left
         } else {
             left + paper_w + gap
         }
+    } else if right_align {
+        (viewport_w - paper_w - LEAF_RIGHT_EDGE).max(0.0)
     } else {
         ((viewport_w - stage_w) / 2.0).max(0.0)
     };
@@ -1276,12 +1286,12 @@ mod tests {
     #[test]
     fn leaf_origin_single_page_centers_and_clears_chrome() {
         // 单页：水平居中；垂直在正文区（工具栏 44 + 状态栏 34 之下）居中。
-        let (x, y) = leaf_origin(false, 700.0, 780.0, 620.0, 640.0, 0.0, false, false);
+        let (x, y) = leaf_origin(false, 700.0, 780.0, 620.0, 640.0, 0.0, false, false, false);
         assert!((x - (700.0 - 620.0) / 2.0).abs() < 0.01);
         let body_h = 780.0 - 78.0;
         assert!((y - (78.0 + (body_h - 640.0) / 2.0)).abs() < 0.01);
         // 专注模式：贴屏，无 chrome 偏移。
-        let (fx, fy) = leaf_origin(false, 700.0, 780.0, 700.0, 780.0, 0.0, false, true);
+        let (fx, fy) = leaf_origin(false, 700.0, 780.0, 700.0, 780.0, 0.0, false, true, false);
         assert!((fx).abs() < 0.01);
         assert!((fy).abs() < 0.01);
     }
@@ -1291,13 +1301,27 @@ mod tests {
         // 对开：两叶并排隔中缝 gap，整体居中；back（下一面）在左。
         let (pw, ph) = (560.0, 640.0);
         let gap = crate::grid::gutter_w(1200.0, 8, 50.0, 0.04);
-        let (lx, ly) = leaf_origin(true, 1200.0, 800.0, pw, ph, gap, true, false);
-        let (rx, ry) = leaf_origin(true, 1200.0, 800.0, pw, ph, gap, false, false);
+        let (lx, ly) = leaf_origin(true, 1200.0, 800.0, pw, ph, gap, true, false, false);
+        let (rx, ry) = leaf_origin(true, 1200.0, 800.0, pw, ph, gap, false, false, false);
         let stage = pw * 2.0 + gap;
         assert!((lx - (1200.0 - stage) / 2.0).abs() < 0.01);
         assert!((rx - (lx + pw + gap)).abs() < 0.01);
         assert_eq!(ly, ry);
         assert!(rx > lx);
+        // 双叶对开：**中缝正落在屏幕正中**（两叶等宽、整体居中）。
+        let gutter_mid = (lx + pw) + gap / 2.0;
+        assert!((gutter_mid - 1200.0 / 2.0).abs() < 0.01, "中缝应居中");
+    }
+
+    #[test]
+    fn leaf_origin_narrow_single_hugs_right_edge() {
+        // 窄屏单叶（手机竖持）：纸面贴屏幕右缘，只留一丝边——
+        // 竖排自右读起，右边是当前叶，整幅宽都归它（字号最大化）。
+        let (x, _y) = leaf_origin(false, 420.0, 900.0, 380.0, 700.0, 0.0, false, false, true);
+        assert!((x - (420.0 - 380.0 - LEAF_RIGHT_EDGE)).abs() < 0.01);
+        // 与居中摆法对比：确实更靠右。
+        let (cx, _cy) = leaf_origin(false, 420.0, 900.0, 380.0, 700.0, 0.0, false, false, false);
+        assert!(x > cx);
     }
 
     // ---- 双行夹注（双列小字）· Z 字型填充 ----

@@ -567,10 +567,15 @@ impl Root {
             }
             row
         } else {
+            // 窄屏（手机竖持）：纸面**贴屏幕右边缘**——竖排自右向左读，
+            // 右缘正是当前叶所在，整幅宽都归这一叶（字号最大化）；
+            // 宽屏单叶仍居中（像摊在桌上的一叶）。
+            let narrow = crate::grid::is_narrow(self.viewport_w, self.viewport_h);
             div()
                 .flex()
                 .flex_row()
-                .justify_center()
+                .when(narrow, |d| d.justify_end())
+                .when(!narrow, |d| d.justify_center())
                 .child(self.render_leaf(&pages, self.page, false, LeafEdge::Alone, cx))
         };
 
@@ -728,12 +733,14 @@ impl Root {
             .child(stage);
 
         // 根容器设为相对定位，便于叠加浮层（目录 / 样式 / 字书 / 笔记）。
+        // 全局背景：**纸色**（配置表 `paperColor`）铺满整窗。
+        // 工具栏 / 状态栏各自再压一层界面色（`chrome`），纸面本体直接透出纸色。
         let mut root = div()
             .relative()
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(t.chrome()))
+            .bg(rgb(t.paper()))
             // 点字弹出的工具条：点正文某字才出现；点其它地方（正文空白处 / 工具栏 / 浮层）即收起，
             // 同时清除拖选选区。
         .on_mouse_down(
@@ -5907,6 +5914,43 @@ impl Root {
                     );
                 }
                 sheet = sheet.child(style_row("丝栏", rules, t));
+                // 纸色：**遍历主题配置表自动生成**预览按钮——新增一套配色
+                // 只需在 `PAPER_THEMES` 加一行，此处零改动。
+                // 每颗按钮就是一张小纸：底色=纸色、边框=界栏色、
+                // 例字=正文色，点中即用该套配色重绘（fit_sizes 后 notify）。
+                let mut themes_row = div().flex().flex_row().items_center().gap_2().flex_wrap();
+                for (i, pt) in crate::theme::PAPER_THEMES.iter().enumerate() {
+                    let on = self.theme.index() == i;
+                    let name = pt.name;
+                    themes_row = themes_row.child(
+                        div()
+                            .w(px(46.0))
+                            .h(px(28.0))
+                            .rounded(px(5.0))
+                            .bg(rgb(pt.paper))
+                            .border_1()
+                            .border_color(rgb(if on { t.accent() } else { pt.border }))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(pt.text))
+                                    .child(SharedString::from(name)),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.set_theme(i);
+                                    cx.notify();
+                                }),
+                            ),
+                    );
+                }
+                sheet = sheet.child(style_row("纸色", themes_row, t));
                 // 标注：通假 / 标点 / 生僻字 / 注释（「红色繁体小注」已删除，
                 // 繁简改由版式行的「简体 / 繁体」统一切换正文字体）。
                 let marks = self.style_chips(
@@ -5915,6 +5959,7 @@ impl Root {
                         ("标点", self.show_punct, StyleAct::Punct),
                         ("生僻字", self.show_rare, StyleAct::Rare),
                         ("数字汉字", self.han_digits, StyleAct::Han),
+                        ("自动开合", self.auto_duplex, StyleAct::AutoDuplex),
                         ("注释", self.show_notes, StyleAct::Notes),
                     ],
                     cx,
@@ -6195,6 +6240,12 @@ impl Root {
                                 this.han_digits = !this.han_digits;
                                 this.fit_sizes();
                             }
+                            // 响应式单 / 双叶：宽屏对开、窄屏单叶贴右；
+                            // 关掉则沿用手动「对开 / 单页」。
+                            StyleAct::AutoDuplex => {
+                                this.auto_duplex = !this.auto_duplex;
+                                this.fit_sizes();
+                            }
                         }
                         cx.notify();
                     }),
@@ -6331,6 +6382,17 @@ impl Root {
         self.theme = Theme::ALL[(idx + 1) % Theme::ALL.len()];
         self.persist();
     }
+
+    /// 切到第 `i` 套纸面主题（配置表 `PAPER_THEMES` 下标）。
+    /// 换纸即重排（纸色变了、夹注兑淡基点也变），随后由调用方 notify 重绘。
+    fn set_theme(&mut self, i: usize) {
+        let Some(next) = Theme::ALL.get(i).copied() else {
+            return;
+        };
+        self.theme = next;
+        self.fit_sizes();
+        self.persist();
+    }
 }
 
 /// 供未来扩展：字体权重占位，避免未使用告警。
@@ -6367,6 +6429,8 @@ enum StyleAct {
     Rare,
     /// 数字转汉字（`1628` → `一六二八`）。
     Han,
+    /// 响应式单 / 双叶：按屏幕宽高比自动决定对开 / 单叶。
+    AutoDuplex,
 }
 
 /// 样式面板的一行：左侧标签，右侧一组控件。

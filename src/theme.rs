@@ -4,6 +4,88 @@
 //! 正文才立得住。夜读不用纯黑底 + 纯白字，改用暖调深棕 + 米色墨，
 //! 长时间读不刺眼。
 
+/// 纸面主题配置：**纸 / 正文 / 夹注 / 界栏**四色。
+///
+/// 这是视觉配色的**唯一数据源**：
+///   * 设置面板的颜色预览按钮由 [`PAPER_THEMES`] 遍历自动生成；
+///   * 渲染层经 [`Theme::paper_theme`] 取这四色上色
+///     （背景=纸色，界栏/版框=界栏色，正文=正文色，双行夹注=夹注色）。
+/// 新增一套配色只在此加一行，UI 与渲染零改动。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PaperTheme {
+    /// 配置 id（持久化 / 反查用）。
+    pub id: &'static str,
+    /// 面板上显示的名字。
+    pub name: &'static str,
+    /// 纸色（全局背景）。
+    pub paper: u32,
+    /// 正文色（松烟墨）。
+    pub text: u32,
+    /// 夹注色（双行小字）。
+    pub note: u32,
+    /// 界栏 / 版框色（乌丝栏）。
+    pub border: u32,
+}
+
+/// 主题配置表：顺序即面板按钮顺序，下标即 `Theme` 的编号。
+pub const PAPER_THEMES: &[PaperTheme] = &[
+    PaperTheme {
+        id: "xuanzhi",
+        name: "宣纸",
+        paper: 0xF5F0E6,
+        text: 0x2F3535,
+        note: 0xB23A30,  // 朱砂红
+        border: 0x2F3535, // 乌丝栏
+    },
+    PaperTheme {
+        id: "mihuang",
+        name: "米黄",
+        paper: 0xF2E6D0,
+        text: 0x222B2D,
+        note: 0x5C7C7F,
+        border: 0x4A6B5D, // 绿丝栏
+    },
+    PaperTheme {
+        id: "qingjian",
+        name: "青简",
+        paper: 0xD8E2DB,
+        text: 0x1A2421,
+        note: 0x6A5A4B,
+        border: 0x1A2421,
+    },
+    PaperTheme {
+        id: "yedou",
+        name: "夜读",
+        paper: 0x1A1C1D,
+        text: 0xDCD6CD, // 月白
+        note: 0xA68E5C, // 秋香
+        border: 0x4A4D4F, // 灰丝栏
+    },
+];
+
+impl PaperTheme {
+    /// 按 id 取配置（未知 id 回落首项）。
+    pub fn by_id(id: &str) -> &'static PaperTheme {
+        PAPER_THEMES.iter().find(|p| p.id == id).unwrap_or(&PAPER_THEMES[0])
+    }
+
+    /// 是否深底（由纸色亮度推导，不写死枚举）。
+    pub fn is_dark(&self) -> bool {
+        luma(self.paper) < DARK_LUMA
+    }
+}
+
+/// 纸色亮度低于此值即视为「夜读」深底（0..255）。
+pub const DARK_LUMA: f32 = 110.0;
+
+/// 感知亮度（0..255），用于深底判定与「谁更淡」的比较。
+pub fn luma(c: u32) -> f32 {
+    let r = ((c >> 16) & 0xFF) as f32;
+    let g = ((c >> 8) & 0xFF) as f32;
+    let b = (c & 0xFF) as f32;
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
     /// 宣纸：米白偏暖，最像常见的影印本。
@@ -34,58 +116,57 @@ impl Theme {
         }
     }
 
+    /// 本主题在 [`PAPER_THEMES`] 里的下标。
+    pub fn index(self) -> usize {
+        match self {
+            Theme::Xuan => 0,
+            Theme::Mi => 1,
+            Theme::Qing => 2,
+            Theme::Ye => 3,
+        }
+    }
+
+    /// 取本主题的四色配置（纸 / 正文 / 夹注 / 界栏）。
+    pub fn paper_theme(self) -> &'static PaperTheme {
+        &PAPER_THEMES[self.index()]
+    }
+
+    /// 是否深底：由纸色亮度推导（新增深底主题无需改这里）。
     pub fn is_dark(self) -> bool {
-        matches!(self, Theme::Ye)
+        self.paper_theme().is_dark()
     }
 
-    /// 纸面（正面）。
+    /// 纸面（正面）：纸色。
     pub fn paper(self) -> u32 {
-        match self {
-            Theme::Xuan => 0xF2EAD6,
-            Theme::Mi => 0xF6EED4,
-            Theme::Qing => 0xE6ECE4,
-            Theme::Ye => 0x1E1A16,
-        }
+        self.paper_theme().paper
     }
 
-    /// 纸面（翻过来的一面，略深一档）。
+    /// 纸面（翻过来的一面）：纸色向「墨 / 纯黑」压深一档。
     pub fn paper_back(self) -> u32 {
-        match self {
-            Theme::Xuan => 0xE9DDC3,
-            Theme::Mi => 0xEDE1C1,
-            Theme::Qing => 0xDBE3DB,
-            Theme::Ye => 0x181512,
-        }
+        let p = self.paper_theme();
+        mix(p.paper, if p.is_dark() { 0x000000 } else { p.text }, 0.07)
     }
 
-    /// 正文墨色。
+    /// 正文墨色（松烟墨）。
     pub fn ink(self) -> u32 {
-        match self {
-            Theme::Xuan => 0x2A241E,
-            Theme::Mi => 0x2E2820,
-            Theme::Qing => 0x1F2C28,
-            Theme::Ye => 0xDCCFB8,
-        }
+        self.paper_theme().text
     }
 
-    /// 淡墨：小字注文、行款、背面。
+    /// 夹注色（双行小字）：与正文严格区分的一色。
+    pub fn note(self) -> u32 {
+        self.paper_theme().note
+    }
+
+    /// 淡墨：小字注文、行款、背面——正文色向纸色兑淡。
     pub fn ink_soft(self) -> u32 {
-        match self {
-            Theme::Xuan => 0x4A4038,
-            Theme::Mi => 0x4E443A,
-            Theme::Qing => 0x3C4A44,
-            Theme::Ye => 0xB3A68E,
-        }
+        let p = self.paper_theme();
+        mix(p.text, p.paper, 0.30)
     }
 
-    /// 界行（列与列之间的细线）。
+    /// 界行（列与列之间的细线）：界栏色向纸色兑淡，比版框再轻一档。
     pub fn rule(self) -> u32 {
-        match self {
-            Theme::Xuan => 0x9C8A6C,
-            Theme::Mi => 0xA08B64,
-            Theme::Qing => 0x6F8A80,
-            Theme::Ye => 0x4B4136,
-        }
+        let p = self.paper_theme();
+        mix(p.border, p.paper, 0.25)
     }
 
     /// 朱丝栏：写经体的朱红界行（古本里的另一路做法）。
@@ -100,37 +181,20 @@ impl Theme {
         }
     }
 
-    /// 版框（四周双边）。
+    /// 版框（四周双边）：界栏色向纸色兑淡一档（比界行轻，框不抢字）。
     pub fn frame(self) -> u32 {
-        match self {
-            Theme::Xuan => 0x6B5A44,
-            Theme::Mi => 0x6E5A3E,
-            Theme::Qing => 0x466157,
-            Theme::Ye => 0x6A5C4B,
-        }
+        let p = self.paper_theme();
+        mix(p.border, p.paper, 0.35)
     }
 
-    /// 古籍版框：四周双边的外框，取近墨的深色（比界行重一档）。
-    /// 对照刻本影印：框线是墨，不是棕；夜读反过来用淡米墨。
+    /// 古籍版框：四周双边的外框——**界栏色**（配置表的 `borderColor`）。
     pub fn frame_ink(self) -> u32 {
-        match self {
-            Theme::Xuan => 0x3A3128,
-            Theme::Mi => 0x3C3328,
-            Theme::Qing => 0x26332E,
-            Theme::Ye => 0x9A8C76,
-        }
+        self.paper_theme().border
     }
 
-    /// 乌丝栏：竖排列间界行，比版框淡一档、比纸深一档。
-    /// 取「墨兑水」的灰调（略去红黄），才是影印本里那种冷灰界行；
-    /// 饱和度一高，细线在小字号下会发粉，看着像朱丝栏。
+    /// 乌丝栏：竖排列间界行——**界栏色**（配置表的 `borderColor`）。
     pub fn rule_ink(self) -> u32 {
-        match self {
-            Theme::Xuan => 0x8A8375,
-            Theme::Mi => 0x8C8474,
-            Theme::Qing => 0x63776F,
-            Theme::Ye => 0x574B3C,
-        }
+        self.paper_theme().border
     }
 
     /// 丝栏取色：按样式面板所选丝栏色给出界行颜色。
@@ -283,7 +347,14 @@ impl InkPalette {
     }
 
     /// 正文色。夜读（深底）时提亮，避免黑底黑字。
+    ///
+    /// **墨朱组（默认）直接取纸主题的正文色**（配置表 `textColor`）——
+    /// 「纸—墨」是一套设计好的搭配，不该再被组内硬编码覆盖；
+    /// 其余墨色组（松墨 / 赭朱 / 靛青 / 紫棠 / 暗金）仍是读者自选的组内配色。
     pub fn ink(self, t: Theme) -> u32 {
+        if matches!(self, InkPalette::Ink) {
+            return t.ink();
+        }
         if t.is_dark() {
             return match self {
                 InkPalette::Ink => 0xDCCFB8,
@@ -304,8 +375,12 @@ impl InkPalette {
         }
     }
 
-    /// 小字注文（繁体、夹注）的颜色。
+    /// 小字注文（繁体、夹注）的颜色：默认组取纸主题的夹注色（`noteColor`），
+    /// 与正文严格分色（见 [`InkPalette::ink`] 的说明）。
     pub fn note(self, t: Theme) -> u32 {
+        if matches!(self, InkPalette::Ink) {
+            return t.note();
+        }
         if t.is_dark() {
             return match self {
                 InkPalette::Indigo => 0x8FA8D0,
@@ -335,6 +410,11 @@ impl InkPalette {
     pub fn z_note(self, t: Theme, back: bool) -> u32 {
         if matches!(self, InkPalette::Gold) && t.is_dark() {
             return 0xEFE6CE; // 米白
+        }
+        // 墨朱组（默认）：双行夹注直接用纸主题的夹注色——进入夹注分支就
+        // 换这支笔（正文 `textColor` / 夹注 `noteColor` 严格分色）。
+        if matches!(self, InkPalette::Ink) {
+            return t.note();
         }
         let paper = if back { t.paper_back() } else { t.paper() };
         mix(self.ink(t), paper, Z_NOTE_FADE)
@@ -420,9 +500,74 @@ mod tests {
     #[test]
     fn back_leaf_uses_back_paper() {
         // 对开左叶纸色略深 → 兑淡基点不同（两叶夹注目色有细微差别）。
+        // 墨朱组已改为直取纸主题夹注色（两叶同色），故这里看组内配色组。
         assert_ne!(
-            InkPalette::Ink.z_note(Theme::Xuan, true),
-            InkPalette::Ink.z_note(Theme::Xuan, false)
+            InkPalette::Forest.z_note(Theme::Xuan, true),
+            InkPalette::Forest.z_note(Theme::Xuan, false)
         );
+    }
+
+    // ---- 纸面主题配置表（UI 与渲染的唯一数据源）----
+
+    #[test]
+    fn paper_themes_are_the_single_source_of_truth() {
+        assert_eq!(PAPER_THEMES.len(), 4);
+        let ids: Vec<&str> = PAPER_THEMES.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec!["xuanzhi", "mihuang", "qingjian", "yedou"]);
+        let names: Vec<&str> = PAPER_THEMES.iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["宣纸", "米黄", "青简", "夜读"]);
+        // 四色齐全、互不重复（纸 / 正文 / 夹注 / 界栏）。
+        for p in PAPER_THEMES {
+            assert!(luma(p.paper) != luma(p.text), "{} 纸与正文同色", p.id);
+            assert_ne!(p.text, p.note, "{} 正文与夹注同色", p.id);
+        }
+    }
+
+    #[test]
+    fn theme_accessors_read_from_paper_theme_config() {
+        // 渲染四色严格取自配置表：背景=纸色、正文=textColor、
+        // 夹注=noteColor、界栏/版框=borderColor。
+        for t in Theme::ALL {
+            let p = t.paper_theme();
+            assert_eq!(t.paper(), p.paper);
+            assert_eq!(t.ink(), p.text);
+            assert_eq!(t.note(), p.note);
+            assert_eq!(t.rule_ink(), p.border, "界栏必须用 borderColor");
+            assert_eq!(t.frame_ink(), p.border, "版框必须用 borderColor");
+        }
+        // 默认墨色组：正文 / 夹注分别用配置表的 textColor / noteColor。
+        for t in Theme::ALL {
+            let p = t.paper_theme();
+            assert_eq!(InkPalette::Ink.ink(t), p.text);
+            assert_eq!(InkPalette::Ink.note(t), p.note);
+            assert_eq!(InkPalette::Ink.z_note(t, false), p.note);
+        }
+    }
+
+    #[test]
+    fn dark_theme_is_derived_from_paper_luma() {
+        assert!(Theme::Ye.is_dark());
+        for t in [Theme::Xuan, Theme::Mi, Theme::Qing] {
+            assert!(!t.is_dark());
+        }
+        // 深底判定来自纸色亮度，不是写死枚举。
+        assert!(PaperTheme::by_id("yedou").is_dark());
+        assert!(!PaperTheme::by_id("xuanzhi").is_dark());
+        // 未知 id 回落首项（配置损坏不崩）。
+        assert_eq!(PaperTheme::by_id("nope").id, "xuanzhi");
+    }
+
+    #[test]
+    fn paper_back_is_darker_than_paper() {
+        for t in Theme::ALL {
+            let p = t.paper();
+            let b = t.paper_back();
+            assert_ne!(p, b);
+            if t.is_dark() {
+                assert!(luma(b) <= luma(p), "深底背面应更沉");
+            } else {
+                assert!(luma(b) < luma(p), "浅纸背面应更深");
+            }
+        }
     }
 }

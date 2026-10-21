@@ -244,6 +244,9 @@ pub struct Root {
     /// 数字转汉字：true 时阿拉伯数字在竖排里显示为汉字（一六二八），
     /// 每个汉字独占一格（不再按「两字一格」压缩）。默认关闭——保留原貌。
     pub han_digits: bool,
+    /// 响应式单 / 双叶：true 时按屏幕宽高比自动决定对开 / 单叶
+    /// （宽屏双叶对开、窄屏单叶贴右），false 时沿用手动 `duplex`。
+    pub auto_duplex: bool,
     /// 书库面板是否展开（书架上下载更多书）。
     pub show_library: bool,
     /// 窗口内容区尺寸（每帧由 render 写入，供铺满屏计算）。
@@ -398,6 +401,7 @@ impl Root {
             show_punct: true,
             show_rare: false,
             han_digits: false,
+            auto_duplex: true,
             show_library: false,
             viewport_w: 1280.0,
             viewport_h: 860.0,
@@ -676,8 +680,13 @@ impl Root {
         // 内容区：视口减去工具栏(≈44)与状态栏(≈34)及四边留白(≈44)。
         // 专注模式：工具栏 / 状态栏隐藏，且去掉四边留白——单面、双面
         // （对开两叶）都真正撑满整屏，如官网宣传图般只见纸面不见界面。
+        // 响应式留白：窄屏（手机竖持）只留一丝边，把宽度全让给字；
+        // 宽屏照旧留 44（纸面四周要有「天地」才像刻本）。
+        let narrow = crate::grid::is_narrow(self.viewport_w, self.viewport_h);
         let (chrome_v, pad) = if self.focus_mode {
             (0.0, 0.0)
+        } else if narrow {
+            (44.0 + 34.0, crate::grid::RESP_MARGIN)
         } else {
             (44.0 + 34.0, 44.0)
         };
@@ -694,9 +703,20 @@ impl Root {
             self.fit_letter(content_w, content_h, notes_foot);
             return;
         }
-        // 双面对开 / 单页由屏幕方向驱动：横屏（宽 > 高，平板 / iPad 横持）
-        // 走双面对开；竖屏走单页。两者都渲染古籍竖笺。
-        let facing = self.viewport_w > self.viewport_h;
+        // 响应式单 / 双叶：宽屏（平板横持 / 电脑）双叶对开、中缝居中；
+        // 窄屏（手机竖持）单叶、纸面贴右边缘。判据见 `grid::should_face`
+        // ——除了宽高比，还要求单叶宽与字号都过得去，宁可单叶也不牺牲字号。
+        // `auto_duplex` 关闭时沿用手动设置（样式面板「对开 / 单页」）。
+        let facing = if self.auto_duplex {
+            crate::grid::should_face(
+                self.viewport_w,
+                self.viewport_h,
+                self.grid.columns,
+                self.zoom,
+            )
+        } else {
+            self.duplex == Duplex::Facing
+        };
         self.duplex = if facing { Duplex::Facing } else { Duplex::Single };
         if std::env::var("JIANDU_FIT_DEBUG").is_ok() {
             eprintln!("[fit] vw={:.0} vh={:.0} content={:.0}x{:.0} cols={} facing={} focus={}", self.viewport_w, self.viewport_h, content_w, content_h, self.grid.columns, facing, self.focus_mode);
@@ -1657,6 +1677,8 @@ impl Root {
                 gap,
                 b.back,
                 self.focus_mode,
+                // 窄屏单叶：纸面贴右边缘（与渲染同源）。
+                !facing && crate::grid::is_narrow(self.viewport_w, self.viewport_h),
             );
             x >= ox + b.x
                 && x <= ox + b.x + b.w

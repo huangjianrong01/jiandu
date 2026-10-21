@@ -48,6 +48,8 @@ pub struct Prefs {
     pub rare: bool,
     /// 数字转汉字：阿拉伯数字在竖排里显示为汉字（一六二八）。
     pub han_digits: bool,
+    /// 响应式单 / 双叶：按屏幕宽高比自动决定对开 / 单叶。
+    pub auto_duplex: bool,
     /// 注释显示。
     pub notes: bool,
     /// 翻页音效。
@@ -72,6 +74,7 @@ impl Default for Prefs {
             punct: true,
             rare: true,
             han_digits: false,
+            auto_duplex: true,
             notes: true,
             sound: true,
         }
