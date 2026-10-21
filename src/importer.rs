@@ -448,82 +448,160 @@ pub fn write_book_json(book: &Book, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 兼容旧签名的薄封装：内部统一走 [`adapt_json_book`] 数据适配器。
 pub fn parse_json_book(text: &str, fallback_title: &str) -> Result<Book> {
-    // 形态 1：完整的 Book 结构
-    if let Ok(mut book) = serde_json::from_str::<Book>(text) {
-        if book.cover.title.is_empty() {
-            book.cover.title = book.title.clone();
-        }
-        return Ok(book);
-    }
+    adapt_json_book(text, fallback_title)
+}
 
-    // 形态 2：{title, author, chapters:[{title, content | paragraphs}]}
-    let v: serde_json::Value = serde_json::from_str(text)
-        .with_context(|| "json 解析失败（需要 Book 结构或等价的 title/chapters 结构）")?;
-    let title = v
-        .get("title")
-        .and_then(|x| x.as_str())
-        .unwrap_or(fallback_title)
-        .to_string();
-    let author = v
-        .get("author")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let mut book = Book::new(title.clone(), author);
-    book.cover.title = title;
-    if let Some(sub) = v.get("subtitle").and_then(|x| x.as_str()) {
-        book.cover.subtitle = sub.to_string();
-    }
-    if let Some(tj) = v.get("tongjia").and_then(|x| x.as_object()) {
-        for (k, val) in tj {
-            if let Some(s) = val.as_str() {
-                book.tongjia.insert(k.clone(), s.to_string());
+/// 数据适配器（Data Adapter）：把各种不规范的 JSON / 纯文本导入文件
+/// 归一成标准 `Book`，让引擎无差别跑通。
+///
+/// 兼容优先级（命中即返回，不再报错）：
+///   1. 完整 `Book` 结构（可反序列化即直用）。
+///   2. `{title, author, chapters:[...]}` 多章标准格式。
+///   3. `{..., chapter:{...}}` 单数章节 —— 自动包成 `[chapter]`。
+///   4. 根节点即单章 `{title, content}` —— 自动包成 `[root]`。
+///   5. 根直接是数组 `[{...}, ...]` —— 当作 chapters。
+///   6. 内容根本不是 JSON（纯文本）—— 包成
+///      `{title:"无题", chapters:[{title:"正文", content: 文本}]}`。
+///   7. 本该是 JSON 却解析失败（畸形 / 截断 / 单引号等）—— 返回古籍风错误，
+///      交由上层弹「此卷竹简散乱，无法识读」浮窗，绝不崩溃。
+pub const ERR_JSON_FORMAT: &str = "此卷竹简散乱，无法识读（JSON 格式有误）";
+
+pub fn adapt_json_book(raw: &str, fallback_title: &str) -> Result<Book> {
+    let v: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => {
+            // 不是合法 JSON：先判断它「本该是 JSON」还是纯文本。
+            if looks_like_json(raw) {
+                // 长得像 JSON 却解析失败 —— 畸形文件，报古籍风错误。
+                return Err(anyhow!(ERR_JSON_FORMAT));
             }
+            // 纯文本兜底：包成「无题 · 正文」单章。
+            return Ok(plain_text_book(raw));
         }
-    }
+    };
 
-    if let Some(chs) = v.get("chapters").and_then(|x| x.as_array()) {
-        for ch in chs {
-            let ct = ch
+    match v {
+        serde_json::Value::Array(items) => {
+            // 形态 5：根即章节数组。
+            let mut book = Book::new(fallback_title, "");
+            book.cover.title = fallback_title.to_string();
+            for ch in &items {
+                book.chapters.push(value_to_chapter(ch));
+            }
+            if book.chapters.is_empty() {
+                return Err(anyhow!(ERR_JSON_FORMAT));
+            }
+            Ok(book)
+        }
+        serde_json::Value::Object(_) => {
+            // 形态 1：完整 Book 直用（章节 / 夹注 / 题署齐全）。
+            if let Ok(mut book) = serde_json::from_str::<Book>(raw) {
+                if book.cover.title.is_empty() {
+                    book.cover.title = book.title.clone();
+                }
+                return Ok(book);
+            }
+            let title = v
                 .get("title")
+                .and_then(|x| x.as_str())
+                .unwrap_or(fallback_title)
+                .to_string();
+            let author = v
+                .get("author")
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            let mut paragraphs: Vec<Paragraph> = Vec::new();
-            if let Some(ps) = ch.get("paragraphs").and_then(|x| x.as_array()) {
-                for p in ps {
-                    match p {
-                        serde_json::Value::String(s) => paragraphs.push(para_of(s)),
-                        serde_json::Value::Object(_) => {
-                            if let Ok(pp) =
-                                serde_json::from_value::<Paragraph>(p.clone())
-                            {
-                                paragraphs.push(pp);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            } else if let Some(content) = ch.get("content").and_then(|x| x.as_str()) {
-                for seg in content.split('\n') {
-                    let seg = seg.trim();
-                    if !seg.is_empty() {
-                        paragraphs.push(para_of(seg));
+            let mut book = Book::new(title.clone(), author);
+            book.cover.title = title;
+            if let Some(sub) = v.get("subtitle").and_then(|x| x.as_str()) {
+                book.cover.subtitle = sub.to_string();
+            }
+            if let Some(tj) = v.get("tongjia").and_then(|x| x.as_object()) {
+                for (k, val) in tj {
+                    if let Some(s) = val.as_str() {
+                        book.tongjia.insert(k.clone(), s.to_string());
                     }
                 }
             }
-            book.chapters.push(Chapter {
-                title: ct,
-                paragraphs,
-            });
+
+            if let Some(chs) = v.get("chapters").and_then(|x| x.as_array()) {
+                // 形态 2：标准多章。
+                for ch in chs {
+                    book.chapters.push(value_to_chapter(ch));
+                }
+            } else if let Some(ch) = v.get("chapter") {
+                // 形态 3：单数章节 —— 自动包成 [chapter]。
+                book.chapters.push(value_to_chapter(ch));
+            } else {
+                // 形态 4：根节点本身就是一章。
+                book.chapters.push(value_to_chapter(&v));
+            }
+
+            if book.chapters.is_empty() {
+                return Err(anyhow!(ERR_JSON_FORMAT));
+            }
+            Ok(book)
+        }
+        _ => Err(anyhow!(ERR_JSON_FORMAT)),
+    }
+}
+
+/// 把单个章节值（来自 chapters 数组 / 单数 chapter / 根节点）归一为 `Chapter`。
+/// 正文支持两种写法：`paragraphs:[...]` 或 `content:"..."`（按换行切段）。
+fn value_to_chapter(ch: &serde_json::Value) -> Chapter {
+    let ct = ch
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut paragraphs: Vec<Paragraph> = Vec::new();
+    if let Some(ps) = ch.get("paragraphs").and_then(|x| x.as_array()) {
+        for p in ps {
+            match p {
+                serde_json::Value::String(s) => paragraphs.push(para_of(s)),
+                serde_json::Value::Object(_) => {
+                    if let Ok(pp) = serde_json::from_value::<Paragraph>(p.clone()) {
+                        paragraphs.push(pp);
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else if let Some(content) = ch.get("content").and_then(|x| x.as_str()) {
+        for seg in content.split('\n') {
+            let seg = seg.trim();
+            if !seg.is_empty() {
+                paragraphs.push(para_of(seg));
+            }
         }
     }
+    Chapter { title: ct, paragraphs }
+}
 
-    if book.chapters.is_empty() {
-        return Err(anyhow!("json 中未找到 chapters"));
+/// 纯文本（非 JSON）兜底：包成 `{title:"无题", chapters:[{title:"正文", content: 文本}]}`。
+fn plain_text_book(text: &str) -> Book {
+    let mut book = Book::new("无题", "");
+    book.cover.title = "无题".to_string();
+    let mut chapter = Chapter {
+        title: "正文".into(),
+        paragraphs: Vec::new(),
+    };
+    for seg in text.split('\n') {
+        let seg = seg.trim();
+        if !seg.is_empty() {
+            chapter.paragraphs.push(para_of(seg));
+        }
     }
-    Ok(book)
+    book.chapters.push(chapter);
+    book
+}
+
+/// 粗略判断一段文本「本该是 JSON」还是纯文本：以 `{` 或 `[` 开头即视为 JSON。
+fn looks_like_json(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with('{') || t.starts_with('[')
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,6 +1236,62 @@ mod tests {
         assert_eq!(b.chapters[0].paragraphs[0].text, "甲乙");
         assert_eq!(b.cover.title, "T");
     }
+
+    // ---- 数据适配器：兼容各种不规范导入 ----
+
+    #[test]
+    fn adapter_single_chapter_field() {
+        // 单数 chapter（非 chapters）自动包成单章。
+        let j = r#"{"title":"老子","chapter":{"title":"道经","content":"道可道\n名可名"}}"#;
+        let b = adapt_json_book(j, "fb").unwrap();
+        assert_eq!(b.chapters.len(), 1);
+        assert_eq!(b.chapters[0].title, "道经");
+        assert_eq!(b.chapters[0].paragraphs.len(), 2);
+        assert_eq!(b.chapters[0].paragraphs[0].text, "道可道");
+        assert_eq!(b.cover.title, "老子");
+    }
+
+    #[test]
+    fn adapter_root_is_single_chapter() {
+        // 根节点直接就是 { title, content }，整棵当作一章。
+        let j = r#"{"title":"无题一章","content":"天地玄黄\n宇宙洪荒"}"#;
+        let b = adapt_json_book(j, "fb").unwrap();
+        assert_eq!(b.chapters.len(), 1);
+        assert_eq!(b.chapters[0].title, "无题一章");
+        assert_eq!(b.chapters[0].paragraphs.len(), 2);
+        assert_eq!(b.cover.title, "无题一章");
+    }
+
+    #[test]
+    fn adapter_root_is_array() {
+        // 根直接是章节数组。
+        let j = r#"[{"title":"一","content":"甲"},{"title":"二","content":"乙"}]"#;
+        let b = adapt_json_book(j, "fb").unwrap();
+        assert_eq!(b.chapters.len(), 2);
+        assert_eq!(b.chapters[0].title, "一");
+        assert_eq!(b.chapters[1].title, "二");
+    }
+
+    #[test]
+    fn adapter_plain_text_not_json() {
+        // 文件名 .json 但内容是纯文本 —— 包成「无题 · 正文」单章。
+        let t = "春眠不觉晓\n处处闻啼鸟";
+        let b = adapt_json_book(t, "fb").unwrap();
+        assert_eq!(b.title, "无题");
+        assert_eq!(b.cover.title, "无题");
+        assert_eq!(b.chapters.len(), 1);
+        assert_eq!(b.chapters[0].title, "正文");
+        assert_eq!(b.chapters[0].paragraphs.len(), 2);
+    }
+
+    #[test]
+    fn adapter_malformed_json_errors_classical() {
+        // 像 JSON 却畸形（缺右括号 / 单引号）—— 报古籍风错误，且不崩溃。
+        let j = r#"{"title":"断简","chapters":[{"title":"残篇","content":"残文"}"#;
+        let err = adapt_json_book(j, "fb").unwrap_err();
+        assert!(err.to_string().contains("竹简散乱"), "{}", err);
+    }
+
 
     #[test]
     fn detect_title_author_from_txt() {

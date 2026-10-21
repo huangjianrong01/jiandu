@@ -1,6 +1,6 @@
 [package]
 name = "jiandu"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "笺读 · 一个用 Rust + GPUI 写的原生中文阅读器（古文竖笺 / 现代横笺）"
 license = "MIT"

@@ -997,7 +997,13 @@ impl Root {
                 self.notice = format!("已上架：{title}");
             }
             Err(e) => {
-                self.notice = format!("导入失败：{e}");
+                let msg = e.to_string();
+                // JSON 格式错误已是古籍风浮窗文案，原样弹出；其余错误补「导入失败：」。
+                self.notice = if msg.contains("竹简散乱") {
+                    msg
+                } else {
+                    format!("导入失败：{msg}")
+                };
             }
         }
     }
