@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>笺读 · 分享面板（极简留白 × 古卷雅韵）</title>
+<style>
+/* ============================================================
+   笺读 JianDu · 分享（导出图片）面板
+   设计调性：极简留白（Minimalist）× 古卷雅韵（Classical）
+
+   三条铁律：
+   1. 去边框化 —— 没有一处“带底色 + 描边”的现代按钮；
+   2. 悬浮感   —— 磨砂玻璃 + 卡片柔和深阴影，控件直接浮在底上；
+   3. 字体分工 —— 纸面文字走宋/楷，界面文字走细黑体极小号。
+   ============================================================ */
+
+:root{
+  /* 字体：正文（宋）/ 批注（楷）/ UI（黑）/ 西文（CM）四角色。
+     与 App 内 fonts::FONT_CONFIGS 一一对应。 */
+  --font-main: "WenJin Mincho","Noto Serif SC","Songti SC",serif;
+  --font-note: "LXGW WenKai","Kaiti SC",serif;
+  --font-ui:   "Source Han Sans SC","PingFang SC",-apple-system,sans-serif;
+  --font-latin:"CMU Serif",Georgia,serif;
+
+  /* 磨砂玻璃：GPUI 0.2.2 无 backdrop-filter，实装退化为 rgba(20,20,20,.8) */
+  --scrim: rgba(20,20,20,.80);
+
+  --ink-hi:   #F2EAD6;   /* 近白：选中态的字与图标线 */
+  --ink-mid:  #D8CFC0;   /* 常态字 */
+  --ink-low:  #8A8378;   /* 极小号浅灰：元信息 */
+  --ink-dim:  #6E6659;   /* 未选中的线条图标 */
+  --cinnabar: #C3272D;   /* 朱砂：印泥 / 选中光晕 */
+  --hair:     rgba(255,255,255,.35); /* 极细白描边 */
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:var(--font-ui);
+  background:#0E0D0B;
+  color:var(--ink-mid);
+  -webkit-font-smoothing:antialiased;
+}
+
+/* ---- 1) 磨砂玻璃遮罩：绝对专注 ---- */
+.scrim{
+  position:fixed; inset:0;
+  display:flex; align-items:center; justify-content:center;
+  background:var(--scrim);
+  backdrop-filter:blur(10px);
+  -webkit-backdrop-filter:blur(10px);
+  /* 背景：一张书页压在底下，只为验证磨砂的通透感（实装里是真实阅读页） */
+  background-image:
+    radial-gradient(120% 80% at 50% 0%, rgba(201,168,124,.10), transparent 60%),
+    repeating-linear-gradient(90deg, rgba(255,255,255,.018) 0 1px, transparent 1px 46px);
+}
+
+/* ---- 卡片：深色柔和阴影把它“浮”起来 ---- */
+.card{
+  position:relative;
+  width:392px; height:560px;
+  background:#F2EAD6;
+  border-radius:2px;
+  box-shadow:
+    0 2px 4px rgba(0,0,0,.24),
+    0 12px 28px rgba(0,0,0,.38),
+    0 36px 72px rgba(0,0,0,.46);
+  display:flex; flex-direction:row-reverse; align-items:flex-start;
+  gap:22px; padding:30px 26px;
+  overflow:hidden;
+}
+/* 纸上的字：竖排，走正文宋体 */
+.card .col{
+  font-family:var(--font-main);
+  font-size:19px; line-height:1.55;
+  color:#2B2622;
+  writing-mode:vertical-rl; text-orientation:upright;
+  letter-spacing:.06em;
+}
+.card .sign{
+  font-family:var(--font-note);
+  font-size:13px; color:#8A8175;
+  writing-mode:vertical-rl; text-orientation:upright;
+  margin-top:auto;
+}
+
+/* ---- 2) 操作栏：一行，无底色无边框 ---- */
+.bar{
+  position:absolute; left:0; top:calc(50% + 280px + 22px);
+  width:100%; display:flex; justify-content:center;
+}
+.bar-inner{
+  width:392px; display:flex; align-items:center; gap:18px;
+}
+
+/* 底色：四枚 20px 圆 + 极细白描边；选中外圈朱砂光晕 */
+.dots{display:flex; align-items:center; gap:13px}
+.dot{
+  width:28px; height:28px; border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  cursor:pointer; border:1px solid transparent;
+  transition:border-color .18s ease;
+}
+.dot:hover{border-color:rgba(242,234,214,.30)}
+.dot.on{border-color:rgba(195,39,45,.80); box-shadow:0 0 0 4px rgba(195,39,45,.10)}
+.dot i{
+  display:block; width:20px; height:20px; border-radius:50%;
+  border:1px solid var(--hair);
+}
+
+/* 元信息：极小号浅灰，文字即开关（没有按钮壳） */
+.meta{
+  flex:1; display:flex; align-items:center; gap:10px;
+  font-size:10.5px; letter-spacing:.08em;
+}
+.meta span{cursor:pointer; color:rgba(138,131,120,.40); transition:color .18s ease}
+.meta span.on{color:rgba(216,207,192,.85)}
+.meta span:hover{color:var(--ink-hi)}
+.meta em{font-style:normal; color:rgba(185,174,156,.25); font-size:10px}
+
+/* 线条图标：只有线，没有方框；选中靠明暗 */
+.icons{display:flex; align-items:center; gap:16px}
+.icon{
+  width:26px; height:26px; border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  cursor:pointer; transition:background .18s ease;
+}
+.icon:hover{background:rgba(242,234,214,.08)}
+.icon svg{display:block}
+.icon svg *{stroke:#6E6659}
+.icon.on svg *{stroke:#F2EAD6}
+.leaf{
+  font-size:10.5px; letter-spacing:.08em;
+  color:rgba(138,131,120,.55); margin-right:14px;
+}
+
+/* ---- 5) 朱砂印章：右下角，悬停微微放大 ---- */
+.seals{
+  position:absolute; left:calc(50% + 196px - 96px); top:calc(50% + 280px + 14px);
+  display:flex; align-items:center; gap:6px;
+}
+.seal{
+  width:52px; height:52px;
+  display:flex; align-items:center; justify-content:center;
+  cursor:pointer;
+}
+.seal i{
+  width:44px; height:44px; border-radius:3px;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:1px; font-style:normal;
+  font-family:var(--font-main); font-size:13px; line-height:1.1;
+  transition:width .14s ease, height .14s ease;
+}
+.seal:hover i{width:48px; height:48px}
+.seal.primary i{background:var(--cinnabar); color:#FFF8EC}
+.seal.ghost i{border:1px solid rgba(242,234,214,.35); color:#F2EAD6}
+
+/* 关闭：淡到几乎看不见的 ✕，无框无底 */
+.close{
+  position:absolute; top:16px; right:20px;
+  width:26px; height:26px; border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  cursor:pointer; font-size:14px;
+  color:rgba(185,174,156,.60);
+}
+.close:hover{background:rgba(242,234,214,.08)}
+
+/* 说明（仅本稿用，实装无） */
+.note{
+  position:absolute; bottom:18px; left:0; right:0; text-align:center;
+  font-size:11px; color:rgba(138,131,120,.55); letter-spacing:.1em;
+}
+</style>
+</head>
+<body>
+
+<div class="scrim">
+  <!-- 关闭 -->
+  <div class="close">✕</div>
+
+  <!-- 预览卡片：真实版式（竖排、题识、朱印） -->
+  <div class="card">
+    <div class="col">明月几时有　把酒问青天<br>不知天上宫阙　今夕是何年</div>
+    <div class="col">我欲乘风归去　又恐琼楼玉宇<br>高处不胜寒　起舞弄清影</div>
+    <div class="sign">水调歌头 · 苏轼</div>
+  </div>
+
+  <!-- 操作栏：一行，四圆 + 极小浅灰字 + 线条图标 -->
+  <div class="bar"><div class="bar-inner">
+    <div class="dots">
+      <div class="dot on"><i style="background:#161310"></i></div>
+      <div class="dot"><i style="background:#2A1512"></i></div>
+      <div class="dot"><i style="background:#14211B"></i></div>
+      <div class="dot"><i style="background:#F2EAD6"></i></div>
+    </div>
+
+    <div class="meta">
+      <span class="on">水调歌头</span><em>·</em>
+      <span class="on">苏轼</span><em>·</em>
+      <span class="on">丙辰中秋</span><em>·</em>
+      <span class="on">二〇二六年十月廿二</span>
+    </div>
+
+    <div class="leaf">第 12 葉</div>
+
+    <div class="icons">
+      <!-- 八行笺：八道横线 -->
+      <div class="icon" title="八行笺">
+        <svg width="13" height="14" viewBox="0 0 13 14" fill="none" stroke-width="2">
+          <path d="M1 2h11M1 5.6h11M1 9.2h11M1 12.8h11"/>
+        </svg>
+      </div>
+      <!-- 竖排分列：三道竖线 -->
+      <div class="icon on" title="竖排分列">
+        <svg width="12" height="14" viewBox="0 0 12 14" fill="none" stroke-width="2">
+          <path d="M2 1v12M6 1v12M10 1v12"/>
+        </svg>
+      </div>
+      <!-- 单列竖排：一道竖线 -->
+      <div class="icon" title="单列竖排">
+        <svg width="12" height="14" viewBox="0 0 12 14" fill="none" stroke-width="2">
+          <path d="M6 1v12"/>
+        </svg>
+      </div>
+      <!-- 晒本：竖长纸 + 两道字列 -->
+      <div class="icon" title="晒本">
+        <svg width="13" height="15" viewBox="0 0 13 15" fill="none" stroke-width="1.6">
+          <rect x="1.3" y="1.3" width="10.4" height="12.4" rx="1"/>
+          <path d="M5 4v7M8 4v7" stroke-width="1.5"/>
+        </svg>
+      </div>
+    </div>
+  </div></div>
+
+  <!-- 朱砂印章：右下角 -->
+  <div class="seals">
+    <div class="seal ghost" title="分享图片"><i>分<br>享</i></div>
+    <div class="seal primary" title="保存图片"><i>保<br>存</i></div>
+  </div>
+
+  <div class="note">朱印落在卡片矩形之外 —— 导出的 PNG 里不会有这枚印</div>
+</div>
+
+</body>
+</html>

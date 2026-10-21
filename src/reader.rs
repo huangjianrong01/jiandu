@@ -26,17 +26,25 @@ use gpui::{
 };
 use std::collections::HashMap;
 
-/// 分享卡底色：(底色, 正文字色, 落款 / 日期色)。对应分享面板的五个色块。
-pub(crate) const SHARE_BGS: [(u32, u32, u32); 5] = [
+/// 分享卡底色：(底色, 正文字色, 落款 / 日期色)。对应分享面板的**四枚圆形**。
+///
+/// 原先五块（含靛青）：靛蓝是现代后台系统的颜色，与「古卷雅韵」相冲，
+/// 故只留墨夜 / 朱漆 / 松烟 / 宣纸四色——正好四枚圆，一排排得开。
+pub(crate) const SHARE_BGS: [(u32, u32, u32); 4] = [
     (0x161310, 0xE9E2D2, 0xA8957A), // 墨夜
     (0x2A1512, 0xF0DFD2, 0xC49A83), // 朱漆
-    (0x121A24, 0xDCE6F0, 0x8FA3B8), // 靛青
     (0x14211B, 0xDDEAE0, 0x93AE9E), // 松烟
     (0xF2EAD6, 0x2B2622, 0x8A8175), // 宣纸
 ];
 
 /// 朱砂红：笺读的落款印泥色（印在分享笺左下角）。
 pub(crate) const CINNABAR: u32 = 0xC3272D;
+
+/// 分享面板「朱砂印章」按钮的**外框**：比印面大一圈，悬停放大时从中心
+/// 向外长，不会推挤旁边的控件（定位算式也按这个高度算面板总高）。
+pub(crate) const SEAL_BOX: f32 = 52.0;
+/// 朱砂印章的印面边长：古印是方的，不做圆角胶囊。
+const SEAL_SIZE: f32 = 44.0;
 
 /// 用户自加夹注的**深朱砂红**字色（#C62828）。
 ///
@@ -951,7 +959,9 @@ impl Root {
             root = root.child(self.render_share_sheet(cx));
         }
         // 全文检索浮层：输入词 → 全书查找 → 跳面 + 朱砂红高亮。
-        if self.show_search && !self.focus_mode {
+        // 分享面板开着时不画——那条「搜索 / 上一处 / 下一处」输入框挂在
+        // 屏幕底部，会把导出界面的沉浸感整个破坏掉（分享关掉后自动回来）。
+        if self.show_search && !self.focus_mode && !self.show_share_panel {
             root = root.child(self.render_search_sheet(cx));
         }
         // 帮助面板：快捷键与操作说明。
@@ -5597,33 +5607,72 @@ impl Root {
                 .child(date_col)
         };
 
-        // ---- 控制面板：元素开关 / 版式 / 底色 ----
-        let mut toggles = div().flex().flex_row().items_center().gap_2();
-        for (label, on, act) in [
-            ("书名", self.share_show_title, ShareAct::Title),
-            ("作者", self.share_show_author, ShareAct::Author),
-            ("章节", self.share_show_chapter, ShareAct::Chapter),
-            ("日期", self.share_show_date, ShareAct::Date),
-        ] {
-            toggles = toggles.child(small_button(label, on, t).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    match act {
-                        ShareAct::Title => this.share_show_title = !this.share_show_title,
-                        ShareAct::Author => this.share_show_author = !this.share_show_author,
-                        ShareAct::Chapter => {
-                            this.share_show_chapter = !this.share_show_chapter
-                        }
-                        ShareAct::Date => this.share_show_date = !this.share_show_date,
-                    }
-                    cx.notify();
-                }),
-            ));
+        // ---- 控制面板：极简留白（无底色、无边框、无方框）----
+        //
+        // 书名 / 作者 / 章节 / 日期不再是按钮，而是**一排极小的浅灰文字**：
+        // 文字本身就是开关（点一下收起该元素），选中稍亮、未选淡到几乎
+        // 融进底色——信息还在，但不再有「现代后台系统」那种控件感。
+        let metas: Vec<(String, bool, ShareAct)> = [
+            (
+                clip_chars(&book_title, 14).to_string(),
+                self.share_show_title,
+                ShareAct::Title,
+            ),
+            (
+                clip_chars(&author, 10).to_string(),
+                self.share_show_author,
+                ShareAct::Author,
+            ),
+            (
+                clip_chars(&chap_title, 12).to_string(),
+                self.share_show_chapter,
+                ShareAct::Chapter,
+            ),
+            (date_text.clone(), self.share_show_date, ShareAct::Date),
+        ]
+        .into_iter()
+        .filter(|(s, _, _)| !s.is_empty())
+        .collect();
+        let mut meta = div().flex().flex_row().items_center().gap(px(10.0)).flex_1();
+        for (i, (text, on, act)) in metas.into_iter().enumerate() {
+            if i > 0 {
+                meta = meta.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgba(0xB9AE9C40))
+                        .child(SharedString::from("·")),
+                );
+            }
+            meta = meta.child(
+                div()
+                    .id(SharedString::from(format!("share-meta-{i}")))
+                    .cursor_pointer()
+                    .text_size(px(10.5))
+                    .text_color(rgba(if on { 0xD8CFC0D9 } else { 0x8A837866 }))
+                    .hover(|s| s.text_color(rgba(0xF2EAD6FF)))
+                    .child(SharedString::from(text))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            match act {
+                                ShareAct::Title => this.share_show_title = !this.share_show_title,
+                                ShareAct::Author => {
+                                    this.share_show_author = !this.share_show_author
+                                }
+                                ShareAct::Chapter => {
+                                    this.share_show_chapter = !this.share_show_chapter
+                                }
+                                ShareAct::Date => this.share_show_date = !this.share_show_date,
+                            }
+                            cx.notify();
+                        }),
+                    ),
+            );
         }
 
-        let icon_ink = 0x2B2622;
-        let mut layouts = div().flex().flex_row().items_center().gap_2();
+        // 版式：**只有线条图标**——没有方框、没有底色，选中靠线的明暗。
+        let mut layouts = div().flex().flex_row().items_center().gap(px(16.0));
         for (lay, label) in [
             (CardLayout::Note, "八行笺"),
             (CardLayout::Columns, "竖排分列"),
@@ -5631,7 +5680,9 @@ impl Root {
             (CardLayout::Scroll, "晒本"),
         ] {
             let on = self.share_layout == lay;
-            let fg = if on { 0xE9E2D2 } else { icon_ink };
+            // 选中 = 近白的亮线；未选中 = 淡到快融进底色的灰线。
+            // 不靠方框与底色区分——那正是要丢掉的「现代控件感」。
+            let fg = if on { 0xF2EAD6 } else { 0x6E6659 };
             let icon = match lay {
                 CardLayout::Note => div()
                     .flex()
@@ -5678,13 +5729,12 @@ impl Root {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .w(px(40.0))
+                    .w(px(26.0))
                     .h(px(26.0))
-                    .rounded(px(4.0))
+                    .rounded(px(13.0))
                     .cursor_pointer()
-                    .bg(rgb(if on { 0x2B2622 } else { t.chip() }))
-                    .border_1()
-                    .border_color(rgb(if on { t.accent() } else { t.chrome_line() }))
+                    // 悬停只给一圈几乎看不见的晕（8% 白），不是按钮底色。
+                    .hover(|s| s.bg(rgba(0xF2EAD614)))
                     .child(icon)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -5697,19 +5747,41 @@ impl Root {
             );
         }
 
-        let mut swatches = div().flex().flex_row().items_center().gap_2();
+        // 葉号：极小号浅灰，与元信息同一档（不再做成标签 / 色块）。
+        let leaf_tag = div()
+            .text_size(px(10.5))
+            .text_color(rgba(0x8A83788C))
+            .child(SharedString::from(format!("第 {} 葉", self.page + 1)));
+
+        // 底色：**四枚 20px 的圆**，圆心一色、边上极细白描边；选中时外面
+        // 多一圈朱砂细环作「光晕」。原先的方块 + 粗边是后台系统的样子。
+        let mut swatches = div().flex().flex_row().items_center().gap(px(13.0));
         for (i, (bgc, _, _)) in SHARE_BGS.iter().enumerate() {
             let on = i == self.share_bg;
             swatches = swatches.child(
                 div()
                     .id(SharedString::from(format!("share-bg-{i}")))
-                    .w(px(30.0))
-                    .h(px(22.0))
-                    .rounded(px(3.0))
+                    .w(px(28.0))
+                    .h(px(28.0))
+                    .rounded(px(14.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .cursor_pointer()
-                    .bg(rgb(*bgc))
-                    .border_2()
-                    .border_color(rgb(if on { t.accent() } else { 0x8A8175 }))
+                    // 选中：外面那圈光晕（朱砂细环）。
+                    .when(on, |d| {
+                        d.border_1().border_color(rgba(0xC3272DCC))
+                    })
+                    .hover(|s| s.border_1().border_color(rgba(0xF2EAD64D)))
+                    .child(
+                        div()
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .rounded(px(10.0))
+                            .bg(rgb(*bgc))
+                            .border_1()
+                            .border_color(rgba(0xFFFFFF59)),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -5721,127 +5793,65 @@ impl Root {
             );
         }
 
-        // 控制条高度：晒本只要一行（版式 chips + 一句说明），其余版式两行。
-        let controls_h = if scroll { 34.0 } else { 88.0 };
-        // 第一行：普通版式 = 元素开关 + 版式；晒本 = 一句说明 + 版式。
-        let row_top = if scroll {
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(rgb(0xB9AE9C))
-                        .child(SharedString::from(format!(
-                            "第 {} 葉 · 晒本（含夹注）· 保存即导出 PNG",
-                            self.page + 1
-                        ))),
-                )
-                .child(layouts)
-        } else {
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .child(toggles)
-                .child(layouts)
-        };
-        // 第二行：底色 + 葉号（晒本无此需要——纸色即主题纸色）。
-        let row_bottom = div()
+        // 控制条：**一行**。左四枚圆、中一行极小浅灰字、右线条图标。
+        // 没有容器底色、没有边框、没有内边距——控件直接浮在磨砂底上。
+        let controls_h: f32 = 30.0;
+        let controls = div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
+            .gap(px(18.0))
+            .h(px(controls_h))
+            .child(swatches)
+            .child(meta)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(0xB9AE9C))
-                            .child(SharedString::from("底色")),
-                    )
-                    .child(swatches),
-            )
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(rgb(0xB9AE9C))
-                    .child(SharedString::from(format!(
-                        "第 {} 葉 · {}",
-                        self.page + 1,
-                        self.share_layout.label()
-                    ))),
+                    .gap(px(14.0))
+                    .child(leaf_tag)
+                    .child(layouts),
             );
 
-        let mut controls = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .h(px(controls_h))
-            .w(px((card_w + 92.0).min(vw * 0.92)))
-            .p_3()
-            .rounded(px(8.0))
-            .bg(rgb(0x1C1915))
-            .border_1()
-            .border_color(rgb(0x3A332B))
-            .child(row_top);
-        if !scroll {
-            controls = controls.child(row_bottom);
-        }
-
-        // ---- 三个动作：保存图片 / 分享图片 / 分享文字（与样式面板同一排）----
-        let save = self.action_button("保存图片", t).on_mouse_down(
+        // ---- 动作：**两枚朱砂印章**，落在卡片右下角 ----
+        // 主印朱底白字（保存图片），副印白线框（分享图片）。悬停微微放大。
+        // 「分享文字」撤了：导出界面里它就是个无关按钮。
+        let save = self.seal_button("保存", true).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 this.save_share_image(window, cx);
             }),
         );
-        let share_img = self.action_button("分享图片", t).on_mouse_down(
+        let share_img = self.seal_button("分享", false).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 this.share_image_to_clipboard(window, cx);
             }),
         );
-        let share_txt = self.action_button("分享文字", t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.copy_page_text();
-                this.notice = "已复制本页文字".to_string();
-                cx.notify();
-            }),
-        );
-        let panel_w = (card_w + 92.0).min(vw * 0.92);
-        let actions = div()
+        let seals = div()
             .flex()
             .flex_row()
-            .gap_2()
-            .h(px(36.0))
-            .w(px(panel_w))
-            .child(save)
+            .items_center()
+            .gap(px(6.0))
             .child(share_img)
-            .child(share_txt);
+            .child(save);
 
-        // 卡片与面板用绝对坐标定位（而不是 flex 居中）：保存 / 分享图片
-        // 要按这块矩形裁图，渲染位置必须与算式严格一致，否则截出来会偏。
-        // 版式：卡片 + 12 + 控制条（晒本 34 / 其余 88）+ 12 + 按钮 36，
-        // 整体垂直居中。
-        let total_h = card_h + 12.0 + controls_h + 12.0 + 36.0;
+        // 卡片与印章用绝对坐标定位（而不是 flex 居中）：保存 / 分享图片
+        // 要按 `share_card_rect` 这块矩形裁图，渲染位置必须与算式严格一致。
+        //
+        // 印章**必须落在卡片矩形之外**（贴着右下角外侧）——若浮在卡片上，
+        // 截出来的图会带一枚朱印，导出就废了。
+        let seal_box_w = 100.0;
+        let total_h = card_h + 20.0 + SEAL_BOX;
         let top = ((vh - total_h) * 0.5).max(0.0);
-        let row_w = card_w;
-        let left = ((vw - row_w) * 0.5).max(0.0);
-        let panel_left = (left - (panel_w - row_w) * 0.5).max(0.0);
+        let left = ((vw - card_w) * 0.5).max(0.0);
+        // 控制条：左侧与卡片对齐，右侧给印章让出位置。
+        let controls_w = (card_w - seal_box_w - 16.0).max(200.0);
+        let seal_left = left + card_w - seal_box_w + 4.0;
         self.share_card_rect = Some((left, top, card_w, card_h));
 
         div()
@@ -5850,28 +5860,29 @@ impl Root {
             .left(px(0.0))
             .w(px(vw))
             .h(px(vh))
-            .bg(rgb(0x0E0D0B))
+            // 磨砂玻璃：GPUI 0.2.2 没有 backdrop-filter，用 80% 不透明的
+            // 近黑（rgba(20,20,20,.8)）压住背景——肉眼看就是一层深色磨砂。
+            .bg(rgba(0x141414CC))
             // 右上角 ✕：面板是全屏覆盖且点空白不收起（防误触丢失选择），
             // 所以关闭必须有个常驻的明确出口；Esc 也有同样效果。
+            // 同样去边框去底色，只留一个淡淡的 ✕。
             .child(
                 div()
                     .absolute()
-                    .top(px(14.0))
-                    .right(px(16.0))
-                    .w(px(30.0))
-                    .h(px(30.0))
+                    .top(px(16.0))
+                    .right(px(20.0))
+                    .w(px(26.0))
+                    .h(px(26.0))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(15.0))
-                    .border_1()
-                    .border_color(rgb(0x5A5248))
-                    .bg(rgb(0x1A1714))
+                    .rounded(px(13.0))
                     .cursor_pointer()
+                    .hover(|s| s.bg(rgba(0xF2EAD614)))
                     .child(
                         div()
-                            .text_size(px(15.0))
-                            .text_color(rgb(0xD8CFC0))
+                            .text_size(px(14.0))
+                            .text_color(rgba(0xB9AE9C99))
                             .child(SharedString::from("✕")),
                     )
                     .on_mouse_down(
@@ -5883,20 +5894,28 @@ impl Root {
                         }),
                     ),
             )
-            .child(div().absolute().left(px(left)).top(px(top)).child(card))
+            // 卡片：深色柔和阴影把它从磨砂底上「浮」起来。
             .child(
                 div()
                     .absolute()
-                    .left(px(panel_left))
-                    .top(px(top + card_h + 12.0))
+                    .left(px(left))
+                    .top(px(top))
+                    .child(card.shadow_lg()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top + card_h + 22.0))
+                    .w(px(controls_w))
                     .child(controls),
             )
             .child(
                 div()
                     .absolute()
-                    .left(px(panel_left))
-                    .top(px(top + card_h + 12.0 + 88.0 + 12.0))
-                    .child(actions),
+                    .left(px(seal_left))
+                    .top(px(top + card_h + 14.0))
+                    .child(seals),
             )
             .on_mouse_down(
                 MouseButton::Left,
@@ -6764,6 +6783,47 @@ impl Root {
                     .text_color(rgb(t.chrome_text()))
                     .child(SharedString::from(label)),
             )
+    }
+
+    /// 分享面板的**朱砂印章**按钮：一枚方印，`filled = true` 是朱底白字
+    /// （主动作：保存），`false` 是白线框（次动作：分享）。
+    ///
+    /// 印面上字**竖排**（走正文族名），不做圆角胶囊、不做图标——印就是印。
+    /// 悬停时印面 `+4px`，从中心向外微微放大（GPUI 0.2.2 没有元素级
+    /// transform，只能改尺寸；外框固定，故放大不挤旁边的控件）。
+    fn seal_button(&self, label: &'static str, filled: bool) -> Div {
+        let family = self.main_family();
+        let mut face = div()
+            .w(px(SEAL_SIZE))
+            .h(px(SEAL_SIZE))
+            .rounded(px(3.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(1.0))
+            .cursor_pointer();
+        face = if filled {
+            face.bg(rgb(CINNABAR))
+        } else {
+            face.border_1().border_color(rgba(0xF2EAD659))
+        };
+        for c in label.chars() {
+            face = face.child(
+                div()
+                    .font_family(family.clone())
+                    .text_size(px(13.0))
+                    .text_color(rgb(if filled { 0xFFF8EC } else { 0xF2EAD6 }))
+                    .child(SharedString::from(c.to_string())),
+            );
+        }
+        div()
+            .w(px(SEAL_BOX))
+            .h(px(SEAL_BOX))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(face.hover(|s| s.w(px(SEAL_SIZE + 4.0)).h(px(SEAL_SIZE + 4.0))))
     }
 
     /// 样式面板里的一组小按钮。
