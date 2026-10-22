@@ -744,9 +744,11 @@ impl Root {
                 ),
             )
             .child(
-                // 批量管理：进去后点书衣是勾选，底部浮出「全选 / 删除所选」。
-                // 开着的时候按钮转朱色，免得忘了自己还在勾选态。
-                shelf_button(if managing { "批量 · 开" } else { "批量" }, managing).on_mouse_down(
+                // 整理（批量管理）：进去后点书衣是勾选，底部浮出「全选 / 反选 /
+                // 删除所选」。开着的时候按钮转朱色，免得忘了自己还在勾选态。
+                // 门有两处：顶栏这一枚，以及**在任一书衣上右键**（见
+                // `render_slip_card`）——想删哪本就在哪本上直接动手。
+                shelf_button(if managing { "整理 · 开" } else { "整理" }, managing).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
@@ -917,12 +919,12 @@ impl Root {
         row
     }
 
-    /// 书衣网格：一格一书。
-        /// 批量管理的底部操作栏：已选册数 · 全选 / 反选 · 删除所选 · 退出。
+    /// 整理（批量管理）的底部操作栏：已选册数 · 全选 / 反选 / 清选 · 删除 · 退出。
     ///
     /// 控件一律走「极小字 + 朱砂」，不做灰底胶囊——与书衣同一套古风语汇。
     fn render_batch_bar(&mut self, cx: &mut Context<Self>) -> Div {
         let n = self.shelf_picked.len();
+        let total = self.shelf_filtered().len();
         let confirm = self.shelf_batch_confirm;
         let mut bar = div()
             .flex()
@@ -936,16 +938,33 @@ impl Root {
             .border_color(rgb(HAIR));
 
         bar = bar.child(text(
-            &format!("已选 {} 册", n),
+            &format!("已选 {n} 册 · 共 {total} 册"),
             12.0,
             if n > 0 { CINNABAR } else { INK_FAINT },
         ));
-        bar = bar.child(link_button("全选 / 反选", INK_FAINT).on_mouse_down(
+        bar = bar.child(link_button("全选", INK_FAINT).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 let entries = this.shelf_filtered();
                 this.pick_all(&entries);
+                cx.notify();
+            }),
+        ));
+        bar = bar.child(link_button("反选", INK_FAINT).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                let entries = this.shelf_filtered();
+                this.invert_pick(&entries);
+                cx.notify();
+            }),
+        ));
+        bar = bar.child(link_button("清选", INK_FAINT).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.clear_pick();
                 cx.notify();
             }),
         ));
@@ -986,7 +1005,7 @@ impl Root {
                 ),
             );
         }
-        bar = bar.child(link_button("退出批量", INK_FAINT).on_mouse_down(
+        bar = bar.child(link_button("退出整理", INK_FAINT).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
@@ -1167,6 +1186,15 @@ fn render_slip_grid(
                     }
                     cx.notify();
                 }),
+            )
+            // 右键：直接进整理态并勾上这一本——不必先去顶栏开「整理」。
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.enter_manage_at(idx);
+                    cx.notify();
+                }),
             );
 
         let hovered = self.shelf_hover == Some(idx);
@@ -1320,6 +1348,15 @@ fn render_slip_grid(
                     } else {
                         this.open_book(idx);
                     }
+                    cx.notify();
+                }),
+            )
+            // 右键：直接进整理态并勾上这一本。
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.enter_manage_at(idx);
                     cx.notify();
                 }),
             )
@@ -2066,9 +2103,9 @@ fn render_slip_grid(
             .text_size(px(12.0))
             .text_color(rgb(0x6B6357))
             .child(SharedString::from(if self.shelf_manage {
-                "批量管理：点书衣勾选 · 底部「全选 / 删除所选」一次清架 · 退出回到翻书"
+                "整理：点书衣勾选 · 右键任一本直接勾选 · 底部「全选 / 反选 / 删除所选」一次清架"
             } else {
-                "点题签开卷 · 书名过长点书名可展开 · 归类 / 改名 / 删除在签下 · 批量管理在顶栏 · 进度自动记住"
+                "点题签开卷 · 书名过长点书名可展开 · 悬停书衣出「归类 / 改名 / 删除」· 右键任意书衣可整理 · 进度自动记住"
             }))
             .child(SharedString::from(if self.notice.is_empty() {
                 String::new()

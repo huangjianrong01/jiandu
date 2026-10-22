@@ -20,7 +20,7 @@ use crate::types::{
     GlyphKey, GlyphKind, MarkKind, NoteKind, NoteSource, Script, StyleTab, TocEntry,
 };
 use gpui::{
-    div, prelude::*, px, rgb, rgba, svg, Context, Div, FontWeight, KeyDownEvent,
+    div, prelude::*, px, rgb, rgba, svg, BoxShadow, Context, Div, FontWeight, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow, ParentElement, SharedString,
     Styled, Window,
 };
@@ -231,6 +231,157 @@ fn small_button(label: &str, on: bool, t: Theme) -> Div {
         .text_size(px(11.5))
         .text_color(rgb(fg))
         .child(SharedString::from(label.to_string()))
+}
+
+// ---- 样式面板的古风控件（v1.21.0 起）----
+//
+// 面板原先是一整套「灰底圆角胶囊 + 深墨实底」的现代控件：方块按钮、粗边
+// 字牌、42pt 这种现代单位。它贴在古籍正文下方，像一张打印纸压在宋版书页上。
+// 现在整块面板改用水墨语汇——**无底、无框、无圆角**，只留一行字与一道
+// 极细的线；选中态只做两件事：文字转朱砂、字下压一道 1px 墨线。
+
+/// 面板选中的朱砂（用户指定 #B23A30）：比落款印泥 `CINNABAR` 略沉一档，
+/// 落在宣纸上像一枚旧朱印，不刺眼。
+const SHEET_ZHU: u32 = 0xB23A30;
+
+/// 极细横线（1px）：选中下划线、行间界、符号线框都用它。
+fn hairline(w: f32, color: u32) -> Div {
+    div().w(px(w)).h(px(1.0)).bg(rgb(color))
+}
+
+/// 极细朱砂**虚线**：GPUI 0.2.2 没有 dashed 边框，用「2 实 2 虚」的短横排出来
+/// （与书架页签的 `hair_dashed` 同一手法，这里是朱色版本）。
+fn zhu_dashed(w: f32, color: u32) -> Div {
+    const DASH: f32 = 2.0;
+    const GAP: f32 = 2.0;
+    let n = (w / (DASH + GAP)).floor().max(1.0) as usize;
+    let mut row = div().flex().flex_row().items_center();
+    for i in 0..n {
+        row = row.child(div().w(px(DASH)).h(px(1.0)).bg(rgb(color)));
+        if i + 1 < n {
+            row = row.child(div().w(px(GAP)).h(px(1.0)));
+        }
+    }
+    row
+}
+
+/// 面板页签：一行字 + 字下一道 1px 墨线，没有底色、没有边框、没有圆角。
+/// 未选中时线宽为 0（但槽位仍在），切换时字不会左右跳。
+fn panel_tab(label: &'static str, on: bool, t: Theme) -> Div {
+    let fg = if on { SHEET_ZHU } else { t.ink_soft() };
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(3.0))
+        .cursor_pointer()
+        .text_color(rgb(fg))
+        .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
+        .child(div().text_size(px(12.0)).child(SharedString::from(label)))
+        .child(
+            div()
+                .w(px(26.0))
+                .h(px(1.0))
+                .flex()
+                .justify_center()
+                .child(if on {
+                    hairline(26.0, t.ink())
+                } else {
+                    div().w(px(0.0)).h(px(1.0))
+                }),
+        )
+}
+
+/// 面板的「收起」：两字，无底无框，悬停转朱砂。
+/// （原来那枚灰底「关闭」按钮，是面板里最像网页控件的一颗。）
+fn panel_close(t: Theme) -> Div {
+    div()
+        .px(px(2.0))
+        .py(px(2.0))
+        .cursor_pointer()
+        .text_size(px(10.5))
+        .text_color(rgb(t.ink_soft()))
+        .hover(|s| s.text_color(rgb(SHEET_ZHU)))
+        .child(SharedString::from("收起"))
+}
+
+/// 面板的**选项文字**：整块面板的基本单位。
+///
+/// `on` 时朱砂字、字下压一道 1px 墨线；否则淡墨字、无线。悬停时淡墨转深墨。
+/// 没有任何背景色——点选靠的是「墨色与朱色」的差别，不是色块。
+fn ink_option(label: &'static str, on: bool, t: Theme) -> Div {
+    let fg = if on { SHEET_ZHU } else { t.chrome_text() };
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(2.0))
+        .cursor_pointer()
+        .text_color(rgb(fg))
+        .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
+        .child(div().text_size(px(12.0)).child(SharedString::from(label)))
+        .child(
+            div()
+                .w(px(18.0))
+                .h(px(1.0))
+                .flex()
+                .justify_center()
+                .child(if on {
+                    hairline(18.0, t.ink())
+                } else {
+                    div().w(px(0.0)).h(px(1.0))
+                }),
+        )
+}
+
+/// 纯文字动作旁的小图标：一律**线框**，不填色。
+#[derive(Clone, Copy)]
+enum ActionIcon {
+    /// 分享图片：一个画框，框底一道地平线。
+    Frame,
+    /// 分享文字：一枚简册（框内两道竖简）。
+    Slips,
+}
+
+/// 样式面板底部的**纯文字动作**：一行字 + 一枚 12px 线框符号。
+/// 没有背景、没有边框、没有内边距堆出来的「按钮形状」；悬停只加深字色。
+fn text_action(label: &'static str, icon: ActionIcon, t: Theme) -> Div {
+    let line = ((t.ink() & 0xFFFFFF) << 8) | 0x8C;
+    let mut glyph = div()
+        .w(px(12.0))
+        .h(px(12.0))
+        .border_1()
+        .border_color(rgba(line))
+        .flex()
+        .items_end()
+        .justify_center()
+        .pb(px(1.5));
+    match icon {
+        ActionIcon::Frame => {
+            glyph = glyph.child(div().w(px(5.0)).h(px(1.0)).bg(rgba(line)));
+        }
+        ActionIcon::Slips => {
+            glyph = glyph.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(1.5))
+                    .child(div().w(px(1.0)).h(px(5.0)).bg(rgba(line)))
+                    .child(div().w(px(1.0)).h(px(5.0)).bg(rgba(line))),
+            );
+        }
+    }
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .cursor_pointer()
+        .text_size(px(11.5))
+        .text_color(rgb(t.ink_soft()))
+        .hover(|s| s.text_color(rgb(t.ink())))
+        .child(glyph)
+        .child(div().child(SharedString::from(label)))
 }
 
 /// 注释全局编号：(章, 段, 偏移) -> 序号。
@@ -6607,8 +6758,8 @@ impl Root {
         // 样式面板宽度与「单张页面」严格等宽：直接取 fit_sizes 算出的实际页宽。
         let style_w = self.page_w;
 
-        // ---- 标签行：样式 / 字体（参照古籍阅读器底部样式面板）----
-        let tab_style = small_button("样式", tab == StyleTab::Style, t).on_mouse_down(
+        // ---- 标签行：样式 / 字体（只有字与一道细线，没有按钮底）----
+        let tab_style = panel_tab("样式", tab == StyleTab::Style, t).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
@@ -6616,7 +6767,7 @@ impl Root {
                 cx.notify();
             }),
         );
-        let tab_font = small_button("字体", tab == StyleTab::Font, t).on_mouse_down(
+        let tab_font = panel_tab("字体", tab == StyleTab::Font, t).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
@@ -6627,17 +6778,18 @@ impl Root {
         let head = div()
             .flex()
             .flex_row()
-            .items_center()
+            .items_start()
             .justify_between()
+            .pb(px(2.0))
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap_2()
+                    .gap(px(18.0))
                     .child(tab_style)
                     .child(tab_font),
             )
-            .child(small_button("关闭", false, t).on_mouse_down(
+            .child(panel_close(t).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
@@ -6646,19 +6798,30 @@ impl Root {
                 }),
             ));
 
+        // 面板像一张**薄纸**：半透明宣纸底（纸色 + 95% 不透明）+ 一道极淡墨边，
+        // 悬浮在古籍之上。GPUI 0.2.2 没有 backdrop-filter，纸底本色已足够
+        // 「透」，再用一层柔和投影把它托起来（影子只向下，不四散）。
+        let paper_veil = ((t.paper() & 0xFFFFFF) << 8) | 0xF2;
         let mut sheet = div()
             .w(px(style_w))
             .flex()
             .flex_col()
-            .gap_2()
-            .p_4()
-            .bg(rgb(t.chrome()))
+            .gap(px(10.0))
+            .px(px(18.0))
+            .py(px(14.0))
+            .bg(rgba(paper_veil))
             .border_1()
-            .border_color(rgb(t.frame()))
-            .rounded(px(8.0))
-            // 界面字体（思源黑体）：面板 / 工具条这类 UI 文字用无衬线，
-            // 与纸面上的宋体正文一眼分得开。字体名不写死——走 `FontRole::Ui`。
-            .font_family(crate::fonts::family_for_role(crate::fonts::FontRole::Ui))
+            .border_color(rgba(((t.rule() & 0xFFFFFF) << 8) | 0x33))
+            .rounded(px(2.0))
+            .shadow(vec![BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.16),
+                offset: gpui::point(px(0.0), px(6.0)),
+                blur_radius: px(16.0),
+                spread_radius: px(-4.0),
+            }])
+            // 面板文字一律走**正文宋体**（原来用思源黑体，正是「生硬」的根源）：
+            // 面板贴在宋版书页下方，字要与书页同一种笔意。
+            .font_family(self.main_family())
             .child(head);
 
         match tab {
@@ -6692,23 +6855,23 @@ impl Root {
                             .cursor_pointer()
                             .child(
                                 div()
-                                    .w(px(28.0))
-                                    .h(px(28.0))
+                                    .w(px(26.0))
+                                    .h(px(26.0))
                                     .bg(rgb(th.paper()))
-                                    .border_2()
-                                    .border_color(rgb(if on { t.accent() } else { t.rule() }))
-                                    .rounded(px(3.0))
+                                    .border_1()
+                                    .border_color(rgb(if on { SHEET_ZHU } else { th.rule() }))
+                                    .rounded(px(2.0))
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_size(px(15.0))
+                                    .text_size(px(14.0))
                                     .text_color(rgb(th.ink()))
                                     .child(SharedString::from("文")),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(if on { t.accent() } else { t.ink_soft() }))
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(if on { SHEET_ZHU } else { t.ink_soft() }))
                                     .child(SharedString::from(th.label())),
                             )
                             .on_mouse_down(
@@ -6738,31 +6901,31 @@ impl Root {
                             .cursor_pointer()
                             .child(
                                 div()
-                                    .w(px(34.0))
-                                    .h(px(28.0))
+                                    .w(px(32.0))
+                                    .h(px(26.0))
                                     .bg(rgb(t.paper()))
-                                    .border_2()
-                                    .border_color(rgb(if on { t.accent() } else { t.rule() }))
-                                    .rounded(px(3.0))
+                                    .border_1()
+                                    .border_color(rgb(if on { SHEET_ZHU } else { t.rule() }))
+                                    .rounded(px(2.0))
                                     .flex()
                                     .flex_row()
                                     .items_center()
                                     .justify_center()
                                     .gap(px(4.0))
                                     .child(
-                                        div().w(px(1.5)).h(px(15.0)).bg(rgb(rule_c)),
+                                        div().w(px(1.5)).h(px(14.0)).bg(rgb(rule_c)),
                                     )
                                     .child(
-                                        div().w(px(1.5)).h(px(15.0)).bg(rgb(rule_c)),
+                                        div().w(px(1.5)).h(px(14.0)).bg(rgb(rule_c)),
                                     )
                                     .child(
-                                        div().w(px(1.5)).h(px(15.0)).bg(rgb(rule_c)),
+                                        div().w(px(1.5)).h(px(14.0)).bg(rgb(rule_c)),
                                     ),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(if on { t.accent() } else { t.ink_soft() }))
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(if on { SHEET_ZHU } else { t.ink_soft() }))
                                     .child(SharedString::from(rc.label())),
                             )
                             .on_mouse_down(
@@ -6837,33 +7000,45 @@ impl Root {
                 // 批注字体：楷体二选一，与正文宋体分开——
                 // 正文匠体、注文手写体，正是刻本的层次。
                 sheet = sheet.child(style_row("批注", self.note_font_row(cx), t));
-                // 字级：小 / 中 / 大 / 特大 四档（原先那条七档圆点滑块已撤销——
-                // 档位密到肉眼分不出，反而要来回试）。选中档用朱砂实底，
-                // 一眼看清自己在哪一档；右侧实时报出当前字号。
+                // 字级：蝇头 / 中楷 / 大字 / 榜书 四档。
+                //
+                // 不再是四颗方块按钮 + 「42pt」：方块是网页控件语汇，pt 是排版
+                // 软件的单位，两者都不该出现在一张纸下面。现在只有四个词，
+                // 选中的那个转朱砂、字下压一道 1px 墨线——像在书眉上圈了一个字。
                 let cur_level = crate::types::ZoomLevel::from_zoom(self.zoom);
-                let mut seg = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .p(px(2.0))
-                    .rounded(px(5.0))
-                    .bg(rgb(t.chip()))
-                    .border_1()
-                    .border_color(rgb(t.chrome_line()));
+                let mut seg = div().flex().flex_row().items_start().gap(px(18.0)).py_1();
                 for lvl in crate::types::ZoomLevel::ALL {
                     let on = lvl == cur_level;
                     seg = seg.child(
                         div()
-                            .id(SharedString::from(format!("zoom-lvl-{}", lvl.label())))
-                            .px_2()
-                            .py_1()
-                            .rounded(px(4.0))
+                            .id(SharedString::from(format!(
+                                "zoom-lvl-{}",
+                                lvl.ancient_name()
+                            )))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(2.0))
                             .cursor_pointer()
-                            .bg(rgb(if on { t.accent() } else { 0x00000000 }))
-                            .text_size(px(11.0))
-                            .text_color(rgb(if on { 0xFFF6E8 } else { t.ink() }))
-                            .child(SharedString::from(lvl.label()))
+                            .text_color(rgb(if on { SHEET_ZHU } else { t.chrome_text() }))
+                            .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .child(SharedString::from(lvl.ancient_name())),
+                            )
+                            .child(
+                                div()
+                                    .w(px(26.0))
+                                    .h(px(1.0))
+                                    .flex()
+                                    .justify_center()
+                                    .child(if on {
+                                        hairline(26.0, t.ink())
+                                    } else {
+                                        div().w(px(0.0)).h(px(1.0))
+                                    }),
+                            )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
@@ -6874,22 +7049,14 @@ impl Root {
                             ),
                     );
                 }
-                seg = seg.child(
-                    div()
-                        .ml_1()
-                        .text_size(px(10.5))
-                        .text_color(rgb(t.ink_soft()))
-                        .child(SharedString::from(format!(
-                            "{}pt",
-                            self.current_size() as i32
-                        ))),
-                );
                 sheet = sheet.child(style_row("字级", seg, t));
             }
         }
 
-        // ---- 底部两个大按钮：分享图片 / 分享文字 ----
-        let share_img = self.action_button("分享图片", t).on_mouse_down(
+        // ---- 底行：两枚**纯文字**动作（分享图片 / 分享文字）----
+        // 原来那两个灰色大方框是面板里最重的色块；现在只剩一行字，字旁一枚
+        // 极小的线框符号（画框=图片，简册=文字），悬停时字色加深。
+        let share_img = text_action("分享图片", ActionIcon::Frame, t).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
@@ -6897,7 +7064,7 @@ impl Root {
                 cx.notify();
             }),
         );
-        let share_txt = self.action_button("分享文字", t).on_mouse_down(
+        let share_txt = text_action("分享文字", ActionIcon::Slips, t).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
@@ -6909,8 +7076,12 @@ impl Root {
             div()
                 .flex()
                 .flex_row()
-                .gap_2()
-                .mt_1()
+                .items_center()
+                .gap(px(24.0))
+                .pt(px(6.0))
+                // 与上一行之间一道极淡的墨界，像纸上的折痕。
+                .border_t_1()
+                .border_color(rgba(((t.rule() & 0xFFFFFF) << 8) | 0x1F))
                 .child(share_img)
                 .child(share_txt),
         );
@@ -7052,27 +7223,9 @@ impl Root {
         cx.notify();
     }
 
-    /// 样式面板底部的大按钮（等宽、居中文字）。
-    fn action_button(&self, label: &'static str, t: Theme) -> Div {
-        div()
-            .flex_1()
-            .flex()
-            .items_center()
-            .justify_center()
-            .py_2()
-            .rounded(px(5.0))
-            .bg(rgb(t.chip()))
-            .border_1()
-            .border_color(rgb(t.chrome_line()))
-            .cursor_pointer()
-            .child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(rgb(t.chrome_text()))
-                    .child(SharedString::from(label)),
-            )
-    }
-
+    /// 样式面板底部的**纯文字动作**（分享图片 / 分享文字）已改为自由函数
+    /// `text_action`：没有灰底方框，只有一行字与一枚极小线框符号。
+    ///
     /// 分享面板的**朱砂印章**按钮：一枚方印，`filled = true` 是朱底白字
     /// （主动作：保存），`false` 是白线框（次动作：分享）。
     ///
@@ -7114,17 +7267,18 @@ impl Root {
             .child(face.hover(|s| s.w(px(SEAL_SIZE + 4.0)).h(px(SEAL_SIZE + 4.0))))
     }
 
-    /// 样式面板里的一组小按钮。
+    /// 样式面板里的一组小选项（标注 / 简繁等开关）。
+    /// 一律无底无框：只有字与字下那道线。
     fn style_chips(
         &self,
         items: Vec<(&'static str, bool, StyleAct)>,
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme;
-        let mut row = div().flex().flex_row().items_center().gap_2();
+        let mut row = div().flex().flex_row().flex_wrap().items_start().gap(px(16.0));
         for (label, on, act) in items {
             row = row.child(
-                small_button(label, on, t).on_mouse_down(
+                ink_option(label, on, t).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -7164,32 +7318,54 @@ impl Root {
         row
     }
 
-    /// 样式面板里的「字体」选择行（字体、字号已收进「样式」面板）。
-    /// 样式面板的「墨色」行：五套正文 / 小字注色，深色圆角按钮（仿古籍 App 墨色行）。
+    /// 样式面板的「墨色」行：两枚小色点（正文 / 注文）+ 一行墨字。
+    /// 原来是「深墨实底胶囊」，在纸面上像贴了两颗黑钮；现在只剩字与色点。
     fn palette_chips(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
-        let mut row = div().flex().flex_row().flex_wrap().items_center().gap_2();
+        let mut row = div().flex().flex_row().flex_wrap().items_start().gap(px(16.0));
         for p in InkPalette::ALL {
             let on = self.palette == p;
             let chip = div()
                 .flex()
-                .flex_row()
+                .flex_col()
                 .items_center()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .rounded(px(5.0))
-                .border_1()
-                .border_color(rgb(if on { t.accent() } else { 0x2A2520 }))
-                .bg(rgb(if on { 0x4A4038 } else { 0x2A2520 }))
+                .gap(px(2.0))
                 .cursor_pointer()
-                .child(div().w(px(11.0)).h(px(11.0)).rounded(px(2.0)).bg(rgb(p.ink(t))))
-                .child(div().w(px(11.0)).h(px(11.0)).rounded(px(2.0)).bg(rgb(p.note(t))))
+                .text_color(rgb(if on { SHEET_ZHU } else { t.chrome_text() }))
+                .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
                 .child(
                     div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(0xE9E2D2))
-                        .child(SharedString::from(p.label())),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .w(px(9.0))
+                                .h(px(9.0))
+                                .rounded_full()
+                                .bg(rgb(p.ink(t))),
+                        )
+                        .child(
+                            div()
+                                .w(px(9.0))
+                                .h(px(9.0))
+                                .rounded_full()
+                                .bg(rgb(p.note(t))),
+                        ),
+                )
+                .child(div().text_size(px(10.5)).child(SharedString::from(p.label())))
+                .child(
+                    div()
+                        .w(px(18.0))
+                        .h(px(1.0))
+                        .flex()
+                        .justify_center()
+                        .child(if on {
+                            hairline(18.0, t.ink())
+                        } else {
+                            div().w(px(0.0)).h(px(1.0))
+                        }),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
@@ -7215,49 +7391,70 @@ impl Root {
     fn font_preset_row(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let cur = self.font_preset;
-        let mut row = div().flex().flex_row().items_center().gap_2().py_1();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap(px(12.0))
+            .py_1();
         for p in crate::types::FontPreset::ALL {
             let on = cur == p;
             let label = p.label();
-            row = row.child(
-                div()
-                    .id(SharedString::from(format!("font-preset-{}", p.index())))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .px_3()
-                    .py_1()
-                    .bg(rgb(if on { t.ink() } else { t.chip() }))
-                    .border_1()
-                    .border_color(rgb(if on { t.accent() } else { t.chrome_line() }))
-                    .rounded(px(4.0))
-                    .cursor_pointer()
-                    // 字牌用这个预设的正文款字体：所见即所得。
-                    .font_family(crate::fonts::family_for(
-                        p.main_choice(),
-                        crate::types::Script::Ancient,
-                    ))
-                    .text_size(px(13.0))
-                    .text_color(rgb(if on { 0xF3EADA } else { t.ink() }))
-                    .child(SharedString::from(label))
-                    .child(
+            // 一张**极简纸卡**：没有粗边、没有深底。未选是透明的，字是墨的；
+            // 选中时字转朱砂、卡底浮一层极淡朱晕，卡片下缘一道朱砂细虚线——
+            // 像在卡片上盖了一枚淡淡的红印，而不是给它套一个绿框。
+            let card = div()
+                .id(SharedString::from(format!("font-preset-{}", p.index())))
+                .relative()
+                .w(px(118.0))
+                .h(px(58.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(3.0))
+                .bg(if on {
+                    rgba(0xB23A3012)
+                } else {
+                    rgba(0x00000000)
+                })
+                .rounded(px(2.0))
+                .cursor_pointer()
+                // 字牌用这个预设的正文款字体：所见即所得。
+                .font_family(crate::fonts::family_for(
+                    p.main_choice(),
+                    crate::types::Script::Ancient,
+                ))
+                .text_color(rgb(if on { SHEET_ZHU } else { t.ink() }))
+                .child(div().text_size(px(14.0)).child(SharedString::from(label)))
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(rgb(if on { SHEET_ZHU } else { t.ink_soft() }))
+                        .child(SharedString::from(p.hint())),
+                )
+                .when(on, |d| {
+                    d.child(
                         div()
-                            .text_size(px(9.0))
-                            .text_color(rgb(if on { 0xC9BFAE } else { t.ink_soft() }))
-                            .child(SharedString::from(p.hint())),
+                            .absolute()
+                            .bottom(px(4.0))
+                            .left(px(6.0))
+                            .child(zhu_dashed(106.0, 0xB23A30AA)),
                     )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            // 换字体 → 换行高 → 重算尺寸 → 重排（四步在
-                            // `set_font_preset` 里一次走完）。
-                            this.set_font_preset(p);
-                            this.notice = format!("排版字体：{}（{}）", p.label(), p.hint());
-                            cx.notify();
-                        }),
-                    ),
-            );
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        // 换字体 → 换行高 → 重算尺寸 → 重排（四步在
+                        // `set_font_preset` 里一次走完）。
+                        this.set_font_preset(p);
+                        this.notice = format!("排版字体：{}（{}）", p.label(), p.hint());
+                        cx.notify();
+                    }),
+                );
+            row = row.child(card);
         }
         row
     }
@@ -7265,7 +7462,7 @@ impl Root {
     fn note_font_row(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let cur = self.note_font();
-        let mut row = div().flex().flex_row().items_center().gap_2().py_1();
+        let mut row = div().flex().flex_row().items_start().gap(px(18.0)).py_1();
         for choice in FontChoice::NOTE {
             let on = cur == choice;
             let label = choice.label();
@@ -7273,17 +7470,27 @@ impl Root {
             row = row.child(
                 div()
                     .id(SharedString::from(format!("note-font-{}", label)))
-                    .px_3()
-                    .py_1()
-                    .bg(rgb(if on { t.ink() } else { t.chip() }))
-                    .border_1()
-                    .border_color(rgb(if on { t.accent() } else { t.chrome_line() }))
-                    .rounded(px(4.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(2.0))
                     .cursor_pointer()
                     .font_family(crate::fonts::note_family(choice))
-                    .text_size(px(13.0))
-                    .text_color(rgb(if on { 0xF3EADA } else { t.ink() }))
-                    .child(SharedString::from(label))
+                    .text_color(rgb(if on { SHEET_ZHU } else { t.chrome_text() }))
+                    .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
+                    .child(div().text_size(px(13.0)).child(SharedString::from(label)))
+                    .child(
+                        div()
+                            .w(px(24.0))
+                            .h(px(1.0))
+                            .flex()
+                            .justify_center()
+                            .child(if on {
+                                hairline(24.0, t.ink())
+                            } else {
+                                div().w(px(0.0)).h(px(1.0))
+                            }),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -7314,32 +7521,40 @@ impl Root {
             .flex_row()
             .flex_wrap()
             .items_start()
-            .gap_2()
+            .gap(px(12.0))
             .py_1();
         for choice in opts {
             let on = cur == choice;
             let label = choice.label();
-            let mut card = div()
-                .id(SharedString::from(format!("font-{}", label)))
+            // 竖排字牌：**没有底、没有框**。选中的字转朱砂，字列右侧压一道
+            // 1px 墨线——竖排书里标重点，线就在字右，不在字下。
+            let mut face = div()
                 .flex()
-                .flex_col()
-                .items_center()
-                .px_2()
-                .py_2()
-                .min_w(px(24.0))
-                .bg(rgb(if on { 0x2B2622 } else { t.chip() }))
-                .border_1()
-                .border_color(rgb(if on { t.accent() } else { t.chrome_line() }))
-                .rounded(px(4.0))
+                .flex_row()
+                .items_start()
+                .gap(px(4.0))
                 .cursor_pointer();
+            let mut col = div().flex().flex_col().items_center().gap(px(1.0));
             for c in label.chars() {
-                card = card.child(
+                col = col.child(
                     div()
-                        .text_size(px(10.5))
-                        .text_color(rgb(if on { 0xF3EADA } else { t.ink() }))
+                        .text_size(px(11.0))
+                        .text_color(rgb(if on { SHEET_ZHU } else { t.chrome_text() }))
                         .child(SharedString::from(c.to_string())),
                 );
             }
+            face = face
+                .child(col)
+                // 竖线槽：未选宽 0，位置固定，切换时不推挤邻居。
+                .child(
+                    div()
+                        .w(px(1.0))
+                        .h(px((label.chars().count() as f32) * 13.0))
+                        .bg(rgb(if on { t.ink() } else { 0x00000000 })),
+                );
+            let card = div()
+                .id(SharedString::from(format!("font-{}", label)))
+                .child(face);
             row = row.child(card.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -7436,17 +7651,19 @@ enum StyleAct {
     AutoDuplex,
 }
 
-/// 样式面板的一行：左侧标签，右侧一组控件。
+/// 样式面板的一行：左侧极小号标签（像书页边的批字），右侧一组控件。
+/// 标签不做粗体、不加底色，只比正文淡一档。
 fn style_row(label: &'static str, chips: Div, t: Theme) -> Div {
     div()
         .flex()
         .flex_row()
-        .items_center()
-        .gap_3()
+        .items_start()
+        .gap(px(14.0))
         .child(
             div()
-                .w(px(58.0))
-                .text_size(px(11.5))
+                .w(px(52.0))
+                .pt(px(2.0))
+                .text_size(px(10.0))
                 .text_color(rgb(t.ink_soft()))
                 .child(SharedString::from(label)),
         )

@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>笺读 · 样式面板（古风化重构）</title>
+<style>
+  /* ============================================================
+     笺读 v1.21.0 · 样式面板「极简古风化」
+     设计原则：
+       1. 无底、无框、无圆角——控件只剩一行字与一道 1px 线；
+       2. 选中只做两件事：转朱砂（#B23A30）、字下压一道墨线；
+       3. 面板是一张薄纸：半透明宣纸底 + 背景模糊 + 向下投影；
+       4. 一切文字走宋体，与书页同一笔意。
+     ============================================================ */
+
+  :root {
+    --zhu: #B23A30;              /* 选中朱砂（用户指定） */
+    --zhu-soft: rgba(178, 58, 48, .55);
+    --zhu-veil: rgba(178, 58, 48, .07);
+    --paper: #F0EAD6;            /* 宣纸 */
+    --paper-deep: #E8DFC6;
+    --ink: #2B2622;
+    --ink-soft: #8A8175;
+    --ink-faint: #A79C8B;
+    --rule: rgba(120, 100, 70, .18);
+    --hair: rgba(120, 100, 70, .12);
+    --song: "WenJinMincho", "Songti SC", "STSong", "Noto Serif SC", "SimSun", serif;
+    --kai: "LXGW WenKai", "Kaiti SC", "STKaiti", "KaiTi", serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body { margin: 0; }
+
+  body {
+    min-height: 100vh;
+    padding: 40px 24px 64px;
+    background:
+      radial-gradient(120% 90% at 50% 0%, #FCF8EE 0%, #F4EDDC 55%, #EDE4CE 100%);
+    font-family: var(--song);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .doc-head {
+    max-width: 720px;
+    margin: 0 auto 26px;
+    text-align: center;
+  }
+  .doc-head h1 {
+    margin: 0 0 6px;
+    font-size: 19px;
+    font-weight: 400;
+    letter-spacing: .34em;
+    text-indent: .34em;
+  }
+  .doc-head p {
+    margin: 0;
+    font-size: 11.5px;
+    line-height: 1.9;
+    color: var(--ink-soft);
+    letter-spacing: .06em;
+  }
+  .doc-head .seal {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 4px 5px;
+    font-size: 9px;
+    line-height: 1.05;
+    color: #FBF4E6;
+    background: var(--zhu);
+    border-radius: 1px;
+    writing-mode: vertical-rl;
+    letter-spacing: .12em;
+  }
+
+  /* ---------------- 舞台：一张竖排书页 ---------------- */
+  .stage {
+    position: relative;
+    max-width: 760px;
+    margin: 0 auto;
+    min-height: 620px;
+    padding: 44px 30px;
+    display: grid;
+    place-items: center;
+    background:
+      linear-gradient(90deg, rgba(120,100,70,.05) 0 1px, transparent 1px) 0 0 / 34px 100%,
+      var(--paper);
+    border: 1px solid rgba(120, 100, 70, .16);
+    box-shadow: inset 0 0 60px rgba(120, 100, 70, .08);
+    overflow: hidden;
+  }
+
+  /* 书页上的正文：竖排、自右向左、淡淡的墨 */
+  .page-text {
+    position: absolute;
+    inset: 30px 34px;
+    writing-mode: vertical-rl;
+    font-size: 17px;
+    line-height: 30px;
+    letter-spacing: .16em;
+    color: rgba(43, 38, 34, .34);
+    user-select: none;
+    pointer-events: none;
+    display: flex;
+    gap: 0;
+    justify-content: flex-start;
+  }
+  .page-text p { margin: 0 0 0 12px; text-indent: 2em; }
+
+  /* ---------------- 面板：一张薄纸 ---------------- */
+  .panel {
+    position: relative;
+    width: 430px;
+    max-width: 100%;
+    padding: 15px 20px 13px;
+    font-family: var(--song);
+    color: var(--ink);
+    background-color: rgba(240, 234, 214, .95);
+    background-image:
+      radial-gradient(90% 60% at 20% 0%, rgba(255, 255, 255, .55), transparent 70%);
+    -webkit-backdrop-filter: blur(10px) saturate(1.05);
+    backdrop-filter: blur(10px) saturate(1.05);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    box-shadow:
+      0 18px 42px -20px rgba(52, 40, 26, .55),
+      0 2px 6px -3px rgba(52, 40, 26, .18);
+  }
+
+  /* 头部：页签 + 收起 */
+  .panel__head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    padding-bottom: 2px;
+  }
+  .tabs { display: flex; gap: 20px; }
+
+  .tab {
+    appearance: none;
+    border: 0;
+    padding: 0;
+    background: none;
+    font: inherit;
+    font-size: 12px;
+    color: var(--ink-soft);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    transition: color .18s ease;
+  }
+  .tab:hover { color: var(--ink); }
+  .tab::after {
+    content: "";
+    display: block;
+    width: 0;
+    height: 1px;
+    background: var(--ink);
+    transition: width .22s ease;
+  }
+  .tab[aria-selected="true"] { color: var(--zhu); }
+  .tab[aria-selected="true"]::after { width: 26px; }
+
+  .collapse {
+    appearance: none;
+    border: 0;
+    padding: 2px;
+    background: none;
+    font: inherit;
+    font-size: 10.5px;
+    color: var(--ink-soft);
+    cursor: pointer;
+    transition: color .18s ease;
+  }
+  .collapse:hover { color: var(--zhu); }
+
+  /* 行 */
+  .rows { display: flex; flex-direction: column; gap: 10px; padding-top: 8px; }
+  .row { display: flex; align-items: flex-start; gap: 14px; }
+  .row__label {
+    flex: 0 0 52px;
+    padding-top: 2px;
+    font-size: 10px;
+    color: var(--ink-soft);
+    letter-spacing: .08em;
+  }
+  .row__body { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px; }
+
+  /* ---------------- 基本选项：字 + 墨线 ---------------- */
+  .opt {
+    appearance: none;
+    border: 0;
+    padding: 0;
+    background: none;
+    font: inherit;
+    font-size: 12px;
+    color: var(--ink);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    transition: color .18s ease;
+  }
+  .opt:hover { color: var(--zhu); }
+  .opt::after {
+    content: "";
+    display: block;
+    width: 0;
+    height: 1px;
+    background: var(--ink);
+    transition: width .22s ease;
+  }
+  .opt[aria-pressed="true"] { color: var(--zhu); }
+  .opt[aria-pressed="true"]::after { width: 18px; }
+
+  /* 墨色：两枚小色点 + 字 */
+  .ink {
+    appearance: none;
+    border: 0;
+    padding: 0;
+    background: none;
+    font: inherit;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    font-size: 10.5px;
+    color: var(--ink);
+    transition: color .18s ease;
+  }
+  .ink:hover { color: var(--zhu); }
+  .ink .dots { display: flex; gap: 3px; }
+  .ink .dots i {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    display: block;
+  }
+  .ink::after {
+    content: "";
+    width: 0;
+    height: 1px;
+    background: var(--ink);
+    transition: width .22s ease;
+  }
+  .ink[aria-pressed="true"] { color: var(--zhu); }
+  .ink[aria-pressed="true"]::after { width: 18px; }
+
+  /* 纸色 / 丝栏：小样张 + 1px 边 */
+  .swatch {
+    appearance: none;
+    border: 0;
+    padding: 0;
+    background: none;
+    font: inherit;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    font-size: 10px;
+    color: var(--ink-soft);
+    transition: color .18s ease;
+  }
+  .swatch span {
+    width: 26px;
+    height: 26px;
+    display: grid;
+    place-items: center;
+    font-size: 14px;
+    border: 1px solid rgba(120, 100, 70, .35);
+    border-radius: 2px;
+  }
+  .swatch[aria-pressed="true"] { color: var(--zhu); }
+  .swatch[aria-pressed="true"] span { border-color: var(--zhu); }
+
+  /* ---------------- 字级：蝇头 / 中楷 / 大字 / 榜书 ---------------- */
+  .sizes { display: flex; align-items: flex-start; gap: 22px; }
+  .size {
+    appearance: none;
+    border: 0;
+    padding: 0;
+    background: none;
+    font: inherit;
+    font-size: 13px;          /* 档位字略大：一眼可读 */
+    color: var(--ink);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    transition: color .18s ease;
+  }
+  .size:hover { color: var(--zhu); }
+  .size::after {
+    content: "";
+    width: 0;
+    height: 1px;
+    background: var(--ink);
+    transition: width .22s ease;
+  }
+  .size[aria-pressed="true"] { color: var(--zhu); }
+  .size[aria-pressed="true"]::after { width: 26px; }
+
+  /* ---------------- 排版字体：两张极简纸卡 ---------------- */
+  .presets { display: flex; gap: 12px; }
+  .preset {
+    appearance: none;
+    border: 0;
+    margin: 0;
+    padding: 0;
+    width: 120px;
+    height: 58px;
+    background: transparent;
+    border-radius: 2px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    color: var(--ink);
+    transition: color .18s ease, background-color .18s ease, outline-color .18s ease;
+    outline: 1px dashed transparent;
+    outline-offset: -1px;
+  }
+  .preset .name { font-size: 14px; }
+  .preset .hint { font-size: 9px; color: var(--ink-soft); transition: color .18s ease; }
+  .preset:hover { outline-color: rgba(120, 100, 70, .28); }
+  .preset[aria-pressed="true"] {
+    color: var(--zhu);
+    background: var(--zhu-veil);
+    outline-color: var(--zhu-soft);
+  }
+  .preset[aria-pressed="true"] .hint { color: rgba(178, 58, 48, .7); }
+
+  /* ---------------- 字体牌：竖排字列，选中朱砂 + 右侧墨线 ---------------- */
+  .faces { display: flex; gap: 14px; align-items: flex-start; }
+  .face {
+    appearance: none;
+    border: 0;
+    padding: 0;
+    background: none;
+    font: inherit;
+    cursor: pointer;
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    color: var(--ink);
+    transition: color .18s ease;
+  }
+  .face .col {
+    writing-mode: vertical-rl;
+    font-size: 11px;
+    line-height: 1.2;
+    letter-spacing: .02em;
+  }
+  .face i {
+    display: block;
+    width: 1px;
+    align-self: stretch;
+    background: transparent;
+    transition: background-color .18s ease;
+  }
+  .face[aria-pressed="true"] { color: var(--zhu); }
+  .face[aria-pressed="true"] i { background: var(--ink); }
+  .face:hover { color: var(--zhu); }
+
+  /* ---------------- 底部：纯文字动作 ---------------- */
+  .foot {
+    display: flex;
+    align-items: center;
+    gap: 26px;
+    margin-top: 10px;
+    padding-top: 9px;
+    border-top: 1px solid var(--hair);
+  }
+  .act {
+    appearance: none;
+    border: 0;
+    padding: 0;
+    background: none;
+    font: inherit;
+    font-size: 11.5px;
+    color: var(--ink-soft);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: color .18s ease;
+  }
+  .act:hover { color: var(--ink); }
+  .act:active { color: var(--zhu); }
+  .act svg {
+    width: 12px;
+    height: 12px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 1;
+    stroke-linecap: square;
+  }
+
+  /* 页签内容切换 */
+  .pane[hidden] { display: none; }
+
+  /* 说明与代码 */
+  .notes {
+    max-width: 760px;
+    margin: 30px auto 0;
+    font-size: 11.5px;
+    line-height: 2;
+    color: var(--ink-soft);
+  }
+  .notes h2 {
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: .22em;
+    color: var(--ink);
+    margin: 0 0 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--hair);
+  }
+  .notes ul { margin: 0 0 22px; padding-left: 1.2em; }
+  .notes code {
+    font-family: "SFMono-Regular", "Menlo", monospace;
+    font-size: 10.5px;
+    background: rgba(120, 100, 70, .08);
+    padding: 1px 4px;
+    border-radius: 2px;
+    color: #5A5147;
+  }
+  details {
+    max-width: 760px;
+    margin: 0 auto;
+    border-top: 1px solid var(--hair);
+    padding-top: 10px;
+  }
+  summary {
+    cursor: pointer;
+    font-size: 11px;
+    letter-spacing: .18em;
+    color: var(--ink-soft);
+    outline: none;
+  }
+  summary:hover { color: var(--zhu); }
+  pre {
+    overflow: auto;
+    margin: 12px 0 0;
+    padding: 14px 16px;
+    background: rgba(255, 252, 244, .7);
+    border: 1px solid var(--hair);
+    border-radius: 2px;
+    font-family: "SFMono-Regular", "Menlo", monospace;
+    font-size: 10.5px;
+    line-height: 1.75;
+    color: #4B433A;
+  }
+</style>
+</head>
+<body>
+
+<header class="doc-head">
+  <h1>样式面板</h1>
+  <p>去底 · 去框 · 去圆角 —— 只留一行字与一道线<br>笺读 v1.21.0 极简古风化重构</p>
+  <span class="seal">笺读</span>
+</header>
+
+<div class="stage">
+  <div class="page-text">
+    <p>周紀一起重光赤奮若盡玄黓困敦凡三十五年初命晉大夫魏斯趙籍韓虔為諸侯</p>
+    <p>臣光曰臣聞天子之職莫大於禮禮莫大於分分莫大於名何謂禮紀綱是也</p>
+    <p>初智宣子將以瑤為後智果曰不如宵也瑤之賢於人者五其不逮者一也</p>
+  </div>
+
+  <!-- ==================== 面板 ==================== -->
+  <section class="panel" aria-label="样式面板">
+
+    <div class="panel__head">
+      <div class="tabs" role="tablist" aria-label="面板页">
+        <button class="tab" role="tab" aria-selected="true" data-pane="style">样式</button>
+        <button class="tab" role="tab" aria-selected="false" data-pane="font">字体</button>
+      </div>
+      <button class="collapse" type="button">收起</button>
+    </div>
+
+    <!-- 样式页 -->
+    <div class="pane" id="pane-style">
+      <div class="rows">
+
+        <div class="row">
+          <div class="row__label">墨色</div>
+          <div class="row__body">
+            <button class="ink" aria-pressed="true">
+              <span class="dots"><i style="background:#2B2622"></i><i style="background:#6B6054"></i></span>
+              松烟
+            </button>
+            <button class="ink" aria-pressed="false">
+              <span class="dots"><i style="background:#1C2A2E"></i><i style="background:#54666B"></i></span>
+              靛青
+            </button>
+            <button class="ink" aria-pressed="false">
+              <span class="dots"><i style="background:#3A2418"></i><i style="background:#7A5A44"></i></span>
+              栗壳
+            </button>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="row__label">简繁</div>
+          <div class="row__body">
+            <button class="opt" aria-pressed="true">繁体</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="row__label">纸色</div>
+          <div class="row__body">
+            <button class="swatch" aria-pressed="true"><span style="background:#F2EAD6;color:#2B2622">文</span>宣纸</button>
+            <button class="swatch" aria-pressed="false"><span style="background:#EDE3C8;color:#3A3226">文</span>米黄</button>
+            <button class="swatch" aria-pressed="false"><span style="background:#E4E8DA;color:#2C3328">文</span>竹青</button>
+            <button class="swatch" aria-pressed="false"><span style="background:#2A2620;color:#E7DECB">文</span>墨夜</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="row__label">丝栏</div>
+          <div class="row__body">
+            <button class="swatch" aria-pressed="true">
+              <span style="background:#F2EAD6"><b style="font-weight:400;font-size:11px;letter-spacing:2px;color:#8C6B3F">丨丨</b></span>乌丝
+            </button>
+            <button class="swatch" aria-pressed="false">
+              <span style="background:#F2EAD6"><b style="font-weight:400;font-size:11px;letter-spacing:2px;color:#B23A30">丨丨</b></span>朱丝
+            </button>
+            <button class="swatch" aria-pressed="false">
+              <span style="background:#F2EAD6"><b style="font-weight:400;font-size:11px;letter-spacing:2px;color:#9C8148">丨丨</b></span>金丝
+            </button>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="row__label">标注</div>
+          <div class="row__body">
+            <button class="opt" aria-pressed="true">通假</button>
+            <button class="opt" aria-pressed="true">标点</button>
+            <button class="opt" aria-pressed="false">生僻字</button>
+            <button class="opt" aria-pressed="true">数字汉字</button>
+            <button class="opt" aria-pressed="false">注释</button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- 字体页 -->
+    <div class="pane" id="pane-font" hidden>
+      <div class="rows">
+
+        <div class="row">
+          <div class="row__label">排版字体</div>
+          <div class="row__body">
+            <div class="presets">
+              <button class="preset" aria-pressed="true">
+                <span class="name" style="font-family:var(--song)">刻本宋体</span>
+                <span class="hint">文津宋体 · 注用霞鹜文楷</span>
+              </button>
+              <button class="preset" aria-pressed="false">
+                <span class="name" style="font-family:var(--kai)">手写楷体</span>
+                <span class="hint" style="font-family:var(--kai)">霞鹜文楷 · 注用玄冬楷书</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="row__label">字体</div>
+          <div class="row__body">
+            <div class="faces">
+              <button class="face" aria-pressed="true" style="font-family:var(--song)">
+                <span class="col">文津宋体</span><i></i>
+              </button>
+              <button class="face" aria-pressed="false" style="font-family:var(--song)">
+                <span class="col">梦源宋体</span><i></i>
+              </button>
+              <button class="face" aria-pressed="false" style="font-family:var(--kai)">
+                <span class="col">霞鹜文楷</span><i></i>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="row__label">批注</div>
+          <div class="row__body">
+            <div class="faces">
+              <button class="face" aria-pressed="true" style="font-family:var(--kai)">
+                <span class="col">玄冬楷书</span><i></i>
+              </button>
+              <button class="face" aria-pressed="false" style="font-family:var(--kai)">
+                <span class="col">霞鹜文楷</span><i></i>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="row__label">字级</div>
+          <div class="row__body">
+            <div class="sizes" data-group="size">
+              <button class="size" aria-pressed="false">蝇头</button>
+              <button class="size" aria-pressed="true">中楷</button>
+              <button class="size" aria-pressed="false">大字</button>
+              <button class="size" aria-pressed="false">榜书</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- 底部动作 -->
+    <div class="foot">
+      <button class="act" type="button">
+        <svg viewBox="0 0 12 12" aria-hidden="true"><rect x=".5" y=".5" width="11" height="11"/><path d="M3.2 8.6h5.6"/></svg>
+        分享图片
+      </button>
+      <button class="act" type="button">
+        <svg viewBox="0 0 12 12" aria-hidden="true"><rect x=".5" y=".5" width="11" height="11"/><path d="M4.2 3.4v5.2M7.8 3.4v5.2"/></svg>
+        分享文字
+      </button>
+    </div>
+
+  </section>
+</div>
+
+<section class="notes">
+  <h2>重构要点</h2>
+  <ul>
+    <li><strong>字级</strong>：四颗方块按钮与 <code>42pt</code> 一律去掉，改古称「蝇头 / 中楷 / 大字 / 榜书」。选中只把字染朱砂 <code>#B23A30</code>，字下压一道 1px 墨线；档位字 13px，比行内其他选项略大一档，便于一眼定位。</li>
+    <li><strong>字体</strong>：刻本 / 手写两张卡片去掉粗边与深底，未选完全透明；选中时淡朱底 <code>rgba(178,58,48,.07)</code> + <code>1px dashed</code> 朱砂虚线（<code>outline-offset:-1px</code>，不占布局），字与副题同转朱砂。</li>
+    <li><strong>底部</strong>：灰底大方框改为纯文字按钮，宋体 11.5px，前置 12px 线框 icon（<code>stroke: currentColor</code>），悬停字色加深、按下转朱砂。</li>
+    <li><strong>关闭</strong>：右上角灰底按钮改为「收起」二字，无底无框，悬停转朱砂。</li>
+    <li><strong>面板</strong>：<code>rgba(240,234,214,.95)</code> 宣纸底 + <code>backdrop-filter: blur(10px)</code>，<code>1px</code> 极淡界线，<code>2px</code> 圆角，投影只向下（<code>0 18px 42px -20px</code>），像一张薄纸浮在书页上。</li>
+  </ul>
+  <h2>与客户端实现的对应</h2>
+  <ul>
+    <li>GPUI 0.2.2 不支持 <code>backdrop-filter</code>：客户端以「纸色 + 95% 不透明」的 <code>rgba</code> 近似透纸感，其余（细线、朱砂、无底、宋体、向下投影）逐条落地，见 <code>src/reader.rs</code> 的 <code>panel_tab / ink_option / text_action / font_preset_row</code>。</li>
+    <li>GPUI 无 dashed 边框，虚线用「2 实 2 虚」的 1px 短横排出（<code>zhu_dashed</code>）；HTML 版直接用 <code>dashed</code>，两者视觉一致。</li>
+  </ul>
+</section>
+
+<details>
+  <summary>核心 CSS（可复制）</summary>
+<pre><code>.panel {
+  background-color: rgba(240, 234, 214, .95);
+  -webkit-backdrop-filter: blur(10px) saturate(1.05);
+  backdrop-filter: blur(10px) saturate(1.05);
+  border: 1px solid rgba(120, 100, 70, .18);
+  border-radius: 2px;
+  box-shadow: 0 18px 42px -20px rgba(52, 40, 26, .55),
+              0 2px 6px -3px rgba(52, 40, 26, .18);
+  font-family: "WenJinMincho", "Songti SC", "Noto Serif SC", serif;
+  color: #2B2622;
+}
+
+/* 选中态只做两件事：朱砂字 + 1px 墨线 */
+.opt, .size, .tab { color: #2B2622; background: none; border: 0; padding: 0; }
+.opt::after, .size::after, .tab::after {
+  content: ""; display: block; width: 0; height: 1px;
+  background: #2B2622; transition: width .22s ease;
+}
+.opt[aria-pressed="true"], .size[aria-pressed="true"], .tab[aria-selected="true"] {
+  color: #B23A30;
+}
+.opt[aria-pressed="true"]::after,
+.size[aria-pressed="true"]::after,
+.tab[aria-selected="true"]::after { width: 22px; }
+
+/* 字体卡：透明底 → 淡朱底 + 朱砂虚线 */
+.preset { background: transparent; border: 0; outline: 1px dashed transparent; outline-offset: -1px; }
+.preset[aria-pressed="true"] {
+  background: rgba(178, 58, 48, .07);
+  outline-color: rgba(178, 58, 48, .55);
+  color: #B23A30;
+}
+
+/* 底部动作：纯文字 + 线框 icon */
+.act { background: none; border: 0; font: inherit; color: #8A8175; display: flex; gap: 6px; align-items: center; }
+.act:hover { color: #2B2622; }
+.act svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 1; }</code></pre>
+</details>
+
+<script>
+  // 页签切换
+  document.querySelectorAll('.tab').forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      document.querySelectorAll('.tab').forEach(function (t) {
+        t.setAttribute('aria-selected', String(t === tab));
+      });
+      var key = tab.dataset.pane;
+      document.getElementById('pane-style').hidden = key !== 'style';
+      document.getElementById('pane-font').hidden = key !== 'font';
+    });
+  });
+
+  // 单选组：同一容器内互斥（字级 / 字体卡 / 字体牌 / 纸色 / 丝栏 / 墨色）
+  document.querySelectorAll('.row__body').forEach(function (body) {
+    body.addEventListener('click', function (e) {
+      var btn = e.target.closest('button');
+      if (!btn) return;
+      var group = btn.parentElement;
+      var members = group.querySelectorAll('button');
+      if (members.length < 2) {
+        if (btn.classList.contains('opt')) btn.setAttribute('aria-pressed',
+          btn.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+        return;
+      }
+      // 标注行是开关组，不做互斥
+      if (group.classList.contains('row__body')) {
+        if (btn.classList.contains('opt')) {
+          btn.setAttribute('aria-pressed',
+            btn.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+          return;
+        }
+      }
+      members.forEach(function (b) { b.setAttribute('aria-pressed', String(b === btn)); });
+    });
+  });
+</script>
+</body>
+</html>

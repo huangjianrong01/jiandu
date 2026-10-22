@@ -1367,13 +1367,13 @@ impl Root {
             .unwrap_or(0)
     }
 
-    /// 设字级档位（样式面板的「小 / 中 / 大 / 特大」）。
+    /// 设字级档位（样式面板的「蝇头 / 中楷 / 大字 / 榜书」）。
     ///
     /// `zoom` 存的是倍率，档位由 `ZoomLevel::from_zoom` 反推，
     /// 所以这里只需把倍率落到该档的 `factor()` 上，排版下一帧自动重算。
     pub fn set_zoom_level(&mut self, lvl: crate::types::ZoomLevel) {
         self.zoom = lvl.factor();
-        self.notice = format!("字级：{}", lvl.label());
+        self.notice = format!("字级：{}（{}）", lvl.ancient_name(), lvl.label());
         self.persist();
     }
 
@@ -2359,7 +2359,7 @@ impl Root {
         self.shelf_batch_confirm = false;
         self.delete_confirm = None;
         self.notice = if self.shelf_manage {
-            "批量管理：点书衣勾选，底部可一次清架".to_string()
+            "整理：点书衣勾选，底部可一次清架（右键任一本也能直接勾选）".to_string()
         } else {
             String::new()
         };
@@ -2384,20 +2384,53 @@ impl Root {
         self.shelf_picked.contains(&idx)
     }
 
-    /// 全选 / 全不选：按**当前筛选后的书目**勾选（看得见的才选）。
-    pub fn pick_all(&mut self, entries: &[(usize, crate::library::ShelfEntry)]) {
-        let all: Vec<usize> = entries.iter().map(|(i, _)| *i).collect();
-        let all_picked = !all.is_empty() && all.iter().all(|i| self.shelf_picked.contains(i));
-        if all_picked {
-            self.shelf_picked.retain(|i| !all.contains(i));
-        } else {
-            for i in all {
-                if !self.shelf_picked.contains(&i) {
-                    self.shelf_picked.push(i);
-                }
-            }
+    /// 右键（或长按）书衣：直接进整理态并勾上这一本。
+    ///
+    /// 「整理」按钮在顶栏最右，容易看漏；书衣上右键是更就手的入口——
+    /// 想删哪本就在哪本上直接动手。
+    pub fn enter_manage_at(&mut self, idx: usize) {
+        if !self.shelf_manage {
+            self.shelf_manage = true;
+            self.shelf_picked.clear();
+        }
+        if !self.shelf_picked.contains(&idx) {
+            self.shelf_picked.push(idx);
             self.shelf_picked.sort_unstable();
         }
+        self.shelf_batch_confirm = false;
+        self.notice = "整理：已勾选此书，可继续点选或批量删除".to_string();
+    }
+
+    /// 反选（只作用于当前筛选出来的书目）：选中的撤掉、没选的勾上。
+    pub fn invert_pick(&mut self, entries: &[(usize, crate::library::ShelfEntry)]) {
+        for (i, _) in entries {
+            match self.shelf_picked.iter().position(|x| x == i) {
+                Some(pos) => {
+                    self.shelf_picked.remove(pos);
+                }
+                None => self.shelf_picked.push(*i),
+            }
+        }
+        self.shelf_picked.sort_unstable();
+        self.shelf_batch_confirm = false;
+    }
+
+    /// 清空勾选（底部栏的「清选」）。
+    pub fn clear_pick(&mut self) {
+        self.shelf_picked.clear();
+        self.shelf_batch_confirm = false;
+    }
+
+    /// 全选：按**当前筛选后的书目**勾选（看得见的才选）。
+    /// 「取消全选 / 反选」各有独立入口（`clear_pick` / `invert_pick`），
+    /// 不在一个按钮里做三态切换——按钮写什么就做什么。
+    pub fn pick_all(&mut self, entries: &[(usize, crate::library::ShelfEntry)]) {
+        for (i, _) in entries {
+            if !self.shelf_picked.contains(i) {
+                self.shelf_picked.push(*i);
+            }
+        }
+        self.shelf_picked.sort_unstable();
         self.shelf_batch_confirm = false;
     }
 

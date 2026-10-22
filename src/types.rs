@@ -344,6 +344,19 @@ impl ZoomLevel {
         }
     }
 
+    /// 样式面板上的**古称**：蝇头 / 中楷 / 大字 / 榜书。
+    ///
+    /// 面板里再写「小 / 中 / 大 / 特大」是尺规语言，写「蝇头 / 榜书」才是
+    /// 书林语言——前者在描述字号，后者在描述一本书的气象。
+    pub fn ancient_name(self) -> &'static str {
+        match self {
+            ZoomLevel::Small => "蝇头",
+            ZoomLevel::Normal => "中楷",
+            ZoomLevel::Large => "大字",
+            ZoomLevel::Huge => "榜书",
+        }
+    }
+
     /// 该档的字号倍率（乘在网格引擎算出的基准字号上）。
     pub fn factor(self) -> f32 {
         match self {
