@@ -426,7 +426,26 @@ fn map_outside_markers(s: &str, f: impl Fn(&str) -> String) -> String {
     out
 }
 
-/// `（…）` → `[注]…[/注]`；不合适时退 `﹁ … ﹂`。
+/// 括注的开括号 → 对应的闭括号（`（）` `()` `［］` `[]` `【】` 五族）。
+fn paren_close(c: char) -> Option<char> {
+    match c {
+        '（' => Some('）'),
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '［' => Some('］'),
+        '【' => Some('】'),
+        _ => None,
+    }
+}
+
+/// 括注 → `[注]…[/注]`（**双行夹注**）；空括号直接删除。
+///
+/// 三条去路（v1.25.0 用户定的口径）：
+/// * **空括号**（`（）` `()` `[]` `【】` 里一个字都没有）→ **整个删掉**：
+///   它只是原书排版留下的空壳，留着就是两个空格子，竖排里格外刺眼；
+/// * 有字、且不超 [`NOTE_MAX_CHARS`] → `[注]…[/注]`，引擎排双行小字；
+/// * 过长的括注 / 套着别的标记 / 括号不配对 → 退竖排双弯引号 `﹁ ﹂`，
+///   **绝不吞掉后文**（这是最容易出的「吃掉半页」事故）。
 fn parens_to_note(s: &str) -> String {
     let cs: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -437,26 +456,25 @@ fn parens_to_note(s: &str) -> String {
             i = end;
             continue;
         }
-        if cs[i] != '（' {
+        let Some(close_ch) = paren_close(cs[i]) else {
             out.push(cs[i]);
             i += 1;
             continue;
-        }
-        // 找配对的 `）`（容许一层嵌套：古籍括注里偶尔再套一个括注）。
+        };
+        let open_ch = cs[i];
+        // 找配对的闭括号（容许同类嵌套：古籍括注里偶尔再套一个括注）。
         let mut depth = 0i32;
         let mut j = i;
         let mut close: Option<usize> = None;
         while j < cs.len() {
-            match cs[j] {
-                '（' => depth += 1,
-                '）' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(j);
-                        break;
-                    }
+            if cs[j] == open_ch {
+                depth += 1;
+            } else if cs[j] == close_ch {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(j);
+                    break;
                 }
-                _ => {}
             }
             j += 1;
         }
@@ -464,10 +482,14 @@ fn parens_to_note(s: &str) -> String {
             Some(k) => {
                 let inner: String = cs[i + 1..k].iter().collect();
                 let inner_t = inner.trim();
-                let ok = !inner_t.is_empty()
-                    && inner_t.chars().count() <= NOTE_MAX_CHARS
+                if inner_t.is_empty() {
+                    // 空括号：连壳一起丢掉。
+                    i = k + 1;
+                    continue;
+                }
+                let ok = inner_t.chars().count() <= NOTE_MAX_CHARS
                     && !inner_t.contains('[')
-                    && !inner_t.contains('（');
+                    && !inner_t.chars().any(|c| paren_close(c).is_some());
                 if ok {
                     out.push_str("[注]");
                     out.push_str(inner_t);
@@ -480,8 +502,13 @@ fn parens_to_note(s: &str) -> String {
                 i = k + 1;
             }
             None => {
-                // 不配对：当单书名式引号用，绝不吞掉后文。
-                out.push('﹁');
+                // 不配对：圆括号退竖排双弯引号；方括号原样留着（它可能
+                // 是残缺的标记，改字反而更难查）。**绝不吞掉后文**。
+                out.push(if open_ch == '（' || open_ch == '(' {
+                    '﹁'
+                } else {
+                    open_ch
+                });
                 i += 1;
             }
         }
@@ -590,10 +617,15 @@ pub fn stage2_numbers(text: &str) -> String {
 // 五、段落与章节重构
 // ------------------------------------------------------------------
 
-/// 阶段五：段落重构 —— 丢页码孤行、压空白、`{ title, content }` 出章。
+/// 阶段五：段落重构 —— 丢页码孤行 / 乱码行、刮孤立数字、压空白、
+/// `{ title, content }` 出章。
 ///
-/// 页码孤行（`1` `12` `· 3 ·` 这类）必须在数字转汉字**之前**认出来丢掉，
-/// 所以它排在这一阶段的最后一步、却是整条链里最晚的一次「还看得见 ASCII」。
+/// 三道过滤的**顺序**是死的：
+///
+/// 1. 整行是不是页码（还看得见 ASCII 数字时判，最准）；
+/// 2. 行内孤立数字（`20161` 这种夹在段中的扫描残渣）——**必须在数字转
+///    汉字之前**，先转成「二〇一六一」就再也认不出了；
+/// 3. 清完只剩标点 / 数字的乱码行。
 pub fn stage5_chapters(chapters: Vec<RawChapter>) -> Vec<RawChapter> {
     let mut out: Vec<RawChapter> = Vec::new();
     for c in chapters {
@@ -603,35 +635,146 @@ pub fn stage5_chapters(chapters: Vec<RawChapter>) -> Vec<RawChapter> {
             if raw.is_empty() || is_page_number(raw) {
                 continue;
             }
-            let l = stage2_numbers(&stage3_punct(raw));
-            let l = squeeze_spaces(&l);
-            if !l.trim().is_empty() {
+            if let Some(l) = clean_line(raw) {
                 lines.push(l);
             }
         }
         if lines.is_empty() {
             continue;
         }
-        out.push(RawChapter::new(
-            squeeze_spaces(&stage2_numbers(&stage3_punct(&c.title))),
-            lines.join("\n"),
-        ));
+        out.push(RawChapter::new(clean_text(&c.title), lines.join("\n")));
     }
     out
 }
 
-/// 是不是一串「横排页码残留」：1~4 位纯数字（可带分隔点）。
+/// 一行正文的完整清洗：刮孤立数字 → 标点古籍化 → 数字转汉字 → 压空白。
+///
+/// 空行 / 乱码行返回 `None`（调用方直接丢）。
+fn clean_line(raw: &str) -> Option<String> {
+    let s = scrub_stray_digits(raw);
+    let s = stage2_numbers(&stage3_punct(&s));
+    let s = squeeze_spaces(&s);
+    let s = s.trim().to_string();
+    if s.is_empty() || is_junk_line(&s) {
+        return None;
+    }
+    Some(s)
+}
+
+/// 一行「短文本」（章题 / 书名用）：不刮数字，只做标点与空白归一。
+fn clean_text(raw: &str) -> String {
+    squeeze_spaces(&stage2_numbers(&stage3_punct(raw)))
+        .trim()
+        .to_string()
+}
+
+/// 是不是一串「横排页码残留」：整行只有数字（可带分隔点 / 括号 / 「第…页」）。
+///
+/// 位数**不设上限**：PDF 转出来的页码常是 `20161`、`20162` 这种「年份前缀
+/// + 页码」的五位串（v1.25.0 用户截图里的正是它），按「1~4 位」判会漏。
+/// 整行只剩数字时，它绝不可能是正文——正文的数总归要挨着汉字。
 fn is_page_number(line: &str) -> bool {
     let t = line.trim();
     let mut digits = 0usize;
     for c in t.chars() {
         if numcn::is_digit(c) {
             digits += 1;
-        } else if !matches!(c, '·' | '-' | '—' | '.' | ' ') {
+        } else if !matches!(
+            c,
+            '·' | '-' | '—' | '.' | ' ' | '[' | ']' | '（' | '）' | '(' | ')' | '第' | '页' | '／'
+                | '/'
+        ) {
             return false;
         }
     }
-    digits > 0 && digits <= 4
+    digits > 0
+}
+
+/// 只剩标点 / 数字的「乱码行」：`·`、`——`、`，，`、`[]`、`[〕`。
+///
+/// 逐字判定：只要出现任何一个汉字 / 西文字母，它就不是乱码行。
+fn is_junk_line(s: &str) -> bool {
+    let mut any = false;
+    for c in s.chars() {
+        if c.is_whitespace() || numcn::is_transparent(c) {
+            continue;
+        }
+        if numcn::is_digit(c)
+            || crate::types::is_punct(c)
+            || matches!(
+                c,
+                '·' | '—' | '―' | '…' | '︙' | '︱' | '﹁' | '﹂' | '﹃' | '﹄'
+                    | '(' | ')' | '[' | ']' | '{' | '}' | '【' | '】' | '「' | '」' | '『' | '』'
+                    | '《' | '》' | '〈' | '〉'
+            )
+        {
+            any = true;
+            continue;
+        }
+        return false;
+    }
+    any
+}
+
+/// 剔除正文里**孤立**的阿拉伯数字（扫描残渣 / 行号 / 页眉角标）。
+///
+/// 「孤立」的判据只有一条：**数字串两侧都不挨汉字**。
+///
+/// * `20161` 独自立在段中 / 行末（两侧是空白或标点）→ 扫描页码，删；
+/// * `· 7 ·`、`12`、`3.` → 同为页眉角标，删；
+/// * `第3章`、`共15卷`、`1980年代` → 两侧有汉字（或数字本身粘着「年」），
+///   是正文里的数，**留给 `stage2_numbers` 转汉字**。
+///
+/// 为什么必须先刮再转：`20161` 一旦被读成「二〇一六一」，下游就再也
+/// 认不出它原本是页码了（这一条是踩过的坑）。
+fn scrub_stray_digits(line: &str) -> String {
+    let cs: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0usize;
+    while i < cs.len() {
+        if let Some(end) = marker_end(&cs, i) {
+            out.extend(&cs[i..end]);
+            i = end;
+            continue;
+        }
+        if !numcn::is_digit(cs[i]) {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        let (len, _digits) = numcn::scan_run(&cs, i);
+        if len == 0 {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        let before = cs[..i]
+            .iter()
+            .rev()
+            .find(|c| !c.is_whitespace() && !numcn::is_transparent(**c))
+            .copied();
+        let after = cs[i + len..]
+            .iter()
+            .find(|c| !c.is_whitespace() && !numcn::is_transparent(**c))
+            .copied();
+        let attached = before.map(crate::west::is_cjk).unwrap_or(false)
+            || after.map(crate::west::is_cjk).unwrap_or(false);
+        // 行尾孤零零的一串数字（后面只剩空白 / 标点）：扫描页码的典型位置，
+        // 即便前面紧挨着汉字也删——`…许 20161` 里的 20161 绝不是正文。
+        let at_tail = cs[i + len..]
+            .iter()
+            .all(|c| c.is_whitespace() || crate::types::is_punct(*c))
+            // 带小数点的串不是页码（`圆周率3.14` 恰好也在行尾）。
+            && !cs[i..i + len].iter().any(|c| matches!(c, '.' | '．'));
+        if !attached || at_tail {
+            // 孤立数字：整串删掉（含尾随的零宽字符）。
+            i += len;
+            continue;
+        }
+        out.extend(&cs[i..i + len]);
+        i += len;
+    }
+    out
 }
 
 /// 压空白：把连续空白 / 软换行 / 零宽字符收成一个。
@@ -674,6 +817,202 @@ fn squeeze_spaces(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+// ------------------------------------------------------------------
+// 六、书级清洗（跨章：书眉 / 元数据）
+// ------------------------------------------------------------------
+
+/// 书眉短行的长度上限（字）：再长的「重复行」是正文（诗里的叠句），不动。
+const HEAD_MAX_CHARS: usize = 30;
+/// 「同一行重复多少次才算书眉」：OCR 的书眉几乎是每页一条。
+const HEAD_MIN_REPEAT: usize = 3;
+
+/// **书级清洗**：把「页眉 / 书口文字」从章题与正文里赶出去。
+///
+/// 电子书的每一页顶端都印着同一行书眉（`历代名家词集精华录卷十九`），
+/// PDF/OCR 转 EPUB 时它被当成正文段落抓进来，于是竖排以后：
+///
+/// * 章题成了「历代名家词集精华录卷十九」——版心（章题列）里赫然一行
+///   书眉，读者以为是书名，其实是每页都重复的那行废字；
+/// * 正文里每隔几十行就冒出一遍同样的字，把行气割断。
+///
+/// 两道处理：
+///
+/// 1. **章题**：剥掉书名前缀与「卷十九」这类卷次尾巴（卷次由引擎自己按
+///    章序生成，书里那一份一律不要）；
+/// 2. **正文**：整段去标点后重复 ≥ [`HEAD_MIN_REPEAT`] 次、且形态像书眉
+///    （以书名开头，或末尾挂「卷 + 数词」）的短段，整段删除。
+///
+/// 只删「重复 + 像书眉」两条同时成立的段，宁可漏删也不误伤正文
+/// （诗里的叠句、经文的复句都可能重复出现，但它们不含书名、也不以卷次结尾）。
+pub fn purge_running_headers(chapters: &mut Vec<crate::types::Chapter>, book_title: &str) {
+    let book = clean_book_title(book_title);
+    for c in chapters.iter_mut() {
+        c.title = strip_head_noise(&c.title, &book);
+    }
+    // 统计短段出现次数（去标点、去空白后比对，OCR 的空格抖动不影响）。
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    for c in chapters.iter() {
+        for p in &c.paragraphs {
+            let k = norm_key(&p.text);
+            if !k.is_empty() && k.chars().count() <= HEAD_MAX_CHARS {
+                *freq.entry(k).or_insert(0) += 1;
+            }
+        }
+    }
+    for c in chapters.iter_mut() {
+        c.paragraphs.retain(|p| {
+            let k = norm_key(&p.text);
+            let n = freq.get(&k).copied().unwrap_or(0);
+            // 两种都算书眉：① 重复 ≥3 次的短行；② **以书名开头的短行**
+            // （书名不会是一句正文，只要开头撞上就够定罪——短书里书眉
+            // 可能只出现一两次，靠重复次数抓不住）。
+            let repeated = n >= HEAD_MIN_REPEAT;
+            let titled = starts_with_book(&k, &book);
+            !(looks_like_running_head(&k, &book) && (repeated || titled))
+        });
+    }
+    chapters.retain(|c| !c.paragraphs.is_empty());
+}
+
+/// 书名清洗：去书名号、截掉书眉污染（`卷十九` / `（全二册）` / 页码）。
+///
+/// 版心只有一格宽，书名多一个字就挤掉一个卷次；而 `dc:title` 里常带着
+/// 「历代名家词集精华录卷十九」这种整条书眉——从「卷」「册」「（」处截断。
+pub fn clean_book_title(raw: &str) -> String {
+    let t: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '《' | '》' | '〈' | '〉' | '【' | '】' | '「' | '」'))
+        .collect();
+    let t = squeeze_spaces(&t);
+    let cut = t
+        .char_indices()
+        .find(|(_, c)| matches!(c, '卷' | '册' | '冊' | '（' | '(' | '：' | ':' | '·'))
+        .map(|(i, _)| i)
+        .unwrap_or(t.len());
+    let head = t[..cut].trim().to_string();
+    if head.chars().count() >= 2 {
+        head
+    } else {
+        t.trim().to_string()
+    }
+}
+
+/// 章题清洗：剥书名前缀 + 卷次尾巴；剥空了就留空（版心自有卷次）。
+///
+/// `…精华录卷十九　湘云遗稿` → `湘云遗稿`；`卷二` → 空。
+fn strip_head_noise(title: &str, book: &str) -> String {
+    let mut t = title.trim().to_string();
+    if book.chars().count() >= 4 {
+        t = t.replace(book, "");
+    }
+    let cs: Vec<char> = t.trim().chars().collect();
+    // 剥「卷 + 数词」前缀（`卷十九　湘云遗稿`）：书眉总把卷次顶在题名前面。
+    let mut i = 0usize;
+    if i < cs.len() && matches!(cs[i], '卷' | '第' | '之') {
+        i += 1;
+    }
+    let num_from = i;
+    while i < cs.len() && (numcn::is_digit(cs[i]) || is_han_numeral(cs[i])) {
+        i += 1;
+    }
+    if i > num_from {
+        let mut j = i;
+        while j < cs.len() && (cs[j].is_whitespace() || matches!(cs[j], '·' | '　')) {
+            j += 1;
+        }
+        // 数词后**紧贴着文字**（`第一章　道可道`）——这不是卷次前缀，不动。
+        let tight = j == i && j < cs.len();
+        if !tight {
+            let rest: String = cs[j..].iter().collect();
+            let rest = rest.trim().trim_end_matches(['卷', '冊', '册']).trim();
+            return rest.to_string();
+        }
+    }
+    t.trim().to_string()
+}
+
+/// 去标点 / 空白后的比对键（OCR 的空格抖动不该影响「是不是同一行」）。
+fn norm_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && !crate::types::is_punct(*c))
+        .filter(|c| !matches!(c, '[' | ']' | '﹁' | '﹂' | '︽' | '︾' | '︙' | '︱'))
+        .collect()
+}
+
+/// 像不像书眉：以书名开头，或以「卷 + 数词」结尾。
+fn looks_like_running_head(t: &str, book: &str) -> bool {
+    if t.is_empty() {
+        return false;
+    }
+    if starts_with_book(t, book) {
+        return true;
+    }
+    ends_with_juan(t)
+}
+
+/// 这一行是不是「书名 + 卷次」的书眉（书名 ≥4 字才算数）。
+///
+/// 只看「以书名开头」会误伤——序跋里常有 `红楼梦第一回……` 这种正文；
+/// 故要求书名之后**只剩一小截**，且其中带卷次（`卷十九` / `十二册`）
+/// 或整截都是数词。
+fn starts_with_book(t: &str, book: &str) -> bool {
+    let bn = book.chars().count();
+    if bn < 4 || !t.starts_with(book) {
+        return false;
+    }
+    let rest: String = t.chars().skip(bn).collect();
+    rest.is_empty()
+        || (rest.chars().count() <= 12
+            && (rest.contains('卷')
+                || rest.contains('册')
+                || rest.contains('冊')
+                || rest
+                    .chars()
+                    .all(|c| is_han_numeral(c) || numcn::is_digit(c))))
+}
+
+/// 末尾是不是「卷 + 数词」（`…卷十九`、`…卷之三`、`…十二册`）。
+fn ends_with_juan(t: &str) -> bool {
+    let cs: Vec<char> = t.chars().collect();
+    let mut i = cs.len();
+    while i > 0 && (is_han_numeral(cs[i - 1]) || cs[i - 1] == '之') {
+        i -= 1;
+    }
+    i < cs.len() && i > 0 && matches!(cs[i - 1], '卷' | '冊' | '册' | '集' | '部')
+}
+
+/// 汉字数词（含〇零两）。
+fn is_han_numeral(c: char) -> bool {
+    matches!(
+        c,
+        '〇' | '零'
+            | '一'
+            | '二'
+            | '三'
+            | '四'
+            | '五'
+            | '六'
+            | '七'
+            | '八'
+            | '九'
+            | '十'
+            | '百'
+            | '千'
+            | '万'
+            | '两'
+            | '壹'
+            | '贰'
+            | '叁'
+            | '肆'
+            | '伍'
+            | '陆'
+            | '柒'
+            | '捌'
+            | '玖'
+            | '拾'
+    )
 }
 
 // ------------------------------------------------------------------
@@ -1109,14 +1448,29 @@ mod tests {
 
     #[test]
     fn stage3_unfit_parens_fall_back_to_corner_quotes() {
-        // 空括注 / 超长括注：不转夹注，改竖排双弯引号。
-        assert_eq!(stage3_punct("曰（）者"), "曰﹁﹂者");
+        // **空括号：连壳一起丢掉**（v1.25.0 用户指定的口径）。
+        assert_eq!(stage3_punct("曰（）者"), "曰者");
+        assert_eq!(stage3_punct("曰[]者"), "曰者");
+        assert_eq!(stage3_punct("曰【】者"), "曰者");
+        // 半角空括号同样命中（先全角化）。
+        assert_eq!(stage3_punct("曰()者"), "曰者");
+        // 超长括注：不转夹注，改竖排双弯引号。
         let long = "甲".repeat(NOTE_MAX_CHARS + 1);
         let out = stage3_punct(&format!("曰（{long}）者"));
         assert!(out.contains('﹁') && out.contains('﹂'), "{out}");
         // 不配对也绝不吞后文。
         let out = stage3_punct("曰（未闭合而后文很长");
         assert!(out.contains("未闭合而后文很长"), "{out}");
+    }
+
+    #[test]
+    fn stage3_square_and_lenticular_brackets_become_notes() {
+        // 方括号 / 六角括号里的字也是括注——一律转双行夹注，不留方括号。
+        assert_eq!(stage3_punct("天[自然也]"), "天[注]自然也[/注]");
+        assert_eq!(stage3_punct("天【自然也】"), "天[注]自然也[/注]");
+        // 但**自己的标记**不能被当成括注再套一层。
+        assert_eq!(stage3_punct("玄[拼音:xuán]"), "玄[拼音:xuán]");
+        assert_eq!(stage3_punct("甲[注]乙[/注]丙"), "甲[注]乙[/注]丙");
     }
 
     #[test]
@@ -1171,9 +1525,118 @@ mod tests {
         assert!(c.content.contains("二二三年"), "{}", c.content);
         assert!(c.content.contains("︽道德经︾"), "{}", c.content);
         assert!(c.content.contains("[注]此说出自史记。[/注]"), "{}", c.content);
-        // 14428 已转汉字，孤行 7 被当页码丢掉。
-        assert!(c.content.contains("一四四二八"), "{}", c.content);
+        // v1.25.0：孤立的 `14428` 与孤行 `7` 都按「扫描页码」丢弃——
+        // 正文的数必须挨着汉字（`共15卷` → `共十五卷`）才算数。
+        assert!(!c.content.contains("一四四二八"), "孤立数字应删：{}", c.content);
+        assert!(!c.content.contains("14428"), "{}", c.content);
         assert!(!c.content.lines().any(|l| l.trim() == "七"), "{}", c.content);
         assert!(c.content.contains('\n'), "段间应有换行：{}", c.content);
+    }
+
+    #[test]
+    fn page_numbers_of_any_length_are_dropped() {
+        // 用户截图里的 `20161` / `20162`：五位页码，按位数上限判会漏。
+        assert!(is_page_number("20161"));
+        assert!(is_page_number("20162"));
+        assert!(is_page_number("· 3 ·"));
+        assert!(is_page_number("第 12 页"));
+        assert!(!is_page_number("十二"));
+        assert!(!is_page_number("道可道"));
+
+        let out = stage5_chapters(vec![RawChapter::new(
+            "卷一",
+            "见牡丹盛开有感\n20161\n又一首\n20162\n",
+        )]);
+        assert!(!out[0].content.contains("二〇一六一"), "{}", out[0].content);
+        assert!(!out[0].content.contains("2016"), "{}", out[0].content);
+        assert_eq!(out[0].content.lines().count(), 2, "{}", out[0].content);
+    }
+
+    #[test]
+    fn stray_digits_are_scraped_only_when_isolated() {
+        // 两侧都不挨汉字 → 扫描残渣，删。
+        assert_eq!(scrub_stray_digits("见牡丹盛开 20161 "), "见牡丹盛开  ");
+        assert_eq!(scrub_stray_digits("· 7 ·"), "·  ·");
+        // 行尾的孤串（后面只剩标点空白）也删：扫描页码的典型位置。
+        assert_eq!(scrub_stray_digits("空余许 20161，"), "空余许 ，");
+        // 挨着汉字、又在句中 → 正文里的数，留给数字清洗。
+        assert_eq!(scrub_stray_digits("第3章"), "第3章");
+        assert_eq!(scrub_stray_digits("共15卷"), "共15卷");
+        assert_eq!(scrub_stray_digits("全书1980页"), "全书1980页");
+        assert_eq!(
+            scrub_stray_digits("见牡丹盛开 20161 有感"),
+            "见牡丹盛开 20161 有感",
+            "句中且两侧有汉字，不敢动"
+        );
+        // 小数是整串（`3.14` 一起判），不拆。
+        assert_eq!(scrub_stray_digits("圆周率3.14"), "圆周率3.14");
+        // 已入标记的数字不动（`[数字:20161]` 是兜底产物，另由下游去壳）。
+        assert_eq!(scrub_stray_digits("甲[数字:20161]乙"), "甲[数字:20161]乙");
+    }
+
+    #[test]
+    fn junk_lines_are_dropped() {
+        let out = stage5_chapters(vec![RawChapter::new("卷一", "正文一句\n·\n，，\n[]\n")]);
+        assert_eq!(out[0].content, "正文一句");
+    }
+
+    #[test]
+    fn running_heads_are_purged_book_wide() {
+        use crate::types::{Chapter, Paragraph};
+        let head = "历代名家词集精华录卷十九".to_string();
+        let mut chapters = vec![
+            Chapter {
+                title: head.clone(),
+                paragraphs: vec![
+                    Paragraph::plain(head.clone()),
+                    Paragraph::plain("燕燕于飞差池其羽"),
+                    Paragraph::plain(head.clone()),
+                ],
+            },
+            Chapter {
+                title: format!("{head}　湘云遗稿"),
+                paragraphs: vec![
+                    Paragraph::plain(head.clone()),
+                    Paragraph::plain("湘云遗稿二卷"),
+                    Paragraph::plain("买陂塘旋栽杨柳"),
+                ],
+            },
+            Chapter {
+                title: "卷二".into(),
+                paragraphs: vec![
+                    Paragraph::plain(head.clone()),
+                    Paragraph::plain("依稀淮岸江皋"),
+                ],
+            },
+        ];
+        purge_running_headers(&mut chapters, "历代名家词集精华录");
+        // 每一条书眉都清干净了。
+        for c in &chapters {
+            assert!(
+                !c.paragraphs.iter().any(|p| p.text.contains("精华录")),
+                "书眉未清：{:?}",
+                c.paragraphs
+            );
+        }
+        // 章题剥掉书名与卷次。
+        assert_eq!(chapters[0].title, "");
+        assert_eq!(chapters[1].title, "湘云遗稿");
+        assert_eq!(chapters[2].title, "");
+        // 正文一句不丢。
+        assert!(chapters.iter().any(|c| c
+            .paragraphs
+            .iter()
+            .any(|p| p.text == "买陂塘旋栽杨柳")));
+    }
+
+    #[test]
+    fn book_title_is_trimmed_at_the_juan() {
+        assert_eq!(
+            clean_book_title("《历代名家词集精华录》卷十九"),
+            "历代名家词集精华录"
+        );
+        assert_eq!(clean_book_title("宋词三百首（全二册）"), "宋词三百首");
+        // 短名不受影响。
+        assert_eq!(clean_book_title("道德经"), "道德经");
     }
 }

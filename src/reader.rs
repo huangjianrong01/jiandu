@@ -3094,10 +3094,11 @@ impl Root {
         // 不会超过一列容量，这里的 hidden 只是兜底）。
         let floor = if columns >= 10 { 10.0 } else { 7.0 };
         let nfs = ((fs * 0.5).max(floor)).min(row_h.max(7.0));
-        // 左侧留白：一道格宽 1/6 的空带，两个小列压缩进余下宽度，
-        // 右缘仍贴列右缘——夹注因此嵌在正文列里，不与界行齐平。
+        // **双行小字**：两个半宽小列，**各占 50%**（v1.25.0 用户指定）——
+        // 右列读在前、左列续后，合起来正好铺满一个正文列的宽度，注块与
+        // 上下正文同宽同界，行气才接得上（原先左缘留 1/6 空白、两列偏右）。
         let pad = cell_w * crate::gloss::NOTE_PAD_RATIO;
-        let sub_w = (cell_w - pad) / 2.0;
+        let sub_w = cell_w * 0.5;
         // 注文小字色：墨色 × 纸色自动推导（永远比正文淡一档）。
         // **用户自加夹注例外**：改深朱砂红（#C62828），与原本夹注一眼可辨。
         let note_color = if is_user {
@@ -3367,17 +3368,19 @@ impl Root {
         // 与纸面同高：上下留白 16、版框双边 3+3、框内留边 3+3、内栏线 1+1，
         // 再加行格与地脚——和 `render_ancient` 里那张纸严丝合缝。
         let h = 16.0 * 2.0 + 14.0 + cell_h * self.grid_rows as f32 + foot_h;
-        // 天头：留约三成字高，上鱼尾才落在版心上部而不是贴着内框。
-        let head = cell_h * 0.30;
+        // 天头：黑口（粗黑块）之下再留一成字高，上鱼尾才落在版心上部
+        // 而不是贴着黑口——本子的书口是「黑口 → 鱼尾 → 书名」三层。
+        let heikou = crate::banxin::heikou_h(cell_h);
+        let head = heikou + cell_h * 0.14;
         // 书口文字：书名（去括号）、卷次「卷五十一」、叶码「五十」。
         let book = self.book_title();
         let juan = format!("卷{}", han_num(chapter + 1));
         let page = han_num(page_idx + 1);
         let lay = crate::banxin::layout(crate::banxin::BanxinOpts {
             gutter_w: gw,
-            // 可用高 = 纸高 − 上下留白(20×2) − 天头；`banxin::layout`
-            // 再扣两枚鱼尾与朱印，剩下的才是文字。
-            band_h: (h - 40.0 - head).max(40.0),
+            // 可用高 = 纸高 − 上下留白(20×2) − 天头（含上黑口）− 下黑口；
+            // `banxin::layout` 再扣两枚鱼尾与朱印，剩下的才是文字。
+            band_h: (h - 40.0 - head - heikou).max(40.0),
             cell_h,
             fs,
             book: &book,
@@ -3459,6 +3462,26 @@ impl Root {
         // 下外框粗线 / 下内框细线
         col = col.child(edge(false, 3.0, 16.0));
         col = col.child(edge(false, 1.0, 22.0));
+        // **黑口**：版心最顶 / 最底各一道粗黑块（大黑口本子）。位置紧贴
+        // 内框细线之内（22px），宽度占满整列书口——它就是纸对折处露出的
+        // 那道墨，翻书时一眼定位。墨色与鱼尾同源（`fish_ink`），深底主题
+        // 下会自动提亮，不会变成一块看不见的黑。
+        let heikou_block = |top: bool| -> Div {
+            let mut b = div()
+                .absolute()
+                .left(px(0.0))
+                .right(px(0.0))
+                .h(px(heikou))
+                .bg(rgb(t.fish_ink()));
+            b = if top {
+                b.top(px(22.0))
+            } else {
+                b.bottom(px(22.0))
+            };
+            b
+        };
+        col = col.child(heikou_block(true));
+        col = col.child(heikou_block(false));
         col = col.child(div().h(px(head)));
         // 上鱼尾：凹口朝下（直线多边形，深灰 `#333333`，见 `banxin_tail`）。
         // 尺寸由 `banxin::layout` 按「宽不越界栏、高约 1.2 倍行高」算好。
@@ -3484,6 +3507,8 @@ impl Root {
             col = col.child(div().h(px(lay.gap)));
             col = col.child(banxin_seal(gw * 0.80, gw * 1.60));
         }
+        // 下黑口的占位：与上黑口对称，别让朱印压在墨块上。
+        col = col.child(div().h(px(heikou)));
         col
     }
 
@@ -3699,13 +3724,13 @@ impl Root {
         block
     }
 
-    /// 一枚句读的落位：**字号 × 0.5、起点偏移到字格右下角、色取淡朱**。
+    /// 一枚句读的落位：**字号 × 0.4、起点偏移到字格右下角、色取淡朱**。
     ///
     /// 竖排里「右」是上一列那一侧、「下」是读序前进的方向，故右下角正是
     /// 刻本句读的位置——它跟着读序贴在字的行进前方，既不挡字也不占位。
     ///
     /// 几何全在 `punct::place`（纯函数，字号与偏移的唯一来源）：
-    /// `fs = 正文 × 0.5`、`dx = 格宽 × 0.3`、`dy = 格高 × 0.3`。
+    /// `fs = 正文 × 0.4`、`dx = 格宽 × 0.3`、`dy = 格高 × 0.3`。
     /// 颜色是「朱砂兑纸色」的淡朱（比正文轻，却仍是句读的朱意），两套
     /// 深浅主题都稳——用兑色而非 opacity，不依赖底色透出来。
     fn punct_overlay(&self, ch: char, cell_w: f32, cell_h: f32, fs: f32, back: bool) -> Div {
@@ -3953,8 +3978,33 @@ impl Root {
                     .text_color(rgb(ink))
                     .child(SharedString::from(vp.to_string())),
             );
+        } else if crate::types::is_title_mark(g.ch) {
+            // **书名号**：强制 `︽ ︾`（竖排专用字形），字号 **0.8 倍**正文
+            // （`punct::TITLE_FS_RATIO`）。它包着一整串书名，既不能按句读
+            // 印成 0.4 倍的小点，也不该与正文齐平——矮一头才像刻本。
+            let tf = (fs * crate::punct::TITLE_FS_RATIO).max(9.0).min(cell_h);
+            cell = cell.child(
+                div()
+                    .text_size(px(tf))
+                    .text_color(rgb(ink))
+                    .child(SharedString::from(
+                        crate::types::title_mark(g.ch).to_string(),
+                    )),
+            );
+        } else if crate::types::is_quote_mark(g.ch) {
+            // **直角引号**：竖排里要旋转 90°（开口朝下）。GPUI 0.2.2 没有
+            // 元素级旋转变换，直接用 Unicode 竖排呈现形 `﹁ ﹂ ﹃ ﹄`
+            // ——字库里存的就是转好的那一枚。
+            cell = cell.child(
+                div()
+                    .text_size(px(fs.min(cell_h)))
+                    .text_color(rgb(ink))
+                    .child(SharedString::from(
+                        crate::types::vertical_quote(g.ch).to_string(),
+                    )),
+            );
         } else if is_punct(g.ch) {
-            // 句读（标点）：**正文字号 × 0.5**，起点偏移到字格右下角
+            // 句读（标点）：**正文字号 × 0.4**，起点偏移到字格右下角
             // （x + 格宽×0.3、y + 格高×0.3），格心整个让给正文。
             // 几何全在 `punct::place`（纯函数、有单测），这里只照抄。
             cell = cell

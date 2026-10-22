@@ -565,7 +565,11 @@ pub fn import_epub(path: &Path) -> Result<Book> {
         .ok_or_else(|| anyhow!("container.xml 里没有 full-path"))?;
 
     let opf = read_zip_text(&mut zip, &opf_path).context("读取 OPF 失败")?;
-    let title = extract_tag_text(&opf, "dc:title").unwrap_or_else(|| file_stem(path));
+    // 书名先过一道清洗：`dc:title` 里常带着整条书眉（`…精华录卷十九`），
+    // 版心只有一格宽，多一个字就挤掉一个卷次。
+    let title = crate::vclean::clean_book_title(
+        &extract_tag_text(&opf, "dc:title").unwrap_or_else(|| file_stem(path)),
+    );
     let author = extract_tag_text(&opf, "dc:creator").unwrap_or_default();
 
     let base_dir = {
@@ -589,7 +593,7 @@ pub fn import_epub(path: &Path) -> Result<Book> {
         .collect();
 
     let mut book = Book::new(title.clone(), author);
-    book.cover.title = title;
+    book.cover.title = title.clone();
 
     // ---- 先按 spine 顺序抽出正文 ----
     let mut ordered: Vec<String> = Vec::new();
@@ -660,6 +664,11 @@ pub fn import_epub(path: &Path) -> Result<Book> {
     if book.chapters.is_empty() {
         return Err(anyhow!("epub 中未解析出正文"));
     }
+
+    // ---- 书级清洗：书眉 / 书口文字逐章赶出去（跨章才能判「重复」）----
+    // 章题剥掉书名前缀与卷次尾巴；正文里重复出现的书眉段整段删除。
+    // 版心（中缝 / 章题列）从此只渲染引擎自己算出来的书名、卷次、叶码。
+    crate::vclean::purge_running_headers(&mut book.chapters, &title);
 
     // ---- 再解析目录：EPUB3 nav 优先，回退 EPUB2 ncx ----
     let nav_href = items

@@ -57,6 +57,9 @@
   /** 零宽 / 不可见字符（EPUB 常在数字间塞 `&#8203;`，不能算断开）。 */
   const TRANSPARENT = /[\u200B\u200C\u200D\uFEFF\u00AD\u2060]/;
 
+  /** 句读 / 括号 / 引号一类「非文字」记号（判乱码行用）。 */
+  const PUNCT = /[，。、；：？！…—―·"'“”‘’「」『』﹁﹂﹃﹄（）()［］\[\]【】《》〈〉︽︾︿﹀︙︱·]/;
+
   /** 一个数字串最多允许转汉字：更长的（ISBN / 时间戳）只包标记、不转。 */
   const MAX_DIGITS = 6;
 
@@ -264,27 +267,34 @@
   const NOTE_MAX_CHARS = 60;
 
   /**
-   * 阶段三之一：`（…）` → `[注]…[/注]`（双行夹注）。
+   * 阶段三之一：括注 → `[注]…[/注]`（双行夹注）；空括号直接删除。
    *
-   * 三条「不转」的底线——转错了比不转更难看：
-   *   · 空括注 / 超过 60 字：排成双行小字要吃掉半列，退回竖排双弯引号 ﹁ ﹂；
-   *   · 括注里套着别的标记（`[`）：已经结构化过，不再套一层；
-   *   · 括号不配对：只把孤括号换成 ﹁ / ﹂，**绝不吞掉后文**。
+   * 五族括号一视同仁：`（）` `()` `[]` `［］` `【】`（`()` 会先被全角化成 `（）`）。
+   *
+   * 三条去路（v1.25.0 口径）：
+   *   · **空括号**（`（）` `[]` `【】` 里一个字都没有）→ **整个删掉**：
+   *     它只是排版留下的空壳，竖排里就是两个空格子；
+   *   · 有字且 ≤ 60 字 → `[注]…[/注]`；
+   *   · 超长 / 套着别的标记 / 不配对 → 退竖排双弯引号 ﹁ ﹂，**绝不吞后文**。
    *
    * @example parensToNote('道可道（可以说出的道）非常道')
    *          // '道可道[注]可以说出的道[/注]非常道'
-   * @example parensToNote('曰（）者')  // '曰﹁﹂者'
+   * @example parensToNote('曰（）者')   // '曰者'
+   * @example parensToNote('天[自然也]') // '天[注]自然也[/注]'
    */
   function parensToNote(text) {
     return outsideMarkers(text, (seg) =>
       seg
-        // 一行正则搞定「非空、无嵌套、≤60 字」的括注。
-        .replace(/[（(]([^（）()]{1,60})[）)]/g, (m, inner) => {
+        // 一行正则收「非空、无嵌套、≤60 字」的括注（五族括号都算）。
+        .replace(/[（(［【\[]([^（）()［］【】\[\]]{1,60})[）)］】\]]/g, (m, inner) => {
           const t = inner.trim();
-          if (!t || t.includes('[')) return '﹁' + inner + '﹂';
+          if (!t) return ''; // 空壳：连括号一起丢掉
+          if (t.includes('[')) return '﹁' + inner + '﹂';
           return '[注]' + t + '[/注]';
         })
-        // 剩下的（空、嵌套、不配对）一律退竖排双弯引号。
+        // 剩下的空括号（`（）` `[]`）：整对删掉，不留空格子。
+        .replace(/[（(［【\[]\s*[）)］】\]]/g, '')
+        // 不配对的圆括号退竖排双弯引号；残缺方括号原样留着（可能是坏标记）。
         .replace(/[（(]/g, '﹁')
         .replace(/[）)]/g, '﹂')
     );
@@ -535,27 +545,84 @@
     return /\b(title|booktitle|chapter-title|chaptertitle|chapter_title|headline)\b/i.test(el.getAttribute('class') || '');
   }
 
-  /** 横排页码残留：1~4 位纯数字（可带分隔点）。 */
+  /**
+   * 横排页码残留：整行只有数字（可带 `· - — . 空格 [ ] （） 第…页` 装饰）。
+   *
+   * **位数不设上限**——PDF 转 EPUB 的页码常是 `20161`、`20162` 这种
+   * 「年份前缀 + 页码」的五位串，按「1~4 位」判会漏一大片。
+   */
   function isPageNumber(line) {
     const t = line.trim();
     let digits = 0;
     for (const c of t) {
       if (isDigit(c)) digits++;
-      else if (!'·-—. '.includes(c)) return false;
+      else if (!'·-—. []（）()第页/／'.includes(c)) return false;
     }
-    return digits > 0 && digits <= 4;
+    return digits > 0;
+  }
+
+  /** 只剩标点 / 数字的乱码行：`·`、`——`、`[]`、`[〕`。 */
+  function isJunkLine(s) {
+    let any = false;
+    for (const c of s) {
+      if (/\s/.test(c) || TRANSPARENT.test(c)) continue;
+      if (isDigit(c) || PUNCT.test(c)) {
+        any = true;
+        continue;
+      }
+      return false;
+    }
+    return any;
+  }
+
+  /**
+   * **剔除正文里孤立的阿拉伯数字**（扫描残渣 / 行号 / 页眉角标）。
+   *
+   * 「孤立」只有一条判据：**数字串两侧都不挨汉字**。
+   *
+   *   '20161'          两侧是边界          → 删（扫描页码）
+   *   '· 7 ·'          两侧是标点 / 空白     → 删（页眉角标）
+   *   '第3章'  '共15卷' 一侧挨着汉字          → 留（交给 cleanNumbers）
+   *   '圆周率3.14'      '3.14' 是整串，左侧挨「率」→ 留
+   *
+   * 顺序铁律：**必须先刮再转**——`20161` 一旦读成「二〇一六一」，
+   * 下游就再也认不出它是页码了。
+   *
+   * @example scrubStrayDigits('见牡丹盛开采撷 20161 有感')  // '见牡丹盛开采撷 有感'
+   * @example scrubStrayDigits('全书共14428字')              // 原样（两侧有汉字）
+   */
+  function scrubStrayDigits(line) {
+    return outsideMarkers(line, (seg) =>
+      seg.replace(/[0-9０-９]+(?:[.,．·][0-9０-９]+)*/g, (run, at, whole) => {
+        const before = whole.slice(0, at).replace(/\s+$/, '').slice(-1);
+        const tailRaw = whole.slice(at + run.length);
+        const after = tailRaw.replace(/^\s+/, '').slice(0, 1);
+        const attach = (c) => !!c && isCJK(c);
+        if (attach(before) || attach(after)) {
+          // 行尾孤零零的一串（后面只剩空白 / 标点）：扫描页码的典型位置，
+          // 即便前面紧挨着汉字也删。带小数点的不是页码。
+          const atTail = /^[\s，。、；：？！…—·「」『』﹁﹂【】︽︾︙︱]*$/.test(tailRaw);
+          if (atTail && !/[.．]/.test(run)) return '';
+          return run;
+        }
+        return ''; // 两侧都不挨汉字 → 孤立数字，整串删掉
+      })
+    );
   }
 
   /**
    * 阶段五：段落重构。
    *
-   * 页码孤行必须在数字转汉字**之前**认出来丢掉——先把 `12` 读成「十二」，
-   * 下游就再也看不出这行原本是个页码了。
+   * 三道过滤的**顺序**是死的：
+   *   1. 整行是页码（还看得见 ASCII 时判最准）→ 丢；
+   *   2. 行内孤立数字（`20161`）**先刮再转**——先读成「二〇一六一」就认不出了；
+   *   3. 清完只剩标点 / 数字的乱码行 → 丢。
    */
   function stageParagraph(raw) {
     const line = raw.trim();
     if (!line || isPageNumber(line)) return '';
-    return squeezeSpaces(cleanNumbers(classicizePunct(line)));
+    const out = squeezeSpaces(cleanNumbers(classicizePunct(scrubStrayDigits(line))));
+    return isJunkLine(out) ? '' : out;
   }
 
   /** 走一遍 DOM，按题署切章。 */
@@ -595,6 +662,162 @@
     walk(doc.body || doc.documentElement);
     flush();
     return out.filter((c) => c.content.trim());
+  }
+
+  // =========================================================================
+  // 5.5 书级清洗：书眉 / 书口文字（跨章才判得出「重复」）
+  // =========================================================================
+
+  const HEAD_MAX_CHARS = 30;
+  const HEAD_MIN_REPEAT = 3;
+
+  /** 汉字数词（含〇零两与大写）。 */
+  const HAN_NUMERAL = /[〇零一二三四五六七八九十百千万两壹贰叁肆伍陆柒捌玖拾]/;
+
+  /**
+   * **书级清洗**：把「页眉 / 书口文字」从章题与正文里赶出去。
+   *
+   * 电子书每页顶端都印着同一行书眉（`历代名家词集精华录卷十九`），
+   * PDF/OCR 转 EPUB 时被当成正文段落抓进来——竖排以后，章题列（版心）
+   * 里赫然一行书眉，正文每隔几十行又冒一遍。
+   *
+   * 两道处理：
+   *   ① 章题：剥书名前缀与「卷十九」这类卷次尾巴（卷次由引擎按章序生成）；
+   *   ② 正文：去标点后重复 ≥3 次、且形态像书眉（以书名开头 / 以卷次数词
+   *      结尾）的短段，整段删除。**两条同时成立才删**，宁可漏删也不误伤
+   *      （诗里的叠句也会重复，但它不含书名、也不以卷次结尾）。
+   *
+   * @param {{title:string, content:string}[]} chapters
+   * @param {string} bookTitle OPF 的 dc:title
+   */
+  function purgeRunningHeaders(chapters, bookTitle) {
+    const book = cleanBookTitle(bookTitle || '');
+    for (const c of chapters) c.title = stripHeadNoise(c.title, book);
+
+    const norm = (s) => s.replace(/[\s，。、；：？！…—·「」『』﹁﹂【】︽︾︙︱[\]]/g, '');
+    const freq = new Map();
+    for (const c of chapters) {
+      for (const line of c.content.split('\n')) {
+        const k = norm(line);
+        if (k && k.length <= HEAD_MAX_CHARS) freq.set(k, (freq.get(k) || 0) + 1);
+      }
+    }
+    for (const c of chapters) {
+      c.content = c.content
+        .split('\n')
+        .filter((line) => {
+          const k = norm(line);
+          const n = freq.get(k) || 0;
+          // ① 重复 ≥3 次的短行；② 以书名 + 卷次开头的短行（短书里书眉
+          // 可能只出现一两次，靠重复次数抓不住）。
+          const repeated = n >= HEAD_MIN_REPEAT;
+          const titled = startsWithBook(k, book);
+          return !(looksLikeRunningHead(k, book) && (repeated || titled));
+        })
+        .join('\n');
+    }
+    return chapters.filter((c) => c.content.trim());
+  }
+
+  /** 书名清洗：去书名号、从「卷 / 册 / （」处截断书眉污染。 */
+  function cleanBookTitle(raw) {
+    const t = squeezeSpaces(raw.replace(/[《》〈〉【】「」]/g, ''));
+    const i = t.search(/[卷册冊（(：:·]/);
+    const head = i > 0 ? t.slice(0, i).trim() : t.trim();
+    return head.length >= 2 ? head : t.trim();
+  }
+
+  /** 章题清洗：剥书名前缀 + 卷次前缀；剥空了就留空（版心自有卷次）。 */
+  function stripHeadNoise(title, book) {
+    let t = (title || '').trim();
+    if (book.length >= 4) t = t.split(book).join('');
+    const m = t.trim().match(/^(?:卷|第|之)?[〇零一二三四五六七八九十百千万两0-9０-９]+([\s　·]*)(.*)$/);
+    if (m) {
+      const tight = !m[1] && m[2]; // 数词后紧贴文字（「第一章　道可道」）→ 不动
+      if (!tight) return (m[2] || '').replace(/[卷冊册]$/, '').trim();
+    }
+    return t.trim();
+  }
+
+  /** 像不像书眉：书名 + 卷次，或以「卷 + 数词」结尾。 */
+  function looksLikeRunningHead(t, book) {
+    if (!t) return false;
+    if (startsWithBook(t, book)) return true;
+    return /[卷冊册集部][之〇零一二三四五六七八九十百千两0-9０-９]+$/.test(t);
+  }
+
+  /**
+   * 这一行是不是「书名 + 卷次」的书眉（书名 ≥4 字才算数）。
+   *
+   * 只看「以书名开头」会误伤——序跋里常有 `红楼梦第一回……` 这种正文；
+   * 故要求书名之后只剩一小截，且其中带卷次（`卷十九`）或整截都是数词。
+   */
+  function startsWithBook(t, book) {
+    if (book.length < 4 || !t.startsWith(book)) return false;
+    const rest = t.slice(book.length);
+    if (!rest) return true;
+    if (rest.length > 12) return false;
+    return /[卷冊册]/.test(rest) || /^[〇零一二三四五六七八九十百千两0-9０-９]+$/.test(rest);
+  }
+
+  // =========================================================================
+  // 5.6 渲染几何：书名号 / 直角引号 / 句读落位（与 Rust 引擎同源）
+  // =========================================================================
+
+  /**
+   * **书名号**：横排 `《》` → 竖排专用 `︽︾`（单书名号 `〈〉` → `︿﹀`）。
+   *
+   * 竖排里 `《` 的尖角朝下，插在列中把行气戳断；`︽` 是它的竖排形态。
+   */
+  function titleMark(c) {
+    return { '《': '︽', '》': '︾', '〈': '︿', '〉': '﹀' }[c] || c;
+  }
+
+  /**
+   * **直角引号旋转 90°**：`「`→`﹁`、`」`→`﹂`、`『`→`﹃`、`』`→`﹄`。
+   *
+   * 竖排里引号的开口要朝下（读序方向）。GPUI 没有元素级旋转，故直接用
+   * Unicode 的竖排呈现形（U+FE41..FE44）——字库里存的就是转好的那一枚。
+   */
+  function verticalQuote(c) {
+    return { '「': '﹁', '」': '﹂', '『': '﹃', '』': '﹄', '“': '﹁', '”': '﹂', '‘': '﹃', '’': '﹄' }[c] || c;
+  }
+
+  /** 标点字号 / 正文字号 = **0.4**；书名号 = **0.8**。 */
+  const PUNCT_FS_RATIO = 0.4;
+  const TITLE_FS_RATIO = 0.8;
+  /** 句读起点偏移 / 字格：**0.3**（贴格子右下角）。 */
+  const PUNCT_DX_RATIO = 0.3;
+  const PUNCT_DY_RATIO = 0.3;
+
+  /**
+   * **句读落位公式**（`punct::place` 的 JS 版，逐字对齐）：
+   *
+   * ```text
+   * dx = cellW × 0.30            y = cellH × 0.30
+   * w  = cellW − dx              h  = cellH − dy
+   * fs = clamp(正文 × 0.4, 6, 22) 再 min(w, h)  —— 再大也压不出格
+   * 盒内**靠右下对齐**：字体把 。，、 的墨迹放在 em box 左下，
+   * 靠右下对齐后墨点才落在格子的右下角（靠左上会飘回格心）。
+   * ```
+   *
+   * @returns {{fs:number, dx:number, dy:number, w:number, h:number}}
+   */
+  function punctPlace(fsBody, cellW, cellH) {
+    const dx = Math.max(cellW * PUNCT_DX_RATIO, 0);
+    const dy = Math.max(cellH * PUNCT_DY_RATIO, 0);
+    const w = Math.max(cellW - dx, 1);
+    const h = Math.max(cellH - dy, 1);
+    const room = Math.min(w, h);
+    let fs = Math.min(fsBody * PUNCT_FS_RATIO, room);
+    if (room >= 6) fs = Math.max(fs, 6);
+    fs = Math.min(fs, 22);
+    return { fs, dx, dy, w, h };
+  }
+
+  /** 书名号落位：同一格，字号 **0.8 倍**正文（不与句读同档）。 */
+  function titlePlace(fsBody, cellH) {
+    return { fs: Math.min(Math.max(fsBody * TITLE_FS_RATIO, 9), cellH) };
   }
 
   // =========================================================================
@@ -741,6 +964,22 @@
     runToCn,
     shouldSkipNumber,
     isYearContext,
+    // 书级清洗
+    purgeRunningHeaders,
+    cleanBookTitle,
+    stripHeadNoise,
+    looksLikeRunningHead,
+    scrubStrayDigits,
+    isJunkLine,
+    // 渲染几何（与 Rust 引擎同源）
+    titleMark,
+    verticalQuote,
+    punctPlace,
+    titlePlace,
+    PUNCT_FS_RATIO,
+    TITLE_FS_RATIO,
+    PUNCT_DX_RATIO,
+    PUNCT_DY_RATIO,
     // 工具
     squeezeSpaces,
     isPageNumber,
