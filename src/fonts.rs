@@ -178,19 +178,23 @@ pub fn family_for_preset(role: FontRole, preset: FontPreset) -> SharedString {
 //
 // 思源系列（Noto CJK）的 em box 偏大：同样的 fontSize，字面比文津宋体
 // 「撑」，竖排时上下两字容易贴到、甚至重叠。给行高乘一个 `lineHeightScale`
-// 把字距松开一格余量，字形就紧凑而不粘连。宋体 1.05、楷体 1.12（楷体
-// 字形更散，需要更多余量）、黑体 1.02、西文 1.02。
+// 把字距松开一格余量，字形就紧凑而不粘连。宋体 1.0、楷体 1.06（楷体
+// 字形更散，需要更多余量）、黑体 1.0、西文 1.0。
+//
+// v1.28.0 整体收紧一档（宋 1.05→1.0、楷 1.12→1.06）：配合
+// `GRID_ROW_RATIO` 1.1→1.0，行高从 1.155×列宽压到 1.0×列宽，
+// 一行能多排一成字，纸面才不是「大字本」。
 
 /// 默认行高缩放（未识别的字体取它）。
-pub const LINE_SCALE_DEFAULT: f32 = 1.05;
+pub const LINE_SCALE_DEFAULT: f32 = 1.0;
 /// 宋体 / 仿宋系：字面方正，余量最小。
-pub const LINE_SCALE_SONG: f32 = 1.05;
+pub const LINE_SCALE_SONG: f32 = 1.0;
 /// 楷体系：笔势舒展，需要更多行间余量。
-pub const LINE_SCALE_KAI: f32 = 1.12;
+pub const LINE_SCALE_KAI: f32 = 1.06;
 /// 黑体 / 无衬线：字重大，略松。
-pub const LINE_SCALE_SANS: f32 = 1.02;
+pub const LINE_SCALE_SANS: f32 = 1.0;
 /// 等宽 / 西文：基线体系不同，与正文同理取最小余量。
-pub const LINE_SCALE_LATIN: f32 = 1.02;
+pub const LINE_SCALE_LATIN: f32 = 1.0;
 
 /// 一款字体的行高缩放：渲染时 `row_h = col_w × GRID_ROW_RATIO × scale`。
 pub fn line_height_scale(choice: FontChoice) -> f32 {

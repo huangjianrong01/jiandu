@@ -240,6 +240,13 @@ fn small_button(label: &str, on: bool, t: Theme) -> Div {
 /// 落在宣纸上像一枚旧朱印，不刺眼。
 const ZHU_BASE: u32 = 0xB23A30;
 
+/// 章题列的字号 / 正文字号：**1.12**（v1.28.0 用户口径「标题字号略大于
+/// 正文」）。
+///
+/// 只放大一成二：再大就成了现代书里的「章标题」，刻本里章题只比正文高
+/// 一头。格宽是字号的 1.33 倍，1.12 的字仍稳稳落在列内，不会探到邻列。
+const TITLE_COL_SCALE: f32 = 1.12;
+
 /// 顶栏高度：一处定义——动画位移、触发带回差、命中判定全用它。
 pub(crate) const BAR_H: f32 = 44.0;
 /// 天头触发带：鼠标进到屏幕顶端这 30px 里，顶栏滑出。
@@ -503,30 +510,24 @@ fn letter_fishtail(w: f32, h: f32, top: bool, color: u32) -> Div {
         )
 }
 
-/// 版心折痕：纸**对折**的那道物理褶——0.5px、`#999999`、**虚线**，
+/// 版心折痕：纸**对折**的那道物理褶——0.5px、`#999999`、**实线**，
 /// 比界行还淡一档，只作「纸的痕迹」，不抢鱼尾与书口文字。
 ///
 /// GPUI 0.2.2 没有元素级 dashed 边框，故用一串短横拼出来：段长固定，
 /// 段距由 `banxin::fold_dashes` 按可用高反算，头尾严丝合缝不留残段。
+/// 中缝那道「纸折痕」：**极细的灰色实线**（v1.28.0）。
+///
+/// 旧版是一串短横拼的虚线（GPUI 0.2.2 没有 dashed 边框）——放大看就是一排
+/// 断续的墨点，在中缝里比鱼尾还吵。用户口径改为「极细灰色实线」：0.5px、
+/// `#999999`、一通到底，它只是纸的痕迹，不是又一根界栏。
 fn fold_crease(x: f32, top: f32, len: f32, color: u32) -> Div {
-    let (n, gap) = crate::banxin::fold_dashes(len, crate::banxin::FOLD_DASH);
-    let mut line = div()
+    div()
         .absolute()
         .top(px(top))
         .left(px(x))
         .w(px(crate::banxin::FOLD_W))
-        .flex()
-        .flex_col()
-        .gap(px(gap));
-    for _ in 0..n {
-        line = line.child(
-            div()
-                .w(px(crate::banxin::FOLD_W))
-                .h(px(crate::banxin::FOLD_DASH))
-                .bg(rgb(color)),
-        );
-    }
-    line
+        .h(px(len.max(0.0)))
+        .bg(rgb(color))
 }
 
 /// 版心书口的一行文字：一字一格、居中竖排，**极小号宋体**（族名由调用
@@ -550,11 +551,15 @@ fn banxin_vtext(line: &crate::banxin::BanxinLine, w: f32, family: &SharedString,
     d
 }
 
-/// 版心小印：朱砂红「箋讀」小方印，嵌在中缝的下鱼尾之下（影印本版心
-/// 下端常见的小印记）。篆字是 `app::ensure_assets()` 写出的两枚 SVG
-/// （`seal_jian.svg` / `seal_du.svg`，等粗圆头线稿），这里只用
-/// `text_color` 着朱砂色，印面自留白（朱文）。
-fn banxin_seal(w: f32, h: f32) -> Div {
+/// 一枚藏印：朱砂红「箋讀」小方印。
+///
+/// v1.28.0 起不再嵌在版心里（用户：版心只留鱼尾、书口字与叶码），改由
+/// `Root::render` 盖在**纸页左下角外侧**——像一册书摊在案上、角落落的
+/// 一方藏印，既认得出是谁的本子，又不隔在书口中缝里。
+/// 篆字是 `app::ensure_assets()` 写出的两枚 SVG（`seal_jian.svg` /
+/// `seal_du.svg`，等粗圆头线稿），这里只用 `text_color` 着朱砂色，
+/// 印面自留白（朱文）。
+pub(crate) fn banxin_seal(w: f32, h: f32) -> Div {
     // 每枚篆字约占印面一半高：两字竖排相叠，正好是一方竖长小印。
     let gw = (w * 0.74).max(9.0);
     let gh = (h - 2.0) / 2.0;
@@ -3231,15 +3236,25 @@ impl Root {
             for c in pair {
                 line = line.child(match c {
                     // 注文里的【】同样显作「」（夹注不过 shown，这里单独过一道）。
-                    Some(ch) => div()
-                        .w(px(sub_w))
-                        .h(px(row_h))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(nfs))
-                        .text_color(rgb(note_color))
-                        .child(SharedString::from(crate::types::bracket_to_quote(ch).to_string())),
+                    Some(ch) => {
+                        let ch = crate::types::bracket_to_quote(ch);
+                        // 小字里的句读再收一档（v1.28.0）：全角句号与注文同号时
+                        // 一个点顶半颗字，整块夹注糊成黑团——见 NOTE_PUNCT_RATIO。
+                        let char_fs = if crate::gloss::is_dot_punct(ch) {
+                            nfs * crate::gloss::NOTE_PUNCT_RATIO
+                        } else {
+                            nfs
+                        };
+                        div()
+                            .w(px(sub_w))
+                            .h(px(row_h))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(char_fs))
+                            .text_color(rgb(note_color))
+                            .child(SharedString::from(ch.to_string()))
+                    }
                     None => div().w(px(sub_w)).h(px(row_h)),
                 });
             }
@@ -3263,7 +3278,13 @@ impl Root {
         let t = self.theme;
         let title = self.chapter_title(chapter);
         let col_w = cell_w * ANCIENT_TITLE_COL;
-        // 篇题字号与正文齐（刻本不把篇题放大，靠独占一列区分）。
+        // 篇题字号**略大于正文**（v1.28.0 用户口径「识别章节标题，其字号
+        // 可以略大于正文」）：1.12 倍——刻本里章题比正文高一头，但不翻成
+        // 「标题字」；格宽仍是 1.33×字号，1.12 不会探出列外。
+        // 章题自成**独占的一列**，其后的正文从左边一列另起（正文列数在
+        // 分页时已按 total-1 算过），故标题永远不会与正文挤在同一列。
+        let tfs = fs * TITLE_COL_SCALE;
+        let tcell = cell_h * TITLE_COL_SCALE;
         // 丝栏：列间界行按样式面板所选（乌 / 金 / 朱）取色。
         let mut col = div()
             .w(px(col_w))
@@ -3289,17 +3310,18 @@ impl Root {
             - th * 2.0
             - num_h
             - cell_h * (0.18 + 0.1 + 0.38);
-        let take_n = (avail / cell_h).floor().clamp(0.0, 7.0) as usize;
+        // 篇题一字一格，格高随放大后的字号（tcell），能排几字按它算。
+        let take_n = (avail / tcell).floor().clamp(0.0, 7.0) as usize;
         // 篇题：一字一格，自上面下。
         for c in title.chars().take(take_n) {
             col = col.child(
                 div()
                     .w(px(col_w))
-                    .h(px(cell_h))
+                    .h(px(tcell))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(fs))
+                    .text_size(px(tfs))
                     .text_color(rgb(t.ink()))
                     .child(SharedString::from(c.to_string())),
             );
@@ -3351,7 +3373,7 @@ impl Root {
             .relative()
             // 地脚那一段不参与「垂直居中」，对鱼尾才落在正文区的正中。
             .pb(px(foot_h));
-        // 折痕：纸对折的物理褶，落在中缝正中（极细虚线，见 `fold_crease`）。
+        // 折痕：纸对折的物理褶，落在中缝正中（极细实线，见 `fold_crease`）。
         col = col.child(fold_crease(
             gw * 0.5 - crate::banxin::FOLD_W * 0.5,
             0.0,
@@ -3384,7 +3406,7 @@ impl Root {
     ///   朱印
     /// ```
     ///
-    /// 正中另有一道**极细虚线**（0.5px、`#999999`）作纸对折的折痕。
+    /// 正中另有一道**极细实线**（0.5px、`#999999`）作纸对折的折痕。
     /// 缝宽约等于一行字宽（`grid::gutter_w`）：刻本版心本就是一列字的
     /// 宽度；文字的高度账由 `banxin::layout` 按优先级分（叶码 → 卷次 →
     /// 书名 → 篇题），分不够就截字，绝不溢出、绝不压字。
@@ -3426,7 +3448,9 @@ impl Root {
             page: &page,
             chapter_title: &self.chapter_title(chapter),
             detailed,
-            seal: true,
+            // v1.28.0：朱印从中缝挪到纸页左下角外侧（见 `render_page_seal`）——
+            // 版心只留「鱼尾 + 书口字 + 叶码」，不再被一枚红印隔着。
+            seal: false,
         });
         // 书口小字**极小号宋体**：走正文字体（默认文津宋体）的回退链，
         // 横笺里也不会退化成黑体。
@@ -3463,7 +3487,7 @@ impl Root {
             .bg(rgb(t.rule_by(self.rule_color)));
         col = col.child(rule_lines);
         // 折痕：纸**对折**的那一道物理褶，落在版心正中——0.5px、`#999999`、
-        // 虚线，只作「纸的痕迹」，比界行还淡，不抢鱼尾与书口文字。
+        // 实线（v1.28.0 由虚线改来），只作「纸的痕迹」，比界行还淡。
         col = col.child(fold_crease(
             gw * 0.5 - crate::banxin::FOLD_W * 0.5,
             22.0,
@@ -3539,13 +3563,7 @@ impl Root {
         col = col.child(div().h(px(lay.gap)));
         // 下鱼尾：∨ 口朝上，与上鱼尾开口相对。
         col = col.child(banxin_tail(lay.tail_w, lay.tail_h, false, t.fish_ink()));
-        // 朱砂小印「箋讀」：贴版心下端（影印本版心印落在下鱼尾之下）。
-        // 版面太挤时 `banxin::layout` 会把印砍掉（叶码优先）。
-        if lay.seal_h > 0.0 {
-            col = col.child(div().h(px(lay.gap)));
-            col = col.child(banxin_seal(gw * 0.80, gw * 1.60));
-        }
-        // 下黑口的占位：与上黑口对称，别让朱印压在墨块上。
+        // 下黑口的占位：与上黑口对称。
         col = col.child(div().h(px(heikou)));
         col
     }

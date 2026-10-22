@@ -103,8 +103,7 @@ mod tests {
             50.0,
             0.0,
             12.0,
-            0.0,
-        );
+            0.0, crate::grid::GRID_FS_MAX);
         (m.col_w, m.row_h, m.fs)
     }
 

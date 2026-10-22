@@ -154,8 +154,11 @@ impl LayoutConfig {
         LAYOUT_CONFIGS.iter().find(|c| c.key == key)
     }
     /// 默认版式（首启 / 配置损坏时的回落）。
+    ///
+    /// v1.28.0 起为 **12 列**：10 列在常见的 1280–1600 宽窗口里字大行稀，
+    /// 摊开像「大字盲人版」；12 列一行多两字，纸面立刻有了刻本该有的密度。
     pub fn default() -> &'static LayoutConfig {
-        Self::by_key("standard10").unwrap_or(&LAYOUT_CONFIGS[1])
+        Self::by_key("standard12").unwrap_or(&LAYOUT_CONFIGS[2])
     }
     /// 默认配置键。
     pub fn default_key() -> &'static str {
@@ -192,7 +195,9 @@ pub struct GridConfig {
 impl Default for GridConfig {
     fn default() -> Self {
         GridConfig {
-            columns: 8,
+            // 与 `LayoutConfig::default()` 同为 12 列：两处默认必须一致，
+            // 否则「首启版式」与「首启列数」会打架（一个说 12、一个排 8）。
+            columns: 12,
             dir: GridDir::Vertical,
             margin: 0.04, line_scale: 1.0,
         }
@@ -201,13 +206,23 @@ impl Default for GridConfig {
 
 /// 字号 / 行高算式系数与上下限（均来自用户给定的公式与边界要求）。
 pub const GRID_FS_RATIO: f32 = 0.75; // fontSize = colWidth × 0.75
-pub const GRID_ROW_RATIO: f32 = 1.1; // rowHeight = colWidth × 1.1
+/// 行高 / 列宽：v1.28.0 由 1.1 收到 **1.0**。
+///
+/// 竖排的字身本身就是列宽（字号 = 0.75 × 列宽），行距留到 1.1 时两字之间
+/// 有近三成空隙，整页看着「稀」；收到 1.0 后字与字之间只剩字面本身的
+/// 一点余白（约 5%），行气才接得上刻本。
+pub const GRID_ROW_RATIO: f32 = 1.0; // rowHeight = colWidth × 1.0
 /// 最小字号保护阈值（用户指定 12px）：窄屏 12/14 列也不至于小到看不清；
 /// 触发后几何按「字号优先」重算，可能超出可用宽 → 由渲染层开启单页
 /// 上下（及左右）滚动，绝不把字挤成一团黑疙瘩。
 pub const GRID_FS_MIN: f32 = 12.0;
-/// 字号上限：专注模式撑满整屏时不被无限制放大。
-pub const GRID_FS_MAX: f32 = 220.0;
+/// 字号上限（px）：**32**（v1.28.0 用户指定 `MaxFontSize = 32px`）。
+///
+/// 旧上限 220 只是「防无限制放大」，实际等于不设限——大屏一对开就能排出
+/// 40 多磅的正文，一列没几个字，整页空旷得像童书大字本。收到 32 后：
+/// 触顶时**列宽跟着回缩**（见 `compute_grid` 第 5 步），字仍贴着格，
+/// 密度不会被大屏稀释。
+pub const GRID_FS_MAX: f32 = 32.0;
 /// 行高缩放的中性值：不放大也不压缩（旧存档 / 未指定字体时取它）。
 pub const LINE_SCALE_BASE: f32 = 1.0;
 /// 行高缩放的合理区间（夹住异常值，免得行气散掉或字压成一团）。
@@ -248,6 +263,9 @@ pub struct GridMetrics {
 /// * `extra_cols`：`columns` **之外**的附加列宽（以 col_w 为单位计）。
 ///   古籍竖笺的章题列是格内一列（章首页少排一列正文给它），已在
 ///   `columns` 内，故传 0；仅有「格外再加竖条」这类需求时才传正值。
+/// * `fs_max`：本次排版的字号上限（px）。常规阅读传 [`GRID_FS_MAX`]；
+///   专注模式这类「我要整个屏幕都用来承载更大的字」的场合传
+///   `f32::INFINITY`，否则大屏上会被 32 限成小字。
 pub fn compute_grid(
     content_w: f32,
     content_h: f32,
@@ -258,6 +276,7 @@ pub fn compute_grid(
     head: f32,
     foot: f32,
     extra_cols: f32,
+    fs_max: f32,
 ) -> GridMetrics {
     // 1) 双面对开：单叶可用宽对半——先扣两叶之间的版心（中缝），
     //    中缝宽约等于一行字宽（见 `gutter_w`）。
@@ -275,13 +294,25 @@ pub fn compute_grid(
 
     // 4) 用户公式：列宽 = 可用宽 / 列数。
     let col_w_raw = inner_w / cfg.columns as f32;
-    // 5) 字号 = 0.75 × 列宽；下限保护窄屏小字。
+    // 5) 字号 = 0.75 × 列宽；上下限双向兜底。
+    //
+    //    触**下限**（窄屏 14 列）：字号优先，反推列宽放大（宁可溢出滚动）。
+    //    触**上限**（大屏对开）：列宽随之回缩到「字刚好贴格」，字与格的
+    //    0.75 比例得以保住——只压字号不回缩列宽的话，字会缩在格心，纸面
+    //    反而更空（这正是「大字本」的反面）。但最多只缩到原列宽的 70%：
+    //    再窄就成了一条纸带，两侧空白比书还宽。
+    let cap = fs_max.max(GRID_FS_MIN);
     let want = col_w_raw * GRID_FS_RATIO * zoom;
     let min_hit = want < GRID_FS_MIN;
-    let fs = want.clamp(GRID_FS_MIN, GRID_FS_MAX);
-    // 触发下限时，反推列宽使字号不小于下限（宁可超出可用宽 → 渲染层滚动），
-    // 避免字比字格还宽而横向重叠。
-    let col_w = if min_hit { fs / GRID_FS_RATIO } else { col_w_raw };
+    let capped = want > cap;
+    let fs = want.clamp(GRID_FS_MIN, cap);
+    let col_w = if min_hit {
+        fs / GRID_FS_RATIO
+    } else if capped {
+        (fs / GRID_FS_RATIO).max(col_w_raw * 0.70)
+    } else {
+        col_w_raw
+    };
     // 6) 行高 = 1.1 × 列宽 × 行高缩放（与字号比例固定，天然保证
     //    rowHeight > fontSize，竖排不上下重叠）。缩放由当前正文字体定
     //    （思源系字面大 → 松开一点余量），见 `fonts::line_height_scale`。
@@ -417,6 +448,9 @@ pub struct GridInput {
     /// 行高缩放（随正文字体）。
     pub line_scale: f32,
     pub dir: GridDir,
+    /// 字号上限（px）：常规阅读 = [`GRID_FS_MAX`]；专注模式传
+    /// `f32::INFINITY`（整屏只排一叶，就是要大字）。
+    pub fs_max: f32,
 }
 
 /// [`calculate_grid`] 的输出：网格度量 + 该模式的元信息。
@@ -460,6 +494,12 @@ pub fn calculate_grid(inp: GridInput) -> GridPlan {
     };
     // 整页：版框 / 天头 / 地脚也乘同一系数——否则「边框不缩放」会让内部
     // 比例随屏幕漂移，那就不是「等比缩放」而是「换个版式」了。
+    // 整页模式是「把基准版式等比缩小看全貌」，字号随缩放走，**不能**套
+    // 阅读用的 32px 上限——那会把整页排成大格小字，比例全毁。
+    let fs_max = match inp.mode {
+        LayoutMode::Full => f32::INFINITY,
+        _ => inp.fs_max,
+    };
     let m = compute_grid(
         bw,
         bh,
@@ -470,6 +510,7 @@ pub fn calculate_grid(inp: GridInput) -> GridPlan {
         inp.head * scale,
         inp.foot * scale,
         0.0,
+        fs_max,
     );
     GridPlan {
         m,
@@ -544,6 +585,7 @@ mod tests {
             margin: 0.04,
             line_scale: 1.0,
             dir: GridDir::Vertical,
+            fs_max: GRID_FS_MAX,
         }
     }
 
@@ -570,12 +612,22 @@ mod tests {
         assert_eq!(single.scale, 1.0);
         assert_eq!(facing.scale, 1.0);
         assert!(full.scale > 0.0 && full.scale <= FULL_SCALE_MAX);
-        // 三模式共用同一套算式：fs = 0.75 × col_w，row_h = 1.1 × col_w。
+        // 三模式共用同一套算式：fs = 0.75 × col_w，row_h = 1.0 × col_w。
         for p in [single, facing, full] {
             assert!(p.m.fs >= GRID_FS_MIN - 0.01, "字号跌破下限：{:.2}", p.m.fs);
             assert!(p.m.row_h > p.m.fs, "row_h 必须大于 fs（竖排不上下重叠）");
             if !p.m.min_font_hit {
-                assert!((p.m.fs - p.m.col_w * GRID_FS_RATIO).abs() < 0.01, "fs 非 0.75×col_w");
+                // 触上限时列宽不再等于 fs/0.75（大屏上会保底 70%），
+                // 但字绝不会比「贴着格」还大。
+                assert!(
+                    p.m.fs <= p.m.col_w * GRID_FS_RATIO + 0.01,
+                    "fs 超过 0.75×col_w：{:.2} > {:.2}",
+                    p.m.fs,
+                    p.m.col_w * GRID_FS_RATIO
+                );
+                if p.m.fs < GRID_FS_MAX - 0.01 {
+                    assert!((p.m.fs - p.m.col_w * GRID_FS_RATIO).abs() < 0.01, "fs 非 0.75×col_w");
+                }
             }
         }
     }
@@ -620,6 +672,32 @@ mod tests {
     }
 
     #[test]
+    fn font_size_is_capped_at_32_on_wide_screens() {
+        // 大屏单叶 12 列：按算式本该排出上百磅的字（「大字本」的根源），
+        // 封顶 32 后列宽跟着回缩，字仍不小于「贴格」所需。
+        let cfg = GridConfig { columns: 12, ..GridConfig::default() };
+        let capped = compute_grid(2560.0, 1400.0, cfg, false, 1.0, 50.0, 0.0, 12.0, 0.0, GRID_FS_MAX);
+        assert!(
+            (capped.fs - GRID_FS_MAX).abs() < 0.01,
+            "大屏字号应封顶 {GRID_FS_MAX}：{:.2}",
+            capped.fs
+        );
+        assert!(
+            capped.col_w >= capped.fs / GRID_FS_RATIO - 0.01,
+            "触顶后列宽收得比字还窄：col_w={:.2} fs={:.2}",
+            capped.col_w,
+            capped.fs
+        );
+        // 传无限上限（专注模式）：不封顶，整屏就该是大字。
+        let free = compute_grid(2560.0, 1400.0, cfg, false, 1.0, 50.0, 0.0, 12.0, 0.0, f32::INFINITY);
+        assert!(
+            free.fs > GRID_FS_MAX * 1.5,
+            "专注模式不该被 {GRID_FS_MAX} 限住：{:.1}",
+            free.fs
+        );
+    }
+
+    #[test]
     fn layout_mode_labels_and_spreads() {
         assert_eq!(LayoutMode::ALL.len(), 3);
         for (i, m) in LayoutMode::ALL.iter().copied().enumerate() {
@@ -644,15 +722,18 @@ mod tests {
 
     #[test]
     fn formulas_match_spec() {
-        // 竖排 8 列：col_w = 可用宽/8，fs = 0.75*col_w，row_h = 1.1*col_w。
+        // 竖排 12 列：col_w = 可用宽/12，fs = 0.75*col_w，row_h = 1.0*col_w。
         // extra_cols = 0：章题列在格内，不占额外宽。
         let (cw, ch) = content();
-        let m = compute_grid(cw, ch, GridConfig::default(), false, 1.0, 50.0, 0.0, 12.0, 0.0);
+        // 传无限上限：这一条验的是「算式本身」，不该被 32px 的阅读上限干扰
+        // （1276 宽单叶的字号本来会上百，触顶后列宽回缩，验不出公式）。
+        let cfg = GridConfig { columns: 12, ..GridConfig::default() };
+        let m = compute_grid(cw, ch, cfg, false, 1.0, 50.0, 0.0, 12.0, 0.0, f32::INFINITY);
         let inner_w = (cw - 50.0 - 2.0 * cw * 0.04).max(40.0);
-        let expect_col = inner_w / 8.0;
+        let expect_col = inner_w / 12.0;
         assert!((m.col_w - expect_col).abs() < 0.01, "col_w {:.2} ≠ {:.2}", m.col_w, expect_col);
         assert!((m.fs - expect_col * 0.75).abs() < 0.01, "fs 非 0.75*col_w");
-        assert!((m.row_h - expect_col * 1.1).abs() < 0.01, "row_h 非 1.1*col_w");
+        assert!((m.row_h - expect_col * GRID_ROW_RATIO).abs() < 0.01, "row_h 非 1.0*col_w");
         // row_h 必大于 fs（竖排不上下重叠）。
         assert!(m.row_h > m.fs, "row_h({}) 必须大于 fs({})", m.row_h, m.fs);
     }
@@ -669,19 +750,21 @@ mod tests {
                 dir: GridDir::Vertical,
                 margin: 0.04, line_scale: 1.0,
             },
-            false,
+            true,
             1.0,
             50.0,
             0.0,
             12.0,
-            0.0,
-        );
+            0.0,GRID_FS_MAX);
         assert!(m.outer_w <= cw + 0.5, "12 列纸宽 {:.1} 超内容区 {:.1}", m.outer_w, cw);
         assert!(m.outer_h <= ch + 0.5, "12 列纸高 {:.1} 超内容区 {:.1}", m.outer_h, ch);
         assert!(m.row_h > m.fs, "12 列 row_h 必须 > fs");
-        // 列越多字越小，12 列 fs < 8 列 fs。
-        let m8 = compute_grid(cw, ch, GridConfig::default(), false, 1.0, 50.0, 0.0, 12.0, 0.0);
-        assert!(m.fs < m8.fs, "12 列应比 8 列字小");
+        // 列越多越密：12 列的列宽必然小于 8 列。字号在两者都触 32px 上限时
+        // 会相等——这正是上限的意思（不再随列数变大的那种「大字本」）。
+        let m8 = compute_grid(cw, ch, GridConfig::default(), true, 1.0, 50.0, 0.0, 12.0, 0.0, GRID_FS_MAX);
+        assert!(m.col_w < m8.col_w + 0.01, "12 列列宽 {:.1} 应不大于 8 列 {:.1}", m.col_w, m8.col_w);
+        assert!(m.fs <= m8.fs + 0.01, "12 列字级不该大于 8 列");
+        assert!(m.rows >= m8.rows, "行高收紧后行数不减少");
     }
 
     #[test]
@@ -700,8 +783,7 @@ mod tests {
             50.0,
             0.0,
             12.0,
-            0.0,
-        );
+            0.0,GRID_FS_MAX);
         assert!(m.outer_w <= cw + 0.5);
         assert!(m.outer_h <= ch + 0.5);
         assert!(m.row_h > m.fs);
@@ -724,8 +806,7 @@ mod tests {
             50.0,
             0.0,
             12.0,
-            0.0,
-        );
+            0.0,GRID_FS_MAX);
         assert!(m.min_font_hit, "窄屏 14 列应触发最小字号");
         assert!(m.fs >= GRID_FS_MIN - 0.01, "fs 不得低于下限 {GRID_FS_MIN}");
         assert!(m.col_w >= m.fs / GRID_FS_RATIO - 0.01, "col_w 须 ≥ fs/0.75，否则字超格");
@@ -830,8 +911,9 @@ mod tests {
                 c.key
             );
         }
-        // 默认档是 standard10。
-        assert_eq!(LayoutConfig::default().key, "standard10");
+        // 默认档是 standard12（v1.28.0 起提高密度）。
+        assert_eq!(LayoutConfig::default().key, "standard12");
+        assert_eq!(LayoutConfig::default().columns, 12);
         // 注册表是精确查表：未知键查不到（`None`），回落由调用方
         // （`current_layout` / `set_layout`）统一处理，从而 `set_layout`
         // 能在解析失败时安全返回，不污染状态。
@@ -856,8 +938,7 @@ mod tests {
                 50.0,
                 0.0,
                 12.0,
-                0.0,
-            );
+                0.0,GRID_FS_MAX);
             // 四档都不溢出内容区，且不重叠（比例约束恒成立）。
             assert!(m.outer_w <= 1320.0 - 44.0 + 0.5, "{} 纸宽溢出", c.key);
             assert!(m.outer_h <= 880.0 - 78.0 - 44.0 + 0.5, "{} 纸高溢出", c.key);
@@ -882,8 +963,7 @@ mod tests {
                 50.0,
                 0.0,
                 12.0,
-                0.0,
-            )
+                0.0,GRID_FS_MAX)
         };
         let base = grid(1.0);
         let kai = grid(1.12);

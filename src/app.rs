@@ -1004,6 +1004,13 @@ impl Root {
             margin: self.grid.margin,
             line_scale: self.grid.line_scale,
             dir: self.grid.dir,
+            // 专注模式：整屏只排一叶，字号不设上限（要的就是满屏大字）；
+            // 常规阅读封顶 32px，免得大屏上一列没几个字、页面空旷。
+            fs_max: if self.focus_mode {
+                f32::INFINITY
+            } else {
+                crate::grid::GRID_FS_MAX
+            },
         });
         self.full_scale = plan.scale;
         let m = plan.m;
@@ -2777,6 +2784,9 @@ impl Render for Root {
         } else if !self.key_focus.is_focused(window) {
             window.focus(&self.key_focus);
         }
+        // 藏印只在阅读正文时出现：书架 / 封面是另一套书衣视觉，专注模式要
+        // 把整幅纸面还给正文（一枚红印也嫌吵）。
+        let show_seal = self.screen == Screen::Reading && !self.focus_mode;
         let screen = self.render_screen(cx);
         // 开发用：JIANDU_SAVE_SHARE=1 时，分享卡渲染到第 3 帧后自动存一张，
         // 便于核对裁剪区域（前两帧还没上屏，截不到）。
@@ -2791,7 +2801,7 @@ impl Render for Root {
             }
         }
         let key_focus = self.key_focus.clone();
-        div()
+        let mut root = div()
             .flex()
             .flex_col()
             .size_full()
@@ -2806,8 +2816,22 @@ impl Render for Root {
             // ← → 翻页、笔记输入）会静默失效。
             .on_key_down(move |event: &KeyDownEvent, _window, app| {
                 let _ = ent.update(app, |this, cx| this.dispatch_key(event, cx));
-            })
-            .child(screen)
+            });
+        // 藏印「箋讀」：盖在**纸页左下角外侧**（v1.28.0 由中缝移来）。
+        // 必须画在 `screen` **之后**：正文屏是整幅不透明纸面，先画的元素会
+        // 被它整块盖住（第一版就是这样，印根本看不见）。印章只在左下角
+        // 一小块，压不到居中的浮层。
+        root = root.child(screen);
+        if show_seal {
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px(12.0))
+                    .bottom(px(30.0))
+                    .child(crate::reader::banxin_seal(22.0, 40.0)),
+            );
+        }
+        root
     }
 }
 
@@ -2858,8 +2882,7 @@ mod tests {
             ANCIENT_EDGE,
             ANCIENT_HEAD,
             ANCIENT_FOOT,
-            0.0,
-        )
+            0.0, crate::grid::GRID_FS_MAX)
     }
 
     #[test]
@@ -2879,8 +2902,7 @@ mod tests {
             ANCIENT_EDGE,
             ANCIENT_HEAD,
             ANCIENT_FOOT,
-            0.0,
-        );
+            0.0, crate::grid::GRID_FS_MAX);
         assert!(m.outer_w <= VW + 0.5, "专注单面纸宽 {:.1} 超 {VW}", m.outer_w);
         assert!(
             m.fs > 24.0,
@@ -2909,7 +2931,9 @@ mod tests {
             ANCIENT_HEAD,
             ANCIENT_FOOT,
             0.0,
-        );
+            // 专注模式不设字号上限（`fs_max = INFINITY`）：整屏只排一叶，
+            // 就是要大字撑满，否则触上限后纸会缩到七成、四周留白。
+            f32::INFINITY);
         assert!(2.0 * m.outer_w + gap <= VW + 0.5);
         assert!(2.0 * m.outer_w + gap > VW * 0.95);
         assert!(m.outer_h <= VH + 0.5, "对开纸高 {:.1} 超 {VH}", m.outer_h);
@@ -2964,8 +2988,7 @@ mod tests {
             ANCIENT_EDGE,
             ANCIENT_HEAD,
             ANCIENT_FOOT,
-            0.0,
-        );
+            0.0, crate::grid::GRID_FS_MAX);
         assert!(2.0 * m.outer_w + crate::grid::gutter_w(cw, 8, ANCIENT_EDGE, 0.04) <= cw + 0.5);
     }
 

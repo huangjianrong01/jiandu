@@ -547,6 +547,27 @@ pub fn layout_book_from_opts(
 /// 列同宽同界，行气才接得上。
 pub const NOTE_PAD_RATIO: f32 = 0.0;
 
+/// 夹注里「点状句读」的字号 / 注文字号：**0.62**（v1.28.0）。
+///
+/// 用户原话：「小字里的标点也要缩小，绝不能在小字里出现大的现代标点」。
+/// 注文本身就是正文的一半（0.5），而全角句号的墨迹几乎填满自己的 em
+/// box——与注文同号时，一个「。」顶半颗小字，整块夹注就糊成一团黑点。
+/// 再收一档到 0.62（≈ 正文的 0.31，与正文句读的 0.3 同档），小字里才只
+/// 剩一粒轻点。
+pub const NOTE_PUNCT_RATIO: f32 = 0.62;
+
+/// 是不是「点状」句读（，。、；：？！…—· 及其半角形）。
+///
+/// 夹注只对这类标点收字号；引号 / 括号 / 书名号要「括住」什么，
+/// 缩小反而括不住，故按原大小排。
+pub fn is_dot_punct(c: char) -> bool {
+    matches!(
+        c,
+        '，' | '。' | '、' | '；' | '：' | '？' | '！' | '…' | '—' | '·'
+            | ',' | '.' | ';' | ':' | '?' | '!'
+    )
+}
+
 /// 一列内所有夹注块的纸面坐标。
 ///
 /// `li` 是该列在 flex_row 里**从左数**的位置（左缘 `li*cell_w`）：
@@ -1247,6 +1268,29 @@ mod tests {
 
     fn flow_of(book: &Book) -> Vec<Glyph> {
         book.to_flow(true)
+    }
+
+    #[test]
+    fn note_punct_is_a_size_smaller_than_the_note_text() {
+        // 注文本身就是正文的一半；注里的句读再收一档（0.62），
+        // 合起来约正文的 0.31——与正文句读 0.3 同档，小字里只剩一粒轻点。
+        assert!(NOTE_PUNCT_RATIO > 0.0 && NOTE_PUNCT_RATIO < 1.0);
+        let body = 28.0f32;
+        let note = body * 0.5;
+        let dot = note * NOTE_PUNCT_RATIO;
+        assert!(dot < note, "注文标点没有比注文字小");
+        assert!(
+            (dot / body - crate::punct::FS_RATIO).abs() < 0.06,
+            "注文标点 {:.3}×正文，与正文句读 0.3 差太远",
+            dot / body
+        );
+        // 只收「点状」句读；引号 / 书名号 / 括号要括住东西，不收。
+        for c in ['，', '。', '、', '；', '：', '？', '！', '…', '—'] {
+            assert!(is_dot_punct(c), "{c} 应算点状句读");
+        }
+        for c in ['「', '」', '『', '』', '《', '》', '（', '）', '道'] {
+            assert!(!is_dot_punct(c), "{c} 不该被缩字号");
+        }
     }
 
     // ---- 注文包围盒（Canvas 命中测试 / 卡片定位）----

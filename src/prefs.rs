@@ -75,9 +75,11 @@ impl Default for Prefs {
             font_note: 0,
             font_preset: 0,
             zoom: 1.0,
-            columns: 10,
+            columns: 12,
             margin: 0.06,
-            layout_key: "standard10".to_string(),
+            // v1.28.0：默认版式由 10 列改为 12 列（密度）。旧存档里的
+            // 自选列数仍照读，只是新装 / 重置时落到 12 列。
+            layout_key: "standard12".to_string(),
             notes_inline: true,
             trad: true,
             tongjia: true,
