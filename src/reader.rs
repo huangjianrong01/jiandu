@@ -19,9 +19,9 @@ use crate::types::{
     GlyphKey, GlyphKind, MarkKind, NoteKind, NoteSource, Script, StyleTab, TocEntry,
 };
 use gpui::{
-    div, prelude::*, px, rgb, rgba, svg, BoxShadow, Context, Div, FontWeight, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow, ParentElement, SharedString,
-    Styled, Window,
+    div, prelude::*, px, rgb, rgba, svg, Animation, AnimationExt, AnyElement, BoxShadow, Context,
+    Div, ElementId, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Overflow, ParentElement, SharedString, Styled, Window,
 };
 use std::collections::HashMap;
 
@@ -239,6 +239,28 @@ fn small_button(label: &str, on: bool, t: Theme) -> Div {
 /// 面板选中的朱砂（用户指定 #B23A30）：比落款印泥 `CINNABAR` 略沉一档，
 /// 落在宣纸上像一枚旧朱印，不刺眼。
 const ZHU_BASE: u32 = 0xB23A30;
+
+/// 顶栏高度：一处定义——动画位移、触发带回差、命中判定全用它。
+pub(crate) const BAR_H: f32 = 44.0;
+/// 天头触发带：鼠标进到屏幕顶端这 30px 里，顶栏滑出。
+pub(crate) const BAR_HOT: f32 = 30.0;
+/// 退出回差：鼠标越过「栏底 + 26px」才收回，免得贴着栏底来回抖。
+pub(crate) const BAR_GAP: f32 = 26.0;
+
+/// 顶栏显隐的判据（**纯函数**，只有它决定收 / 放）。
+///
+/// `y` 是鼠标的窗口纵坐标，`shown` 是当前是否已滑出，`pinned` 表示有面板开着。
+/// 关键在于**回差**：收着时门槛是 30px（须探到天头才出），打开时门槛放宽到
+/// 「栏底 + 26px」（贴在栏下沿也不算离开）——否则鼠标一离开字面就闪回收起，
+/// 点第二下都点不着。
+pub(crate) fn bar_wants_show(y: f32, shown: bool, pinned: bool) -> bool {
+    pinned
+        || if shown {
+            y <= BAR_H + BAR_GAP
+        } else {
+            y <= BAR_HOT
+        }
+}
 
 /// 面板选中色的**实际取值**：深底主题（夜读）上这枚朱砂会沉进深纸看不见，
 /// 故向宣纸白提亮一档——界面色与纸面永远反色，不会出现「暗纸上的暗朱」。
@@ -1077,14 +1099,34 @@ impl Root {
                 cx.notify();
             }),
         );
+        // 顶栏「触天头即出」——**由鼠标位置驱动，不铺一条 30px 的命中带**。
+        //
+        // 为什么不在天头摆一张透明的触发条：那会在纸面上开一条 30px 的死区，
+        // 顶格的字点不动、翻页也失灵。改成在根元素上听 `mousemove`，只算 y：
+        //   · 收着时：进到 `BAR_HOT` 以内 → 滑出；
+        //   · 打开时：越过「栏底 + `BAR_GAP`」→ 收回（回差，防贴边抖动）；
+        //   · 任一面板开着（`bar_pinned`）→ 一律留住。
+        // root 铺满整窗、又是冒泡链末端，鼠标在纸面任何一处都会到这里。
+        root = root.on_mouse_move(cx.listener(
+            |this, event: &MouseMoveEvent, _window, cx| {
+                let y = event.position.y.to_f64() as f32;
+                let want = bar_wants_show(y, this.bar_shown, this.bar_pinned());
+                if want != this.bar_shown {
+                    this.bar_shown = want;
+                    cx.notify();
+                }
+            },
+        ));
         // 键盘总入口不挂在这里：GPUI 只把按键派发给「焦点节点 → 根元素」这条
         // 路径上的监听器，而本函数是根元素的子层（见 app.rs 的 Render::render）。
 
         if !self.focus_mode {
+            // 顶栏是**浮层**（绝对定位、贴顶、默认收到天头外），所以排在正文
+            // 之后画、盖在纸面之上；正文因此能一直铺到屏幕顶端。
             root = root
-                .child(toolbar)
                 .child(body)
-                .child(self.render_reading_status(total));
+                .child(self.render_reading_status(total))
+                .child(toolbar);
         } else {
             root = root.child(body);
             // 左上角常驻「退出专注」（避开右上角的字书浮层）。
@@ -2103,45 +2145,78 @@ impl Root {
             ))
     }
 
-    fn render_reading_toolbar(&mut self, total: usize, cx: &mut Context<Self>) -> Div {
+    /// 任一面板开着 → 顶栏必须留住。
+    ///
+    /// 面板都从底边浮起，鼠标一移下去就把顶栏收走，用户会以为「点了没反应」；
+    /// 所以「有门开着」时显隐不受鼠标位置支配。分享卡是整屏深底导出界面，
+    /// 不算「开着的门」——那时顶栏该退场。
+    fn bar_pinned(&self) -> bool {
+        self.show_toc
+            || self.show_style
+            || self.show_grid_panel
+            || self.show_search
+            || self.show_notes_panel
+            || self.show_help
+    }
+
+    /// 顶栏（天头那张薄纸）的渲染。
+    ///
+    /// v1.26.0「沉浸式古风化」以后，它不再是布局里的一条横栏，而是**浮在
+    /// 纸面上的一张半透明宣纸**：默认收到天头之外（`top = -BAR_H`），
+    /// 鼠标触到天头 30px 才滑下来，读完即退——把整幅纸面还给正文。
+    ///
+    /// 三组纯文字：书阁 · 目录 · 封面 ｜ 版式 · 字体 · 专注 ｜ 检索 · 朱批 · 帮助。
+    /// 没有图标、没有底色块、没有底线：字本身就是按钮。
+    fn render_reading_toolbar(&mut self, total: usize, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
-        // 单页 / 双面对开由屏幕方向驱动（横屏对开、竖屏单页），不再提供手动切换；
-        // 古籍竖笺为唯一排版格式（现代横笺已移除）。列数 / 留白见「版式」面板。
+        let zhu = sheet_zhu(t);
+        let family = self.main_family();
+        // 半透明宣纸底：GPUI 0.2.2 没有 `backdrop-filter`，磨砂只能用
+        // 「纸色 90% 不透明」近似——书页的墨从底下隐约透出一点，字仍看得清。
+        //（深底主题自动取深纸，不必另写一套。）
+        let veil = ((t.paper() & 0xFFFFFF) << 8) | 0xE6;
+        // 组间界行：墨 10%——`rgba(0,0,0,.1)` 落在纸面上的等价物。
+        let sep_ink = ((t.ink() & 0xFFFFFF) << 8) | 0x1A;
 
-        // 顶部工具栏：横栏，含书架 / 封面 / 目录 / 样式 / 专注 / 版式等。
-        // 字体、字号已收进「样式」面板；翻页改为「点正文区右半屏下一页 /
-        // 左半屏上一页」，键盘 ← / → 方向键同样可用。
-        let mut bar = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .p_2()
-            .bg(rgb(t.chrome()))
-            .border_b_1()
-            .border_color(rgb(t.chrome_line()));
+        // 一枚纯文字：无底、无框、无图标。悬停转朱砂；`on`（面板开着）时
+        // 常驻朱砂——这是「此门已开」的唯一提示，不另加下划线或色块。
+        // GPUI 0.2.2 无 letter-spacing，字距只能靠 12px 的内边距撑开。
+        let item = |label: &'static str, on: bool| -> Div {
+            let fg = if on { zhu } else { t.ink() };
+            div()
+                .h(px(BAR_H))
+                .flex()
+                .items_center()
+                .px(px(12.0))
+                .cursor_pointer()
+                .text_size(px(13.0))
+                .text_color(rgb(fg))
+                .hover(move |s| s.text_color(rgb(zhu)))
+                .child(SharedString::from(label))
+        };
+        // 组间竖线：13px 高的一道极细界，不贯通到顶底（贯通就成了表格）。
+        let sep = || -> Div {
+            div()
+                .w(px(1.0))
+                .h(px(13.0))
+                .ml(px(17.0))
+                .mr(px(17.0))
+                .bg(rgba(sep_ink))
+        };
 
-        bar = bar.child(small_button("‹ 书架", false, t).on_mouse_down(
+        // ---- 左组：书阁（回书架） / 目录（卷目） / 封面 ----
+        let mut left = div().h(px(BAR_H)).flex().items_center().pl(px(26.0));
+        left = left.child(item("书阁", false).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 this.back_to_shelf();
                 cx.notify();
             }),
         ));
-        bar = bar.child(small_button("封面", false, t).on_mouse_down(
+        left = left.child(item("目录", self.show_toc).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
-                this.persist();
-                this.screen = Screen::Cover;
-                cx.notify();
-            }),
-        ));
-
-        let toc_on = self.show_toc;
-        bar = bar.child(small_button("☰ 目录", toc_on, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                // 底部菜单「目录」：展开 / 收起侧栏（带滑入滑出动画）。
+                // 展开 / 收起侧栏（带滑入滑出动画）。
                 if this.show_toc {
                     this.close_toc();
                 } else {
@@ -2150,25 +2225,49 @@ impl Root {
                 cx.notify();
             }),
         ));
+        left = left.child(item("封面", false).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                this.persist();
+                this.screen = Screen::Cover;
+                cx.notify();
+            }),
+        ));
+        left = left.child(sep());
 
-        // 样式面板：纸色 / 字级 / 版式 / 注文。
-        let style_on = self.show_style;
-        bar = bar.child(small_button("样式", style_on, t).on_mouse_down(
+        // ---- 中组：版式（列数 / 留白） / 字体（纸色 · 字级 · 注文） / 专注 ----
+        let mut mid = div().h(px(BAR_H)).flex().items_center();
+        mid = mid.child(item("版式", self.show_grid_panel).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                this.show_grid_panel = !this.show_grid_panel;
+                cx.notify();
+            }),
+        ));
+        mid = mid.child(item("字体", self.show_style).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 this.show_style = !this.show_style;
                 cx.notify();
             }),
         ));
+        mid = mid.child(item("专注", false).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                this.focus_mode = !this.focus_mode;
+                cx.notify();
+            }),
+        ));
+        mid = mid.child(sep());
 
-        // 全文检索：输入词 → 全书查找 → 跳到那一面并朱砂红高亮。
-        // 打开时把焦点交给检索框，否则输入法没有落点、打不进中文。
-        let search_on = self.show_search;
-        bar = bar.child(small_button("检索", search_on, t).on_mouse_down(
+        // ---- 右组：检索 / 朱批（笔记） / 帮助 ----
+        let mut right = div().h(px(BAR_H)).flex().items_center().pr(px(26.0));
+        right = right.child(item("检索", self.show_search).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
                 this.show_search = !this.show_search;
                 if this.show_search {
+                    // 焦点交给检索框，否则输入法没有落点、打不进中文。
                     window.focus(&this.search_focus);
                 } else {
                     this.clear_search();
@@ -2176,44 +2275,14 @@ impl Root {
                 cx.notify();
             }),
         ));
-
-        // 专注模式：沉浸阅读，隐藏工具栏 / 状态栏 / 目录。
-        let focus_on = self.focus_mode;
-        bar = bar.child(small_button("专注", focus_on, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                this.focus_mode = !this.focus_mode;
-                cx.notify();
-            }),
-        ));
-
-        // 版式控制面板：列数 8 / 10 / 12 / 14 与四周留白随时可调
-        // （单页 / 对开由屏幕方向自动决定）。
-        let grid_on = self.show_grid_panel;
-        bar = bar.child(small_button("版式", grid_on, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                this.show_grid_panel = !this.show_grid_panel;
-                cx.notify();
-            }),
-        ));
-
-        // 繁体 / 通假 / 注释 已收进正文下方的「样式条」与快捷键，避免顶栏重复。
-        // 首行缩进固定两个字（横竖排一视同仁），不再提供开关。
-
-        // 笔记 / 批注面板。
-        let notes_on = self.show_notes_panel;
-        bar = bar.child(small_button("笔记", notes_on, t).on_mouse_down(
+        right = right.child(item("朱批", self.show_notes_panel).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 this.show_notes_panel = !this.show_notes_panel;
                 cx.notify();
             }),
         ));
-
-        // 帮助：快捷键与操作说明一览。
-        let help_on = self.show_help;
-        bar = bar.child(small_button("帮助", help_on, t).on_mouse_down(
+        right = right.child(item("帮助", self.show_help).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 this.show_help = !this.show_help;
@@ -2221,13 +2290,70 @@ impl Root {
             }),
         ));
 
-        bar = bar.child(div().flex_1());
+        let mut bar = div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .h(px(BAR_H))
+            .flex()
+            .flex_row()
+            .items_center()
+            .bg(rgba(veil))
+            .font_family(family)
+            .text_color(rgb(t.ink()));
 
-        // 翻页：点正文区左 / 右半屏，或键盘方向键；章节跳转走「目录」。
-        // 工具栏不再放上一页 / 下一页 / 上章 / 下章按钮。
+        // 三列等分：左组贴左、中组绝对居中、右组贴右——中组不会被左右两组的
+        // 宽度推歪（三格 `flex_1` 而不是 `space-between`）。
+        bar = bar
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(BAR_H))
+                    .flex()
+                    .items_center()
+                    .justify_start()
+                    .child(left),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(BAR_H))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(mid),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(BAR_H))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .child(right),
+            );
+
+        // 滑入 / 滑出：GPUI 0.2.2 只有元素级动画（没有 CSS transition），且
+        // 动画状态按元素 id 缓存——所以显隐各用一个 id，id 一变动画就从头播。
+        let shown = self.bar_shown;
+        let anim = Animation::new(std::time::Duration::from_millis(if shown { 220 } else { 160 }))
+            .with_easing(move |x: f32| {
+                if shown {
+                    1.0 - (1.0 - x).powi(3) // 出场：先快后慢，像纸片落上案头
+                } else {
+                    x * x // 收回：先慢后快，收起时不拖泥带水
+                }
+            });
+        let anim_id =
+            ElementId::NamedInteger(SharedString::from("jd-topbar"), if shown { 1 } else { 0 });
 
         let _ = total;
-        bar
+        bar.with_animation(anim_id, anim, |d: Div, v: f32| {
+            // v: 0 → 1。shown 时由 -BAR_H 落回 0；hidden 时由 0 收进 -BAR_H。
+            d.top(px(-BAR_H * (1.0 - v)))
+        })
+        .into_any_element()
     }
 
     /// 跳到上一章 / 下一章的首面。
@@ -7977,8 +8103,32 @@ fn note_paper(card_w: f32, card_h: f32, body: &[char], ink: u32, mute: u32) -> D
 
 #[cfg(test)]
 mod tests {
-    use super::{chapters_ended_at, cn_date_from_str, cn_small, first_empty_column, note_grid_plan};
+    use super::{
+        bar_wants_show, chapters_ended_at, cn_date_from_str, cn_small, first_empty_column,
+        note_grid_plan, BAR_GAP, BAR_H, BAR_HOT,
+    };
     use crate::gloss::{Page, Piece};
+
+    /// 顶栏：贴着天头出、栏下沿附近赖着不走、深入纸面才收；有面板开着则永远不放。
+    #[test]
+    fn topbar_has_hysteresis_and_stays_while_a_panel_is_open() {
+        // 收着时：只有探进天头 30px 才出来（鼠标停在 y=80 不动）。
+        assert!(bar_wants_show(0.0, false, false));
+        assert!(bar_wants_show(BAR_HOT, false, false));
+        assert!(!bar_wants_show(BAR_HOT + 1.0, false, false));
+        assert!(!bar_wants_show(400.0, false, false));
+        // 打开后：门槛放宽到「栏底 + 回差」，紧贴栏下沿也不会立刻收。
+        assert!(bar_wants_show(BAR_H + BAR_GAP, true, false));
+        assert!(bar_wants_show(BAR_HOT + 1.0, true, false));
+        assert!(!bar_wants_show(BAR_H + BAR_GAP + 1.0, true, false));
+        // 回差确实存在：同一个 y，收着时不弹、开着时不收。
+        let y = BAR_H + 10.0;
+        assert!(!bar_wants_show(y, false, false));
+        assert!(bar_wants_show(y, true, false));
+        // 任一面板开着：鼠标在屏幕最底下也要留住。
+        assert!(bar_wants_show(2000.0, false, true));
+        assert!(bar_wants_show(2000.0, true, true));
+    }
 
     /// 「篇 / 章 / 字」只收在此叶收尾的章：跨叶未完的章不赶它，
     /// 两章同叶收尾时两章都列（一行一篇）。

@@ -145,6 +145,12 @@ pub struct Root {
     pub show_style: bool,
     /// 专注模式：隐藏工具栏、状态栏与目录，沉浸阅读。
     pub focus_mode: bool,
+    /// 顶栏是否已滑出（v1.26.0「沉浸式古风化」）。
+    ///
+    /// 顶栏默认隐身，只在鼠标触到天头 `BAR_HOT` 时滑出、离开即退；
+    /// 任一面板展开时由 `bar_pinned()` 强制留住。开局置 `true`，让人
+    /// 第一眼看到天头有东西——否则工具栏等于藏起来没人找得到。
+    pub bar_shown: bool,
     /// 字号缩放系数（A-/A+ 调节；配合视口铺满使用）。
     pub zoom: f32,
     /// 点字查字面板当前查询的字（None 表示未打开）。
@@ -412,6 +418,7 @@ impl Root {
             toc_animating: false,
             show_style: false,
             focus_mode: false,
+            bar_shown: true,
             zoom: 1.0,
             lookup: None,
             lookup_key: None,

@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>笺读 · 顶部工具栏（沉浸式古风化）</title>
+<style>
+  /* ============================================================
+     笺读 v1.26.0 · 顶部工具栏「沉浸式古风化」
+     设计原则：
+       1. 默认隐身——只在鼠标触到天头 30px 时滑出，读完即退；
+       2. 底是半透明宣纸 + 磨砂，不是系统白条：书页从底下透出来；
+       3. 没有底线、没有图标、没有色块——三组纯文字，中间一道极细界行；
+       4. 墨字 · 悬停转朱砂；面板展开时该字保持朱砂（提示「此门已开」）。
+     ============================================================ */
+
+  :root {
+    --zhu: #B23A30;                       /* 朱砂（悬停 / 展开态） */
+    --ink: #2F3535;                       /* 深墨（常态字色） */
+    --paper-bar: rgba(245, 240, 230, .90);/* 半透明宣纸底 */
+    --sep: rgba(0, 0, 0, .10);            /* 组间界行 */
+    --bar-h: 44px;                        /* 工具栏高 */
+    --hot-h: 30px;                        /* 天头触发带高 */
+    --song: "WenJinMincho", "Songti SC", "STSong", "Noto Serif SC", "SimSun", serif;
+    --kai: "LXGW WenKai", "Kaiti SC", "STKaiti", "KaiTi", serif;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+
+  body {
+    background: radial-gradient(120% 90% at 50% 0%, #FCF8EE 0%, #F3ECDA 58%, #EAE1CA 100%);
+    font-family: var(--song);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  /* ---------- 背景：一张竖排书叶（用来验磨砂与透光） ---------- */
+
+  .stage {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 56px 24px 40px;
+  }
+
+  .leaf {
+    display: flex;
+    flex-direction: row-reverse;   /* 竖排自右向左读 */
+    gap: 26px;
+    padding: 34px 30px;
+    height: min(78vh, 620px);
+    background: #F7F1E1;
+    border: 3px solid #A9977B;
+    box-shadow: 0 2px 10px rgba(90, 74, 48, .10);
+  }
+  .leaf p {
+    margin: 0;
+    writing-mode: vertical-rl;
+    text-orientation: upright;
+    font-size: 17px;
+    line-height: 2.05;
+    letter-spacing: .06em;
+    color: #2B2622;
+  }
+  .leaf p.gloss {
+    font-family: var(--kai);
+    font-size: 10px;
+    line-height: 1.55;
+    color: #8C5A3C;
+  }
+
+  /* ---------- 工具栏本体 ---------- */
+
+  .jbar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: var(--bar-h);
+    z-index: 50;
+    background: var(--paper-bar);
+    -webkit-backdrop-filter: blur(8px) saturate(1.08);
+    backdrop-filter: blur(8px) saturate(1.08);
+    /* 没有 border-bottom：下缘只靠「透明度的落差」收口，
+       这才是宣纸压不住书页的样子；加线就成了网页顶栏。 */
+    transform: translateY(-100%);
+    opacity: 0;
+    pointer-events: none;
+    transition:
+      transform .26s cubic-bezier(.22, .61, .36, 1),
+      opacity   .18s linear;
+    will-change: transform;
+  }
+  .jbar.is-shown {
+    transform: translateY(0);
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .jbar-inner {
+    height: 100%;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+  }
+
+  .jgroup { display: flex; align-items: center; }
+  .jgroup:nth-child(1) { justify-self: start;  padding-left: 26px; }
+  .jgroup:nth-child(2) { justify-self: center; }
+  .jgroup:nth-child(3) { justify-self: end;    padding-right: 26px; }
+
+  /* 组间界行：极细一道，不必贯通到底——像书口的一道界，不像表格 */
+  .jgroup:not(:last-child)::after {
+    content: "";
+    width: 0;
+    height: 13px;
+    border-right: 1px solid var(--sep);
+    margin: 0 17px;
+  }
+
+  .jitem {
+    appearance: none;
+    background: none;
+    border: 0;
+    font: inherit;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    font-size: 13px;
+    letter-spacing: .22em;
+    text-indent: .22em;          /* 抵消末字后多出的一档字距 */
+    color: var(--ink);
+    cursor: pointer;
+    transition: color .18s ease;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .jitem:hover { color: var(--zhu); }
+  .jitem.is-on { color: var(--zhu); }
+  .jitem:focus-visible { outline: 1px solid var(--zhu); outline-offset: -4px; }
+
+  /* ---------- 天头触发带 + 一枚「藏起来的提示」 ---------- */
+
+  .hot {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: var(--hot-h);
+    z-index: 49;
+  }
+  .hot-tick {
+    position: fixed;
+    top: 5px; left: 50%;
+    width: 38px; height: 2px;
+    margin-left: -19px;
+    border-radius: 1px;
+    background: rgba(47, 53, 53, .16);
+    z-index: 48;
+    transition: opacity .3s ease;
+  }
+  body.is-bar-shown .hot-tick { opacity: 0; }
+
+  /* ---------- 演示用：展开的面板 + 页脚说明 ---------- */
+
+  .panel {
+    position: fixed;
+    left: 50%;
+    bottom: 44px;
+    transform: translate(-50%, 12px);
+    width: min(560px, calc(100vw - 48px));
+    padding: 18px 22px 16px;
+    background: rgba(247, 241, 225, .97);
+    border-radius: 2px;
+    box-shadow: 0 10px 30px rgba(70, 56, 34, .16);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .2s ease, transform .22s cubic-bezier(.22, .61, .36, 1);
+    z-index: 40;
+  }
+  .panel.is-open { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+  .panel h2 {
+    margin: 0 0 10px;
+    font-size: 12px;
+    font-weight: 400;
+    letter-spacing: .3em;
+    color: #6B6156;
+  }
+  .panel .line {
+    height: 1px;
+    background: rgba(120, 100, 70, .16);
+    margin: 10px 0 12px;
+  }
+  .panel .body {
+    font-size: 12.5px;
+    line-height: 2;
+    color: #4A443C;
+    letter-spacing: .04em;
+  }
+  .panel .close {
+    position: absolute;
+    right: 16px;
+    top: 14px;
+    font: inherit;
+    font-size: 10.5px;
+    color: #8A8175;
+    background: none;
+    border: 0;
+    cursor: pointer;
+    padding: 2px;
+  }
+  .panel .close:hover { color: var(--zhu); }
+
+  .doc-note {
+    position: fixed;
+    left: 0; right: 0; bottom: 10px;
+    text-align: center;
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    color: #8A8175;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body class="is-bar-shown">
+
+  <!-- ===== 背景书叶：只为看「半透明 + 磨砂」的透光效果 ===== -->
+  <div class="stage">
+    <div class="leaf">
+      <p class="gloss">道可道非常道名可名非常名</p>
+      <p>道可道，非常道；名可名，非常名。无名天地之始，有名万物之母。故常无欲以观其妙，常有欲以观其徼。此两者同出而异名，同谓之玄，玄之又玄，众妙之门。</p>
+      <p>天下皆知美之为美，斯恶已；皆知善之为善，斯不善已。故有无相生，难易相成，长短相形，高下相倾，音声相和，前后相随。</p>
+    </div>
+  </div>
+
+  <!-- ===== 天头触发带（30px） ===== -->
+  <div class="hot" id="hot"></div>
+  <div class="hot-tick" id="hotTick"></div>
+
+  <!-- ===== 工具栏 ===== -->
+  <nav class="jbar is-shown" id="jbar" aria-label="书阁与版式">
+    <div class="jbar-inner">
+      <!-- 左组：回到书架 / 卷目 / 封面 -->
+      <div class="jgroup">
+        <button class="jitem" data-act="shelf">书阁</button>
+        <button class="jitem" data-act="toc"   data-panel="卷目">目录</button>
+        <button class="jitem" data-act="cover">封面</button>
+      </div>
+      <!-- 中组：版式 / 字体 / 专注 -->
+      <div class="jgroup">
+        <button class="jitem" data-act="grid"  data-panel="版式">版式</button>
+        <button class="jitem" data-act="font"  data-panel="字体">字体</button>
+        <button class="jitem" data-act="focus">专注</button>
+      </div>
+      <!-- 右组：检索 / 朱批 / 帮助 -->
+      <div class="jgroup">
+        <button class="jitem" data-act="search" data-panel="检索">检索</button>
+        <button class="jitem" data-act="notes"  data-panel="朱批">朱批</button>
+        <button class="jitem" data-act="help"   data-panel="帮助">帮助</button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ===== 演示面板（真实 App 里是目录 / 版式 / 字体面板） ===== -->
+  <section class="panel" id="panel" aria-live="polite">
+    <button class="close" id="panelClose">收起</button>
+    <h2 id="panelTitle">卷目</h2>
+    <div class="line"></div>
+    <div class="body" id="panelBody"></div>
+  </section>
+
+  <p class="doc-note">把鼠标移到屏幕上缘（30px）——工具栏滑出；移开即退。点「目录」「版式」等，字转朱砂并留住。</p>
+
+<script>
+/* ============================================================
+   浮现控制器
+   ------------------------------------------------------------
+   · 触发：鼠标进入天头 30px → 滑出；
+   · 退出：滑到栏下 26px 之外 → 收回（回差，避免边缘抖动）；
+   · 驻留：任一面板展开（pinned）→ 无论鼠标在哪都留着；
+   · 一次动作（书阁 / 封面 / 专注）→ 留 700ms 让用户看见落点再退。
+   ============================================================ */
+(function () {
+  const bar     = document.getElementById('jbar');
+  const hotTick = document.getElementById('hotTick');
+  const panel   = document.getElementById('panel');
+  const pTitle  = document.getElementById('panelTitle');
+  const pBody   = document.getElementById('panelBody');
+  const pClose  = document.getElementById('panelClose');
+
+  const BAR_H = 44;        // 与 CSS --bar-h 一致
+  const HOT_H = 30;        // 与 CSS --hot-h 一致
+  const GAP   = 26;        // 退出回差
+
+  const state = {
+    shown: true,     // 开局先亮一次，让人知道天头有东西
+    pinned: false,   // 有面板开着
+    linger: 0,       // 一次动作后的驻留计时器
+    current: null    // 当前展开的是哪个面板
+  };
+
+  function render() {
+    bar.classList.toggle('is-shown', state.shown);
+    document.body.classList.toggle('is-bar-shown', state.shown);
+  }
+
+  function show() {
+    if (state.shown) return;
+    state.shown = true;
+    render();
+  }
+
+  function hide() {
+    if (!state.shown || state.pinned) return;
+    state.shown = false;
+    render();
+  }
+
+  /* ---- 鼠标位置驱动显隐（一次监听，rAF 节流） ---- */
+  let queued = false;
+  let lastY = -1;
+
+  document.addEventListener('mousemove', function (e) {
+    lastY = e.clientY;
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(function () {
+      queued = false;
+      if (state.pinned || lastY < 0) return;
+      if (lastY <= HOT_H) {
+        show();
+      } else if (state.shown && lastY > BAR_H + GAP) {
+        hide();
+      }
+    });
+  }, { passive: true });
+
+  /* 触屏：轻点天头也能唤出 */
+  document.addEventListener('touchstart', function (e) {
+    if (e.touches[0] && e.touches[0].clientY <= HOT_H + 10) show();
+  }, { passive: true });
+
+  /* 键盘可达：⌥/Alt 唤出 */
+  document.addEventListener('keydown', function (e) {
+    if (e.altKey) show();
+    if (e.key === 'Escape') { closePanel(); }
+  });
+
+  /* ---- 面板 ---- */
+  const COPY = {
+    '卷目': '第一章 道可道　第二章 天下皆知美　第三章 不尚贤……（点条目即跳面）',
+    '版式': '八行 · 十行 · 十二行 · 十四行；单叶 / 对开由屏幕方向自动决定。',
+    '字体': '正文 文津宋体 · 批注 玄冬楷书；字级 蝇头 / 中楷 / 大字 / 榜书。',
+    '检索': '输入词句，全书查找；命中的字在纸面上转朱砂。',
+    '朱批': '这一叶的批注：点行间夹注可放大，长按可增删。',
+    '帮助': '← → 翻页　⌘T 繁简　Esc 收起浮层　Alt 唤出顶栏'
+  };
+
+  function openPanel(name) {
+    state.current = name;
+    state.pinned = true;
+    pTitle.textContent = name;
+    pBody.textContent = COPY[name] || '';
+    panel.classList.add('is-open');
+    show();
+  }
+
+  function closePanel() {
+    if (!state.pinned) return;
+    state.pinned = false;
+    state.current = null;
+    panel.classList.remove('is-open');
+    document.querySelectorAll('.jitem.is-on').forEach(function (b) {
+      b.classList.remove('is-on');
+      b.setAttribute('aria-pressed', 'false');
+    });
+    // 关面板后先留一息，鼠标若已在下方自然收回
+    if (lastY > BAR_H + GAP) hide();
+  }
+
+  pClose.addEventListener('click', closePanel);
+
+  /* ---- 点击：面板类按钮驻留，动作类按钮闪一下 ---- */
+  document.querySelectorAll('.jitem').forEach(function (btn) {
+    btn.setAttribute('aria-pressed', 'false');
+    btn.addEventListener('click', function () {
+      const name = btn.dataset.panel;
+      if (name) {
+        if (state.current === name) {
+          closePanel();          // 再点一次收起
+          return;
+        }
+        document.querySelectorAll('.jitem.is-on').forEach(function (b) {
+          b.classList.remove('is-on');
+          b.setAttribute('aria-pressed', 'false');
+        });
+        btn.classList.add('is-on');       // ← 面板展开：该字保持朱砂
+        btn.setAttribute('aria-pressed', 'true');
+        openPanel(name);
+      } else {
+        // 书阁 / 封面 / 专注：执行后留 700ms 再允许收回
+        show();
+        clearTimeout(state.linger);
+        state.linger = setTimeout(function () { if (!state.pinned) hide(); }, 700);
+      }
+    });
+  });
+})();
+</script>
+</body>
+</html>
