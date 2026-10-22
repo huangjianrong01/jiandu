@@ -112,25 +112,6 @@ impl GridDir {
 /// （保留以供分页一致性测试遍历；UI 与状态切换已改走 [`LAYOUT_CONFIGS`]。）
 pub const GRID_COLUMN_CHOICES: [usize; 4] = [8, 10, 12, 14];
 
-/// 版框样式。渲染层只按这个值分支，不写死「信笺才文武」。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BorderStyle {
-    /// 单线：一根细框，普通古籍竖笺。
-    Single,
-    /// 文武边栏：外粗内细，信笺 / 讲究的刻本用。
-    Double,
-}
-
-impl BorderStyle {
-    /// 边框样式标签（UI / 调试用）。
-    pub fn label(self) -> &'static str {
-        match self {
-            BorderStyle::Single => "单线",
-            BorderStyle::Double => "文武",
-        }
-    }
-}
-
 /// 版式配置：数据驱动排版引擎的**唯一数据源**。
 ///
 /// 取代原先散落的 `letter_mode` 布尔、`GRID_COLUMN_CHOICES` 硬编码与
@@ -149,23 +130,22 @@ pub struct LayoutConfig {
     pub dir: GridDir,
     /// 四周留白比例。
     pub margin: f32,
-    /// 版框样式：单线（standard）/ 文武（信笺）。
-    pub border_style: BorderStyle,
     /// 是否在版心（中缝）绘制上下相对的「对鱼尾」。
     pub show_fish_tail: bool,
 }
 
 /// 版式配置注册表：有序数组即「单一数据源」。新增版式（如 16 列）只需在此
 /// 追加一行，UI / 渲染 / 几何自动适配——零 if-else 扩散。
+///
+/// v1.24.0 起四档列数（8 / 10 / 12 / 14）走**同一条刻本几何**：原先的
+/// 「信笺 14 列」独占一条 2:3 平铺稿纸路径（`fit_letter`），已被移除——
+/// 那套模板只有 14 列能用，且与列数选择器冲突（选 14 得到的是信笺而不是
+/// 标准刻本）。版框统一为「外粗内细」的文武边栏（见 `render_ancient`）。
 pub const LAYOUT_CONFIGS: &[LayoutConfig] = &[
-    LayoutConfig { key: "standard8",  label: "标准 8 列",  columns: 8,  dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Single, show_fish_tail: false },
-    LayoutConfig { key: "standard10", label: "标准 10 列", columns: 10, dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Single, show_fish_tail: false },
-    LayoutConfig { key: "standard12", label: "标准 12 列", columns: 12, dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Single, show_fish_tail: false },
-    // 标准 14 列：与 8/10/12 同一条刻本几何（列数选择器选 14 时命中它）。
-    // 放在「信笺」之前——`set_columns(14)` 取第一个匹配，故默认选标准版。
-    LayoutConfig { key: "standard14", label: "标准 14 列", columns: 14, dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Single, show_fish_tail: false },
-    // 信笺：四周文武边栏 + 中缝对鱼尾，独占 2:3 平铺稿纸几何（见 `fit_letter`）。
-    LayoutConfig { key: "letter14",   label: "信笺 14 列", columns: 14, dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Double, show_fish_tail: true },
+    LayoutConfig { key: "standard8",  label: "标准 8 列",  columns: 8,  dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false },
+    LayoutConfig { key: "standard10", label: "标准 10 列", columns: 10, dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false },
+    LayoutConfig { key: "standard12", label: "标准 12 列", columns: 12, dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false },
+    LayoutConfig { key: "standard14", label: "标准 14 列", columns: 14, dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false },
 ];
 
 impl LayoutConfig {
@@ -181,9 +161,14 @@ impl LayoutConfig {
     pub fn default_key() -> &'static str {
         Self::default().key
     }
-    /// 是否「信笺」模板：独占 2:3 平铺几何与对鱼尾，与普通对开 / 单页是两条路径。
-    pub fn is_letter(&self) -> bool {
-        self.key == "letter14"
+    /// 旧存档里可能还写着已删除的「信笺 14 列」键：一律回落到同列数的标准版。
+    /// （列数不变、几何不变，用户察觉不到，但不会再走那条已删除的模板路径。）
+    pub fn migrate_key(key: &str) -> &'static str {
+        match LayoutConfig::by_key(key) {
+            Some(c) => c.key,
+            None if key == "letter14" => "standard14",
+            None => Self::default_key(),
+        }
     }
 }
 
@@ -646,11 +631,15 @@ mod tests {
         assert!(LayoutMode::Facing.spreads());
         assert!(LayoutMode::Full.spreads());
         assert!(!LayoutMode::Single.spreads());
-        // 8/10/12/14 四档都有对应版式，且「列数 14」取标准版（不是信笺）。
+        // 8/10/12/14 四档都有对应版式，且列数选择器取到的是标准版。
         for n in GRID_COLUMN_CHOICES {
             let cfg = LAYOUT_CONFIGS.iter().find(|c| c.columns == n).unwrap();
-            assert!(!cfg.is_letter() || n == 14, "{n} 列首选项不该是信笺");
+            assert_eq!(cfg.columns, n);
+            assert!(cfg.key.starts_with("standard"), "{n} 列应命中标准版式");
         }
+        // 已删除的「信笺」键要能平滑迁移到标准 14 列。
+        assert_eq!(LayoutConfig::migrate_key("letter14"), "standard14");
+        assert_eq!(LayoutConfig::migrate_key("nope"), LayoutConfig::default_key());
     }
 
     #[test]
@@ -828,23 +817,19 @@ mod tests {
 
     #[test]
     fn layout_configs_are_the_single_source_of_truth() {
-        // 注册表覆盖用户指定的四档列数（8/10/12/14），外加「信笺 14 列」
-        // 这一特殊模板；键 / 标签 / 列数一一对应。
-        assert_eq!(LAYOUT_CONFIGS.len(), 5);
+        // 注册表恰好是用户指定的四档列数（8/10/12/14），键 / 标签 / 列数
+        // 一一对应；「信笺」模板已删除，不再出现在这张表里。
+        assert_eq!(LAYOUT_CONFIGS.len(), 4);
         let keys: Vec<&str> = LAYOUT_CONFIGS.iter().map(|c| c.key).collect();
-        assert_eq!(
-            keys,
-            vec!["standard8", "standard10", "standard12", "standard14", "letter14"]
-        );
-        // 标准三档是单线、无鱼尾；信笺是文武边栏 + 对鱼尾。
-        for c in LAYOUT_CONFIGS.iter().filter(|c| !c.is_letter()) {
-            assert_eq!(c.border_style, BorderStyle::Single, "{} 应为单线", c.key);
-            assert!(!c.show_fish_tail, "{} 不应有鱼尾", c.key);
+        assert_eq!(keys, vec!["standard8", "standard10", "standard12", "standard14"]);
+        for c in LAYOUT_CONFIGS {
+            assert_eq!(c.dir, GridDir::Vertical, "{} 应为竖排", c.key);
+            assert!(
+                !c.key.contains("letter"),
+                "{} 信笺模板已删除，不该还在注册表里",
+                c.key
+            );
         }
-        let letter = LayoutConfig::by_key("letter14").unwrap();
-        assert_eq!(letter.border_style, BorderStyle::Double);
-        assert!(letter.show_fish_tail);
-        assert_eq!(letter.columns, 14);
         // 默认档是 standard10。
         assert_eq!(LayoutConfig::default().key, "standard10");
         // 注册表是精确查表：未知键查不到（`None`），回落由调用方

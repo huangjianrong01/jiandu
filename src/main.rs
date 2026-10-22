@@ -32,6 +32,7 @@ mod sound;
 mod theme;
 mod trad;
 mod types;
+mod vclean;
 mod west;
 
 use app::Root;

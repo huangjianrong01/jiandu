@@ -11,7 +11,6 @@ use crate::app::{
 };
 use crate::dict;
 use crate::gloss::{Page, Piece};
-use crate::grid::BorderStyle;
 use crate::lines;
 use crate::theme::{InkPalette, Theme};
 use crate::trad;
@@ -73,9 +72,7 @@ pub(crate) struct LeafGeo {
     pub rows: usize,
     /// 正文字号 = cell_w × `GRID_FS_RATIO`（收敛在[min,max]）。
     pub fs: f32,
-    /// 版框样式：单线 / 文武（外粗内细），由当前 `LayoutConfig` 决定。
-    pub border_style: BorderStyle,
-    /// 信笺模板：叶内第 7/8 列之间插一列宽中缝（对鱼尾）。
+    /// 叶内中缝（对鱼尾）开关，由当前 `LayoutConfig` 决定。
     pub show_fish_tail: bool,
     /// 夹注行内显示（双行小字夹注）；false = 页脚注横排列表。
     pub notes_inline: bool,
@@ -84,8 +81,8 @@ pub(crate) struct LeafGeo {
 }
 
 impl LeafGeo {
-    /// 当前阅读视图的几何（与 `fit_sizes` / `fit_letter` 算出的同源）。
-    /// 边框样式与鱼尾开关直接从当前 `LayoutConfig` 取，不再读 `letter_mode` 布尔。
+    /// 当前阅读视图的几何（与 `fit_sizes` 算出的同源）。
+    /// 鱼尾开关直接从当前 `LayoutConfig` 取，不再读 `letter_mode` 布尔。
     pub(crate) fn current(r: &Root) -> Self {
         let cfg = r.current_layout();
         Self {
@@ -93,7 +90,6 @@ impl LeafGeo {
             cell_h: r.row_h,
             rows: r.grid_rows,
             fs: r.size_ancient,
-            border_style: cfg.border_style,
             show_fish_tail: cfg.show_fish_tail,
             notes_inline: r.notes_inline,
             interactive: true,
@@ -754,7 +750,7 @@ impl Root {
     fn meixin_band(&self, total: usize) -> Option<(f32, f32)> {
         crate::types::meixin_band(
             self.viewport_w,
-            self.is_letter_mode(),
+            false, // 信笺模板已删除：不再有「叶内宽中缝」这一种版心
             self.duplex == Duplex::Facing,
             // 中缝渲染条件：对开且下一面（左半叶）存在。
             self.page + 1 < total,
@@ -2330,11 +2326,6 @@ impl Root {
                 .flex_col()
                 .items_center();
             sc.style().overflow.y = Some(Overflow::Scroll);
-            if self.is_letter_mode() {
-                // 信笺 14 列在窄屏上可能横向也放不下：允许左右滚动，
-                // 而不是把字继续压小（最小字号保护的另一半）。
-                sc.style().overflow.x = Some(Overflow::Scroll);
-            }
             sc.child(inner)
         } else {
             inner
@@ -2582,14 +2573,15 @@ impl Root {
             .border_color(rgb(t.frame_ink()))
             .child(grid)
             .child(foot);
-        // 文武边栏的内层细线（single 不画，避免两根细线并行像伪双边）。
-        if geo.border_style == BorderStyle::Double {
-            inner = match edge {
-                LeafEdge::Left => inner.border_t_1().border_b_1().border_l_1(),
-                LeafEdge::Right => inner.border_t_1().border_b_1().border_r_1(),
-                LeafEdge::Alone => inner.border_1(),
-            };
-        }
+        // **内框线（文武边栏的内层细线）**：与列间界行（乌丝栏）同一条——
+        // 同色、同粗（1px）、同起止，看上去就是「界行围了一圈」，而不是
+        // 另起一条比界行还重的框。对开时内侧（贴中缝那侧）不画。
+        inner = match edge {
+            LeafEdge::Left => inner.border_t_1().border_b_1().border_l_1(),
+            LeafEdge::Right => inner.border_t_1().border_b_1().border_r_1(),
+            LeafEdge::Alone => inner.border_1(),
+        };
+        inner = inner.border_color(rgb(t.rule_by(self.rule_color)));
         // 卷首题署（卷端）：章首页开卷列顶部叠一卷端题名——
         // 第一行（顶格）写书名·卷次，第二行（低几格）写署名；
         // 落在 layout_book 预留的空白带上，与正文互不遮挡。
@@ -2614,15 +2606,13 @@ impl Root {
             .border_color(rgb(t.frame_ink()))
             .p(px(3.0))
             .child(inner);
-        // 外层框线：single = 1px 单线；double = 3px 粗框（与内层细线夹 3px 间隙
-        // 形成外粗内细的文武边栏）。对开内侧仍留空，两半拼合不打架。
-        frame = match (edge, geo.border_style) {
-            (LeafEdge::Left, BorderStyle::Double) => frame.border_t_3().border_b_3().border_l_3(),
-            (LeafEdge::Right, BorderStyle::Double) => frame.border_t_3().border_b_3().border_r_3(),
-            (LeafEdge::Alone, BorderStyle::Double) => frame.border_3(),
-            (LeafEdge::Left, BorderStyle::Single) => frame.border_t_1().border_b_1().border_l_1(),
-            (LeafEdge::Right, BorderStyle::Single) => frame.border_t_1().border_b_1().border_r_1(),
-            (LeafEdge::Alone, BorderStyle::Single) => frame.border_1(),
+        // **外层框线一律加粗（3px）**：8 / 10 / 12 / 14 列都是「外粗内细」
+        // 的文武边栏——外框压得住整版，内框与界行同粗，层次才立得住。
+        // 对开内侧仍留空，两半拼合成一整张纸时不打架。
+        frame = match edge {
+            LeafEdge::Left => frame.border_t_3().border_b_3().border_l_3(),
+            LeafEdge::Right => frame.border_t_3().border_b_3().border_r_3(),
+            LeafEdge::Alone => frame.border_3(),
         };
 
         // 纸面留白：对开时内侧（贴纸心那一侧）收掉，两半才能拼成一张纸。
@@ -3777,12 +3767,17 @@ impl Root {
         }
         let key = (g.chapter, g.para, g.offset);
         let marked = self.underlines.contains(&key);
-        // 生僻字注音：开启且命中生僻字表时，在字格顶部标读音（不影响正文排布）。
-        let rare_py = if self.show_rare && !is_punct(g.ch) {
-            self.rare_pinyin(g.ch)
+        // 注音：**书里的优先，字典兜底**。
+        //   * `NoteKind::Ruby` —— EPUB `<ruby><rt>` 导入时挂在该字上的读音
+        //     （`[拼音:…]` 标记 → 注音注），作者标什么就读什么；
+        //   * 没有则查内置生僻字表（`rare_pinyin`），按「生僻字注音」开关走。
+        let ruby_py: Option<String> = if self.show_rare {
+            self.ruby_pinyin(g)
+                .or_else(|| (!is_punct(g.ch)).then(|| self.rare_pinyin(g.ch)).flatten().map(str::to_string))
         } else {
             None
         };
+        let rare_py = ruby_py;
         // 专名线 / 书名线：人名、地名画实线，书名画波浪线，贴字左侧、逐字连贯。
         // 标点字不画线条——线在标点处自然断开，绝不穿过标点。
         let mark_line = if is_punct(g.ch) {
@@ -3899,7 +3894,7 @@ impl Root {
         // ── 竖排注音（生僻字拼音）──────────────────────────────────
         // 一字母一行、贴字格右上角；字号 30%，长拼音自动降号（下限 18%）。
         // 横向排会撑破一格宽、压到左边下一列——这正是必须修的病根。
-        if let Some(py) = rare_py {
+        if let Some(py) = rare_py.as_deref() {
             let rl = crate::ruby::layout(py, fs, cell_w, cell_h);
             let mut ruby = div()
                 .absolute()
@@ -4067,7 +4062,7 @@ impl Root {
                                 // 单击（未拖选）带注音的字：直接呼出「注音浮签」，
                                 // 大字显示拼音与本字；拖选仍走原来的选区工具条。
                                 if this.sel_anchor == this.sel_focus {
-                                    if let Some(py) = rare_py {
+                                    if let Some(py) = rare_py.clone() {
                                         this.popup = None;
                                         this.note_zoom = Some(crate::gloss::NoteZoom {
                                             text: g.ch.to_string(),
@@ -4189,6 +4184,18 @@ impl Root {
         dict::pinyin_of(c)
             .or_else(|| trad::simplified_of(c).and_then(dict::pinyin_of))
             .or_else(|| trad::traditional_of(c).and_then(dict::pinyin_of))
+    }
+
+    /// 书里的注音（EPUB `<ruby><rt>` 导入的 `NoteKind::Ruby`）。
+    ///
+    /// 与 `rare_pinyin` 的分工：这个是**作者标了什么就读什么**（`长[拼音:cháng]`
+    /// 的 cháng 不会被通用字表念成 zhǎng），字表只在没标音时兜底。
+    fn ruby_pinyin(&self, g: Glyph) -> Option<String> {
+        let p = self.book.as_ref()?.chapters.get(g.chapter)?.paragraphs.get(g.para)?;
+        p.notes
+            .iter()
+            .find(|n| n.kind == NoteKind::Ruby && n.at == g.offset)
+            .map(|n| n.text.clone())
     }
 
     fn render_reading_status(&self, total: usize) -> Div {
@@ -5809,15 +5816,10 @@ impl Root {
         }
         let slice = &flow[i0..i0 + n];
 
-        // ② 续排：列数减一（长图更竖）；信笺保持 14 列（中缝列照旧）。
+        // ② 续排：列数减一（长图更竖）。
         //    夹注经 gloss 闭包行内化——晒本一律带注，与 notes_inline 无关，
         //    但尊重「显示注释」总开关（note_chars_with_source 内部已判）。
-        let cfg = self.current_layout();
-        let cols2 = if cfg.is_letter() {
-            self.grid.columns
-        } else {
-            self.grid.columns.saturating_sub(1).max(3)
-        };
+        let cols2 = self.grid.columns.saturating_sub(1).max(3);
         let gloss = |g: &Glyph| -> Option<crate::gloss::GlossPayload> {
             self.note_chars_with_source(*g)
                 .map(|(s, src)| (s.to_string(), src, *g))
@@ -5841,8 +5843,8 @@ impl Root {
         //    地脚里随字号伸缩的那部分（0.36×字号比）一并代入高度约束。
         let ratio = crate::grid::GRID_ROW_RATIO; // 1.1
         let fs_ratio = crate::grid::GRID_FS_RATIO; // 0.75
-        // 信笺多一列中缝；非信笺章首页的章题列已含在 cols2 里（limit+1）。
-        let cols_total = if cfg.is_letter() { cols2 + 1 } else { cols2 } as f32;
+        // 章首页的章题列已含在 cols2 里（limit+1），不再额外加中缝列。
+        let cols_total = cols2 as f32;
         let by_w = (box_w - 46.0) / cols_total;
         let by_h = (box_h - 56.0) / (rows2 as f32 * ratio + 0.36 * fs_ratio);
         let mut cell_w = by_w.min(by_h).max(8.0);
@@ -5873,8 +5875,8 @@ impl Root {
             cell_h,
             rows: rows2,
             fs,
-            border_style: cfg.border_style,
-            show_fish_tail: cfg.show_fish_tail,
+            // 晒本是单叶长图，无叶内中缝，恒不画鱼尾。
+            show_fish_tail: false,
             notes_inline: true,
             interactive: false,
         };

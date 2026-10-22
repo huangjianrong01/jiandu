@@ -626,7 +626,25 @@ const BLOCK_TAGS: [&str; 11] = [
 /// * `<strong> <b>` → `[高亮]…[/高亮]`；
 /// * `<blockquote>` 整块 → `[注]…[/注]`；
 /// * `&nbsp; &lt; &#123;` 之类实体一律还原。
+///
+/// 末尾统一做一道 [`classicize`]（全角标点 + 数字转汉字）。EPUB 那条更细的
+/// 五阶段链（[`crate::vclean`]）要自己在「古籍化」之前插工序，故另走
+/// [`parse_html_raw`]——两者共用同一台标签行走器，不分叉。
 pub fn parse_html(html: &str) -> Vec<RawChapter> {
+    let mut chapters = parse_html_raw(html);
+    chapters.iter_mut().for_each(|c| {
+        c.title = classicize(&c.title);
+        c.content = classicize(&c.content);
+    });
+    chapters
+}
+
+/// html / xml → 标准章数组，**不做**古籍化（标点 / 数字原样）。
+///
+/// 给 [`crate::vclean`] 用：竖排清洗要先把「页码孤行」按 ASCII 数字认出来
+/// 丢掉，再把括号转夹注、最后把数字读成汉字；若这里先把数字化成汉字，
+/// 下游就再也认不出「这一行原本是个页码」了。
+pub fn parse_html_raw(html: &str) -> Vec<RawChapter> {
     let mut s = html.to_string();
     for tag in DROP_BLOCKS {
         s = remove_block(&s, tag);
@@ -651,6 +669,8 @@ pub fn parse_html(html: &str) -> Vec<RawChapter> {
     // 光看名字认不出它是「注」，得靠开标签时记下的那一笔。
     let mut stack: Vec<OpenTag> = Vec::new();
     let mut heading: Option<String> = None;
+    // 正在由「非 h1~h6 的题署标签」撑起的标题：值为该标签名，闭合即收口。
+    let mut heading_owner: Option<String> = None;
     let mut in_blockquote = 0usize;
 
     // 段落入库时才还原实体：`&nbsp;` `&#12298;` 之类是**文本**层面的噪声，
@@ -696,6 +716,20 @@ pub fn parse_html(html: &str) -> Vec<RawChapter> {
         let lower = name.to_ascii_lowercase();
 
         if closing {
+            // 题署标签（`<div epub:type="title">` 一类）闭合：收口成章标题。
+            // 它开时没进栈（见下面的开始标签分支），故不能走栈对名那条路。
+            if heading_owner.as_deref() == Some(lower.as_str()) {
+                heading_owner = None;
+                if let Some(h) = heading.take() {
+                    let h = decode_entities(h.trim());
+                    if !h.is_empty() {
+                        flush(&mut paras, &mut buf);
+                        push_chapter_html(&mut chapters, &title, &mut paras);
+                        title = h;
+                    }
+                }
+                continue;
+            }
             match lower.as_str() {
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                     if let Some(h) = heading.take() {
@@ -735,6 +769,15 @@ pub fn parse_html(html: &str) -> Vec<RawChapter> {
         }
 
         // ---- 开始标签 ----
+        // EPUB3 的章题不一定写成 `<h1>`：`<div epub:type="title">`、
+        // `<p class="title">`、`<span role="doc-title">` 遍地都是。
+        // 这类块一开就当「题署」起头，闭合同名标签时收口。
+        if is_doc_title_tag(&lower, &attrs) {
+            flush(&mut paras, &mut buf);
+            heading = Some(String::new());
+            heading_owner = Some(lower.clone());
+            continue;
+        }
         if let Some(h) = lower.strip_prefix('h') {
             if h.len() == 1 && h.chars().all(|c| ('1'..='6').contains(&c)) {
                 flush(&mut paras, &mut buf);
@@ -781,10 +824,6 @@ pub fn parse_html(html: &str) -> Vec<RawChapter> {
         let text = decode_entities(&plain);
         return parse_txt(&text);
     }
-    chapters.iter_mut().for_each(|c| {
-        c.title = classicize(&c.title);
-        c.content = classicize(&c.content);
-    });
     chapters
 }
 
@@ -794,6 +833,34 @@ fn push_chapter_html(out: &mut Vec<RawChapter>, title: &str, paras: &mut Vec<Str
     }
     out.push(RawChapter::new(title, paras.join("\n")));
     paras.clear();
+}
+
+/// 这个标签是不是「章节题署」（EPUB3 的 `epub:type="title"` 一族）。
+///
+/// 只认块级的几个容器名——`<title>`（head 里）与 `<h1>~<h6>` 另有专路，
+/// 不能在这里重复吞掉。
+fn is_doc_title_tag(name: &str, attrs: &str) -> bool {
+    if !matches!(name, "div" | "p" | "span" | "section" | "hgroup") {
+        return false;
+    }
+    let et = attr_value(attrs, "epub:type").to_ascii_lowercase();
+    if et
+        .split_whitespace()
+        .any(|t| matches!(t, "title" | "fulltitle" | "subtitle"))
+    {
+        return true;
+    }
+    let role = attr_value(attrs, "role").to_ascii_lowercase();
+    if role == "doc-title" {
+        return true;
+    }
+    let cls = attr_value(attrs, "class").to_ascii_lowercase();
+    cls.split_whitespace().any(|c| {
+        matches!(
+            c,
+            "title" | "booktitle" | "chapter-title" | "chaptertitle" | "chapter_title" | "headline"
+        )
+    })
 }
 
 /// 标签名 → 笺读标记种类：`em / i / cite / q / span.note` 是注，
@@ -1092,8 +1159,10 @@ pub fn parse_str(kind: SrcKind, text: &str) -> Result<Vec<RawChapter>> {
         SrcKind::Markdown => Ok(parse_markdown(text)),
         SrcKind::Html => Ok(parse_html(text)),
         SrcKind::Json => parse_jsonish(text),
-        // epub 是容器：先由 importer 拆出 xhtml，再逐份走 Html 分支。
-        SrcKind::Epub => Ok(parse_html(text)),
+        // epub 是容器：先由 importer 拆出 xhtml，再逐份走竖排清洗管线
+        // （`vclean` 五阶段；比 `parse_html` 多出广告降噪 / ruby 注音 /
+        // 括号转夹注 / 页码孤行清理）。
+        SrcKind::Epub => Ok(crate::vclean::clean_epub(text)),
     }
 }
 
@@ -1126,15 +1195,82 @@ pub fn split_highlights(s: &str) -> (String, Vec<(usize, usize, String)>) {
     (out, spans)
 }
 
+/// 摘出 `[拼音:…]`（EPUB `<ruby><rt>` 转来的注音），返回（干净文本, [(宿主字下标, 拼音)]）。
+///
+/// 标记的语义是「**前一个字**的读音」——清洗时把 `<ruby>汉<rt>hàn</rt></ruby>`
+/// 写成 `汉[拼音:hàn]`，故宿主下标取标记前一个已输出字的位次。段首无字则丢弃
+/// （注音无处可挂，留着反而变成字面方括号）。
+///
+/// 竖排渲染侧把它当**格内附属标记**：拼音逐字母竖叠在字格右上角
+/// （`ruby::layout`），既不占格、也不进双行夹注，行气不断。
+pub fn split_ruby(s: &str) -> (String, Vec<(usize, String)>) {
+    let mut out = String::with_capacity(s.len());
+    let mut marks: Vec<(usize, String)> = Vec::new();
+    let mut rest = s;
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix("[拼音:") {
+            let (body, after) = match tail.find(']') {
+                Some(i) => (&tail[..i], &tail[i + 1..]),
+                None => (tail, ""),
+            };
+            let n = out.chars().count();
+            let py = body.trim();
+            if n > 0 && !py.is_empty() {
+                marks.push((n - 1, py.to_string()));
+            }
+            rest = after;
+        } else {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    (out, marks)
+}
+
+/// 摘掉 `[数字:…]` 兜底标记，只留中间的数字串本身。
+///
+/// 这个标记是**跨渲染器的约定**（「这一串不许拆成单字，整串横躺」）。笺读自己的
+/// 竖排引擎本来就把连续数字整串成组（`west::scan_digit_run` + 半格账），所以
+/// 入库时把壳去掉即可；留着壳会被当成正文方括号画出来。
+pub fn strip_digit_marks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix("[数字:") {
+            let (body, after) = match tail.find(']') {
+                Some(i) => (&tail[..i], &tail[i + 1..]),
+                None => (tail, ""),
+            };
+            out.push_str(body);
+            rest = after;
+        } else {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
+}
+
 /// 一行正文 → 段落：摘掉 `[高亮]`（转成着重 `Note`），`〖〗≪≫` 由 `para_of` 解析。
+///
+/// 顺序有讲究：先拆 `[数字:…]` 壳（它可能包着 `[高亮]`），再拆 `[高亮]`，
+/// 最后拆 `[拼音:…]`——注音下标必须与「去掉着重标记之后」的正文同口径，
+/// 否则挂错字。
 ///
 /// 导入管线的每一条正文都从这里过，EPUB 与普通文本共用同一条清洗链，
 /// 免得「epub 有高亮、txt 没有」这类分叉。
 pub fn paragraph_of(line: &str) -> Paragraph {
-    let (clean, spans) = split_highlights(line);
+    let line = strip_digit_marks(line);
+    let (clean, spans) = split_highlights(&line);
+    let (clean, rubies) = split_ruby(&clean);
     let mut p = crate::importer::para_of(&clean);
     for (at, len, text) in spans {
         p.notes.push(Note::span(at, len, NoteKind::Emph, text));
+    }
+    for (at, py) in rubies {
+        p.notes.push(Note::span(at, 1, NoteKind::Ruby, py));
     }
     p
 }
@@ -1183,7 +1319,56 @@ pub fn chapters_to_book(fallback_title: &str, author: &str, chapters: Vec<RawCha
 mod tests {
     use super::*;
 
+    // ---- 标记解析（EPUB 竖排清洗产出的三种标记）----
+
+    #[test]
+    fn ruby_mark_attaches_pinyin_to_previous_char() {
+        // `[拼音:…]` 的语义是「**前一个字**的读音」，宿主下标取标记前一字。
+        let (clean, marks) = split_ruby("玄[拼音:xuán]之又玄");
+        assert_eq!(clean, "玄之又玄");
+        assert_eq!(marks, vec![(0usize, "xuán".to_string())]);
+        // 段首无字：注音无处可挂，丢弃（不留字面方括号）。
+        let (clean, marks) = split_ruby("[拼音:o]甲");
+        assert_eq!(clean, "甲");
+        assert!(marks.is_empty());
+    }
+
+    #[test]
+    fn ruby_mark_becomes_ruby_note_on_the_host_glyph() {
+        use crate::types::NoteKind;
+        let p = paragraph_of("玄[拼音:xuán]之又玄");
+        assert_eq!(p.text, "玄之又玄", "标记不得进正文");
+        let ruby = p
+            .notes
+            .iter()
+            .find(|n| n.kind == NoteKind::Ruby)
+            .expect("应挂一条注音注");
+        assert_eq!(ruby.at, 0);
+        assert_eq!(ruby.text, "xuán");
+        assert_eq!(ruby.len, 1);
+    }
+
+    #[test]
+    fn digit_mark_is_unwrapped_at_ingest() {
+        // `[数字:…]` 是跨渲染器约定；竖排引擎本就整串成组，入库时去壳即可。
+        assert_eq!(strip_digit_marks("ISBN [数字:978-7-02]"), "ISBN 978-7-02");
+        assert_eq!(paragraph_of("编号[数字:978-7-02]").text, "编号978-7-02");
+    }
+
+    #[test]
+    fn markers_coexist_with_highlights() {
+        use crate::types::NoteKind;
+        let p = paragraph_of("道[高亮]可[/高亮]道[拼音:dào]");
+        assert_eq!(p.text, "道可道");
+        assert!(p.notes.iter().any(|n| n.kind == NoteKind::Emph && n.at == 1));
+        // 注音下标按「去掉着重标记之后」的口径算，挂在末字（下标 2）。
+        let ruby = p.notes.iter().find(|n| n.kind == NoteKind::Ruby).unwrap();
+        assert_eq!(ruby.at, 2, "注音挂错字：{:?}", p.notes);
+    }
+
     // ---- 解码 ----
+
+    #[test]
 
     #[test]
     fn decode_utf8_and_bom() {

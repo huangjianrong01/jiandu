@@ -68,6 +68,9 @@ pub fn to_txt(book: &Book) -> String {
                     // 着重（导入时 `**加粗**` 转来的朱砂圈点）：导出还原成
                     // markdown 的加粗，round-trip 不丢标记。
                     NoteKind::Emph => "着重",
+                    // 注音（EPUB `<ruby>` 导入）：导出成「拼音」条，不回写标记
+                    // ——正文里注音是格内附属物，独立成行更好读。
+                    NoteKind::Ruby => "拼音",
                 };
                 out.push_str(&format!("〔{tag}〕{}\n", n.text));
             }

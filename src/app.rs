@@ -631,9 +631,9 @@ impl Root {
         if std::env::var("JIANDU_FACING").is_ok() {
             root.duplex = Duplex::Facing;
         }
-        // 开发用：直接进「信笺（14 列）」模板，便于截图核对。
+        // 开发用：直接切到 14 列（信笺模板已删除，14 列就是标准刻本版式）。
         if std::env::var("JIANDU_LETTER").is_ok() {
-            root.layout_key = "letter14";
+            root.layout_key = "standard14";
             root.grid.columns = 14;
             root.duplex = Duplex::Single;
         }
@@ -948,12 +948,6 @@ impl Root {
         self.content_w = content_w;
         self.content_h = content_h;
         let notes_foot = self.show_notes && !self.notes_inline;
-        // 信笺（14 列）模板：单张平铺稿纸，按 23×34cm（2:3）铺排，
-        // 14 个正文列 + 1 个中缝列。与普通过开 / 单页是两条独立的几何路径。
-        if self.current_layout().is_letter() {
-            self.fit_letter(content_w, content_h, notes_foot);
-            return;
-        }
         // ---- 渲染模式分派（对开 / 单叶 / 整页）----
         // 自动模式下只在对开 ⇄ 单叶之间来回（整页是「看整体版式」的手动档，
         // 自动切进去会打断阅读）。判据 `grid::should_face` 除宽高比外还要求
@@ -1017,68 +1011,14 @@ impl Root {
         self.grid_min_font = m.min_font_hit;
     }
 
-    /// 信笺（14 列）模板的几何：单张平铺稿纸，宽高比照参考图 23×34cm
-    /// （≈2:3）。纸宽 = `columns` 个正文列 + 1 个中缝列（中缝与一列同宽），
-    /// 两侧再加版框预留 `ANCIENT_EDGE`；行数未知，故枚举行数，取
-    /// 「纸面宽高比最接近 2:3」且能完整塞进内容区的那一档，再据此反算
-    /// 列宽 / 字号 / 行高——14 列下字仍居中、不溢出。
-    fn fit_letter(&mut self, content_w: f32, content_h: f32, notes_foot: bool) {
-        let aspect = 34.0 / 23.0;
-        let edge = ANCIENT_EDGE;
-        let head = ANCIENT_HEAD;
-        let foot = ANCIENT_FOOT + if notes_foot { ANCIENT_NOTES } else { 0.0 };
-        // 正文列 + 1 个中缝列。
-        let cols_total = self.grid.columns as f32 + 1.0;
-        let row_ratio = crate::grid::GRID_ROW_RATIO;
-        let mut best_rows = 10usize;
-        let mut best_err = f32::MAX;
-        let mut best_cw = 8.0f32;
-        for rows in 6..=44usize {
-            let by_w = (content_w - edge) / cols_total;
-            let by_h =
-                (content_h - edge - head - foot) / (rows as f32 * row_ratio);
-            let cw = by_w.min(by_h);
-            if cw < 3.0 {
-                continue;
-            }
-            let w = cols_total * cw + edge;
-            let h = rows as f32 * row_ratio * cw + edge + head + foot;
-            let err = (h / w - aspect).abs();
-            if err < best_err {
-                best_err = err;
-                best_rows = rows;
-                best_cw = cw;
-            }
-        }
-        // 字号 = 0.75 × 列宽；窄屏触底则反推列宽（宁可纸面略宽 → 渲染层滚动），
-        // 保证 14 列时字仍不小于可读下限、也不与字格重叠。
-        let mut fs = best_cw * crate::grid::GRID_FS_RATIO * self.zoom;
-        let min_hit = fs < crate::grid::GRID_FS_MIN;
-        fs = fs.clamp(crate::grid::GRID_FS_MIN, crate::grid::GRID_FS_MAX);
-        let col_w = if min_hit { fs / crate::grid::GRID_FS_RATIO } else { best_cw };
-        let row_h = col_w * row_ratio;
-        self.size_ancient = fs;
-        self.size_modern = fs;
-        self.line_modern = row_h;
-        self.page_w = cols_total * col_w + edge;
-        self.page_h = best_rows as f32 * row_h + edge + head + foot;
-        self.col_w = col_w;
-        self.row_h = row_h;
-        self.grid_rows = best_rows;
-        self.grid_min_font = min_hit;
-        // 信笺是**一张平铺的纸**，不对开。
-        self.duplex = Duplex::Single;
-    }
-
     /// 当前版式配置：数据驱动的唯一数据源（见 [`crate::grid::LAYOUT_CONFIGS`]）。
+    ///
+    /// 走 `migrate_key`：旧存档里可能还写着已删除的「letter14（信笺）」，
+    /// 一律迁到同列数的 standard14，几何不变、用户察觉不到。
     pub fn current_layout(&self) -> &'static crate::grid::LayoutConfig {
-        crate::grid::LayoutConfig::by_key(self.layout_key)
+        let key = crate::grid::LayoutConfig::migrate_key(self.layout_key);
+        crate::grid::LayoutConfig::by_key(key)
             .unwrap_or_else(crate::grid::LayoutConfig::default)
-    }
-
-    /// 是否「信笺」模板（独占 2:3 平铺几何与对鱼尾）。
-    pub fn is_letter_mode(&self) -> bool {
-        self.current_layout().is_letter()
     }
 
     /// 统一的版式切换入口（数据驱动）：按配置键换版式，**保持当前阅读进度**
@@ -1153,16 +1093,6 @@ impl Root {
             self.grid.columns
         );
         self.persist();
-    }
-
-    /// 切「信笺（14 列）」模板（便捷封装；内部走 [`set_layout`]）。
-    pub fn set_letter_mode(&mut self, on: bool) {
-        let key = if on {
-            "letter14"
-        } else {
-            crate::grid::LayoutConfig::default_key()
-        };
-        self.set_layout(key);
     }
 
     /// 设列数（8 / 10 / 12 / 14）：列数档位全部来自配置，统一走 [`set_layout`]，

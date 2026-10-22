@@ -38,8 +38,6 @@ pub struct Prefs {
     pub columns: usize,
     /// 四边留白比例。
     pub margin: f32,
-    /// true = 信笺（14列）模板：单张平铺稿纸，中缝占两格、立对鱼尾。
-    pub letter: bool,
     /// 当前版式配置键（见 `crate::grid::LAYOUT_CONFIGS`）：数据驱动切换的句柄。
     pub layout_key: String,
     /// true = 双行夹注；false = 页脚注。
@@ -79,7 +77,6 @@ impl Default for Prefs {
             zoom: 1.0,
             columns: 10,
             margin: 0.06,
-            letter: false,
             layout_key: "standard10".to_string(),
             notes_inline: true,
             trad: true,
@@ -221,7 +218,7 @@ mod tests {
         // 老存档没有 `font_note` / `auto_duplex` / `font_preset`：不能整份
         // 反序列化失败（一失败就 `unwrap_or_default()`，用户所有偏好全丢）。
         let old = r#"{"theme":1,"palette":0,"font_ancient":0,"font_modern":0,"zoom":1.0,
-            "columns":10,"margin":0.06,"letter":false,"layout_key":"standard10",
+            "columns":10,"margin":0.06,"layout_key":"standard10",
             "notes_inline":true,"trad":true,"tongjia":true,"punct":true,"rare":true,
             "han_digits":false,"notes":true,"sound":true}"#;
         let p: Prefs = serde_json::from_str(old).expect("老存档应能读进来");

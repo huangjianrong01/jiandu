@@ -18,4 +18,5 @@ pub mod pipeline;
 pub mod ruby;
 pub mod trad;
 pub mod types;
+pub mod vclean;
 pub mod west;

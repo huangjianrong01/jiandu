@@ -609,9 +609,12 @@ pub fn import_epub(path: &Path) -> Result<Book> {
     for raw_href in ordered {
         let file_key = normalize_href(&raw_href);
         if let Ok(html) = read_zip_text(&mut zip, &file_key) {
-            // 与 md / txt 同一条管线：一个 spine 文件里的 <h2> 也能切成多章，
-            // `<em>` 变夹注、`<strong>` 变着重、script/style/nav 一并降噪。
-            let subs = crate::pipeline::parse_html(&html);
+            // 走 **EPUB 竖排清洗管线**（`vclean`，五阶段）：结构降噪（剔广告 /
+            // 剥颜色）→ ruby 注音转 `[拼音:…]` / noteref 转 `[注]…[/注]` →
+            // 数字转汉字（转不动的整串包 `[数字:…]`）→ 括号转夹注、
+            // 《》→︽︾、……→︙ → 丢页码孤行、段间 `\n`。
+            // 与 md / txt 的 `parse_html` 是同一台标签行走器，差别只在前后的工序。
+            let subs = crate::vclean::clean_epub(&html);
             if subs.iter().all(|c| c.content.trim().is_empty()) {
                 continue;
             }

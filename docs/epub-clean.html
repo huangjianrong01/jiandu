@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>笺读 · EPUB 竖排清洗管线（五阶段）</title>
+<style>
+  :root{
+    --paper:#F2EBDC;      /* 宣纸 */
+    --paper-2:#EAE2CF;
+    --ink:#2B2925;        /* 墨 */
+    --ink-soft:#6E685C;
+    --rule:#C9BEA4;       /* 界栏 */
+    --zhu:#B23A30;        /* 朱砂 */
+    --cyan:#2F4858;       /* 瓷青 */
+    --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--paper);color:var(--ink)}
+  body{
+    font-family:"Songti SC","STSong","Noto Serif SC",serif;
+    line-height:1.75;-webkit-font-smoothing:antialiased;
+    padding:40px 32px 72px;
+  }
+  .wrap{max-width:1080px;margin:0 auto}
+  header{display:flex;align-items:baseline;gap:14px;border-bottom:1px solid var(--rule);padding-bottom:14px}
+  h1{font-size:22px;font-weight:400;letter-spacing:.12em;margin:0}
+  header .seal{
+    margin-left:auto;width:38px;height:38px;border:1.5px solid var(--zhu);color:var(--zhu);
+    display:grid;place-items:center;font-size:13px;line-height:1.05;letter-spacing:.02em;
+    writing-mode:vertical-rl;border-radius:2px;
+  }
+  .lede{margin:18px 0 26px;color:var(--ink-soft);font-size:14px;max-width:60em}
+  .lede b{color:var(--ink);font-weight:400}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:26px}
+  @media(max-width:920px){.grid{grid-template-columns:1fr}}
+
+  .pane{border:1px solid var(--rule);background:rgba(255,255,255,.32);border-radius:2px}
+  .pane h2{
+    font-size:13px;font-weight:400;letter-spacing:.18em;color:var(--ink-soft);
+    margin:0;padding:9px 14px;border-bottom:1px solid var(--rule);
+    display:flex;align-items:center;gap:8px;
+  }
+  .pane h2 .n{
+    font-family:var(--mono);font-size:10px;color:var(--zhu);border:1px solid var(--zhu);
+    width:16px;height:16px;display:grid;place-items:center;border-radius:50%;letter-spacing:0
+  }
+  .pane h2 .hint{margin-left:auto;font-size:11px;letter-spacing:0;color:var(--ink-soft);opacity:.75}
+  textarea{
+    width:100%;height:230px;border:0;background:transparent;color:var(--ink);
+    font-family:var(--mono);font-size:12px;line-height:1.7;padding:14px;resize:vertical;outline:none;
+  }
+  pre{
+    margin:0;padding:14px;font-family:var(--mono);font-size:12px;line-height:1.7;
+    white-space:pre-wrap;word-break:break-word;max-height:230px;overflow:auto;
+  }
+  .bar{display:flex;align-items:center;gap:14px;margin:20px 0 26px}
+  button{
+    font:inherit;font-size:13px;letter-spacing:.1em;color:var(--ink);cursor:pointer;
+    background:none;border:0;border-bottom:1px solid var(--rule);padding:2px 2px 4px;transition:.18s;
+  }
+  button:hover{color:var(--zhu);border-color:var(--zhu)}
+  button.primary{color:var(--zhu);border-color:var(--zhu)}
+  .bar .sep{flex:1}
+  .bar small{color:var(--ink-soft);font-size:12px}
+
+  .out{border:1px solid var(--rule);background:rgba(255,255,255,.32);border-radius:2px;margin-top:26px}
+  .out h2{font-size:13px;font-weight:400;letter-spacing:.18em;color:var(--ink-soft);margin:0;padding:9px 14px;border-bottom:1px solid var(--rule)}
+  .out pre{max-height:none}
+
+  mark{background:rgba(178,58,48,.13);color:var(--zhu);padding:0 1px;border-radius:1px}
+  .k{color:var(--cyan)}
+  .note-box{
+    margin-top:26px;border-left:2px solid var(--zhu);padding:2px 0 2px 14px;
+    color:var(--ink-soft);font-size:13px;
+  }
+  .note-box b{color:var(--ink);font-weight:400}
+  .err{color:var(--zhu)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>EPUB 竖排清洗管线</h1>
+    <span style="color:var(--ink-soft);font-size:12px;letter-spacing:.06em">五阶段 · Data Pipeline · v1.24.0</span>
+    <span class="seal">笺<br>读</span>
+  </header>
+
+  <p class="lede">
+    横排电子书的产物直接进竖排引擎，有三处会崩：<b>数字被拆成单字</b>（14428 → 1/4/4/2/8 竖着摞）、
+    <b>现代标点突兀</b>（《》立在列里、（）占了两个字格）、<b>内嵌小字破坏行气</b>（&lt;sup&gt; 一行插进两个小字）。
+    下面这条管线把 xhtml 一路洗成竖排能读的 <b>{ title, content }</b>，只留三种标记：
+    <mark>[注]</mark> 双行夹注、<mark>[高亮]</mark> 朱砂圈点、<mark>[拼音:]</mark> 格内注音。
+  </p>
+
+  <div class="grid">
+    <div class="pane">
+      <h2><span class="n">入</span>原始 xhtml<span class="hint">可自行粘贴</span></h2>
+      <textarea id="src" spellcheck="false"></textarea>
+    </div>
+    <div class="pane">
+      <h2><span class="n">出</span>最终结构<span class="hint">[{ title, content }]</span></h2>
+      <pre id="final">—</pre>
+    </div>
+  </div>
+
+  <div class="bar">
+    <button class="primary" id="run">清 洗</button>
+    <button id="reset">复原样张</button>
+    <span class="sep"></span>
+    <small id="stat"></small>
+  </div>
+
+  <div class="grid">
+    <div class="pane">
+      <h2><span class="n">①</span>结构降噪<span class="hint">剔噪块 / 广告 / 颜色</span></h2>
+      <pre id="s1">—</pre>
+    </div>
+    <div class="pane">
+      <h2><span class="n">②</span>标记提取<span class="hint">ruby → 拼音；noteref → 夹注</span></h2>
+      <pre id="s2">—</pre>
+    </div>
+    <div class="pane">
+      <h2><span class="n">③</span>标点古籍化<span class="hint">《》→︽︾；（）→[注]</span></h2>
+      <pre id="s3">—</pre>
+    </div>
+    <div class="pane">
+      <h2><span class="n">④</span>数字清洗<span class="hint">转汉字 / [数字:] 兜底</span></h2>
+      <pre id="s4">—</pre>
+    </div>
+  </div>
+
+  <div class="note-box" id="note">
+    <b>为什么顺序不能换</b>：注文必须先抽（脚注体常装在 &lt;aside&gt; 里，降噪会连它一起删）；
+    ruby 必须先于数字（&lt;rt&gt; 里的音调数字会被数字清洗误伤）；
+    页码孤行必须先于数字转汉字（先读成「十二」就再也认不出它原本是个页码）。
+  </div>
+</div>
+
+<script src="epub-vertical-clean.js"></script>
+<script>
+const SAMPLE = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>道德经</title><style>p{color:#c00}</style></head>
+<body>
+  <div class="ad-banner">限时特惠 · 买书立减</div>
+
+  <div epub:type="title">第一章　道可道</div>
+
+  <p>道可道（可以说出的道），非常道。名可名，非常名。</p>
+
+  <p>有无相生，难易相成，长短相形，高下相倾。</p>
+
+  <p><ruby>玄<rp>(</rp><rt>xuán</rt><rp>)</rp></ruby>之又玄，众妙之门。</p>
+
+  <p>公元223年，《道德经》<a epub:type="noteref" href="#fn1">1</a>已成定本，共14428字。</p>
+
+  <p><span style="color:#c00">赐</span>也，非人力可强。</p>
+
+  <p>12</p>
+
+  <aside epub:type="footnote" id="fn1"><p>此说出自《史记》。</p></aside>
+</body>
+</html>`;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const hl = (s) => esc(s).replace(/(\[(?:注|高亮|拼音|数字)[^\]]*\])/g, '<mark>$1</mark>')
+                         .replace(/(\[\/(?:注|高亮)\])/g, '<mark>$1</mark>');
+
+function run() {
+  const html = $('src').value;
+  const J = window.JianDuEpubClean;
+  try {
+    // 逐阶段复现（与 cleanEpub 内部同序）
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const notes = J.resolveNoteref(doc);
+    J.extractRuby(doc);
+    J.denoiseDOM(doc);
+    const s1 = doc.body ? doc.body.innerHTML : '';
+    const s2 = s1;
+    const text = (doc.body ? doc.body.textContent : '').replace(/[ \t]+/g, ' ').trim();
+    const s3 = J.classicizePunct(text);
+    const s4 = J.cleanNumbers(s3);
+
+    $('s1').innerHTML = hl(s1.replace(/\s*\n\s*/g, '\n').trim().slice(0, 1200) || '（空）');
+    $('s2').innerHTML = hl(doc.body.textContent.replace(/\s*\n\s*/g, '\n').trim().slice(0, 1200) || '（空）');
+    $('s3').innerHTML = hl(s3.slice(0, 1200) || '（空）');
+    $('s4').innerHTML = hl(s4.slice(0, 1200) || '（空）');
+
+    const out = J.cleanEpub(html);
+    $('final').textContent = out.length ? JSON.stringify(out, null, 2) : '（未产出章节）';
+    const chars = out.reduce((n, c) => n + c.content.length, 0);
+    $('stat').textContent = `${out.length} 章 · ${chars} 字 · 脚注 ${notes.size} 条`;
+    $('stat').className = '';
+  } catch (e) {
+    $('final').innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    $('stat').textContent = '失败';
+    $('stat').className = 'err';
+  }
+}
+
+$('src').value = SAMPLE;
+$('run').addEventListener('click', run);
+$('reset').addEventListener('click', () => { $('src').value = SAMPLE; run(); });
+run();
+</script>
+</body>
+</html>
