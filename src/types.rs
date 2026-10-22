@@ -764,6 +764,17 @@ impl Book {
         self.chapters.iter().map(|c| c.char_count()).sum()
     }
 
+    /// **平均一章多少字**——自动列数的判据（见 `grid::auto_columns`）。
+    ///
+    /// 取平均而非总字数：一部一百章的短章语录（如《道德经》）与一部十章的
+    /// 长篇，总字数可能相近，但「一叶该装多少」完全不同。空书返回 0。
+    pub fn avg_chapter_chars(&self) -> usize {
+        if self.chapters.is_empty() {
+            return 0;
+        }
+        self.total_chars() / self.chapters.len()
+    }
+
     /// 把字键 `(chapter, para, offset)` 换算成**全书统一的字符下标**（charIndex）。
     ///
     /// 与 `to_flow` / `flow_chars_of` 同一口径：段首两个缩进占位也计入，

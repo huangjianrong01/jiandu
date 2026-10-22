@@ -4,7 +4,7 @@
 //! 每本书的阅读档案（第几面、模式、字体、标注开关）会即时写回 library.json。
 
 use crate::fonts;
-use crate::grid::{compute_grid, GridConfig, GridDir, LayoutConfig};
+use crate::grid::{GridConfig, GridDir, LayoutConfig};
 use crate::library::Library;
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
@@ -282,6 +282,19 @@ pub struct Root {
     /// 响应式单 / 双叶：true 时按屏幕宽高比自动决定对开 / 单叶
     /// （宽屏双叶对开、窄屏单叶贴右），false 时沿用手动 `duplex`。
     pub auto_duplex: bool,
+    /// **列数是否自动**（v1.29.0）：true = 按「这本书平均一章多少字」加上
+    /// 当前可用宽算列数，false = 锁定用户手动选的那一档。
+    ///
+    /// 默认开。老机器升级后不会因为曾经选过 8 / 10 列就一直停在旧密度上——
+    /// 自动档每帧重算；想锁死就在「版式」面板点具体列数（那会把这里置 false），
+    /// 点回「自动」再放开。
+    pub columns_auto: bool,
+    /// 自动换挡时**待恢复的阅读锚点**（章, 段, 偏移）。
+    ///
+    /// 拉窗口可能让自动列数跨档（8 → 12），一换档就是整本重排、页码全变。
+    /// `fit_sizes` 里不能在算完网格**之前**去动分页（那时几何还是旧的），
+    /// 故只把锚点挂起，等 `render_reading` 排完新页再回找位置。
+    pub pending_anchor: Option<(usize, usize, usize)>,
     /// **渲染模式**（v1.23.0 三种版式）：对开翻阅 / 手机竖屏单叶 / 整页等比缩放。
     ///
     /// 与 `duplex` 的分工：`layout_mode` 是**用户 / 屏幕选的意图**，
@@ -470,6 +483,9 @@ impl Root {
             show_rare: false,
             han_digits: false,
             auto_duplex: true,
+            // 列数默认自动：按书的内容与可用宽算，不写死某一档。
+            columns_auto: true,
+            pending_anchor: None,
             show_library: false,
             viewport_w: 1280.0,
             viewport_h: 860.0,
@@ -522,6 +538,18 @@ impl Root {
         if let Ok(v) = std::env::var("JIANDU_SHELF") {
             if v == "list" {
                 root.shelf_view = ShelfView::Spine;
+            }
+        }
+        // 开发用：JIANDU_PANEL=grid|style|toc|notes|help 直接把某个面板摊开，
+        // 便于逐面板截图核对（顶栏默认隐身，脚本点不到）。
+        if let Ok(v) = std::env::var("JIANDU_PANEL") {
+            match v.as_str() {
+                "grid" => root.show_grid_panel = true,
+                "style" => root.show_style = true,
+                "toc" => root.open_toc(),
+                "notes" => root.show_notes_panel = true,
+                "help" => root.show_help = true,
+                _ => {}
             }
         }
         if let Ok(v) = std::env::var("JIANDU_SHELF_Q") {
@@ -955,31 +983,6 @@ impl Root {
         self.content_w = content_w;
         self.content_h = content_h;
         let notes_foot = self.show_notes && !self.notes_inline;
-        // ---- 渲染模式分派（对开 / 单叶 / 整页）----
-        // 自动模式下只在对开 ⇄ 单叶之间来回（整页是「看整体版式」的手动档，
-        // 自动切进去会打断阅读）。判据 `grid::should_face` 除宽高比外还要求
-        // 单叶宽与字号都过得去——宁可单叶也不牺牲字号。
-        let mode = if self.auto_duplex && self.layout_mode != crate::grid::LayoutMode::Full {
-            if crate::grid::should_face(
-                self.viewport_w,
-                self.viewport_h,
-                self.grid.columns,
-                self.zoom,
-            ) {
-                crate::grid::LayoutMode::Facing
-            } else {
-                crate::grid::LayoutMode::Single
-            }
-        } else {
-            self.layout_mode
-        };
-        self.layout_mode = mode;
-        let facing = mode.spreads();
-        // 当帧铺法：整页铺的也是一整叶（两叶 + 中缝），故与对开同为 Facing。
-        self.duplex = if facing { Duplex::Facing } else { Duplex::Single };
-        if std::env::var("JIANDU_FIT_DEBUG").is_ok() {
-            eprintln!("[fit] vw={:.0} vh={:.0} content={:.0}x{:.0} cols={} facing={} focus={}", self.viewport_w, self.viewport_h, content_w, content_h, self.grid.columns, facing, self.focus_mode);
-        }
         // 古籍竖笺几何预留：版框双边 50、无天头（篇题进版框）、地脚 12 +
         // 页脚注区（脚注模式且开注释时）。列宽 / 字号 / 行高 / 总行数由网格
         // 引擎按列数动态算出（8 / 10 / 12 / 14 列可切）。
@@ -988,7 +991,100 @@ impl Root {
         let edge = ANCIENT_EDGE;
         let head = ANCIENT_HEAD;
         let foot = ANCIENT_FOOT + if notes_foot { ANCIENT_NOTES } else { 0.0 };
-        // 章题列不占额外宽度（格内一列），故 extra = 0。
+        let margin = self.grid.margin;
+        let line_scale = self.grid.line_scale;
+        let dir = self.grid.dir;
+        let zoom = self.zoom;
+        // 专注模式：整屏只排一叶，字号不设上限（要的就是满屏大字）；
+        // 常规阅读封顶 32px，免得大屏上一列没几个字、页面空旷。
+        let fs_max = if self.focus_mode {
+            f32::INFINITY
+        } else {
+            crate::grid::GRID_FS_MAX
+        };
+        // ---- 渲染模式分派（对开 / 单叶 / 整页）----
+        // 自动模式下只在对开 ⇄ 单叶之间来回（整页是「看整体版式」的手动档，
+        // 自动切进去会打断阅读）。判据 `grid::should_face` 除宽高比外还要求
+        // 单叶宽与字号都过得去——宁可单叶也不牺牲字号。
+        let mut mode = if self.auto_duplex && self.layout_mode != crate::grid::LayoutMode::Full {
+            if crate::grid::should_face(self.viewport_w, self.viewport_h, self.grid.columns, zoom) {
+                crate::grid::LayoutMode::Facing
+            } else {
+                crate::grid::LayoutMode::Single
+            }
+        } else {
+            self.layout_mode
+        };
+        // ---- 自动列数（v1.29.0）：按「书的内容」选档，不是一刀切一个默认值 ----
+        //
+        // 打分用的字号取自**真实的网格试算**（含 32px 上限与列宽回缩），与
+        // 最终渲染同一口径——不会出现「算出来 12 列、排出来却是另一码事」。
+        // 铺法取决于列数、列数又取决于铺法给的可用宽，故至多两轮收敛。
+        if self.columns_auto {
+            let avg = self
+                .book
+                .as_ref()
+                .map(|b| b.avg_chapter_chars())
+                .unwrap_or(0);
+            let mut cols = self.grid.columns;
+            for _ in 0..2 {
+                let probe = mode;
+                let next = crate::grid::auto_columns(
+                    |c| {
+                        crate::grid::calculate_grid(crate::grid::GridInput {
+                            columns: c,
+                            mode: probe,
+                            content_w,
+                            content_h,
+                            zoom,
+                            edge,
+                            head,
+                            foot,
+                            margin,
+                            line_scale,
+                            dir,
+                            fs_max,
+                        })
+                        .m
+                        .fs
+                    },
+                    avg,
+                );
+                if next == cols {
+                    break;
+                }
+                cols = next;
+                // 列数变了可能改变铺法（单叶宽 / 字号门槛），重判一次。
+                if self.auto_duplex && self.layout_mode != crate::grid::LayoutMode::Full {
+                    mode = if crate::grid::should_face(self.viewport_w, self.viewport_h, cols, zoom)
+                    {
+                        crate::grid::LayoutMode::Facing
+                    } else {
+                        crate::grid::LayoutMode::Single
+                    };
+                }
+            }
+            if cols != self.grid.columns {
+                // 换档 = 整本重排、页码全变。记下当前页首字，等新页排好再回找
+                // （此处几何还是旧的，`layout_pages` 会按旧列数算，锚点才准）。
+                if self.pending_anchor.is_none() {
+                    self.pending_anchor = self.page_anchor();
+                }
+                self.grid.columns = cols;
+                // 版式键跟着走，面板上那一档才会亮。
+                if let Some(c) = crate::grid::LAYOUT_CONFIGS.iter().find(|c| c.columns == cols) {
+                    self.layout_key = c.key;
+                }
+            }
+        }
+        self.layout_mode = mode;
+        let facing = mode.spreads();
+        // 当帧铺法：整页铺的也是一整叶（两叶 + 中缝），故与对开同为 Facing。
+        self.duplex = if facing { Duplex::Facing } else { Duplex::Single };
+        let fit_debug = std::env::var("JIANDU_FIT_DEBUG").is_ok();
+        if fit_debug {
+            eprintln!("[fit] vw={:.0} vh={:.0} content={:.0}x{:.0} cols={} auto={} avg={} facing={} focus={}", self.viewport_w, self.viewport_h, content_w, content_h, self.grid.columns, self.columns_auto, self.book.as_ref().map(|b| b.avg_chapter_chars()).unwrap_or(0), facing, self.focus_mode);
+        }
         // 统一入口 `calculateGrid(columns, mode)`：模式只决定内容区怎么给
         // （对开对半 / 单叶整幅 / 整页按基准版式等比缩放），列宽与字号
         // 的算式三模式完全一致。
@@ -997,20 +1093,14 @@ impl Root {
             mode,
             content_w,
             content_h,
-            zoom: self.zoom,
+            zoom,
             edge,
             head,
             foot,
-            margin: self.grid.margin,
-            line_scale: self.grid.line_scale,
-            dir: self.grid.dir,
-            // 专注模式：整屏只排一叶，字号不设上限（要的就是满屏大字）；
-            // 常规阅读封顶 32px，免得大屏上一列没几个字、页面空旷。
-            fs_max: if self.focus_mode {
-                f32::INFINITY
-            } else {
-                crate::grid::GRID_FS_MAX
-            },
+            margin,
+            line_scale,
+            dir,
+            fs_max,
         });
         self.full_scale = plan.scale;
         let m = plan.m;
@@ -1023,6 +1113,12 @@ impl Root {
         self.row_h = m.row_h;
         self.grid_rows = m.rows;
         self.grid_min_font = m.min_font_hit;
+        if fit_debug {
+            eprintln!(
+                "[fit] → fs={:.1} col_w={:.1} rows={} paper={:.0}x{:.0}",
+                m.fs, m.col_w, m.rows, m.outer_w, m.outer_h
+            );
+        }
     }
 
     /// 当前版式配置：数据驱动的唯一数据源（见 [`crate::grid::LAYOUT_CONFIGS`]）。
@@ -1046,6 +1142,10 @@ impl Root {
             Some(c) => c,
             None => return,
         };
+        // 手动选了具体的一档 = 锁定：自动档让位，否则下一帧 `fit_sizes`
+        // 又按内容把它算回去，用户会觉得「我点了 8 列怎么自己跳走了」。
+        // （自动档内部是直接改 `grid.columns` / `layout_key`，不走这里。）
+        self.columns_auto = false;
         if self.layout_key == cfg.key {
             return; // 同一档，跳过无谓重排
         }
@@ -1072,7 +1172,7 @@ impl Root {
     }
 
     /// 按锚点把 `self.page` 重定位到「含这个字」的那一面（找不到则原位不动）。
-    fn restore_anchor(&mut self, anchor: Option<(usize, usize, usize)>) {
+    pub(crate) fn restore_anchor(&mut self, anchor: Option<(usize, usize, usize)>) {
         let Some((c, pa, o)) = anchor else { return };
         if let Some(pi) = self.layout_pages().iter().position(|pg| {
             pg.glyphs
@@ -2855,6 +2955,9 @@ pub fn open_external(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 单测验的是「算式本身」，直接调 `compute_grid` 绕开 `calculate_grid`
+    // 的三模式分派（非测试代码一律走 `calculate_grid` 这个唯一入口）。
+    use crate::grid::compute_grid;
 
     /// 默认窗口 1320×880、普通模式（工具栏 + 状态栏 + 四边留白）。
     const VW: f32 = 1320.0;

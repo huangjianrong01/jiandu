@@ -229,6 +229,68 @@ pub const LINE_SCALE_BASE: f32 = 1.0;
 pub const LINE_SCALE_MIN: f32 = 0.85;
 pub const LINE_SCALE_MAX: f32 = 1.6;
 
+// ── 自动列数（v1.29.0）：按「书的内容」选档，而不是一刀切一个默认值 ────
+/// 短章 / 次短章的分界（平均一章字数）：低于此按「语录、短札」处理。
+pub const AUTO_SHORT_CHARS: usize = 150;
+/// 次短章 / 常篇的分界。
+pub const AUTO_MID_CHARS: usize = 500;
+/// 常篇 / 长篇的分界：高于此按「长篇章回」处理。
+pub const AUTO_LONG_CHARS: usize = 1200;
+
+/// **内容定档**：平均一章多少字 → 列数。**与屏幕无关**。
+///
+/// 刻本的实际做法就是这样——短章语录（如《道德经》）字大行疏、开本窄；
+/// 长篇话本字小行密、开本宽。篇幅决定疏密，而不是所有书都排一个样。
+///
+/// 四档正好落在 [`GRID_COLUMN_CHOICES`] 上：8 / 10 / 12 / 14。
+pub fn content_columns(avg_chapter_chars: usize) -> usize {
+    if avg_chapter_chars < AUTO_SHORT_CHARS {
+        8
+    } else if avg_chapter_chars < AUTO_MID_CHARS {
+        10
+    } else if avg_chapter_chars < AUTO_LONG_CHARS {
+        12
+    } else {
+        14
+    }
+}
+
+/// **自动档：选列数**。纯函数，不碰 GPUI，可单测。
+///
+/// 两条规则，主次分明：
+///   1. **内容定档**（[`content_columns`]）——篇幅是主因，屏幕管不着。
+///   2. **屏幕兜底**：只有当该档的字号跌破可读下限 [`GRID_FS_MIN`] 时，
+///      才逐级往少列退（列少 → 列宽大 → 字大）。
+///
+/// 关键：`fs_of` 只在第 2 条里当**兜底判据**用，不参与选档。
+/// 早期版本拿「字号接近某个目标值」打分，结果在宽屏上 8/10/12 列的字号
+/// 全被 `GRID_FS_MAX = 32` 压成同一个数，判据失去区分度，任何书都只能
+/// 选最密档——自适应名存实亡。**字号触顶不是「该加列」的信号**：触顶时
+/// `compute_grid` 会让列宽回缩、纸面变窄居中（见其第 5 步），那正是
+/// 「疏朗而不空旷」，是短章该有的样子。
+///
+/// `fs_of` 求「排成 c 列时正文的实际字号」，是**唯一的口径来源**：
+/// 运行时传真实的 `calculate_grid` 试算（含字号上下限与列宽回缩），
+/// 单测里传一句简算即可——两边共用同一套判据，不会各写一套而漂移。
+pub fn auto_columns(fs_of: impl Fn(usize) -> f32, avg_chapter_chars: usize) -> usize {
+    let mut cols = content_columns(avg_chapter_chars);
+    // 屏幕兜底：字太小就读不动了，逐级往疏处退。
+    // 触顶（字过大）不在这里处理——那是列宽回缩的事，不是加列的理由。
+    while cols > GRID_COLUMN_CHOICES[0] && fs_of(cols) < GRID_FS_MIN - 0.01 {
+        let prev = GRID_COLUMN_CHOICES
+            .iter()
+            .rev()
+            .find(|&&c| c < cols)
+            .copied()
+            .unwrap_or(GRID_COLUMN_CHOICES[0]);
+        if prev == cols {
+            break;
+        }
+        cols = prev;
+    }
+    cols
+}
+
 /// 网格度量：由 [`compute_grid`] 算出，渲染与分页共用，不再写死任何像素。
 #[derive(Clone, Copy, Debug)]
 pub struct GridMetrics {
@@ -918,6 +980,76 @@ mod tests {
         // （`current_layout` / `set_layout`）统一处理，从而 `set_layout`
         // 能在解析失败时安全返回，不污染状态。
         assert!(LayoutConfig::by_key("nope").is_none());
+    }
+
+    #[test]
+    fn content_columns_steps_up_as_chapters_grow() {
+        // 篇幅越长 → 列数越多（越密）。四档正好落在可选列数上。
+        assert_eq!(content_columns(60), 8, "语录短章（《道德经》体量）");
+        assert_eq!(content_columns(300), 10);
+        assert_eq!(content_columns(800), 12);
+        assert_eq!(content_columns(5000), 14, "长篇章回");
+        // 单调递增：不会「更长的书反而排得更疏」。
+        let mut prev = 0;
+        for avg in [10, 150, 500, 1200, 99999] {
+            let c = content_columns(avg);
+            assert!(c >= prev, "篇幅增长时列数回退：{avg} → {c}");
+            prev = c;
+        }
+        // 每档都在可选列数里（面板上点得到）。
+        for avg in [0, 149, 150, 499, 500, 1199, 1200, 100000] {
+            let c = content_columns(avg);
+            assert!(
+                GRID_COLUMN_CHOICES.contains(&c),
+                "内容档 {c} 不在可选列数里"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_columns_follows_the_book_not_a_fixed_default() {
+        // 同一块屏幕（半叶 560），书不同 → 列数不同。
+        // 这正是「自适应文章内容」：不是所有书都套一个默认档。
+        let fs_of = |c: usize| 560.0 / c as f32 * GRID_FS_RATIO;
+        let quote = auto_columns(fs_of, 60); // 语录短章
+        let essay = auto_columns(fs_of, 300);
+        let misc = auto_columns(fs_of, 800); // 常篇
+        let novel = auto_columns(fs_of, 5000); // 长篇章回
+        assert!(quote < misc && misc < novel, "篇幅越长越密：{quote} {misc} {novel}");
+        assert_eq!(quote, 8, "短章在宽屏上仍排 8 列（字大、纸窄、疏朗）");
+        assert_eq!(novel, 14, "长篇排最密档");
+        assert_eq!(essay, 10);
+        assert_eq!(misc, 12);
+    }
+
+    #[test]
+    fn auto_columns_only_retreats_when_the_type_gets_too_small() {
+        // 屏幕只在「字跌破下限」时兜底，不会替书做主——
+        // 这是修掉的老毛病：早先用「字号接近目标值」打分，宽屏上 8/10/12
+        // 列的字号全被 32px 上限压成同一个数，判据失去区分度，任何书都
+        // 只能选最密档，自适应名存实亡。
+        let wide = |c: usize| 560.0 / c as f32 * GRID_FS_RATIO;
+        assert_eq!(auto_columns(wide, 60), 8, "宽屏不改变内容档");
+        // 极窄屏（半叶 300）：14 列字只有 16px、12 列 18.75px，还过得去；
+        // 换成半叶 150 才逼得动 14 列往回退。
+        let tiny = |c: usize| 150.0 / c as f32 * GRID_FS_RATIO;
+        let c = auto_columns(tiny, 5000);
+        assert!(c < 14, "极窄屏上长篇也得往疏处退：{c}");
+        assert!(tiny(c) >= GRID_FS_MIN - 0.01, "退到 {c} 列字号仍 {:.1}", tiny(c));
+    }
+
+    #[test]
+    fn auto_columns_never_lands_below_the_comfort_floor() {
+        // 屏幕兜底的底线：任何宽度下都不会停在「字小到读不动」的那一档
+        // （除非已经退到最疏档——那时由 GRID_FS_MIN 抬字号、溢出滚动）。
+        for w in [260.0, 320.0, 420.0, 560.0, 700.0, 900.0] {
+            let c = auto_columns(|c| w / c as f32 * GRID_FS_RATIO, 500);
+            let fs = w / c as f32 * GRID_FS_RATIO;
+            assert!(
+                fs >= crate::grid::GRID_FS_MIN || c == GRID_COLUMN_CHOICES[0],
+                "宽 {w} 选了 {c} 列，字号 {fs} 跌破下限"
+            );
+        }
     }
 
     #[test]

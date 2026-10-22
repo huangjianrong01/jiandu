@@ -793,6 +793,12 @@ impl Root {
         }
         // 按当前窗口视口把字格缩放到铺满屏。
         self.fit_sizes();
+        // 自动列数刚换过档（拉窗口跨了档）：几何已更新，此刻才能按新排版
+        // 把阅读位置找回来，免得「拉一下窗口就跳到别处」。
+        if let Some(anchor) = self.pending_anchor.take() {
+            self.restore_anchor(Some(anchor));
+            self.sync_current_chapter();
+        }
         let t = self.theme;
         // 「面 → 列 → 片」一次排好：分页与切列同源（gloss::layout_book），
         // 双行夹注的跨列流转也在这里定型，渲染侧不再重算。
@@ -7012,7 +7018,9 @@ impl Root {
                     .gap(px(16.0))
                     .flex_wrap();
                 for (label, n) in COL_OPTS {
-                    let on = cur_cols == n;
+                    // 自动档开着时具体档都不亮——亮的是「自动」那一枚，
+                    // 否则用户会以为自己锁定了 12 列。
+                    let on = cur_cols == n && !self.columns_auto;
                     cols_row = cols_row.child(
                         ink_option(label, on, t).on_mouse_down(
                             MouseButton::Left,
@@ -7024,6 +7032,19 @@ impl Root {
                         ),
                     );
                 }
+                // 自动档：列数按「这本书平均一章多少字」+ 当前可用宽算，
+                // 换本书、拉窗口都会自己换挡（`grid::auto_columns`）。
+                cols_row = cols_row.child(
+                    ink_option("自动", self.columns_auto, t).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.columns_auto = !this.columns_auto;
+                            this.fit_sizes();
+                            cx.notify();
+                        }),
+                    ),
+                );
                 sheet = sheet.child(style_row("列数", cols_row, t));
                 // （原先此处还有一行「纸色」——与下面 `PAPER_THEMES` 那一行
                 // 重复，v1.22.0 去重：纸色只留配置表那一行，主题也由它驱动。）

@@ -35,7 +35,20 @@ pub struct Prefs {
     /// 字级倍率（1.0 = 中）。
     pub zoom: f32,
     /// 每面列数（8 / 10 / 12 / 14）。
+    ///
+    /// **只在 `columns_auto == false` 时生效**——自动档每帧按「书的内容 +
+    /// 可用宽」重算列数，这个字段仅作手动档的记忆与自动档的初值。
     pub columns: usize,
+    /// **列数是否自动**（true = 自动档）。
+    ///
+    /// 自动档同时看两头：这本书**平均一章多少字**（短章疏排、长篇密排）与
+    /// **当前可用宽**（字级落在舒适区）。见 `grid::auto_columns`。
+    ///
+    /// 老存档没有这一项 → `default_true`。这正是升级的迁移点：旧存的
+    /// 8 / 10 列不再把新密度盖住，一进来就按内容重算；想锁死就手动切一次
+    /// 列数（手动切换会把这儿置 false）。
+    #[serde(default = "default_true")]
+    pub columns_auto: bool,
     /// 四边留白比例。
     pub margin: f32,
     /// 当前版式配置键（见 `crate::grid::LAYOUT_CONFIGS`）：数据驱动切换的句柄。
@@ -76,6 +89,8 @@ impl Default for Prefs {
             font_preset: 0,
             zoom: 1.0,
             columns: 12,
+            // 自动档默认开：列数按书的内容与视口算，不写死某一档。
+            columns_auto: true,
             margin: 0.06,
             // v1.28.0：默认版式由 10 列改为 12 列（密度）。旧存档里的
             // 自选列数仍照读，只是新装 / 重置时落到 12 列。
