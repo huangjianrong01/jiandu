@@ -584,46 +584,41 @@ fn banxin_seal(w: f32, h: f32) -> Div {
         )
 }
 
-/// 书耳：刻本贴在书脑侧版框上角的一小片「耳朵」（题签小耳，线装 / 包背装
+/// 书耳：刻本贴在版框上角的一小片「耳朵」（题签小耳，线装 / 包背装
 /// 常见）。样式参照用户给的「天 / 地 / 鱼尾 / 书脑 / 耳子」图：一片竖长
 /// 小牌，外侧带线、内侧贴住版框，紧贴左上角不放空。
 ///
-/// `mirror` = true 时贴右上（右半叶的外侧在其右），否则贴左上。
+/// **只挂左上角一处**（v1.27.0）：原先对开时右半叶还会镜像出一枚右耳，
+/// 两耳说的是同一件事（本章章名），纯属重复——留一枚贴左上即够。
+///
 /// 耳内竖排题签（篇章名 / 卷名 / 提要，见 `types::ear_label`），
 /// 单列自适应收缩——耳片极窄，读的是个「形」与位置。
-fn book_ear(t: Theme, w: f32, h: f32, x: f32, top: f32, mirror: bool, label: &str) -> Div {
+fn book_ear(t: Theme, w: f32, h: f32, x: f32, top: f32, label: &str) -> Div {
     // 耳内小字：高出一成给行距，宽不超出耳片。
     let fs = (w * 0.62).max(6.5).min(10.0);
     // 耳片只有一列宽：单列自适应（字号随耳高收缩，装不下才截断缀「…」）。
     let (efs, ecol, _cut) = crate::shelf::fit_single_column(label, h - 6.0, fs);
-    let mut e = div()
+    div()
         .absolute()
         .top(px(top))
+        .left(px(x))
         .w(px(w))
         .h(px(h))
         .bg(rgb(t.paper()))
         .border_t_1()
         .border_b_1()
+        .border_l_1()
         .border_color(rgb(t.frame_ink()))
         .flex()
         .items_center()
         .justify_center()
-        .overflow_hidden();
-    e = if mirror {
-        e.left(px(x))
-            .border_r_1()
-            .border_color(rgb(t.frame_ink()))
-    } else {
-        e.left(px(x))
-            .border_l_1()
-            .border_color(rgb(t.frame_ink()))
-    };
-    e.child(crate::shelf::vertical_cols(
-        &[ecol],
-        efs,
-        t.ink_soft(),
-        FontWeight::NORMAL,
-    ))
+        .overflow_hidden()
+        .child(crate::shelf::vertical_cols(
+            &[ecol],
+            efs,
+            t.ink_soft(),
+            FontWeight::NORMAL,
+        ))
 }
 
 /// 一叶在「一张纸」里的位置：对开时两半内侧要收掉留白，才能接成一整张。
@@ -1204,11 +1199,9 @@ impl Root {
         if self.show_help {
             root = root.child(self.render_help_sheet(cx));
         }
-        // 左上角书名签条：挂在所有浮层之前，浮层打开时会盖住它（不抢戏）；
-        // 专注模式沉浸阅读，一并收起。
-        if !self.focus_mode {
-            root = root.child(self.render_spine_label(cx));
-        }
+        // 左上角那枚独立的书名签条（v1.27.0 删除）：它离书页有一段距离，
+        // 且与版框上的书耳、顶栏的「目录」重复——书名与卷目入口都不缺，
+        // 只剩一块飘在留白里的牌子碍眼。书耳仍在（左半叶左上角）。
 
         // 点字弹出的工具条：仅在点击正文某字时出现，点别处自动收起。
         if self.popup.is_some() {
@@ -2076,75 +2069,6 @@ impl Root {
         col.child(head).child(list)
     }
 
-    /// 左上角竖写书名签条。
-    ///
-    /// 线装书的题签贴在书衣左上角，翻开后仍要让人知道在读哪一部书，
-    /// 所以这里让它常驻阅读视图左上角（天头留白处，不压正文）。
-    /// 点它即呼出卷目——签条本身就是「这是什么书」的入口。
-    ///
-    /// 配色跟着主题走：日间＝宣纸底浓墨字，夜读＝深褐底米白字，
-    /// 顶端一枚朱砂短线代替藏印，不为装饰而抢正文。
-    fn render_spine_label(&self, cx: &mut Context<Self>) -> Div {
-        let Some(book) = &self.book else {
-            return div();
-        };
-        // 题签文字：书名或封面题签（【】显作「」，与版面其它文字一致）。
-        let raw = if book.cover.title.is_empty() {
-            &book.title
-        } else {
-            &book.cover.title
-        };
-        let title: String = raw.chars().map(crate::types::bracket_to_quote).collect();
-        if title.is_empty() {
-            return div();
-        }
-        let t = self.theme;
-        // 贴向书页左上「天头」，而不是压在顶栏上：
-        //   · 竖向落在工具栏之下（约 56px 起），让开顶栏按钮区；
-        //   · 横向贴着正文页左缘——页在正文区居中，左缘 ≈ (视口宽-内容宽)/2，
-        //     签条放在它左侧留白里，既不压字，又一眼看得出在读哪部书。
-        let page_left = ((self.viewport_w - self.content_w) / 2.0).max(0.0);
-        let left = (page_left - 62.0).max(8.0);
-        let top = 56.0;
-        div()
-            .absolute()
-            .top(px(top))
-            .left(px(left))
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(7.0))
-            .pb(px(9.0))
-            .px(px(4.0))
-            .gap(px(5.0))
-            .bg(rgb(t.paper()))
-            .border_1()
-            .border_color(rgb(t.rule()))
-            .rounded(px(2.0))
-            .cursor_pointer()
-            // 点签条出卷目，并吃掉事件：不当作翻页，也不收起别的浮层。
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.open_toc();
-                    this.press_at = None;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(div().w(px(18.0)).h(px(2.0)).bg(rgb(t.accent())))
-            // 宽度给到两列（≈46px）、高度 200px：长书名自动分两列竖排，
-            // 不再被单列截断缀「…」，可看到完整书名。
-            .child(crate::shelf::vertical_block(
-                &title,
-                46.0,
-                200.0,
-                14.0,
-                t.ink(),
-                FontWeight::MEDIUM,
-            ))
-    }
-
     /// 任一面板开着 → 顶栏必须留住。
     ///
     /// 面板都从底边浮起，鼠标一移下去就把顶栏收走，用户会以为「点了没反应」；
@@ -2757,30 +2681,18 @@ impl Root {
             .child(frame);
 
         // 书耳：贴版框上角的一小片「耳朵」（刻本书脑侧的题签小耳）。
-        // 位置随叶位走：单叶 / 左半叶贴左上（左外侧留白里），右半叶镜像到右上
-        // ——紧贴版框不放空，与用户给的「天 / 地 / 鱼尾 / 书脑 / 耳子」图同款。
-        {
+        //
+        // **只贴在左上角**（v1.27.0 用户口径）：对开时右半叶原先会镜像出一枚
+        // 右耳，两耳同说「本章章名」，是重复的功能，故右半叶不再挂耳——
+        // 一叶摊开只在书页左上角留一枚。
+        if edge != LeafEdge::Right {
             let pad = 16.0;
             let ear_w = (cell_w * 0.16).clamp(11.0, 14.0).min(pad - 2.0);
             // 耳高约一格（刻本书耳只有一两字高，不是一整条边）。
             let ear_h = (cell_h * 1.25).clamp(34.0, 150.0);
             // 耳内题签按内容自适应：篇章名 / 卷名 / 提要（types::ear_label）。
             let ear_label = self.ear_label(chapter);
-            let (ear_x, ear_mirror) = match edge {
-                // 右半叶：外侧在右，耳朵贴右上（右缘探进右外侧留白里）。
-                LeafEdge::Right => (grid_w + 14.0, true),
-                // 单叶 / 左半叶：外侧在左，耳朵贴左上。
-                _ => (pad - ear_w, false),
-            };
-            sheet = sheet.child(book_ear(
-                t,
-                ear_w,
-                ear_h,
-                ear_x,
-                pad,
-                ear_mirror,
-                &ear_label,
-            ));
+            sheet = sheet.child(book_ear(t, ear_w, ear_h, pad - ear_w, pad, &ear_label));
         }
 
         // 注文不进正文时，退回页脚注。
