@@ -6,3 +6,5 @@ Cargo.lock.bak
 .DS_Store
 resources/fonts/*.otf
 resources/fonts/*.ttf
+ios/*/build/
+ios/**/build/
