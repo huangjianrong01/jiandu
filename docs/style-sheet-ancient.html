@@ -252,7 +252,26 @@
   .ink[aria-pressed="true"] { color: var(--zhu); }
   .ink[aria-pressed="true"]::after { width: 18px; }
 
-  /* 纸色 / 丝栏：小样张 + 1px 边 */
+  /* 纸色：八颗圆形小点（不是方块），选中套一圈朱砂细环 */
+  .dots { display: flex; gap: 13px; flex-wrap: wrap; align-items: flex-start; }
+  .dot {
+    appearance: none; border: 0; padding: 0; margin: 0; background: none; font: inherit;
+    cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  }
+  .dot i {
+    display: block; width: 18px; height: 18px; border-radius: 50%;
+    border: 1px solid rgba(120, 100, 70, .35);
+    transition: box-shadow .18s ease;
+  }
+  .dot span { font-size: 9px; color: var(--ink-soft); transition: color .18s ease; }
+  .dot:hover span { color: var(--ink); }
+  .dot[aria-pressed="true"] i {
+    border: 2px solid var(--zhu);
+    box-shadow: 0 0 0 3px rgba(178, 58, 48, .08);
+  }
+  .dot[aria-pressed="true"] span { color: var(--zhu); }
+
+  /* 丝栏：小样张 + 1px 边 */
   .swatch {
     appearance: none;
     border: 0;
@@ -521,10 +540,16 @@
         <div class="row">
           <div class="row__label">纸色</div>
           <div class="row__body">
-            <button class="swatch" aria-pressed="true"><span style="background:#F2EAD6;color:#2B2622">文</span>宣纸</button>
-            <button class="swatch" aria-pressed="false"><span style="background:#EDE3C8;color:#3A3226">文</span>米黄</button>
-            <button class="swatch" aria-pressed="false"><span style="background:#E4E8DA;color:#2C3328">文</span>竹青</button>
-            <button class="swatch" aria-pressed="false"><span style="background:#2A2620;color:#E7DECB">文</span>墨夜</button>
+            <div class="dots">
+              <button class="dot" aria-pressed="true"><i style="background:#F5F0E6"></i><span>宣纸</span></button>
+              <button class="dot" aria-pressed="false"><i style="background:#F2E6D0"></i><span>米黄</span></button>
+              <button class="dot" aria-pressed="false"><i style="background:#D8E2DB"></i><span>青简</span></button>
+              <button class="dot" aria-pressed="false"><i style="background:#1A1C1D"></i><span>夜读</span></button>
+              <button class="dot" aria-pressed="false"><i style="background:#F7F8F4"></i><span>鱼肚白</span></button>
+              <button class="dot" aria-pressed="false"><i style="background:#DEE4D6"></i><span>竹影绿</span></button>
+              <button class="dot" aria-pressed="false"><i style="background:#E2D3C3"></i><span>茶驼色</span></button>
+              <button class="dot" aria-pressed="false"><i style="background:#C8D8E4"></i><span>黛蓝笺</span></button>
+            </div>
           </div>
         </div>
 
@@ -646,6 +671,14 @@
     <li><strong>底部</strong>：灰底大方框改为纯文字按钮，宋体 11.5px，前置 12px 线框 icon（<code>stroke: currentColor</code>），悬停字色加深、按下转朱砂。</li>
     <li><strong>关闭</strong>：右上角灰底按钮改为「收起」二字，无底无框，悬停转朱砂。</li>
     <li><strong>面板</strong>：<code>rgba(240,234,214,.95)</code> 宣纸底 + <code>backdrop-filter: blur(10px)</code>，<code>1px</code> 极淡界线，<code>2px</code> 圆角，投影只向下（<code>0 18px 42px -20px</code>），像一张薄纸浮在书页上。</li>
+  </ul>
+  <h2>纸色：八色国色，圆形排列</h2>
+  <ul>
+    <li>纸色原来在面板里出现<strong>两行</strong>（一行读旧枚举、一行读配置表），v1.22.0 去重：只留 <code>PAPER_THEMES</code> 那一行，主题、UI、渲染全部由它驱动。</li>
+    <li>八色 = 原有四色（宣纸 / 米黄 / 青简 / 夜读）+ 新增四色国色：<code>鱼肚白 #F7F8F4</code>、<code>竹影绿 #DEE4D6</code>、<code>茶驼色 #E2D3C3</code>、<code>黛蓝笺 #C8D8E4</code>——全部低饱和（纸色 RGB 极差 &lt; 60），摒弃高饱和刺眼色。</li>
+    <li>每套配色是<strong>一颗 18px 圆形点</strong>（点面 = 纸色、细边 = 界栏色），选中的套一圈朱砂环；点名 9px 极小宋体，选中转朱砂。新增配色只需在配置表加一行，UI 自动出现。</li>
+    <li>切主题走 <code>set_theme(i)</code>：<strong>纸 / 正文 / 夹注 / 界栏四色同时换</strong>并 <code>fit_sizes()</code> 重排（直接赋值 <code>theme</code> 只换背景，夹注兑淡与界栏不会跟着变）。</li>
+    <li>深底（夜读）下界面底更沉、界面字更亮、选中朱砂向宣纸白提亮一档——绝无白底白字 / 暗纸暗朱（<code>theme.rs</code> 有回归断言：界面字与界面底亮度差 &gt; 60）。</li>
   </ul>
   <h2>与客户端实现的对应</h2>
   <ul>

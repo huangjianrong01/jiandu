@@ -242,7 +242,17 @@ fn small_button(label: &str, on: bool, t: Theme) -> Div {
 
 /// 面板选中的朱砂（用户指定 #B23A30）：比落款印泥 `CINNABAR` 略沉一档，
 /// 落在宣纸上像一枚旧朱印，不刺眼。
-const SHEET_ZHU: u32 = 0xB23A30;
+const ZHU_BASE: u32 = 0xB23A30;
+
+/// 面板选中色的**实际取值**：深底主题（夜读）上这枚朱砂会沉进深纸看不见，
+/// 故向宣纸白提亮一档——界面色与纸面永远反色，不会出现「暗纸上的暗朱」。
+fn sheet_zhu(t: Theme) -> u32 {
+    if t.is_dark() {
+        crate::theme::mix(ZHU_BASE, 0xF2EAD6, 0.38)
+    } else {
+        ZHU_BASE
+    }
+}
 
 /// 极细横线（1px）：选中下划线、行间界、符号线框都用它。
 fn hairline(w: f32, color: u32) -> Div {
@@ -268,7 +278,7 @@ fn zhu_dashed(w: f32, color: u32) -> Div {
 /// 面板页签：一行字 + 字下一道 1px 墨线，没有底色、没有边框、没有圆角。
 /// 未选中时线宽为 0（但槽位仍在），切换时字不会左右跳。
 fn panel_tab(label: &'static str, on: bool, t: Theme) -> Div {
-    let fg = if on { SHEET_ZHU } else { t.ink_soft() };
+    let fg = if on { sheet_zhu(t) } else { t.ink_soft() };
     div()
         .flex()
         .flex_col()
@@ -301,7 +311,7 @@ fn panel_close(t: Theme) -> Div {
         .cursor_pointer()
         .text_size(px(10.5))
         .text_color(rgb(t.ink_soft()))
-        .hover(|s| s.text_color(rgb(SHEET_ZHU)))
+        .hover(|s| s.text_color(rgb(sheet_zhu(t))))
         .child(SharedString::from("收起"))
 }
 
@@ -310,7 +320,7 @@ fn panel_close(t: Theme) -> Div {
 /// `on` 时朱砂字、字下压一道 1px 墨线；否则淡墨字、无线。悬停时淡墨转深墨。
 /// 没有任何背景色——点选靠的是「墨色与朱色」的差别，不是色块。
 fn ink_option(label: &'static str, on: bool, t: Theme) -> Div {
-    let fg = if on { SHEET_ZHU } else { t.chrome_text() };
+    let fg = if on { sheet_zhu(t) } else { t.chrome_text() };
     div()
         .flex()
         .flex_col()
@@ -6841,50 +6851,8 @@ impl Root {
                     ),
                 );
                 sheet = sheet.child(style_row("简繁", ver, t));
-                // 纸色：五套纸底大色板，选中描边。
-                let mut swatches = div().flex().flex_row().items_end().gap_2();
-                for th in Theme::ALL {
-                    let on = th == t;
-                    swatches = swatches.child(
-                        div()
-                            .id(SharedString::from(format!("theme-{:?}", th)))
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_1()
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .w(px(26.0))
-                                    .h(px(26.0))
-                                    .bg(rgb(th.paper()))
-                                    .border_1()
-                                    .border_color(rgb(if on { SHEET_ZHU } else { th.rule() }))
-                                    .rounded(px(2.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(px(14.0))
-                                    .text_color(rgb(th.ink()))
-                                    .child(SharedString::from("文")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(rgb(if on { SHEET_ZHU } else { t.ink_soft() }))
-                                    .child(SharedString::from(th.label())),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.theme = th;
-                                    cx.notify();
-                                }),
-                            ),
-                    );
-                }
-                sheet = sheet.child(style_row("纸色", swatches, t));
+                // （原先此处还有一行「纸色」——与下面 `PAPER_THEMES` 那一行
+                // 重复，v1.22.0 去重：纸色只留配置表那一行，主题也由它驱动。）
                 // 丝栏：乌 / 金 / 朱 三色界行（竖排列间那道细线）。
                 // 色块里立三道竖线，直接预览界行颜色与粗细。
                 let mut rules = div().flex().flex_row().items_end().gap_2();
@@ -6905,7 +6873,7 @@ impl Root {
                                     .h(px(26.0))
                                     .bg(rgb(t.paper()))
                                     .border_1()
-                                    .border_color(rgb(if on { SHEET_ZHU } else { t.rule() }))
+                                    .border_color(rgb(if on { sheet_zhu(t) } else { t.rule() }))
                                     .rounded(px(2.0))
                                     .flex()
                                     .flex_row()
@@ -6925,7 +6893,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(px(10.0))
-                                    .text_color(rgb(if on { SHEET_ZHU } else { t.ink_soft() }))
+                                    .text_color(rgb(if on { sheet_zhu(t) } else { t.ink_soft() }))
                                     .child(SharedString::from(rc.label())),
                             )
                             .on_mouse_down(
@@ -6939,36 +6907,56 @@ impl Root {
                     );
                 }
                 sheet = sheet.child(style_row("丝栏", rules, t));
-                // 纸色：**遍历主题配置表自动生成**预览按钮——新增一套配色
-                // 只需在 `PAPER_THEMES` 加一行，此处零改动。
-                // 每颗按钮就是一张小纸：底色=纸色、边框=界栏色、
-                // 例字=正文色，点中即用该套配色重绘（fit_sizes 后 notify）。
-                let mut themes_row = div().flex().flex_row().items_center().gap_2().flex_wrap();
+                // 纸色：**遍历主题配置表自动生成**——新增一套配色只需在
+                // `PAPER_THEMES` 加一行，此处零改动。
+                //
+                // 每套配色是一颗**圆形小点**（不是方块）：点面=纸色，
+                // 细边=界栏色，点名=极小宋体；选中的那颗套一圈朱砂细环，
+                // 点名转朱砂。八颗点排列在一起，像一排印泥调色盘。
+                let mut themes_row = div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(13.0))
+                    .flex_wrap();
                 for (i, pt) in crate::theme::PAPER_THEMES.iter().enumerate() {
                     let on = self.theme.index() == i;
                     let name = pt.name;
+                    let dot = div()
+                        .w(px(18.0))
+                        .h(px(18.0))
+                        .rounded_full()
+                        .bg(rgb(pt.paper))
+                        .border_1()
+                        .border_color(rgb(if on { sheet_zhu(t) } else { pt.border }));
                     themes_row = themes_row.child(
                         div()
-                            .w(px(46.0))
-                            .h(px(28.0))
-                            .rounded(px(5.0))
-                            .bg(rgb(pt.paper))
-                            .border_1()
-                            .border_color(rgb(if on { t.accent() } else { pt.border }))
+                            .id(SharedString::from(format!("theme-{}-{}", pt.id, i)))
                             .flex()
+                            .flex_col()
                             .items_center()
-                            .justify_center()
+                            .gap(px(3.0))
                             .cursor_pointer()
                             .child(
+                                // 选中的外面再套一圈极淡朱晕（环的余韵），
+                                // 未选的只是干净一颗点。
+                                dot.when(on, |d| {
+                                    d.border_2().border_color(rgb(sheet_zhu(t)))
+                                }),
+                            )
+                            .child(
                                 div()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(pt.text))
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(if on { sheet_zhu(t) } else { t.ink_soft() }))
                                     .child(SharedString::from(name)),
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
+                                    // 换纸要走 `set_theme`（fit_sizes + 持久），
+                                    // 直接赋值 `this.theme` 只换背景，夹注兑淡
+                                    // 与界栏不会跟着变。
                                     this.set_theme(i);
                                     cx.notify();
                                 }),
@@ -7020,7 +7008,7 @@ impl Root {
                             .items_center()
                             .gap(px(2.0))
                             .cursor_pointer()
-                            .text_color(rgb(if on { SHEET_ZHU } else { t.chrome_text() }))
+                            .text_color(rgb(if on { sheet_zhu(t) } else { t.chrome_text() }))
                             .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
                             .child(
                                 div()
@@ -7331,7 +7319,7 @@ impl Root {
                 .items_center()
                 .gap(px(2.0))
                 .cursor_pointer()
-                .text_color(rgb(if on { SHEET_ZHU } else { t.chrome_text() }))
+                .text_color(rgb(if on { sheet_zhu(t) } else { t.chrome_text() }))
                 .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
                 .child(
                     div()
@@ -7415,7 +7403,7 @@ impl Root {
                 .justify_center()
                 .gap(px(3.0))
                 .bg(if on {
-                    rgba(0xB23A3012)
+                    rgba(((sheet_zhu(t) & 0xFFFFFF) << 8) | 0x12)
                 } else {
                     rgba(0x00000000)
                 })
@@ -7426,12 +7414,12 @@ impl Root {
                     p.main_choice(),
                     crate::types::Script::Ancient,
                 ))
-                .text_color(rgb(if on { SHEET_ZHU } else { t.ink() }))
+                .text_color(rgb(if on { sheet_zhu(t) } else { t.ink() }))
                 .child(div().text_size(px(14.0)).child(SharedString::from(label)))
                 .child(
                     div()
                         .text_size(px(9.0))
-                        .text_color(rgb(if on { SHEET_ZHU } else { t.ink_soft() }))
+                        .text_color(rgb(if on { sheet_zhu(t) } else { t.ink_soft() }))
                         .child(SharedString::from(p.hint())),
                 )
                 .when(on, |d| {
@@ -7440,7 +7428,7 @@ impl Root {
                             .absolute()
                             .bottom(px(4.0))
                             .left(px(6.0))
-                            .child(zhu_dashed(106.0, 0xB23A30AA)),
+                            .child(zhu_dashed(106.0, ((sheet_zhu(t) & 0xFFFFFF) << 8) | 0xAA)),
                     )
                 })
                 .on_mouse_down(
@@ -7476,7 +7464,7 @@ impl Root {
                     .gap(px(2.0))
                     .cursor_pointer()
                     .font_family(crate::fonts::note_family(choice))
-                    .text_color(rgb(if on { SHEET_ZHU } else { t.chrome_text() }))
+                    .text_color(rgb(if on { sheet_zhu(t) } else { t.chrome_text() }))
                     .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
                     .child(div().text_size(px(13.0)).child(SharedString::from(label)))
                     .child(
@@ -7539,7 +7527,7 @@ impl Root {
                 col = col.child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(if on { SHEET_ZHU } else { t.chrome_text() }))
+                        .text_color(rgb(if on { sheet_zhu(t) } else { t.chrome_text() }))
                         .child(SharedString::from(c.to_string())),
                 );
             }

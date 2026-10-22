@@ -28,6 +28,10 @@ pub struct PaperTheme {
 }
 
 /// 主题配置表：顺序即面板按钮顺序，下标即 `Theme` 的编号。
+///
+/// 全系低饱和「中国传统国色」：纸、墨、界行都压一档，正文才立得住。
+/// 原为四套（宣纸 / 米黄 / 青简 / 夜读），v1.22.0 又补四套国色
+/// （鱼肚白 / 竹影绿 / 茶驼色 / 黛蓝笺）——共八色。新增只在此加一行。
 pub const PAPER_THEMES: &[PaperTheme] = &[
     PaperTheme {
         id: "xuanzhi",
@@ -61,6 +65,38 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         note: 0xA68E5C, // 秋香
         border: 0x4A4D4F, // 灰丝栏
     },
+    PaperTheme {
+        id: "yudu",
+        name: "鱼肚白",
+        paper: 0xF7F8F4, // 极简清冷
+        text: 0x2F3535, // 松烟墨
+        note: 0xC0392B,  // 朱红
+        border: 0x8E9596,
+    },
+    PaperTheme {
+        id: "zhuying",
+        name: "竹影绿",
+        paper: 0xDEE4D6, // 幽静禅意
+        text: 0x293326,  // 深墨绿
+        note: 0x9A3B3B,  // 沉朱砂
+        border: 0x65725E,
+    },
+    PaperTheme {
+        id: "chahe",
+        name: "茶驼色",
+        paper: 0xE2D3C3, // 老书岁月
+        text: 0x3D352F,  // 焦墨
+        note: 0xA63F2E,  // 赭红
+        border: 0x7A6859,
+    },
+    PaperTheme {
+        id: "dailan",
+        name: "黛蓝笺",
+        paper: 0xC8D8E4, // 浅灰蓝，婉约高级
+        text: 0x1E2C3A,  // 藏青
+        note: 0x8B3A3A,  // 胭脂红
+        border: 0x566C80,
+    },
 ];
 
 impl PaperTheme {
@@ -86,6 +122,18 @@ pub fn luma(c: u32) -> f32 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
+/// 彩度（RGB 三通道极差，0..255）：用来把「低饱和国色」写成可回归的约束。
+///
+/// 竞品爱用高饱和的蓝 / 紫 / 绿做阅读底，一眼就跳；这套配色全部压在极差
+/// 之下——纸色极差不超过 60，正文与界栏不超过 80。夹注朱印是另一回事，
+/// 它可以艳，但不许染成荧光（上限 170）。
+pub fn sat(c: u32) -> f32 {
+    let r = ((c >> 16) & 0xFF) as f32;
+    let g = ((c >> 8) & 0xFF) as f32;
+    let b = (c & 0xFF) as f32;
+    r.max(g).max(b) - r.min(g).min(b)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
     /// 宣纸：米白偏暖，最像常见的影印本。
@@ -96,6 +144,14 @@ pub enum Theme {
     Qing,
     /// 夜读：暖调深底。
     Ye,
+    /// 鱼肚白：极简清冷，低饱和国色（v1.22.0）。
+    YuDu,
+    /// 竹影绿：幽静禅意，低饱和国色。
+    ZhuYing,
+    /// 茶驼色：老书岁月，低饱和国色。
+    ChaHe,
+    /// 黛蓝笺：婉约高级，低饱和国色。
+    DaiLan,
 }
 
 impl Default for Theme {
@@ -105,15 +161,21 @@ impl Default for Theme {
 }
 
 impl Theme {
-    pub const ALL: [Theme; 4] = [Theme::Xuan, Theme::Mi, Theme::Qing, Theme::Ye];
+    /// 顺序必须与 [`PAPER_THEMES`] 完全一致——下标即主题编号。
+    pub const ALL: [Theme; 8] = [
+        Theme::Xuan,
+        Theme::Mi,
+        Theme::Qing,
+        Theme::Ye,
+        Theme::YuDu,
+        Theme::ZhuYing,
+        Theme::ChaHe,
+        Theme::DaiLan,
+    ];
 
+    /// 面板上显示的名字（直接取配置表，免得两套名字不同步）。
     pub fn label(self) -> &'static str {
-        match self {
-            Theme::Xuan => "宣纸",
-            Theme::Mi => "米黄",
-            Theme::Qing => "青简",
-            Theme::Ye => "夜读",
-        }
+        self.paper_theme().name
     }
 
     /// 本主题在 [`PAPER_THEMES`] 里的下标。
@@ -123,6 +185,10 @@ impl Theme {
             Theme::Mi => 1,
             Theme::Qing => 2,
             Theme::Ye => 3,
+            Theme::YuDu => 4,
+            Theme::ZhuYing => 5,
+            Theme::ChaHe => 6,
+            Theme::DaiLan => 7,
         }
     }
 
@@ -171,14 +237,9 @@ impl Theme {
 
     /// 朱丝栏：写经体的朱红界行（古本里的另一路做法）。
     /// 竖排正文目前走「乌丝栏」（`rule_ink`，黑口本一路），此色留给
-    /// 将来的朱丝版式 / 朱印装饰。
+    /// 将来的朱丝版式 / 朱印装饰——取夹注的朱色，与全书的朱印同源。
     pub fn rule_red(self) -> u32 {
-        match self {
-            Theme::Xuan => 0xB23A2E,
-            Theme::Mi => 0xB23A2E,
-            Theme::Qing => 0xA8443A,
-            Theme::Ye => 0xD0634E,
-        }
+        self.note()
     }
 
     /// 版框（四周双边）：界栏色向纸色兑淡一档（比界行轻，框不抢字）。
@@ -224,88 +285,87 @@ impl Theme {
     }
 
     /// 丝栏取色：按样式面板所选丝栏色给出界行颜色。
-    /// 乌 = `rule_ink`（冷灰）；朱 = `rule_red`（朱红）；
-    /// 金 = 泥金——亮纸上压一档防飘，夜读里提亮才看得见。
+    /// 乌 = `rule_ink`（界栏色）；朱 = `rule_red`（夹注朱色）；
+    /// 金 = 泥金——亮纸上压一档防飘，深底里提亮才看得见（不写死枚举，
+    /// 新增国色主题零改动）。
     pub fn rule_by(self, rc: crate::types::RuleColor) -> u32 {
         match rc {
             crate::types::RuleColor::Wu => self.rule_ink(),
             crate::types::RuleColor::Zhu => self.rule_red(),
-            crate::types::RuleColor::Jin => match self {
-                Theme::Xuan | Theme::Mi => 0xB08A3E,
-                Theme::Qing => 0x8F7A45,
-                Theme::Ye => 0xC2A25C,
-            },
+            crate::types::RuleColor::Jin => {
+                if self.is_dark() {
+                    0xC2A25C
+                } else {
+                    0xB08A3E
+                }
+            }
         }
     }
 
     /// 朱色：印章、句读、当前条目。
+    ///
+    /// 取夹注的朱色（与全书朱印同源），深底再向纸色提亮一档——
+    /// 否则夜读里朱印会沉进深纸看不见。浅纸直接用，深底自动提亮。
     pub fn accent(self) -> u32 {
-        match self {
-            Theme::Xuan => 0xA33B2B,
-            Theme::Mi => 0xA63A22,
-            Theme::Qing => 0x99503C,
-            Theme::Ye => 0xC4614A,
+        let p = self.paper_theme();
+        if p.is_dark() {
+            mix(p.note, p.paper, 0.20)
+        } else {
+            p.note
         }
     }
 
     /// 靛色：通假标注。
     pub fn indigo(self) -> u32 {
-        match self {
-            Theme::Xuan => 0x3E5A8A,
-            Theme::Mi => 0x3E5A8A,
-            Theme::Qing => 0x365C6B,
-            Theme::Ye => 0x7E9BC8,
+        if self.is_dark() {
+            0x7E9BC8
+        } else {
+            0x3E5A8A
         }
     }
 
-    /// 界面底（工具栏、状态栏、浮层）。
+    /// 界面底（工具栏、状态栏、浮层）——纸色向黑（深底）或向白（浅底）压，
+    /// 永远与纸面同调，不另起一套色；深底自动更暗、浅底自动更亮。
     pub fn chrome(self) -> u32 {
-        match self {
-            Theme::Xuan => 0xFBF7EC,
-            Theme::Mi => 0xFDF9E9,
-            Theme::Qing => 0xF1F5F0,
-            Theme::Ye => 0x211D18,
+        let p = self.paper_theme();
+        if p.is_dark() {
+            mix(p.paper, 0x000000, 0.16)
+        } else {
+            mix(p.paper, 0xFFFFFF, 0.10)
         }
     }
 
-    /// 界面分隔线。
+    /// 界面分隔线——向对比色压一档（深底提亮、浅底压暗）。
     pub fn chrome_line(self) -> u32 {
-        match self {
-            Theme::Xuan => 0xE4DBC6,
-            Theme::Mi => 0xE8DEC5,
-            Theme::Qing => 0xD8E1D9,
-            Theme::Ye => 0x38312A,
+        let p = self.paper_theme();
+        if p.is_dark() {
+            mix(p.paper, 0xFFFFFF, 0.16)
+        } else {
+            mix(p.paper, 0x000000, 0.10)
         }
     }
 
-    /// 界面文字。
+    /// 界面文字——深底取浅、浅底取深，保证与 `chrome()` 永远反色，
+    /// 绝不出现白底白字 / 黑底黑字。
     pub fn chrome_text(self) -> u32 {
-        match self {
-            Theme::Xuan => 0x4A443C,
-            Theme::Mi => 0x4C4438,
-            Theme::Qing => 0x3A4A44,
-            Theme::Ye => 0xC9BDA8,
+        let p = self.paper_theme();
+        if p.is_dark() {
+            mix(p.paper, 0xFFFFFF, 0.30)
+        } else {
+            mix(p.text, p.paper, 0.10)
         }
     }
 
-    /// 控件底（未选中的小按钮）。
+    /// 控件底（未选中的小按钮）——纸色向白压一档（深浅都压白，控件浮于纸面）。
     pub fn chip(self) -> u32 {
-        match self {
-            Theme::Xuan => 0xF3EFE4,
-            Theme::Mi => 0xF6F0DC,
-            Theme::Qing => 0xE7EDE6,
-            Theme::Ye => 0x2B2620,
-        }
+        let p = self.paper_theme();
+        mix(p.paper, 0xFFFFFF, if p.is_dark() { 0.12 } else { 0.06 })
     }
 
-    /// 控件底（选中）。
+    /// 控件底（选中）——朱色向纸色兑淡，深浅底都压到「可辨的淡朱」。
     pub fn chip_on(self) -> u32 {
-        match self {
-            Theme::Xuan => 0xF3DFC6,
-            Theme::Mi => 0xF5E0C1,
-            Theme::Qing => 0xDCE7DF,
-            Theme::Ye => 0x43382C,
-        }
+        let p = self.paper_theme();
+        mix(p.note, p.paper, if p.is_dark() { 0.45 } else { 0.62 })
     }
 }
 
@@ -516,6 +576,59 @@ mod tests {
     }
 
     #[test]
+    fn eight_paper_themes_are_registered_and_indexed() {
+        // 主题数与配置表严格同长：加一套配色，两边必须同时加。
+        assert_eq!(Theme::ALL.len(), PAPER_THEMES.len());
+        assert_eq!(PAPER_THEMES.len(), 8);
+        for (i, t) in Theme::ALL.iter().copied().enumerate() {
+            let p = t.paper_theme();
+            assert_eq!(t.index(), i, "{:?} 下标错位", t);
+            assert_eq!(t.label(), p.name, "{:?} 名字与配置表不同步", t);
+            assert_eq!(t.paper(), p.paper);
+            assert_eq!(t.ink(), p.text);
+            assert_eq!(t.note(), p.note);
+            assert_eq!(t.rule_ink(), p.border);
+        }
+        // 四套国色都注册了（id 反查得到）。
+        for id in ["yudu", "zhuying", "chahe", "dailan"] {
+            assert_eq!(PaperTheme::by_id(id).id, id);
+        }
+    }
+
+    #[test]
+    fn themes_are_low_saturation_guose() {
+        // 摒弃高饱和刺眼色：纸 / 正文 / 界栏一律低饱和（通道极差受限）。
+        // 夹注朱色是朱印语汇，可以比纸「艳」，但仍不许染成荧光。
+        for t in Theme::ALL {
+            let p = t.paper_theme();
+            assert!(sat(p.paper) < 60.0, "{} 纸色太艳：{:06X}", t.label(), p.paper);
+            assert!(sat(p.text) < 80.0, "{} 正文太艳：{:06X}", t.label(), p.text);
+            assert!(sat(p.border) < 80.0, "{} 界栏太艳：{:06X}", t.label(), p.border);
+            assert!(sat(p.note) < 170.0, "{} 夹注过艳：{:06X}", t.label(), p.note);
+        }
+    }
+
+    #[test]
+    fn ui_chrome_always_inverts_with_text() {
+        // 深底（夜读）下界面底要更暗、界面字要更亮——绝不出现白底白字 / 黑底黑字。
+        for t in Theme::ALL {
+            let d = (luma(t.chrome_text()) - luma(t.chrome())).abs();
+            assert!(d > 60.0, "{} 界面字与界面底对比不足：{d:.1}", t.label());
+            // 正文与纸面同样要有可辨对比。
+            let di = (luma(t.ink()) - luma(t.paper())).abs();
+            assert!(di > 60.0, "{} 正文与纸对比不足：{di:.1}", t.label());
+            // 深底判定：纸暗则底更暗、字更亮。
+            if t.is_dark() {
+                assert!(luma(t.chrome()) < luma(t.paper()), "{} 深底界面底应更沉", t.label());
+                assert!(luma(t.chrome_text()) > luma(t.paper()), "{} 深底界面字应提亮", t.label());
+            } else {
+                assert!(luma(t.chrome()) > luma(t.paper()), "{} 浅纸界面底应更亮", t.label());
+                assert!(luma(t.chrome_text()) < luma(t.paper()), "{} 浅纸界面字应更深", t.label());
+            }
+        }
+    }
+
+    #[test]
     fn mix_blends_channels() {
         assert_eq!(mix(0x000000, 0xFFFFFF, 0.0), 0x000000);
         assert_eq!(mix(0x000000, 0xFFFFFF, 1.0), 0xFFFFFF);
@@ -537,11 +650,19 @@ mod tests {
 
     #[test]
     fn paper_themes_are_the_single_source_of_truth() {
-        assert_eq!(PAPER_THEMES.len(), 4);
+        assert_eq!(PAPER_THEMES.len(), 8);
         let ids: Vec<&str> = PAPER_THEMES.iter().map(|p| p.id).collect();
-        assert_eq!(ids, vec!["xuanzhi", "mihuang", "qingjian", "yedou"]);
+        assert_eq!(
+            ids,
+            vec![
+                "xuanzhi", "mihuang", "qingjian", "yedou", "yudu", "zhuying", "chahe", "dailan"
+            ]
+        );
         let names: Vec<&str> = PAPER_THEMES.iter().map(|p| p.name).collect();
-        assert_eq!(names, vec!["宣纸", "米黄", "青简", "夜读"]);
+        assert_eq!(
+            names,
+            vec!["宣纸", "米黄", "青简", "夜读", "鱼肚白", "竹影绿", "茶驼色", "黛蓝笺"]
+        );
         // 四色齐全、互不重复（纸 / 正文 / 夹注 / 界栏）。
         for p in PAPER_THEMES {
             assert!(luma(p.paper) != luma(p.text), "{} 纸与正文同色", p.id);
