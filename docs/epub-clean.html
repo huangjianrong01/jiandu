@@ -172,6 +172,13 @@ const hl = (s) => esc(s).replace(/(\[(?:注|高亮|拼音|数字)[^\]]*\])/g, '<
 function run() {
   const html = $('src').value;
   const J = window.JianDuEpubClean;
+  if (!J) {
+    $('final').innerHTML =
+      '<span class="err">未加载 epub-vertical-clean.js —— 两个文件需放在同一目录（用本地 http 服务打开本页最稳）。</span>';
+    $('stat').textContent = '缺脚本';
+    $('stat').className = 'err';
+    return;
+  }
   try {
     // 逐阶段复现（与 cleanEpub 内部同序）
     const doc = new DOMParser().parseFromString(html, 'text/html');
