@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>笺读 · 响应式多版式引擎（对开 / 单叶 / 整页）</title>
+<style>
+  :root{
+    --zhu:#B23A30; --paper:#F0EAD6; --ink:#2F3535;
+    --ink-soft:#8A8175; --hair:rgba(120,100,70,.18);
+    --song:"WenJinMincho","Songti SC","STSong","Noto Serif SC",serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:28px 22px 56px;background:radial-gradient(120% 90% at 50% 0%,#FCF8EE,#F4EDDC 55%,#EDE4CE);
+       font-family:var(--song);color:var(--ink);-webkit-font-smoothing:antialiased}
+  .head{max-width:840px;margin:0 auto 20px;text-align:center}
+  .head h1{margin:0 0 6px;font-size:18px;font-weight:400;letter-spacing:.3em;text-indent:.3em}
+  .head p{margin:0;font-size:11.5px;line-height:1.9;color:var(--ink-soft)}
+
+  .panel{max-width:840px;margin:0 auto;padding:16px 20px 14px;background:rgba(240,234,214,.95);
+         border:1px solid var(--hair);border-radius:2px;
+         box-shadow:0 18px 42px -20px rgba(52,40,26,.5)}
+  .row{display:flex;align-items:flex-start;gap:14px;margin-bottom:12px}
+  .row__label{flex:0 0 52px;padding-top:2px;font-size:10px;color:var(--ink-soft);letter-spacing:.08em}
+  .row__body{display:flex;flex-wrap:wrap;gap:16px}
+  .opt{appearance:none;border:0;padding:0;background:none;font:inherit;font-size:12px;color:var(--ink);
+       cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:2px;transition:color .18s}
+  .opt:hover{color:var(--zhu)}
+  .opt::after{content:"";display:block;width:0;height:1px;background:var(--ink);transition:width .22s}
+  .opt[aria-pressed="true"]{color:var(--zhu)}
+  .opt[aria-pressed="true"]::after{width:20px}
+
+  .stage{margin-top:6px;padding:10px;background:#E9E2CF;border:1px solid var(--hair);border-radius:2px;
+         display:flex;justify-content:center}
+  canvas{display:block;background:#F5F0E6;box-shadow:0 6px 20px -12px rgba(52,40,26,.6)}
+
+  .sliders{max-width:840px;margin:14px auto 0;display:flex;gap:22px;align-items:center;flex-wrap:wrap;
+           font-size:11.5px;color:var(--ink-soft)}
+  .sliders label{display:flex;align-items:center;gap:8px}
+  input[type=range]{width:150px;accent-color:var(--zhu)}
+  .stats{max-width:840px;margin:12px auto 0;font-size:11px;line-height:1.9;color:var(--ink-soft)}
+  .stats b{color:var(--ink);font-weight:400}
+  .notes{max-width:840px;margin:26px auto 0;font-size:11.5px;line-height:2;color:var(--ink-soft)}
+  .notes h2{font-size:11px;font-weight:400;letter-spacing:.22em;color:var(--ink);margin:0 0 8px;padding-bottom:6px;border-bottom:1px solid var(--hair)}
+  .notes ul{margin:0 0 20px;padding-left:1.2em}
+  .notes code{font-family:"SFMono-Regular",Menlo,monospace;font-size:10.5px;background:rgba(120,100,70,.08);padding:1px 4px;border-radius:2px}
+</style>
+</head>
+<body>
+
+<header class="head">
+  <h1>响应式多版式引擎</h1>
+  <p>一套算式 · 三种铺法 —— calculateGrid（列数, 模式）</p>
+</header>
+
+<section class="panel">
+  <div class="row">
+    <div class="row__label">版式</div>
+    <div class="row__body" id="modes"></div>
+  </div>
+  <div class="row">
+    <div class="row__label">列数</div>
+    <div class="row__body" id="cols"></div>
+  </div>
+
+  <div class="stage"><canvas id="cv"></canvas></div>
+
+  <div class="sliders">
+    <label>视口宽 <input type="range" id="vw" min="320" max="1400" value="1200"></label>
+    <label>视口高 <input type="range" id="vh" min="420" max="1000" value="800"></label>
+    <span id="vp">1200 × 800</span>
+  </div>
+
+  <div class="stats" id="stats"></div>
+</section>
+
+<section class="notes">
+  <h2>三种模式的核心差异</h2>
+  <ul>
+    <li><strong>对开翻阅（Spread）</strong>：单叶可用宽 = (内容宽 − 中缝) / 2，两叶 + 中缝铺满屏幕，中缝落在正中并立鱼尾 / 叶码；视线自右向左扫视。</li>
+    <li><strong>手机竖屏（Mobile Portrait）</strong>：整幅宽都给这一叶，中缝不画、纸面贴屏幕右缘；列宽约为对开时的两倍——同一个字号，手机上反而更大。</li>
+    <li><strong>整页（Full Page）</strong>：按 <code>fullScale = min(w/1180, h/820)</code> 取系数，只对<strong>外层</strong>做 <code>ctx.scale(k, k)</code>，内部按基准版式原样绘制；列数、行数、字格比例全部不变，变的只是整体大小。</li>
+  </ul>
+  <h2>网格算式（三模式共用）</h2>
+  <ul>
+    <li><code>colWidth = 可用宽 / columns</code>，字号随列宽线性缩放：<code>fontSize = 0.75 × colWidth</code>，<code>rowHeight = 1.1 × colWidth × lineScale</code>，<code>totalRows = floor(可用高 / rowHeight)</code>。</li>
+    <li>最小字号阈值 <code>12px</code>：跌破时<strong>反推列宽</strong>（宁可纸面略宽、由外层滚动），14 列窄屏也不会小如蚂蚁。</li>
+    <li>切列数 / 切模式都先记 <code>charIndex</code> 锚点（当前页首字的章·段·偏移），重排后按它回找新页码——绝不跳回卷首。</li>
+    <li>ResizeObserver + window.resize（120ms 防抖）→ 重新 <code>calculateGrid</code>；自动模式只在对开 ⇄ 单叶之间来回，整页是手动档。</li>
+  </ul>
+</section>
+
+<script src="layout-engine.js"></script>
+<script>
+(function () {
+  var L = window.JianDuLayout;
+  var MODES = L.LayoutMode.ALL;
+  var COLS = [8, 10, 12, 14];
+  var SAMPLE = '周紀一起重光赤奮若盡玄黓困敦凡三十五年初命晉大夫魏斯趙籍韓虔為諸侯臣光曰臣聞天子之職莫大於禮禮莫大於分分莫大於名何謂禮紀綱是也何謂分君臣是也何謂名公侯卿大夫是也夫以四海之廣兆民之衆受制於一人雖有絕倫之力高世之智莫不奔走而服役者豈非以禮為之紀綱哉';
+
+  var state = {
+    mode: 'facing',
+    columns: 10,
+    auto: true,
+    viewportW: 1200,
+    viewportH: 800,
+    zoom: 1,
+  };
+
+  var cv = document.getElementById('cv');
+  var ctx = cv.getContext('2d');
+
+  // ---- 控件（与客户端样式面板同一套语汇：字 + 一道墨线）----
+  function build(host, items, isOn, pick) {
+    host.innerHTML = '';
+    items.forEach(function (it) {
+      var b = document.createElement('button');
+      b.className = 'opt';
+      b.textContent = it.label;
+      b.setAttribute('aria-pressed', String(isOn(it.value)));
+      b.onclick = function () { pick(it.value); sync(); };
+      host.appendChild(b);
+    });
+  }
+
+  function buildControls() {
+    build(document.getElementById('modes'),
+      MODES.map(function (m) { return { label: L.LayoutMode.label(m), value: m }; })
+        .concat([{ label: '自动', value: 'auto' }]),
+      function (v) { return v === 'auto' ? state.auto : (!state.auto && state.mode === v); },
+      function (v) {
+        if (v === 'auto') { state.auto = !state.auto; }
+        else { state.mode = v; state.auto = false; } // 手动选模式即退出自动
+      });
+    build(document.getElementById('cols'),
+      COLS.map(function (n) { return { label: n + ' 列', value: n }; }),
+      function (n) { return state.columns === n; },
+      function (n) { state.columns = n; });
+  }
+
+  function sync() {
+    buildControls();
+    var vw = state.viewportW, vh = state.viewportH;
+    // 自动模式：只在对开 ⇄ 单叶之间来回；整页是手动档。
+    if (state.auto && state.mode !== 'full') {
+      state.mode = L.autoMode(vw, vh, state.columns, state.zoom, null);
+    }
+    // 内容区：扣掉工具栏(44) / 状态栏(34) / 四边留白
+    var narrow = L.isNarrow(vw, vh);
+    var pad = narrow ? 16 : 44;
+    var contentW = Math.max(220, vw - pad);
+    var contentH = Math.max(220, vh - 78 - pad);
+
+    var plan = L.calculateGrid({
+      columns: state.columns, mode: state.mode,
+      contentW: contentW, contentH: contentH, zoom: state.zoom,
+      edge: 50, head: 0, foot: 12, margin: 0.04, lineScale: 1.05,
+    });
+
+    // 画布 = 模拟视口（CSS 像素 × DPR）
+    var dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(vw * dpr);
+    cv.height = Math.round(vh * dpr);
+    cv.style.width = Math.min(vw, 820) + 'px';
+    cv.style.height = Math.min(vw, 820) * (vh / vw) + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    L.render(ctx, plan, {
+      mode: state.mode, viewportW: vw, viewportH: vh,
+      chars: SAMPLE, ink: '#2F3535', rule: 'rgba(47,53,53,.16)', frame: '#2F3535', fish: '#333',
+    });
+
+    document.getElementById('stats').innerHTML =
+      '模式 <b>' + L.LayoutMode.label(state.mode) + '</b>（' + (state.auto ? '自动' : '手动') + '）' +
+      ' · 列数 <b>' + plan.m.columns + '</b>' +
+      ' · 列宽 <b>' + plan.m.colW.toFixed(1) + '</b>' +
+      ' · 字号 <b>' + plan.m.fs.toFixed(1) + '</b>' +
+      ' · 行高 <b>' + plan.m.rowH.toFixed(1) + '</b>' +
+      ' · 每面 <b>' + plan.m.rows + '</b> 行' +
+      ' · 纸面 <b>' + plan.m.outerW.toFixed(0) + '×' + plan.m.outerH.toFixed(0) + '</b>' +
+      (plan.scale !== 1 ? ' · 整页缩放 <b>' + plan.scale.toFixed(2) + '×</b>' : '') +
+      (plan.m.minFontHit ? ' · <b>已触发最小字号保护</b>' : '');
+    document.getElementById('vp').textContent = vw + ' × ' + vh;
+  }
+
+  // ---- 视口滑块（模拟屏幕变化；真窗口变化由下面的监听器接管）----
+  document.getElementById('vw').oninput = function (e) {
+    state.viewportW = +e.target.value; sync();
+  };
+  document.getElementById('vh').oninput = function (e) {
+    state.viewportH = +e.target.value; sync();
+  };
+
+  // ---- 监听真实窗口尺寸变化（ResizeObserver + resize，120ms 防抖）----
+  L.onViewportResize(document.body, function (size) {
+    // 页面宽度变化只影响画布展示宽度，不改动模拟视口；这里仅刷新一次绘制。
+    sync();
+  });
+
+  buildControls();
+  sync();
+})();
+</script>
+</body>
+</html>

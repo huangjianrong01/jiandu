@@ -6851,6 +6851,72 @@ impl Root {
                     ),
                 );
                 sheet = sheet.child(style_row("简繁", ver, t));
+                // ---- 版式：对开 / 单叶 / 整页（三模式）+ 「自动」开关 ----
+                // 自动开着时由屏幕宽高比在对开 ⇄ 单叶之间自动响应；手动选任一
+                // 档即退出自动（见 `Root::set_layout_mode`）。整页是「看整体
+                // 版式」的手动档，缩放到整叶塞进屏幕。
+                let cur_mode = self.layout_mode;
+                let mut modes = div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(16.0))
+                    .flex_wrap();
+                for m in crate::grid::LayoutMode::ALL {
+                    let on = cur_mode == m;
+                    modes = modes.child(
+                        ink_option(m.label(), on, t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.set_layout_mode(m);
+                                cx.notify();
+                            }),
+                        ),
+                    );
+                }
+                modes = modes.child(
+                    ink_option("自动", self.auto_duplex, t).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.auto_duplex = !this.auto_duplex;
+                            this.fit_sizes();
+                            cx.notify();
+                        }),
+                    ),
+                );
+                sheet = sheet.child(style_row("版式", modes, t));
+                // ---- 列数：8 / 10 / 12 / 14 ----
+                // 走 `set_columns` → `set_layout`：同样保住 charIndex 锚点，
+                // 换列数不跳页；`calculateGrid` 立刻重算列宽与字号。
+                const COL_OPTS: [(&str, usize); 4] = [
+                    ("8 列", 8),
+                    ("10 列", 10),
+                    ("12 列", 12),
+                    ("14 列", 14),
+                ];
+                let cur_cols = self.grid.columns;
+                let mut cols_row = div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(16.0))
+                    .flex_wrap();
+                for (label, n) in COL_OPTS {
+                    let on = cur_cols == n;
+                    cols_row = cols_row.child(
+                        ink_option(label, on, t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.set_columns(n);
+                                cx.notify();
+                            }),
+                        ),
+                    );
+                }
+                sheet = sheet.child(style_row("列数", cols_row, t));
                 // （原先此处还有一行「纸色」——与下面 `PAPER_THEMES` 那一行
                 // 重复，v1.22.0 去重：纸色只留配置表那一行，主题也由它驱动。）
                 // 丝栏：乌 / 金 / 朱 三色界行（竖排列间那道细线）。
@@ -6972,7 +7038,6 @@ impl Root {
                         ("标点", self.show_punct, StyleAct::Punct),
                         ("生僻字", self.show_rare, StyleAct::Rare),
                         ("数字汉字", self.han_digits, StyleAct::Han),
-                        ("自动开合", self.auto_duplex, StyleAct::AutoDuplex),
                         ("注释", self.show_notes, StyleAct::Notes),
                     ],
                     cx,

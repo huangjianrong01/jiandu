@@ -57,6 +57,10 @@ pub struct Prefs {
     /// 响应式单 / 双叶：按屏幕宽高比自动决定对开 / 单叶。
     #[serde(default = "default_true")]
     pub auto_duplex: bool,
+    /// **渲染模式**下标（[`crate::grid::LayoutMode::ALL`]）：
+    /// 0 = 对开翻阅、1 = 手机竖屏单叶、2 = 整页等比缩放。
+    #[serde(default)]
+    pub layout_mode: usize,
     /// 注释显示。
     pub notes: bool,
     /// 翻页音效。
@@ -84,6 +88,7 @@ impl Default for Prefs {
             rare: true,
             han_digits: false,
             auto_duplex: true,
+            layout_mode: 0,
             notes: true,
             sound: true,
         }

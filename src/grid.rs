@@ -161,6 +161,9 @@ pub const LAYOUT_CONFIGS: &[LayoutConfig] = &[
     LayoutConfig { key: "standard8",  label: "标准 8 列",  columns: 8,  dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Single, show_fish_tail: false },
     LayoutConfig { key: "standard10", label: "标准 10 列", columns: 10, dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Single, show_fish_tail: false },
     LayoutConfig { key: "standard12", label: "标准 12 列", columns: 12, dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Single, show_fish_tail: false },
+    // 标准 14 列：与 8/10/12 同一条刻本几何（列数选择器选 14 时命中它）。
+    // 放在「信笺」之前——`set_columns(14)` 取第一个匹配，故默认选标准版。
+    LayoutConfig { key: "standard14", label: "标准 14 列", columns: 14, dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Single, show_fish_tail: false },
     // 信笺：四周文武边栏 + 中缝对鱼尾，独占 2:3 平铺稿纸几何（见 `fit_letter`）。
     LayoutConfig { key: "letter14",   label: "信笺 14 列", columns: 14, dir: GridDir::Vertical, margin: 0.04, border_style: BorderStyle::Double, show_fish_tail: true },
 ];
@@ -326,6 +329,172 @@ pub fn compute_grid(
     }
 }
 
+// ── 三种渲染模式（v1.23.0：全平台响应式多版式引擎）──────────────────
+/// 渲染模式：同一套网格引擎，三种铺法。
+///
+/// 模式只决定「内容区怎么给」与「铺几叶」，**几何算式完全一致**
+/// （col_w = 可用宽 / 列数、fs = 0.75 × col_w、row_h = 1.1 × col_w）——
+/// 差别全在 [`calculate_grid`] 里那一次分派，渲染层不再写模式判定。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub enum LayoutMode {
+    /// **对开翻阅（Spread）**：左右两半叶 + 中缝（版心含鱼尾 / 叶码），
+    /// 视线自右向左扫视。适合电脑端与平板横屏。
+    #[default]
+    Facing,
+    /// **手机竖屏（Mobile Portrait）**：屏幕撑不住双叶，强制单叶；
+    /// 版心贴屏幕右缘，正文网格尽量放大，保证阅读不费眼。
+    Single,
+    /// **标准刻本整页（Full Page）**：把一整叶（两叶 + 中缝）当作一个整体
+    /// 等比缩放塞进屏幕。内部网格比例不变，只对外层做 Scale。
+    Full,
+}
+
+impl LayoutMode {
+    pub const ALL: [LayoutMode; 3] = [
+        LayoutMode::Facing,
+        LayoutMode::Single,
+        LayoutMode::Full,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LayoutMode::Facing => "对开",
+            LayoutMode::Single => "单叶",
+            LayoutMode::Full => "整页",
+        }
+    }
+
+    /// 面板上的注释（一句话说清适合什么场景）。
+    pub fn hint(self) -> &'static str {
+        match self {
+            LayoutMode::Facing => "两半叶对开，中缝居中",
+            LayoutMode::Single => "只排一叶，字更大",
+            LayoutMode::Full => "整叶等比缩放，看版式",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            LayoutMode::Facing => 0,
+            LayoutMode::Single => 1,
+            LayoutMode::Full => 2,
+        }
+    }
+
+    pub fn from_index(i: usize) -> LayoutMode {
+        Self::ALL.get(i).copied().unwrap_or(LayoutMode::Facing)
+    }
+
+    /// 是否按「两叶 + 中缝」铺排：整页模式铺的也是**一整叶**（两叶 + 缝），
+    /// 故与对开同路；只有手机竖屏是单叶。
+    pub fn spreads(self) -> bool {
+        matches!(self, LayoutMode::Facing | LayoutMode::Full)
+    }
+}
+
+/// 整页模式的**基准版式尺寸**（一整叶 = 两叶 + 中缝），比例取刻本开本
+/// （≈1.44:1）。几何恒定按这个基准算，再由 [`full_scale`] 等比缩放——
+/// 内部网格比例永不改变，变的只是外层 Scale。
+pub const FULL_BASE_W: f32 = 1180.0;
+pub const FULL_BASE_H: f32 = 820.0;
+/// 缩放上下限：太小字不可读，太大一叶撑爆屏幕（专注模式可放大看版式）。
+pub const FULL_SCALE_MIN: f32 = 0.25;
+pub const FULL_SCALE_MAX: f32 = 3.0;
+
+/// 整页缩放系数：取「宽能塞下」与「高能塞下」里更小的那个——
+/// 与 CSS `object-fit: contain` 同一套思路，保证整叶完整可见。
+pub fn full_scale(content_w: f32, content_h: f32, zoom: f32) -> f32 {
+    let k = (content_w / FULL_BASE_W).min(content_h / FULL_BASE_H);
+    (k * zoom.max(0.1)).clamp(FULL_SCALE_MIN, FULL_SCALE_MAX)
+}
+
+/// [`calculate_grid`] 的输入：模式 + 列数 + 视口 + 预留。
+#[derive(Clone, Copy, Debug)]
+pub struct GridInput {
+    /// 列数（8 / 10 / 12 / 14）。
+    pub columns: usize,
+    /// 渲染模式。
+    pub mode: LayoutMode,
+    /// 可用内容区宽（已扣工具栏 / 状态栏 / 四边留白）。
+    pub content_w: f32,
+    /// 可用内容区高。
+    pub content_h: f32,
+    /// 字级倍率（整页模式下并入缩放系数）。
+    pub zoom: f32,
+    /// 版框 + 内边距双边预留。
+    pub edge: f32,
+    /// 天头预留。
+    pub head: f32,
+    /// 地脚预留。
+    pub foot: f32,
+    /// 四周留白比例。
+    pub margin: f32,
+    /// 行高缩放（随正文字体）。
+    pub line_scale: f32,
+    pub dir: GridDir,
+}
+
+/// [`calculate_grid`] 的输出：网格度量 + 该模式的元信息。
+#[derive(Clone, Copy, Debug)]
+pub struct GridPlan {
+    /// 网格度量（列宽 / 字号 / 行高 / 行数 / 纸面尺寸）。
+    pub m: GridMetrics,
+    /// 实际参与计算的内容区（整页模式是**缩放后**的虚拟尺寸）。
+    pub box_w: f32,
+    pub box_h: f32,
+    /// 是否按「两叶 + 中缝」铺排。
+    pub facing: bool,
+    /// 整页模式的缩放系数（其余模式恒为 1.0）。
+    pub scale: f32,
+}
+
+/// **统一入口**：`calculateGrid(columns, mode)`。
+///
+/// 三种模式在这里分派一次，之后共用同一套算式：
+///   * 对开：`content / 2`（扣中缝）给单叶 → 两叶 + 缝；
+///   * 单叶：整幅 `content` 都给这一叶 → 字最大；
+///   * 整页：按 [`full_scale`] 把基准版式等比缩放，再走「两叶 + 缝」。
+///
+/// 字号始终 = 0.75 × 列宽，并有 [`GRID_FS_MIN`] 下限兜底（14 列窄屏
+/// 也不会小如蚂蚁；触发时反推列宽、由渲染层开启滚动）。
+pub fn calculate_grid(inp: GridInput) -> GridPlan {
+    let scale = match inp.mode {
+        LayoutMode::Full => full_scale(inp.content_w, inp.content_h, inp.zoom),
+        _ => 1.0,
+    };
+    let (bw, bh, facing, zoom) = match inp.mode {
+        LayoutMode::Facing => (inp.content_w, inp.content_h, true, inp.zoom),
+        LayoutMode::Single => (inp.content_w, inp.content_h, false, inp.zoom),
+        LayoutMode::Full => (FULL_BASE_W * scale, FULL_BASE_H * scale, true, 1.0),
+    };
+    let cfg = GridConfig {
+        columns: inp.columns.max(1),
+        dir: inp.dir,
+        margin: inp.margin,
+        line_scale: inp.line_scale,
+    };
+    // 整页：版框 / 天头 / 地脚也乘同一系数——否则「边框不缩放」会让内部
+    // 比例随屏幕漂移，那就不是「等比缩放」而是「换个版式」了。
+    let m = compute_grid(
+        bw,
+        bh,
+        cfg,
+        facing,
+        zoom,
+        inp.edge * scale,
+        inp.head * scale,
+        inp.foot * scale,
+        0.0,
+    );
+    GridPlan {
+        m,
+        box_w: bw,
+        box_h: bh,
+        facing,
+        scale,
+    }
+}
+
 /// 给定网格坐标 `(col, row)`，返回该格左上角的 `(x, y)`。
 ///
 /// 这是横竖排共用的「格子坐标」逻辑——方向只改变 x 的映射：
@@ -373,6 +542,115 @@ mod tests {
 
     fn content() -> (f32, f32) {
         (1320.0 - 44.0, 880.0 - 78.0 - 44.0)
+    }
+
+    // ---- 三种渲染模式（v1.23.0）----
+
+    fn input(mode: LayoutMode, columns: usize, cw: f32, ch: f32) -> GridInput {
+        GridInput {
+            columns,
+            mode,
+            content_w: cw,
+            content_h: ch,
+            zoom: 1.0,
+            edge: 50.0,
+            head: 0.0,
+            foot: 12.0,
+            margin: 0.04,
+            line_scale: 1.0,
+            dir: GridDir::Vertical,
+        }
+    }
+
+    #[test]
+    fn three_modes_share_one_grid_formula() {
+        let (cw, ch) = content();
+        let single = calculate_grid(input(LayoutMode::Single, 10, cw, ch));
+        let facing = calculate_grid(input(LayoutMode::Facing, 10, cw, ch));
+        let full = calculate_grid(input(LayoutMode::Full, 10, cw, ch));
+        // 铺几叶：对开与整页铺两叶 + 中缝，手机竖屏只铺一叶。
+        assert!(facing.facing, "对开 = 两叶");
+        assert!(full.facing, "整页 = 一整叶（两叶 + 中缝）");
+        assert!(!single.facing, "手机竖屏 = 单叶");
+        // 单叶把整幅宽都给了这一叶 → 字更大。
+        assert!(
+            single.m.col_w > facing.m.col_w,
+            "单叶列宽 {:.1} 应大于对开 {:.1}",
+            single.m.col_w,
+            facing.m.col_w
+        );
+        // 整页：整叶必须完整塞进内容区（等比缩放，不留裁切）。
+        assert!(full.m.outer_w <= cw + 0.5, "整页纸宽 {:.1} 超内容区 {:.1}", full.m.outer_w, cw);
+        assert!(full.m.outer_h <= ch + 0.5, "整页纸高 {:.1} 超内容区 {:.1}", full.m.outer_h, ch);
+        assert_eq!(single.scale, 1.0);
+        assert_eq!(facing.scale, 1.0);
+        assert!(full.scale > 0.0 && full.scale <= FULL_SCALE_MAX);
+        // 三模式共用同一套算式：fs = 0.75 × col_w，row_h = 1.1 × col_w。
+        for p in [single, facing, full] {
+            assert!(p.m.fs >= GRID_FS_MIN - 0.01, "字号跌破下限：{:.2}", p.m.fs);
+            assert!(p.m.row_h > p.m.fs, "row_h 必须大于 fs（竖排不上下重叠）");
+            if !p.m.min_font_hit {
+                assert!((p.m.fs - p.m.col_w * GRID_FS_RATIO).abs() < 0.01, "fs 非 0.75×col_w");
+            }
+        }
+    }
+
+    #[test]
+    fn full_mode_scales_without_changing_inner_proportions() {
+        let a = calculate_grid(input(LayoutMode::Full, 10, 1200.0, 800.0));
+        let b = calculate_grid(input(LayoutMode::Full, 10, 600.0, 400.0));
+        // 屏幕减半 → 缩放系数减半（取宽高里更紧的一边）。
+        assert!((b.scale / a.scale - 0.5).abs() < 0.02, "缩放未等比：{:.3} vs {:.3}", a.scale, b.scale);
+        // 内部网格同比例缩放：列宽 / 字号 / 行高都恰好减半。
+        assert!((b.m.col_w / a.m.col_w - 0.5).abs() < 0.02, "列宽未等比缩放");
+        assert!((b.m.fs / a.m.fs - 0.5).abs() < 0.02, "字号未等比缩放");
+        assert!((b.m.row_h / a.m.row_h - 0.5).abs() < 0.02, "行高未等比缩放");
+        // 列数与行数不变——「只对外层缩放，不改内部网格比例」。
+        assert_eq!(a.m.columns, b.m.columns);
+        assert!((a.m.rows as i32 - b.m.rows as i32).abs() <= 1, "行数不该随屏幕变：{} vs {}", a.m.rows, b.m.rows);
+    }
+
+    #[test]
+    fn column_switch_scales_linearly_and_guards_min_font() {
+        let (cw, ch) = content();
+        let mut prev = f32::MAX;
+        for n in GRID_COLUMN_CHOICES {
+            let p = calculate_grid(input(LayoutMode::Single, n, cw, ch));
+            assert_eq!(p.m.columns, n);
+            // 列数越多列宽越小（线性反比）。
+            assert!(p.m.col_w <= prev + 0.01, "{n} 列列宽未随列数收窄");
+            prev = p.m.col_w;
+            assert!(p.m.fs >= GRID_FS_MIN - 0.01, "{n} 列字号跌破 {GRID_FS_MIN}");
+        }
+        // 极窄屏 14 列：触发最小字号保护 → 反推列宽，字不小于 12px。
+        let p = calculate_grid(input(LayoutMode::Single, 14, 240.0, 480.0));
+        assert!(p.m.min_font_hit, "窄屏 14 列应触发最小字号保护");
+        assert!(p.m.fs >= GRID_FS_MIN - 0.01, "保护后字号仍 {:.2}", p.m.fs);
+        assert!(
+            p.m.col_w >= p.m.fs / GRID_FS_RATIO - 0.01,
+            "反推列宽不足：col_w={:.2} fs={:.2}",
+            p.m.col_w,
+            p.m.fs
+        );
+    }
+
+    #[test]
+    fn layout_mode_labels_and_spreads() {
+        assert_eq!(LayoutMode::ALL.len(), 3);
+        for (i, m) in LayoutMode::ALL.iter().copied().enumerate() {
+            assert_eq!(m.index(), i);
+            assert_eq!(LayoutMode::from_index(i), m);
+            assert!(!m.label().is_empty());
+            assert!(!m.hint().is_empty());
+        }
+        assert!(LayoutMode::Facing.spreads());
+        assert!(LayoutMode::Full.spreads());
+        assert!(!LayoutMode::Single.spreads());
+        // 8/10/12/14 四档都有对应版式，且「列数 14」取标准版（不是信笺）。
+        for n in GRID_COLUMN_CHOICES {
+            let cfg = LAYOUT_CONFIGS.iter().find(|c| c.columns == n).unwrap();
+            assert!(!cfg.is_letter() || n == 14, "{n} 列首选项不该是信笺");
+        }
     }
 
     #[test]
@@ -550,10 +828,14 @@ mod tests {
 
     #[test]
     fn layout_configs_are_the_single_source_of_truth() {
-        // 注册表恰好覆盖用户指定的四个档位，键 / 标签 / 列数一一对应。
-        assert_eq!(LAYOUT_CONFIGS.len(), 4);
+        // 注册表覆盖用户指定的四档列数（8/10/12/14），外加「信笺 14 列」
+        // 这一特殊模板；键 / 标签 / 列数一一对应。
+        assert_eq!(LAYOUT_CONFIGS.len(), 5);
         let keys: Vec<&str> = LAYOUT_CONFIGS.iter().map(|c| c.key).collect();
-        assert_eq!(keys, vec!["standard8", "standard10", "standard12", "letter14"]);
+        assert_eq!(
+            keys,
+            vec!["standard8", "standard10", "standard12", "standard14", "letter14"]
+        );
         // 标准三档是单线、无鱼尾；信笺是文武边栏 + 对鱼尾。
         for c in LAYOUT_CONFIGS.iter().filter(|c| !c.is_letter()) {
             assert_eq!(c.border_style, BorderStyle::Single, "{} 应为单线", c.key);

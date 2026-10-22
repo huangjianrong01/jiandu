@@ -276,6 +276,15 @@ pub struct Root {
     /// 响应式单 / 双叶：true 时按屏幕宽高比自动决定对开 / 单叶
     /// （宽屏双叶对开、窄屏单叶贴右），false 时沿用手动 `duplex`。
     pub auto_duplex: bool,
+    /// **渲染模式**（v1.23.0 三种版式）：对开翻阅 / 手机竖屏单叶 / 整页等比缩放。
+    ///
+    /// 与 `duplex` 的分工：`layout_mode` 是**用户 / 屏幕选的意图**，
+    /// `duplex` 是它推导出的**当帧铺法**（整页也铺两叶 + 中缝，故 = Facing）。
+    /// 自动模式下 `auto_duplex` 只在对开 ⇄ 单叶之间来回，不碰整页。
+    pub layout_mode: crate::grid::LayoutMode,
+    /// 整页模式的当帧缩放系数（其余模式恒为 1.0）：供 UI 与调试查看
+    /// 「整叶被缩到了几成」。
+    pub full_scale: f32,
     /// 书库面板是否展开（书架上下载更多书）。
     pub show_library: bool,
     /// 窗口内容区尺寸（每帧由 render 写入，供铺满屏计算）。
@@ -381,6 +390,8 @@ impl Root {
             show_grid_panel: false,
             layout_key: LayoutConfig::default_key(),
             duplex: Duplex::Single,
+            layout_mode: crate::grid::LayoutMode::Facing,
+            full_scale: 1.0,
             // 正文首选文津宋体：大字符集、生僻字全覆盖、竖排标点挤压正确。
             font_ancient: FontChoice::WenJinMincho,
             font_modern: FontChoice::SourceHanSans,
@@ -943,20 +954,27 @@ impl Root {
             self.fit_letter(content_w, content_h, notes_foot);
             return;
         }
-        // 响应式单 / 双叶：宽屏（平板横持 / 电脑）双叶对开、中缝居中；
-        // 窄屏（手机竖持）单叶、纸面贴右边缘。判据见 `grid::should_face`
-        // ——除了宽高比，还要求单叶宽与字号都过得去，宁可单叶也不牺牲字号。
-        // `auto_duplex` 关闭时沿用手动设置（样式面板「对开 / 单页」）。
-        let facing = if self.auto_duplex {
-            crate::grid::should_face(
+        // ---- 渲染模式分派（对开 / 单叶 / 整页）----
+        // 自动模式下只在对开 ⇄ 单叶之间来回（整页是「看整体版式」的手动档，
+        // 自动切进去会打断阅读）。判据 `grid::should_face` 除宽高比外还要求
+        // 单叶宽与字号都过得去——宁可单叶也不牺牲字号。
+        let mode = if self.auto_duplex && self.layout_mode != crate::grid::LayoutMode::Full {
+            if crate::grid::should_face(
                 self.viewport_w,
                 self.viewport_h,
                 self.grid.columns,
                 self.zoom,
-            )
+            ) {
+                crate::grid::LayoutMode::Facing
+            } else {
+                crate::grid::LayoutMode::Single
+            }
         } else {
-            self.duplex == Duplex::Facing
+            self.layout_mode
         };
+        self.layout_mode = mode;
+        let facing = mode.spreads();
+        // 当帧铺法：整页铺的也是一整叶（两叶 + 中缝），故与对开同为 Facing。
         self.duplex = if facing { Duplex::Facing } else { Duplex::Single };
         if std::env::var("JIANDU_FIT_DEBUG").is_ok() {
             eprintln!("[fit] vw={:.0} vh={:.0} content={:.0}x{:.0} cols={} facing={} focus={}", self.viewport_w, self.viewport_h, content_w, content_h, self.grid.columns, facing, self.focus_mode);
@@ -969,18 +987,25 @@ impl Root {
         let edge = ANCIENT_EDGE;
         let head = ANCIENT_HEAD;
         let foot = ANCIENT_FOOT + if notes_foot { ANCIENT_NOTES } else { 0.0 };
-        let extra = 0.0;
-        let m = compute_grid(
+        // 章题列不占额外宽度（格内一列），故 extra = 0。
+        // 统一入口 `calculateGrid(columns, mode)`：模式只决定内容区怎么给
+        // （对开对半 / 单叶整幅 / 整页按基准版式等比缩放），列宽与字号
+        // 的算式三模式完全一致。
+        let plan = crate::grid::calculate_grid(crate::grid::GridInput {
+            columns: self.grid.columns,
+            mode,
             content_w,
             content_h,
-            self.grid,
-            facing,
-            self.zoom,
+            zoom: self.zoom,
             edge,
             head,
             foot,
-            extra,
-        );
+            margin: self.grid.margin,
+            line_scale: self.grid.line_scale,
+            dir: self.grid.dir,
+        });
+        self.full_scale = plan.scale;
+        let m = plan.m;
         self.size_ancient = m.fs;
         self.size_modern = m.fs;
         self.line_modern = m.row_h;
@@ -1071,26 +1096,63 @@ impl Root {
             return; // 同一档，跳过无谓重排
         }
         // 锚点：当前页第一个字（段首缩进占位也算），切版前后都用它定位。
-        let anchor = self
-            .layout_pages()
-            .get(self.page)
-            .and_then(|p| p.glyphs.first())
-            .map(|g| (g.chapter, g.para, g.offset));
+        let anchor = self.page_anchor();
         self.layout_key = cfg.key;
         self.grid.columns = cfg.columns;
         self.grid.dir = cfg.dir;
         self.grid.margin = cfg.margin;
         self.fit_sizes();
-        if let Some((c, pa, o)) = anchor {
-            if let Some(pi) = self.layout_pages().iter().position(|pg| {
-                pg.glyphs
-                    .iter()
-                    .any(|g| (g.chapter, g.para, g.offset) == (c, pa, o))
-            }) {
-                self.page = pi;
-            }
-        }
+        self.restore_anchor(anchor);
         self.sync_current_chapter();
+    }
+
+    /// 当前页首字的 **charIndex 锚点**（章, 段, 偏移）。
+    ///
+    /// 切列数 / 切模式 / 改注文排法都会**整本重排**，页码随之变化；
+    /// 记下锚点再按它回找新页码，才不会「换个版式就跳回卷首」。
+    fn page_anchor(&self) -> Option<(usize, usize, usize)> {
+        self.layout_pages()
+            .get(self.page)
+            .and_then(|p| p.glyphs.first())
+            .map(|g| (g.chapter, g.para, g.offset))
+    }
+
+    /// 按锚点把 `self.page` 重定位到「含这个字」的那一面（找不到则原位不动）。
+    fn restore_anchor(&mut self, anchor: Option<(usize, usize, usize)>) {
+        let Some((c, pa, o)) = anchor else { return };
+        if let Some(pi) = self.layout_pages().iter().position(|pg| {
+            pg.glyphs
+                .iter()
+                .any(|g| (g.chapter, g.para, g.offset) == (c, pa, o))
+        }) {
+            self.page = pi;
+        }
+    }
+
+    /// **切渲染模式**（对开 / 单叶 / 整页）：同样保住阅读进度。
+    ///
+    /// 与 `set_layout` 走同一套锚点机制——先记当前页首字（charIndex），
+    /// 换模式重排后按这个字回找新页码，绝不跳到第一页。
+    pub fn set_layout_mode(&mut self, mode: crate::grid::LayoutMode) {
+        if self.layout_mode == mode {
+            return;
+        }
+        let anchor = self.page_anchor();
+        self.layout_mode = mode;
+        // 手动选模式即视为「不再自动响应屏幕」——否则下一帧 `fit_sizes`
+        // 又按宽高比把它改回去，面板上的选择看着像没生效。
+        // 想回到自动，重新打开「自动版式」开关即可。
+        self.auto_duplex = false;
+        self.fit_sizes();
+        self.restore_anchor(anchor);
+        self.sync_current_chapter();
+        self.notice = format!(
+            "版式：{}（{}）· {} 列",
+            mode.label(),
+            mode.hint(),
+            self.grid.columns
+        );
+        self.persist();
     }
 
     /// 切「信笺（14 列）」模板（便捷封装；内部走 [`set_layout`]）。
