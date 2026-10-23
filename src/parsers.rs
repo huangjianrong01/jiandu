@@ -521,6 +521,45 @@ pub fn is_thin_chapter(title: &str, body: &str) -> bool {
     !body.chars().any(|ch| matches!(ch, '。' | '！' | '？' | '；'))
 }
 
+/// 夹在**正文中间**的散页：书商常把「目录」「书影」插在卷与卷之间。
+///
+/// `front_matter_cut` 只砍卷首那一串前缀——它必须先认出「正文起手」才动刀，
+/// 所以当第一章本来就是正文时它返回 0，夹在后面的目录页就漏网了（实测
+/// 《史记》第 14 章「目录」：11 段 119 字、通篇无句读，就是一页卷名清单）。
+///
+/// 与 [`is_thin_chapter`] 的差别：字数放宽到 [`STRAY_CHAPTER_CHARS`]
+/// （目录页要列十几行卷名），但**句读这条一点不放宽**——目录页通篇没有
+/// 句号，而真正的短章再短也有一两个句号。段数也不再设限（目录页段数多）。
+pub fn is_stray_front_chapter(title: &str, body: &str) -> bool {
+    if !is_front_matter_title(title) {
+        return false;
+    }
+    let body = body.trim();
+    if body.is_empty() {
+        return true;
+    }
+    if body.chars().count() > STRAY_CHAPTER_CHARS {
+        return false;
+    }
+    !body.chars().any(|ch| matches!(ch, '。' | '！' | '？' | '；'))
+}
+
+/// 散页判据的字数上限：比 `THIN_CHAPTER_CHARS` 宽——目录页要列十几行卷名。
+const STRAY_CHAPTER_CHARS: usize = 600;
+
+/// 全书扫一遍，返回**应当删掉的**那些夹带散页的章号（升序）。
+///
+/// 只认「题名像附件 + 正文不像正文」这两条同时成立，正文章绝不会被误伤：
+/// 真章的题名是「卷X / 第X回 / 某某列传」，压根进不了附件词表。
+pub fn stray_front_indices(pairs: &[(&str, &str)]) -> Vec<usize> {
+    pairs
+        .iter()
+        .enumerate()
+        .filter(|(_, (t, b))| is_stray_front_chapter(t, b))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// 正文开头出现这些词 → 这一章是版权页 / 出版信息页。
 ///
 /// 版权页的题名常是 `未知`（扫描本没写 `<title>`），只能从内容认：
@@ -1168,6 +1207,53 @@ mod tests {
             .collect();
         let out = drop_front_matter(chapters);
         assert_eq!(out.len(), 8, "短章被误删：{out:?}");
+    }
+
+    // ── 夹在正文中间的散页（《史记》第 14 章「目录」） ────────────────
+
+    /// 卷与卷之间插的目录页：题名是「目录」、通篇无句读 → 抓出来。
+    #[test]
+    fn stray_toc_page_inside_the_body_is_caught() {
+        let toc_body = "卷一 五帝本纪第一\n卷二 夏本纪第二\n卷三 殷本纪第三\n\
+                        卷四 周本纪第四\n卷五 秦本纪第五";
+        let pairs = [
+            ("卷一 五帝本纪第一", "黄帝者，少典之子。"),
+            ("目录", toc_body),
+            ("卷二 夏本纪第二", "夏禹，名曰文命。"),
+        ];
+        assert_eq!(stray_front_indices(&pairs), vec![1]);
+    }
+
+    /// 同题名的**真正文**不会被误删：只要有一个句号就得留下。
+    #[test]
+    fn chapter_titled_toc_but_with_punct_is_kept() {
+        let pairs = [
+            ("卷一 五帝本纪第一", "黄帝者，少典之子。"),
+            ("目录", "本篇目录如下，凡三卷。"),
+            ("卷二 夏本纪第二", "夏禹，名曰文命。"),
+        ];
+        assert!(stray_front_indices(&pairs).is_empty());
+    }
+
+    /// 正文章题名（卷X / 列传）压根进不了附件词表，全书扫也不误伤。
+    #[test]
+    fn stray_scan_never_touches_real_chapters() {
+        let pairs: Vec<(&str, &str)> = (1..=6)
+            .map(|i| {
+                (
+                    match i {
+                        1 => "卷一 五帝本纪第一",
+                        2 => "卷二 夏本纪第二",
+                        3 => "卷三 殷本纪第三",
+                        4 => "卷四 周本纪第四",
+                        5 => "卷五 秦本纪第五",
+                        _ => "卷六 秦始皇本纪第六",
+                    },
+                    "黄帝者，少典之子。",
+                )
+            })
+            .collect();
+        assert!(stray_front_indices(&pairs).is_empty());
     }
 
     // ── 清剿上标幽灵字 ──────────────────────────────────────────────

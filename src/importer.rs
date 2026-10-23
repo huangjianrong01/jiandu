@@ -58,12 +58,37 @@ pub fn import_from_path(path: &Path) -> Result<Book> {
 /// 判据全在 `parsers::front_matter_cut`（题名 / 薄章 / 版权页元数据三道），
 /// 这里只负责动刀：章序前移 + 目录条目跟着重编号。
 /// 砍不砍得动由判据说了算，判据说不砍就一章不动。
-pub fn skip_front_matter(book: &mut Book) {
-    if book.chapters.len() <= 1 {
+/// 删掉给定章号（升序），并把目录条目按新章号重排。
+///
+/// 指向被删章的条目整条丢；其余条目的 `chapter` 减去「它前面被删了几章」。
+fn drop_chapters(book: &mut Book, doomed: &[usize]) {
+    if doomed.is_empty() {
         return;
     }
-    let bodies: Vec<String> = book
-        .chapters
+    for i in doomed.iter().rev() {
+        if *i < book.chapters.len() {
+            book.chapters.remove(*i);
+        }
+    }
+    let mut toc = std::mem::take(&mut book.toc);
+    toc.retain(|e| !doomed.contains(&e.chapter));
+    for e in toc.iter_mut() {
+        e.chapter -= doomed.iter().filter(|&&d| d < e.chapter).count();
+    }
+    book.toc = toc;
+}
+
+/// 取「题名 + 正文」对照表，供两道判据共用（正文按段拼，段间换行）。
+fn chapter_pairs<'a>(book: &'a Book, bodies: &'a [String]) -> Vec<(&'a str, &'a str)> {
+    book.chapters
+        .iter()
+        .zip(bodies.iter())
+        .map(|(c, b)| (c.title.as_str(), b.as_str()))
+        .collect()
+}
+
+fn chapter_bodies(book: &Book) -> Vec<String> {
+    book.chapters
         .iter()
         .map(|c| {
             c.paragraphs
@@ -72,27 +97,38 @@ pub fn skip_front_matter(book: &mut Book) {
                 .collect::<Vec<_>>()
                 .join("\n")
         })
-        .collect();
-    let pairs: Vec<(&str, &str)> = book
-        .chapters
-        .iter()
-        .zip(bodies.iter())
-        .map(|(c, b)| (c.title.as_str(), b.as_str()))
-        .collect();
-    let cut = crate::parsers::front_matter_cut(&pairs);
-    if cut == 0 || cut >= book.chapters.len() {
+        .collect()
+}
+
+pub fn skip_front_matter(book: &mut Book) {
+    if book.chapters.len() <= 1 {
         return;
     }
-    book.chapters.drain(..cut);
-    // 目录条目跟着前移；指向被砍掉那几章的条目整条丢。
-    let mut toc = std::mem::take(&mut book.toc);
-    toc.retain(|e| e.chapter >= cut);
-    for e in toc.iter_mut() {
-        e.chapter -= cut;
+    // ① 夹在**正文中间**的散页：书商常把「目录」「书影」插在卷与卷之间。
+    //
+    // `front_matter_cut` 只砍卷首那一串前缀（它要先认出「正文起手」才动刀），
+    // 当第一章本来就是正文时它返回 0，夹在后面的目录页就漏网了——实测《史记》
+    // 第 14 章「目录」（11 段 119 字、通篇无句读）正是这么躲过去的。
+    let bodies = chapter_bodies(book);
+    let stray = crate::parsers::stray_front_indices(&chapter_pairs(book, &bodies));
+    drop_chapters(book, &stray);
+
+    if book.chapters.len() <= 1 {
+        if book.toc.is_empty() {
+            book.rebuild_toc_from_chapters();
+        }
+        return;
     }
-    // 再扫一道题名：EPUB 的 nav/ncx 里常有「封面」「目录」这类**单独一条**
-    // 的条目，它们指向的章可能已被上面的 `cut` 吃掉、也可能侥幸躲过——
+    // ② 卷首那一串连续的前言（总目录 / 版权页 / 书影 / 前言 / 目录）。
+    let bodies = chapter_bodies(book);
+    let cut = crate::parsers::front_matter_cut(&chapter_pairs(book, &bodies));
+    if cut > 0 && cut < book.chapters.len() {
+        drop_chapters(book, &(0..cut).collect::<Vec<_>>());
+    }
+    // ③ 目录条目再按题名扫一道：EPUB 的 nav/ncx 里常有「封面」「目录」这类
+    // **单独一条**的条目，它们指向的章可能已被上面吃掉、也可能侥幸躲过——
     // 只认章号会漏，索性题名也判一次（判据与砍章同一把，不会分叉）。
+    let mut toc = std::mem::take(&mut book.toc);
     toc.retain(|e| !crate::parsers::is_front_matter_title(&e.title));
     book.toc = toc;
     if book.toc.is_empty() {
@@ -1251,6 +1287,49 @@ mod tests {
         assert_eq!(notes[0].at, 1); // 锚在「见」
         assert_eq!(notes[1].kind, NoteKind::Note);
         assert_eq!(notes[1].at, 3); // 锚在「欲」
+    }
+
+    /// v1.39.0 夹带散页：第一章本来就是正文时，`front_matter_cut` 返回 0，
+    /// 夹在卷与卷之间的「目录」页就漏了。书级清扫必须按题名 + 无句读把
+    /// 它抓出来，同时目录条目跟着重编号（后面几章的章号要减一）。
+    #[test]
+    fn stray_toc_page_between_volumes_is_dropped() {
+        let mut b = Book::new("史记", "司马迁");
+        for (title, body) in [
+            ("卷一 五帝本纪第一", "黄帝者，少典之子，姓公孙。"),
+            (
+                "目录",
+                "卷一 五帝本纪第一\n卷二 夏本纪第二\n卷三 殷本纪第三",
+            ),
+            ("卷二 夏本纪第二", "夏禹，名曰文命。"),
+        ] {
+            let mut c = Chapter {
+                title: title.into(),
+                paragraphs: Vec::new(),
+            };
+            c.paragraphs.push(Paragraph::plain(body));
+            b.chapters.push(c);
+        }
+        b.toc = vec![
+            TocEntry::new("卷一 五帝本纪第一", 0, 1),
+            TocEntry::new("目录", 1, 2),
+            TocEntry::new("卷二 夏本纪第二", 2, 1),
+        ];
+        skip_front_matter(&mut b);
+
+        let left: Vec<&str> = b.chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(
+            left,
+            vec!["卷一 五帝本纪第一", "卷二 夏本纪第二"],
+            "夹带的目录页没删：{left:?}"
+        );
+        // 目录条目：删掉「目录」且后面那章的 chapter 从 2 变成 1。
+        let got: Vec<(&str, usize)> = b.toc.iter().map(|e| (e.title.as_str(), e.chapter)).collect();
+        assert_eq!(
+            got,
+            vec![("卷一 五帝本纪第一", 0), ("卷二 夏本纪第二", 1)],
+            "目录没跟着重编号：{got:?}"
+        );
     }
 
     /// v1.37.0 目录智能清洗：砍掉卷首附件章后，**目录条目必须同步前移并重
