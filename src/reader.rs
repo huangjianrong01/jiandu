@@ -22,7 +22,7 @@ use crate::types::{
 use gpui::{
     canvas, div, prelude::*, px, rgb, rgba, svg, Animation, AnimationExt, AnyElement, App, BoxShadow,
     Bounds, Context, Div, ElementId, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Overflow, ParentElement, SharedString, Styled, Window,
+    MouseMoveEvent, MouseUpEvent, Overflow, ParentElement, Pixels, SharedString, Styled, Window,
 };
 use std::collections::HashMap;
 
@@ -768,6 +768,24 @@ pub(crate) fn sheet_side_pads(half: LeafHalf, pad: f32) -> (f32, f32) {
     }
 }
 
+/// **列数的唯一数据源**（v1.35.0）：UI 只认这张表，底层只收整数 / `None`。
+///
+/// 刻本按「一叶几行」称呼开本，故文案是「八行」这类古称，值才是引擎要的
+/// 列数；`None` = 自动（按这本书平均一章多少字 + 当前可用宽每帧换挡，见
+/// `grid::auto_columns`）。
+///
+/// 去重记录：原先「版式」浮层遍历 `grid::LAYOUT_CONFIGS` 出四枚档位按钮、
+/// 样式面板又写死一份 `COL_OPTS`，两处同时改 `columns_auto` / `grid.columns`
+/// ——同一件事两副面孔。现在只剩这一张表：读写都过
+/// `Root::columns_pref` / `Root::set_columns_pref`。
+pub(crate) const COLUMN_OPTS: [(&str, Option<usize>); 5] = [
+    ("八行", Some(8)),
+    ("十行", Some(10)),
+    ("十二行", Some(12)),
+    ("十四行", Some(14)),
+    ("自动", None),
+];
+
 impl Root {
     // ------------------------------------------------------------------
     // 阅读视图
@@ -865,6 +883,37 @@ impl Root {
         };
 
         let toolbar = self.render_reading_toolbar(total, cx);
+
+        // 导出探针（v1.35.0）：一枚**什么都不画**的隐形 canvas，尺寸与纸面
+        // 严丝合缝，只在 prepaint 时把「当帧纸面在窗口内容区里的矩形」记下来，
+        // 供「印制笺卡（PNG）」按此范围截图。
+        //
+        // 它是渲染的**输出**而不是输入——不绘制像素、不读回任何值、不改
+        // 任何排版坐标；父层只是多包一层 `relative`（尺寸由纸面撑出，与原来
+        // 的 stage 完全同尺寸），布局看不出差别。
+        let probe = self.page_rect.clone();
+        let stage = div()
+            .relative()
+            .child(stage)
+            .child(
+                canvas(
+                    move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+                        let unit = px(1.0);
+                        probe.set(Some((
+                            bounds.origin.x / unit,
+                            bounds.origin.y / unit,
+                            bounds.size.width / unit,
+                            bounds.size.height / unit,
+                        )));
+                    },
+                    |_bounds, _state, _window, _cx| {},
+                )
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0)),
+            );
 
         // 正文区：单页 / 对开舞台居中铺满。样式面板改为浮层（见下方 root.overlay），
         // 允许盖住正文下部，因此这里不再为它预留高度。
@@ -1138,7 +1187,7 @@ impl Root {
             // 之后画、盖在纸面之上；正文因此能一直铺到屏幕顶端。
             root = root
                 .child(body)
-                .child(self.render_reading_status(total))
+                .child(self.render_reading_status(total, cx))
                 .child(toolbar);
         } else {
             root = root.child(body);
@@ -1185,20 +1234,9 @@ impl Root {
                     .child(self.render_style_sheet(cx)),
             );
         }
-        // 版式控制面板：列数 8/10/12/14 + 四周留白（浮层，点工具栏「版式」展开）。
-        if self.show_grid_panel && !self.focus_mode {
-            root = root.child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(42.0))
-                    .flex()
-                    .flex_row()
-                    .justify_center()
-                    .child(self.render_grid_panel(cx)),
-            );
-        }
+        // （原「版式控制面板」浮层 v1.35.0 已删除：那四枚 8/10/12/14 档位与
+        // 样式面板的「列数」是同一件事的两副面孔，现统一并入「版字」页的
+        // `COLUMN_OPTS`；留白两行也一并搬过去了。）
         // 笔记 / 批注浮层。
         if self.show_notes_panel && !self.focus_mode {
             root = root.child(self.render_notes_panel(cx));
@@ -2126,7 +2164,6 @@ impl Root {
     fn bar_pinned(&self) -> bool {
         self.show_toc
             || self.show_style
-            || self.show_grid_panel
             || self.show_search
             || self.show_notes_panel
             || self.show_help
@@ -2138,7 +2175,7 @@ impl Root {
     /// 纸面上的一张半透明宣纸**：默认收到天头之外（`top = -BAR_H`），
     /// 鼠标触到天头 30px 才滑下来，读完即退——把整幅纸面还给正文。
     ///
-    /// 三组纯文字：书阁 · 目录 · 封面 ｜ 版式 · 字体 · 专注 ｜ 检索 · 朱批 · 帮助。
+    /// 三组纯文字：书阁 · 目录 · 封面 ｜ 版字 · 样式 · 专注 ｜ 检索 · 朱批 · 帮助。
     /// 没有图标、没有底色块、没有底线：字本身就是按钮。
     fn render_reading_toolbar(&mut self, total: usize, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
@@ -2208,22 +2245,36 @@ impl Root {
         ));
         left = left.child(sep());
 
-        // ---- 中组：版式（列数 / 留白） / 字体（纸色 · 字级 · 注文） / 专注 ----
+        // ---- 中组：版字（列数 / 字体 / 字级 / 留白） / 样式（纸色 · 墨色 ·
+        // 标注） / 专注 ----
+        //
+        // v1.35.0：原先的「版式」浮层与「字体」页合并为一张样式纸的**两页**，
+        // 这里是两页各自的入口——点哪枚就停在哪页，不再两处各开一个浮层。
         let mut mid = div().h(px(BAR_H)).flex().items_center();
-        mid = mid.child(item("版式", self.show_grid_panel).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                this.show_grid_panel = !this.show_grid_panel;
-                cx.notify();
-            }),
-        ));
-        mid = mid.child(item("字体", self.show_style).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                this.show_style = !this.show_style;
-                cx.notify();
-            }),
-        ));
+        mid = mid
+            .child(item("版字", self.show_style && self.style_tab == StyleTab::Banzi).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    let open = !(this.show_style && this.style_tab == StyleTab::Banzi);
+                    this.show_style = open;
+                    if open {
+                        this.style_tab = StyleTab::Banzi;
+                    }
+                    cx.notify();
+                }),
+            ));
+        mid = mid
+            .child(item("样式", self.show_style && self.style_tab == StyleTab::Style).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    let open = !(this.show_style && this.style_tab == StyleTab::Style);
+                    this.show_style = open;
+                    if open {
+                        this.style_tab = StyleTab::Style;
+                    }
+                    cx.notify();
+                }),
+            ));
         mid = mid.child(item("专注", false).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
@@ -4589,7 +4640,7 @@ impl Root {
             .map(|n| n.text.clone())
     }
 
-    fn render_reading_status(&self, total: usize) -> Div {
+    fn render_reading_status(&mut self, total: usize, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let unit = match self.script {
             Script::Ancient => "叶",
@@ -4661,6 +4712,34 @@ impl Root {
         if !self.show_punct {
             right.push_str(" · 标点隐");
         }
+        // 导出：**极简文字按钮**（无底无框，悬停转朱砂），落在状态栏中段。
+        // 状态栏是常驻的一条，`justify_between` 三格即「页码 ｜ 导出 ｜ 书信息」。
+        let action = |label: &'static str| -> Div {
+            div()
+                .px(px(8.0))
+                .cursor_pointer()
+                .text_size(px(11.5))
+                .text_color(rgb(t.chrome_text()))
+                .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+                .child(SharedString::from(label))
+        };
+        let png_btn = action("印制笺卡（PNG）").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                // 截当前纸面 → 弹系统保存对话框 → 落盘。
+                this.export_page_png(window, cx);
+            }),
+        );
+        let md_btn = action("导出纯文本（MD）").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _window, cx| {
+                cx.stop_propagation();
+                // 全书正文 + `[^n]` 脚注 → 弹保存对话框写成 .md。
+                this.export_markdown_file(cx);
+            }),
+        );
+
         div()
             .flex()
             .items_center()
@@ -4672,6 +4751,15 @@ impl Root {
             .text_size(px(11.5))
             .text_color(rgb(t.chrome_text()))
             .child(SharedString::from(left))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(png_btn)
+                    .child(md_btn),
+            )
             .child(SharedString::from(right))
     }
 
@@ -7062,192 +7150,34 @@ impl Root {
             }))
     }
 
-    /// 版式控制面板：古籍竖笺的列数（8/10/12/14）、版心宽（留白三档）与
-    /// 四周留白随时可切。单页 / 双面对开由屏幕方向自动决定（横屏对开、
-    /// 竖屏单页），不在此调整。
-    fn render_grid_panel(&self, cx: &mut Context<Self>) -> Div {
-        let t = self.theme;
-        let margin = self.grid.margin;
-
-        let mut panel = div()
-            .w(px(360.0))
-            .p_4()
-            .bg(rgb(t.chrome()))
-            .border_1()
-            .border_color(rgb(t.chrome_line()))
-            .rounded(px(6.0))
-            .shadow_lg()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(12.0))
-                            .text_color(rgb(t.accent()))
-                            .child(SharedString::from("版式 · 古籍竖笺")),
-                    )
-                    .child(small_button("收起", true, t).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.show_grid_panel = false;
-                            cx.notify();
-                        }),
-                    )),
-            );
-
-        // 版式档位：直接遍历配置注册表自动生成按钮——新增档位（如 16 列）
-        // 只需在 `LAYOUT_CONFIGS` 加一行，此处零改动。按钮文案读 `cfg.label`，
-        // 点亮态比对 `self.layout_key`，点击统一走 `set_layout`（保持阅读进度重排）。
-        let mut layout_row = div().flex().flex_row().items_center().gap_2().flex_wrap();
-        for cfg in crate::grid::LAYOUT_CONFIGS {
-            let key = cfg.key;
-            let on = self.layout_key == key;
-            layout_row = layout_row.child(
-                small_button(cfg.label, on, t).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.set_layout(key);
-                        cx.notify();
-                    }),
-                ),
-            );
-        }
-        panel = panel.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(t.ink_soft()))
-                        .child(SharedString::from("版式")),
-                )
-                .child(layout_row),
-        );
-
-        // 版心宽（留白档，v1.33.0）：版心（界行文字区）宽 ÷ 单叶可用宽。
-        // 宋版书版心只占纸宽六成（宽 = 复古）；满屏档让文字区铺满叶面。
-        // 与「四周留白」是两件事：那一行管纸面内边距，这一行管文字区占多宽。
-        let mut bx_row = div().flex().flex_row().items_center().gap_2();
-        for (label, val) in [
-            ("宽 60%", crate::grid::BANXIN_RATIOS[0]),
-            ("中 75%", crate::grid::BANXIN_RATIOS[1]),
-            ("窄 90%", crate::grid::BANXIN_RATIOS[2]),
-        ] {
-            let on = (self.banxin_ratio - val).abs() < 0.005;
-            bx_row = bx_row.child(small_button(label, on, t).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.set_banxin_ratio(val);
-                    cx.notify();
-                }),
-            ));
-        }
-        panel = panel.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(t.ink_soft()))
-                        .child(SharedString::from("版心宽")),
-                )
-                .child(bx_row),
-        );
-
-        // 留白行：窄 / 中 / 宽（四周同比例留白）。
-        let mut m_row = div().flex().flex_row().items_center().gap_2();
-        for (label, val) in [("窄", 0.02f32), ("中", 0.06), ("宽", 0.12)] {
-            let on = (margin - val).abs() < 0.005;
-            m_row = m_row.child(small_button(label, on, t).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.set_margin(val);
-                    cx.notify();
-                }),
-            ));
-        }
-        panel = panel.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(t.ink_soft()))
-                        .child(SharedString::from("四周留白")),
-                )
-                .child(m_row),
-        );
-
-        // 实时反馈：当前引擎算出的版心宽 / 列宽 / 字号 / 每面行数。
-        panel.child(
-            div()
-                .text_size(px(10.5))
-                .text_color(rgb(t.ink_soft()))
-                .child(SharedString::from(format!(
-                    "版心 {:.0}% · 列宽 {:.0} · 字号 {:.0} · 每面 {} 行 · {}",
-                    self.banxin_ratio * 100.0,
-                    self.col_w,
-                    self.size_ancient,
-                    self.grid_rows,
-                    if self.duplex == Duplex::Facing {
-                        "对开（横屏）"
-                    } else {
-                        "单页（竖屏）"
-                    }
-                ))),
-        )
-    }
-
     fn render_style_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let tab = self.style_tab;
         // 样式面板宽度与「单张页面」严格等宽：直接取 fit_sizes 算出的实际页宽。
         let style_w = self.page_w;
 
-        // ---- 标签行：样式 / 字体（只有字与一道细线，没有按钮底）----
-        let tab_style = panel_tab("样式", tab == StyleTab::Style, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.style_tab = StyleTab::Style;
-                cx.notify();
-            }),
-        );
-        let tab_font = panel_tab("字体", tab == StyleTab::Font, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.style_tab = StyleTab::Font;
-                cx.notify();
-            }),
-        );
+        // ---- 标签行：样式 / 版字（只有字与一道细线，没有按钮底）----
+        //
+        // v1.35.0：两页由 `StyleTab::ALL` 驱动，加页签只改枚举一处。
+        // 「版字」= 原「版式」浮层 + 「字体」页合并后的一页。
+        let mut tabs = div().flex().flex_row().gap(px(18.0));
+        for page in StyleTab::ALL {
+            tabs = tabs.child(panel_tab(page.label(), tab == page, t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.style_tab = page;
+                    cx.notify();
+                }),
+            ));
+        }
         let head = div()
             .flex()
             .flex_row()
             .items_start()
             .justify_between()
             .pb(px(2.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(18.0))
-                    .child(tab_style)
-                    .child(tab_font),
-            )
+            .child(tabs)
             .child(panel_close(t).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -7335,56 +7265,12 @@ impl Root {
                         }),
                     ),
                 );
-                sheet = sheet.child(style_row("版式", modes, t));
-                // ---- 列数：8 / 10 / 12 / 14 ----
-                // 走 `set_columns` → `set_layout`：同样保住 charIndex 锚点，
-                // 换列数不跳页；`calculateGrid` 立刻重算列宽与字号。
-                // 古风档名（v1.30.0）：刻本按「一叶几行」称呼开本，疏密自带
-                // 名目——行少则字大行宽（疏朗）、行多则字小行密（密排）。
-                // 切到这里不只是改列数：列宽随之变，字号（0.75×列宽）与行高
-                // （1.0×列宽）一起变，八行本翻开来就是宋版书那种疏朗大字。
-                const COL_OPTS: [(&str, usize); 4] = [
-                    ("八行疏朗本", 8),
-                    ("十行经典本", 10),
-                    ("十二行密排本", 12),
-                    ("十四行信笺本", 14),
-                ];
-                let cur_cols = self.grid.columns;
-                let mut cols_row = div()
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .gap(px(16.0))
-                    .flex_wrap();
-                for (label, n) in COL_OPTS {
-                    // 自动档开着时具体档都不亮——亮的是「自动」那一枚，
-                    // 否则用户会以为自己锁定了 12 列。
-                    let on = cur_cols == n && !self.columns_auto;
-                    cols_row = cols_row.child(
-                        ink_option(label, on, t).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.set_columns(n);
-                                cx.notify();
-                            }),
-                        ),
-                    );
-                }
-                // 自动档：列数按「这本书平均一章多少字」+ 当前可用宽算，
-                // 换本书、拉窗口都会自己换挡（`grid::auto_columns`）。
-                cols_row = cols_row.child(
-                    ink_option("自动", self.columns_auto, t).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.columns_auto = !this.columns_auto;
-                            this.fit_sizes();
-                            cx.notify();
-                        }),
-                    ),
-                );
-                sheet = sheet.child(style_row("列数", cols_row, t));
+                // 行名改「页面」：这一排管的是**怎么铺**（对开 / 单叶 / 整页），
+                // 与「版字」页里管字多大的列数是两回事，不再都叫「版式」。
+                sheet = sheet.child(style_row("页面", modes, t));
+                // （列数 v1.35.0 已搬到「版字」页：它和字体 / 字级 / 留白是
+                // 同一组决定「字多大」的参数，拆在两页会各自为政。唯一数据
+                // 源是模块级 `COLUMN_OPTS`，样式页不再出现列数控件。）
                 // （原先此处还有一行「纸色」——与下面 `PAPER_THEMES` 那一行
                 // 重复，v1.22.0 去重：纸色只留配置表那一行，主题也由它驱动。）
                 // 丝栏：乌 / 金 / 朱 三色界行（竖排列间那道细线）。
@@ -7512,7 +7398,79 @@ impl Root {
                 );
                 sheet = sheet.child(style_row("标注", marks, t));
             }
-            StyleTab::Font => {
+            StyleTab::Banzi => {
+                // ---- 列数：八行 / 十行 / 十二行 / 十四行 / 自动 ----
+                //
+                // 唯一数据源 `COLUMN_OPTS`：文案是古称，值是引擎要的
+                // `Option<usize>`（None = 自动）。读写只过 `columns_pref` /
+                // `set_columns_pref`——同一件事不再有第二处入口。
+                // 切档不只是列变：列宽随之变，字号与行高跟着变，八行本翻开
+                // 来就是宋版书那种疏朗大字（行款比例见 `grid::LAYOUT_CONFIGS`）。
+                let cur = self.columns_pref();
+                let mut cols_row = div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(16.0))
+                    .flex_wrap();
+                for (label, want) in COLUMN_OPTS {
+                    cols_row = cols_row.child(
+                        ink_option(label, cur == want, t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.set_columns_pref(want);
+                                cx.notify();
+                            }),
+                        ),
+                    );
+                }
+                sheet = sheet.child(style_row("列数", cols_row, t));
+                // ---- 留白（左右）：版心宽 ÷ 单叶可用宽，三档 ----
+                //
+                // 「版心宽」就是左右留白比例的另一面：版心占得越窄，两侧留白
+                // 越阔。宋版书版心只占纸宽六成（宽 = 复古），满屏档让文字区
+                // 铺满叶面。天头率随档联动（`grid::top_frac_for`），
+                // 且**天头恒为地脚的两倍**（`grid::TOP_OF_BOT`）——这一档只
+                // 动左右，不动那条铁律。
+                let mut bx_row = div().flex().flex_row().items_start().gap(px(16.0)).flex_wrap();
+                for (label, val) in [
+                    ("宽 60%", crate::grid::BANXIN_RATIOS[0]),
+                    ("中 75%", crate::grid::BANXIN_RATIOS[1]),
+                    ("窄 90%", crate::grid::BANXIN_RATIOS[2]),
+                ] {
+                    let on = (self.banxin_ratio - val).abs() < 0.005;
+                    bx_row = bx_row.child(
+                        ink_option(label, on, t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.set_banxin_ratio(val);
+                                this.fit_sizes();
+                                cx.notify();
+                            }),
+                        ),
+                    );
+                }
+                sheet = sheet.child(style_row("留白", bx_row, t));
+                // ---- 纸边：纸面四周留白（窄 / 中 / 宽）----
+                let margin = self.grid.margin;
+                let mut m_row = div().flex().flex_row().items_start().gap(px(16.0)).flex_wrap();
+                for (label, val) in [("窄", 0.02f32), ("中", 0.06), ("宽", 0.12)] {
+                    let on = (margin - val).abs() < 0.005;
+                    m_row = m_row.child(
+                        ink_option(label, on, t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.set_margin(val);
+                                this.fit_sizes();
+                                cx.notify();
+                            }),
+                        ),
+                    );
+                }
+                sheet = sheet.child(style_row("纸边", m_row, t));
                 // **排版字体**：刻本宋体 ↔ 手写楷体（一键换一对，见
                 // `Root::set_font_preset`——换完连行高与分页一起重算）。
                 sheet = sheet.child(style_row("排版字体", self.font_preset_row(cx), t));
@@ -7571,6 +7529,23 @@ impl Root {
                     );
                 }
                 sheet = sheet.child(style_row("字级", seg, t));
+                // 实时反馈：引擎当下算出的列数 / 版心 / 列宽 / 字号 / 每面行款。
+                // 自动档每帧换挡，这一行是「当前到底排成什么样」的唯一凭据。
+                sheet = sheet.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(t.ink_soft()))
+                        .child(SharedString::from(format!(
+                            "{} 列{} · 版心 {:.0}% · 列宽 {:.0} · 字号 {:.0} · 每面 {} 行 · 天头:地脚 {:.1}:1",
+                            self.grid.columns,
+                            if self.columns_auto { "（自动）" } else { "" },
+                            self.banxin_ratio * 100.0,
+                            self.col_w,
+                            self.size_ancient,
+                            self.grid_rows,
+                            self.margin_top / self.margin_bot.max(0.01),
+                        ))),
+                );
             }
         }
 
@@ -8395,9 +8370,10 @@ fn note_paper(card_w: f32, card_h: f32, body: &[char], ink: u32, mute: u32) -> D
 mod tests {
     use super::{
         bar_wants_show, chapters_ended_at, cn_date_from_str, cn_small, first_empty_column,
-        note_grid_plan, sheet_side_pads, BAR_GAP, BAR_H, BAR_HOT,
+        note_grid_plan, sheet_side_pads, COLUMN_OPTS, BAR_GAP, BAR_H, BAR_HOT,
     };
     use crate::gloss::{Page, Piece};
+    use crate::types::StyleTab;
     use crate::grid::LeafHalf;
 
     /// 顶栏：贴着天头出、栏下沿附近赖着不走、深入纸面才收；有面板开着则永远不放。
@@ -8566,5 +8542,53 @@ mod tests {
             // 单叶两侧对称（居中独摆，不与任何叶拼幅）。
             assert_eq!(sheet_side_pads(LeafHalf::Alone, pad), (pad, pad));
         }
+    }
+
+    /// v1.35.0 去重：列数**只有一张表**（`COLUMN_OPTS`）。
+    ///
+    /// 原先「版式」浮层遍历 `LAYOUT_CONFIGS` 出四枚档位、样式面板又写死一份
+    /// 四档数组，两处同时改 `columns_auto` / `grid.columns`。现在 UI 只认这
+    /// 一张表，且**值是引擎要的整数或 None**（文案「八行」只是古称）。
+    #[test]
+    fn columns_has_one_single_source_of_truth() {
+        // 恰好五档：八行 / 十行 / 十二行 / 十四行 / 自动。
+        assert_eq!(COLUMN_OPTS.len(), 5, "列数档位必须是 5 档");
+        let labels: Vec<&str> = COLUMN_OPTS.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            labels,
+            vec!["八行", "十行", "十二行", "十四行", "自动"],
+            "文案必须按刻本「一叶几行」的古称排序"
+        );
+        // 传给底层引擎的是整数或 None——不是文案、不是配置键。
+        let values: Vec<Option<usize>> = COLUMN_OPTS.iter().map(|(_, v)| *v).collect();
+        assert_eq!(
+            values,
+            vec![Some(8), Some(10), Some(12), Some(14), None],
+            "八行→8、十行→10、十二行→12、十四行→14、自动→None"
+        );
+        // 四档整数必须都能在行款表里查到（否则点了没反应）。
+        for (label, want) in COLUMN_OPTS {
+            if let Some(n) = want {
+                assert!(
+                    crate::grid::LayoutConfig::by_columns(n).is_some(),
+                    "{label}（{n} 列）在行款表里查不到"
+                );
+            }
+        }
+        // 无重复项：两处去重后不许再长出第二张表。
+        let mut seen = std::collections::BTreeSet::new();
+        for (_, want) in COLUMN_OPTS {
+            assert!(seen.insert(want), "列数档位重复：{want:?}");
+        }
+    }
+
+    /// v1.35.0：面板只剩**两页**——样式（纸墨标注）与版字（列数字体字级留白）。
+    /// 独立的「版式」浮层与「字体」页已合并，枚举里不许再留它们的残影。
+    #[test]
+    fn style_panel_has_exactly_two_tabs() {
+        assert_eq!(StyleTab::ALL.len(), 2, "面板只该有 样式 / 版字 两页");
+        let labels: Vec<&str> = StyleTab::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(labels, vec!["样式", "版字"]);
+        assert_ne!(StyleTab::Style, StyleTab::Banzi);
     }
 }

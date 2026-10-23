@@ -119,20 +119,30 @@ pub fn arrow_key_turns(key: &str) -> Option<bool> {
     }
 }
 
-/// 样式面板的标签页：样式（纸色 / 墨色 / 版式）或字体。
+/// 样式面板的标签页：**样式**（纸色 / 墨色 / 标注）与**版字**（列数 / 字体 /
+/// 字级 / 留白）。
+///
+/// v1.35.0 合并：原先「版式」面板（独立浮层里的 8/10/12/14 四档）与「字体」
+/// 页各管一套字号相关设置，功能重叠；现在两处合成 **版字** 一页，
+/// 列数只认 [`crate::reader::COLUMN_OPTS`] 这一张表（值 = `Option<usize>`）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StyleTab {
+    /// 纸墨：纸色 / 墨色 / 丝栏 / 标注 / 简繁 / 翻阅方式。
     Style,
-    Font,
+    /// 版字：列数 / 字体 / 字级 / 留白（版式与字体合并后的一页）。
+    Banzi,
 }
 
 impl StyleTab {
     pub fn label(&self) -> &'static str {
         match self {
             StyleTab::Style => "样式",
-            StyleTab::Font => "字体",
+            StyleTab::Banzi => "版字",
         }
     }
+
+    /// 两页：样式与版字（新增页签只需在这里加一项，标签行自动跟上）。
+    pub const ALL: [StyleTab; 2] = [StyleTab::Style, StyleTab::Banzi];
 }
 
 /// 拖拽选区的字键：(chapter, para, offset)。字典序即阅读顺序。

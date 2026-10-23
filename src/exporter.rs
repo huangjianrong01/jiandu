@@ -209,6 +209,94 @@ pub fn convert(input: &Path, out: &Path) -> Result<PathBuf> {
     export_book(&book, out)
 }
 
+// ------------------------------------------------------------------
+// 原生保存对话框（rfd）与「另存为」写盘
+// ------------------------------------------------------------------
+
+/// 弹出**系统原生**保存对话框，返回用户选中的路径。
+///
+/// `None` = 用户点了「取消」——这是**正常结果，不是错误**，调用方必须原样
+/// 吞掉（顶多提示一句「已取消」），绝不能 `unwrap` / `expect`，否则取消
+/// 一次就 panic 闪退。
+///
+/// 阻塞式 API：macOS 后端内部会把面板派发到主线程再等结果，所以即使在
+/// GPUI 的后台 executor 上调用也是安全的（与导入对话框同一条路子）。
+pub fn pick_save_path(title: &str, file_name: &str, filter_name: &str, exts: &[&str]) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title(title)
+        // 默认文件名：调用方拼好「笺卡_书名_页码.png」这类名字传进来。
+        .set_file_name(file_name)
+        .add_filter(filter_name, exts)
+        .save_file()
+}
+
+/// 把路径**补上**指定扩展名（用户手打了不带后缀的名字时兜底）。
+///
+/// 对话框在某些系统上不会自动补后缀，缺后缀会让后面按扩展名分派的写盘
+/// 逻辑走错分支（例如 .md 被当成 txt 导出）。
+pub fn with_extension(path: PathBuf, ext: &str) -> PathBuf {
+    if path.extension().and_then(|e| e.to_str()).is_some() {
+        path
+    } else {
+        let mut p = path.into_os_string();
+        p.push(".");
+        p.push(ext);
+        PathBuf::from(p)
+    }
+}
+
+/// 写字节到 `path`：**先建父目录再写**，失败只返回 `Err`，不 panic。
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    std::fs::write(path, bytes).with_context(|| format!("写入失败：{}", path.display()))?;
+    Ok(path.to_path_buf())
+}
+
+/// 拷一份文件（`from` → `to`）：PNG 导出走「先截到临时文件、再按用户选的
+/// 位置落盘」两步，这一步就是第二步。
+pub fn copy_file(from: &Path, to: &Path) -> Result<PathBuf> {
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    std::fs::copy(from, to).with_context(|| format!("保存失败：{}", to.display()))?;
+    Ok(to.to_path_buf())
+}
+
+/// 书名 → 安全的文件名主干：去掉路径分隔符与控制字符，并给长度设上限。
+///
+/// 书名来自 epub 元数据，可能带 `/`、`:`、换行——直接拼进默认文件名会让
+/// 保存对话框把路径拐到别处，甚至写到意料之外的目录。
+pub fn safe_file_stem(title: &str) -> String {
+    let mut s: String = title
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r'))
+        .collect();
+    s = s.trim().to_string();
+    if s.is_empty() {
+        return "未命名".to_string();
+    }
+    // 文件名有 255 字节上限，中文按 3 字节算，取 60 字足够安全。
+    let n = s.chars().count();
+    if n > 60 {
+        s = s.chars().take(60).collect();
+    }
+    s
+}
+
+/// 导出 Markdown 到用户选定的路径（正文 + `[^n]` 脚注）。
+///
+/// 返回 `Ok(None)` = 用户取消了保存；`Ok(Some(path))` = 已写出。
+pub fn export_markdown_picked(book: &Book, title: &str, file_name: &str) -> Result<Option<PathBuf>> {
+    let Some(picked) = pick_save_path(title, file_name, "Markdown", &["md", "markdown"]) else {
+        return Ok(None);
+    };
+    let path = with_extension(picked, "md");
+    let body = to_markdown(book);
+    write_bytes(&path, body.as_bytes()).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

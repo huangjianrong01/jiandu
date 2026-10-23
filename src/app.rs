@@ -15,7 +15,9 @@ use gpui::{
     div, px, rgb, AsyncApp, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, Render, SharedString, Styled, WeakEntity, Window,
 };
-use std::path::PathBuf;
+use std::cell::Cell;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// 当前所在界面。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,9 +115,10 @@ pub struct Root {
     /// 由 `Prefs::margin_tier` 落下，`set_banxin_ratio` 改写并持久化；
     /// 网格引擎据此反推列宽，天头率随档联动（`grid::top_frac_for`）。
     pub banxin_ratio: f32,
-    /// 版式控制面板（列数 / 方向 / 留白）是否展开。
-    pub show_grid_panel: bool,
     /// 当前版式配置键：数据驱动排版引擎的句柄（见 [`crate::grid::LAYOUT_CONFIGS`]）。
+    ///
+    /// v1.35.0：它**不是**列数的来源，只是「行款（字级 / 行高比例）」的句柄——
+    /// 列数的唯一数据源是 [`Root::columns_pref`]，UI 只写那里、只读那里。
     /// 取代原先散落的 `letter_mode` 布尔——所有版式只是注册表里的一条记录。
     pub layout_key: &'static str,
     pub duplex: Duplex,
@@ -259,6 +262,13 @@ pub struct Root {
     /// 分享卡在窗口内容区里的矩形 (x, y, w, h)，渲染时写入，
     /// 保存 / 分享图片时据此只截卡片，而不是整块屏幕。
     pub share_card_rect: Option<(f32, f32, f32, f32)>,
+    /// **当前纸面（整幅双叶）在窗口内容区里的矩形** (x, y, w, h)。
+    ///
+    /// 由阅读视图里一枚**不绘制任何东西**的测量探针在 prepaint 时写入
+    /// （见 `reader::render_screen` 的 `stage` 包装层）。导出 PNG 据此把
+    /// 截图范围收得与纸面严丝合缝——不带上状态栏，也不裁掉半个版框。
+    /// 它是渲染帧的**输出**而非输入，故不影响任何排版坐标。
+    pub page_rect: Rc<Cell<Option<(f32, f32, f32, f32)>>>,
     /// 开发用：自动存卡的帧计数（到第 3 帧才截）。
     pub share_shot_frames: u8,
     /// 点字弹出的工具条所锚定的字（None 表示未弹出）。
@@ -429,7 +439,6 @@ impl Root {
             // 留白默认「中（75%）」：既留古籍两侧留白的优雅，又保证现代
             // 屏幕上的阅读体验（用户 v1.33.0 定稿）。启动时由 prefs 落值。
             banxin_ratio: prefs.banxin_ratio(),
-            show_grid_panel: false,
             layout_key: LayoutConfig::default_key(),
             duplex: Duplex::Single,
             layout_mode: crate::grid::LayoutMode::Facing,
@@ -490,6 +499,7 @@ impl Root {
             share_bg: 0,
             rule_color: RuleColor::Wu,
             share_card_rect: None,
+            page_rect: Rc::new(Cell::new(None)),
             share_shot_frames: 0,
             popup: None,
             sel_anchor: None,
@@ -564,11 +574,16 @@ impl Root {
                 root.shelf_view = ShelfView::Spine;
             }
         }
-        // 开发用：JIANDU_PANEL=grid|style|toc|notes|help 直接把某个面板摊开，
+        // 开发用：JIANDU_PANEL=style|banzi|toc|notes|help 直接把某个面板摊开，
         // 便于逐面板截图核对（顶栏默认隐身，脚本点不到）。
+        // v1.35.0：独立的「版式」浮层已并入样式面板的「版字」页，`grid` 档
+        // 改指「展开样式面板并切到版字页」。
         if let Ok(v) = std::env::var("JIANDU_PANEL") {
             match v.as_str() {
-                "grid" => root.show_grid_panel = true,
+                "grid" | "banzi" => {
+                    root.show_style = true;
+                    root.style_tab = StyleTab::Banzi;
+                }
                 "style" => root.show_style = true,
                 "toc" => root.open_toc(),
                 "notes" => root.show_notes_panel = true,
@@ -674,13 +689,15 @@ impl Root {
                 }
             }
         }
-        // 开发用：展开样式面板 / 切到字体页。
+        // 开发用：展开样式面板 / 切到版字页。
         if std::env::var("JIANDU_STYLE_OPEN").is_ok() {
             root.show_style = true;
         }
-        // 开发用：直接展开版式面板（列数 / 留白），便于截图核对。
-        if std::env::var("JIANDU_GRID_OPEN").is_ok() {
-            root.show_grid_panel = true;
+        // 开发用：展开样式面板并直接停在「版字」页（v1.35.0 取代旧的
+        // JIANDU_GRID_OPEN——独立版式浮层已并入这一页）。
+        if std::env::var("JIANDU_BANZI_OPEN").is_ok() {
+            root.show_style = true;
+            root.style_tab = StyleTab::Banzi;
         }
         // 开发用：直接进入专注模式。
         if std::env::var("JIANDU_FOCUS").is_ok() {
@@ -697,7 +714,7 @@ impl Root {
             root.duplex = Duplex::Single;
         }
         if std::env::var("JIANDU_FONT_TAB").is_ok() {
-            root.style_tab = StyleTab::Font;
+            root.style_tab = StyleTab::Banzi;
         }
         // 开发用：JIANDU_NOTE_ZOOM=x,y 在给定窗口坐标直接弹出注文放大卡
         // （模拟点击注文块；本机合成鼠标点击被 macOS TCC 拦，无法端到端
@@ -1293,6 +1310,44 @@ impl Root {
         self.persist();
     }
 
+    /// **列数的唯一读口**（v1.35.0）：`None` = 自动（按书与可用宽每帧算），
+    /// `Some(n)` = 锁死 n 列。
+    ///
+    /// 原先「版式」浮层读 `layout_key`、样式面板读 `grid.columns` +
+    /// `columns_auto`，两处各自判断、同一件事两副面孔；现在 UI 一律只读这
+    /// 一处，写入只走 [`set_columns_pref`]。底层引擎仍照旧吃
+    /// `grid.columns` + `columns_auto`，换算在这里做一次，引擎零改动。
+    pub fn columns_pref(&self) -> Option<usize> {
+        if self.columns_auto {
+            None
+        } else {
+            Some(self.grid.columns)
+        }
+    }
+
+    /// **列数的唯一写入口**（v1.35.0）：接 UI 的 `Option<usize>`，
+    /// 落到引擎的 `columns_auto` + `set_columns`。
+    ///
+    /// `None`（自动）只是放开锁，让下一帧 `fit_sizes` 按内容重算，不必
+    /// 保锚重排；`Some(n)` 走 `set_layout`，保住 charIndex 锚点不跳页。
+    pub fn set_columns_pref(&mut self, want: Option<usize>) {
+        match want {
+            None => {
+                if self.columns_auto {
+                    return;
+                }
+                self.columns_auto = true;
+                self.fit_sizes();
+            }
+            Some(n) => {
+                if !self.columns_auto && self.grid.columns == n {
+                    return;
+                }
+                self.set_columns(n);
+            }
+        }
+    }
+
     /// 设列数（8 / 10 / 12 / 14）：列数档位全部来自配置，统一走 [`set_layout`]，
     /// 因此同样保持阅读进度、不跳回卷首。
     pub fn set_columns(&mut self, n: usize) {
@@ -1564,6 +1619,180 @@ impl Root {
                 }
             }
         })
+        .detach();
+    }
+
+    // ------------------------------------------------------------------
+    // 导出：印制笺卡（PNG） / 导出纯文本（MD）
+    // ------------------------------------------------------------------
+
+    /// 当前纸面（整幅双叶）在**屏幕坐标**里的矩形 (x, y, w, h)。
+    ///
+    /// `screencapture -R` 吃屏幕坐标；窗口 frame 含标题栏，内容区从标题栏
+    /// 下沿开始，故 y 要加 `窗口高 − 视口高`。`page_rect` 由渲染帧写入
+    /// （内容区坐标），这里只做一次平移，不参与任何排版计算。
+    pub fn page_screen_rect(&self, window: &Window) -> (f32, f32, f32, f32) {
+        let b = window.bounds();
+        let unit = px(1.0);
+        let wx = b.origin.x / unit;
+        let wy = b.origin.y / unit;
+        let wh = b.size.height / unit;
+        let title_h = (wh - self.viewport_h).max(0.0);
+        let (rx, ry, rw, rh) = self
+            .page_rect
+            .get()
+            .unwrap_or((0.0, 0.0, self.viewport_w, self.viewport_h));
+        (
+            (wx + rx).max(0.0),
+            (wy + title_h + ry).max(0.0),
+            rw.max(1.0),
+            rh.max(1.0),
+        )
+    }
+
+    /// 把**当前纸面**截成 PNG 写到 `dest`（macOS `screencapture`，Retina 真
+    /// 分辨率——屏幕上渲染多少像素就存多少像素，不做缩放，即最高画质）。
+    ///
+    /// 失败一律返回 `Err(可读原因)`，绝不 panic：没给屏幕录制权限、坐标算错、
+    /// 目标目录不可写，三种情况在界面上都能看到各自的说法。
+    pub fn capture_page_png(&self, window: &Window, dest: &Path) -> Result<(), String> {
+        let (x, y, w, h) = self.page_screen_rect(window);
+        if w < 40.0 || h < 40.0 {
+            return Err(format!("纸面区域过小（{w:.0}×{h:.0}），无法截图"));
+        }
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        let rect = format!("{x:.0},{y:.0},{w:.0},{h:.0}");
+        let out = std::process::Command::new("screencapture")
+            .args(["-x", "-R", &rect])
+            .arg(dest)
+            .output();
+        match out {
+            Ok(o) if o.status.success() && dest.exists() => Ok(()),
+            Ok(o) => {
+                let why = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                let why = if why.is_empty() {
+                    format!("退出码 {:?}", o.status.code())
+                } else {
+                    why
+                };
+                let hint = if why.to_lowercase().contains("permission")
+                    || why.to_lowercase().contains("not allowed")
+                    || why.to_lowercase().contains("denied")
+                {
+                    "请到「系统设置 → 隐私与安全性 → 屏幕录制」勾选笺读后重试"
+                } else {
+                    "（若提示权限不足：系统设置 → 隐私与安全性 → 屏幕录制）"
+                };
+                Err(format!("截图失败：{why} {hint}"))
+            }
+            Err(e) => Err(format!("无法调用 screencapture：{e}")),
+        }
+    }
+
+    /// 『印制笺卡（PNG）』按钮：截当前纸面 → 弹系统保存对话框 → 落盘。
+    ///
+    /// 顺序**不能反**：先截后弹。保存面板一浮起，再截就截到面板自己了。
+    /// 用户取消 = 正常结果：清掉临时文件、提示一句，不 panic、不报错红。
+    pub fn export_page_png(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir().join(format!("jiandu-card-{secs}.png"));
+        if let Err(e) = self.capture_page_png(window, &tmp) {
+            self.notice = e;
+            cx.notify();
+            return;
+        }
+        let title = self
+            .book
+            .as_ref()
+            .map(|b| b.title.clone())
+            .unwrap_or_else(|| "笺读".to_string());
+        let default = format!(
+            "笺卡_{}_{}.png",
+            crate::exporter::safe_file_stem(&title),
+            self.page + 1
+        );
+        cx.spawn(
+            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let picked = cx
+                        .background_executor()
+                        .spawn(async move {
+                            crate::exporter::pick_save_path(
+                                "印制笺卡（PNG）",
+                                &default,
+                                "PNG 图片",
+                                &["png"],
+                            )
+                        })
+                        .await;
+                    let Some(dest) = picked else {
+                        // 用户点了取消：这不是错误。
+                        let _ = std::fs::remove_file(&tmp);
+                        this.update(&mut cx, |this, cx| {
+                            this.notice = "已取消保存".to_string();
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    };
+                    let dest = crate::exporter::with_extension(dest, "png");
+                    let res = crate::exporter::copy_file(&tmp, &dest);
+                    let _ = std::fs::remove_file(&tmp);
+                    this.update(&mut cx, |this, cx| {
+                        this.notice = match res {
+                            Ok(p) => format!("已印制笺卡：{}", p.display()),
+                            Err(e) => format!("保存失败：{e}"),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// 『导出纯文本（MD）』按钮：全书正文 + `[^n]` 脚注，弹系统保存对话框落盘。
+    pub fn export_markdown_file(&mut self, cx: &mut Context<Self>) {
+        let Some(book) = self.book.clone() else {
+            self.notice = "尚未打开书籍，无法导出".to_string();
+            cx.notify();
+            return;
+        };
+        let file_name = format!("{}.md", crate::exporter::safe_file_stem(&book.title));
+        cx.spawn(
+            |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let res = cx
+                        .background_executor()
+                        .spawn(async move {
+                            crate::exporter::export_markdown_picked(
+                                &book,
+                                "导出纯文本（MD）",
+                                &file_name,
+                            )
+                        })
+                        .await;
+                    this.update(&mut cx, |this, cx| {
+                        this.notice = match res {
+                            Ok(Some(p)) => format!("已导出 Markdown：{}", p.display()),
+                            // 取消不是失败：只说一声，不甩错误。
+                            Ok(None) => "已取消导出".to_string(),
+                            Err(e) => format!("导出失败：{e}"),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
         .detach();
     }
 
