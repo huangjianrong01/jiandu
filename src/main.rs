@@ -35,6 +35,7 @@ mod trad;
 mod types;
 mod vclean;
 mod west;
+mod zen_kit;
 
 use app::Root;
 use anyhow::Result;
@@ -79,7 +80,11 @@ fn main() {
     // 命令行模式：`jiandu --convert 输入 --out 输出`
     //   epub -> json / txt / md 的批量转换，不开窗口。
     let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 {
+    // `jiandu --zen`：直接打开原生 GPUI 竖笺演示窗口（天头地脚非对称 + Canvas 网格
+    // + 三 Tab 设置 + 右侧热区 spring 抽屉），不开书架，便于单独验证排版与交互。
+    // 演示模式下跳过 CLI 分支，直接进开窗流程。
+    let zen_demo = args.iter().any(|a| a == "--zen");
+    if !zen_demo && args.len() > 1 {
         if let Some(code) = run_cli(&args[1..]) {
             std::process::exit(code);
         }
@@ -89,7 +94,7 @@ fn main() {
         .with_assets(JianDuAssets {
             base: Library::home(),
         })
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
         // 注册随包字体（存在才生效），找不到则沿回退链使用系统字体。
         fonts::register_bundled_fonts(cx);
 
@@ -116,21 +121,37 @@ fn main() {
             }
         }
         let bounds = Bounds::centered(None, size(px(win_w), px(win_h)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("笺读 · JianDu".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |_window, cx| cx.new(|cx| Root::new(cx)),
-        )
-        .expect("failed to open window");
+        // `--zen`：根视图换成原生 GPUI 竖笺演示（zen_kit::ZenView）——天头地脚非对称 +
+        // Canvas 网格 + 三 Tab 设置 + 右侧热区 spring 抽屉；否则照旧开书架 Root。
+        // （WindowOptions 不可 Clone，用工厂函数给两个分支各造一份。）
+        if zen_demo {
+            // ZenView::new 已返回 Entity<ZenView>（Entity<V: Render> 本身即 Render），
+            // 直接交给 open_window，不要再套一层 cx.new（否则变成 Entity<Entity<..>>）。
+            cx.open_window(zen_window_options(bounds), |_window, cx| {
+                zen_kit::ZenView::new(cx)
+            })
+            .expect("failed to open window");
+        } else {
+            cx.open_window(zen_window_options(bounds), |_window, cx| {
+                cx.new(|cx| Root::new(cx))
+            })
+            .expect("failed to open window");
+        }
 
         cx.activate(true);
     });
+}
+
+/// 书架 / 竖笺演示共用的窗口参数（标题、尺寸、居中）。
+fn zen_window_options(bounds: Bounds<gpui::Pixels>) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some("笺读 · JianDu".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 /// 处理命令行；返回 `Some(退出码)` 表示是 CLI 任务，不必开窗口。
@@ -200,6 +221,11 @@ fn print_cli_help() {
          直接运行（不带参数）打开书架窗口：\n\
          \n\
            jiandu\n\
+         \n\
+         原生 GPUI 竖笺演示（天头地脚非对称 + Canvas 古籍网格 + 三 Tab 设置\n\
+         + 右侧热区 spring 抽屉，不开书架）：\n\
+         \n\
+           jiandu --zen\n\
          \n\
          格式转换（epub -> json / txt / md）：\n\
          \n\
