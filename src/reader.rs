@@ -241,12 +241,27 @@ fn small_button(label: &str, on: bool, t: Theme) -> Div {
 /// 落在宣纸上像一枚旧朱印，不刺眼。
 const ZHU_BASE: u32 = 0xB23A30;
 
-/// 章题列的字号 / 正文字号：**1.12**（v1.28.0 用户口径「标题字号略大于
-/// 正文」）。
+/// 章题列的字号 / 正文字号：**1.2**（v1.28.0 用户口径「标题字号略大于
+/// 正文」，v1.36 再抬一档）。
 ///
-/// 只放大一成二：再大就成了现代书里的「章标题」，刻本里章题只比正文高
-/// 一头。格宽是字号的 1.33 倍，1.12 的字仍稳稳落在列内，不会探到邻列。
-const TITLE_COL_SCALE: f32 = 1.12;
+/// 刻本里章题只比正文高一头——再大就成了现代书里的「章标题」；但只放大
+/// 一成二又与正文难分，卷首要有一点「尊」。格宽是字号的 1.33 倍，1.2 的
+/// 字仍稳稳落在列内，不会探到邻列。
+const TITLE_COL_SCALE: f32 = 1.2;
+
+/// **大题（书名）**最多排几字：版心只有一格宽，书名再长也得让位给篇题。
+const BIG_TITLE_MAX: usize = 4;
+/// 大题的字号 / 小题的字号：**0.92**（大题次尊一档，仍高于正文）。
+const BIG_TITLE_SCALE: f32 = 0.92;
+/// 小题（篇题）最多排几字。
+const SUB_TITLE_MAX: usize = 7;
+
+/// **卷首章题上空几格**（v1.36）：两格。
+///
+/// 刻本的卷首题名不顶着上鱼尾排，而是低两格起——「空两格另起一列」那份
+/// 尊。章题列本就独占一列、通高到版框，空出的两格只是把篇题往下压，
+/// 既不占正文的地，也不会挤掉正文（能排几字按扣除后的余高算）。
+const TITLE_HEAD_CELLS: f32 = 2.0;
 
 /// 顶栏高度：一处定义——动画位移、触发带回差、命中判定全用它。
 pub(crate) const BAR_H: f32 = 44.0;
@@ -3332,7 +3347,10 @@ impl Root {
         // 右列读在前、左列续后，合起来正好铺满一个正文列的宽度，注块与
         // 上下正文同宽同界，行气才接得上（原先左缘留 1/6 空白、两列偏右）。
         let pad = cell_w * crate::gloss::NOTE_PAD_RATIO;
-        let sub_w = cell_w * 0.5;
+        // 两侧各让出极窄一道（见 `NOTE_EDGE_INSET`）：小字不蹭界栏，
+        // 两个小列仍各占余下宽度的一半，注块中线不变。
+        let inset = cell_w * crate::gloss::NOTE_EDGE_INSET;
+        let sub_w = (cell_w - pad - inset * 2.0) * 0.5;
         // 注文小字色：墨色 × 纸色自动推导（永远比正文淡一档）。
         // **用户自加夹注例外**：改深朱砂红（#C62828），与原本夹注一眼可辨。
         let note_color = if is_user {
@@ -3424,6 +3442,8 @@ impl Root {
                 .items_center();
             // 注块左缘的留白带（不排字）。
             line = line.child(div().w(px(pad)).h(px(row_h)));
+            // 左隙：小字与界栏之间的一线之隔。
+            line = line.child(div().w(px(inset)).h(px(row_h)));
             for c in pair {
                 line = line.child(match c {
                     // 注文里的【】同样显作「」（夹注不过 shown，这里单独过一道）。
@@ -3449,6 +3469,8 @@ impl Root {
                     None => div().w(px(sub_w)).h(px(row_h)),
                 });
             }
+            // 右隙：与左隙对称。
+            line = line.child(div().w(px(inset)).h(px(row_h)));
             block = block.child(line);
         }
         block
@@ -3496,14 +3518,57 @@ impl Root {
         // 余下全给篇题——鱼尾取了 1.5 字高后，短叶也不会溢出。
         let nfs = (fs * 0.42).max(9.0);
         let num_h = (nfs + 2.0) * han_num(chapter + 1).chars().count() as f32;
-        let avail = cell_h * rows as f32 + foot_h
+        // 卷首空两格：题名不顶着上鱼尾起，低 [`TITLE_HEAD_CELLS`] 格再落字。
+        let lead = tcell * TITLE_HEAD_CELLS;
+        let room = cell_h * rows as f32 + foot_h
             - head
             - th * 2.0
             - num_h
+            - lead
             - cell_h * (0.18 + 0.1 + 0.38);
-        // 篇题一字一格，格高随放大后的字号（tcell），能排几字按它算。
-        let take_n = (avail / tcell).floor().clamp(0.0, 7.0) as usize;
-        // 篇题：一字一格，自上面下。
+        // ── 大题在上、小题在下（古籍卷首常例）────────────────────────
+        // **大题 = 书名**（《史记》），**小题 = 篇题 / 章题**（五帝本纪第一）。
+        // 正文起首书名与篇题各占一行、前后呼应，上下位序取「大题在上、
+        // 小题在下」的那种。小题是本篇之名，最尊（1.2×）；大题为全书之名，
+        // 次之一档（1.1×），仍高于正文。
+        let big: Vec<char> = self.book_title().chars().take(BIG_TITLE_MAX).collect();
+        let mut big_n = big.len();
+        let gap_h = cell_h * 0.3;
+        // 一字一格，格高随放大后的字号（tcell），能排几字按它算。
+        let sub_n_of = |n: usize| -> usize {
+            let g = if n > 0 { gap_h } else { 0.0 };
+            ((room - n as f32 * tcell - g) / tcell)
+                .floor()
+                .clamp(0.0, SUB_TITLE_MAX as f32) as usize
+        };
+        let mut take_n = sub_n_of(big_n);
+        // 小题优先：地方不够就先砍大题，绝不把篇题挤没（保底 3 字）。
+        while take_n < 3 && big_n > 0 {
+            big_n -= 1;
+            take_n = sub_n_of(big_n);
+        }
+        // 空两格：两枚空白字格（与正文格同高的纯留白，不画线、不排字）。
+        if take_n > 0 || big_n > 0 {
+            col = col.child(div().h(px(lead)));
+        }
+        // 大题：书名，一字一格，自上面下（次尊一档）。
+        for c in big.iter().take(big_n) {
+            col = col.child(
+                div()
+                    .w(px(col_w))
+                    .h(px(tcell))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(tfs * BIG_TITLE_SCALE))
+                    .text_color(rgb(t.ink()))
+                    .child(SharedString::from(c.to_string())),
+            );
+        }
+        if big_n > 0 {
+            col = col.child(div().h(px(gap_h)));
+        }
+        // 小题：篇题，一字一格，自上面下（最尊）。
         for c in title.chars().take(take_n) {
             col = col.child(
                 div()

@@ -180,7 +180,10 @@ pub fn fullwidth_punct(s: &str) -> String {
 
 /// 一道「古籍化」：全角标点 + 阿拉伯数字转汉字。
 pub fn classicize(s: &str) -> String {
-    crate::numcn::normalize_numbers(&fullwidth_punct(s))
+    // 破折号竖排化与 EPUB 那条链同源（`vclean::dash_to_vertical`）：
+    // 横躺的 `——` 在竖排里就是一根拦腰截断行气的横杠。
+    let s = crate::vclean::dash_to_vertical(&s);
+    crate::numcn::normalize_numbers(&fullwidth_punct(&s))
 }
 
 /// 章序号的中文写法（`1 -> 一`、`15 -> 十五`），切卷时用。
@@ -1170,6 +1173,42 @@ pub fn parse_str(kind: SrcKind, text: &str) -> Result<Vec<RawChapter>> {
     crate::parsers::UniversalParser::parse(kind, text)
 }
 
+/// 摘出 `[注]…[/注]`（双行夹注），返回（干净文本, [(宿主字下标, 注文)]）。
+///
+/// **标记本身绝不进正文流**：它只是「从这里开始排双行小字」的开关信号，
+/// 连一个字格都不占（v1.36 用户口径）。摘出后正文只剩纯字，注文挂到宿主字
+/// 上（宿主 = 标记前那个字，与 `〖〗` 同口径），由排版引擎在布局时展开成
+/// 双行夹注——标签若留在文本里，就会被当成「[」「注」「]」「/」四个正文字
+/// 排进字格，行气当场断成四截。
+///
+/// 未闭合的 `[注]` 到文本末尾视为一条注文（容错，不丢字）；空注文连壳丢弃
+/// （`道[注][/注]可` → `道可`，不留空夹注）。
+pub fn split_notes(s: &str) -> (String, Vec<(usize, String)>) {
+    let mut out = String::with_capacity(s.len());
+    let mut notes = Vec::new();
+    let mut rest = s;
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix("[注]") {
+            let (body, after) = match tail.find("[/注]") {
+                Some(i) => (&tail[..i], &tail[i + "[/注]".len()..]),
+                None => (tail, ""),
+            };
+            // 宿主 = 标记前那个已输出的正文字（段首无字则锚在首字上）。
+            let at = out.chars().count().saturating_sub(1);
+            let text = body.trim();
+            if !text.is_empty() {
+                notes.push((at, text.to_string()));
+            }
+            rest = after;
+        } else {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    (out, notes)
+}
+
 /// 摘出 `[高亮]…[/高亮]`，返回（干净文本, [(起始字序, 字数, 文本)]）。
 ///
 /// `[注]…[/注]` **不动**——它留在文本里，由排版引擎在布局时展开成双行夹注。
@@ -1265,11 +1304,62 @@ pub fn strip_digit_marks(s: &str) -> String {
 ///
 /// 导入管线的每一条正文都从这里过，EPUB 与普通文本共用同一条清洗链，
 /// 免得「epub 有高亮、txt 没有」这类分叉。
+/// 一趟扫完 `[高亮]` 与 `[注]` 两类标记。
+///
+/// 为什么必须一趟：两种标记的宿主下标都是「**已输出正文的字数**」。分两次
+/// 扫的话，后扫的那种会把先扫那一种的标签长度也算进正文里——`道可[高亮]非常
+/// [/高亮]道[注]夹注[/注]` 里，「夹注」本该挂在正文第 4 字，先摘夹注会挂到
+/// 第 12 字（把 `[高亮]` 那几个标签字当成了正文）。一趟扫，两者的 `at`
+/// 都以同一份纯正文为准，绝不会互相错位。
+///
+/// 返回（干净文本, [(着重起始字序, 字数, 文本)], [(夹注宿主字序, 注文)]）。
+pub fn split_body_marks(s: &str) -> (String, Vec<(usize, usize, String)>, Vec<(usize, String)>) {
+    let mut out = String::with_capacity(s.len());
+    let mut spans = Vec::new();
+    let mut notes = Vec::new();
+    let mut rest = s;
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix("[高亮]") {
+            let (body, after) = match tail.find("[/高亮]") {
+                Some(i) => (&tail[..i], &tail[i + "[/高亮]".len()..]),
+                None => (tail, ""),
+            };
+            let at = out.chars().count();
+            let len = body.chars().count();
+            out.push_str(body);
+            if len > 0 {
+                spans.push((at, len, body.to_string()));
+            }
+            rest = after;
+        } else if let Some(tail) = rest.strip_prefix("[注]") {
+            let (body, after) = match tail.find("[/注]") {
+                Some(i) => (&tail[..i], &tail[i + "[/注]".len()..]),
+                None => (tail, ""),
+            };
+            let at = out.chars().count().saturating_sub(1);
+            let text = body.trim();
+            if !text.is_empty() {
+                notes.push((at, text.to_string()));
+            }
+            rest = after;
+        } else {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    (out, spans, notes)
+}
+
 pub fn paragraph_of(line: &str) -> Paragraph {
     let line = strip_digit_marks(line);
-    let (clean, spans) = split_highlights(&line);
+    // 一趟摘净着重与夹注（下标同源，见 `split_body_marks`），再摘注音。
+    let (clean, spans, notes) = split_body_marks(&line);
     let (clean, rubies) = split_ruby(&clean);
     let mut p = crate::importer::para_of(&clean);
+    for (at, text) in notes {
+        p.notes.push(Note::new(at, NoteKind::Note, text));
+    }
     for (at, len, text) in spans {
         p.notes.push(Note::span(at, len, NoteKind::Emph, text));
     }
@@ -1534,7 +1624,8 @@ mod tests {
         assert_eq!(decode_entities("a&nbsp;b&lt;c&gt;d&amp;e"), "a b<c>d&e");
         assert_eq!(decode_entities("&#36947;&#x5FB7;"), "道德");
         let cs = parse_html("<p>甲&nbsp;乙&mdash;丙&ldquo;丁&rdquo;</p>");
-        assert_eq!(cs[0].content, "甲 乙—丙“丁”");
+        // 破折号竖排化：`&mdash;`（`—`）不得横躺在竖排里，收成竖线 ︱。
+        assert_eq!(cs[0].content, "甲 乙︱丙“丁”");
     }
 
     #[test]
@@ -1561,11 +1652,46 @@ mod tests {
         )];
         let b = chapters_to_book("道德经", "老子", cs);
         let p = &b.chapters[0].paragraphs[0];
-        assert_eq!(p.text, "道可非常道[注]夹注[/注]");
-        assert_eq!(p.notes.len(), 1);
-        assert_eq!(p.notes[0].kind, NoteKind::Emph);
-        assert_eq!(p.notes[0].at, 2);
-        assert_eq!(p.notes[0].len, 2);
+        // 夹注标签**不进正文**：它只是双行小字的开关，正文里一个字格都不占。
+        assert_eq!(p.text, "道可非常道");
+        assert_eq!(p.notes.len(), 2);
+        // 着重（`[高亮]`）：跨两字的着重号。
+        let emph = p.notes.iter().find(|n| n.kind == NoteKind::Emph).unwrap();
+        assert_eq!(emph.at, 2);
+        assert_eq!(emph.len, 2);
+        // 夹注（`[注]`）：挂在前一字「道」上，文本留在注里。
+        let note = p.notes.iter().find(|n| n.kind == NoteKind::Note).unwrap();
+        assert_eq!(note.at, 4);
+        assert_eq!(note.text, "夹注");
+    }
+
+    /// 夹注标签只作开关：**绝不占字格**（v1.36）。
+    #[test]
+    fn note_marks_never_occupy_a_cell() {
+        let (clean, notes) = split_notes("黄帝者，少典之子[注]子：后代。[/注]，姓公孙。");
+        assert!(!clean.contains('['), "标签残留：{clean}");
+        assert!(!clean.contains("注"), "标签残留：{clean}");
+        assert_eq!(clean, "黄帝者，少典之子，姓公孙。");
+        // 宿主 = 标记前那个字（「子」在正文里的下标 7）。
+        assert_eq!(notes, vec![(7usize, "子：后代。".to_string())]);
+        // 空夹注连壳丢弃，不留空档。
+        let (clean, notes) = split_notes("道[注][/注]可");
+        assert_eq!(clean, "道可");
+        assert!(notes.is_empty(), "空夹注不该留：{notes:?}");
+        // 未闭合的 `[注]` 吞到结尾（不丢字）。
+        let (clean, notes) = split_notes("道[注]未尽");
+        assert_eq!(clean, "道");
+        assert_eq!(notes, vec![(0usize, "未尽".to_string())]);
+    }
+
+    /// 破折号 → 竖排竖线（两条链路同源：`vclean::classic_punct` 与
+    /// `pipeline::classicize` 都走 `dash_to_vertical`）。
+    #[test]
+    fn dashes_become_vertical_rule() {
+        assert_eq!(crate::vclean::dash_to_vertical("甲——乙"), "甲︱乙");
+        assert_eq!(crate::vclean::dash_to_vertical("甲—乙—丙"), "甲︱乙︱丙");
+        assert_eq!(crate::vclean::dash_to_vertical("甲－乙"), "甲︱乙");
+        assert_eq!(classicize("甲——乙"), "甲︱乙");
     }
 
     #[test]

@@ -34,6 +34,9 @@ pub fn import_from_path(path: &Path) -> Result<Book> {
             ))
         }
     };
+    // 正文里残留（或旧 JSON 里本就存着）的 `[注]…[/注]` 标签：摘成夹注，
+    // 绝不让 `[` `注` `]` 四个字占掉字格。
+    book.ingest_inline_notes();
     // 前言 / 序言 / 导读同样不进书架（epub 在自己的流程末尾已砍过一次）。
     skip_front_matter(&mut book);
     // 没有目录的格式（txt / md / json）在这里统一按章节标题补齐。
@@ -443,7 +446,10 @@ pub fn write_book_json(book: &Book, dst: &Path) -> Result<()> {
 
 /// 兼容旧签名的薄封装：内部统一走 [`adapt_json_book`] 数据适配器。
 pub fn parse_json_book(text: &str, fallback_title: &str) -> Result<Book> {
-    adapt_json_book(text, fallback_title)
+    let mut book = adapt_json_book(text, fallback_title)?;
+    // 旧 JSON 里可能还留着 `[注]…[/注]` 字面标签（早先没拆），开卷前吸一遍。
+    book.ingest_inline_notes();
+    Ok(book)
 }
 
 /// 数据适配器（Data Adapter）：把各种不规范的 JSON / 纯文本导入文件

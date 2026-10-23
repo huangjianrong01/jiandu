@@ -355,7 +355,9 @@ fn cleanup_punct_inner(seg: &str) -> String {
     // 现代括号 → 直角引号（竖排里（）开口朝错方向，且这本就是「引用 / 括注」的语义）。
     let s = s.replace('（', "「").replace('）', "」");
     // 省略号 → 竖排省略号（…… 是横排躺倒的两点，竖排该是居中的竖点）。
-    s.replace("……", "︙").replace('…', "︙")
+    let s = s.replace("……", "︙").replace('…', "︙");
+    // 破折号 → 竖排竖线（与 `vclean::classic_punct` 同一道，两条链路同源）。
+    crate::vclean::dash_to_vertical(&s)
 }
 
 // ------------------------------------------------------------------

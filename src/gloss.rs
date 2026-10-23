@@ -577,23 +577,30 @@ pub fn layout_book_from_opts(
 /// 列同宽同界，行气才接得上。
 pub const NOTE_PAD_RATIO: f32 = 0.0;
 
-/// 夹注里「点状句读」的字号 / 注文字号：**0.62**（v1.28.0）。
+/// 注块**两侧**各留这么点空隙（占正文列宽的比例）。
+///
+/// 双行小字贴着界栏排会「糊」在栏线上——小字的墨迹几乎顶到界行，远看像
+/// 栏线变粗了一截。故左右各让出一丁点（5%），小字仍然居中、仍然与正文
+/// 列同宽同界，只是不再蹭着栏线。留白是**两侧对称**的，不改注块中线。
+pub const NOTE_EDGE_INSET: f32 = 0.05;
+
+/// 夹注里「点状句读」的字号 / 注文字号：**0.56**（v1.28.0 定 0.62，
+/// v1.36 再收 10%）。
 ///
 /// 用户原话：「小字里的标点也要缩小，绝不能在小字里出现大的现代标点」。
 /// 注文本身就是正文的一半（0.5），而全角句号的墨迹几乎填满自己的 em
 /// box——与注文同号时，一个「。」顶半颗小字，整块夹注就糊成一团黑点。
-/// 再收一档到 0.62（≈ 正文的 0.31，与正文句读的 0.3 同档），小字里才只
-/// 剩一粒轻点。
-pub const NOTE_PUNCT_RATIO: f32 = 0.62;
+/// 0.56 折算下来约正文的 0.28，小字里只剩一粒若有若无的轻点。
+pub const NOTE_PUNCT_RATIO: f32 = 0.56;
 
-/// 是不是「点状」句读（，。、；：？！…—· 及其半角形）。
+/// 是不是「点状」句读（，。、；：？！…—· 及其半角形，含竖排破折号 ︱）。
 ///
 /// 夹注只对这类标点收字号；引号 / 括号 / 书名号要「括住」什么，
 /// 缩小反而括不住，故按原大小排。
 pub fn is_dot_punct(c: char) -> bool {
     matches!(
         c,
-        '，' | '。' | '、' | '；' | '：' | '？' | '！' | '…' | '—' | '·'
+        '，' | '。' | '、' | '；' | '：' | '？' | '！' | '…' | '—' | '︱' | '·'
             | ',' | '.' | ';' | ':' | '?' | '!'
     )
 }
@@ -617,7 +624,9 @@ pub fn note_boxes_in_column(
     west_mode: bool,
 ) -> Vec<NoteBox> {
     let row_h = cell_h / 2.0;
+    // 命中区与视觉同源：左缘留白 + 两侧细隙之内才是小字真正落墨的地方。
     let pad = cell_w * NOTE_PAD_RATIO;
+    let inset = cell_w * NOTE_EDGE_INSET;
     let mut y = 0.0f32;
     let mut out = Vec::new();
     let mut idx = 0usize;
@@ -657,9 +666,9 @@ pub fn note_boxes_in_column(
                 let rows = (text.chars().count() + 1) / 2;
                 let h = rows as f32 * row_h;
                 out.push(NoteBox {
-                    x: li as f32 * cell_w + pad,
+                    x: li as f32 * cell_w + pad + inset,
                     y,
-                    w: cell_w - pad,
+                    w: cell_w - pad - inset * 2.0,
                     h,
                     text: text.clone(),
                     page: 0,
@@ -1443,11 +1452,13 @@ mod tests {
         // 第二个注块：又排了一个正文字 + 半个注块。
         assert!((boxes[1].y - (51.0 + 25.5 + 51.0)).abs() < 0.01);
         assert!((boxes[1].h - 51.0).abs() < 0.01);
-        // 宽 = 列宽 − 左侧留白（注块左缘空一道，见 NOTE_PAD_RATIO）；
-        // x = 列序 li × 列宽 + 同一留白。
+        // 宽 = 列宽 − 左侧留白 − 两侧细隙（见 NOTE_PAD_RATIO / NOTE_EDGE_INSET）；
+        // x = 列序 li × 列宽 + 留白 + 左隙。
         let pad = 46.0 * NOTE_PAD_RATIO;
-        assert!((boxes[0].w - (46.0 - pad)).abs() < 0.01);
-        assert!((boxes[0].x - (2.0 * 46.0 + pad)).abs() < 0.01);
+        let inset = 46.0 * NOTE_EDGE_INSET;
+        assert!((boxes[0].w - (46.0 - pad - inset * 2.0)).abs() < 0.01);
+        assert!((boxes[0].x - (2.0 * 46.0 + pad + inset)).abs() < 0.01);
+        assert!(inset > 0.0, "小字两侧要留出一线之隔，别贴着界栏");
         assert_eq!(boxes[0].text, "甲乙");
         assert_eq!(boxes[1].text, "丙丁戊己");
     }
@@ -1462,7 +1473,7 @@ mod tests {
         let text_cols = 4;
         let rightmost = note_boxes_in_column(&col, text_cols - 1 - 0, cell_w, cell_h, true);
         let leftmost = note_boxes_in_column(&col, text_cols - 1 - 3, cell_w, cell_h, true);
-        let pad = cell_w * NOTE_PAD_RATIO;
+        let pad = cell_w * NOTE_PAD_RATIO + cell_w * NOTE_EDGE_INSET;
         assert!((rightmost[0].x - (3.0 * cell_w + pad)).abs() < 0.01);
         assert!((leftmost[0].x - pad).abs() < 0.01);
         assert!(rightmost[0].x > leftmost[0].x);

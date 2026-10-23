@@ -523,6 +523,39 @@ fn parens_to_note(s: &str) -> String {
     out
 }
 
+/// 现代破折号 → 竖排专用竖线 `︱`（U+FE31）。
+///
+/// 横排的 `——` 是一根**躺着**横穿字格的杠，竖排里它拦腰截断整列的行气
+/// （用户原话：「横版破折号在竖排里太出戏」）。竖排该是**一根立着的线**：
+/// 连续几道并成一枚（中文常写两道 `——`），一根足够，两道并排反成两道黑杠。
+/// `︱` 是 Unicode 的竖排呈现形（U+FE31），字库里存的就是立着的那一枚。
+///
+/// 它**不进 `is_punct`**：句读（，。）由 `punct` 手绘小小一枚，而破折号要
+/// 顶满字格才像刻本里的那条竖线，故按正文字排，只是字形换成立着的。
+pub fn dash_to_vertical(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < cs.len() {
+        if is_dash(cs[i]) {
+            // 连续几道并成一枚。
+            while i + 1 < cs.len() && is_dash(cs[i + 1]) {
+                i += 1;
+            }
+            out.push('︱');
+        } else {
+            out.push(cs[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 横排破折号一族：`—` `―` `–` `‐` `‑` 与全角 `－`。
+fn is_dash(c: char) -> bool {
+    matches!(c, '—' | '―' | '–' | '‐' | '‑' | '－')
+}
+
 /// `《》……——""` 的竖排替换（逐字扫，避免误伤已生成的标记）。
 fn classic_punct(s: &str) -> String {
     let cs: Vec<char> = s.chars().collect();
@@ -544,8 +577,9 @@ fn classic_punct(s: &str) -> String {
                 }
                 out.push('︙');
             }
-            '—' | '―' => {
-                while i + 1 < cs.len() && (cs[i + 1] == '—' || cs[i + 1] == '―') {
+            // 破折号一族（`——` / `—` / `–` / `－`…）→ 一枚竖排竖线。
+            c if is_dash(c) => {
+                while i + 1 < cs.len() && is_dash(cs[i + 1]) {
                     i += 1;
                 }
                 out.push('︱');

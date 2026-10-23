@@ -795,6 +795,31 @@ impl Book {
         acc
     }
 
+    /// **吸入正文里残留的 `[注]…[/注]` 标签**（幂等，可反复调用）。
+    ///
+    /// 标签是「从这里开始排双行小字」的开关信号，**不是正文**：留在文本里
+    /// 就会被当成 `[` `注` `]` `/` 四个正文字排进字格（v1.36 修的正是这个）。
+    /// 这里把它们摘成 `Note{ NoteKind::Note }` 挂到宿主字上，正文从此只剩
+    /// 纯字——翻页、检索、长按取字拿到的也都是干净文本。
+    ///
+    /// 导入管线新产出的段落已经拆过一遍（`pipeline::paragraph_of`），这一道
+    /// 是给「直接反序列化进来的旧 JSON」兜底：书架里那些早先存下的书，
+    /// 打开时也会被顺手洗干净。
+    pub fn ingest_inline_notes(&mut self) {
+        for ch in self.chapters.iter_mut() {
+            for p in ch.paragraphs.iter_mut() {
+                if !p.text.contains("[注]") {
+                    continue;
+                }
+                let (clean, notes) = crate::pipeline::split_notes(&p.text);
+                p.text = clean;
+                for (at, text) in notes {
+                    p.notes.push(Note::new(at, NoteKind::Note, text));
+                }
+            }
+        }
+    }
+
     /// 没有目录时，按章节标题补一份平铺目录。
     pub fn ensure_toc(&mut self) {
         if self.toc.is_empty() {
