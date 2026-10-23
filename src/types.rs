@@ -878,6 +878,12 @@ impl Book {
     pub fn ingest_inline_notes(&mut self) {
         for ch in self.chapters.iter_mut() {
             for p in ch.paragraphs.iter_mut() {
+                // v1.40.0：旧档里残留的现代括号先转成 `[注]…[/注]`
+                // （`〔名午，考王之子〕` 这类括注当年是直接排进字格的），
+                // 于是老书**开卷即洗净**，不必重新导入。
+                if p.text.contains('〔') || p.text.contains('【') || p.text.contains('[') {
+                    p.text = crate::parsers::purge_bracket_marks(&p.text);
+                }
                 if !p.text.contains("[注]") {
                     continue;
                 }

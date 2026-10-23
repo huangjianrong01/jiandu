@@ -297,6 +297,10 @@ pub fn cleanup_ancient_text(text: &str) -> String {
     let s = strip_html_residue(&s);
     // 5) 标点竖排化 + 书名号 / 省略号：只对标记之外的文本跑（标记保护）。
     let s = crate::vclean::map_outside_markers(&s, cleanup_punct_inner);
+    // 5.5) 现代括号（`〔…〕` / `【…】` / `[…]`）一律不许进正文流：短的转
+    // 夹注、长的剥壳（见 `purge_bracket_marks`）。放在标点化之后——先让
+    // 正文的标点定形，再把括注整段摘成夹注。
+    let s = purge_bracket_marks(&s);
     // 6) 单字杂质夹注（`[注]已[/注]` 这类上标残渣）连壳删。
     let s = scrub_ghost_notes(&s);
     // 7) 孤立的 `[注]` 壳（不成对的）连壳删，保留完整 `[注]…[/注]` 夹注。
@@ -343,6 +347,106 @@ fn strip_html_residue(s: &str) -> String {
     let s = crate::pipeline::decode_entities(&s);
     // 去标签（任何残留的 `<…>`）。
     crate::pipeline::strip_tags(&s)
+}
+
+/// **铲掉现代括号**（v1.40.0）：`〔 〕`、`【 】`、`[ ]` 一律不许进正文流。
+///
+/// 现代整理本爱用方括号括注（「威烈王〔名午，考王之子〕」）。竖排里这四个
+/// 括号会各占**一个完整的正文字格**——一排方括号横在版心，比错字还刺眼。
+///
+/// 处理规则（括号符号本身绝不留下）：
+/// * `〔…〕` / `【…】`：内容 ≤ [`BRACKET_NOTE_MAX`] 字 → 转 `[注]…[/注]`
+///   （落成双行小字夹注，正合古籍体例）；更长的一律剥壳、内容留作正文——
+///   整段注疏塞进半格会把版面撑破。
+/// * 半角 `[…]`：除自家标记（`[注]` / `[/注]` / `[高亮]` / `[拼音:…]`）
+///   原样放行，其余一律剥壳留内容。
+/// * 落单的半个括号（无配对的开 / 闭）直接删字符。
+pub fn purge_bracket_marks(s: &str) -> String {
+    const OPEN: [char; 3] = ['〔', '【', '['];
+    const CLOSE: [char; 3] = ['〕', '】', ']'];
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < cs.len() {
+        let c = cs[i];
+        // 自家标记原样放行（[注] / [/注] / [高亮] / [拼音:…]）。
+        if c == '[' && starts_own_marker(&cs, i) {
+            let (body, next) = take_own_marker(&cs, i);
+            out.push_str(&body);
+            i = next;
+            continue;
+        }
+        if let Some(k) = OPEN.iter().position(|&o| o == c) {
+            // 找配对的闭括号（同一副）。
+            if let Some(j) = (i + 1..cs.len()).find(|&j| cs[j] == CLOSE[k]) {
+                let inner: String = cs[i + 1..j].iter().collect();
+                let n = inner.chars().count();
+                if n == 0 {
+                    // 空壳：连括号一起删。
+                } else if k < 2 && n <= BRACKET_NOTE_MAX {
+                    out.push_str("[注]");
+                    out.push_str(&inner);
+                    out.push_str("[/注]");
+                } else {
+                    // 半角括号 / 超长括注：只剥壳，内容照进正文。
+                    out.push_str(&inner);
+                }
+                i = j + 1;
+                continue;
+            }
+            // 没有配对：这个开括号是杂质，删字符、正文照常。
+            i += 1;
+            continue;
+        }
+        if CLOSE.contains(&c) {
+            // 落单的闭括号：删。
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// 转成夹注的括注长度上限（超过就只剥壳，不当夹注排）。
+const BRACKET_NOTE_MAX: usize = 80;
+
+/// `i` 处是不是自家标记（保护它们不被当杂质剥掉）。
+fn starts_own_marker(cs: &[char], i: usize) -> bool {
+    let rest: String = cs[i..].iter().take(8).collect();
+    rest.starts_with("[注]")
+        || rest.starts_with("[/注]")
+        || rest.starts_with("[高亮]")
+        || rest.starts_with("[/高亮]")
+        || rest.starts_with("[拼音:")
+        || rest.starts_with("[数字:")
+}
+
+/// 取出 `i` 处那条自家标记，返回 (标记文本, 下一个下标)。
+fn take_own_marker(cs: &[char], i: usize) -> (String, usize) {
+    // 带参数的标记（`[拼音:xxx]` / `[数字:xxx]`）收在第一个 `]`；
+    // 其余是定长标记（注意是**字符数**不是字节数）。
+    let head4: String = cs[i..].iter().take(3).collect();
+    if head4 == "[拼音" || head4 == "[数字" {
+        for j in i..cs.len() {
+            if cs[j] == ']' {
+                return (cs[i..=j].iter().collect(), j + 1);
+            }
+        }
+        return (cs[i..].iter().collect(), cs.len());
+    }
+    let len = if cs[i..].iter().take(4).collect::<String>() == "[/注]" {
+        4
+    } else if cs[i..].iter().take(4).collect::<String>() == "[高亮]" {
+        4
+    } else if cs[i..].iter().take(5).collect::<String>() == "[/高亮]" {
+        5
+    } else {
+        3 // [注]
+    };
+    let end = (i + len).min(cs.len());
+    (cs[i..end].iter().collect(), end)
 }
 
 /// 工序 5（标记之外的那一段）：半角 / 全角现代标点竖排化 + 书名号 / 省略号。
@@ -1057,6 +1161,26 @@ mod tests {
     /// 数字强制汉字化：年份、页码、数量都转，绝不残留阿拉伯数字被竖排拆散。
     #[test]
     fn digits_become_chinese_not_vertical_runs() {
+        // v1.40.0：现代括号绝不进正文流
+        assert_eq!(
+            purge_bracket_marks("威烈王〔名午，考王之子〕元年"),
+            "威烈王[注]名午，考王之子[/注]元年"
+        );
+        assert_eq!(purge_bracket_marks("甲【乙丙】丁"), "甲[注]乙丙[/注]丁");
+        // 半角方括号：只剥壳，内容照进正文
+        assert_eq!(purge_bracket_marks("甲[乙丙]丁"), "甲乙丙丁");
+        // 自家标记原样放行
+        assert_eq!(
+            purge_bracket_marks("前[注]成对[/注]后"),
+            "前[注]成对[/注]后"
+        );
+        assert_eq!(purge_bracket_marks("长[拼音:cháng]江"), "长[拼音:cháng]江");
+        // 空壳 / 落单的半个括号：直接删
+        assert_eq!(purge_bracket_marks("甲〔〕乙〔丙"), "甲乙丙");
+        assert_eq!(purge_bracket_marks("甲〕乙"), "甲乙");
+        // 超长括注：只剥壳，不撑破版面
+        let long: String = std::iter::repeat('注').take(100).collect();
+        assert!(purge_bracket_marks(&format!("甲〔{long}〕乙")).contains(&long));
         let s = cleanup_ancient_text("贞观223年，卷十五第3回，共1980页");
         assert!(!s.contains('2'), "数字未转：{s}");
         assert!(!s.contains('3'), "数字未转：{s}");

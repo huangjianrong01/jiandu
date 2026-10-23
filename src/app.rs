@@ -201,6 +201,13 @@ pub struct Root {
     /// 掠过一排字不会连甩十几张。
     pub hover_key: Option<(usize, usize, usize)>,
     pub hover_seq: usize,
+    /// 当前这张字书浮签是**悬停**呼出来的吗？
+    ///
+    /// 悬停呼出的那张要随指针走：移到别的字就换、离开正文就收；
+    /// 长按 / 点字呼出的那张则是「钉住」的，只能点掉。两条路共用一个
+    /// `bubble`，故必须记一笔来源，否则悬停会把长按的签顶掉、或长按的签
+    /// 把悬停永远堵死（v1.40.0 修）。
+    pub hover_card: bool,
     /// 当前书的笔记：页序号 -> 正文。
     pub notes: std::collections::HashMap<usize, String>,
     /// 笔记面板是否展开。
@@ -497,6 +504,7 @@ impl Root {
             lookup_rect: None,
             hover_key: None,
             hover_seq: 0,
+            hover_card: false,
             notes: std::collections::HashMap::new(),
             show_notes_panel: false,
             note_editing: false,
@@ -875,19 +883,23 @@ impl Root {
         self.lookup_rect = rect;
     }
 
-    /// **悬停查词**（v1.38.0）：鼠标在一个字上停满 [`crate::reader::HOVER_LOOKUP`]
-    /// 就自动浮出字书浮签，与长按互为两条路——手不离笔时悬停更快，
-    /// 触屏没有 hover 就仍走长按。
+    /// **悬停查词**（v1.38.0，v1.40.0 重做状态机）：鼠标在一个字上停满
+    /// [`crate::reader::HOVER_LOOKUP`] 就自动浮出字书浮签，与长按互为两条路——
+    /// 手不离笔时悬停更快，触屏没有 hover 就仍走长按。
     ///
     /// 只排定时器、不立刻弹签：鼠标每动一格就把 `hover_seq` 加一，先前那枚
     /// 定时器醒来发现代号对不上便自行作废。于是「掠过一排字」不会连甩
     /// 十几张签，只有真正停住的那一个字才弹。
+    ///
+    /// v1.40.0 三处修正（此前会造成「悬停完全没反应」）：
+    ///   * 悬停呼出的签**随指针走**：移到别的字就换签、离开正文就收签。
+    ///     旧版一见 `bubble.is_some()` 就整体退出，于是弹过一张之后永远不再弹。
+    ///   * 工具条（`popup`）不再堵死悬停：停稳后收掉工具条让位给字书签。
+    ///   * 长按 / 点字呼出的签仍「钉住」，只有悬停那张才自动收。
     pub fn probe_hover(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
-        // 这些状态下悬停一律不弹：写批注 / 拖选 / 已有浮层 / 专注 / 面板展开。
+        // 这些状态下悬停一律不弹：写批注 / 拖选 / 专注 / 面板展开。
         if self.note_editing
             || self.dragging
-            || self.bubble.is_some()
-            || self.popup.is_some()
             || self.focus_mode
             || self.show_toc
             || self.show_style
@@ -896,13 +908,26 @@ impl Root {
             self.hover_key = None;
             return;
         }
+        // 长按 / 点字呼出的签是「钉住」的：不去打扰，等用户点掉。
+        if self.bubble.is_some() && !self.hover_card {
+            self.hover_key = None;
+            return;
+        }
         let Some(gb) = self.glyph_hit_at(x, y) else {
             self.hover_key = None;
+            // 指针离开正文：把悬停那张收掉（钉住的不动）。
+            if self.hover_card {
+                self.dismiss_hover_card(cx);
+            }
             return;
         };
         let key = gb.key();
-        // 还停在同一个字上：别重启计时（否则抖一下就得再等 500ms）。
-        if self.hover_key == Some(key) {
+        // 已经在这个字上摆着签：别重启计时。
+        if self.hover_card && self.lookup_key == Some(key) {
+            return;
+        }
+        // 还停在这个字上（签还没弹出来）：同理别重启。
+        if self.hover_key == Some(key) && !self.hover_card {
             return;
         }
         self.hover_key = Some(key);
@@ -926,12 +951,12 @@ impl Root {
                     if g2.key() != key {
                         return;
                     }
-                    if this.bubble.is_some()
-                        || this.popup.is_some()
-                        || this.note_editing
-                        || this.dragging
-                    {
+                    if this.note_editing || this.dragging {
                         return;
+                    }
+                    // 工具条（点字弹的那条）让位：同一时刻只留一层浮签。
+                    if this.popup.is_some() {
+                        this.popup = None;
                     }
                     let ch = g2.glyph.ch;
                     let mut text = this.text_from(key, 4);
@@ -952,12 +977,22 @@ impl Root {
                         Some((x, y)),
                         Some((g2.x, g2.y, g2.w, g2.h)),
                     );
+                    this.hover_card = true;
                     cx.notify();
                 });
             }
         })
         // 后台等 500ms 的那枚定时器不必持有：窗口关了它自然被丢。
         .detach();
+    }
+
+    /// 收起「悬停」那张字书浮签（钉住的不动）。
+    fn dismiss_hover_card(&mut self, cx: &mut Context<Self>) {
+        self.hover_card = false;
+        self.hover_key = None;
+        self.bubble = None;
+        self.close_lookup();
+        cx.notify();
     }
 
     /// 关闭字义浮签：三件套一起清，免得下次点字还残留上次的 charIndex。
@@ -967,6 +1002,8 @@ impl Root {
         self.lookup_text.clear();
         self.lookup_at = None;
         self.lookup_rect = None;
+        // 签都没了，自然也不是「悬停那张」了。
+        self.hover_card = false;
     }
 
     // ------------------------------------------------------------------
@@ -977,6 +1014,101 @@ impl Root {
     // 落在格子缝隙、夹注块上、或拖选结束那一下，元素不一定命中。这里走
     // 几何：窗口坐标 → 叶 → 列 → 列内半格账 → 字。与渲染同源（列序、
     // 夹注半格、西文成组、卷首题署预留带都对齐），见 `crate::hit`。
+
+    /// 选区在屏幕上的**包围盒**（窗口坐标，v1.40.0）。
+    ///
+    /// 浮签要绕开的是**整段被选中的字**，不是按下那一点——否则拖选一排
+    /// 字时，浮签会稳稳压在选区上。做法与 `glyph_hit_at` 同源：逐叶逐列
+    /// 取格，凡字形键落在选区内的就并进包围盒。纯读布局，不改任何排版。
+    pub fn selected_anchor(&self) -> Option<crate::hit::Anchor> {
+        let a = self.sel_anchor?;
+        let b = self.sel_focus?;
+        if a == b {
+            return None;
+        }
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let pages = self.layout_pages();
+        if pages.is_empty() {
+            return None;
+        }
+        let facing = self.duplex == Duplex::Facing;
+        let mut leaves: Vec<(usize, bool)> = Vec::new();
+        if facing {
+            if self.page < pages.len() {
+                leaves.push((self.page, false)); // 右叶
+            }
+            if self.page + 1 < pages.len() {
+                leaves.push((self.page + 1, true)); // 左叶
+            }
+        } else if self.page < pages.len() {
+            leaves.push((self.page, false));
+        }
+        let gap = crate::grid::gutter_w(
+            self.content_w,
+            self.grid.columns,
+            ANCIENT_EDGE,
+            self.grid.margin,
+        );
+        let right_align = !facing && crate::grid::is_narrow(self.viewport_w, self.viewport_h);
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for (idx, back) in leaves {
+            let Some(pg) = pages.get(idx) else { continue };
+            let (ox, oy) = crate::gloss::leaf_origin(
+                facing,
+                self.viewport_w,
+                self.viewport_h,
+                self.page_w,
+                self.page_h,
+                gap,
+                back,
+                self.focus_mode,
+                right_align,
+            );
+            let f = self.leaf_frame(pg);
+            for i in 0..f.text_cols {
+                let cx = crate::hit::col_x(&f, i);
+                let skip = if f.start_chapter && i == 0 {
+                    f.reserve as f32 * f.cell_h
+                } else {
+                    0.0
+                };
+                let items: &[crate::gloss::Piece] =
+                    pg.columns.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+                for sp in crate::hit::column_spans(items, f.cell_h, f.west_mode) {
+                    let in_sel = match &sp.kind {
+                        crate::hit::SpanKind::Main(g) => {
+                            let k = (g.chapter, g.para, g.offset);
+                            k >= lo && k <= hi
+                        }
+                        crate::hit::SpanKind::West(chars) => chars.iter().any(|g| {
+                            let k = (g.chapter, g.para, g.offset);
+                            k >= lo && k <= hi
+                        }),
+                        _ => false,
+                    };
+                    if !in_sel {
+                        continue;
+                    }
+                    let gx = ox + cx;
+                    let gy = oy + sp.y + skip;
+                    x0 = x0.min(gx);
+                    y0 = y0.min(gy);
+                    x1 = x1.max(gx + f.cell_w);
+                    y1 = y1.max(gy + sp.h);
+                }
+            }
+        }
+        if x0 == f32::MAX {
+            None
+        } else {
+            Some(crate::hit::Anchor {
+                x: x0,
+                y: y0,
+                w: (x1 - x0).max(1.0),
+                h: (y1 - y0).max(1.0),
+            })
+        }
+    }
 
     /// 从 `key` 起向后取 `n` 个字符（查词用：词组最长匹配）。
     ///

@@ -183,6 +183,9 @@ pub fn classicize(s: &str) -> String {
     // 破折号竖排化与 EPUB 那条链同源（`vclean::dash_to_vertical`）：
     // 横躺的 `——` 在竖排里就是一根拦腰截断行气的横杠。
     let s = crate::vclean::dash_to_vertical(&s);
+    // 现代括号不进正文流（与 `parsers::cleanup_ancient_text` 同源）：EPUB
+    // 那条链也走这里，两链一致才不会「时有时无」。
+    let s = crate::parsers::purge_bracket_marks(&s);
     crate::numcn::normalize_numbers(&fullwidth_punct(&s))
 }
 

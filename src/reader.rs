@@ -208,6 +208,36 @@ fn clip_chars(s: &str, max: usize) -> String {
     }
 }
 
+/// **竖排一列**：把一串字自上而下叠成一列（古籍竖排的通用写法）。
+///
+/// GPUI 0.2.2 没有元素级旋转，故「横排内容竖过来」一律走这里：一字一格
+/// 往下叠。视觉上等价于把横排那一行整体旋转 90°——注音、按钮、释文
+/// 全用它，签上就不会出现任何一个横排的字。
+///
+/// 字号由 `fs` 定，格高取 `fs * 1.12`（行距略松，小字也不粘）；返回值
+/// 仍需调用方补 `.w()` ——列宽由各家自定（字头宽、注音窄）。
+fn vertical_text(s: &str, fs: f32, family: SharedString) -> Div {
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_start()
+        .font_family(family)
+        .text_size(px(fs));
+    for c in s.chars() {
+        col = col.child(
+            div()
+                .h(px(fs * 1.12))
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(SharedString::from(c.to_string())),
+        );
+    }
+    col
+}
+
 /// 两个字在字形流里是否同一位置：章节 / 段 / 偏移 / 字 / 种类全同。
 /// 段首缩进占位每段两个、字段全同，所以必须连 `kind` 一起比对——
 /// 晒本长图靠它在流里定当前叶的切片起点（见 `Root::sunben_sheet`）。
@@ -1302,6 +1332,7 @@ impl Root {
         // 查词浮签——与 `JIANDU_HEAD_NOTE` 同款调试开关，便于核对浮签版式
         // 与避让，不影响正常交互（只在 `bubble` 为空时生效一次）。
         self.dev_lookup_once();
+        self.dev_menu_once();
 
         // 长按正文弹出的「字义浮签」（释义 / charIndex / 选中文本 / 在线查阅）。
         if self.bubble.is_some() {
@@ -4605,6 +4636,21 @@ impl Root {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
+                            // ★ 长按（v1.40.0）：这一下**不能**被字格吞掉。
+                            //
+                            // 字格在这里弹「工具条」并 `stop_propagation()`，
+                            // 冒泡到此为止——正文层（`body`）的抬起处理器
+                            // 永远收不到，于是 `held >= LONG_PRESS` 那条长按
+                            // 查词的路整个不成立（真机表现：长按毫无反应，
+                            // 只冒出一条工具条）。故长按时直接放行，把这一下
+                            // 让给正文层的长按分支去弹字书浮签。
+                            if this
+                                .press_time
+                                .map(|t| t.elapsed() >= LONG_PRESS)
+                                .unwrap_or(false)
+                            {
+                                return;
+                            }
                             if this.sel_anchor.is_some() {
                                 this.dragging = false;
                                 this.sel_focus = Some(key);
@@ -5262,6 +5308,15 @@ impl Root {
             text = ch.to_string();
         }
         let (x, y) = (gb.x + gb.w * 0.5, gb.y + gb.h * 0.5);
+        // 开发用：`JIANDU_LOOKUP_CHAR=某字` 时刻意查该字（不问叶面首字），
+        // 便于核对短释义的卡高自适应与长释义的截断分栏。
+        let (ch, text) = match std::env::var("JIANDU_LOOKUP_CHAR") {
+            Ok(s) if !s.trim().is_empty() => {
+                let c = s.trim().chars().next().unwrap();
+                (c, c.to_string())
+            }
+            _ => (ch, text.clone()),
+        };
         self.bubble = Some(crate::types::GlyphHit {
             key,
             ch,
@@ -5270,6 +5325,37 @@ impl Root {
             y,
         });
         self.open_lookup(key, ch, text, Some((x, y)), Some((gb.x, gb.y, gb.w, gb.h)));
+    }
+
+    /// 开发用：`JIANDU_MENU=1` 时开卷就在叶面上点一个字，把「竖排书签」
+    /// 摊出来——与 `JIANDU_LOOKUP` 同款开关，便于截图核对这枚签的版式。
+    fn dev_menu_once(&mut self) {
+        if std::env::var("JIANDU_MENU").is_err() || self.popup.is_some() {
+            return;
+        }
+        let (vw, vh) = (self.viewport_w, self.viewport_h);
+        let mut y = vh * 0.28;
+        while y < vh * 0.7 {
+            let mut x = vw * 0.9;
+            while x > vw * 0.5 {
+                if let Some(gb) = self.glyph_hit_at(x, y) {
+                    if gb.glyph.kind == crate::types::GlyphKind::Char {
+                        let key = gb.key();
+                        let ch = gb.glyph.ch;
+                        self.popup = Some(crate::types::GlyphHit {
+                            key,
+                            ch,
+                            text: ch.to_string(),
+                            x: gb.x + gb.w * 0.5,
+                            y: gb.y + gb.h * 0.5,
+                        });
+                        return;
+                    }
+                }
+                x -= self.col_w.max(8.0) * 0.5;
+            }
+            y += self.row_h.max(8.0) * 0.5;
+        }
     }
 
     fn render_lookup_card(&mut self, cx: &mut Context<Self>) -> Div {
@@ -5298,244 +5384,282 @@ impl Root {
             .map(|z| z.pinyin.clone())
             .or_else(|| entry.as_ref().map(|e| e.pinyin.clone()))
             .unwrap_or_default();
-        let pos = entry.as_ref().map(|e| e.pos.clone()).unwrap_or_default();
-        // 释义串：〔康熙〕一段 + 〔說文〕一段，交给下面既有的分列器切成
-        // 竖排数栏——自右向左读，先康熙后說文，两个标记就是分栏的界碑。
-        // 两段都截一截：康熙原文动辄数百字，全塞进来会挤爆卡片。
-        let gloss = match zishu.as_ref() {
-            Some(z) => {
-                let mut s = String::new();
-                if !z.kangxi.is_empty() {
-                    s.push_str("〔康熙〕");
-                    s.push_str(&clip_chars(&z.kangxi, 110));
-                }
-                if !z.shuowen.is_empty() {
-                    if !s.is_empty() {
-                        s.push('　');
-                    }
-                    s.push_str("〔說文〕");
-                    s.push_str(&clip_chars(&z.shuowen, 55));
-                }
-                s
-            }
-            None => entry.as_ref().map(|e| e.gloss.clone()).unwrap_or_default(),
+
+        // ── 横排便签的度量（v1.41.0）：定宽 400、高度自适应、溢出内滚 ──
+        //
+        // 竖排那版对短释义很雅，但康熙原文动辄数百字，切成四五列之后每列
+        // 都得竖着追着读，反而比横排累。故回到横排，只把「古风质感」留住：
+        // 宣纸底、朱细框、宋体、朱砂小标题。
+        //
+        // 尺寸账（v1.41.0 重算）：上一稿按「估算行数」截断正文，但每行字数
+        // 估得偏宽、行高又没写进样式，两处误差累加，正文实际比预算多出七八
+        // 行，把底部那排「考據原典 / 拓印 / 檢索 / 收」整个顶出卡外（截图：
+        // 說文只剩半行、按钮凭空消失）。现在改成三截硬账：
+        //   ① 字头条（含朱丝线）与按钮行都是**固定高度**的卡内子层；
+        //   ② 中间正文区 `flex_1` + `overflow_y_scroll`，超长自己滚；
+        //   ③ 卡高按估算自适应、封顶 `max_h`，且 `line_height` 显式写死，
+        //      使「算出来的行高」与「排出来的行高」是同一个数。
+        let pad = 14.0;
+        let max_w = 400.0f32.min(vw - 24.0);
+        let inner_w = max_w - pad * 2.0 - 2.0; // 扣掉内边距与边框
+        let fs = 14.0f32; // 正文（释义）字号
+        let line_h = fs * 1.62; // 行距（同时写进 `line_height`，账实相符）
+        let head_fs = 34.0; // 字头大字
+        let py_fs = 15.0; // 拼音（小一号的无衬线）
+        let title_fs = 13.0; // 【康熙】/【說文】小标题
+        let title_h = title_fs * 1.6;
+        let head_row_h = head_fs * 1.25;
+        let head_block_h = head_row_h + 7.0; // 字头条 + 朱丝线
+        let btn_row_h = 22.0;
+        let sec_gap = 10.0;
+        let max_h = (vh * 0.82).clamp(220.0, 560.0);
+        // 一行能排多少字：宋体汉字是**全角**，一个字正好一个字号宽，故直取
+        // `inner_w / fs`。留余量（×1.06）会把每行少算一个字，十几行累计下来
+        // 卡高多出近一行，按钮上方就空出一条白带。
+        let per_line = ((inner_w / fs).floor() as usize).clamp(8, 60);
+
+        // 康熙 / 說文 各自成段（不再拼成一串去竖排分列）。
+        let (kx, sw) = match zishu.as_ref() {
+            Some(z) => (z.kangxi.clone(), z.shuowen.clone()),
+            None => (
+                String::new(),
+                entry.as_ref().map(|e| e.gloss.clone()).unwrap_or_default(),
+            ),
         };
-        // 页眉：双引擎命中时报「康熙 · 說文 · 部X · 某某切」，退回时仍是
-        // 旧字书的「字書 · 词性」。
-        let head_label = match zishu.as_ref() {
-            Some(z) => {
-                let mut s = String::from("康熙 · 說文");
-                if !z.radical.is_empty() {
-                    s.push_str(&format!(" · 部{}", z.radical));
-                }
-                if !z.fanqie.is_empty() {
-                    s.push_str(&format!(" · {}", z.fanqie));
-                }
-                s
+        let fallback = kx.is_empty() && sw.is_empty();
+        let kx_show = if fallback {
+            "（本地字書未收，可点「考據原典」上漢典）".to_string()
+        } else {
+            kx
+        };
+        // 脏数据兜底：单字条上限四千字，再长也不值得在浮签里读。
+        let kx_show = clip_chars(&kx_show, 4000);
+        let sw_show = clip_chars(&sw, 3000);
+
+        let lines_of = |s: &str| -> usize {
+            if s.is_empty() {
+                0
+            } else {
+                (s.chars().count() + per_line - 1) / per_line
             }
-            None => format!("字書 · {pos}"),
+        };
+        // 正文区在「卡封顶」时能容下多少行正文（标题占的地方先扣掉）。
+        let body_h_at = |h: f32| -> f32 {
+            (h - pad * 2.0 - head_block_h - sec_gap * 2.0 - btn_row_h - 2.0).max(60.0)
+        };
+        let mut kx_lines = lines_of(&kx_show).max(1);
+        let mut sw_lines = lines_of(&sw_show);
+        let content_h = |kx_l: usize, sw_l: usize| -> f32 {
+            title_h
+                + 4.0
+                + kx_l as f32 * line_h
+                + if sw_l == 0 {
+                    0.0
+                } else {
+                    sec_gap + title_h + 4.0 + sw_l as f32 * line_h
+                }
+        };
+        let h_for = |kx_l: usize, sw_l: usize| -> f32 {
+            pad * 2.0
+                + head_block_h
+                + sec_gap * 2.0
+                + content_h(kx_l, sw_l)
+                + btn_row_h
+                + 2.0
+        };
+        let mut h = h_for(kx_lines, sw_lines);
+        if h > max_h {
+            // 封顶了：正文装不下，按「康熙为主、說文分四分之一」重分行数。
+            // 注意要把**說文那一段的小标题与段间留白**先扣掉——上一稿只扣了
+            // 康熙的标题，白算出一行多，最后一行正好落进滚动区的下沿被裁掉。
+            let body = body_h_at(max_h);
+            let sw_extra = if sw_lines > 0 {
+                sec_gap + title_h + 4.0
+            } else {
+                0.0
+            };
+            let avail =
+                (((body - (title_h + 4.0) - sw_extra) / line_h).floor()).max(2.0) as usize;
+            let mut sw_l = if sw_lines > 0 {
+                (avail / 4).max(1).min(sw_lines)
+            } else {
+                0
+            };
+            let kx_l = avail.saturating_sub(sw_l).min(kx_lines).max(1);
+            if sw_lines > 0 && sw_l + kx_l > avail {
+                sw_l = avail.saturating_sub(kx_l);
+            }
+            kx_lines = kx_l;
+            sw_lines = sw_l;
+        }
+        let kx_text = clip_chars(&kx_show, kx_lines * per_line);
+        let sw_text = if sw_lines == 0 {
+            String::new()
+        } else {
+            clip_chars(&sw_show, sw_lines * per_line)
+        };
+        // 定稿高度：按**截断后文本**的估算行数收，而不是按行数预算收。
+        // 预算按「康熙优先、說文四分一」分完往往用不满（說文那条常常两行
+        // 就完），照预算收会在按钮上方留出一大块死白，像卡片被截了一刀。
+        h = h_for(lines_of(&kx_text).max(1), lines_of(&sw_text)).min(max_h);
+        let w = max_w;
+
+        // ── 卡面配色：宣纸 + 朱砂 + 暖墨 ────────────────────────────────
+        //
+        // 纸色固定取宣纸白（#F5F0E6，α=0.98）；深底主题下向纸面兑一档，
+        // 免得夜里弹出一块刺眼的亮板。墨色按纸色明暗择一，保证任何主题
+        // 下都是「暖墨压暖纸」，不会出现灰绿字浮在白宣上。
+        let paper_hex = if t.is_dark() {
+            crate::theme::mix(0xF5F0E6, t.paper(), 0.28)
+        } else {
+            0xF5F0E6
+        };
+        let zhu = 0xB23A30;
+        let washi = rgba((paper_hex << 8) | 0xFA);
+        let lum = (((paper_hex >> 16) & 0xFF) * 30
+            + ((paper_hex >> 8) & 0xFF) * 59
+            + (paper_hex & 0xFF) * 11)
+            / 100;
+        let (ink_main, ink_body) = if lum > 128 {
+            (crate::theme::mix(0x2A2620, paper_hex, 0.06), crate::theme::mix(0x2A2620, paper_hex, 0.18))
+        } else {
+            (crate::theme::mix(0xF2ECE0, paper_hex, 0.06), crate::theme::mix(0xF2ECE0, paper_hex, 0.18))
         };
 
-        // ── 竖排度量：宽高按释义长度与视口反算（绝不撑破屏幕）────────
-        let m = crate::hit::card_metrics(gloss.chars().count(), vw, vh);
-
-        // ── 智能避让：绕开被查的那个字 ──────────────────────────────
-        // `lookup_rect` 是坐标反查量出的**字的屏幕矩形**；没走反查（元素
-        // 命中那一路）就以落点为中心造一个字格，避让照旧成立。
+        // ── 智能避让：绕开被查的那个字（有选区则绕开整段选区）─────────
         let anchor = match self.lookup_rect {
             Some((x, y, w, h)) => crate::hit::Anchor { x, y, w, h },
-            None => crate::hit::Anchor {
+            None => self.selected_anchor().unwrap_or(crate::hit::Anchor {
                 x: hit.x - self.col_w * 0.5,
                 y: hit.y - self.row_h * 0.5,
                 w: self.col_w,
                 h: self.row_h,
-            },
+            }),
         };
         let place = crate::hit::place_card(
             &anchor,
-            m.w,
-            m.h,
+            w,
+            h,
             vw,
             vh,
             crate::hit::CARD_PAD,
             crate::hit::CARD_GAP,
         );
 
-        // 字体：正文（字头 / 释义）与西文（拼音）各按角色取，不写字族名。
+        // ── 字体：正文 / 字头宋体，拼音无衬线 ─────────────────────────
         let main_family = self.main_family();
         let latin_family = crate::fonts::family_for_role(crate::fonts::FontRole::Latin);
-        // 内容区高：扣双线框 + 内边距 + 页眉一行 + 页脚两行（与 `card_metrics`
-        // 预留的 56 同源）。
-        let inner_h = (m.h - 56.0).max(60.0);
-        // 竖排的**行距由格子高显式给死**（不是靠字体行高）：每字一个
-        // `line_h` 高的格子，`per_col` 个字正好铺满 `inner_h`——字体行高
-        // 偏大偏小都不会溢出卡片，也不会在底部留一截空白。
-        let line_h = ((inner_h - 2.0) / m.per_col.max(1) as f32).clamp(10.0, 22.0);
-        let gloss_fs = m.gloss_fs.min(line_h * 0.92);
 
-        // ── 第一列：大字汉字（宋体，每字一格，朱线细框）─────────────
-        let head_fs = 30.0f32.min(m.w * 0.16);
-        let mut head_col = div()
-            .w(px(40.0))
-            .h(px(inner_h))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_start()
-            .gap(px(2.0));
-        for c in word.chars().take(4) {
-            head_col = head_col.child(
-                div()
-                    .w(px(34.0))
-                    .h(px(34.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .border_1()
-                    .border_color(rgb(t.accent()))
-                    .rounded(px(2.0))
-                    .font_family(main_family.clone())
-                    .text_size(px(head_fs))
-                    .text_color(rgb(t.ink()))
-                    .child(SharedString::from(c.to_string())),
-            );
-        }
-
-        // ── 第二列：拼音（竖排小字，逐字母叠下，走西文字体）──────────
-        let py_letters: Vec<char> = pinyin
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .take(12)
-            .collect();
-        // 拼音同样给死行距：字母多就压紧（最小 9），少就 12——绝不溢出。
-        let py_line = if py_letters.is_empty() {
-            12.0
-        } else {
-            ((inner_h - 2.0) / py_letters.len() as f32).clamp(9.0, 12.0)
-        };
-        let mut py_col = div()
-            .w(px(18.0))
-            .h(px(inner_h))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_start();
-        if py_letters.is_empty() {
-            py_col = py_col.child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(t.ink_soft()))
-                    .child(SharedString::from("—")),
-            );
-        } else {
-            for c in py_letters {
-                py_col = py_col.child(
-                    div()
-                        .h(px(py_line))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .font_family(latin_family.clone())
-                        .text_size(px((py_line * 0.92).min(11.5)))
-                        .text_color(rgb(t.accent()))
-                        .child(SharedString::from(c.to_string())),
-                );
-            }
-        }
-
-        // ── 后面几列：释义（竖排小字，自右向左分列）─────────────────
-        // 先切列再倒序 push：首列落在最右（紧邻拼音列），读序自右向左。
-        let mut chunks: Vec<String> = Vec::new();
-        let mut rest: Vec<char> = gloss.chars().collect();
-        if rest.is_empty() {
-            chunks.push("（本地字书未收，可点「考据原典」上汉典）".to_string());
-        }
-        while !rest.is_empty() && chunks.len() < m.cols.max(1) {
-            let n = rest.len().min(m.per_col);
-            let s: String = rest.drain(..n).collect();
-            chunks.push(s);
-        }
-        if !rest.is_empty() {
-            // 列数用尽还有剩：末列补省略号（不撑高卡片）。
-            if let Some(last) = chunks.last_mut() {
-                last.push('…');
-            }
-        }
-        let mut cols = div()
+        // ── 字头条：左大字 + 旁边拼音（下压一根朱丝线，作笺纸的天头）──
+        let word4: String = word.chars().take(4).collect();
+        let mut head_row = div()
+            .w_full()
             .flex()
             .flex_row()
-            .items_start()
-            .gap(px(1.0))
-            .h(px(inner_h));
-        for s in chunks.iter().rev() {
-            let mut c = div()
-                .w(px(m.gloss_fs * 1.5))
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .font_family(main_family.clone())
+                    .text_size(px(head_fs))
+                    .line_height(px(head_fs * 1.2))
+                    .text_color(rgb(ink_main))
+                    .child(SharedString::from(word4)),
+            );
+        if !pinyin.is_empty() {
+            head_row = head_row.child(
+                div()
+                    .font_family(latin_family.clone())
+                    .text_size(px(py_fs))
+                    .text_color(rgb(zhu))
+                    .child(SharedString::from(pinyin.clone())),
+            );
+        }
+        let head_block = div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(head_row)
+            .child(div().w_full().h(px(1.0)).bg(rgba((zhu << 8) | 0x2E)));
+
+        // 一段释义：朱砂小标题 + 宋体正文（行高写死，与预算同数）。
+        let section = |label: &'static str, body: String, empty: bool| -> Div {
+            if empty {
+                return div();
+            }
+            div()
+                .w_full()
                 .flex()
                 .flex_col()
-                .items_center();
-            for ch in s.chars() {
-                c = c.child(
+                .gap(px(4.0))
+                .child(
                     div()
-                        .h(px(line_h))
-                        .flex()
-                        .items_center()
-                        .justify_center()
                         .font_family(main_family.clone())
-                        .text_size(px(gloss_fs))
-                        .text_color(rgb(t.ink_soft()))
-                        .child(SharedString::from(ch.to_string())),
-                );
-            }
-            cols = cols.child(c);
-        }
+                        .text_size(px(title_fs))
+                        .line_height(px(title_h))
+                        .text_color(rgb(zhu))
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .w(px(inner_w))
+                        .font_family(main_family.clone())
+                        .text_size(px(fs))
+                        .line_height(px(line_h))
+                        .text_color(rgb(ink_body))
+                        .child(SharedString::from(body)),
+                )
+        };
+        let sec_kx = section("【康熙】", kx_text, false);
+        let sw_empty = sw_text.is_empty();
+        let sec_sw = section("【說文】", sw_text, sw_empty);
 
-        // ── 脚注：charIndex ────────────────────────────────────────
-        let (ci, pi, oi) = hit.key;
-        // 脚注写短一点：卡片窄，长串会挤掉右侧按钮（这里只留「哪一段哪一字」）。
-        let mut idx_line = format!("第{}章·{}段·{}字", ci + 1, pi + 1, oi + 1);
-        if let Some(f) = self.lookup_flat_index() {
-            idx_line.push_str(&format!(" · 全书{f}"));
-        }
-        let foot = div()
+        // 正文区：自己滚。字头与按钮行都在它之外，所以**按钮永在卡内**。
+        let body_area = div()
+            .id("jiandu-lookup-body")
+            .w_full()
             .flex_1()
-            .overflow_hidden()
-            .text_size(px(9.0))
-            .text_color(rgb(t.ink_soft()))
-            .child(SharedString::from(idx_line));
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .scrollbar_width(px(3.0))
+            .flex()
+            .flex_col()
+            .gap(px(sec_gap))
+            .child(sec_kx)
+            .child(sec_sw);
 
-        // ── 底部：考据原典 / 复制 / 检索 / 关闭 ────────────────────
+        // ── 底部一行：考據原典 / 拓印 / 檢索 / 收（小字，宋体）────────
         let zdic = crate::dict::zdic_url(&word);
+        let link = |label: &'static str| -> Div {
+            div()
+                .font_family(main_family.clone())
+                .text_size(px(11.5))
+                .text_color(rgb(zhu))
+                .cursor_pointer()
+                .hover(move |s| s.text_color(rgb(ink_main)))
+                .child(SharedString::from(label))
+        };
+        let zdic_u = zdic.clone();
         let zdic_word = word.clone();
-        let btn_zdic = div()
-            .px_2p5()
-            .py_1()
-            .border_1()
-            .border_color(rgb(t.accent()))
-            .rounded(px(2.0))
-            .text_size(px(11.5))
-            .text_color(rgb(t.accent()))
-            .cursor_pointer()
-            .child(SharedString::from("考據原典"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    if crate::app::open_external(&zdic) {
-                        this.notice = format!("已用浏览器打开汉典：{zdic_word}");
-                    } else {
-                        this.notice = "未能调用系统浏览器".to_string();
-                    }
-                    cx.notify();
-                }),
-            );
-        let copy_key = hit.key;
-        let copy_text = hit.text.clone();
-        let btn_copy = small_button("复制", false, t).on_mouse_down(
+        let btn_zdic = link("考據原典").on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                // 长按单字时没有选区：临时把这一个字设为选区再复制，
-                // 免得退化成「复制整页」。
+                if crate::app::open_external(&zdic_u) {
+                    this.notice = format!("已用浏览器打开汉典：{zdic_word}");
+                } else {
+                    this.notice = "未能调用系统浏览器".to_string();
+                }
+                cx.notify();
+            }),
+        );
+        let copy_key = hit.key;
+        let btn_copy = link("拓印").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
                 if !this.has_selection() {
                     this.sel_anchor = Some(copy_key);
                     this.sel_focus = Some(copy_key);
@@ -5547,8 +5671,8 @@ impl Root {
                 cx.notify();
             }),
         );
-        let search_text = copy_text.clone();
-        let btn_search = small_button("检索", false, t).on_mouse_down(
+        let search_text = hit.text.clone();
+        let btn_search = link("檢索").on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
@@ -5563,7 +5687,7 @@ impl Root {
                 cx.notify();
             }),
         );
-        let btn_close = small_button("收", false, t).on_mouse_down(
+        let btn_close = link("收").on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
@@ -5572,96 +5696,40 @@ impl Root {
                 cx.notify();
             }),
         );
-
-        let body = div()
-            .w_full()
-            .flex_1()
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(4.0))
-            .overflow_hidden()
-            .child(cols)
-            .child(py_col)
-            .child(head_col);
-        // 页脚分两行：上行 charIndex（可截断），下行按钮右对齐——
-        // 挤成一行时脚注会把「考據原典」压扁，窄卡片上尤其难看。
         let bar = div()
             .w_full()
+            .flex_none()
             .flex()
-            .flex_col()
-            .gap(px(3.0))
-            .child(foot)
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_end()
-                    .gap_1()
-                    .child(btn_zdic)
-                    .child(btn_copy)
-                    .child(btn_search)
-                    .child(btn_close),
-            );
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .gap(px(12.0))
+            .child(btn_zdic)
+            .child(btn_copy)
+            .child(btn_search)
+            .child(btn_close);
 
-        // ── 纸签：宣纸底 + 朱砂双线细框 + 细微阴影 ──────────────────
-        // 外层一根朱线、内层再一根淡朱线（中间留 3px 纸色），就是刻本
-        // 牌记那种「双边框」；不用系统弹窗，是叠在正文之上的一层 div。
-        let inner_line = crate::theme::mix(t.accent(), t.paper(), 0.62);
-        // 宣纸底**半透明**（α≈0.88）：浮签压在正文之上，底下那一行字
-        // 若隐若现——像把一张薄纸签贴在书叶上，而不是盖一块木板。
-        // 透明度只叠在这张签的底色上，文字与朱线仍是实色，可读性不掉。
-        let paper_alpha: u32 = 0xEA;
-        let paper_washi = rgba((t.paper() << 8) | paper_alpha);
+        // ── 便签本体：宣纸半透明 + 一根极细朱砂边 + 微弱阴影 ──────────
         div()
             .absolute()
             .left(px(place.left))
             .top(px(place.top))
-            .w(px(m.w))
-            .h(px(m.h))
-            .bg(paper_washi)
+            .w(px(w))
+            .h(px(h))
+            .bg(washi)
             .border_1()
-            .border_color(rgb(t.accent()))
-            .rounded(px(3.0))
-            .shadow_lg()
-            .p(px(3.0))
-            .child(
-                div()
-                    .w_full()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .border_1()
-                    .border_color(rgb(inner_line))
-                    .rounded(px(2.0))
-                    .p_2()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(9.5))
-                                    .text_color(rgb(t.ink_soft()))
-                                    .child(SharedString::from(head_label)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(9.5))
-                                    .text_color(rgb(t.ink_soft()))
-                                    .child(SharedString::from(hit.text.clone())),
-                            ),
-                    )
-                    .child(body)
-                    .child(bar),
-            )
-            // 点浮签内部不让它冒到根容器的「点别处收起」监听上去，
-            // 否则点一下「考据原典」浮签就没了。
+            .border_color(rgb(zhu))
+            .rounded(px(2.0))
+            .shadow_sm()
+            .p(px(pad))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .gap(px(sec_gap))
+            .child(head_block)
+            .child(body_area)
+            .child(bar)
+            // 点浮签内部不让它冒到根容器的「点别处收起」监听上去。
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_this, _, _, cx| {
@@ -5670,6 +5738,12 @@ impl Root {
             )
     }
 
+    /// 样式浮层：纸色、字级、版式、注文排法。
+    /// 笔记 / 批注浮层：列出全书笔记，并可在当前页写笔记。
+    /// 竖排工具框：查询 / 划线 / 笔记 / 复制 / 分享（参照 03 图）。
+    /// 点字弹出的工具条：在点击位置附近浮起一行 查询 / 划线 / 笔记 / 复制 / 分享。
+    /// 不再常驻右上角，只有点了正文某个字才出现；点别处即收起。
+    /// 每个工具都作用于被点击的那个字。
     /// 全文检索浮层：输入一个词，全书瞬时查找，跳到那一面并用朱砂红高亮。
     ///
     /// 输入框套 `ime::InputField` —— 中文输入法不走 keydown，
@@ -5965,12 +6039,18 @@ impl Root {
             )
     }
 
-    /// 样式浮层：纸色、字级、版式、注文排法。
-    /// 笔记 / 批注浮层：列出全书笔记，并可在当前页写笔记。
-    /// 竖排工具框：查询 / 划线 / 笔记 / 复制 / 分享（参照 03 图）。
-    /// 点字弹出的工具条：在点击位置附近浮起一行 查询 / 划线 / 笔记 / 复制 / 分享。
-    /// 不再常驻右上角，只有点了正文某个字才出现；点别处即收起。
-    /// 每个工具都作用于被点击的那个字。
+    /// 点字弹出的**竖排书签**（v1.40.0 重写）。
+    ///
+    /// 旧版是一条横排白底长条：九个现代按钮、圆角、chrome 底——像网页
+    /// 右键菜单，横在书叶上既出戏又挡字。这里改成一枚真正的书签：
+    ///   * **竖排**：每枚钮两个字自上而下叠成一列，整签窄窄一条；
+    ///   * **古风**：半透明宣纸底、一根极细朱砂边、楷体、无任何现代边框
+    ///     与图标，只在悬停时把墨色转成朱砂；
+    ///   * **精简**：撤掉「划线」（已有朱批）与「分享」，改名——查询→查典、
+    ///     笔记→朱批、复制→拓印，专名线（人名 / 地名 / 书名）照旧；
+    ///   * **避让**：落位走 `hit::place_card`，锚点是**整段选区的包围盒**
+    ///     （`Root::selected_anchor`），不是按下那一点——文字靠右则签在左、
+    ///     文字靠下则签向上展开，绝不压住选中的字。
     fn render_glyph_menu(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let Some(hit) = self.popup.clone() else {
@@ -5979,108 +6059,70 @@ impl Root {
         let vw = self.viewport_w;
         let vh = self.viewport_h;
 
-        // 工具条尺寸估算，用于把浮条夹在视口内。按钮数必须与下面实际排布
-        // 一致（查询 / 划线 / 人名 / 地名 / 书名 / 夹注 / 笔记 / 复制 / 分享，
-        // 共 9 个）：早先按 5 个估算，宽度少算 150+px，靠右时右半截（含
-        // 「笔记 / 复制 / 分享」）被裁到屏幕外——既显示不全，也点不到。
-        let n: f32 = 9.0;
-        let bw = 46.0;
-        let gap = 6.0;
-        let pad = 8.0;
-        let menu_w = pad * 2.0 + bw * n + gap * (n - 1.0); // ≈ 426
-        let menu_h = 38.0;
-        let avail = (vw - 16.0).max(120.0);
-        // 窄窗放不下一整排时折行，保证每个按钮都留在屏内。
-        let wraps = menu_w > avail;
-        let est_h = if wraps { menu_h * 2.0 + 4.0 } else { menu_h };
+        // ── 锚点：让开的是「整段选中的文字」 ──────────────────────────
+        let anchor = self
+            .selected_anchor()
+            .or_else(|| {
+                self.glyph_hit_at(hit.x, hit.y).map(|gb| crate::hit::Anchor {
+                    x: gb.x,
+                    y: gb.y,
+                    w: gb.w,
+                    h: gb.h,
+                })
+            })
+            .unwrap_or(crate::hit::Anchor {
+                x: hit.x - self.col_w * 0.5,
+                y: hit.y - self.row_h * 0.5,
+                w: self.col_w,
+                h: self.row_h,
+            });
+        let anchor_rect = Some((anchor.x, anchor.y, anchor.w, anchor.h));
+        let hit_xy = (hit.x, hit.y);
 
-        // 落在选区「左下方」：先按右缘对齐命中点向左展开，再夹进视口四边，
-        // 保证整条工具条完整可见。
-        let mut left = hit.x - menu_w;
-        if left < 8.0 {
-            left = 8.0;
-        }
-        let max_left = (vw - menu_w.min(avail) - 8.0).max(8.0);
-        if left > max_left {
-            left = max_left;
-        }
-        let mut top = hit.y + 14.0; // 选区正下方
-        if top + est_h > vh - 8.0 {
-            top = (hit.y - est_h - 14.0).max(8.0); // 下方放不下则翻到上方
-        }
+        // ── 尺寸：一条窄签 ────────────────────────────────────────────
+        let fs = 14.5f32;
+        let item_w = fs * 1.7;
+        let item_h = fs * 2.24; // 两字一钮
+        let gap = 7.0;
+        let pad = 6.0;
+        let n: f32 = 7.0; // 查典 / 朱批 / 夹注 / 拓印 / 人名 / 地名 / 书名
+        let w = pad * 2.0 + item_w + 2.0;
+        let h = pad * 2.0 + item_h * n + gap * (n - 1.0) + 2.0;
+        let place = crate::hit::place_card(
+            &anchor,
+            w,
+            h,
+            vw,
+            vh,
+            crate::hit::CARD_PAD,
+            crate::hit::CARD_GAP,
+        );
 
+        // 楷体：毛笔质感，比黑体更像写在签上的字。
+        let kai = crate::fonts::family_for_role(crate::fonts::FontRole::Note);
         let key = hit.key;
         let ch = hit.ch;
 
-        let btn_query = small_button("查询", false, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                // 一并记下 charIndex 与选中文本：字书面板上要显示「第几章第几段
-                // 第几字」，并在底部给出「在线查阅」。
-                let text = if this.has_selection() {
-                    this.selected_text()
-                } else {
-                    ch.to_string()
-                };
-                this.open_lookup(key, ch, text, None, None);
-                this.popup = None;
-                this.clear_selection();
-                cx.notify();
-            }),
-        );
-        // 划线：拖选了整段则对选区全部字划线（再点取消）；单击单字则只划该字。
-        let btn_mark = small_button("划线", false, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                if this.has_selection() {
-                    this.underline_selection();
-                } else if this.underlines.contains(&key) {
-                    this.underlines.remove(&key);
-                    this.save_annotations();
-                } else {
-                    this.underlines.insert(key);
-                    this.save_annotations();
-                }
-                this.popup = None;
-                cx.notify();
-            }),
-        );
-        // 标记：拖选整段则对选区全部字加专名线（人名 / 地名）或书名线
-        // （波浪线）；单击单字则只标该字。标记写入书稿并回写 JSON，下次
-        // 打开仍在（与数据里预置的标记走同一通道，mark_kind 实时读 self.book）。
-        let btn_person = small_button("人名", false, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.mark_selection(NoteKind::Person);
-                this.popup = None;
-                cx.notify();
-            }),
-        );
-        let btn_place = small_button("地名", false, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.mark_selection(NoteKind::Place);
-                this.popup = None;
-                cx.notify();
-            }),
-        );
-        let btn_bookm = small_button("书名", false, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.mark_selection(NoteKind::Book);
-                this.popup = None;
-                cx.notify();
-            }),
-        );
-        // 夹注：在**这个字**上加一条双行小字夹注（深朱砂红、可右键改删）。
-        // 与「笔记」不同：笔记是页眉批注（整页一条），夹注是嵌在正文列里
-        // 的双行小字，且**挂在字形上、不进正文流**——注入后只从当前半叶
-        // 起点局部重排（`relayout_from_halfleaf`），绝不重排全书。
+        // 一枚竖排钮：**无边框、无底色**，只有字；悬停转朱砂。
+        let mut items: Vec<Div> = Vec::new();
+        let push_btn = |label: &'static str, items: &mut Vec<Div>| {
+            items.push(
+                vertical_text(label, fs, kai.clone())
+                    .w(px(item_w))
+                    .text_color(rgb(t.ink()))
+                    .cursor_pointer()
+                    .hover(move |s| s.text_color(rgb(t.accent()))),
+            );
+        };
+        push_btn("查典", &mut items);
+        push_btn("朱批", &mut items);
+        push_btn("夹注", &mut items);
+        push_btn("拓印", &mut items);
+        push_btn("人名", &mut items);
+        push_btn("地名", &mut items);
+        push_btn("书名", &mut items);
+
+        // 夹注：先看看这个字上有没有旧注，有就预填（算改写）。
         let existing_note = self
             .book
             .as_ref()
@@ -6095,70 +6137,134 @@ impl Root {
             })
             .map(|n| n.text.clone())
             .unwrap_or_default();
-        let btn_gloss = small_button("夹注", false, t).on_mouse_down(
+
+        // ── 逐枚绑上动作（与上面 push 的次序一一对应）────────────────
+        let mut items = items.into_iter();
+        let b_query = items
+            .next()
+            .unwrap()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    // ★ 与离线字书**无缝衔接**：就地呼出康熙 + 說文浮签
+                    // （`render_lookup_card` 走 `dict::query_dict`），锚点
+                    // 用选区包围盒，浮签照旧不压字。
+                    let text = if this.has_selection() {
+                        this.selected_text()
+                    } else {
+                        ch.to_string()
+                    };
+                    this.bubble = Some(GlyphHit {
+                        key,
+                        ch,
+                        text: text.clone(),
+                        x: hit_xy.0,
+                        y: hit_xy.1,
+                    });
+                    this.open_lookup(key, ch, text, Some(hit_xy), anchor_rect);
+                    this.hover_card = false;
+                    this.popup = None;
+                    this.clear_selection();
+                    cx.notify();
+                }),
+            );
+        let b_note = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.start_note_edit_at(Some(hit_xy));
+                this.popup = None;
+                cx.notify();
+            }),
+        );
+        let b_gloss = items.next().unwrap().on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 // 已有夹注则预填（算改写），没有则从空白起。
-                this.start_note_inject(key, &existing_note, Some((hit.x, hit.y)));
+                this.start_note_inject(key, &existing_note, Some(hit_xy));
+                this.popup = None;
                 cx.notify();
             }),
         );
-        // 笔记：在点击处直接浮出笔记框，盖在文本上输入；不另开面板、
-        // 不推开正文，Esc 取消 / ⏎ 保存 / 点别处自动保存。
-        let btn_note = small_button("笔记", false, t).on_mouse_down(
+        let b_copy = items.next().unwrap().on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.start_note_edit_at(Some((hit.x, hit.y)));
-                cx.notify();
-            }),
-        );
-        let btn_copy = small_button("复制", false, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
+                if !this.has_selection() {
+                    this.sel_anchor = Some(key);
+                    this.sel_focus = Some(key);
+                }
                 this.copy_page_text();
                 this.popup = None;
                 this.clear_selection();
                 cx.notify();
             }),
         );
-        let btn_share = small_button("分享", false, t).on_mouse_down(
+        let b_person = items.next().unwrap().on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.show_share_panel = true;
+                this.mark_selection(NoteKind::Person);
                 this.popup = None;
-                this.clear_selection();
+                cx.notify();
+            }),
+        );
+        let b_place = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.mark_selection(NoteKind::Place);
+                this.popup = None;
+                cx.notify();
+            }),
+        );
+        let b_book = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.mark_selection(NoteKind::Book);
+                this.popup = None;
                 cx.notify();
             }),
         );
 
+        // ── 纸签本体 ──────────────────────────────────────────────────
+        let paper_washi = rgba((t.paper() << 8) | 0xF2);
+        // 钮与钮之间**只用留白**分档（不画线、不加框）：一枚钮就是签上的
+        // 一行字，靠呼吸感隔开，比一根根细线更像手写的书签。
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_start()
+            .gap(px(gap))
+            .child(b_query);
+        for b in [b_note, b_gloss, b_copy, b_person, b_place, b_book] {
+            col = col.child(b);
+        }
+
         div()
             .absolute()
-            .top(px(top))
-            .left(px(left))
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .max_w(px(avail))
-            .items_center()
-            .gap(px(gap))
-            .p(px(pad))
-            .rounded(px(9.0))
-            .bg(rgb(t.chrome()))
+            .left(px(place.left))
+            .top(px(place.top))
+            .w(px(w))
+            .h(px(h))
+            .bg(paper_washi)
             .border_1()
-            .border_color(rgb(t.frame()))
-            .child(btn_query)
-            .child(btn_mark)
-            .child(btn_person)
-            .child(btn_place)
-            .child(btn_bookm)
-            .child(btn_gloss)
-            .child(btn_note)
-            .child(btn_copy)
-            .child(btn_share)
+            .border_color(rgb(t.accent()))
+            .rounded(px(2.0))
+            .shadow_sm()
+            .p(px(pad))
+            .child(col)
+            // 签内不冒泡：否则一点钮，根容器的「点别处收起」就把签收了。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
     }
 
     /// 注文放大悬浮卡（交互层）：点行内夹注小字后弹出——现代风格半透明

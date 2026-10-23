@@ -290,6 +290,63 @@ pub fn zishu_ready() -> bool {
     matches!(ZISHU.lock(), Ok(g) if g.is_some())
 }
 
+/// 字书原文的**显示层**净化：只洗网页残渣，不动一个字的正文。
+///
+/// 库里的康熙 / 說文正文是从网页版字书灌下来的，段落之间夹着 `<hr>`、`<br>`
+/// 这类标签，还有 `&nbsp;` 之类的实体。竖排时看不出来（标签会被竖排引擎
+/// 当西文挤掉），改横排之后它们就成了宣纸便签上的一行尖括号，比释义本身
+/// 还抢眼。这里做三件事：剥标签（块级标签换成全角空格断句）、还原几个最
+/// 常见的实体、把连写的全角空格收成一枚。**不做**任何改写、删节、繁简转换。
+pub fn tidy_zishu(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            if let Some(j) = chars[i + 1..].iter().position(|&c| c == '>') {
+                let tag: String = chars[i + 1..i + 1 + j].iter().collect();
+                let name: String = tag
+                    .trim_start_matches('/')
+                    .split(|c: char| c.is_whitespace() || c == '/')
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
+                if matches!(name.as_str(), "hr" | "br" | "p" | "div" | "li" | "tr") {
+                    out.push('　');
+                }
+                i += j + 2;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    let out = out
+        .replace("&nbsp;", "　")
+        .replace("&lt;", "〈")
+        .replace("&gt;", "〉")
+        .replace("&quot;", "「")
+        .replace("&amp;", "&");
+    // 连写的全角空格（网页拿它做段首缩进）收成一枚，免得行首空一大片。
+    let mut tidy = String::with_capacity(out.len());
+    let mut prev_space = false;
+    for c in out.chars() {
+        let sp = matches!(c, '　' | ' ' | '\n' | '\r' | '\t');
+        if sp {
+            if !prev_space {
+                tidy.push('　');
+            }
+        } else {
+            tidy.push(c);
+        }
+        prev_space = sp;
+    }
+    tidy.trim_matches('　').to_string()
+}
+
 /// 按一个字头查一条记录（`alias` 表已含繁简两种写法，故简繁都能命中）。
 fn query_word(conn: &rusqlite::Connection, w: &str) -> Option<Zishu> {
     let mut st = conn
@@ -314,12 +371,12 @@ fn query_word(conn: &rusqlite::Connection, w: &str) -> Option<Zishu> {
     let r = rows.next().ok()??;
     Some(Zishu {
         word: r.get(0).unwrap_or_default(),
-        kangxi: r.get(1).unwrap_or_default(),
+        kangxi: tidy_zishu(&r.get::<_, String>(1).unwrap_or_default()),
         pinyin: r.get(2).unwrap_or_default(),
         radical: r.get(3).unwrap_or_default(),
         fanqie: r.get(4).unwrap_or_default(),
         volume: r.get(5).unwrap_or_default(),
-        shuowen: r.get(6).unwrap_or_default(),
+        shuowen: tidy_zishu(&r.get::<_, String>(6).unwrap_or_default()),
     })
 }
 
@@ -389,6 +446,23 @@ pub fn rare_len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 字书原文的网页残渣必须洗掉：`<hr>` 之类的标签绝不进浮签。
+    #[test]
+    fn tidy_zishu_strips_html_residue() {
+        let raw = "反其旄倪。<hr>考證：〔【說文】孩子也。象形。〕　謹照原文。<br />又　&nbsp;云。";
+        let s = tidy_zishu(raw);
+        assert!(!s.contains('<'), "标签没剥干净：{s}");
+        assert!(!s.contains("&nbsp;"), "实体没还原：{s}");
+        assert!(s.contains("考證"), "正文被误删：{s}");
+        assert!(s.contains("孩子也"), "正文被误删：{s}");
+        // 连写的全角空格收成一枚，且首尾不留空。
+        assert!(!s.contains("　　　"), "空格没收：{s}");
+        assert_eq!(s.trim(), s);
+        // 空串 / 纯标签都退化成空。
+        assert_eq!(tidy_zishu(""), "");
+        assert_eq!(tidy_zishu("<hr>"), "");
+    }
 
     /// 字书嵌进来了吗——没嵌（脚本没跑 / 资源缺失）就谈不上后面几条。
     #[test]
