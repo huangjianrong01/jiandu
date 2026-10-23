@@ -1303,16 +1303,17 @@ mod tests {
     #[test]
     fn note_punct_is_a_size_smaller_than_the_note_text() {
         // 注文本身就是正文的一半；注里的句读再收一档（0.62），
-        // 合起来约正文的 0.31——与正文句读 0.3 同档，小字里只剩一粒轻点。
+        // 合起来约正文的 0.31——略小于正文句读（0.4×），小字里只剩一粒轻点。
         assert!(NOTE_PUNCT_RATIO > 0.0 && NOTE_PUNCT_RATIO < 1.0);
         let body = 28.0f32;
         let note = body * 0.5;
         let dot = note * NOTE_PUNCT_RATIO;
         assert!(dot < note, "注文标点没有比注文字小");
         assert!(
-            (dot / body - crate::punct::FS_RATIO).abs() < 0.06,
-            "注文标点 {:.3}×正文，与正文句读 0.3 差太远",
-            dot / body
+            (dot / body - crate::punct::FS_RATIO).abs() < 0.12,
+            "注文标点 {:.3}×正文，与正文句读 {:.2} 差太远",
+            dot / body,
+            crate::punct::FS_RATIO
         );
         // 只收「点状」句读；引号 / 书名号 / 括号要括住东西，不收。
         for c in ['，', '。', '、', '；', '：', '？', '！', '…', '—'] {

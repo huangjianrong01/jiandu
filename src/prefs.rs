@@ -51,6 +51,16 @@ pub struct Prefs {
     pub columns_auto: bool,
     /// 四边留白比例。
     pub margin: f32,
+    /// **留白档**下标（[`crate::grid::BANXIN_RATIOS`]）：0 = 宽（复古 60%）、
+    /// 1 = 中（标准 75%，默认）、2 = 窄（满屏 90%）。
+    ///
+    /// 版心（界行文字区 + 版框）宽 ÷ 单叶可用宽的比例——宋版书版心只占纸宽
+    /// 六成，故「宽」档最接近文物原型；「窄」档让文字区铺满叶面。宽档联动
+    /// 更大的天头（文物感），见 `crate::grid::top_frac_for`。
+    ///
+    /// 老存档没有这一项 → 回落默认档「中」（`default_margin_tier`）。
+    #[serde(default = "default_margin_tier")]
+    pub margin_tier: usize,
     /// 当前版式配置键（见 `crate::grid::LAYOUT_CONFIGS`）：数据驱动切换的句柄。
     pub layout_key: String,
     /// true = 双行夹注；false = 页脚注。
@@ -92,6 +102,9 @@ impl Default for Prefs {
             // 自动档默认开：列数按书的内容与视口算，不写死某一档。
             columns_auto: true,
             margin: 0.06,
+            // 留白默认「中（标准 75%）」：既留古籍两侧留白的优雅，又保证
+            // 现代屏幕上的阅读体验（用户 v1.33.0 定稿）。
+            margin_tier: crate::grid::BANXIN_TIER_DEFAULT,
             // v1.28.0：默认版式由 10 列改为 12 列（密度）。旧存档里的
             // 自选列数仍照读，只是新装 / 重置时落到 12 列。
             layout_key: "standard12".to_string(),
@@ -112,6 +125,11 @@ impl Default for Prefs {
 /// 「默认开」的开关：老存档里没有这一项时按 true 回落（响应式开合是默认体验）。
 fn default_true() -> bool {
     true
+}
+
+/// 留白档默认值：「中（标准 75%）」。老存档没有 `margin_tier` 时回落这里。
+fn default_margin_tier() -> usize {
+    crate::grid::BANXIN_TIER_DEFAULT
 }
 
 /// 按下标取枚举元素，越界回落到首项。
@@ -158,6 +176,15 @@ impl Prefs {
     /// 排版字体（刻本宋体 / 手写楷体）。
     pub fn font_preset(&self) -> FontPreset {
         pick(&FontPreset::ALL, self.font_preset)
+    }
+
+    /// 留白档 → 版心率（0.60 / 0.75 / 0.90）。下标越界回落默认档，
+    /// 绝不 panic（老存档 / 手改档都能安全读）。
+    pub fn banxin_ratio(&self) -> f32 {
+        crate::grid::BANXIN_RATIOS
+            .get(self.margin_tier)
+            .copied()
+            .unwrap_or(crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT])
     }
 
     /// 从当前设置反向填好存档（存下标，故需反查在枚举里的位置）。
@@ -254,5 +281,35 @@ mod tests {
         assert_eq!(FontPreset::from_index(p.font_preset), FontPreset::Kai);
         // 越界回落首项，不 panic。
         assert_eq!(FontPreset::from_index(99), FontPreset::Song);
+    }
+
+    #[test]
+    fn margin_tier_defaults_to_standard_and_round_trips() {
+        // 留白档：默认「中（75%）」——既留古籍两侧留白的优雅，又保证现代
+        // 屏幕上的阅读体验（用户 v1.33.0 定稿）。
+        let p = Prefs::default();
+        assert_eq!(p.margin_tier, crate::grid::BANXIN_TIER_DEFAULT);
+        assert!((p.banxin_ratio() - 0.75).abs() < 1e-6);
+        // 三档都取得到，且宽 < 中 < 窄（版心越来越满）。
+        for (i, r) in crate::grid::BANXIN_RATIOS.iter().enumerate() {
+            let mut q = Prefs::default();
+            q.margin_tier = i;
+            assert!((q.banxin_ratio() - r).abs() < 1e-6);
+        }
+        // 越界回落默认档，不 panic。
+        let mut q = Prefs::default();
+        q.margin_tier = 99;
+        assert!((q.banxin_ratio() - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn old_prefs_without_margin_tier_falls_back_to_standard() {
+        // 老存档没有 `margin_tier`：必须能读进来，且留白档回落「中」。
+        let old = r#"{"theme":0,"palette":0,"font_ancient":0,"font_modern":0,"zoom":1.0,
+            "columns":12,"margin":0.06,"layout_key":"standard12",
+            "notes_inline":true,"trad":true,"tongjia":true,"punct":true,"rare":true,
+            "han_digits":false,"notes":true,"sound":true}"#;
+        let p: Prefs = serde_json::from_str(old).expect("老存档应能读进来");
+        assert!((p.banxin_ratio() - 0.75).abs() < 1e-6, "老存档留白档应回落 75%");
     }
 }

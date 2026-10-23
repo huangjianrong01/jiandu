@@ -1,6 +1,6 @@
 [package]
 name = "jiandu"
-version = "1.31.0"
+version = "1.34.0"
 edition = "2021"
 description = "笺读 · 一个用 Rust + GPUI 写的原生中文阅读器（古文竖笺 / 现代横笺）"
 license = "MIT"
@@ -28,6 +28,10 @@ encoding_rs = "0.8"
 once_cell = "1"
 # 原生文件选择器（导入 md/txt/epub/json）
 rfd = "0.14"
+# 导出分享：PNG 解码 + PDF 光栅嵌入（均取自离线缓存，可离线构建）。
+# 只开 `png` feature，避免 image 默认拉进 jpeg/tiff 等未缓存的子依赖。
+image = { version = "0.25", default-features = false, features = ["png"] }
+flate2 = "1"
 
 [profile.release]
 lto = "thin"

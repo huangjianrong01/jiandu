@@ -97,6 +97,12 @@ mod tests {
                 columns: cols,
                 dir: GridDir::Vertical,
                 margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
+                // 行款字数：按列数查行款表（v1.32.0）。
+                target_chars: crate::grid::LayoutConfig::by_columns(cols)
+                    .map(|c| c.target_chars)
+                    .unwrap_or(21),
+                // 留白默认档「中（75%）」（v1.33.0）。
+                banxin_ratio: crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT],
             },
             false,
             1.0,

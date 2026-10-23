@@ -12,6 +12,7 @@ mod banxin;
 mod content;
 mod dict;
 mod exporter;
+mod pdf;
 mod fonts;
 mod grid;
 mod gloss;

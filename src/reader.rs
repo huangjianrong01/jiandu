@@ -11,6 +11,7 @@ use crate::app::{
 };
 use crate::dict;
 use crate::gloss::{Page, Piece};
+use crate::grid::LeafHalf;
 use crate::lines;
 use crate::theme::{InkPalette, Theme};
 use crate::trad;
@@ -19,9 +20,9 @@ use crate::types::{
     GlyphKey, GlyphKind, MarkKind, NoteKind, NoteSource, Script, StyleTab, TocEntry,
 };
 use gpui::{
-    div, prelude::*, px, rgb, rgba, svg, Animation, AnimationExt, AnyElement, BoxShadow, Context,
-    Div, ElementId, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Overflow, ParentElement, SharedString, Styled, Window,
+    canvas, div, prelude::*, px, rgb, rgba, svg, Animation, AnimationExt, AnyElement, App, BoxShadow,
+    Bounds, Context, Div, ElementId, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Overflow, ParentElement, SharedString, Styled, Window,
 };
 use std::collections::HashMap;
 
@@ -626,17 +627,6 @@ fn book_ear(t: Theme, w: f32, h: f32, x: f32, top: f32, label: &str) -> Div {
         ))
 }
 
-/// 一叶在「一张纸」里的位置：对开时两半内侧要收掉留白，才能接成一整张。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LeafEdge {
-    /// 独占一纸（单面阅读，或对开的最后一叶）。
-    Alone,
-    /// 左半叶：内侧是右边，右留白收掉。
-    Left,
-    /// 右半叶：内侧是左边，左留白收掉。
-    Right,
-}
-
 /// 章末统计（篇 / 章 / 字），排在该章末葉正文之后的第一片空列里。
 #[derive(Clone, Default)]
 struct ChapStat {
@@ -689,7 +679,8 @@ fn chapters_ended_at(pages: &[Page], idx: usize) -> Vec<usize> {
 }
 
 /// 葉码用汉字数字：刊本叶码写作「一、二 … 十、十一 … 二十」，不用阿拉伯数字。
-fn han_num(n: usize) -> String {
+/// 行款信息（状态栏「半叶八行，行十五字」）与兜底提示也借它转汉字。
+pub(crate) fn han_num(n: usize) -> String {
     const D: [&str; 10] = ["〇", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
     match n {
         0 => "〇".to_string(),
@@ -761,6 +752,22 @@ fn build_note_index(book: &Book) -> NoteIndex {
     map
 }
 
+/// 对开两叶的纸面**左右**留白（Invariant 2：两叶必须一丝不差等宽）。
+///
+/// 内侧（贴中缝那一侧）收掉、外侧留 `pad`——左右叶严格镜像：
+/// `Left = (pad, 0)`、`Right = (0, pad)`，故两叶纸面总宽恒等，
+/// 中缝因此钉在整张纸的正中央（引擎侧的等分证明见
+/// `grid::frame_tests::facing_split_is_symmetric_and_the_gutter_sits_on_the_center_line`；
+/// 渲染侧的镜像由 `tests::facing_sheets_are_mirrored_so_the_two_leaves_are_equal_width`
+/// 把着）。单叶（`Alone`）两侧对称留白，居中独摆。
+pub(crate) fn sheet_side_pads(half: LeafHalf, pad: f32) -> (f32, f32) {
+    match half {
+        LeafHalf::Right => (0.0, pad),
+        LeafHalf::Left => (pad, 0.0),
+        LeafHalf::Alone => (pad, pad),
+    }
+}
+
 impl Root {
     // ------------------------------------------------------------------
     // 阅读视图
@@ -827,7 +834,7 @@ impl Root {
             let left_is_head = pages.get(next).map(|p| p.start_chapter).unwrap_or(false);
             let cur_is_head = pages.get(cur).map(|p| p.start_chapter).unwrap_or(false);
             if next < total {
-                row = row.child(self.render_leaf(&pages, next, false, LeafEdge::Left, cx));
+                row = row.child(self.render_leaf(&pages, next, false, LeafHalf::Left, cx));
                 let ch = pages
                     .get(cur)
                     .and_then(|p| p.glyphs.first())
@@ -840,7 +847,7 @@ impl Root {
                 row = row.child(self.render_gutter(ch, cur, detailed));
             }
             if cur < total {
-                let edge = if next < total { LeafEdge::Right } else { LeafEdge::Alone };
+                let edge = if next < total { LeafHalf::Right } else { LeafHalf::Alone };
                 row = row.child(self.render_leaf(&pages, cur, false, edge, cx));
             }
             row
@@ -854,7 +861,7 @@ impl Root {
                 .flex_row()
                 .when(narrow, |d| d.justify_end())
                 .when(!narrow, |d| d.justify_center())
-                .child(self.render_leaf(&pages, self.page, false, LeafEdge::Alone, cx))
+                .child(self.render_leaf(&pages, self.page, false, LeafHalf::Alone, cx))
         };
 
         let toolbar = self.render_reading_toolbar(total, cx);
@@ -873,7 +880,7 @@ impl Root {
         //
         // 专注模式：四边留白也去掉（p_0），纸面撑满整屏；
         // 普通模式保留 p_4 留白，纸面如书中一叶。
-        let mut body = div().flex_1().flex().flex_col().items_center().justify_center();
+        let mut body = div().flex_1().flex().flex_col().items_center().justify_start();
         if self.focus_mode {
             body = body.p_0();
         } else {
@@ -2368,7 +2375,7 @@ impl Root {
         pages: &[Page],
         idx: usize,
         back: bool,
-        edge: LeafEdge,
+        edge: LeafHalf,
         cx: &mut Context<Self>,
     ) -> Div {
         let page = pages.get(idx);
@@ -2536,6 +2543,7 @@ impl Root {
     // ------------------------------------------------------------------
     // 古文竖笺：八列、从右到左、四周双边、双行小字夹注
     // ------------------------------------------------------------------
+
     fn render_ancient(
         &self,
         glyphs: &[Glyph],
@@ -2543,7 +2551,7 @@ impl Root {
         back: bool,
         start_chapter: bool,
         idx: usize,
-        edge: LeafEdge,
+        edge: LeafHalf,
         stats: &[ChapStat],
         // 渲染几何（当前视图 / 晒本长图各算一套；全部几何读这一份）。
         geo: LeafGeo,
@@ -2599,6 +2607,10 @@ impl Root {
             // 章首页的开卷列（i==0，紧邻版心）：顶部预留一段空白带给卷首题署，
             // 正文从带下接着排（带高 = chapter_inscription_reserve_rows）。
             let top_skip = if start_chapter && i == 0 { reserve } else { 0 };
+            // 最左一列（i == text_cols-1）贴版框左缘：它的左界行由 inner
+            // 的闭合细线（`border_l_1`）充当，自己不再画——否则两条 1px
+            // 并成 2px，乌丝栏就不再根根一样粗（v1.34.0 闭合版框的收尾）。
+            let first_col = i == text_cols - 1;
             // 信笺模板：在第 7、8 个正文列之间插一道一列宽的中缝。
             // 章首页最右多一个章题列（也算一列），分割点随之前移一列，
             // 左右两边仍各是 7 列。
@@ -2616,6 +2628,7 @@ impl Root {
                 self.grid.columns,
                 back,
                 top_skip,
+                first_col,
                 &note_index,
                 geo.interactive,
                 cx,
@@ -2655,24 +2668,54 @@ impl Root {
                     .child(SharedString::from(han_num(idx + 1))),
             );
 
+        // ════════════════════════════════════════════════════════════
+        // v1.34.0 三大前提（Invariants）——用户点名「绝对不许破坏」。
+        // 动下面这段边框代码之前，先看一遍；跑测试先跑
+        // `grid::frame_tests` 与 `punct` 两个模块：
+        //
+        //   ① 天宽地窄：纸面的 `pt` / `pb` 就是引擎的 `margin_top` /
+        //      `margin_bot`，而 `margin_bot = margin_top ÷ 2`（用户铁律，
+        //      `grid::TOP_OF_BOT`）。**加粗外框（1→3px）只长在框上，
+        //      不许多吃一寸天头、不许把上下拉成对称。**
+        //   ② 绝对居中：左右叶的左右留白走 `sheet_side_pads`（严格镜像），
+        //      两叶纸面总宽恒等；中缝宽 = `grid::gutter_w`（引擎同一算式），
+        //      故中缝钉在屏幕正中。
+        //   ③ 句读不被盖：`punct_overlay` 是字格的子元素，而字格 ⊂ 列 ⊂
+        //      grid ⊂ inner ⊂ frame ⊂ sheet——GPUI 先画祖先后画子孙，
+        //      边框是祖先自身的一部分，**在渲染顺序上不可能盖住句读**；
+        //      下面的边框循环只碰 `border_*`，绝不重建 `grid` 的子元素树。
+        // ════════════════════════════════════════════════════════════
+        //
         // 版框：由配置驱动——single = 单线；double = 外粗内细（文武边栏）。
-        // 文武的内层细线只在 double 时画；single 只需最外一根。对开拼合时
-        // **内侧（贴中缝那一侧）不设框线**：左右两叶拼成一整张纸，外框只围
-        // 整页外缘；单叶（Alone）才四边全封闭。内层 `relative`：地脚 / 卷首
-        // 题署都用绝对定位叠在行格之上。
+        // 文武的内层细线只在 double 时画；single 只需最外一根。
+        // **四边一律闭合**（v1.34.0）：对开两叶贴中缝的内侧缘（左叶右缘 /
+        // 右叶左缘）也设框线——左右两叶拼成一整张纸时，外框围住整页外缘、
+        // 内侧各一道粗竖框把中缝夹住；单叶（Alone）同样四边全封闭。
+        // 内层 `relative`：地脚 / 卷首题署都用绝对定位叠在行格之上。
         let mut inner = div()
             .relative()
             .border_color(rgb(t.frame_ink()))
             .child(grid)
             .child(foot);
         // **内框线（文武边栏的内层细线）**：与列间界行（乌丝栏）同一条——
-        // 同色、同粗（1px）、同起止，看上去就是「界行围了一圈」，而不是
-        // 另起一条比界行还重的框。对开时内侧（贴中缝那侧）不画。
-        inner = match edge {
-            LeafEdge::Left => inner.border_t_1().border_b_1().border_l_1(),
-            LeafEdge::Right => inner.border_t_1().border_b_1().border_r_1(),
-            LeafEdge::Alone => inner.border_1(),
-        };
+        // 同色、同粗（1px）、同起止，看上去就是「界行围了一圈」。
+        // **四边一律闭合**（v1.34.0，`grid::frame_sides`）：对开两叶贴中缝
+        // 的内侧缘（左叶右缘 / 右叶左缘）也必须画——此前内侧留空，中缝像
+        // 一条孤立的马路悬在中央（用户实测）。界行的上下两端因此接到
+        // 横框上，字格围成完全封闭的网格。
+        let sides = crate::grid::frame_sides(edge);
+        if sides[0] {
+            inner = inner.border_t_1();
+        }
+        if sides[1] {
+            inner = inner.border_r_1();
+        }
+        if sides[2] {
+            inner = inner.border_b_1();
+        }
+        if sides[3] {
+            inner = inner.border_l_1();
+        }
         inner = inner.border_color(rgb(t.rule_by(self.rule_color)));
         // 卷首题署（卷端）：章首页开卷列顶部叠一卷端题名——
         // 第一行（顶格）写书名·卷次，第二行（低几格）写署名；
@@ -2700,41 +2743,88 @@ impl Root {
             .child(inner);
         // **外层框线一律加粗（3px）**：8 / 10 / 12 / 14 列都是「外粗内细」
         // 的文武边栏——外框压得住整版，内框与界行同粗，层次才立得住。
-        // 对开内侧仍留空，两半拼合成一整张纸时不打架。
-        frame = match edge {
-            LeafEdge::Left => frame.border_t_3().border_b_3().border_l_3(),
-            LeafEdge::Right => frame.border_t_3().border_b_3().border_r_3(),
-            LeafEdge::Alone => frame.border_3(),
-        };
-
-        // 纸面留白：对开时内侧（贴纸心那一侧）收掉，两半才能拼成一张纸。
-        // `relative`：书耳用绝对定位挂在纸面左上 / 右上角。
-        let pad = 16.0;
-        let mut sheet = div()
-            .relative()
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(pad))
-            .pb(px(pad))
-            .pl(px(if edge == LeafEdge::Right { 0.0 } else { pad }))
-            .pr(px(if edge == LeafEdge::Left { 0.0 } else { pad }))
-            .bg(rgb(paper))
-            .child(frame);
+        // **四边一律闭合**（v1.34.0）：左半叶的右缘、右半叶的左缘各立一道
+        // 粗竖框，两线分居中缝两侧，把鱼尾、书名、叶码死死夹在中间——
+        // 中缝不再是一条悬空的「马路」。
+        if sides[0] {
+            frame = frame.border_t_3();
+        }
+        if sides[1] {
+            frame = frame.border_r_3();
+        }
+        if sides[2] {
+            frame = frame.border_b_3();
+        }
+        if sides[3] {
+            frame = frame.border_l_3();
+        }
 
         // 书耳：贴版框上角的一小片「耳朵」（刻本书脑侧的题签小耳）。
         //
         // **只贴在左上角**（v1.27.0 用户口径）：对开时右半叶原先会镜像出一枚
         // 右耳，两耳同说「本章章名」，是重复的功能，故右半叶不再挂耳——
         // 一叶摊开只在书页左上角留一枚。
-        if edge != LeafEdge::Right {
-            let pad = 16.0;
-            let ear_w = (cell_w * 0.16).clamp(11.0, 14.0).min(pad - 2.0);
+        //
+        // v1.32.0 行款重构后，版心（界行区）窄于纸面、在叶内居中——书耳
+        // 若是纸面的子元素就会漂在留白里，与版框脱节。故改挂到 **frame**
+        // （版框自身）上：left/top 均为 0，即「版框左上角」，框宽耳随。
+        if edge != LeafHalf::Right {
+            let ear_w = (cell_w * 0.16).clamp(11.0, 14.0);
             // 耳高约一格（刻本书耳只有一两字高，不是一整条边）。
             let ear_h = (cell_h * 1.25).clamp(34.0, 150.0);
             // 耳内题签按内容自适应：篇章名 / 卷名 / 提要（types::ear_label）。
             let ear_label = self.ear_label(chapter);
-            sheet = sheet.child(book_ear(t, ear_w, ear_h, pad - ear_w, pad, &ear_label));
+            frame = frame.child(book_ear(t, ear_w, ear_h, 0.0, 0.0, &ear_label));
+        }
+
+        // 纸面留白：对开时内侧（贴纸心那一侧）收掉，两半才能拼成一张纸。
+        // `relative`：书耳 / 地脚牌记用绝对定位挂在纸面角上。
+        //
+        // 天头地脚非对称（v1.31.x）：阅读视图用网格引擎算出的 `margin_top`
+        // （天头，宽）/ `margin_bot`（地脚，窄）作上下内边距，并把纸张高度
+        // 锁死为 `content_h`，强制顶部对齐——无论屏幕多大，天头永远是地脚
+        // 的 ~2 倍，绝不再靠垂直居中把非对称留白藏起来。分享 / 长图(非交互)
+        // 维持对称 `pad` 与自适应高度，避免破坏导出尺寸。
+        let pad = 16.0;
+        let top_margin = if geo.interactive { self.margin_top } else { pad };
+        let bot_margin = if geo.interactive { self.margin_bot } else { pad };
+        // 左右留白走 `sheet_side_pads`（Invariant 2：左右叶镜像 → 等宽）。
+        let (pl, pr) = sheet_side_pads(edge, pad);
+        let mut sheet = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(top_margin))
+            .pb(px(bot_margin))
+            .pl(px(pl))
+            .pr(px(pr))
+            .bg(rgb(paper))
+            .child(frame);
+        // 纸张高度锁死为内容区高：顶对齐后整张纸撑满正文区，天头 / 地脚就是
+        // 引擎算出的 `margin_top` / `margin_bot`（非交互的导出图保持自适应）。
+        if geo.interactive {
+            sheet = sheet.h(px(self.content_h.max(120.0)));
+        }
+        // 地脚牌记：天头宽、地脚窄，地脚那点留白缀一行极小宋体版权页
+        // （「笺读数字刻本」），优雅地把底部空间利用起来，而不是靠居中去遮挡。
+        if geo.interactive {
+            sheet = sheet.child(
+                div()
+                    .absolute()
+                    .bottom(px(4.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .flex()
+                    .flex_row()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(rgb(t.ink_soft()))
+                            .child(SharedString::from("笺读数字刻本")),
+                    ),
+            );
         }
 
         // 注文不进正文时，退回页脚注。
@@ -2781,6 +2871,9 @@ impl Root {
     /// `rows` = 每列字数（来自网格引擎）；`foot_h` 是地脚高度：
     /// 列高照加，界行才能通到版框下沿。
     /// `columns` = 当前列数（≥10 时夹注走阈值字号 / 单行，避免小字糊掉）。
+    /// `first_col` = 是否是**最左一列**（贴版框左缘）：它的左界行由
+    /// `inner` 的 `border_l_1` 充当（v1.34.0 四边闭合后那条线必然存在），
+    /// 自己再画一道就并成 2px——乌丝栏必须根根一样粗。
     fn ancient_column(
         &self,
         items: &[Piece],
@@ -2793,6 +2886,9 @@ impl Root {
         back: bool,
         // 顶部预留给卷首题署的空白行数（0 = 不预留，普通列）。
         top_skip: usize,
+        // 是否最左一列（贴版框左缘）：为真则不画左界行（由 inner 的
+        // 闭合细线充当），免得两条 1px 并成 2px。
+        first_col: bool,
         note_index: &NoteIndex,
         // 字格 / 注块是否挂鼠标交互（晒本预览传 false：纯展示）。
         interactive: bool,
@@ -2801,15 +2897,17 @@ impl Root {
         let t = self.theme;
         // 列外框（含乌丝栏界行）高度固定，与邻列对齐；顶部预留带用内边距把
         // 正文内容压到带下，预留带内仍是空白纸面，留给卷首题署叠绘。
-        let col = div()
+        let mut col = div()
             .w(px(cell_w))
             .h(px(cell_h * rows as f32 + foot_h))
             .flex()
             .flex_col()
-            .items_center()
-            // 丝栏：列间界行按样式面板所选（乌 / 金 / 朱）取色。
-            .border_l_1()
-            .border_color(rgb(t.rule_by(self.rule_color)));
+            .items_center();
+        // 丝栏：列间界行按样式面板所选（乌 / 金 / 朱）取色。
+        // 最左一列不画（见 `first_col`）：版框内缘那道闭合细线就是它。
+        if !first_col {
+            col = col.border_l_1().border_color(rgb(t.rule_by(self.rule_color)));
+        }
         let mut content = div().w_full().flex().flex_col().items_center();
         if top_skip > 0 {
             content = content.pt(px(cell_h * top_skip as f32));
@@ -3476,12 +3574,11 @@ impl Root {
         col.child(div().flex_1())
     }
 
-    /// 中缝（版心）：对开时立在纸心的一道竖栏——左缘一条细线（与页内
-    /// 界行同粗细、与内框同起止）夹一字宽的纸带，右缘那条由右半叶最左
-    /// 一列的界行充当（两线间距恰为一列字宽，与左右丝栏等距延续）。
-    /// 带内自上而下排布：
+    /// 中缝（版心）：对开时立在纸心的一道竖栏——鱼尾、书口字、叶码
+    /// 都立于此。带内自上而下排布：
     ///
     /// ```text
+    ///   上黑口（粗墨一道）
     ///   上鱼尾（∧ 口朝下）
     ///   书名   宋词三百首     ← 极小号宋体，竖排
     ///   卷次   卷五十一
@@ -3489,7 +3586,7 @@ impl Root {
     ///          ⋯⋯
     ///   叶码   五十
     ///   下鱼尾（∨ 口朝上）
-    ///   朱印
+    ///   下黑口（粗墨一道）
     /// ```
     ///
     /// 正中另有一道**极细实线**（0.5px、`#999999`）作纸对折的折痕。
@@ -3497,6 +3594,32 @@ impl Root {
     /// 宽度；文字的高度账由 `banxin::layout` 按优先级分（叶码 → 卷次 →
     /// 书名 → 篇题），分不够就截字，绝不溢出、绝不压字。
     /// 左半叶是章首时不用它——那一叶自带的「章题列」本身就是版心。
+    ///
+    /// ── v1.34.0：中缝与两叶是**同一张纸**（用户「把中缝两端与外边框
+    /// 完美闭合」）────────────────────────────────────────
+    /// 旧版中缝是一根独立竖栏：自己算高（605pt vs 纸面 640pt）、自己
+    /// 用绝对定位钉框线（结果飘到两叶版框上方 83px）、左右各画一条
+    /// 竖线——摊开来中缝像一条孤立的马路悬在中央，两叶「分家」。
+    /// 现在它与 `render_ancient` 的纸面**逐层同构**：
+    ///
+    /// ```text
+    ///   sheet   : h(content_h) + pt(margin_top) + pb(margin_bot)   ← 同值
+    ///   frame   : p(3) + border_*_3                                ← 同层同位
+    ///   inner   : border_*_1                                       ← 同层同位
+    ///   内容    : 两叶是 grid+foot，中缝是版心栏（同高 core_h）
+    /// ```
+    ///
+    /// 三条好处，条条冲着用户的三大前提：
+    ///   ① **上下闭合**：中缝的上下外框 / 内框与左右叶的上下框在同一
+    ///      高度、同一粗细，摊开是一整张平铺的纸——「两端完美闭合」；
+    ///   ② **不碰 Invariant 1**：中缝的上下留白直接读引擎的
+    ///      `margin_top` / `margin_bot`（2:1 铁律见 `grid::TOP_OF_BOT`），
+    ///      不自己算数，天头地脚因此与两叶一丝不差；
+    ///   ③ **不碰 Invariant 2**：中缝宽仍是引擎的 `gutter_w`，左右两叶
+    ///      等宽（`sheet_side_pads` 镜像），中缝钉在屏幕正中。
+    /// 左右竖框则**不画**：两叶的版框已四边闭合（`grid::frame_sides`），
+    /// 左叶右缘与右叶左缘各一道粗竖框 + 一道细竖框，正好把中缝夹住——
+    /// 中缝再画自己的竖线，缝上就成并排的两条。
     fn render_gutter(&self, chapter: usize, page_idx: usize, detailed: bool) -> Div {
         let t = self.theme;
         let fs = self.size_ancient;
@@ -3509,24 +3632,35 @@ impl Root {
             ANCIENT_EDGE,
             self.grid.margin,
         );
-        // 地脚高与 `render_ancient` 同式，中缝才能与纸面上下对齐。
+        // ── 与两叶同源的纵向几何（Invariant 1 / ②）──────────────────
+        // 纸面锁 `content_h`、上下留白用引擎的天头 / 地脚——与
+        // `render_ancient` 的 sheet 逐值相同，中缝因此与两叶严格对齐。
+        let mt = self.margin_top;
+        let mb = self.margin_bot;
+        let h = self.content_h.max(120.0);
+        // 地脚高与 `render_ancient` 同式（叶码条跟着字号走）。
         let foot_h = (fs * 0.36).max(9.0) + 10.0;
-        // 与纸面同高：上下留白 16、版框双边 3+3、框内留边 3+3、内栏线 1+1，
-        // 再加行格与地脚——和 `render_ancient` 里那张纸严丝合缝。
-        let h = 16.0 * 2.0 + 14.0 + cell_h * self.grid_rows as f32 + foot_h;
-        // 天头：黑口（粗黑块）之下再留一成字高，上鱼尾才落在版心上部
-        // 而不是贴着黑口——本子的书口是「黑口 → 鱼尾 → 书名」三层。
+        // 版心内芯高 = 行格 + 地脚叶码条，与两叶的 `grid + foot` 同高
+        // （两叶的列高本来就含 foot_h，界行才通到版框下沿）。
+        let core_h = cell_h * self.grid_rows as f32 + foot_h;
+        // 版心**内芯**宽：gw 扣掉左右两叶各 7pt 的框层（3 粗框 + 3 框内
+        // 留边 + 1 内细线）。鱼尾、黑口、书口字都排在这两条细线之间，
+        // 绝不探到框上——中缝因此被两叶的竖框「夹」住。
+        let core_w = (gw - 14.0).max(9.0);
+        // 黑口：版心天头 / 地脚各一道粗黑块（大黑口本子），紧贴内框细线
+        // 之内——它就是纸对折处露出的那道墨，翻书时一眼定位。墨色与鱼尾
+        // 同源（`fish_ink`），深底主题下会自动提亮。
         let heikou = crate::banxin::heikou_h(cell_h);
-        let head = heikou + cell_h * 0.14;
         // 书口文字：书名（去括号）、卷次「卷五十一」、叶码「五十」。
         let book = self.book_title();
         let juan = format!("卷{}", han_num(chapter + 1));
         let page = han_num(page_idx + 1);
         let lay = crate::banxin::layout(crate::banxin::BanxinOpts {
-            gutter_w: gw,
-            // 可用高 = 纸高 − 上下留白(20×2) − 天头（含上黑口）− 下黑口；
-            // `banxin::layout` 再扣两枚鱼尾与朱印，剩下的才是文字。
-            band_h: (h - 40.0 - head - heikou).max(40.0),
+            // 鱼尾与书口字都按**内芯宽**排：不得探出两条细线。
+            gutter_w: core_w,
+            // 可用高 = 内芯高 − 上下黑口 − 口下气口；`banxin::layout`
+            // 再扣两枚鱼尾与段间留白，剩下的才是文字。
+            band_h: (core_h - heikou * 2.0 - cell_h * 0.14).max(40.0),
             cell_h,
             // v1.30.0：鱼尾宽按「列宽 × 0.7」取（见 `banxin_tail_size`）。
             col_w: self.col_w,
@@ -3543,117 +3677,96 @@ impl Root {
         // 书口小字**极小号宋体**：走正文字体（默认文津宋体）的回退链，
         // 横笺里也不会退化成黑体。
         let family = crate::fonts::family_for(self.current_font(), Script::Ancient);
+        // 版心内芯：全部走**流式布局**（旧版用绝对定位钉线，纸一伸缩就漂）。
+        // 自上而下：上黑口 → 口下气口 → 上鱼尾 → 书名/卷次/篇题 →
+        //          叶码 → 下鱼尾 → 下黑口。
         let mut col = div()
-            .w(px(gw))
-            .h(px(h))
+            .w(px(core_w))
+            .h(px(core_h))
             .flex()
             .flex_col()
-            .items_center()
-            // `relative`：版心细线用绝对定位锚在本栏内（GPUI 的 absolute
-            // 子元素以最近的 positioned 祖先为定位上下文，缺了它线会飘到
-            // 根节点上去）。
-            .relative()
-            .overflow_hidden()
-            .pt(px(16.0 + 4.0))
-            .pb(px(16.0 + 4.0))
-            .bg(rgb(t.paper()));
-        // 版心细线（界栏）：与左右叶的**内框**（border_1）同起同止——参考图
-        // 「横版」里中缝线不顶纸缘、也不碰外粗框。线位 = 纸面顶 + 留白16
-        // + 外框3 + 框内留边3 = 22（col 与纸面同高同顶，故 absolute
-        // top/bottom 取 22，即内框上/下沿），头尾与内框严丝合缝。
-        // 只画**左缘一条**：右缘那条由右半叶最左一列的界行（丝栏）充当
-        // ——否则 col 右线与右叶第一根界行只隔几像素，中缝靠右就像
-        // 并排的两条竖线（用户实测指出）。左右两线因此分居中缝两侧、
-        // 与左右叶的界行等距延续（间距恰为一列字宽）。
-        // 取色与页内界行同源（乌 / 金 / 朱丝栏）。
-        let rule_lines = div()
-            .absolute()
-            .top(px(22.0))
-            .bottom(px(22.0))
-            .left(px(0.0))
-            .w(px(1.0))
-            .bg(rgb(t.rule_by(self.rule_color)));
-        col = col.child(rule_lines);
-        // 折痕：纸**对折**的那一道物理褶，落在版心正中——0.5px、`#999999`、
-        // 实线（v1.28.0 由虚线改来），只作「纸的痕迹」，比界行还淡。
-        col = col.child(fold_crease(
-            gw * 0.5 - crate::banxin::FOLD_W * 0.5,
-            22.0,
-            (h - 44.0).max(0.0),
-            t.fold_ink(),
-        ));
-        // 纸心头顶 / 脚底的框线贯通：对开两叶拼成**一张平铺的整纸**，
-        // 外框粗线与内框细线必须横贯全页、全封闭——左叶的上下框只画到
-        // 纸心左缘、右叶只从纸心右缘起，若不在这里补上中缝那一段，
-        // 上框 / 下框就在纸心断成两截（用户指出「头尾没有封闭」）。
-        // 位置与 `render_ancient` 的版框逐层对齐：纸面顶下 16（留白）=
-        // 外框粗线（3px，与左右叶 frame 的 border_t_3 同粗同位），
-        // 再下 3px（框内留边）= 内框细线（1px，与 inner 的 border_t_1
-        // 同位）；底边对称（bottom 16 = 粗线、bottom 22 = 细线）。
-        // 列数（8/10/12/14）只改缝宽 gw，这几条线的位置恒定不动。
-        let frame_col = t.frame_ink();
-        let edge = |top: bool, thick: f32, inset: f32| -> Div {
-            let mut e = div()
-                .absolute()
-                .left(px(0.0))
-                .right(px(0.0))
-                .h(px(thick))
-                .bg(rgb(frame_col));
-            e = if top {
-                e.top(px(inset))
-            } else {
-                e.bottom(px(inset))
-            };
-            e
-        };
-        // 上外框粗线 / 上内框细线
-        col = col.child(edge(true, 3.0, 16.0));
-        col = col.child(edge(true, 1.0, 22.0));
-        // 下外框粗线 / 下内框细线
-        col = col.child(edge(false, 3.0, 16.0));
-        col = col.child(edge(false, 1.0, 22.0));
-        // **黑口**：版心最顶 / 最底各一道粗黑块（大黑口本子）。位置紧贴
-        // 内框细线之内（22px），宽度占满整列书口——它就是纸对折处露出的
-        // 那道墨，翻书时一眼定位。墨色与鱼尾同源（`fish_ink`），深底主题
-        // 下会自动提亮，不会变成一块看不见的黑。
-        let heikou_block = |top: bool| -> Div {
-            let mut b = div()
-                .absolute()
-                .left(px(0.0))
-                .right(px(0.0))
-                .h(px(heikou))
-                .bg(rgb(t.fish_ink()));
-            b = if top {
-                b.top(px(22.0))
-            } else {
-                b.bottom(px(22.0))
-            };
-            b
-        };
-        col = col.child(heikou_block(true));
-        col = col.child(heikou_block(false));
-        col = col.child(div().h(px(head)));
+            .items_center();
+        // 上黑口：紧贴内框细线之内的一道粗墨。
+        col = col.child(div().w_full().h(px(heikou)).bg(rgb(t.fish_ink())));
+        // 口下气口：黑口与上鱼尾之间留一成字高，书口才成「黑口 → 鱼尾
+        // → 书名」三层，而不是全糊在口上。
+        col = col.child(div().h(px(cell_h * 0.14)));
         // 上鱼尾：凹口朝下（直线多边形，深灰 `#333333`，见 `banxin_tail`）。
         // 尺寸由 `banxin::layout` 按「宽不越界栏、高约 1.2 倍行高」算好。
         col = col.child(banxin_tail(lay.tail_w, lay.tail_h, true, t.fish_ink()));
         col = col.child(div().h(px(lay.gap)));
-        // 书名 → 卷次 → 篇题（极小号宋体，一字一格竖排）。
-        for line in &lay.above {
-            col = col.child(banxin_vtext(line, gw, &family, t));
+        // 书名 → 卷次 → 篇题（极小号宋体，一字一格竖排）。每段之间留一道
+        // 小气口，绝不连成一串（v1.31.x：原先三段直接相接，看着像「挤成一坨」）。
+        for (i, line) in lay.above.iter().enumerate() {
+            if i > 0 {
+                col = col.child(div().h(px(3.0)));
+            }
+            col = col.child(banxin_vtext(line, core_w, &family, t));
         }
         // 余量全给中间：书名卷次贴着上鱼尾、叶码贴着下鱼尾，两枚鱼尾
         // 「夹」住书口文字，正是刻本版心的样子。
         col = col.child(div().flex_1());
         // 叶码。
         for line in &lay.below {
-            col = col.child(banxin_vtext(line, gw, &family, t));
+            col = col.child(banxin_vtext(line, core_w, &family, t));
         }
         col = col.child(div().h(px(lay.gap)));
         // 下鱼尾：∨ 口朝上，与上鱼尾开口相对。
         col = col.child(banxin_tail(lay.tail_w, lay.tail_h, false, t.fish_ink()));
-        // 下黑口的占位：与上黑口对称。
-        col = col.child(div().h(px(heikou)));
-        col
+        // 下黑口：与上黑口对称，压在内框细线之上。
+        col = col.child(div().w_full().h(px(heikou)).bg(rgb(t.fish_ink())));
+
+        // ── 纸面 / 版框 / 内框：与 `render_ancient` 的 sheet 逐层同构 ──
+        // `relative`：折痕用绝对定位锚在本栏内（GPUI 的 absolute 子元素
+        // 以最近的 positioned 祖先为定位上下文，缺了它线会飘到根节点上）。
+        // **不设 `overflow_hidden`**：两叶的纸面也没设——版框自然高
+        // （core_h + 14）略超内容盒时两边一样溢出，框线才仍对齐；
+        // 单边裁一刀，中缝的下框反比两叶短一截。
+        let mut paper = div()
+            .relative()
+            .w(px(gw))
+            .h(px(h))
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(mt))
+            .pb(px(mb))
+            .bg(rgb(t.paper()));
+        // 版框（与两叶的 frame 同层）：外粗 3px + 框内留边 3px，
+        // **只画上下横框**——左右竖框由两叶闭合的版框充当。
+        let mut frame = div()
+            .w(px(gw))
+            .p(px(3.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .border_color(rgb(t.frame_ink()))
+            .border_t_3()
+            .border_b_3();
+        // 内框细线（与两叶的 inner 同层）：1px、与界行同色同起止，
+        // 只画上下——中缝的上下两端因此与左右叶的上下框**逐层闭合**，
+        // 界行（乌丝栏）也顺着这两条线接到横框上，字格围成封闭网格。
+        let inner = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .border_color(rgb(t.rule_by(self.rule_color)))
+            .border_t_1()
+            .border_b_1()
+            .child(col);
+        // 折痕：纸**对折**的那一道物理褶，落在版心正中——0.5px、`#999999`、
+        // 实线（v1.28.0 由虚线改来），只作「纸的痕迹」，比界行还淡。
+        // 起止夹在两条内框细线之间（mt+6 ⇄ h-mb-6），与两叶的内框同界。
+        paper = paper.child(fold_crease(
+            gw * 0.5 - crate::banxin::FOLD_W * 0.5,
+            mt + 6.0,
+            (h - mt - mb - 12.0).max(0.0),
+            t.fold_ink(),
+        ));
+        frame = frame.child(inner);
+        paper = paper.child(frame);
+        paper
     }
 
     /// 书名（版心书口用）：去《》【】「」等括号与空白，只留题名——
@@ -3907,32 +4020,64 @@ impl Root {
             .child(SharedString::from(c.to_string()))
     }
 
+    /// 句读浮层：**绝不用字体字形**，也绝不用 SVG 贴图——一枚 `canvas`
+    /// 上 `paint_path` 纯手绘的朱砂小记号（几何全在 `punct::place`）。
+    ///
+    /// ── Invariant 3：句读永不被边框盖住 / 重置 ──────────────────────
+    /// 本浮层是 `cell`（字格）的子元素，而 `cell` ⊂ `ancient_column` ⊂
+    /// `grid` ⊂ `inner` ⊂ `frame` ⊂ `sheet`：GPUI  immediate 模式下
+    /// **先画祖先、后画子孙**，版框（`border_*_3` / `border_*_1`）是
+    /// 祖先元素自身的一部分，必然先落笔；句读是整棵树最深处的叶子，
+    /// 必然最后落笔。故加粗外框、闭合中缝这类改动**在渲染顺序上
+    /// 不可能盖住句读**——只有一种情况会弄丢它：改边框时顺手把
+    /// `grid` 的子元素树重建 / 替换掉。本函数与 `ancient_column`
+    /// 的字格渲染因此只增不减，边框循环（`frame_sides` 驱动的四个
+    /// `if`）也只碰 `border_*`，不碰 children。
+    ///
+    /// 另外记号本身被 `punct::place` 夹在字格内（有单测钉死），
+    /// 版框在字格之外，二者物理上不相交；中缝栏虽有
+    /// `overflow_hidden`，但句读在两叶里、不在中缝里，淋不到。
     fn punct_overlay(&self, ch: char, cell_w: f32, cell_h: f32, fs: f32, back: bool) -> Div {
-        let t = self.theme;
-        let pb = crate::punct::place(fs, cell_w, cell_h);
-        let paper = if back { t.paper_back() } else { t.paper() };
-        let ink = crate::theme::mix(paper, t.accent(), crate::punct::INK_MIX);
+        // 几何（纯函数、有单测）：直径 = 正文 × 0.35、中心钉在格内
+        // 70% × 70% 的右下象限，绝不居中、绝不溢出。
+        let m = crate::punct::place(fs, cell_w, cell_h, crate::punct::kind_of(ch));
+        let ink = self.punct_ink(back);
+        // 浮层铺满字格：canvas 的 paint 闭包收到的是**窗口坐标**的
+        // bounds，把字格原点（ox/oy）加回记号中心即可。
         div()
             .absolute()
-            // 起点再叠一层「墨迹补偿」：em box 右移 0.7×fs，墨点才正贴格
-            // 右缘（em box 余下的空白探出格一点，墨点不出格）。见
-            // `punct::INK_DX_RATIO`——只靠 justify_end 会把墨点留在格右侧
-            // 五分之一处，看着像格心偏下的一颗黑痣。
-            .left(px(pb.dx + pb.ink_dx))
-            .top(px(pb.dy + pb.ink_dy))
-            .w(px(pb.w))
-            .h(px(pb.h))
-            .flex()
-            .flex_row()
-            // 盒自 (dx, dy) 铺到格右 / 下缘，字面**靠右下对齐**：
-            // 字体把句读的墨迹放在 em box 的左下（。，、）或正中（？！），
-            // 靠右下对齐后两种情形的墨迹都落在格子的右下角——若靠左上
-            // 对齐，。，、 的墨点会飘回格子中间（旧版看着像「居中」）。
-            .items_end()
-            .justify_end()
-            .text_size(px(pb.fs))
-            .text_color(rgb(ink))
-            .child(SharedString::from(self.shown(ch).to_string()))
+            .left(px(0.0))
+            .top(px(0.0))
+            .w(px(cell_w))
+            .h(px(cell_h))
+            .child(
+                canvas(
+                    // prepaint：纯布局阶段，只读 bounds，返回空状态。
+                    |_bounds: Bounds<gpui::Pixels>, _window: &mut Window, _cx: &mut App| (),
+                    // paint：只读几何与颜色，绝不修改 State、绝不 notify
+                    // （闭包签名收 `&mut App` 也从类型上保证了这一点）。
+                    move |bounds: Bounds<gpui::Pixels>, _state: (), window: &mut Window, _cx: &mut App| {
+                        let ox = f32::from(bounds.origin.x);
+                        let oy = f32::from(bounds.origin.y);
+                        crate::punct::paint_mark(window, ox + m.cx, oy + m.cy, m, ink);
+                    },
+                )
+                .w(px(cell_w))
+                .h(px(cell_h)),
+            )
+    }
+
+    /// 句读墨色（Invariant 3 的颜色一侧）：亮纸上用暗朱砂 / 熟褐
+    /// `#9A3B3B`（用户定「深沉、不要太鲜艳」）；深底主题（夜读等）
+    /// 向纸色提亮一档，否则整粒沉进深纸里看不见。
+    fn punct_ink(&self, back: bool) -> u32 {
+        let t = self.theme;
+        let paper = if back { t.paper_back() } else { t.paper() };
+        if t.is_dark() {
+            crate::theme::mix(crate::punct::PUNCT_INK, paper, 0.45)
+        } else {
+            crate::punct::PUNCT_INK
+        }
     }
 
     /// 正文单字格：主字 + 旁注（繁体/通假）+ 句读朱点。
@@ -4187,9 +4332,10 @@ impl Root {
                     )),
             );
         } else if is_punct(g.ch) {
-            // 句读（标点）：**正文字号 × 0.4**，起点偏移到字格右下角
-            // （x + 格宽×0.3、y + 格高×0.3），格心整个让给正文。
-            // 几何全在 `punct::place`（纯函数、有单测），这里只照抄。
+            // 句读（标点）：**正文字号 × 0.35** 的朱砂小手绘（空心圈 / 小弧），
+            // 中心钉在字格右下角（x + 格宽×0.7、y + 格高×0.7），格心整个
+            // 让给正文。几何与绘制全在 `punct`（纯函数 + `paint_path`，
+            // 有单测），这里只照抄——**严禁**在这里回落字体字形或 SVG。
             cell = cell
                 .relative()
                 .child(self.punct_overlay(g.ch, cell_w, cell_h, fs, back));
@@ -4449,20 +4595,41 @@ impl Root {
             Script::Ancient => "叶",
             Script::Modern => "页",
         };
-        // 列数随「版式」面板切换（8 / 10 / 12 / 14），状态栏同步显示。
-        let cols_label = match self.grid.columns {
-            8 => "八列".to_string(),
-            10 => "十列".to_string(),
-            12 => "十二列".to_string(),
-            14 => "十四列".to_string(),
-            n => format!("{n} 列"),
-        };
+        // 行款信息（v1.32.0）：版本学口径「半叶几行、行几字」——版式名 +
+        // 行款表的目标字数；触发最小字号保护（窗口过小）时改报实际排下的
+        // 字数，与「无法展示完整的 X 行 Y 字」提示互为印证。
+        // 列数不在行款表（用户自定档）时退回引擎实测行数，照样有行款可报。
+        let hangkou = crate::grid::LayoutConfig::by_columns(self.grid.columns)
+            .map(|c| {
+                if self.grid_min_font {
+                    format!(
+                        "{} · 半叶{}行，行{}字",
+                        c.label,
+                        han_num(self.grid.columns),
+                        han_num(self.grid_rows)
+                    )
+                } else {
+                    format!(
+                        "{} · 半叶{}行，行{}字",
+                        c.label,
+                        han_num(self.grid.columns),
+                        han_num(c.target_chars)
+                    )
+                }
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "半叶{}行，行{}字",
+                    han_num(self.grid.columns),
+                    han_num(self.grid_rows)
+                )
+            });
         let mode = match self.script {
             Script::Ancient => {
                 if self.notes_inline && self.show_notes {
-                    format!("古文竖笺 · {cols_label} · 双行小字夹注 · 从右到左")
+                    format!("古文竖笺 · {hangkou} · 双行小字夹注 · 从右到左")
                 } else {
-                    format!("古文竖笺 · {cols_label} · 四周双边 · 从右到左")
+                    format!("古文竖笺 · {hangkou} · 四周双边 · 从右到左")
                 }
             }
             Script::Modern => "现代横笺 · 仅横线".to_string(),
@@ -6131,7 +6298,7 @@ impl Root {
             false,
             laid.start_chapter,
             self.page,
-            LeafEdge::Alone,
+            LeafHalf::Alone,
             &stats,
             geo,
             cx,
@@ -6895,8 +7062,9 @@ impl Root {
             }))
     }
 
-    /// 版式控制面板：古籍竖笺的列数（8/10/12/14）与四周留白随时可切。
-    /// 单页 / 双面对开由屏幕方向自动决定（横屏对开、竖屏单页），不在此调整。
+    /// 版式控制面板：古籍竖笺的列数（8/10/12/14）、版心宽（留白三档）与
+    /// 四周留白随时可切。单页 / 双面对开由屏幕方向自动决定（横屏对开、
+    /// 竖屏单页），不在此调整。
     fn render_grid_panel(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let margin = self.grid.margin;
@@ -6964,6 +7132,39 @@ impl Root {
                 .child(layout_row),
         );
 
+        // 版心宽（留白档，v1.33.0）：版心（界行文字区）宽 ÷ 单叶可用宽。
+        // 宋版书版心只占纸宽六成（宽 = 复古）；满屏档让文字区铺满叶面。
+        // 与「四周留白」是两件事：那一行管纸面内边距，这一行管文字区占多宽。
+        let mut bx_row = div().flex().flex_row().items_center().gap_2();
+        for (label, val) in [
+            ("宽 60%", crate::grid::BANXIN_RATIOS[0]),
+            ("中 75%", crate::grid::BANXIN_RATIOS[1]),
+            ("窄 90%", crate::grid::BANXIN_RATIOS[2]),
+        ] {
+            let on = (self.banxin_ratio - val).abs() < 0.005;
+            bx_row = bx_row.child(small_button(label, on, t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.set_banxin_ratio(val);
+                    cx.notify();
+                }),
+            ));
+        }
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(t.ink_soft()))
+                        .child(SharedString::from("版心宽")),
+                )
+                .child(bx_row),
+        );
+
         // 留白行：窄 / 中 / 宽（四周同比例留白）。
         let mut m_row = div().flex().flex_row().items_center().gap_2();
         for (label, val) in [("窄", 0.02f32), ("中", 0.06), ("宽", 0.12)] {
@@ -6990,13 +7191,14 @@ impl Root {
                 .child(m_row),
         );
 
-        // 实时反馈：当前引擎算出的列宽 / 字号 / 每面行数。
+        // 实时反馈：当前引擎算出的版心宽 / 列宽 / 字号 / 每面行数。
         panel.child(
             div()
                 .text_size(px(10.5))
                 .text_color(rgb(t.ink_soft()))
                 .child(SharedString::from(format!(
-                    "列宽 {:.0} · 字号 {:.0} · 每面 {} 行 · {}",
+                    "版心 {:.0}% · 列宽 {:.0} · 字号 {:.0} · 每面 {} 行 · {}",
+                    self.banxin_ratio * 100.0,
                     self.col_w,
                     self.size_ancient,
                     self.grid_rows,
@@ -8193,9 +8395,10 @@ fn note_paper(card_w: f32, card_h: f32, body: &[char], ink: u32, mute: u32) -> D
 mod tests {
     use super::{
         bar_wants_show, chapters_ended_at, cn_date_from_str, cn_small, first_empty_column,
-        note_grid_plan, BAR_GAP, BAR_H, BAR_HOT,
+        note_grid_plan, sheet_side_pads, BAR_GAP, BAR_H, BAR_HOT,
     };
     use crate::gloss::{Page, Piece};
+    use crate::grid::LeafHalf;
 
     /// 顶栏：贴着天头出、栏下沿附近赖着不走、深入纸面才收；有面板开着则永远不放。
     #[test]
@@ -8338,5 +8541,30 @@ mod tests {
         assert_eq!(c, 14);
         assert!(fs >= 8.0);
         assert!(pc >= 1);
+    }
+
+    /// Invariant 2（绝对居中对称）的**渲染**一侧：对开两叶的左右留白
+    /// 严格镜像，纸面总宽恒等——左叶右缘与右叶左缘在同一条竖线上相接，
+    /// 中缝因此不偏分毫地钉在整张纸正中（引擎侧的等分证明在
+    /// `grid::frame_tests::facing_split_is_symmetric_and_the_gutter_sits_on_the_center_line`）。
+    ///
+    /// 这条测试守着「加粗外框 / 闭合中缝不许把两叶改胖改瘦」：
+    /// 只要左右留白还镜像，两叶等宽就不依赖任何一边的具体数值。
+    #[test]
+    fn facing_sheets_are_mirrored_so_the_two_leaves_are_equal_width() {
+        for pad in [0.0, 16.0, 44.0] {
+            let (lpl, lpr) = sheet_side_pads(LeafHalf::Left, pad);
+            let (rpl, rpr) = sheet_side_pads(LeafHalf::Right, pad);
+            // 镜像：左叶的左边距 == 右叶的右边距，反之亦然。
+            assert_eq!(lpl, rpr, "pad={pad} 左右叶不留白不镜像");
+            assert_eq!(lpr, rpl, "pad={pad} 左右叶内侧留白不镜像");
+            // 总宽恒等——「两叶一丝不差等宽」的直接来源。
+            assert_eq!(lpl + lpr, rpl + rpr, "pad={pad} 两叶纸面总宽不等");
+            // 内侧（贴中缝那一侧）必须收掉：两叶才能拼成一张纸。
+            assert_eq!(lpr, 0.0, "左叶右缘（贴中缝）必须收掉留白");
+            assert_eq!(rpl, 0.0, "右叶左缘（贴中缝）必须收掉留白");
+            // 单叶两侧对称（居中独摆，不与任何叶拼幅）。
+            assert_eq!(sheet_side_pads(LeafHalf::Alone, pad), (pad, pad));
+        }
     }
 }

@@ -55,6 +55,36 @@ pub fn is_narrow(viewport_w: f32, viewport_h: f32) -> bool {
     viewport_w / viewport_h < FACING_MIN_ASPECT
 }
 
+// ── 版框闭合（v1.34.0） ─────────────────────────────────────────────────
+/// 一叶在摊开纸面上的位置：对开的左半 / 右半 / 独占一整张。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LeafHalf {
+    /// 独占一纸（单面阅读，或对开的最后一叶）。
+    Alone,
+    /// 左半叶：内侧是右缘（贴中缝那一侧）。
+    Left,
+    /// 右半叶：内侧是左缘（贴中缝那一侧）。
+    Right,
+}
+
+/// 版框四边（上 / 右 / 下 / 左）是否描边——**恒为四边全闭合**。
+///
+/// v1.34.0 用户实测的「双叶分家」事故：左半叶只画左框、右半叶只画右框，
+/// 贴中缝的内侧两缘都空着，中缝就像一条孤立的马路悬在中央，鱼尾与
+/// 叶码无所依傍。现在不论左叶 / 右叶 / 单叶，**外框粗线（3px）与内框
+/// 细线（1px）都画满四边**：
+///
+/// * 左半叶的右缘、右半叶的左缘各立一道粗竖框，两线分居中缝两侧，
+///   把鱼尾、书名、叶码死死夹在中间——中缝不再悬空；
+/// * 内框细线与列间界行（乌丝栏）同色同粗同起止，围成一圈，
+///   字格的上下两端因此接到横框上，网格完全封闭。
+///
+/// 渲染层（`reader::render_ancient`）按这张表给 `frame` / `inner`
+/// 上 `border_3` / `border_1`，测试钉死「任何一半都不许缺边」。
+pub fn frame_sides(_half: LeafHalf) -> [bool; 4] {
+    [true, true, true, true]
+}
+
 /// 响应式单 / 双叶判断。
 ///
 /// * 宽屏（平板横持 / 电脑）：**双叶对开**，两叶等宽、中缝落在屏幕正中；
@@ -132,6 +162,12 @@ pub struct LayoutConfig {
     pub desc: &'static str,
     /// 每面列数（竖排=竖列数）：8 / 10 / 12 / 14。
     pub columns: usize,
+    /// **每列目标字数**（v1.32.0 古版行款）：半叶 `columns` 行、每行
+    /// `target_chars` 字——宋版「半叶八行，行十五字」即 8 列 × 15 字。
+    ///
+    /// 这是**神圣不可违**的行款：字号与行高由它反算（`row_h = 可用高 /
+    /// target_chars`），排版引擎绝不为了塞满屏幕而拆散每列字数。
+    pub target_chars: usize,
     /// **字号 / 列宽**：`fs = 列宽 × fs_ratio`。
     ///
     /// 行款越古越疏：宋版八行字大（0.8），信笺十四行字小（0.68）。
@@ -164,25 +200,31 @@ pub const LAYOUT_CONFIGS: &[LayoutConfig] = &[
     LayoutConfig {
         key: "standard8", preset: "song8",
         label: "八行疏朗本", desc: "宋版：字大，行距宽",
-        columns: 8, fs_ratio: 0.80, line_ratio: 1.20,
+        // 行款：半叶八行，行十五字。
+        columns: 8, target_chars: 15, fs_ratio: 0.82, line_ratio: 1.20,
         dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
     },
     LayoutConfig {
         key: "standard10", preset: "ming10",
         label: "十行经典本", desc: "明版：适中",
-        columns: 10, fs_ratio: 0.75, line_ratio: 1.15,
+        // 行款：半叶十行，行十九字。
+        columns: 10, target_chars: 19, fs_ratio: 0.80, line_ratio: 1.15,
         dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
     },
     LayoutConfig {
         key: "standard12", preset: "qing12",
         label: "十二行密排本", desc: "清版：密集",
-        columns: 12, fs_ratio: 0.70, line_ratio: 1.10,
+        // 行款：半叶十二行，行二十一字。
+        // v1.31.x：字号比 0.70 → 0.78，让字更贴满字格、呈「字阵」的致密感，
+        // 不再显得空旷（列数恒为 12，只调字 / 格比例）。
+        columns: 12, target_chars: 21, fs_ratio: 0.78, line_ratio: 1.10,
         dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
     },
     LayoutConfig {
         key: "standard14", preset: "letter14",
         label: "十四行信笺本", desc: "信笺：极密",
-        columns: 14, fs_ratio: 0.65, line_ratio: 1.05,
+        // 行款：半叶十四行，行二十六字。
+        columns: 14, target_chars: 26, fs_ratio: 0.72, line_ratio: 1.05,
         dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
     },
 ];
@@ -263,7 +305,19 @@ pub struct GridConfig {
     /// 不同字体的 em box 大小不同——思源系列字面偏大，同样字号下竖排
     /// 上下两字容易贴住。按当前正文字体给一点余量（宋体 1.0、楷体 1.06），
     /// 字形才紧凑而不重叠。见 `fonts::line_height_scale`。
+    ///
+    /// v1.32.0 行款重构后，行高由 `target_chars` 反算（行款优先），此系数
+    /// 仅作历史兼容保留，不再参与 `compute_grid` 的字号 / 行高算式。
     pub line_scale: f32,
+    /// **每列目标字数**（v1.32.0 行款）：半叶 `columns` 行、每行此数字。
+    /// 字号与行高由它反算：`row_h = 可用高 / target_chars`、
+    /// `fs = row_h × FS_OF_ROW`。见 [`LayoutConfig::target_chars`]。
+    pub target_chars: usize,
+    /// **版心率**（v1.33.0 用户可调留白档）：版心宽 ÷ 单叶可用宽。
+    /// 0.60 = 宽（复古）/ 0.75 = 中（标准，默认）/ 0.90 = 窄（满屏）。
+    /// 见 [`BANXIN_RATIOS`]；天头率随档联动（[`top_frac_for`]）。
+    /// 传 0 = 用默认档（与 `fs_ratio` 的 0 哨兵同俗）。
+    pub banxin_ratio: f32,
 }
 
 impl Default for GridConfig {
@@ -278,6 +332,10 @@ impl Default for GridConfig {
             fs_ratio: c.fs_ratio,
             line_ratio: c.line_ratio,
             line_scale: 1.0,
+            target_chars: c.target_chars,
+            // 留白默认「中（75%）」：既留古籍两侧留白的优雅，又保证现代
+            // 屏幕上的阅读体验（用户 v1.33.0 定稿）。
+            banxin_ratio: BANXIN_RATIOS[BANXIN_TIER_DEFAULT],
         }
     }
 }
@@ -301,11 +359,80 @@ pub const GRID_FS_MIN: f32 = 12.0;
 /// 触顶时**列宽跟着回缩**（见 `compute_grid` 第 5 步），字仍贴着格，
 /// 密度不会被大屏稀释。
 pub const GRID_FS_MAX: f32 = 32.0;
+/// **字号 / 行高**（v1.32.0 行款）：`fs = row_h × FS_OF_ROW`。
+///
+/// 行款重构后，行高由「每列目标字数」反算（`row_h = 可用高 / target_chars`），
+/// 字号必须**略小于**行高——字面只占行高的一成半不到，竖排上下两字才不粘连
+/// （朱砂句读、批注小字都叠在字格里，留白就是呼吸位）。
+pub const FS_OF_ROW: f32 = 0.85;
+/// 列数 → 目标字数的兜底斜率（未登记行款的列数按它估：8→15、10→19、
+/// 12→22、14→26，与登记值同量级）。
+pub const TARGET_CHARS_SLOPE: f32 = 1.85;
 /// 行高缩放的中性值：不放大也不压缩（旧存档 / 未指定字体时取它）。
 pub const LINE_SCALE_BASE: f32 = 1.0;
 /// 行高缩放的合理区间（夹住异常值，免得行气散掉或字压成一团）。
 pub const LINE_SCALE_MIN: f32 = 0.85;
 pub const LINE_SCALE_MAX: f32 = 1.6;
+
+/// 古籍竖笺「天头宽、地脚窄」（v1.31.x，与 `zen_kit` 同源）：天头占内容区
+/// 高度的比例。天头留白给眉批、地脚只容鱼尾叶码，故天头明显更宽。
+///
+/// v1.34.0 起它同时是**地脚的唯一来源**：地脚不再单独给比例，一律取
+/// 天头 ÷ [`TOP_OF_BOT`]（用户铁律「天头必须是地脚的 2 倍」，见
+/// `frame_tests::top_margin_is_exactly_twice_the_bottom_margin`）。
+/// 留白三档联动因此也长在地脚上：宽（复古）档天头大 → 地脚同步大。
+pub const ANCIENT_TOP_FRAC: f32 = 0.12;
+
+/// **天头 ÷ 地脚**（用户 v1.34.0 铁律：天头必须是地脚的 **2 倍**）。
+///
+/// 这条律与边框粗细、字号大小、列数多少、留白档位**统统无关**：
+/// 外框从 1px 加粗到 3px、中缝闭合、句读重绘，都不许多吃一寸天头、
+/// 也不许把地脚撑成对称——否则「天宽地窄」的刻本气质就没了。
+/// 违反它的回归由 `frame_tests` 的两条测试把着：
+///   * `top_margin_is_exactly_twice_the_bottom_margin`（全档位 × 全尺寸
+///     × 开/关页脚注，比例恒为 2.000）；
+///   * `bottom_margin_never_grows_past_the_top`（地脚永远窄于天头）。
+///
+/// 注意：页脚注区（`foot`，`ANCIENT_NOTES`）**不是地脚的一部分**——
+/// 它并进纵向预留（与 `head` 同理），否则一开页脚注，2:1 就被注区
+/// 撑变形（那正是用户点名「绝不允许」的漂移）。
+pub const TOP_OF_BOT: f32 = 2.0;
+
+// ── 留白三档（v1.33.0）：版心宽占单叶可用宽的比例 ────────────────────
+/// **版心率**：版心（界行文字区 + 版框）宽 ÷ 单叶可用宽。
+///
+/// 宋版书版心只占纸宽六成——两侧留白是纸的一部分，不是浪费。但现代屏幕
+/// 宽而扁，六成常常剩下一片桌面；故做成三档，由用户在「文物感」与
+/// 「阅读效率」之间自选：
+///   0. **宽（复古 60%）**：宋版 authentic 比例，两侧留白最阔；
+///   1. **中（标准 75%）**：**默认档**——既留古籍两侧留白的优雅，
+///      又保证现代屏幕上的阅读体验（用户 v1.33.0 定稿）；
+///   2. **窄（满屏 90%）**：文字区铺满叶面，追求最大信息密度。
+///
+/// 存**下标**进 `Prefs::margin_tier`（改标签不让老存档失效），越界回落默认档。
+pub const BANXIN_RATIOS: [f32; 3] = [0.60, 0.75, 0.90];
+/// 默认档下标：「中（标准 75%）」。
+pub const BANXIN_TIER_DEFAULT: usize = 1;
+/// 各档联动的**天头率**：版心越窄（越复古），天头越宽——选「宽」留白的人
+/// 在追求极致文物感，值得更大的天头（用户 v1.33.0 要求「天头地脚也拉大」）。
+/// 与 [`BANXIN_RATIOS`] 同序：0.60→0.16、0.75→0.12（=基准）、0.90→0.09。
+pub const BANXIN_TOP_FRACS: [f32; 3] = [0.16, 0.12, 0.09];
+/// 列宽上限（相对行高）：满屏档把字格拉宽当字距，但宽过行高两倍，乌丝栏
+/// 就散成一道栅栏、不再像书。触顶时版心占比略降（字距优先让位版式感）。
+pub const COL_W_MAX_OF_ROW: f32 = 2.0;
+
+/// 留白档 → 天头率。版心率落在 [`BANXIN_RATIOS`] 某一档上就取该档的天头率
+/// （「宽留白配大天头」的联动只此一处，不会两处漂移）；未登记的比值
+/// （用户自定 / 未来新档）退回基准 [`ANCIENT_TOP_FRAC`]。
+pub fn top_frac_for(banxin_ratio: f32) -> f32 {
+    match BANXIN_RATIOS
+        .iter()
+        .position(|r| (r - banxin_ratio).abs() < 0.005)
+    {
+        Some(i) => BANXIN_TOP_FRACS[i],
+        None => ANCIENT_TOP_FRAC,
+    }
+}
 
 // ── 自动列数（v1.29.0）：按「书的内容」选档，而不是一刀切一个默认值 ────
 /// 短章 / 次短章的分界（平均一章字数）：低于此按「语录、短札」处理。
@@ -374,6 +501,13 @@ pub fn auto_columns(fs_of: impl Fn(usize) -> f32, avg_chapter_chars: usize) -> u
 pub struct GridMetrics {
     pub dir: GridDir,
     pub columns: usize,
+    /// **行款目标字数**（v1.32.0）：半叶 `columns` 行、每行应排此数字。
+    /// 与 `LayoutConfig::target_chars` 同源，状态栏行款信息读它。
+    pub target_chars: usize,
+    /// **实际每列字数**（v1.32.0）：行款未被兜底时恒等于 `target_chars`；
+    /// 触发最小字号保护（窗口过小）时小于它——状态栏据此提示
+    /// 「无法展示完整的 X 行 Y 字」。
+    pub chars_per_col: usize,
     pub rows: usize,
     /// 字格宽（竖排=列宽；横排=单字格宽）。
     pub col_w: f32,
@@ -391,6 +525,11 @@ pub struct GridMetrics {
     pub outer_h: f32,
     /// 是否触发了最小字号（需要单页滚动）。
     pub min_font_hit: bool,
+    /// 天头预留（px）：内容高 × [`ANCIENT_TOP_FRAC`]，上缘留白。
+    pub margin_top: f32,
+    /// 地脚预留（px）：**天头 ÷ [`TOP_OF_BOT`]（= 天头的一半）**，下缘留白
+    /// （明显窄于天头）。用户铁律：天头必须是地脚的 2 倍。
+    pub margin_bot: f32,
 }
 
 /// 计算网格。
@@ -425,66 +564,98 @@ pub fn compute_grid(
     } else {
         content_w
     };
-    // 2) 四周留白（相对内容区比例），上下 / 左右同比例。
-    let mw = (per_leaf * cfg.margin).max(0.0);
-    let mh = (content_h * cfg.margin).max(0.0);
-    // 3) 字格可用区（再扣版框 + 留白）。
-    let inner_w = (per_leaf - edge - 2.0 * mw).max(40.0);
-    let inner_h = (content_h - head - foot - 2.0 * mh).max(40.0);
 
-    // 4) 用户公式：列宽 = 可用宽 / 列数。
-    let col_w_raw = inner_w / cfg.columns as f32;
-    // 5) 字号 = 列宽 × `fs_ratio`（行款给的，宋版 0.80 / 信笺 0.68）；
-    //    上下限双向兜底。
+    // ── 天头地脚非对称（v1.31.x，与 `zen_kit` 同源）──────────────────
+    // 传统刻本「天头宽、地脚窄」：天头留给眉批，地脚只容鱼尾叶码，故天头
+    // 明显更宽。纵向预留分两份：天头（`top_frac_for(版心率)` × 内容高）
+    // + 地脚（**天头 ÷ `TOP_OF_BOT` = 天头的一半**，用户铁律 2:1）；
+    // 页脚注区（`foot`）不是地脚，它与 `head` 一样并进纵向预留——
+    // 否则开页脚注就会把 2:1 撑变形。
     //
-    //    触**下限**（窄屏 14 列）：字号优先，反推列宽放大（宁可溢出滚动）。
-    //    触**上限**（大屏对开）：列宽随之回缩到「字刚好贴格」，字与格的
-    //    `fs_ratio` 比例得以保住——只压字号不回缩列宽的话，字会缩在格心，
-    //    纸面反而更空（这正是「大字本」的反面）。但最多只缩到原列宽的 70%：
-    //    再窄就成了一条纸带，两侧空白比书还宽。
-    let ratio = if cfg.fs_ratio > 0.0 { cfg.fs_ratio } else { GRID_FS_RATIO };
+    // 天头率随留白档联动（v1.33.0）：选「宽（复古）」的人值得更大的天头，
+    // 选「窄（满屏）」的人要把每一像素都让给文字——见 `top_frac_for`。
+    let top_frac = top_frac_for(cfg.banxin_ratio);
+    let mt = (content_h * top_frac).max(0.0);
+    let mb = (mt / TOP_OF_BOT).max(0.0);
+
+    // 4) **古版行款反算**（v1.32.0）：每列字数神圣不可违——
+    //    先定「半叶几行、每行几字」（行款表 `target_chars`），再由可用高
+    //    反算行高与字号：`row_h = 可用高 / target_chars`，
+    //    `fs = row_h × FS_OF_ROW`（0.85，字面必须略小于行高才不粘连）。
+    //
+    //    这与旧版「算字号求行数」正好相反：旧版为了塞满屏幕会悄悄改动
+    //    每列字数（floor 余量、列宽回缩都在拆行款）；现在行款是因，
+    //    几何是果——屏幕只决定「这一版印得印不下」，不改「一行几字」。
+    //
+    //    页脚鱼尾条（`foot_h`）依赖字号，先不计它探一遍（只占约 18px，
+    //    一遍收敛即够），拿到探针字号再精算可用高。
+    let target = cfg.target_chars.max(1) as f32;
     let cap = fs_max.max(GRID_FS_MIN);
-    let want = col_w_raw * ratio * zoom;
-    let min_hit = want < GRID_FS_MIN;
-    let capped = want > cap;
-    let fs = want.clamp(GRID_FS_MIN, cap);
-    let col_w = if min_hit {
-        fs / ratio
-    } else if capped {
-        (fs / ratio).max(col_w_raw * 0.70)
+    // 探针与精算都扣掉页脚注区（`foot`）：它是注文带、不是地脚留白
+    // （见 `TOP_OF_BOT` 的说明），绝不计入 2:1 的任何一侧。
+    let fs_probe = (((content_h - head - mt - mb - foot).max(40.0) / target) * FS_OF_ROW)
+        .clamp(GRID_FS_MIN, cap);
+    let foot_h = (fs_probe * 0.36).max(9.0) + 10.0; // 与 `render_ancient` 的 `foot_h` 同源
+    // 5) 字格可用高 = 内容高 − 天头 − 地脚预留 − 页脚注区 − 鱼尾叶码条
+    //    − 版框上缘（`head` 仅竖排无天头行时恒为 0）。
+    let inner_h = (content_h - head - mt - mb - foot - foot_h).max(40.0);
+    // 6) 行高 = 可用高 / 每列目标字数（行款值）；字号 = 行高 × 0.85 × 字级
+    //    倍率，再按上下限夹住（专注模式传 INFINITY 豁免上限）。
+    let row_h_std = inner_h / target;
+    let fs = (row_h_std * FS_OF_ROW * zoom).clamp(GRID_FS_MIN, cap);
+    // 7) 窗口过小：按公式算出的字号跌破下限 → **锁定最小字号**，行高反被
+    //    抬大 → 一列排不下 `target` 字（`rows < target`）。此时渲染层开
+    //    单页滚动、状态栏提示「无法展示完整的 X 行 Y 字」——绝不拆行款，
+    //    绝不把字压成一团黑疙瘩。
+    let min_hit = row_h_std * FS_OF_ROW * zoom < GRID_FS_MIN;
+    let row_h = if min_hit { fs / FS_OF_ROW } else { row_h_std };
+    // 行数 = 可用高 / 行高。加 1e-4 再 floor：`inner_h/(inner_h/target)` 在浮点
+    // 里可能落在 target−ε（如 25.999999999999996），直接 floor 会少算一行，
+    // 状态栏报「行二十字」、纸高也短一行——epsilon 只吃掉浮点尘，吃不到
+    // 真正的余量（真实余量 ≥ 千分之一行时才该少排）。
+    let rows = ((inner_h / row_h + 1e-4).floor()).max(1.0) as usize;
+    // 8) **版心率定列宽**（v1.33.0 用户可调留白档）：版心（界行区 + 版框）
+    //    宽 = 单叶可用宽 × `banxin_ratio`（0.60 复古 / 0.75 标准 / 0.90 满屏），
+    //    列宽由它反推：`col_w = (版心宽 − 版框) / 列数`。字格因此不必是方的——
+    //    满屏档把多出的宽度当**字距**（字形仍居中于格内，行款字号不变），
+    //    复古档则收到近乎方格。三条边界：
+    //      · 下限 `fs`：字不破格——放不下就退回「可用宽均分」（旧行为），
+    //        版心占比随之超标，交由横向滚动，绝不把字压扁；
+    //      · 上限 `row_h × COL_W_MAX_OF_ROW`：再宽乌丝栏就散成栅栏；
+    //      · 纸边留白让位：纸宽（版心 + 纸边）不超出单叶，满屏档留白归零，
+    //        纸正好贴满叶面；复古档纸窄，叶面两侧露出桌面。
+    let n = (cfg.columns as f32 + extra_cols).max(1.0);
+    let ratio = if cfg.banxin_ratio > 0.0 {
+        cfg.banxin_ratio.clamp(0.35, 1.0)
     } else {
-        col_w_raw
+        BANXIN_RATIOS[BANXIN_TIER_DEFAULT]
     };
-    // 6) 行高 = 字号 × `line_ratio` × 行高缩放（v1.30.0：行高挂在**字号**上，
-    //    不再挂列宽）。行款给的 `line_ratio` 是「行高 / 字号」的倍数
-    //    （宋版 1.20 → 疏朗、信笺 1.05 → 紧凑），乘以 `fs_ratio` 才是
-    //    「行高 / 列宽」：宋版 0.96、明版 0.8625、清版 0.792、信笺 0.714。
-    //
-    //    缩放由当前正文字体定（思源系字面大 → 松开一点余量），见
-    //    `fonts::line_height_scale`。行款保证了 `line_ratio > 1`，
-    //    故 rowHeight > fontSize 恒成立，竖排不会上下重叠。
-    let scale = if cfg.line_scale > 0.0 {
-        cfg.line_scale.clamp(LINE_SCALE_MIN, LINE_SCALE_MAX)
+    let banxin_w = (per_leaf * ratio).max(120.0);
+    let mw = (per_leaf * cfg.margin)
+        .min(((per_leaf - banxin_w) / 2.0).max(0.0))
+        .max(0.0);
+    let inner_w = (per_leaf - edge - 2.0 * mw).max(40.0);
+    let want = (banxin_w - edge) / n; // 版心率反推的列宽
+    let col_w = if want >= fs {
+        want.clamp(fs, row_h * COL_W_MAX_OF_ROW)
     } else {
-        LINE_SCALE_BASE
+        // 窄屏（典型：手机 12/14 列）：75% 叶宽放不下 12px 下限的字，
+        // 退回可用宽均分——版心占比超标 → 滚动，字仍不破格。
+        (inner_w / n).clamp(fs, row_h * COL_W_MAX_OF_ROW)
     };
-    let lratio = if cfg.line_ratio > 0.0 {
-        cfg.line_ratio
-    } else {
-        GRID_ROW_RATIO / ratio
-    };
-    let row_h = fs * lratio * scale;
-    // 7) 总行数 = floor(可用高 / 行高)。
-    let rows = ((inner_h / row_h).floor()).max(1.0) as usize;
 
     let grid_w = (cfg.columns as f32 + extra_cols) * col_w;
     let grid_h = rows as f32 * row_h;
     let outer_w = grid_w + edge + 2.0 * mw;
-    let outer_h = grid_h + head + foot + 2.0 * mh;
+    // 整张纸高 = 字格区 + 天头 + 地脚预留 + 鱼尾叶码条（+ 版框上缘）。
+    // 行款未被兜底时 `grid_h == inner_h`，纸高恒等于内容区高。
+    let outer_h = grid_h + head + mt + mb + foot_h;
 
     GridMetrics {
         dir: cfg.dir,
         columns: cfg.columns,
+        target_chars: cfg.target_chars.max(1),
+        chars_per_col: rows,
         rows,
         col_w,
         row_h,
@@ -494,6 +665,8 @@ pub fn compute_grid(
         outer_w,
         outer_h,
         min_font_hit: min_hit,
+        margin_top: mt,
+        margin_bot: mb,
     }
 }
 
@@ -604,6 +777,10 @@ pub struct GridInput {
     pub fs_ratio: f32,
     /// **行高 / 字号**（行款预设给）：宋版 1.20、信笺 1.05。传 0 = 查表。
     pub line_ratio: f32,
+    /// **版心率**（v1.33.0 留白档）：版心宽 ÷ 单叶可用宽。
+    /// 0.60 宽（复古）/ 0.75 中（标准，默认）/ 0.90 窄（满屏）。
+    /// 传 0 = 默认档。见 [`BANXIN_RATIOS`]。
+    pub banxin_ratio: f32,
     pub dir: GridDir,
     /// 字号上限（px）：常规阅读 = [`GRID_FS_MAX`]；专注模式传
     /// `f32::INFINITY`（整屏只排一叶，就是要大字）。
@@ -663,6 +840,12 @@ pub fn calculate_grid(inp: GridInput) -> GridPlan {
         fs_ratio,
         line_ratio,
         line_scale: inp.line_scale,
+        // 行款字数：按列数查行款表；未登记的列数按斜率估一个（同量级）。
+        target_chars: preset
+            .map(|c| c.target_chars)
+            .unwrap_or_else(|| ((inp.columns.max(1) as f32) * TARGET_CHARS_SLOPE).round() as usize),
+        // 留白档：调用方（fit_sizes，读 Prefs）给 0 = 用默认档。
+        banxin_ratio: inp.banxin_ratio,
     };
     // 整页：版框 / 天头 / 地脚也乘同一系数——否则「边框不缩放」会让内部
     // 比例随屏幕漂移，那就不是「等比缩放」而是「换个版式」了。
@@ -756,6 +939,8 @@ mod tests {
             foot: 12.0,
             margin: 0.04,
             line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
+            // 留白档：测试助手一律走默认档「中（75%）」——与出厂行为一致。
+            banxin_ratio: BANXIN_RATIOS[BANXIN_TIER_DEFAULT],
             dir: GridDir::Vertical,
             fs_max: GRID_FS_MAX,
         }
@@ -771,10 +956,13 @@ mod tests {
         assert!(facing.facing, "对开 = 两叶");
         assert!(full.facing, "整页 = 一整叶（两叶 + 中缝）");
         assert!(!single.facing, "手机竖屏 = 单叶");
-        // 单叶把整幅宽都给了这一叶 → 字更大。
+        // 单叶把整幅宽都给了这一叶 → 版心更宽（列宽更大、字距更疏）。
+        // 行款模型（v1.32.0）下字号由「每列几字」定：单叶与对开**字号相同**
+        // （同一行款印不出两种字），差别只在版心宽——版心率（v1.33.0）
+        // 按单叶可用宽算，单叶的叶更宽，故列更宽。
         assert!(
-            single.m.col_w > facing.m.col_w,
-            "单叶列宽 {:.1} 应大于对开 {:.1}",
+            single.m.col_w >= facing.m.col_w - 0.01,
+            "单叶列宽 {:.1} 不该小于对开 {:.1}",
             single.m.col_w,
             facing.m.col_w
         );
@@ -784,22 +972,29 @@ mod tests {
         assert_eq!(single.scale, 1.0);
         assert_eq!(facing.scale, 1.0);
         assert!(full.scale > 0.0 && full.scale <= FULL_SCALE_MAX);
-        // 三模式共用同一套算式：fs = 0.75 × col_w，row_h = 1.0 × col_w。
+        // 三模式共用同一套行款算式：row_h = 可用高 / target_chars，
+        // fs = row_h × FS_OF_ROW，col_w = (版心 − 版框) / 列数（版心率定宽）。
         for p in [single, facing, full] {
             assert!(p.m.fs >= GRID_FS_MIN - 0.01, "字号跌破下限：{:.2}", p.m.fs);
             assert!(p.m.row_h > p.m.fs, "row_h 必须大于 fs（竖排不上下重叠）");
-            if !p.m.min_font_hit {
-                // 触上限时列宽不再等于 fs/0.75（大屏上会保底 70%），
-                // 但字绝不会比「贴着格」还大。
+            // 字不破格：字号不超过列宽、也不超过行高。
+            assert!(
+                p.m.fs <= p.m.col_w + 0.01,
+                "字宽超格：fs={:.2} col_w={:.2}",
+                p.m.fs,
+                p.m.col_w
+            );
+            assert!(p.m.fs <= p.m.row_h + 0.01, "字高超行高");
+            if !p.m.min_font_hit && p.m.fs < GRID_FS_MAX + 0.01 {
+                // 未被兜底、未触顶：字号严格 = 行高 × 0.85（行款算式本身）。
                 assert!(
-                    p.m.fs <= p.m.col_w * GRID_FS_RATIO + 0.01,
-                    "fs 超过 0.75×col_w：{:.2} > {:.2}",
+                    (p.m.fs - p.m.row_h * FS_OF_ROW).abs() < 0.01,
+                    "fs 非 row_h×{FS_OF_ROW}：{:.2} vs {:.2}",
                     p.m.fs,
-                    p.m.col_w * GRID_FS_RATIO
+                    p.m.row_h * FS_OF_ROW
                 );
-                if p.m.fs < GRID_FS_MAX - 0.01 {
-                    assert!((p.m.fs - p.m.col_w * GRID_FS_RATIO).abs() < 0.01, "fs 非 0.75×col_w");
-                }
+                // 行款满额：每列字数 = 目标（屏幕只决定印不印得下，不改行款）。
+                assert_eq!(p.m.chars_per_col, p.m.target_chars);
             }
         }
     }
@@ -831,13 +1026,15 @@ mod tests {
             prev = p.m.col_w;
             assert!(p.m.fs >= GRID_FS_MIN - 0.01, "{n} 列字号跌破 {GRID_FS_MIN}");
         }
-        // 极窄屏 14 列：触发最小字号保护 → 反推列宽，字不小于 12px。
-        let p = calculate_grid(input(LayoutMode::Single, 14, 240.0, 480.0));
+        // 极窄屏 14 列（行款 26 字/列）：可用高除以 26 后字号跌破 12px
+        // 下限 → 触发最小字号锁定，fs 不应低于下限，且列宽保证字不超格
+        // （字格至少与字同宽——不够宽就溢出滚动，不压字）。
+        let p = calculate_grid(input(LayoutMode::Single, 14, 200.0, 400.0));
         assert!(p.m.min_font_hit, "窄屏 14 列应触发最小字号保护");
         assert!(p.m.fs >= GRID_FS_MIN - 0.01, "保护后字号仍 {:.2}", p.m.fs);
         assert!(
-            p.m.col_w >= p.m.fs / GRID_FS_RATIO - 0.01,
-            "反推列宽不足：col_w={:.2} fs={:.2}",
+            p.m.col_w >= p.m.fs - 0.01,
+            "列宽不足：col_w={:.2} fs={:.2}",
             p.m.col_w,
             p.m.fs
         );
@@ -863,10 +1060,19 @@ mod tests {
         // 传无限上限（专注模式）：不封顶，整屏就该是大字。
         let free = compute_grid(2560.0, 1400.0, cfg, false, 1.0, 50.0, 0.0, 12.0, 0.0, f32::INFINITY);
         assert!(
-            free.fs > GRID_FS_MAX * 1.5,
+            free.fs > GRID_FS_MAX,
             "专注模式不该被 {GRID_FS_MAX} 限住：{:.1}",
             free.fs
         );
+        assert!(
+            free.fs > capped.fs * 1.2,
+            "不封顶的字号 {:.1} 应明显大于封顶值 {:.1}",
+            free.fs,
+            capped.fs
+        );
+        // 行款不被上限拆散：封顶只压字号，每列仍是 21 字。
+        assert_eq!(capped.chars_per_col, 21);
+        assert_eq!(free.chars_per_col, 21);
     }
 
     #[test]
@@ -894,27 +1100,59 @@ mod tests {
 
     #[test]
     fn formulas_match_spec() {
-        // 竖排 12 列：col_w = 可用宽/12，fs = 0.75*col_w，row_h = 1.0*col_w。
-        // extra_cols = 0：章题列在格内，不占额外宽。
+        // 行款算式（v1.32.0）：row_h = 可用高 / target_chars；
+        // fs = row_h × FS_OF_ROW；col_w = (版心 − 版框) / 列数（v1.33.0
+        // 版心率定宽：版心 = 单叶可用宽 × 0.75）。
+        // 每列字数神圣：未被兜底时 rows 恒等于 target_chars。
         let (cw, ch) = content();
-        // 传无限上限：这一条验的是「算式本身」，不该被 32px 的阅读上限干扰
-        // （1276 宽单叶的字号本来会上百，触顶后列宽回缩，验不出公式）。
-        // 显式给「旧口径」两个比例（0.75 字级 / 1.0 列宽行高）：这条验的是
-        // 算式本身，不该被行款预设的另一个比例搅进来。
+        // 传无限上限：这一条验的是「算式本身」，不该被 32px 的阅读上限干扰。
         let cfg = GridConfig {
             columns: 12,
-            fs_ratio: 0.75,
-            line_ratio: 1.0 / 0.75,
+            target_chars: 21,
             ..GridConfig::default()
         };
         let m = compute_grid(cw, ch, cfg, false, 1.0, 50.0, 0.0, 12.0, 0.0, f32::INFINITY);
         let inner_w = (cw - 50.0 - 2.0 * cw * 0.04).max(40.0);
-        let expect_col = inner_w / 12.0;
-        assert!((m.col_w - expect_col).abs() < 0.01, "col_w {:.2} ≠ {:.2}", m.col_w, expect_col);
-        assert!((m.fs - expect_col * 0.75).abs() < 0.01, "fs 非 0.75*col_w");
-        assert!((m.row_h - expect_col * GRID_ROW_RATIO).abs() < 0.01, "row_h 非 1.0*col_w");
-        // row_h 必大于 fs（竖排不上下重叠）。
+        // ① 行款目标 = 21 字/列，且实实在在排满（行款没被拆）。
+        assert_eq!(m.target_chars, 21);
+        assert_eq!(m.chars_per_col, 21, "行款应排满每列 21 字");
+        assert_eq!(m.rows, 21);
+        // ② 字号 = 行高 × 0.85（字面必须略小于行高，竖排不粘连）。
+        assert!((m.fs - m.row_h * FS_OF_ROW).abs() < 0.01, "fs 非 row_h×{FS_OF_ROW}");
         assert!(m.row_h > m.fs, "row_h({}) 必须大于 fs({})", m.row_h, m.fs);
+        // ③ 版心率定宽（v1.33.0）：版心 = 可用宽 × 75%，列宽由它反推，
+        //    再受两条边界夹住（字不破格 ≥ fs；字距不散 ≤ 2×行高）。
+        //    单叶 1276 宽上 75% 档会撞第二条（字距上限）——这正是帽子的
+        //    用途：宁可版心占比略降，也不把乌丝栏拉成一道栅栏。
+        let want = (cw * 0.75 - 50.0) / 12.0;
+        let expect_col = want.clamp(m.fs, m.row_h * COL_W_MAX_OF_ROW);
+        assert!(
+            (m.col_w - expect_col).abs() < 0.01,
+            "列宽 {:.2} 应 = clamp((75%×{:.0}−版框)/12, fs, 2×row_h) = {:.2}",
+            m.col_w,
+            cw,
+            expect_col
+        );
+        assert!(m.col_w >= m.fs - 0.01, "字宽超格：fs={:.2} col_w={:.2}", m.fs, m.col_w);
+        assert!(
+            m.col_w <= m.row_h * COL_W_MAX_OF_ROW + 0.01,
+            "字距散成栅栏：col_w={:.2} row_h={:.2}",
+            m.col_w,
+            m.row_h
+        );
+        assert!(m.col_w * 12.0 <= inner_w + 0.5, "12 列总宽 {:.1} 超可用宽", m.grid_w);
+        assert!(m.grid_w <= inner_w + 0.5);
+        // ④ 纵向预算正好用光：纸高 + 页脚注区 = 内容区高。
+        //    自 v1.34.0 起 `foot`（注文带）**不是地脚的一部分**——地脚
+        //    = 天头 ÷ 2（用户铁律 `TOP_OF_BOT`），注区像 `head` 一样是
+        //    独立的纵向预留，故纸高 = 内容高 − 注区。
+        assert!(
+            (m.outer_h + 12.0 - ch).abs() < 0.5,
+            "纸高 + 注区 {:.1} 应 = 内容高 {:.1}",
+            m.outer_h + 12.0,
+            ch
+        );
+        assert!(m.outer_w <= cw + 0.5, "纸宽 {:.1} 超内容区 {:.1}", m.outer_w, cw);
     }
 
     #[test]
@@ -931,6 +1169,7 @@ mod tests {
                 columns: qing.columns,
                 fs_ratio: qing.fs_ratio,
                 line_ratio: qing.line_ratio,
+                target_chars: qing.target_chars,
                 ..GridConfig::default()
             },
             true,
@@ -954,6 +1193,7 @@ mod tests {
                 columns: song.columns,
                 fs_ratio: song.fs_ratio,
                 line_ratio: song.line_ratio,
+                target_chars: song.target_chars,
                 ..GridConfig::default()
             },
             true,
@@ -978,6 +1218,8 @@ mod tests {
             assert!(b.columns > a.columns, "列数应递增：{} → {}", a.columns, b.columns);
             assert!(b.fs_ratio < a.fs_ratio, "字号比应递减：{} → {}", a.columns, b.columns);
             assert!(b.line_ratio < a.line_ratio, "行高比应递减：{} → {}", a.columns, b.columns);
+            // 行款字数随列数递增（八行十五字 → 十四行二十六字）。
+            assert!(b.target_chars > a.target_chars, "行款字数应递增：{} → {}", a.columns, b.columns);
             assert!(!a.desc.is_empty() && !a.label.is_empty(), "行款缺文案");
         }
         // 预设键可按名点名（含长名别名）。
@@ -993,33 +1235,54 @@ mod tests {
 
     #[test]
     fn font_size_and_row_height_follow_the_preset_ratios() {
-        // 不写死像素：fs = 可用宽/列数 × fontSizeRatio，row_h = fs × lineHeightRatio。
+        // 行款驱动（v1.32.0）：每列字数 = 行款表 target_chars（神圣）；
+        // 行高 = 可用高 / target_chars；字号 = 行高 × FS_OF_ROW。
         let (cw, ch) = content();
         let mut prev_rows = 0usize;
         for p in LayoutConfig::presets() {
             let cfg = GridConfig {
                 columns: p.columns,
-                fs_ratio: p.fs_ratio,
-                line_ratio: p.line_ratio,
+                target_chars: p.target_chars,
                 ..GridConfig::default()
             };
-            // 单叶 + 无限上限：纯粹验行款比例，不被 32px 上限干扰。
+            // 单叶 + 无限上限：纯粹验行款算式，不被 32px 上限干扰。
             let m = compute_grid(cw, ch, cfg, false, 1.0, 50.0, 0.0, 12.0, 0.0, f32::INFINITY);
-            let inner_w = (cw - 50.0 - 2.0 * cw * 0.04).max(40.0);
-            let expect_col = inner_w / p.columns as f32;
+            // ① 行款目标字数如实刻在度量里，且每列排满（行款没被拆）。
+            assert_eq!(m.target_chars, p.target_chars, "{} 列行款字数", p.columns);
+            assert_eq!(m.chars_per_col, p.target_chars, "{} 列应排满行款", p.columns);
+            assert_eq!(m.rows, p.target_chars);
+            // ② 字号 = 行高 × 0.85：字面必须略小于行高（防粘连的底线）。
             assert!(
-                (m.fs - expect_col * p.fs_ratio).abs() < 0.01,
-                "{} 列字号应 = 列宽 × {:.2}，实为 {:.2}",
-                p.columns, p.fs_ratio, m.fs
+                (m.fs - m.row_h * FS_OF_ROW).abs() < 0.01,
+                "{} 列字号应 = 行高 × {:.2}，实为 {:.2} / {:.2}",
+                p.columns, FS_OF_ROW, m.fs, m.row_h
             );
-            assert!(
-                (m.row_h - m.fs * p.line_ratio).abs() < 0.01,
-                "{} 列行高应 = 字号 × {:.2}，实为 {:.2}",
-                p.columns, p.line_ratio, m.row_h
-            );
-            // 行高必大于字号：竖排两字不上下重叠（行款保证 line_ratio > 1）。
             assert!(m.row_h > m.fs, "{} 列 row_h({:.2}) 必须 > fs({:.2})", p.columns, m.row_h, m.fs);
-            // 行款越密，一列能排的字越多。
+            // ③ 版心率定宽（v1.33.0）：列宽 = (75%×可用宽 − 版框)/列数，
+            //    夹在 [fs, 2×行高] 之间；总宽不溢出可用宽。
+            let want = (cw * 0.75 - 50.0) / p.columns as f32;
+            let expect_col = want.clamp(m.fs, m.row_h * COL_W_MAX_OF_ROW);
+            assert!(
+                (m.col_w - expect_col).abs() < 0.01,
+                "{} 列列宽 {:.2} 应 = {:.2}",
+                p.columns, m.col_w, expect_col
+            );
+            let inner_w = (cw - 50.0 - 2.0 * cw * 0.04).max(40.0);
+            assert!(
+                m.col_w * p.columns as f32 <= inner_w + 0.5,
+                "{} 列总宽 {:.1} 超可用宽 {:.1}",
+                p.columns, m.grid_w, inner_w
+            );
+            // ④ 纵向预算正好用光：纸高 + 页脚注区 = 内容区高
+            //    （`foot` 是注文带、不是地脚，见 `TOP_OF_BOT`）。
+            assert!(
+                (m.outer_h + 12.0 - ch).abs() < 0.5,
+                "{} 列纸高 + 注区 {:.1} ≠ 内容高 {:.1}",
+                p.columns,
+                m.outer_h + 12.0,
+                ch
+            );
+            // ⑤ 行款越密，一列能排的字越多。
             assert!(m.rows >= prev_rows, "{} 列行数 {} 少于上一档 {}", p.columns, m.rows, prev_rows);
             prev_rows = m.rows;
         }
@@ -1035,6 +1298,8 @@ mod tests {
                 columns: 14,
                 dir: GridDir::Vertical,
                 margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
+                target_chars: 26,
+                banxin_ratio: BANXIN_RATIOS[BANXIN_TIER_DEFAULT],
             },
             false,
             1.0,
@@ -1049,15 +1314,18 @@ mod tests {
 
     #[test]
     fn min_font_prevents_tiny_glyphs_on_narrow_screen() {
-        // 极窄内容区（200×640）+ 14 列：触发最小字号，fs 不应低于下限，
-        // 且 col_w 反推保证字不超格。
+        // 极窄内容区（200×400）+ 14 列（行款 26 字/列）：可用高除以 26 后
+        // 字号跌破 12px 下限 → 触发最小字号锁定，fs 不应低于下限，
+        // 且列宽保证字不超格（字格至少与字同宽——不够宽就溢出滚动）。
         let m = compute_grid(
             200.0,
-            640.0,
+            400.0,
             GridConfig {
                 columns: 14,
                 dir: GridDir::Vertical,
                 margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
+                target_chars: 26,
+                banxin_ratio: BANXIN_RATIOS[BANXIN_TIER_DEFAULT],
             },
             false,
             1.0,
@@ -1067,7 +1335,9 @@ mod tests {
             0.0,GRID_FS_MAX);
         assert!(m.min_font_hit, "窄屏 14 列应触发最小字号");
         assert!(m.fs >= GRID_FS_MIN - 0.01, "fs 不得低于下限 {GRID_FS_MIN}");
-        assert!(m.col_w >= m.fs / GRID_FS_RATIO - 0.01, "col_w 须 ≥ fs/0.75，否则字超格");
+        assert!(m.col_w >= m.fs - 0.01, "col_w 须 ≥ fs，否则字超格");
+        // 行款兜底：锁字号后一列排不满 26 字（渲染层开滚动 + 状态栏提示）。
+        assert!(m.chars_per_col < m.target_chars, "兜底时行款应排不满");
     }
 
     #[test]
@@ -1082,6 +1352,8 @@ mod tests {
         let m = GridMetrics {
             dir: GridDir::Vertical,
             columns: 3,
+            target_chars: 2,
+            chars_per_col: 2,
             rows: 2,
             col_w: 10.0,
             row_h: 11.0,
@@ -1091,6 +1363,8 @@ mod tests {
             outer_w: 30.0,
             outer_h: 22.0,
             min_font_hit: false,
+            margin_top: 0.0,
+            margin_bot: 0.0,
         };
         assert_eq!(cell_origin(&m, 2, 0), (0.0, 0.0));
         assert_eq!(cell_origin(&m, 0, 0), (20.0, 0.0));
@@ -1107,6 +1381,8 @@ mod tests {
         let m = GridMetrics {
             dir: GridDir::Horizontal,
             columns: 3,
+            target_chars: 2,
+            chars_per_col: 2,
             rows: 2,
             col_w: 10.0,
             row_h: 11.0,
@@ -1116,6 +1392,8 @@ mod tests {
             outer_w: 30.0,
             outer_h: 22.0,
             min_font_hit: false,
+            margin_top: 0.0,
+            margin_bot: 0.0,
         };
         assert_eq!(cell_origin(&m, 0, 0), (0.0, 0.0));
         assert_eq!(cell_origin(&m, 2, 0), (20.0, 0.0));
@@ -1260,6 +1538,8 @@ mod tests {
                     dir: c.dir,
                     margin: c.margin,
                     line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
+                    target_chars: c.target_chars,
+                    banxin_ratio: BANXIN_RATIOS[BANXIN_TIER_DEFAULT],
                 },
                 false,
                 1.0,
@@ -1275,7 +1555,10 @@ mod tests {
     }
 
     #[test]
-    fn line_height_scale_loosens_rows_and_keeps_glyphs_apart() {
+    fn hangkou_wins_over_line_scale_and_keeps_glyphs_apart() {
+        // 行款优先（v1.32.0）：每列字数由行款表定，字体行高缩放
+        // （line_scale）**不再参与**字号 / 行高算式——绝不为了适配字体
+        // 而悄悄改动「一行几字」。缩放只影响观感余量，不动行款。
         let grid = |scale: f32| {
             compute_grid(
                 800.0,
@@ -1285,6 +1568,8 @@ mod tests {
                     dir: GridDir::Vertical,
                     margin: 0.04,
                     line_scale: scale, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
+                    target_chars: 15,
+                    banxin_ratio: BANXIN_RATIOS[BANXIN_TIER_DEFAULT],
                 },
                 false,
                 1.0,
@@ -1295,18 +1580,274 @@ mod tests {
         };
         let base = grid(1.0);
         let kai = grid(1.12);
-        // 行高随缩放放大 → 每列能排的行数相应减少（分页与渲染同源，不溢出）。
-        assert!(kai.row_h > base.row_h, "{} vs {}", kai.row_h, base.row_h);
-        assert!(kai.rows <= base.rows);
-        // 无论怎么缩放，行高始终大于字号：竖排绝不会上下重叠。
-        assert!(kai.row_h > kai.fs);
-        assert!(base.row_h > base.fs);
-        // 中性值 = 不缩放。
-        assert!((grid(crate::grid::LINE_SCALE_BASE).row_h - base.row_h).abs() < 0.01);
-        // 异常值被夹住，行气不至于散掉或压成一团。
         let wild = grid(9.0);
-        assert!(wild.row_h <= base.row_h * crate::grid::LINE_SCALE_MAX + 0.01);
         let tiny = grid(0.01);
-        assert!(tiny.row_h >= base.row_h * crate::grid::LINE_SCALE_MIN - 0.01);
+        // ① 行款恒定：四个缩放下每列字数都一样（15 字），行款没被拆。
+        for (name, m) in [("base", &base), ("kai", &kai), ("wild", &wild), ("tiny", &tiny)] {
+            assert_eq!(m.rows, 15, "{name} 行款应恒为 15 字/列");
+            assert_eq!(m.chars_per_col, m.target_chars, "{name} 行款应排满");
+        }
+        // ② 行高 / 字号恒定：缩放不进来搅局（同输入 → 同输出）。
+        for (name, m) in [("kai", &kai), ("wild", &wild), ("tiny", &tiny)] {
+            assert!((m.row_h - base.row_h).abs() < 0.01, "{name} 行高不该随缩放漂移");
+            assert!((m.fs - base.fs).abs() < 0.01, "{name} 字号不该随缩放漂移");
+        }
+        // ③ 无论怎么缩放，行高始终大于字号：竖排绝不会上下重叠。
+        for (name, m) in [("base", &base), ("kai", &kai), ("wild", &wild), ("tiny", &tiny)] {
+            assert!(m.row_h > m.fs, "{name} row_h({:.2}) 必须 > fs({:.2})", m.row_h, m.fs);
+            assert!((m.fs - m.row_h * FS_OF_ROW).abs() < 0.01, "{name} 字号应 = 行高×0.85");
+        }
+        // ④ 中性值 = 不缩放（确定性）。
+        assert!((grid(crate::grid::LINE_SCALE_BASE).row_h - base.row_h).abs() < 0.01);
+    }
+
+    // ---- 留白三档（v1.33.0）：版心宽 ÷ 单叶可用宽 ----
+
+    /// 三档的版心率：宽（复古 60%）< 中（标准 75%）< 窄（满屏 90%），
+    /// 默认档是「中」——既留古籍两侧留白的优雅，又保证现代屏幕阅读体验。
+    #[test]
+    fn banxin_ratio_tiers_step_from_retro_to_full() {
+        assert_eq!(BANXIN_RATIOS.len(), 3, "三档");
+        assert_eq!(BANXIN_TIER_DEFAULT, 1, "默认档 = 中");
+        assert!((BANXIN_RATIOS[BANXIN_TIER_DEFAULT] - 0.75).abs() < 1e-6);
+        assert!(BANXIN_RATIOS[0] < BANXIN_RATIOS[1] && BANXIN_RATIOS[1] < BANXIN_RATIOS[2]);
+        // 天头率随档联动：版心越窄（越复古），天头越宽——选「宽」的人
+        // 在追求极致文物感，值得更大的天头（用户 v1.33.0 要求）。
+        assert!(
+            top_frac_for(BANXIN_RATIOS[0]) > top_frac_for(BANXIN_RATIOS[1])
+                && top_frac_for(BANXIN_RATIOS[1]) > top_frac_for(BANXIN_RATIOS[2]),
+            "天头率应随留白档收窄：{:?}",
+            BANXIN_TOP_FRACS
+        );
+        // 未登记的比值（用户自定）退回基准天头，不 panic。
+        assert!((top_frac_for(0.66) - ANCIENT_TOP_FRAC).abs() < 1e-6);
+    }
+
+    /// 版心率真的管用：三档各自把版心拉到「单叶可用宽 × 档位」，
+    /// 纸不超出单叶，字不破格、字距不散；**行款一字不改**（每列仍 21 字）。
+    #[test]
+    fn banxin_ratio_sizes_the_block_and_keeps_hangkou() {
+        // 1202×710 对开（用户的屏幕口径）：12 列、行款 21 字/列。
+        let (cw, ch) = (1161.0, 640.0);
+        let base = GridConfig {
+            columns: 12,
+            target_chars: 21,
+            ..GridConfig::default()
+        };
+        let gap = gutter_w(cw, 12, 50.0, base.margin);
+        let per_leaf = (cw - gap) / 2.0;
+        let mut prev_top = f32::MAX;
+        for (i, &ratio) in BANXIN_RATIOS.iter().enumerate() {
+            let m = compute_grid(
+                cw,
+                ch,
+                GridConfig {
+                    banxin_ratio: ratio,
+                    ..base
+                },
+                true,
+                1.0,
+                50.0,
+                0.0,
+                0.0,
+                0.0,
+                GRID_FS_MAX,
+            );
+            // ① 版心 = 单叶可用宽 × 档位（此尺寸下三档都不触顶，精确命中）。
+            let banxin = m.grid_w + 50.0;
+            assert!(
+                (banxin - per_leaf * ratio).abs() < 0.5,
+                "{} 档版心 {:.1} 应 = {:.0}×{:.2}",
+                ["宽", "中", "窄"][i],
+                banxin,
+                per_leaf,
+                ratio
+            );
+            // ② 纸不超出单叶（满屏档时纸边留白归零、正好贴满）。
+            assert!(m.outer_w <= per_leaf + 0.5, "{} 档纸宽 {:.1} 超单叶", ["宽", "中", "窄"][i], m.outer_w);
+            // ③ 字不破格、字距不散成栅栏。
+            assert!(m.col_w >= m.fs - 0.01, "{} 档字宽超格", ["宽", "中", "窄"][i]);
+            assert!(
+                m.col_w <= m.row_h * COL_W_MAX_OF_ROW + 0.01,
+                "{} 档字距过宽：col_w={:.1} row_h={:.1}",
+                ["宽", "中", "窄"][i],
+                m.col_w,
+                m.row_h
+            );
+            // ④ 行款神圣：留白档只改版心宽与天头，不改「一行几字」。
+            assert_eq!(m.rows, 21, "{} 档行款被拆：{} 字/列", ["宽", "中", "窄"][i], m.rows);
+            assert_eq!(m.chars_per_col, m.target_chars);
+            // ⑤ 天头随档收窄（宽档最大 → 窄档最小）。
+            assert!(
+                m.margin_top < prev_top,
+                "{} 档天头 {:.1} 未随档收窄（上一档 {:.1}）",
+                ["宽", "中", "窄"][i],
+                m.margin_top,
+                prev_top
+            );
+            prev_top = m.margin_top;
+        }
+    }
+
+    /// 版心率缺省（传 0）= 默认档「中（75%）」——与出厂行为一致，
+    /// 老调用方不传这一字段也能拿到标准留白。
+    #[test]
+    fn banxin_ratio_unset_falls_back_to_standard() {
+        let (cw, ch) = (1161.0, 640.0);
+        let base = GridConfig {
+            columns: 12,
+            target_chars: 21,
+            banxin_ratio: 0.0,
+            ..GridConfig::default()
+        };
+        let m = compute_grid(cw, ch, base, true, 1.0, 50.0, 0.0, 0.0, 0.0, GRID_FS_MAX);
+        let std = compute_grid(
+            cw,
+            ch,
+            GridConfig {
+                banxin_ratio: BANXIN_RATIOS[BANXIN_TIER_DEFAULT],
+                ..base
+            },
+            true,
+            1.0,
+            50.0,
+            0.0,
+            0.0,
+            0.0,
+            GRID_FS_MAX,
+        );
+        assert!((m.col_w - std.col_w).abs() < 0.01, "缺省版心率应落到 75% 档");
+        assert!((m.margin_top - std.margin_top).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    // ════════════════════════════════════════════════════════════════
+    // v1.34.0 三大前提（Invariants）——用户点名「绝对不许破坏」：
+    //   ① 天宽地窄：天头必须是地脚的 **2 倍**（`TOP_OF_BOT`）；
+    //   ② 绝对居中：对开两叶一丝不差等宽，中缝钉在屏幕正中央；
+    //   ③ 句读不被盖：几何钉在 `punct` 模块（见那里的单测），
+    //      渲染顺序上句读是整棵树最深的叶子，必然最后落笔。
+    // 动边框 / 动字号 / 动列数之前，先跑这个模块。
+    // ════════════════════════════════════════════════════════════════
+
+    /// ① 天宽地窄：**任何**列数、任何留白档、任何窗口尺寸、开不开页脚注，
+    /// 天头都严格是地脚的 2 倍——加粗外框（1px→3px）不许把版面挤扁，
+    /// 更不许把上下留白拉成对称。
+    #[test]
+    fn top_margin_is_exactly_twice_the_bottom_margin() {
+        // 窗口尺寸 × 列数 × 留白档 × 页脚注开关，全扫一遍。
+        for &(cw, ch) in &[(1161.0, 640.0), (1280.0, 760.0), (900.0, 500.0), (1600.0, 1000.0)] {
+            for &cols in &[8usize, 10, 12, 14] {
+                for &ratio in &BANXIN_RATIOS {
+                    for &foot in &[0.0, 76.0] {
+                        let cfg = GridConfig {
+                            columns: cols,
+                            target_chars: LayoutConfig::by_columns(cols)
+                                .map(|c| c.target_chars)
+                                .unwrap_or(21),
+                            banxin_ratio: ratio,
+                            ..GridConfig::default()
+                        };
+                        let m = compute_grid(cw, ch, cfg, true, 1.0, 50.0, 0.0, foot, 0.0, GRID_FS_MAX);
+                        let want = m.margin_top / TOP_OF_BOT;
+                        assert!(
+                            (m.margin_bot - want).abs() < 0.01,
+                            "2:1 被打破：cols={cols} 档={ratio} 窗={cw}×{ch} foot={foot} → 天头 {:.2} / 地脚 {:.2}",
+                            m.margin_top,
+                            m.margin_bot
+                        );
+                        // 顺带钉死「宽窄」方向本身：天头永远严格大于地脚。
+                        assert!(
+                            m.margin_top > m.margin_bot,
+                            "上下留白对称了：{:.2} vs {:.2}",
+                            m.margin_top,
+                            m.margin_bot
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// ① 的兜底：地脚永不超过天头（哪怕内容区矮到留白被 clamp 成 0）。
+    #[test]
+    fn bottom_margin_never_grows_past_the_top() {
+        for &ch in &[220.0, 240.0, 320.0, 640.0] {
+            let cfg = GridConfig::default();
+            let m = compute_grid(1161.0, ch, cfg, true, 1.0, 50.0, 0.0, 0.0, 0.0, GRID_FS_MAX);
+            assert!(m.margin_bot <= m.margin_top + 1e-6, "ch={ch} 地脚反超天头");
+        }
+    }
+
+    /// ② 绝对居中：对分两叶 + 中缝恰好铺满内容宽，两叶一丝不差等宽，
+    /// 且**中缝中心 = 屏幕正中央**（`gw/2 + per_leaf == cw/2`）。
+    /// 中缝宽只由「列数 / 内容宽 / 版框 / 纸边」决定，与边框粗细无关。
+    #[test]
+    fn facing_split_is_symmetric_and_the_gutter_sits_on_the_center_line() {
+        for &(cw, cols) in &[
+            (1161.0, 8usize),
+            (1161.0, 10),
+            (1161.0, 12),
+            (1161.0, 14),
+            (900.0, 12),
+            (1600.0, 14),
+        ] {
+            for &edge in &[50.0, 14.0, 3.0] {
+                // 外框从 1px 加到 3px（edge 取几档）都不许破坏等宽与居中。
+                let gw = gutter_w(cw, cols, edge, 0.10);
+                let per_leaf = ((cw - gw) / 2.0).max(60.0);
+                // ②-a 两叶严格等宽：从中缝向两侧各分一半，右叶宽度由
+                //   「剩余宽度」反算，差值必须为 0（不许有一丝舍入损失）。
+                let right_w = cw - gw - per_leaf;
+                assert!(
+                    (per_leaf - right_w).abs() < 1e-9,
+                    "cols={cols} edge={edge}：两叶不等宽 {per_leaf} vs {right_w}"
+                );
+                // ②-b 两叶 + 中缝 = 内容宽（不溢不欠）。
+                assert!(
+                    (per_leaf * 2.0 + gw - cw).abs() < 1e-4,
+                    "cols={cols} edge={edge}：{per_leaf}×2 + {gw} ≠ {cw}"
+                );
+                // ②-c 中缝中心钉在屏幕正中。
+                let gutter_center = per_leaf + gw * 0.5;
+                assert!(
+                    (gutter_center - cw * 0.5).abs() < 1e-4,
+                    "cols={cols} edge={edge}：中缝中心 {gutter_center} 不在屏幕正中 {}",
+                    cw * 0.5
+                );
+                // ②-d 中缝宽度合理（立得住一对鱼尾，又不像一条马路）。
+                assert!(gw >= LEAF_GAP_MIN - 1e-6 && gw <= LEAF_GAP_MAX + 1e-6);
+            }
+        }
+    }
+
+    /// v1.34.0 回归（用户实测「双叶分家」）：对开两叶贴中缝的内侧缘
+    /// **也必须描边**——左叶右缘、右叶左缘各一道粗竖框，中缝才被
+    /// 两条竖线夹住，而不是一条孤立的马路。
+    #[test]
+    fn every_half_closes_all_four_sides() {
+        for half in [LeafHalf::Alone, LeafHalf::Left, LeafHalf::Right] {
+            let sides = frame_sides(half);
+            assert_eq!(sides, [true, true, true, true], "{half:?} 有边没闭合：{sides:?}");
+        }
+    }
+
+    /// 左半叶的右缘（贴中缝）与右半叶的左缘（贴中缝）都必须闭合——
+    /// 这正是 v1.34.0 之前漏画的两条竖边框。
+    #[test]
+    fn gutter_facing_edges_are_closed() {
+        // 左半叶：右缘（下标 1）闭合。
+        assert!(frame_sides(LeafHalf::Left)[1], "左半叶右缘必须描边");
+        // 右半叶：左缘（下标 3）闭合。
+        assert!(frame_sides(LeafHalf::Right)[3], "右半叶左缘必须描边");
+        // 上下横框任何时候都闭合（界行两端才接得上）。
+        for half in [LeafHalf::Alone, LeafHalf::Left, LeafHalf::Right] {
+            let s = frame_sides(half);
+            assert!(s[0] && s[2], "{half:?} 上下横框断了");
+        }
     }
 }

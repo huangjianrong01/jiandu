@@ -103,6 +103,16 @@ pub struct Root {
     pub grid_rows: usize,
     /// 是否触发了最小字号（需要单页滚动）。
     pub grid_min_font: bool,
+    /// 天头预留（内容高的比例推导，单位 px）：竖笺「天头宽、地脚窄」之上缘，
+    /// 由网格引擎按 [`crate::grid::ANCIENT_TOP_FRAC`] 算出，渲染层据以铺纸。
+    pub margin_top: f32,
+    /// 地脚预留（内容高比例 + 页脚注区）：下缘留白，明显窄于天头。
+    pub margin_bot: f32,
+    /// **版心率**（v1.33.0 留白档）：版心宽 ÷ 单叶可用宽。
+    /// 0.60 宽（复古）/ 0.75 中（标准，默认）/ 0.90 窄（满屏）。
+    /// 由 `Prefs::margin_tier` 落下，`set_banxin_ratio` 改写并持久化；
+    /// 网格引擎据此反推列宽，天头率随档联动（`grid::top_frac_for`）。
+    pub banxin_ratio: f32,
     /// 版式控制面板（列数 / 方向 / 留白）是否展开。
     pub show_grid_panel: bool,
     /// 当前版式配置键：数据驱动排版引擎的句柄（见 [`crate::grid::LAYOUT_CONFIGS`]）。
@@ -397,6 +407,9 @@ impl Root {
             let _ = library.seed_sample();
         }
         ensure_assets();
+        // 阅读偏好（跨书持久化）：留白档从这里落下——文件缺失 / 损坏一律
+        // 回落默认值（不让坏存档挡住启动），见 `prefs::Prefs::load`。
+        let prefs = crate::prefs::Prefs::load();
         let count = library.books.len();
         let mut root = Self {
             library,
@@ -411,6 +424,11 @@ impl Root {
             row_h: 11.0,
             grid_rows: 11,
             grid_min_font: false,
+            margin_top: 0.0,
+            margin_bot: 0.0,
+            // 留白默认「中（75%）」：既留古籍两侧留白的优雅，又保证现代
+            // 屏幕上的阅读体验（用户 v1.33.0 定稿）。启动时由 prefs 落值。
+            banxin_ratio: prefs.banxin_ratio(),
             show_grid_panel: false,
             layout_key: LayoutConfig::default_key(),
             duplex: Duplex::Single,
@@ -975,15 +993,20 @@ impl Root {
         // 响应式留白：窄屏（手机竖持）只留一丝边，把宽度全让给字；
         // 宽屏照旧留 44（纸面四周要有「天地」才像刻本）。
         let narrow = crate::grid::is_narrow(self.viewport_w, self.viewport_h);
-        let (chrome_v, pad) = if self.focus_mode {
-            (0.0, 0.0)
+        // 横向留白（纸面左右天地）：专注模式 0、窄屏一丝边、宽屏留 44。
+        let pad = if self.focus_mode {
+            0.0
         } else if narrow {
-            (44.0 + 34.0, crate::grid::RESP_MARGIN)
+            crate::grid::RESP_MARGIN
         } else {
-            (44.0 + 34.0, 44.0)
+            44.0
         };
+        // 纵向预留：状态栏(~34) + 正文区上下内白(p_4=32) + 安全余量(~4)，
+        // 让算出的纸高(content_h)正好等于正文区可用高——这样纸张撑满、不再
+        // 有「居中才能遮丑」的残余留白（见 render_ancient 的天头地脚非对称）。
+        let v_reserve = if self.focus_mode { 0.0 } else { 70.0 };
         // 样式面板为浮层（可盖住正文下部），不为它预留高度，正文始终铺满。
-        let content_h = (self.viewport_h - chrome_v - pad).max(220.0);
+        let content_h = (self.viewport_h - v_reserve).max(220.0);
         // 目录改为浮层，不占水平空间。
         let content_w = (self.viewport_w - pad).max(220.0);
         self.content_w = content_w;
@@ -1056,6 +1079,9 @@ impl Root {
                             line_ratio: crate::grid::LayoutConfig::by_columns(c)
                                 .map(|x| x.line_ratio)
                                 .unwrap_or(0.0),
+                            // 留白档照当前偏好走：自动选列数不该把用户选的
+                            // 版心率甩在一边（试算与终版同口径）。
+                            banxin_ratio: self.banxin_ratio,
                             dir,
                             fs_max,
                         })
@@ -1119,12 +1145,23 @@ impl Root {
             // 不只是列变少，字也跟着大、行也跟着宽。
             fs_ratio: cur_cfg.fs_ratio,
             line_ratio: cur_cfg.line_ratio,
+            // 留白档（v1.33.0）：版心宽 ÷ 单叶可用宽（0.60 复古 / 0.75 标准
+            // / 0.90 满屏），天头率随档联动。读自 `Prefs::margin_tier`。
+            banxin_ratio: self.banxin_ratio,
             dir,
             fs_max,
         });
         self.full_scale = plan.scale;
         let m = plan.m;
+        self.margin_top = m.margin_top;
+        self.margin_bot = m.margin_bot;
         self.size_ancient = m.fs;
+        if std::env::var("JIANDU_FIT_DEBUG").is_ok() {
+            eprintln!(
+                "[fit] content_h={:.0} 天头 margin_top={:.1}  地脚 margin_bot={:.1}  比例 {:.2}:1",
+                content_h, m.margin_top, m.margin_bot, m.margin_top / m.margin_bot.max(0.01)
+            );
+        }
         self.size_modern = m.fs;
         self.line_modern = m.row_h;
         self.page_w = m.outer_w;
@@ -1136,18 +1173,34 @@ impl Root {
         // 窄屏硬选多列（典型是手机竖屏选十四行信笺）：字号已被抬到 12px 下限，
         // 纸面会溢出滚动——提示一句，别让用户以为排版坏了。
         if m.min_font_hit && !self.min_font_noticed {
+            // 行款兜底（v1.32.0）：字号已锁在 12px 下限，一列排不满行款
+            // 字数——明说「无法展示完整的 X 行 Y 字」，绝不悄悄拆行款。
             self.notice = format!(
-                "字已小到 {:.0}px（{} 列）· 建议横屏或使用平板阅读",
-                m.fs, m.columns
+                "当前窗口过小，无法展示完整的{}行{}字（已锁 {:.0}px 最小字号，可滚动查看）",
+                crate::reader::han_num(m.columns),
+                crate::reader::han_num(m.target_chars),
+                m.fs
             );
             self.min_font_noticed = true;
         } else if !m.min_font_hit {
             self.min_font_noticed = false;
         }
         if fit_debug {
+            // 行款 + 双叶几何（v1.32.0）：行款字数、每列实际字数、单叶纸宽、
+            // 中缝宽，以及「两叶 + 中缝」相对内容区的占比——中缝是否居中、
+            // 左右是否均分，一眼可查。
+            let gap = crate::grid::gutter_w(
+                content_w,
+                self.grid.columns,
+                ANCIENT_EDGE,
+                self.grid.margin,
+            );
+            let row_w = if facing { 2.0 * m.outer_w + gap } else { m.outer_w };
             eprintln!(
-                "[fit] → fs={:.1} col_w={:.1} rows={} paper={:.0}x{:.0}",
-                m.fs, m.col_w, m.rows, m.outer_w, m.outer_h
+                "[fit] → fs={:.1} col_w={:.1} row_h={:.1} rows={} (行款 {}字/列, 实际 {}字) paper={:.0}x{:.0} leaf={:.0} gap={:.1} row_w={:.0}/content_w={:.0} ({:.0}%)",
+                m.fs, m.col_w, m.row_h, m.rows, m.target_chars, m.chars_per_col, m.outer_w, m.outer_h,
+                if facing { (content_w - gap) / 2.0 } else { m.outer_w },
+                gap, row_w, content_w, row_w / content_w * 100.0
             );
         }
     }
@@ -1254,6 +1307,25 @@ impl Root {
     /// 设四周留白比例（0..1，近似四边同留白）。
     pub fn set_margin(&mut self, m: f32) {
         self.grid.margin = m.clamp(0.0, 0.2);
+    }
+
+    /// 设**留白档**（v1.33.0）：版心宽 ÷ 单叶可用宽。
+    ///
+    /// 三档（[`crate::grid::BANXIN_RATIOS`]）：0.60 宽（复古）/ 0.75 中
+    /// （标准，默认）/ 0.90 窄（满屏）。列宽由版心率反推、天头率随档联动
+    /// （见 `crate::grid::top_frac_for`），行款字数不受影响——这一档只管
+    /// 「文字区占多宽」，不管「一行几字」。
+    ///
+    /// 几何在下一帧 `fit_sizes` 重算（分页只数字数，不随宽度变，故不必
+    /// 保锚重排）；偏好**读-改-写**落盘，老存档其余字段不受影响。
+    pub fn set_banxin_ratio(&mut self, ratio: f32) {
+        self.banxin_ratio = ratio.clamp(0.35, 1.0);
+        let mut prefs = crate::prefs::Prefs::load();
+        prefs.margin_tier = crate::grid::BANXIN_RATIOS
+            .iter()
+            .position(|r| (r - self.banxin_ratio).abs() < 0.005)
+            .unwrap_or(crate::grid::BANXIN_TIER_DEFAULT);
+        prefs.save();
     }
 
     /// 切换「双行夹注 ⇄ 页脚注」时保持阅读位置：记下当前页首字锚点，
@@ -2782,8 +2854,10 @@ pub fn draft_move(draft: &str, cursor: &mut usize, left: bool) {
 pub const ANCIENT_EDGE: f32 = 50.0;
 /// 古文竖笺天头：篇题与书名已移进版框（章题列 + 地脚），天头不再单占一行。
 pub const ANCIENT_HEAD: f32 = 0.0;
-/// 古文竖笺地脚：鱼尾 + 葉码 一行（小字按 0.36×字号伸缩，这里只留固定部分）。
-pub const ANCIENT_FOOT: f32 = 12.0;
+/// 古文竖笺地脚预留：鱼尾 + 葉码条由渲染层的 `foot_h` 单独承担，纵向留白
+/// 完全交给网格引擎的 `margin_bot`（= 天头 ÷ 2，用户铁律「天头是地脚
+/// 的 2 倍」，见 `grid::TOP_OF_BOT`），故此处归零。
+pub const ANCIENT_FOOT: f32 = 0.0;
 /// 古文竖笺页脚注区预留（脚注模式且开启注释时）。
 pub const ANCIENT_NOTES: f32 = 76.0;
 /// 章题列宽度系数：章题列就是「列数」里的格内一列，与正文列同宽。
@@ -2837,6 +2911,14 @@ fn ensure_assets() {
         crate::banxin::fishtail_svg(false, crate::banxin::LETTER_TAIL_ASPECT),
     );
     let bot_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 13\"><path d=\"M0,13 L11,13 L12,0 Z M24,13 L13,13 L12,0 Z\" fill=\"#1A150F\"/></svg>";
+    // 句读「读」号：一枚小弧线（逗号 / 顿号 / 冒号类的记号），替代字体字形——
+    // 极小字号下 `，。` 会缩成一枚「奇怪的黑痣」。GPUI 只取 alpha 再用 text_color
+    // 着朱砂色，故 stroke 为不透明实色、fill 为 none。见 reader::punct_overlay。
+    let punct_comma = dir.join("punct_comma.svg");
+    let _ = std::fs::write(
+        &punct_comma,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><path d=\"M5,19 A14,14 0 0 1 19,5\" fill=\"none\" stroke=\"#1A150F\" stroke-width=\"3.6\" stroke-linecap=\"round\"/></svg>",
+    );
     // 朱砂小印「箋讀」的小篆字稿：两枚 100×100 的等粗圆头线篆（墨色由
     // 渲染层 text_color 换成朱砂红）。随系统没有篆体字库，索性照小篆结构
     // （左右对称、笔势圆匀、收笔不出锋）手写成路径，缩到 20px 见方也读得出
@@ -3006,6 +3088,12 @@ mod tests {
             columns,
             dir: GridDir::Vertical,
             margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
+            // 行款字数：按列数查行款表（v1.32.0）。
+            target_chars: crate::grid::LayoutConfig::by_columns(columns)
+                .map(|c| c.target_chars)
+                .unwrap_or(21),
+            // 留白默认档「中（75%）」（v1.33.0）。
+            banxin_ratio: crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT],
         };
         compute_grid(
             cw,
@@ -3026,6 +3114,8 @@ mod tests {
             columns: 8,
             dir: GridDir::Vertical,
             margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
+            target_chars: 15,
+            banxin_ratio: crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT],
         };
         let m = compute_grid(
             VW,
@@ -3053,6 +3143,8 @@ mod tests {
             columns: 8,
             dir: GridDir::Vertical,
             margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
+            target_chars: 15,
+            banxin_ratio: crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT],
         };
         let gap = crate::grid::gutter_w(VW, 8, ANCIENT_EDGE, cfg.margin);
         let m = compute_grid(
@@ -3069,12 +3161,16 @@ mod tests {
             // 就是要大字撑满，否则触上限后纸会缩到七成、四周留白。
             f32::INFINITY);
         assert!(2.0 * m.outer_w + gap <= VW + 0.5);
-        assert!(2.0 * m.outer_w + gap > VW * 0.95);
+        // 行款版式（v1.32.0）：字格取方，版心（界行区）窄于纸面——宋版书
+        // 版心本就只占纸宽六成，两侧留白归纸面，故不再要求铺到 95%。
+        // 底线：两叶 + 中缝仍占得下大部分宽度（不是两条细缝）。
+        assert!(2.0 * m.outer_w + gap > VW * 0.4);
         assert!(m.outer_h <= VH + 0.5, "对开纸高 {:.1} 超 {VH}", m.outer_h);
-        // 中缝宽约等于一行字宽（用户参考图「古风3」的要求）。
+        // 中缝容得下一对鱼尾：与字格同量级（0.5×~2×），不窄于半格、
+        // 不宽过两格（宽过两格就成了两片孤叶）。
         assert!(
-            (gap - m.col_w).abs() <= m.col_w * 0.12,
-            "中缝宽 {gap:.1} 应与一行字宽 {:.1} 相当",
+            gap >= m.col_w * 0.5 && gap <= m.col_w * 2.0,
+            "中缝宽 {gap:.1} 与字格宽 {:.1} 不成比例",
             m.col_w
         );
     }
@@ -3112,6 +3208,8 @@ mod tests {
             columns: 8,
             dir: GridDir::Vertical,
             margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
+            target_chars: 15,
+            banxin_ratio: crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT],
         };
         let m = compute_grid(
             cw,

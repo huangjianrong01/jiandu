@@ -81,6 +81,9 @@ pub fn to_txt(book: &Book) -> String {
 }
 
 /// 生成 Markdown：章节用二级标题，层级目录用列表缩进。
+///
+/// 正文里的注释（注 / 通假 / 人名 / 地名 / 书名 / 拼音）转成标准 Markdown
+/// 脚注 `[^1]`，定义集中在每章末尾；着重（朱砂圈点）保留为 `**加粗**`。
 pub fn to_markdown(book: &Book) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {}\n\n", book.title));
@@ -95,38 +98,89 @@ pub fn to_markdown(book: &Book) -> String {
     }
     out.push_str("\n---\n\n");
 
+    let mut footnote_counter: usize = 0;
     for ch in &book.chapters {
         out.push_str(&format!("## {}\n\n", ch.title));
+        let mut defs: Vec<(usize, String)> = Vec::new();
         for p in &ch.paragraphs {
-            out.push_str(&emph_to_bold(&p.text, &p.notes));
+            let (body, mut fs) = md_with_footnotes(&p.text, &p.notes, &mut footnote_counter);
+            out.push_str(&body);
             out.push_str("\n\n");
+            defs.append(&mut fs);
+        }
+        if !defs.is_empty() {
+            out.push_str("**脚注**\n\n");
+            for (n, d) in defs {
+                out.push_str(&format!("[^{n}]: {d}\n"));
+            }
+            out.push('\n');
         }
     }
     out
 }
 
-/// 导出 markdown 时把着重还原成 `**加粗**`：导入 → 导出走一圈不丢标记。
-fn emph_to_bold(text: &str, notes: &[Note]) -> String {
-    let emph: Vec<(usize, usize)> = notes
-        .iter()
-        .filter(|n| n.kind == NoteKind::Emph && n.len > 0)
-        .map(|n| (n.at, n.at + n.len))
-        .collect();
-    if emph.is_empty() {
-        return text.to_string();
-    }
+/// 把一段正文里的注释转成行内 `[^n]` 标记，并返回本段用到的脚注定义。
+///
+/// 仅处理带位置（`at`/`len`）的注释；无位置的（导入缺位）退化为随文
+/// `〔tag〕text`，不丢信息。`Emph` 仍走加粗，不当脚注。
+fn md_with_footnotes(
+    text: &str,
+    notes: &[Note],
+    counter: &mut usize,
+) -> (String, Vec<(usize, String)>) {
     let cs: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len() + 8);
-    for (i, c) in cs.iter().enumerate() {
-        if emph.iter().any(|(a, _)| *a == i) {
-            out.push_str("**");
+    // 按位置排序，避免乱序插入错位。
+    let mut placed: Vec<&Note> = notes
+        .iter()
+        .filter(|n| n.len > 0 && n.at < cs.len())
+        .collect();
+    placed.sort_by_key(|n| n.at);
+
+    let mut out = String::with_capacity(text.len() + placed.len() * 6);
+    let mut defs: Vec<(usize, String)> = Vec::new();
+    let mut i = 0usize;
+    for n in placed {
+        // 先把光标到注释起点之间的正文原样写出。
+        while i < n.at {
+            out.push(cs[i]);
+            i += 1;
         }
-        out.push(*c);
-        if emph.iter().any(|(_, b)| *b == i + 1) {
-            out.push_str("**");
+        match n.kind {
+            NoteKind::Emph => {
+                out.push_str("**");
+                for k in n.at..(n.at + n.len).min(cs.len()) {
+                    out.push(cs[k]);
+                }
+                out.push_str("**");
+            }
+            _ => {
+                *counter += 1;
+                let tag = note_tag(n.kind);
+                out.push_str(&format!("[^{}]", *counter));
+                defs.push((*counter, format!("{tag}{}", n.text)));
+            }
         }
+        i = (n.at + n.len).min(cs.len());
     }
-    out
+    // 余下正文。
+    while i < cs.len() {
+        out.push(cs[i]);
+        i += 1;
+    }
+    (out, defs)
+}
+
+/// 注释种类的脚注标签。
+fn note_tag(kind: NoteKind) -> String {
+    match kind {
+        NoteKind::Note => "注：".to_string(),
+        NoteKind::Tongjia => "通假：".to_string(),
+        NoteKind::Person => "人名：".to_string(),
+        NoteKind::Place => "地名：".to_string(),
+        NoteKind::Book => "书名：".to_string(),
+        NoteKind::Ruby => "拼音：".to_string(),
+        NoteKind::Emph => String::new(),
+    }
 }
 
 /// 按扩展名导出。返回实际写出的路径。
@@ -196,5 +250,30 @@ mod tests {
         let m = to_markdown(&sample());
         assert!(m.starts_with("# 测试书"));
         assert!(m.contains("## 第一章"));
+    }
+
+    #[test]
+    fn md_uses_footnotes_for_notes() {
+        use crate::types::{Note, NoteKind};
+        let mut b = Book::new("注书", "某");
+        let mut c = Chapter {
+            title: "章一".into(),
+            paragraphs: Vec::new(),
+        };
+        let mut p = Paragraph::plain("关关雎鸠");
+        // 在「雎」字处挂一条注释（at=2, len=1）。
+        p.notes.push(Note {
+            kind: NoteKind::Note,
+            at: 2,
+            len: 1,
+            text: "雎鸠，水鸟也".into(),
+            source: crate::types::NoteSource::Original,
+        });
+        c.paragraphs.push(p);
+        b.chapters.push(c);
+        let m = to_markdown(&b);
+        assert!(m.contains("[^1]"), "正文应出现脚注引用");
+        assert!(m.contains("[^1]: 注：雎鸠，水鸟也"), "应出现脚注定义");
+        assert!(m.contains("**脚注**"), "章末应有脚注区");
     }
 }
