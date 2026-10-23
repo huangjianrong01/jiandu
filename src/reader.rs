@@ -100,7 +100,10 @@ impl LeafGeo {
 
 /// 长按阈值：按住正文超过这么久再抬起，算「长按」——弹气泡菜单
 /// （复制 / 检索 / 字典），而不是普通的点字 / 拖选。
-const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(450);
+const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(500);
+/// **悬停查词阈值**：鼠标在一个字上停这么久，自动浮出字书浮签
+/// （与长按同值——两条路手感一致，见 `Root::probe_hover`）。
+pub const HOVER_LOOKUP: std::time::Duration = std::time::Duration::from_millis(500);
 
 // ── 天头眉批（v1.37.0）────────────────────────────────────────────
 /// 眉批字号 = 正文字号 × 此比例。用户定「正文的 40%」：再大就压过正文、
@@ -1201,6 +1204,13 @@ impl Root {
                     this.bar_shown = want;
                     cx.notify();
                 }
+                // 悬停查词：鼠标停在一个字上满 500ms 就浮出字书浮签。
+                // 只在**非专注模式**生效（专注模式连顶栏都收了，不该冒签），
+                // 且排在顶栏显隐之后——两者都吃这一次 mousemove，互不干扰。
+                if !this.focus_mode {
+                    let x = event.position.x.to_f64() as f32;
+                    this.probe_hover(x, y, cx);
+                }
             },
         ));
         // 键盘总入口不挂在这里：GPUI 只把按键派发给「焦点节点 → 根元素」这条
@@ -1287,6 +1297,11 @@ impl Root {
         if self.popup.is_some() {
             root = root.child(self.render_glyph_menu(cx));
         }
+
+        // 开发用：`JIANDU_LOOKUP=1` 时开卷自动对叶面上第一个命中的字开一次
+        // 查词浮签——与 `JIANDU_HEAD_NOTE` 同款调试开关，便于核对浮签版式
+        // 与避让，不影响正常交互（只在 `bubble` 为空时生效一次）。
+        self.dev_lookup_once();
 
         // 长按正文弹出的「字义浮签」（释义 / charIndex / 选中文本 / 在线查阅）。
         if self.bubble.is_some() {
@@ -1845,8 +1860,45 @@ impl Root {
                 cx.notify();
             }),
         );
+        // **「⟲ 回到卷首」**（v1.38.0）：面板最上方一枚极小号文字钮——
+        // 无底无框、悬停转朱砂，与「目錄 / ✕」同一档视觉重量。目录拉到
+        // 一百多卷时，拖回最右那根竹简太费手，一键回卷首是刚需。
+        let back_div = div()
+            .font_family(song.clone())
+            .text_size(px(10.0))
+            .text_color(rgb(MOON_DIM))
+            .cursor_pointer()
+            .hover(|s| s.text_color(rgb(VERMILION)))
+            .child(SharedString::from("⟲ 回到卷首"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.jump_to_start();
+                    // 回到卷首后面板没了意义，顺手收起（与点竹简跳章一致）。
+                    this.close_toc();
+                    cx.notify();
+                }),
+            );
         // 标题与关闭钮的左右位置随排版方向翻转：竖排时标题靠右（书从右翻开），
-        // 关闭钮紧挨标题；条目数放在另一侧。
+        // 关闭钮紧挨标题；条目数（与「回到卷首」）放在另一侧。
+        let meta = if rtl {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(count_div)
+                .child(back_div)
+        } else {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(back_div)
+                .child(count_div)
+        };
         let head = if rtl {
             div()
                 .flex()
@@ -1858,7 +1910,7 @@ impl Root {
                 .bg(rgb(PANEL_BG2))
                 .border_b_1()
                 .border_color(rgb(LINE))
-                .child(count_div)
+                .child(meta)
                 .child(
                     div()
                         .flex()
@@ -1888,7 +1940,7 @@ impl Root {
                         .child(title_div)
                         .child(close_div),
                 )
-                .child(count_div)
+                .child(meta)
         };
 
         // 书目主体：竹简条 + 划线栏，两栏平行并排。
@@ -4750,6 +4802,29 @@ impl Root {
             .map(|b| b.title.clone())
             .unwrap_or_default();
         let left = format!("第 {} {} / 共 {} {}", self.page + 1, unit, total, unit);
+        // 页码处**双击**＝一键回到卷首（v1.38.0）。
+        //
+        // 状态栏那一行「第 X 叶 / 共 Y 叶」本就是全书坐标，双击它回卷首
+        // 是最自然的手势——不必先开目录、再拖到最右一根竹简。
+        // GPUI 0.2.2 没有 `on_double_click`，只有 `MouseDownEvent::click_count`
+        // （双击时系统会连发两次 mousedown，第二次的 click_count 为 2），
+        // 故这里判 `>= 2`；单击（click_count == 1）一律放行，不吞事件。
+        let page_chip = div()
+            .cursor_pointer()
+            .text_color(rgb(t.chrome_text()))
+            .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+            .child(SharedString::from(left.clone()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    if event.click_count < 2 {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    this.jump_to_start();
+                    cx.notify();
+                }),
+            );
         let mut right = format!(
             "{label} · {mode} · {duplex} · {} {}pt · {}{} · 点右半屏/→翻下页 · 点左半屏/←翻上页",
             self.current_font().label(),
@@ -4805,7 +4880,7 @@ impl Root {
             .border_color(rgb(t.chrome_line()))
             .text_size(px(11.5))
             .text_color(rgb(t.chrome_text()))
-            .child(SharedString::from(left))
+            .child(page_chip)
             .child(
                 div()
                     .flex()
@@ -5153,6 +5228,50 @@ impl Root {
     ///
     /// 位置由 [`crate::hit::place_card`] 算出：**绝不压住被查的那个字**
     /// （字在屏幕右侧则向左展开、字在底部则向上展开）。
+    /// 开发用：扫一遍叶面找一个字，开一次查词浮签（见调用处的说明）。
+    ///
+    /// 不写死坐标——列数 / 留白 / 窗口尺寸一变，固定点就落到界栏上了；
+    /// 这里用 `glyph_hit_at` 从右向左、自上而下试，命中第一个字就收工。
+    fn dev_lookup_once(&mut self) {
+        if std::env::var("JIANDU_LOOKUP").is_err() || self.bubble.is_some() {
+            return;
+        }
+        let (vw, vh) = (self.viewport_w, self.viewport_h);
+        let mut hit = None;
+        let mut y = vh * 0.22;
+        while y < vh * 0.8 && hit.is_none() {
+            let mut x = vw * 0.92;
+            while x > vw * 0.45 {
+                if let Some(gb) = self.glyph_hit_at(x, y) {
+                    if !crate::types::is_punct(gb.glyph.ch) {
+                        hit = Some(gb);
+                        break;
+                    }
+                }
+                x -= self.col_w.max(8.0) * 0.5;
+            }
+            y += self.row_h.max(8.0) * 0.5;
+        }
+        let Some(gb) = hit else {
+            return;
+        };
+        let key = gb.key();
+        let ch = gb.glyph.ch;
+        let mut text = self.text_from(key, 4);
+        if text.is_empty() {
+            text = ch.to_string();
+        }
+        let (x, y) = (gb.x + gb.w * 0.5, gb.y + gb.h * 0.5);
+        self.bubble = Some(crate::types::GlyphHit {
+            key,
+            ch,
+            text: text.clone(),
+            x,
+            y,
+        });
+        self.open_lookup(key, ch, text, Some((x, y)), Some((gb.x, gb.y, gb.w, gb.h)));
+    }
+
     fn render_lookup_card(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let Some(hit) = self.bubble.clone() else {
@@ -5161,15 +5280,61 @@ impl Root {
         let vw = self.viewport_w;
         let vh = self.viewport_h;
 
-        // ── 词条：先成词（长安），再退单字 ─────────────────────────
+        // ── 词条：**双引擎字书优先**（康熙 + 說文），不成再退旧字书 ──
+        //
+        // `query_dict` 走嵌在二进制里的 dict.db：一字同时给出康熙的历代
+        // 韵书引文与說文的小篆本义；它收不到的（标点、词组、极生僻字）
+        // 才退回 `guhanyu.json` 那部古汉语字典。
+        let zishu = crate::dict::query_dict(hit.ch);
         let entry = crate::dict::lookup(&hit.text).or_else(|| crate::dict::entry_of(hit.ch));
-        let word = entry
+        let word = zishu
             .as_ref()
-            .map(|e| e.word.clone())
+            .map(|z| z.word.clone())
+            .or_else(|| entry.as_ref().map(|e| e.word.clone()))
             .unwrap_or_else(|| hit.ch.to_string());
-        let pinyin = entry.as_ref().map(|e| e.pinyin.clone()).unwrap_or_default();
+        let pinyin = zishu
+            .as_ref()
+            .filter(|z| !z.pinyin.is_empty())
+            .map(|z| z.pinyin.clone())
+            .or_else(|| entry.as_ref().map(|e| e.pinyin.clone()))
+            .unwrap_or_default();
         let pos = entry.as_ref().map(|e| e.pos.clone()).unwrap_or_default();
-        let gloss = entry.as_ref().map(|e| e.gloss.clone()).unwrap_or_default();
+        // 释义串：〔康熙〕一段 + 〔說文〕一段，交给下面既有的分列器切成
+        // 竖排数栏——自右向左读，先康熙后說文，两个标记就是分栏的界碑。
+        // 两段都截一截：康熙原文动辄数百字，全塞进来会挤爆卡片。
+        let gloss = match zishu.as_ref() {
+            Some(z) => {
+                let mut s = String::new();
+                if !z.kangxi.is_empty() {
+                    s.push_str("〔康熙〕");
+                    s.push_str(&clip_chars(&z.kangxi, 110));
+                }
+                if !z.shuowen.is_empty() {
+                    if !s.is_empty() {
+                        s.push('　');
+                    }
+                    s.push_str("〔說文〕");
+                    s.push_str(&clip_chars(&z.shuowen, 55));
+                }
+                s
+            }
+            None => entry.as_ref().map(|e| e.gloss.clone()).unwrap_or_default(),
+        };
+        // 页眉：双引擎命中时报「康熙 · 說文 · 部X · 某某切」，退回时仍是
+        // 旧字书的「字書 · 词性」。
+        let head_label = match zishu.as_ref() {
+            Some(z) => {
+                let mut s = String::from("康熙 · 說文");
+                if !z.radical.is_empty() {
+                    s.push_str(&format!(" · 部{}", z.radical));
+                }
+                if !z.fanqie.is_empty() {
+                    s.push_str(&format!(" · {}", z.fanqie));
+                }
+                s
+            }
+            None => format!("字書 · {pos}"),
+        };
 
         // ── 竖排度量：宽高按释义长度与视口反算（绝不撑破屏幕）────────
         let m = crate::hit::card_metrics(gloss.chars().count(), vw, vh);
@@ -5445,13 +5610,18 @@ impl Root {
         // 外层一根朱线、内层再一根淡朱线（中间留 3px 纸色），就是刻本
         // 牌记那种「双边框」；不用系统弹窗，是叠在正文之上的一层 div。
         let inner_line = crate::theme::mix(t.accent(), t.paper(), 0.62);
+        // 宣纸底**半透明**（α≈0.88）：浮签压在正文之上，底下那一行字
+        // 若隐若现——像把一张薄纸签贴在书叶上，而不是盖一块木板。
+        // 透明度只叠在这张签的底色上，文字与朱线仍是实色，可读性不掉。
+        let paper_alpha: u32 = 0xEA;
+        let paper_washi = rgba((t.paper() << 8) | paper_alpha);
         div()
             .absolute()
             .left(px(place.left))
             .top(px(place.top))
             .w(px(m.w))
             .h(px(m.h))
-            .bg(rgb(t.paper()))
+            .bg(paper_washi)
             .border_1()
             .border_color(rgb(t.accent()))
             .rounded(px(3.0))
@@ -5478,7 +5648,7 @@ impl Root {
                                 div()
                                     .text_size(px(9.5))
                                     .text_color(rgb(t.ink_soft()))
-                                    .child(SharedString::from(format!("字書 · {pos}"))),
+                                    .child(SharedString::from(head_label)),
                             )
                             .child(
                                 div()

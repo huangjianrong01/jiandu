@@ -1,6 +1,6 @@
 [package]
 name = "jiandu"
-version = "1.37.0"
+version = "1.38.0"
 edition = "2021"
 description = "笺读 · 一个用 Rust + GPUI 写的原生中文阅读器（古文竖笺 / 现代横笺）"
 license = "MIT"
@@ -32,6 +32,10 @@ rfd = "0.14"
 # 只开 `png` feature，避免 image 默认拉进 jpeg/tiff 等未缓存的子依赖。
 image = { version = "0.25", default-features = false, features = ["png"] }
 flate2 = "1"
+# 离线双引擎字典：《康熙字典》+《說文解字》合并库（见 `scripts/merge_dict.py`）。
+# `bundled` = 自己编译一份 sqlite3 进二进制，不依赖系统库版本；数据文件由
+# `include_bytes!` 嵌入，运行时零 I/O、断网可查。
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"

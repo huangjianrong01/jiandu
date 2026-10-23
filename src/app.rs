@@ -193,6 +193,14 @@ pub struct Root {
     /// 由长按的**坐标反查**（`glyph_hit_at`）量出来，和 `lookup_at`
     /// （手指落点）不是一回事：落点可能偏在字格边缘，而要让开的是整个字。
     pub lookup_rect: Option<(f32, f32, f32, f32)>,
+    /// **悬停查词**（v1.38.0）：鼠标停住 500ms 就浮出字书浮签。
+    ///
+    /// `hover_key` 记「当前悬停在哪个字上」（charIndex 三元组），
+    /// `hover_seq` 是**一次悬停的代号**：鼠标一动就 +1，之前排的那枚定时器
+    /// 醒来发现代号对不上便自行作废——这样只有真正停住 500ms 才弹签，
+    /// 掠过一排字不会连甩十几张。
+    pub hover_key: Option<(usize, usize, usize)>,
+    pub hover_seq: usize,
     /// 当前书的笔记：页序号 -> 正文。
     pub notes: std::collections::HashMap<usize, String>,
     /// 笔记面板是否展开。
@@ -487,6 +495,8 @@ impl Root {
             lookup_text: String::new(),
             lookup_at: None,
             lookup_rect: None,
+            hover_key: None,
+            hover_seq: 0,
             notes: std::collections::HashMap::new(),
             show_notes_panel: false,
             note_editing: false,
@@ -863,6 +873,91 @@ impl Root {
         self.lookup_text = text;
         self.lookup_at = at;
         self.lookup_rect = rect;
+    }
+
+    /// **悬停查词**（v1.38.0）：鼠标在一个字上停满 [`crate::reader::HOVER_LOOKUP`]
+    /// 就自动浮出字书浮签，与长按互为两条路——手不离笔时悬停更快，
+    /// 触屏没有 hover 就仍走长按。
+    ///
+    /// 只排定时器、不立刻弹签：鼠标每动一格就把 `hover_seq` 加一，先前那枚
+    /// 定时器醒来发现代号对不上便自行作废。于是「掠过一排字」不会连甩
+    /// 十几张签，只有真正停住的那一个字才弹。
+    pub fn probe_hover(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        // 这些状态下悬停一律不弹：写批注 / 拖选 / 已有浮层 / 专注 / 面板展开。
+        if self.note_editing
+            || self.dragging
+            || self.bubble.is_some()
+            || self.popup.is_some()
+            || self.focus_mode
+            || self.show_toc
+            || self.show_style
+            || self.book.is_none()
+        {
+            self.hover_key = None;
+            return;
+        }
+        let Some(gb) = self.glyph_hit_at(x, y) else {
+            self.hover_key = None;
+            return;
+        };
+        let key = gb.key();
+        // 还停在同一个字上：别重启计时（否则抖一下就得再等 500ms）。
+        if self.hover_key == Some(key) {
+            return;
+        }
+        self.hover_key = Some(key);
+        self.hover_seq = self.hover_seq.wrapping_add(1);
+        let seq = self.hover_seq;
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                cx.background_executor()
+                    .timer(crate::reader::HOVER_LOOKUP)
+                    .await;
+                let _ = this.update(&mut cx, |this, cx| {
+                    if this.hover_seq != seq || this.hover_key != Some(key) {
+                        return;
+                    }
+                    // 醒来时再反查一次：确认指针还压在那个字上（其间可能
+                    // 翻了页、换了列数，坐标底下的字已经不是原来那个了）。
+                    let Some(g2) = this.glyph_hit_at(x, y) else {
+                        return;
+                    };
+                    if g2.key() != key {
+                        return;
+                    }
+                    if this.bubble.is_some()
+                        || this.popup.is_some()
+                        || this.note_editing
+                        || this.dragging
+                    {
+                        return;
+                    }
+                    let ch = g2.glyph.ch;
+                    let mut text = this.text_from(key, 4);
+                    if text.is_empty() {
+                        text = ch.to_string();
+                    }
+                    this.bubble = Some(GlyphHit {
+                        key,
+                        ch,
+                        text: text.clone(),
+                        x,
+                        y,
+                    });
+                    this.open_lookup(
+                        key,
+                        ch,
+                        text,
+                        Some((x, y)),
+                        Some((g2.x, g2.y, g2.w, g2.h)),
+                    );
+                    cx.notify();
+                });
+            }
+        })
+        // 后台等 500ms 的那枚定时器不必持有：窗口关了它自然被丢。
+        .detach();
     }
 
     /// 关闭字义浮签：三件套一起清，免得下次点字还残留上次的 charIndex。
@@ -1928,6 +2023,25 @@ impl Root {
             self.current_chapter = g.chapter;
         }
         self.notice = format!("已跳到第 {} 葉", p + 1);
+        self.persist();
+    }
+
+    /// **一键回到卷首**（v1.38.0）：状态栏页码处双击、目录面板顶部
+    /// 「⟲ 回到卷首」都走它。
+    ///
+    /// 与翻页共用 `goto_page`，因此双面对开时同样自动落回偶数叶（否则
+    /// 卷首会跑到左半叶、与下一叶错开半叶、读序颠倒）。**不改任何排版
+    /// 参数**——列数 / 留白 / 字级 / 版式一概不动，只是把游标拨回第一叶，
+    /// 重绘由下一帧的 `paginate` 自然完成。
+    pub fn jump_to_start(&mut self) {
+        let already = self.page == 0;
+        self.goto_page(0);
+        // `goto_page` 会写「已跳到第 1 葉」；回到卷首给一句更贴题的提示。
+        self.notice = if already {
+            "已在卷首".to_string()
+        } else {
+            "已回到卷首".to_string()
+        };
         self.persist();
     }
 

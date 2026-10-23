@@ -5,6 +5,7 @@
 
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 const RAW: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -206,6 +207,144 @@ pub fn zdic_url(ch: &str) -> String {
     format!("{ZDIC_BASE}{}", percent_encode(&c.to_string()))
 }
 
+// ----------------------------------------------------------------------
+// 双引擎离线字书：《康熙字典》 × 《說文解字》
+// ----------------------------------------------------------------------
+//
+// `guhanyu.json` 那部是「古汉语常用字字典」——**释义现代汉语化、收字 3900**，
+// 读《史记》够用，但遇上「𠀤」「㫃」这类字就哑了。这两部才是查字的正主：
+//   * 《康熙字典》48709 条：反切、叶音、历代韵书引文、部首卷次；
+//   * 《說文解字》11037 字头：小篆本义与徐铉 / 段注系统的原文。
+//
+// 两部由 `scripts/merge_dict.py` 在构建期合成**一个** `dict.db`（说文本来是
+// 9833 个碎 JSON，逐个打包既不体面也慢），再由 `include_bytes!` 嵌进二进制：
+// 运行时零 I/O、断网可查、跟随 .app 走。
+//
+// SQLite 只能读文件、读不了内存里的 `&[u8]`，故首次查询时把嵌入的字节落到
+// 一个缓存路径再以只读方式打开；长度对不上就重写（升版后嵌的是新库）。
+
+/// 合并后的字书库（康熙 + 說文）。
+const ZISHU_DB: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/dict/dict.db"
+));
+
+/// **一条字书记录**：康熙释义与說文原文分开存，浮签分栏各列一列。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Zishu {
+    /// 字头（正条，多为繁体 / 传统字形）。
+    pub word: String,
+    /// 拼音（带调，来自說文条目）。
+    pub pinyin: String,
+    /// 部首。
+    pub radical: String,
+    /// 反切（“於悉切”）。
+    pub fanqie: String,
+    /// 康熙部首卷次（“【寅集上】【子字部】”）。
+    pub volume: String,
+    /// 《康熙字典》释义原文。
+    pub kangxi: String,
+    /// 《說文解字》原文。
+    pub shuowen: String,
+}
+
+impl Zishu {
+    /// 两部都没收到内容就算没查到（只有空壳字头不值得浮一张签）。
+    pub fn is_empty(&self) -> bool {
+        self.kangxi.is_empty() && self.shuowen.is_empty()
+    }
+}
+
+/// 字书缓存落盘路径：`~/.jiandu/zishu.db`（拿不到 HOME 就退回临时目录）。
+fn zishu_cache_path() -> std::path::PathBuf {
+    let dir = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".jiandu"))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join("zishu.db")
+}
+
+/// 落盘并打开只读连接；任何一步失败都返回 `None`（查词降级，绝不崩）。
+fn open_zishu() -> Option<rusqlite::Connection> {
+    let path = zishu_cache_path();
+    let stale = std::fs::metadata(&path)
+        .map(|m| m.len() != ZISHU_DB.len() as u64)
+        .unwrap_or(true);
+    if stale {
+        std::fs::write(&path, ZISHU_DB).ok()?;
+    }
+    rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
+}
+
+/// 字书连接（懒开：第一次查词才落盘，启动不付这份代价）。
+static ZISHU: Lazy<Mutex<Option<rusqlite::Connection>>> =
+    Lazy::new(|| Mutex::new(open_zishu()));
+
+/// 字书可用吗（状态栏 / 兜底判断用）。
+pub fn zishu_ready() -> bool {
+    matches!(ZISHU.lock(), Ok(g) if g.is_some())
+}
+
+/// 按一个字头查一条记录（`alias` 表已含繁简两种写法，故简繁都能命中）。
+fn query_word(conn: &rusqlite::Connection, w: &str) -> Option<Zishu> {
+    let mut st = conn
+        .prepare(
+            "SELECT d.word,
+                    ifnull(d.content, ''),
+                    ifnull(d.pinyin, ''),
+                    ifnull(d.radical, ''),
+                    ifnull(d.fanqie, ''),
+                    ifnull(d.volume, ''),
+                    ifnull(d.shuowen, '')
+             FROM alias a JOIN dict d ON d.word = a.head
+             WHERE a.word = ?1
+             ORDER BY (d.word = ifnull((SELECT trad FROM variant
+                                        WHERE word = ?1 LIMIT 1), ?1)) DESC,
+                      (ifnull(d.shuowen, '') <> '') DESC,
+                      length(d.content) DESC
+             LIMIT 1",
+        )
+        .ok()?;
+    let mut rows = st.query(rusqlite::params![w]).ok()?;
+    let r = rows.next().ok()??;
+    Some(Zishu {
+        word: r.get(0).unwrap_or_default(),
+        kangxi: r.get(1).unwrap_or_default(),
+        pinyin: r.get(2).unwrap_or_default(),
+        radical: r.get(3).unwrap_or_default(),
+        fanqie: r.get(4).unwrap_or_default(),
+        volume: r.get(5).unwrap_or_default(),
+        shuowen: r.get(6).unwrap_or_default(),
+    })
+}
+
+/// **查词总入口**：原字 → 繁体 → 简体，三级兜底。
+///
+/// 兜底的两条路：
+///   1. 库里的 `alias` 表——构建期用 macOS ICU 把字书里出现过的每个字批量
+///      转成简体而建（2898 组），简写输入直接命中繁体字头；
+///   2. `crate::trad` 的简繁对照——跨不出 ICU 那张表时再补一道。
+/// 两道都不成（生僻字、标点、拉丁字母）就返回 `None`，浮签退回旧字书。
+pub fn query_dict(ch: char) -> Option<Zishu> {
+    let guard = ZISHU.lock().ok()?;
+    let conn = guard.as_ref()?;
+    let own = ch.to_string();
+    query_word(conn, &own)
+        .or_else(|| {
+            crate::trad::traditional_of(ch)
+                .and_then(|t| query_word(conn, &t.to_string()))
+        })
+        .or_else(|| {
+            crate::trad::simplified_of(ch).and_then(|s| query_word(conn, &s.to_string()))
+        })
+        .filter(|z| !z.is_empty())
+}
+
 /// 字书收录字数（用于状态展示）。
 pub fn len() -> usize {
     DICT.len()
@@ -250,6 +389,42 @@ pub fn rare_len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 字书嵌进来了吗——没嵌（脚本没跑 / 资源缺失）就谈不上后面几条。
+    #[test]
+    fn zishu_db_is_embedded() {
+        assert!(
+            ZISHU_DB.len() > 1_000_000,
+            "dict.db 只有 {} 字节，像是没合并",
+            ZISHU_DB.len()
+        );
+        assert!(zishu_ready(), "字书没能打开（落盘失败？）");
+    }
+
+    /// 双引擎：同一字要同时给出康熙释义与說文原文。
+    #[test]
+    fn zishu_merges_kangxi_and_shuowen() {
+        let z = query_dict('讀').expect("字书应收录「讀」");
+        assert!(z.kangxi.contains("徒谷切"), "康熙缺反切：{}", z.kangxi);
+        assert!(z.shuowen.contains("誦書也"), "說文缺原文：{}", z.shuowen);
+        assert_eq!(z.pinyin, "dú");
+        assert_eq!(z.radical, "言");
+    }
+
+    /// 繁简兜底：拿简体字查，要能落到繁体字头上（ICU 对照表建的 alias）。
+    #[test]
+    fn zishu_falls_back_from_simplified() {
+        let z = query_dict('学').expect("简体「学」应兜底到繁体字头");
+        assert_eq!(z.word, "學");
+        assert!(!z.kangxi.is_empty());
+    }
+
+    /// 库里没收的东西（拉丁字母）不该拿空壳出来撑一张浮签。
+    #[test]
+    fn zishu_returns_none_for_unknown() {
+        assert!(query_dict('A').is_none());
+        assert!(query_dict('，').is_none());
+    }
 
     #[test]
     fn dict_is_loaded_from_guhanyu_json() {

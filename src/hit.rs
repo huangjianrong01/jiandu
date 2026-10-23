@@ -517,10 +517,12 @@ pub fn card_metrics(gloss_len: usize, vw: f32, vh: f32) -> CardMetrics {
     let inner_max = (max_h - 56.0).max(60.0);
     let per_col_limit = ((inner_max / line).floor() as usize).max(6);
     // 列数：按「一列最多 per_col_limit 字」铺开；最多 6 列（再多就成条幅了）。
+    // v1.38.0：上限 6 → 8。双引擎浮签要塞「康熙 + 說文」两段，
+    // 6 列装不下就截尾，八列恰好容下 110 字康熙 + 55 字說文而不必省略。
     let cols = if gloss_len == 0 {
         1
     } else {
-        ((gloss_len + per_col_limit - 1) / per_col_limit).clamp(1, 6)
+        ((gloss_len + per_col_limit - 1) / per_col_limit).clamp(1, 8)
     };
     // 每列字数：**均分**，让各列齐平（末列不至于只剩两个字）。
     let per_col = if gloss_len == 0 {
