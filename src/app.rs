@@ -24,7 +24,12 @@ use std::rc::Rc;
 pub enum Screen {
     /// 书架（书封墙）。
     Shelf,
-    /// 单本书的封面。
+    /// 单本书的封面（书衣）。
+    ///
+    /// v1.37.0 UI 瘦身把阅读页工具栏那枚「封面」撤了，故当前**没有入口**
+    /// 走到这一屏；`shelf::render_cover` 仍在（书架侧随时可接回一个入口），
+    /// 所以保留变体并豁免 dead_code，而不是把整页书衣删掉。
+    #[allow(dead_code)]
     Cover,
     /// 正文阅读。
     Reading,
@@ -214,6 +219,19 @@ pub struct Root {
     pub note_focus: FocusHandle,
     /// 笔记框 IME 组字中的标记区间（UTF-16 下标）。
     pub note_marked: Option<std::ops::Range<usize>>,
+    /// **天头眉批**：读者点在版框上方那段天头里手写的一列朱砂小字。
+    ///
+    /// 与 `notes`（页眉批注，按页号存）是两回事：眉批钉在**字**上
+    /// （`HeadNote::key` = 该面首字字键），改列数 / 改字号重新分页后仍
+    /// 跟着那一面；位置存的是归一化比例，窗口缩放自动跟随。
+    pub head_notes: Vec<crate::types::HeadNote>,
+    /// 正在写的眉批落点 `(key, u, v)`。
+    ///
+    /// `note_editing` 为 true 且此项为 Some 时，草稿**就地竖排**显示在天头
+    /// （而不是弹浮层卡片），⏎ 存成眉批而不是夹注。
+    pub head_anchor: Option<((usize, usize, usize), f32, f32)>,
+    /// 按下时是否落在天头里（capture 阶段记下归一化 (u, v)，抬起时开写）。
+    pub head_press: Option<(f32, f32)>,
     /// 浮层笔记框的锚点（窗口坐标）；None 时按视口居中偏上放置。
     pub note_pos: Option<(f32, f32)>,
     /// 刚打开笔记框的这一次点击：抬起时不要立刻「自动保存」把它关掉。
@@ -478,6 +496,9 @@ impl Root {
             note_cursor: 0,
             note_focus: _cx.focus_handle(),
             note_marked: None,
+            head_notes: Vec::new(),
+            head_anchor: None,
+            head_press: None,
             note_pos: None,
             note_suppress_commit: false,
             rename_idx: None,
@@ -1249,7 +1270,7 @@ impl Root {
     ///
     /// 切列数 / 切模式 / 改注文排法都会**整本重排**，页码随之变化；
     /// 记下锚点再按它回找新页码，才不会「换个版式就跳回卷首」。
-    fn page_anchor(&self) -> Option<(usize, usize, usize)> {
+    pub fn page_anchor(&self) -> Option<(usize, usize, usize)> {
         self.layout_pages()
             .get(self.page)
             .and_then(|p| p.glyphs.first())
@@ -1266,6 +1287,72 @@ impl Root {
         }) {
             self.page = pi;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 天头眉批（v1.37.0）
+    // ------------------------------------------------------------------
+
+    /// **天头带**在窗口内容区里的矩形 (x, y, w, h)。
+    ///
+    /// 天头 = 纸面顶缘往下 `margin_top` 那一条（版框以上的留白）。
+    /// `x/y/w` 取当帧纸面矩形（`page_rect`，由 `render_screen` 的探针写入），
+    /// 高就是引擎算出的天头——换留白档、拖窗口都会立刻变，所以眉批**只存
+    /// 比例不存像素**（见 `types::HeadNote`），缩放时自动等比跟随。
+    pub fn head_band(&self) -> Option<(f32, f32, f32, f32)> {
+        let (x, y, w, h) = self.page_rect.get()?;
+        let bh = self.margin_top.min(h);
+        // 天头太窄（专注模式几乎不留白）：不开写，免得点一下就误进输入态。
+        if bh < crate::reader::HEAD_BAND_MIN || w <= 0.0 {
+            return None;
+        }
+        Some((x, y, w, bh))
+    }
+
+    /// 窗口坐标落进天头带 → 归一化 `(u, v)`；不在天头里返回 `None`。
+    pub fn head_band_hit(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let (bx, by, bw, bh) = self.head_band()?;
+        if x < bx || x > bx + bw || y < by || y > by + bh {
+            return None;
+        }
+        Some(((x - bx) / bw, (y - by) / bh))
+    }
+
+    /// 在天头 `(u, v)` 处**起一条眉批**：进入编辑态，草稿就地竖排显示。
+    ///
+    /// 复用夹注那套输入通道（`note_draft` / `note_cursor` / `note_focus`），
+    /// 故中文输入法、退格、⏎ 保存、Esc 取消全都是现成的——只有「画在哪、
+    /// 存到哪」不同（见 `commit_note_edit` 的天头分支）。
+    pub fn open_head_note(&mut self, u: f32, v: f32) {
+        let Some(key) = self.page_anchor() else {
+            self.notice = "此页无法题眉批".to_string();
+            return;
+        };
+        self.cancel_note_edit();
+        self.head_anchor = Some((key, u, v));
+        self.note_draft.clear();
+        self.note_cursor = 0;
+        self.note_editing = true;
+        // 开写那一下的 mouseup 会重新命中正文，别让它「点别处自动保存」把
+        // 刚开的小框立刻关掉——与浮层笔记框同一个坑（见 `note_suppress_commit`）。
+        self.note_suppress_commit = true;
+        self.popup = None;
+        self.notice = "眉批：键入后 ⏎ 落笔，Esc 弃".to_string();
+    }
+
+    /// 存一条天头眉批：同位置已有就**向左挪一列**，挪出左缘绕回右缘；
+    /// 写完立刻回写书稿 JSON（下次开卷还在）。
+    pub fn push_head_note(&mut self, key: (usize, usize, usize), u: f32, v: f32, text: String) {
+        // 同一处已有 → 向左让开一列（判据见 `HeadNote::free_u`）。
+        let u = crate::types::HeadNote::free_u(&self.head_notes, key, u, v);
+        let text: String = text.chars().filter(|c| !matches!(c, '\n' | '\r')).collect();
+        self.head_notes
+            .push(crate::types::HeadNote::new(key, u, v, text));
+        if let Some(book) = self.book.as_mut() {
+            book.head_notes = self.head_notes.clone();
+        }
+        self.persist_book_json();
+        self.notice = format!("已题眉批 · 共 {} 条", self.head_notes.len());
     }
 
     /// **切渲染模式**（对开 / 单叶 / 整页）：同样保住阅读进度。
@@ -1424,6 +1511,14 @@ impl Root {
                         })
                         .sum(),
                 );
+                // 天头眉批开卷时从书稿里取一次（之后增删改都回写同一份）。
+                self.head_notes = book.head_notes.clone();
+                self.head_anchor = None;
+                self.head_press = None;
+                // 开发用：JIANDU_HEAD_NOTE=1 会在**第一帧渲染时**自动题两条
+                // 同位置的眉批（第二条自动向左让开一列）——注入点放在
+                // `render_head_notes` 里，因为此刻才有页锚点（开卷那一刻
+                // 版面还没排，`page_anchor()` 是 None）。只动内存，不写 JSON。
                 self.book = Some(book);
                 self.notes = nt;
                 self.underlines = ul.into_iter().collect();
@@ -1447,7 +1542,8 @@ impl Root {
                 // 单页 / 双面对开交由 fit_sizes 依屏幕方向决定（横屏对开、竖屏单页）。
                 // 点书架的书**直接进正文上次读的那一面**（`self.page` 已在上面从
                 // 档案恢复），不再先落书衣封面——翻书就该回到原处。
-                // 想看书衣仍可从阅读页工具栏「封面」进。
+                // （v1.37.0 UI 瘦身撤掉了阅读页工具栏那枚「封面」，
+                //  书衣只在书架这一侧看了。）
                 self.screen = Screen::Reading;
                 self.notice.clear();
                 // 恢复进度后立刻对齐当前章，目录朱砂红点才不会错位。
@@ -2656,6 +2752,21 @@ impl Root {
 
     /// 保存草稿并退出编辑态。
     pub fn commit_note_edit(&mut self) {
+        // ★ 天头眉批优先：草稿是就地写在天头上的，⏎ 存进 `head_notes`
+        //   而不是夹注 / 页眉批注（判断只认 `head_anchor` 一枚开关）。
+        if let Some((key, u, v)) = self.head_anchor.take() {
+            let text = std::mem::take(&mut self.note_draft);
+            self.note_editing = false;
+            self.note_suppress_commit = false;
+            self.note_cursor = 0;
+            self.note_pos = None;
+            if text.trim().is_empty() {
+                self.notice = "已取消眉批".to_string();
+            } else {
+                self.push_head_note(key, u, v, text);
+            }
+            return;
+        }
         let text = std::mem::take(&mut self.note_draft);
         let target = self.note_edit_note.take();
         let inject = self.note_inject_key.take();
@@ -2701,6 +2812,7 @@ impl Root {
         self.note_suppress_commit = false;
         self.note_edit_note = None;
         self.note_inject_key = None;
+        self.head_anchor = None;
         self.note_draft.clear();
         self.note_cursor = 0;
         self.note_pos = None;
@@ -3068,7 +3180,7 @@ pub const ANCIENT_EDGE: f32 = 50.0;
 /// 古文竖笺天头：篇题与书名已移进版框（章题列 + 地脚），天头不再单占一行。
 pub const ANCIENT_HEAD: f32 = 0.0;
 /// 古文竖笺地脚预留：鱼尾 + 葉码条由渲染层的 `foot_h` 单独承担，纵向留白
-/// 完全交给网格引擎的 `margin_bot`（= 天头 ÷ 2，用户铁律「天头是地脚
+/// 完全交给网格引擎的 `margin_bot`（= 天头 ÷ 1.5，用户铁律「天头是地脚
 /// 的 2 倍」，见 `grid::TOP_OF_BOT`），故此处归零。
 pub const ANCIENT_FOOT: f32 = 0.0;
 /// 古文竖笺页脚注区预留（脚注模式且开启注释时）。

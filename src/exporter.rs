@@ -99,7 +99,7 @@ pub fn to_markdown(book: &Book) -> String {
     out.push_str("\n---\n\n");
 
     let mut footnote_counter: usize = 0;
-    for ch in &book.chapters {
+    for (ci, ch) in book.chapters.iter().enumerate() {
         out.push_str(&format!("## {}\n\n", ch.title));
         let mut defs: Vec<(usize, String)> = Vec::new();
         for p in &ch.paragraphs {
@@ -112,6 +112,21 @@ pub fn to_markdown(book: &Book) -> String {
             out.push_str("**脚注**\n\n");
             for (n, d) in defs {
                 out.push_str(&format!("[^{n}]: {d}\n"));
+            }
+            out.push('\n');
+        }
+        // 天头眉批（v1.37.0）：按章收在这一章末尾——批语钉在某一面上，
+        // 导出成纯文本没有「面」这个概念，挂在所属章下最不容易走失。
+        let heads: Vec<&str> = book
+            .head_notes
+            .iter()
+            .filter(|n| n.key.0 == ci)
+            .map(|n| n.text.as_str())
+            .collect();
+        if !heads.is_empty() {
+            out.push_str("**眉批**\n\n");
+            for h in heads {
+                out.push_str(&format!("- {h}\n"));
             }
             out.push('\n');
         }

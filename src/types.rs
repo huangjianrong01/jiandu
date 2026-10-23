@@ -742,7 +742,76 @@ pub struct Book {
     /// 目录。没有就按章节自动生成（见 `ensure_toc`）。
     #[serde(default)]
     pub toc: Vec<TocEntry>,
+    /// **天头眉批**（v1.37.0）：读者点在版框上方那段天头里手写的一列
+    /// 朱砂小字。存的是**归一化坐标**（见 [`HeadNote`]），故窗口缩放、
+    /// 换留白档、改列数之后位置自动等比跟随，不用回写存储值。
+    #[serde(default)]
+    pub head_notes: Vec<HeadNote>,
     pub chapters: Vec<Chapter>,
+}
+
+/// 同一处再写一条眉批时**向左挪一列**的距离（占纸面宽的比例）。
+///
+/// 竖排右起，故「下一列」在左边——与传统批书的续写方向一致。
+pub const HEAD_NOTE_STEP: f32 = 0.042;
+/// 判定「同一位置」的纵向容差（占天头高的比例）：上下差得比这多就不算
+/// 挤在一起，不必挪列（天头能并排写两行短批）。
+pub const HEAD_NOTE_V_TOL: f32 = 0.28;
+
+/// **一条天头眉批**。
+///
+/// 位置只存**比例**，不存像素：
+///   * `u` — 横向 [0,1]，0 = 纸面左缘（竖排右起，故「向左挪一列」是 `u` 减小）；
+///   * `v` — 纵向 [0,1]，0 = 天头顶缘。
+///
+/// 这样 `margin_top` 随留白档变大、窗口被拖宽拖窄，眉批都跟着天头等比缩放，
+/// 绝不会出现「改一次版面，批语全飘到正文里」的事（v1.37.0 用户点名要求）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HeadNote {
+    /// 钉在哪一面上：该面**首字**的字键 `(chapter, para, offset)`
+    /// （与 `page_anchor()` 同源）。分页变了也能靠它把眉批找回去。
+    pub key: (usize, usize, usize),
+    /// 天头带内的归一化横向位置 [0,1]。
+    pub u: f32,
+    /// 天头带内的归一化纵向位置 [0,1]。
+    pub v: f32,
+    /// 批语正文（竖排显示，一般一句）。
+    pub text: String,
+}
+
+impl HeadNote {
+    pub fn new(key: (usize, usize, usize), u: f32, v: f32, text: impl Into<String>) -> Self {
+        Self {
+            key,
+            u: u.clamp(0.0, 1.0),
+            v: v.clamp(0.0, 1.0),
+            text: text.into(),
+        }
+    }
+
+    /// **防重叠**：同一面、纵向又挨着的已有眉批，把新批的 `u` **向左挪
+    /// 一列**——竖排右起，故「下一列」在左边，与传统批书续写方向一致。
+    /// 挪出左缘则绕回右缘（天头写满了就从头接着排，绝不叠成一团墨）。
+    ///
+    /// 纯函数（不碰存储），便于单测：见 `tests::head_notes_never_overlap`。
+    pub fn free_u(notes: &[HeadNote], key: (usize, usize, usize), u: f32, v: f32) -> f32 {
+        let step = HEAD_NOTE_STEP;
+        let tol = HEAD_NOTE_V_TOL;
+        let mut u = u.clamp(0.0, 1.0);
+        for _ in 0..24 {
+            let taken = notes.iter().any(|n| {
+                n.key == key && (n.u - u).abs() < step * 0.8 && (n.v - v).abs() < tol
+            });
+            if !taken {
+                return u;
+            }
+            u -= step;
+            if u < 0.01 {
+                u = 0.99;
+            }
+        }
+        u
+    }
 }
 
 impl Book {
@@ -753,6 +822,7 @@ impl Book {
             cover: Cover::default(),
             tongjia: BTreeMap::new(),
             toc: Vec::new(),
+            head_notes: Vec::new(),
             chapters: Vec::new(),
         }
     }
@@ -1457,6 +1527,35 @@ mod tests {
             )],
         });
         b
+    }
+
+    /// 天头眉批**绝不允许叠字**：同一处再写一条，`u` 必须向左让开一列。
+    #[test]
+    fn head_notes_never_overlap() {
+        let k = (0usize, 0usize, 0usize);
+        let first = HeadNote::new(k, 0.70, 0.22, "批一");
+        // 同一位置第二条：必须向左挪（u 变小），不能原地叠上去。
+        let u2 = HeadNote::free_u(&[first.clone()], k, 0.70, 0.22);
+        assert!(u2 < 0.70 - 1e-6, "同位置没让开：u2 = {u2}");
+        assert!(u2 > 0.0, "让出了左缘：u2 = {u2}");
+        // 第三条继续往左。
+        let two = vec![first.clone(), HeadNote::new(k, u2, 0.22, "批二")];
+        let u3 = HeadNote::free_u(&two, k, 0.70, 0.22);
+        assert!(u3 < u2, "第三条没继续让：u3 = {u3} vs u2 = {u2}");
+        // 纵向差得远（不在同一行气里）就不算挤——原位即可。
+        let u_far = HeadNote::free_u(&[first.clone()], k, 0.70, 0.90);
+        assert!((u_far - 0.70).abs() < 1e-6, "上下不挨着却被挪：{u_far}");
+        // 另一面的眉批互不相干（key 不同）。
+        let u_other = HeadNote::free_u(&[first], (3, 1, 7), 0.70, 0.22);
+        assert!((u_other - 0.70).abs() < 1e-6, "别面的眉批不该干扰：{u_other}");
+    }
+
+    /// 眉批的新字段必须向后兼容：旧 JSON 里没有 `head_notes` 也能读进来。
+    #[test]
+    fn book_without_head_notes_still_loads() {
+        let j = r#"{"title":"旧档","chapters":[{"title":"一","paragraphs":["甲"]}]}"#;
+        let b: Book = serde_json::from_str(j).expect("旧书稿应能读");
+        assert!(b.head_notes.is_empty());
     }
 
     #[test]

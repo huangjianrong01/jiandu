@@ -102,6 +102,22 @@ impl LeafGeo {
 /// （复制 / 检索 / 字典），而不是普通的点字 / 拖选。
 const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(450);
 
+// ── 天头眉批（v1.37.0）────────────────────────────────────────────
+/// 眉批字号 = 正文字号 × 此比例。用户定「正文的 40%」：再大就压过正文、
+/// 再小在 Retina 上糊成一团。下限 9px 由渲染处兜住。
+pub const HEAD_NOTE_FS_RATIO: f32 = 0.40;
+/// 眉批墨色：**半透明朱砂** `rgba(178, 58, 48, 0.8)`。
+///
+/// GPUI 0.2.2 的 `rgba` 收单枚 `0xRRGGBBAA`（alpha 在低字节），0.8 ≈ 0xCC。
+/// 半透明而非实色：天头那点纸色透出来，才像毛笔蘸朱砂写上去的，
+/// 而不是贴了一张印刷贴纸。
+pub const HEAD_NOTE_INK: u32 = 0xB23A30CC;
+/// 天头窄于此（px）就不开写：专注模式几乎不留天头，免得点一下就误进输入态。
+pub const HEAD_BAND_MIN: f32 = 10.0;
+/// 眉批排布的另两个常量（`HEAD_NOTE_STEP` / `HEAD_NOTE_V_TOL`）放在
+/// `types.rs` 的 `HeadNote` 旁边——`types` 是 lib 的一部分，而 `reader`
+/// 只在 bin 里，放那儿 types 反而够不着。
+
 /// 圈号（1-20）。
 const CIRCLED: [&str; 20] = [
     "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩", "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰",
@@ -880,7 +896,7 @@ impl Root {
         // 任何排版坐标；父层只是多包一层 `relative`（尺寸由纸面撑出，与原来
         // 的 stage 完全同尺寸），布局看不出差别。
         let probe = self.page_rect.clone();
-        let stage = div()
+        let mut stage = div()
             .relative()
             .child(stage)
             .child(
@@ -902,6 +918,10 @@ impl Root {
                 .right(px(0.0))
                 .bottom(px(0.0)),
             );
+        // ★ 天头眉批：铺在纸面天头带里的一层（绝对定位，不参与任何排版）。
+        //   必须挂在**纸面这一层**上：它的原点就是 `page_rect` 的左上角，
+        //   眉批的 `u/v` × 当帧天头带 = 屏幕坐标，拖窗口 / 换留白档自动跟随。
+        stage = stage.child(self.render_head_notes(cx));
 
         // 正文区：单页 / 对开舞台居中铺满。版字面板改为浮层（见下方 root.overlay），
         // 允许盖住正文下部，因此这里不再为它预留高度。
@@ -926,10 +946,15 @@ impl Root {
         let body = body
             .capture_any_mouse_down(cx.listener(
                 move |this, event: &MouseDownEvent, _window, _cx| {
-                    this.press_at = Some((
+                    let (px_, py_) = (
                         event.position.x.to_f64() as f32,
                         event.position.y.to_f64() as f32,
-                    ));
+                    );
+                    // ★ 天头眉批：这一下按在版框上方那段留白里吗？
+                    //   命中就记下归一化 (u, v)，抬起时**就地开写**而不翻页。
+                    //   记在 capture 阶段（先于字格处理器），落点不会有遗漏。
+                    this.head_press = this.head_band_hit(px_, py_);
+                    this.press_at = Some((px_, py_));
                     // 记下按下时刻：抬起时据此判定「长按」（弹气泡菜单）。
                     this.press_time = Some(std::time::Instant::now());
                     this.touched_glyph = false;
@@ -938,6 +963,21 @@ impl Root {
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
+                        let (ux, uy) = (
+                            event.position.x.to_f64() as f32,
+                            event.position.y.to_f64() as f32,
+                        );
+                        // ★ 天头眉批（v1.37.0）：按下落在天头 → 抬起就地开写。
+                        //   必须排在最前：天头那一下不能翻页、不能弹工具条。
+                        //   已在写另一条时，先落笔存好手上这条，再在新位置起一条。
+                        if let Some((u, v)) = this.head_press.take() {
+                            if this.note_editing && this.head_anchor.is_some() {
+                                this.commit_note_edit();
+                            }
+                            this.open_head_note(u, v);
+                            cx.notify();
+                            return;
+                        }
                         // 笔记浮层开着：在正文区松手＝保存笔记并收起浮层，不翻页。
                         // 但「刚打开浮层那一下」要跳过：它的 mouseup 会重新命中
                         // 正文，若在此提交空草稿，浮层会闪开即关、根本写不了。
@@ -951,10 +991,6 @@ impl Root {
                             cx.notify();
                             return;
                         }
-                        let (ux, uy) = (
-                            event.position.x.to_f64() as f32,
-                            event.position.y.to_f64() as f32,
-                        );
                         let pressed = this.press_at.take();
                         // 长按：按住正文超过阈值 → 弹气泡菜单（复制 / 检索 / 字典）。
                         // 判在「抬起」而非「按下」，避免和拖选取字打架：
@@ -1269,7 +1305,9 @@ impl Root {
 
         // 浮层笔记框：划线 / 点字后直接盖在文本上写笔记——
         // 不另开面板、不推开正文，Esc 取消、⏎ 保存、点别处自动保存。
-        if self.note_editing {
+        // 天头眉批复用同一套编辑态，但它**就地竖排**显示在天头上
+        // （`render_head_notes`），不能再压一张浮层卡片上去。
+        if self.note_editing && self.head_anchor.is_none() {
             root = root.child(self.render_note_editor(cx));
         }
 
@@ -2163,7 +2201,10 @@ impl Root {
     /// 纸面上的一张半透明宣纸**：默认收到天头之外（`top = -BAR_H`），
     /// 鼠标触到天头 30px 才滑下来，读完即退——把整幅纸面还给正文。
     ///
-    /// 三组纯文字：书阁 · 目录 · 封面 ｜ 版字 · 样式 · 专注 ｜ 检索 · 朱批 · 帮助。
+    /// 三组纯文字：书阁 · 目录 ｜ 版字 · 专注 ｜ 检索 · 朱批 · 帮助。
+    ///
+    /// v1.37.0「UI 瘦身」撤掉了「封面」一枚：书衣看点在书架点书那一刻，
+    /// 读着读着没人想回封面，它只是白占天头一条横向空间。
     /// 没有图标、没有底色块、没有底线：字本身就是按钮。
     fn render_reading_toolbar(&mut self, total: usize, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
@@ -2202,7 +2243,7 @@ impl Root {
                 .bg(rgba(sep_ink))
         };
 
-        // ---- 左组：书阁（回书架） / 目录（卷目） / 封面 ----
+        // ---- 左组：书阁（回书架） / 目录（卷目） ----
         let mut left = div().h(px(BAR_H)).flex().items_center().pl(px(26.0));
         left = left.child(item("书阁", false).on_mouse_down(
             MouseButton::Left,
@@ -2223,14 +2264,7 @@ impl Root {
                 cx.notify();
             }),
         ));
-        left = left.child(item("封面", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                this.persist();
-                this.screen = Screen::Cover;
-                cx.notify();
-            }),
-        ));
+        // （v1.37.0：此处原有一枚「封面」，已删——见本函数头注释。）
         left = left.child(sep());
 
         // ---- 中组：版字（列数 / 字体 / 字级 / 留白 / 纸墨 / 标注） / 专注 ----
@@ -2696,7 +2730,7 @@ impl Root {
         // `grid::frame_tests` 与 `punct` 两个模块：
         //
         //   ① 天宽地窄：纸面的 `pt` / `pb` 就是引擎的 `margin_top` /
-        //      `margin_bot`，而 `margin_bot = margin_top ÷ 2`（用户铁律，
+        //      `margin_bot`，而 `margin_bot = margin_top ÷ 1.5`（用户铁律，
         //      `grid::TOP_OF_BOT`）。**加粗外框（1→3px）只长在框上，
         //      不许多吃一寸天头、不许把上下拉成对称。**
         //   ② 绝对居中：左右叶的左右留白走 `sheet_side_pads`（严格镜像），
@@ -3685,7 +3719,7 @@ impl Root {
     ///   ① **上下闭合**：中缝的上下外框 / 内框与左右叶的上下框在同一
     ///      高度、同一粗细，摊开是一整张平铺的纸——「两端完美闭合」；
     ///   ② **不碰 Invariant 1**：中缝的上下留白直接读引擎的
-    ///      `margin_top` / `margin_bot`（2:1 铁律见 `grid::TOP_OF_BOT`），
+    ///      `margin_top` / `margin_bot`（3:2 铁律见 `grid::TOP_OF_BOT`），
     ///      不自己算数，天头地脚因此与两叶一丝不差；
     ///   ③ **不碰 Invariant 2**：中缝宽仍是引擎的 `gutter_w`，左右两叶
     ///      等宽（`sheet_side_pads` 镜像），中缝钉在屏幕正中。
@@ -4809,6 +4843,133 @@ impl Root {
     /// 浮层笔记框：盖在正文上的一张小卡片——标题、草稿（带光标）、保存 / 取消。
     /// 锚点取点击处（没有则视口居中偏上），并夹进视口；纸底半透明，
     /// 底下正文若隐若现，写笔记的同时不影响阅读。
+    /// **天头眉批**（v1.37.0）：把读者写在版框上方那段天头里的小字竖排画出来。
+    ///
+    /// 画两样东西：
+    ///   * 已存的一列列朱砂小字（`types::HeadNote`）——坐标一律由 `u/v` 比例
+    ///     × **当帧**天头带算出，故窗口缩放、换留白档、改列数都自动等比跟随，
+    ///     存储值一个字节都不用改（用户点名的「必须跟着天头等比缩放」）；
+    ///   * 正在写的那条——就地竖排 + 一道朱色光标，外面套 `ime::InputField`
+    ///     接中文输入法（可打印字符一律不走 keydown，见 `ime.rs` 架构说明）。
+    ///
+    /// 无背景、无边框：朱砂小字直接落在纸的留白上，像毛笔写上去的。
+    /// 整层是绝对定位，**不参与任何排版**，故绝不会碰动三大铁律的几何。
+    fn render_head_notes(&mut self, cx: &mut Context<Self>) -> Div {
+        let dbg = std::env::var("JIANDU_HEAD_NOTE").is_ok();
+        let Some((_, _, bw, bh)) = self.head_band() else {
+            return div();
+        };
+        // 只画钉在**当前这一面**上的眉批：判据是该面首字的字键
+        // （与 `page_anchor()` 同源），改列数重新分页后仍能找回去。
+        let Some(key) = self.page_anchor() else {
+            if dbg {
+                eprintln!("[眉批] 无页锚点");
+            }
+            return div();
+        };
+        // 开发用：JIANDU_HEAD_NOTE=1 自动题两条**同位置**的眉批（第二条
+        // 应向左让开一列），便于核对天头渲染与防重叠。只动内存，不写 JSON。
+        if dbg && self.head_notes.is_empty() {
+            let (u, v) = (0.70f32, 0.18f32);
+            self.head_notes.push(crate::types::HeadNote::new(
+                key,
+                u,
+                v,
+                "批曰：此本与《索隐》异",
+            ));
+            let u2 = crate::types::HeadNote::free_u(&self.head_notes, key, u, v);
+            self.head_notes
+                .push(crate::types::HeadNote::new(key, u2, v, "再批：让开一列"));
+        }
+        let fs = (self.size_ancient * HEAD_NOTE_FS_RATIO).max(9.0);
+        let lh = fs * 1.06;
+        let family = self.note_family();
+
+        let mut layer = div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w(px(bw))
+            .h(px(bh))
+            .font_family(family)
+            .text_size(px(fs))
+            .text_color(rgba(HEAD_NOTE_INK));
+
+        for n in self.head_notes.iter() {
+            if n.key != key {
+                continue;
+            }
+            let (x, y) = Self::head_note_pos(n.u, n.v, n.text.chars().count(), bw, bh, fs, lh);
+            layer = layer.child(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .child(Self::head_note_column(&n.text, fs, lh, None)),
+            );
+        }
+
+        // 正在写的那条：就地竖排 + 光标，并套 IME 输入层接中文。
+        if self.note_editing {
+            if let Some((k, u, v)) = self.head_anchor {
+                if k == key {
+                    let n = self.note_draft.chars().count();
+                    let (x, y) = Self::head_note_pos(u, v, n.max(1), bw, bh, fs, lh);
+                    let draft = self.note_draft.clone();
+                    let cur = self.note_cursor;
+                    layer = layer.child(
+                        div()
+                            .absolute()
+                            .left(px(x))
+                            .top(px(y))
+                            // 输入层：焦点落在此元素上，`InputHandler` 才把
+                            // 输入法组好的汉字送回 `note_draft`（见 `ime.rs`）。
+                            .child(crate::ime::InputField::new(
+                                Self::head_note_column(&draft, fs, lh, Some(cur)),
+                                self.note_focus.clone(),
+                                cx.entity(),
+                            )),
+                    );
+                }
+            }
+        }
+        layer
+    }
+
+    /// 眉批字柱的**左上角**：由归一化 (u, v) 换算，并向内夹紧——
+    /// 一列写到底不许溢出天头、也不许被纸缘切掉半个字。
+    fn head_note_pos(u: f32, v: f32, chars: usize, bw: f32, bh: f32, fs: f32, lh: f32) -> (f32, f32) {
+        let w = fs * 1.2;
+        let x = (u * bw).min((bw - w).max(0.0)).max(0.0);
+        let y = (v * bh).min((bh - chars as f32 * lh).max(0.0)).max(0.0);
+        (x, y)
+    }
+
+    /// 一列竖排小字（眉批的「字柱」）：逐字换行成列，`cursor` 为 Some 时在
+    /// 第 cur 字前插一道朱色细横标（竖排里光标就是字上方的一道横线）。
+    fn head_note_column(text: &str, fs: f32, lh: f32, cursor: Option<usize>) -> Div {
+        let mut col = div().flex().flex_col().items_center();
+        let n = text.chars().count();
+        for (i, ch) in text.chars().enumerate() {
+            if cursor == Some(i) {
+                col = col.child(div().w(px(fs)).h(px(1.5)).bg(rgba(HEAD_NOTE_INK)));
+            }
+            col = col.child(
+                div()
+                    .h(px(lh))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(SharedString::from(ch.to_string())),
+            );
+        }
+        // 光标在串尾：补一道横线，否则末尾看不见落点。
+        if cursor == Some(n) {
+            col = col.child(div().w(px(fs)).h(px(1.5)).bg(rgba(HEAD_NOTE_INK)));
+        }
+        col
+    }
+
     fn render_note_editor(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let vw = self.viewport_w;
@@ -6928,6 +7089,8 @@ impl Root {
         list = list.child(help_row("Esc", "退出专注 / 图片·文字分享 / 收起浮层", t));
 
         list = list.child(help_sec("文字", t));
+        // v1.37.0：天头（版框上方那段留白）点一下就能写朱砂小字。
+        list = list.child(help_row("点天头留白", "题「眉批」：⏎ 落笔 · Esc 弃", t));
         list = list.child(help_row("点正文文字", "查询 / 划线 / 笔记 / 复制 / 分享", t));
         list = list.child(help_row("拖选文字", "连续划线（竖排同样支持）", t));
         list = list.child(help_row("⌘C", "复制（有选区复制选区，否则整页）", t));
@@ -7334,7 +7497,7 @@ impl Root {
         // 「版心宽」就是左右留白比例的另一面：版心占得越窄，两侧留白
         // 越阔。宋版书版心只占纸宽六成（宽 = 复古），满屏档让文字区
         // 铺满叶面。天头率随档联动（`grid::top_frac_for`），
-        // 且**天头恒为地脚的两倍**（`grid::TOP_OF_BOT`）——这一档只
+        // 且**天头恒为地脚的 1.5 倍**（`grid::TOP_OF_BOT`）——这一档只
         // 动左右，不动那条铁律。
         let mut bx_row = div().flex().flex_row().items_start().gap(px(16.0)).flex_wrap();
         for (label, val) in [

@@ -90,6 +90,10 @@ pub fn skip_front_matter(book: &mut Book) {
     for e in toc.iter_mut() {
         e.chapter -= cut;
     }
+    // 再扫一道题名：EPUB 的 nav/ncx 里常有「封面」「目录」这类**单独一条**
+    // 的条目，它们指向的章可能已被上面的 `cut` 吃掉、也可能侥幸躲过——
+    // 只认章号会漏，索性题名也判一次（判据与砍章同一把，不会分叉）。
+    toc.retain(|e| !crate::parsers::is_front_matter_title(&e.title));
     book.toc = toc;
     if book.toc.is_empty() {
         book.rebuild_toc_from_chapters();
@@ -1247,6 +1251,58 @@ mod tests {
         assert_eq!(notes[0].at, 1); // 锚在「见」
         assert_eq!(notes[1].kind, NoteKind::Note);
         assert_eq!(notes[1].at, 3); // 锚在「欲」
+    }
+
+    /// v1.37.0 目录智能清洗：砍掉卷首附件章后，**目录条目必须同步前移并重
+    /// 编号**，且 nav 里那些单独一条的「封面」「目录」也要一并丢——只认
+    /// 章号会漏（它们可能指向一个侥幸没被砍掉的章）。
+    #[test]
+    fn toc_is_purged_along_with_the_front_matter() {
+        let mut b = Book::new("通鉴", "司马光");
+        for (title, body) in [
+            ("封面", ""),
+            ("胡三省简介", "胡三省，宋元之际史学家，以注通鉴名世。"),
+            (
+                "卷第一【周纪一】",
+                "威烈王二十三年。初命晋大夫魏斯、赵籍、韩虔为诸侯。臣光曰。",
+            ),
+            ("卷第二【周纪二】", "周纪二正文。臣光曰。"),
+        ] {
+            let mut c = Chapter {
+                title: title.into(),
+                paragraphs: Vec::new(),
+            };
+            c.paragraphs.push(Paragraph::plain(body));
+            b.chapters.push(c);
+        }
+        b.toc = vec![
+            TocEntry::new("封面", 0, 1),
+            TocEntry::new("胡三省简介", 1, 1),
+            TocEntry::new("目录", 1, 2),
+            TocEntry::new("卷第一【周纪一】", 2, 1),
+            TocEntry::new("卷第二【周纪二】", 3, 1),
+        ];
+        skip_front_matter(&mut b);
+
+        let left: Vec<&str> = b.chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(left, vec!["卷第一【周纪一】", "卷第二【周纪二】"], "附件章没砍干净：{left:?}");
+        let titles: Vec<&str> = b.toc.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["卷第一【周纪一】", "卷第二【周纪二】"],
+            "目录没洗干净：{titles:?}"
+        );
+        assert_eq!(b.toc[0].chapter, 0, "目录章号没跟着重编号");
+        assert_eq!(b.toc[1].chapter, 1);
+    }
+
+    /// `卷第一`（《资治通鉴》的卷次写法）必须能认成正文起手——v1.37.0 之前
+    /// 只认 `卷一`，通鉴全书找不到一个起手，前言一章都砍不动。
+    #[test]
+    fn juan_di_yi_counts_as_the_body_start() {
+        assert!(crate::parsers::is_body_start_title("卷第一【周纪一】"));
+        assert!(crate::parsers::is_body_start_title("卷一　五帝本纪第一"));
+        assert!(!crate::parsers::is_body_start_title("卷帙浩繁"));
     }
 
     #[test]
