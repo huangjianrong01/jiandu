@@ -402,7 +402,14 @@ pub fn stage3_punct(text: &str) -> String {
 }
 
 /// 只对「标记之外」的文本段跑 `f`，标记原样保留。
-fn map_outside_markers(s: &str, f: impl Fn(&str) -> String) -> String {
+///
+/// 标记集合见 [`MARKERS`]（`[注]`/`[/注]`/`[高亮]`/`[/高亮]`/`[拼音:`/`[数字:`），
+/// 这些是有语义的排版指令，清洗（全角标点、书名号、省略号替换……）绝不能
+/// 碰它们的内部——否则 `[拼音:hàn]` 的冒号会被转成全角、断掉注音解析。
+///
+/// 提升为 `pub(crate)` 供 `parsers::cleanup_ancient_text` 复用，免得两套清洗
+/// 各写一份「绕开标记」的逻辑。
+pub(crate) fn map_outside_markers(s: &str, f: impl Fn(&str) -> String) -> String {
     let cs: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     let mut buf = String::new();

@@ -1550,6 +1550,52 @@ impl Root {
     /// 当前所在章用朱砂红标出（加粗 + 描边）。点击章即按该章首字下标
     /// （`start_char_index`）重新排版并跳到第一叶。点面板外空白处平滑收起
     /// （由 `toc_slide` 驱动滑出动画）。
+    /// **目录章名专用竖排**（v1.30.0）。
+    ///
+    /// 目录不与正文共用那套 100% 严格的字格：竹简条长短本就不齐（
+    /// 「十五卷 四书」四个字、「历代名家词集精华录卷十九」十几个字），
+    /// 硬塞进等高格子只会互相迁就——长的被截断、短的底下空一大截。
+    ///
+    /// 故这里单走一条：
+    ///   * **高度由内容撑开**（`max` 只是防失控的上限，不是等高指令）；
+    ///   * **字距固定**（`gap`），条与条之间的间距也固定（容器的 `gap`），
+    ///     疏密一致，看着仍是一束整齐的简；
+    ///   * **空书名号剔除**：`︽︾` / `《》` 里没裹字的一律删掉——目录里
+    ///     常见这种空壳，竖排时变成两个孤零零的小角标，把行气戳断；
+    ///   * 书名号用竖排形 `︽ ︾`、字号比正文小一档（0.7），不抢章名。
+    fn toc_title_column(
+        title: &str,
+        fs: f32,
+        fg: u32,
+        bold: bool,
+        family: &SharedString,
+        max_chars: usize,
+    ) -> Div {
+        let clean = crate::types::strip_empty_title_marks(title);
+        let txt = clip_chars(&clean, max_chars);
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            // 字距固定（不再按字格均分）：长章名自然排长、短的排短。
+            .gap(px((fs * 0.12).max(1.0)))
+            .pt_3()
+            .font_family(family.clone());
+        for c in txt.chars() {
+            let is_mark = crate::types::is_title_mark(c);
+            let shown = crate::types::title_mark(c);
+            let size = if is_mark { fs * crate::punct::TITLE_FS_RATIO } else { fs };
+            col = col.child(
+                div()
+                    .text_size(px(size))
+                    .when(bold && !is_mark, |d| d.font_weight(FontWeight::BOLD))
+                    .text_color(rgb(fg))
+                    .child(SharedString::from(shown.to_string())),
+            );
+        }
+        col
+    }
+
     fn render_toc_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let vw = self.viewport_w;
         let vh = self.viewport_h;
@@ -1638,30 +1684,13 @@ impl Root {
                 _ => (34.0, 12.5),
             };
             let fg = if cur { VERMILION } else { MOON };
-            // 章名按竹条可用高度尽量排全，排不下才截断加省略号（高度统一后
-            // 各档可用高度一致，只因字号不同容纳字数有别）。
+            // 章名走**目录专用排版**（`toc_title_column`）：高度按内容撑开，
+            // 不再把所有竹简压成等高——长短不一的章名各排各的，字距与条距
+            // 仍固定。这里只留一道防失控的上限（1.6 屏高），超长才截断。
             let fish_h = w * 0.84 / 1.846;
             let avail = (strip_h - fish_h * 2.0 - 26.0).max(16.0);
-            let max_chars = (avail / (fs + 4.0)).floor().max(2.0) as usize;
-            let title_txt = clip_chars(&e.title, max_chars);
-
-            let mut title = div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap_1()
-                .pt_3()
-                .font_family(song.clone());
-            for c in title_txt.chars() {
-                title = title.child(
-                    div()
-                        .text_size(px(fs))
-                        // 当前章加粗，一眼能认出「我在这卷」。
-                        .when(cur, |d| d.font_weight(FontWeight::BOLD))
-                        .text_color(rgb(fg))
-                        .child(SharedString::from(c.to_string())),
-                );
-            }
+            let max_chars = (avail * 1.6 / (fs + 4.0)).floor().max(2.0) as usize;
+            let title = Self::toc_title_column(&e.title, fs, fg, cur, &song, max_chars);
             // 该章首页的叶码（小字），点这条简就跳到那一叶。查表，不再重排。
             let page_no = chapter_page.get(&chapter).copied().unwrap_or(0) + 1;
 
@@ -1670,7 +1699,9 @@ impl Root {
                 div()
                     .flex_shrink_0()
                     .w(px(w))
-                    .h(px(strip_h))
+                    // **不设固定高**：竹简长度由章名撑开（目录不与正文共用
+                    // 严格等高字格）。条底仍由容器的 `items_end` 对齐，
+                    // 一束简看着还是齐的。
                     .flex()
                     .flex_col()
                     .items_center()
@@ -2830,6 +2861,32 @@ impl Root {
                     ));
                     idx = j;
                 }
+                // 书名号（`Attach`）：半格账记 0，**不占独立格**。
+                // 开号 `︽` 由后一个字 look-behind 画、闭号 `︾` 由前一个字
+                // look-ahead 画，故正常情况下在下面的 `Main` 分支里就被消费
+                // 掉了；走到这里说明它**没有宿主**（列尾 / 段尾落单），
+                // 兜底单独画一小格，总比丢字强。
+                Piece::Main(g) if g.kind == GlyphKind::Attach => {
+                    let has_host = if crate::types::is_open_title(g.ch) {
+                        items[idx + 1..]
+                            .iter()
+                            .any(|p| matches!(p, Piece::Main(m) if m.kind != GlyphKind::Attach))
+                    } else {
+                        idx > 0
+                            && matches!(items[idx - 1], Piece::Main(m) if m.kind != GlyphKind::Attach)
+                    };
+                    if !has_host {
+                        // 落单：单独占一格，但仍是 0.7 倍小字、不撑满格。
+                        content = content.child(
+                            div()
+                                .w(px(cell_w))
+                                .h(px(cell_h))
+                                .relative()
+                                .child(self.title_mark_overlay(g.ch, cell_w, cell_h, fs, back)),
+                        );
+                    }
+                    idx += 1;
+                }
                 Piece::Main(g) => {
                     // 挤压标点：紧随其后的 `Hang` 字与**本字同格**——列排满
                     // 时排不下的句读挂在末字右下角，不另起一列占列首格。
@@ -2839,7 +2896,29 @@ impl Root {
                         Some(Piece::Main(h)) if h.kind == GlyphKind::Hang => Some(*h),
                         _ => None,
                     };
-                    idx += if hang.is_some() { 2 } else { 1 };
+                    // 书名号：开号在本字的**前一格位**（它领起的就是本字，
+                    // 故画在本字格右上角）；闭号紧跟本字（书名末字），同 Hang
+                    // 一路被本字吃掉。
+                    let open_mk = match items.get(idx.wrapping_sub(1)) {
+                        Some(Piece::Main(m))
+                            if m.kind == GlyphKind::Attach
+                                && crate::types::is_open_title(m.ch) =>
+                        {
+                            Some(m.ch)
+                        }
+                        _ => None,
+                    };
+                    let close_mk = match items.get(idx + 1) {
+                        Some(Piece::Main(m))
+                            if m.kind == GlyphKind::Attach
+                                && crate::types::is_close_title(m.ch) =>
+                        {
+                            Some(m.ch)
+                        }
+                        _ => None,
+                    };
+                    idx += 1 + if hang.is_some() { 1 } else { 0 }
+                        + if close_mk.is_some() { 1 } else { 0 };
                     let mark = self.mark_kind(*g);
                     content = content.child(self.ancient_cell(
                         *g,
@@ -2851,6 +2930,7 @@ impl Root {
                         note_index,
                         interactive,
                         hang,
+                        (open_mk, close_mk),
                         cx,
                     ));
                 }
@@ -3304,7 +3384,7 @@ impl Root {
         let head = cell_h * 1.0;
         col = col.child(div().h(px(head)));
         // 上鱼尾：与版心同一枚燕尾（深灰 `#333333`），尺寸同式。
-        let (tw, th) = crate::banxin::banxin_tail_size(col_w, cell_h);
+        let (tw, th) = crate::banxin::banxin_tail_size(col_w, cell_h, col_w);
         col = col.child(banxin_tail(tw, th, true, t.fish_ink()));
         col = col.child(div().h(px(cell_h * 0.18)));
         // 篇题能排几字：总高扣天头、两枚鱼尾、篇题数与几段留白，
@@ -3448,6 +3528,8 @@ impl Root {
             // `banxin::layout` 再扣两枚鱼尾与朱印，剩下的才是文字。
             band_h: (h - 40.0 - head - heikou).max(40.0),
             cell_h,
+            // v1.30.0：鱼尾宽按「列宽 × 0.7」取（见 `banxin_tail_size`）。
+            col_w: self.col_w,
             fs,
             book: &book,
             juan: &juan,
@@ -3795,6 +3877,36 @@ impl Root {
     /// `fs = 正文 × 0.4`、`dx = 格宽 × 0.3`、`dy = 格高 × 0.3`。
     /// 颜色是「朱砂兑纸色」的淡朱（比正文轻，却仍是句读的朱意），两套
     /// 深浅主题都稳——用兑色而非 opacity，不依赖底色透出来。
+    /// 书名号叠加层（v1.30.0）：缩到正文 **0.7 倍**，贴在字格**右上角**，
+    /// 不撑满格子、不与正文争格心。
+    ///
+    /// 书名号绝不单独占一格——半格账记 0（见 `gloss::piece_units`），
+    /// 开号 `︽` 叠在书名首字那一格、闭号 `︾` 叠在书名末字那一格，
+    /// 一对角标正好把书名「括」住，行气不断（旧版它独占一格，读起来一断一断）。
+    fn title_mark_overlay(&self, ch: char, cell_w: f32, cell_h: f32, fs: f32, back: bool) -> Div {
+        let t = self.theme;
+        let c = crate::types::title_mark(ch);
+        let pfs = (fs * crate::punct::TITLE_FS_RATIO)
+            .max(6.0)
+            .min(cell_h.min(cell_w));
+        let ink = if back { t.ink_soft() } else { t.ink() };
+        div()
+            .absolute()
+            // 右上角：贴格上缘与格右缘（竖排右缘是上一列那一侧，正是
+            // 刻本旁标的位置）。只占一个小方盒，正文字仍在格心。
+            .top(px(0.0))
+            .right(px(0.0))
+            .w(px(pfs))
+            .h(px(pfs))
+            .flex()
+            .flex_row()
+            .items_start()
+            .justify_end()
+            .text_size(px(pfs))
+            .text_color(rgb(ink))
+            .child(SharedString::from(c.to_string()))
+    }
+
     fn punct_overlay(&self, ch: char, cell_w: f32, cell_h: f32, fs: f32, back: bool) -> Div {
         let t = self.theme;
         let pb = crate::punct::place(fs, cell_w, cell_h);
@@ -3802,8 +3914,12 @@ impl Root {
         let ink = crate::theme::mix(paper, t.accent(), crate::punct::INK_MIX);
         div()
             .absolute()
-            .left(px(pb.dx))
-            .top(px(pb.dy))
+            // 起点再叠一层「墨迹补偿」：em box 右移 0.7×fs，墨点才正贴格
+            // 右缘（em box 余下的空白探出格一点，墨点不出格）。见
+            // `punct::INK_DX_RATIO`——只靠 justify_end 会把墨点留在格右侧
+            // 五分之一处，看着像格心偏下的一颗黑痣。
+            .left(px(pb.dx + pb.ink_dx))
+            .top(px(pb.dy + pb.ink_dy))
             .w(px(pb.w))
             .h(px(pb.h))
             .flex()
@@ -3833,6 +3949,10 @@ impl Root {
         interactive: bool,
         // 挤进本格右下角的句读（列排满时排不下的那枚），`None` 为常规字格。
         hang: Option<Glyph>,
+        // 叠到本格右上角的书名号（v1.30.0）：`(开号, 闭号)`。
+        // 开号 `︽` 落在书名**首字**格、闭号 `︾` 落在书名**末字**格，
+        // 两者都不占独立格——书名号因此永不落列首 / 列尾。
+        title_marks: (Option<char>, Option<char>),
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme;
@@ -4041,9 +4161,10 @@ impl Root {
                     .child(SharedString::from(vp.to_string())),
             );
         } else if crate::types::is_title_mark(g.ch) {
-            // **书名号**：强制 `︽ ︾`（竖排专用字形），字号 **0.8 倍**正文
-            // （`punct::TITLE_FS_RATIO`）。它包着一整串书名，既不能按句读
-            // 印成 0.4 倍的小点，也不该与正文齐平——矮一头才像刻本。
+            // **书名号**（兜底路径）：正常流程里 `to_flow` 已把它换成 `︽ ︾`
+            // 并标成 `Attach`，由 `title_mark_overlay` 叠到邻字格的右上角、
+            // 半格账记 0、不占格。走到这里说明它是**孤立**的（前后都没有
+            // 可依附的正文），只能单独一格——字号仍是 0.7 倍正文。
             let tf = (fs * crate::punct::TITLE_FS_RATIO).max(9.0).min(cell_h);
             cell = cell.child(
                 div()
@@ -4101,6 +4222,18 @@ impl Root {
             cell = cell
                 .relative()
                 .child(self.punct_overlay(h.ch, cell_w, cell_h, fs, back));
+        }
+        // 书名号：贴**本格右上角**、0.7 倍正文。开号在本格（书名首字）、
+        // 闭号也在本格（书名末字）——一格至多各一枚，绝不单独占列。
+        let (open_mk, close_mk) = title_marks;
+        if open_mk.is_some() || close_mk.is_some() {
+            cell = cell.relative();
+            if let Some(c) = open_mk {
+                cell = cell.child(self.title_mark_overlay(c, cell_w, cell_h, fs, back));
+            }
+            if let Some(c) = close_mk {
+                cell = cell.child(self.title_mark_overlay(c, cell_w, cell_h, fs, back));
+            }
         }
         // 脚注模式下补圈号角标。
         if !self.notes_inline && self.show_notes {
@@ -7004,11 +7137,15 @@ impl Root {
                 // ---- 列数：8 / 10 / 12 / 14 ----
                 // 走 `set_columns` → `set_layout`：同样保住 charIndex 锚点，
                 // 换列数不跳页；`calculateGrid` 立刻重算列宽与字号。
+                // 古风档名（v1.30.0）：刻本按「一叶几行」称呼开本，疏密自带
+                // 名目——行少则字大行宽（疏朗）、行多则字小行密（密排）。
+                // 切到这里不只是改列数：列宽随之变，字号（0.75×列宽）与行高
+                // （1.0×列宽）一起变，八行本翻开来就是宋版书那种疏朗大字。
                 const COL_OPTS: [(&str, usize); 4] = [
-                    ("8 列", 8),
-                    ("10 列", 10),
-                    ("12 列", 12),
-                    ("14 列", 14),
+                    ("八行疏朗本", 8),
+                    ("十行经典本", 10),
+                    ("十二行密排本", 12),
+                    ("十四行信笺本", 14),
                 ];
                 let cur_cols = self.grid.columns;
                 let mut cols_row = div()

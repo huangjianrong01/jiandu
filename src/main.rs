@@ -19,6 +19,7 @@ mod hit;
 mod note_inject;
 mod numcn;
 mod pipeline;
+mod parsers;
 mod ime;
 mod importer;
 mod library;

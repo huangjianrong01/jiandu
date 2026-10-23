@@ -122,10 +122,25 @@ pub const GRID_COLUMN_CHOICES: [usize; 4] = [8, 10, 12, 14];
 pub struct LayoutConfig {
     /// 配置键（数据驱动切换的句柄，见 [`LAYOUT_CONFIGS`]）。
     pub key: &'static str,
+    /// **古版行款预设键**（v1.30.0）：`song_dynasty_8` / `ming_dynasty_10` /
+    /// `qing_dynasty_12` / `letter_14`。与 `key` 一一对应，供外部配置与
+    /// 脚本按「行款」点名（见 [`LayoutConfig::by_preset`]）。
+    pub preset: &'static str,
     /// 按钮 / 菜单上显示的标签（UI 直接读它，不写死文案）。
     pub label: &'static str,
+    /// 行款释文（一句话说清这套版式的来历与观感）。
+    pub desc: &'static str,
     /// 每面列数（竖排=竖列数）：8 / 10 / 12 / 14。
     pub columns: usize,
+    /// **字号 / 列宽**：`fs = 列宽 × fs_ratio`。
+    ///
+    /// 行款越古越疏：宋版八行字大（0.8），信笺十四行字小（0.68）。
+    pub fs_ratio: f32,
+    /// **行高 / 字号**：`row_h = fs × line_ratio`。
+    ///
+    /// 与 `fs_ratio` 相乘才是「行高 / 列宽」：宋版 0.8×1.2 = 0.96 列宽、
+    /// 信笺 0.68×1.05 = 0.714 列宽——行款越密，行高收得越紧。
+    pub line_ratio: f32,
     /// 排版方向（沿用既有方向枚举）。
     pub dir: GridDir,
     /// 四周留白比例。
@@ -141,17 +156,68 @@ pub struct LayoutConfig {
 /// 「信笺 14 列」独占一条 2:3 平铺稿纸路径（`fit_letter`），已被移除——
 /// 那套模板只有 14 列能用，且与列数选择器冲突（选 14 得到的是信笺而不是
 /// 标准刻本）。版框统一为「外粗内细」的文武边栏（见 `render_ancient`）。
+///
+/// v1.30.0 起每一行还带一套**古版行款**（`fs_ratio` / `line_ratio`）：
+/// 切版式不只是改列数，字级与行高一起变——八行本翻开来就是宋版书那种
+/// 疏朗大字，十四行信笺则是精刻细密的小字。
 pub const LAYOUT_CONFIGS: &[LayoutConfig] = &[
-    LayoutConfig { key: "standard8",  label: "标准 8 列",  columns: 8,  dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false },
-    LayoutConfig { key: "standard10", label: "标准 10 列", columns: 10, dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false },
-    LayoutConfig { key: "standard12", label: "标准 12 列", columns: 12, dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false },
-    LayoutConfig { key: "standard14", label: "标准 14 列", columns: 14, dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false },
+    LayoutConfig {
+        key: "standard8", preset: "song8",
+        label: "八行疏朗本", desc: "宋版：字大，行距宽",
+        columns: 8, fs_ratio: 0.80, line_ratio: 1.20,
+        dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
+    },
+    LayoutConfig {
+        key: "standard10", preset: "ming10",
+        label: "十行经典本", desc: "明版：适中",
+        columns: 10, fs_ratio: 0.75, line_ratio: 1.15,
+        dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
+    },
+    LayoutConfig {
+        key: "standard12", preset: "qing12",
+        label: "十二行密排本", desc: "清版：密集",
+        columns: 12, fs_ratio: 0.70, line_ratio: 1.10,
+        dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
+    },
+    LayoutConfig {
+        key: "standard14", preset: "letter14",
+        label: "十四行信笺本", desc: "信笺：极密",
+        columns: 14, fs_ratio: 0.65, line_ratio: 1.05,
+        dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
+    },
 ];
 
 impl LayoutConfig {
     /// 按配置键取配置；未知键回落默认。
     pub fn by_key(key: &str) -> Option<&'static LayoutConfig> {
         LAYOUT_CONFIGS.iter().find(|c| c.key == key)
+    }
+    /// **按行款预设键取配置**（v1.30.0）：`song_dynasty_8` / `ming_dynasty_10` /
+    /// `qing_dynasty_12` / `letter_14`。未知键返回 `None`。
+    ///
+    /// 两套键并存是刻意的：`key` 是存档里的稳定句柄（旧存档写的是
+    /// `standard*`），`preset` 是对外的行款名，便于脚本 / 配置按版式点名。
+    pub fn by_preset(preset: &str) -> Option<&'static LayoutConfig> {
+        LAYOUT_CONFIGS.iter().find(|c| c.preset == preset).or_else(|| {
+            // 长名别名（`song_dynasty_8` 等）：同一套行款，两种叫法都认，
+            // 免得外部脚本换个写法就查不到。
+            let short = match preset {
+                "song_dynasty_8" => "song8",
+                "ming_dynasty_10" => "ming10",
+                "qing_dynasty_12" => "qing12",
+                "letter_14" => "letter14",
+                other => other,
+            };
+            LAYOUT_CONFIGS.iter().find(|c| c.preset == short)
+        })
+    }
+    /// 四套行款的**疏密梯度**自检值：`(列数, 字号比, 行高比)`，由稀到密。
+    pub fn presets() -> &'static [LayoutConfig] {
+        LAYOUT_CONFIGS
+    }
+    /// 列数 → 该列数对应的行款（列数与行款一一对应，故查表即可）。
+    pub fn by_columns(columns: usize) -> Option<&'static LayoutConfig> {
+        LAYOUT_CONFIGS.iter().find(|c| c.columns == columns)
     }
     /// 默认版式（首启 / 配置损坏时的回落）。
     ///
@@ -184,22 +250,34 @@ pub struct GridConfig {
     pub dir: GridDir,
     /// 四周留白比例（相对内容区，0..1）。
     pub margin: f32,
-    /// **行高缩放**（`lineHeightScale`）：行高 = 列宽 × `GRID_ROW_RATIO` × 它。
+    /// **字号 / 列宽**（v1.30.0 由行款预设给，不再写死 `GRID_FS_RATIO`）：
+    /// `fs = 列宽 × fs_ratio`。宋版八行 0.80、信笺十四行 0.68。
+    pub fs_ratio: f32,
+    /// **行高 / 字号**（v1.30.0 同样来自行款）：`row_h = fs × line_ratio`。
+    ///
+    /// 与 `fs_ratio` 相乘才得到「行高 / 列宽」：宋版 0.96、信笺 0.714——
+    /// 行款越密，行高收得越紧，一列能多排几个字。
+    pub line_ratio: f32,
+    /// **行高缩放**（`lineHeightScale`）：行高 = 字号 × `line_ratio` × 它。
     ///
     /// 不同字体的 em box 大小不同——思源系列字面偏大，同样字号下竖排
-    /// 上下两字容易贴住。按当前正文字体给一点余量（宋体 1.05、楷体 1.12），
+    /// 上下两字容易贴住。按当前正文字体给一点余量（宋体 1.0、楷体 1.06），
     /// 字形才紧凑而不重叠。见 `fonts::line_height_scale`。
     pub line_scale: f32,
 }
 
 impl Default for GridConfig {
     fn default() -> Self {
+        // 与 `LayoutConfig::default()`（清版十二行）同源：列数与两个比例
+        // 都从那一行取，两处默认就不会打架。
+        let c = LayoutConfig::default();
         GridConfig {
-            // 与 `LayoutConfig::default()` 同为 12 列：两处默认必须一致，
-            // 否则「首启版式」与「首启列数」会打架（一个说 12、一个排 8）。
-            columns: 12,
-            dir: GridDir::Vertical,
-            margin: 0.04, line_scale: 1.0,
+            columns: c.columns,
+            dir: c.dir,
+            margin: c.margin,
+            fs_ratio: c.fs_ratio,
+            line_ratio: c.line_ratio,
+            line_scale: 1.0,
         }
     }
 }
@@ -356,34 +434,46 @@ pub fn compute_grid(
 
     // 4) 用户公式：列宽 = 可用宽 / 列数。
     let col_w_raw = inner_w / cfg.columns as f32;
-    // 5) 字号 = 0.75 × 列宽；上下限双向兜底。
+    // 5) 字号 = 列宽 × `fs_ratio`（行款给的，宋版 0.80 / 信笺 0.68）；
+    //    上下限双向兜底。
     //
     //    触**下限**（窄屏 14 列）：字号优先，反推列宽放大（宁可溢出滚动）。
     //    触**上限**（大屏对开）：列宽随之回缩到「字刚好贴格」，字与格的
-    //    0.75 比例得以保住——只压字号不回缩列宽的话，字会缩在格心，纸面
-    //    反而更空（这正是「大字本」的反面）。但最多只缩到原列宽的 70%：
+    //    `fs_ratio` 比例得以保住——只压字号不回缩列宽的话，字会缩在格心，
+    //    纸面反而更空（这正是「大字本」的反面）。但最多只缩到原列宽的 70%：
     //    再窄就成了一条纸带，两侧空白比书还宽。
+    let ratio = if cfg.fs_ratio > 0.0 { cfg.fs_ratio } else { GRID_FS_RATIO };
     let cap = fs_max.max(GRID_FS_MIN);
-    let want = col_w_raw * GRID_FS_RATIO * zoom;
+    let want = col_w_raw * ratio * zoom;
     let min_hit = want < GRID_FS_MIN;
     let capped = want > cap;
     let fs = want.clamp(GRID_FS_MIN, cap);
     let col_w = if min_hit {
-        fs / GRID_FS_RATIO
+        fs / ratio
     } else if capped {
-        (fs / GRID_FS_RATIO).max(col_w_raw * 0.70)
+        (fs / ratio).max(col_w_raw * 0.70)
     } else {
         col_w_raw
     };
-    // 6) 行高 = 1.1 × 列宽 × 行高缩放（与字号比例固定，天然保证
-    //    rowHeight > fontSize，竖排不上下重叠）。缩放由当前正文字体定
-    //    （思源系字面大 → 松开一点余量），见 `fonts::line_height_scale`。
+    // 6) 行高 = 字号 × `line_ratio` × 行高缩放（v1.30.0：行高挂在**字号**上，
+    //    不再挂列宽）。行款给的 `line_ratio` 是「行高 / 字号」的倍数
+    //    （宋版 1.20 → 疏朗、信笺 1.05 → 紧凑），乘以 `fs_ratio` 才是
+    //    「行高 / 列宽」：宋版 0.96、明版 0.8625、清版 0.792、信笺 0.714。
+    //
+    //    缩放由当前正文字体定（思源系字面大 → 松开一点余量），见
+    //    `fonts::line_height_scale`。行款保证了 `line_ratio > 1`，
+    //    故 rowHeight > fontSize 恒成立，竖排不会上下重叠。
     let scale = if cfg.line_scale > 0.0 {
         cfg.line_scale.clamp(LINE_SCALE_MIN, LINE_SCALE_MAX)
     } else {
         LINE_SCALE_BASE
     };
-    let row_h = col_w * GRID_ROW_RATIO * scale;
+    let lratio = if cfg.line_ratio > 0.0 {
+        cfg.line_ratio
+    } else {
+        GRID_ROW_RATIO / ratio
+    };
+    let row_h = fs * lratio * scale;
     // 7) 总行数 = floor(可用高 / 行高)。
     let rows = ((inner_h / row_h).floor()).max(1.0) as usize;
 
@@ -509,6 +599,11 @@ pub struct GridInput {
     pub margin: f32,
     /// 行高缩放（随正文字体）。
     pub line_scale: f32,
+    /// **字号 / 列宽**（行款预设给）：宋版 0.80、信笺 0.68。
+    /// 传 0 = 按列数自行查行款表（见 [`LayoutConfig::by_columns`]）。
+    pub fs_ratio: f32,
+    /// **行高 / 字号**（行款预设给）：宋版 1.20、信笺 1.05。传 0 = 查表。
+    pub line_ratio: f32,
     pub dir: GridDir,
     /// 字号上限（px）：常规阅读 = [`GRID_FS_MAX`]；专注模式传
     /// `f32::INFINITY`（整屏只排一叶，就是要大字）。
@@ -548,10 +643,25 @@ pub fn calculate_grid(inp: GridInput) -> GridPlan {
         LayoutMode::Single => (inp.content_w, inp.content_h, false, inp.zoom),
         LayoutMode::Full => (FULL_BASE_W * scale, FULL_BASE_H * scale, true, 1.0),
     };
+    // 行款比例：优先用调用方给的（UI 已按当前版式取好）；没给就按列数
+    // 查行款表——保证「切版式 = 列数 + 字级 + 行高一起变」，且两处同源。
+    let preset = LayoutConfig::by_columns(inp.columns.max(1));
+    let fs_ratio = if inp.fs_ratio > 0.0 {
+        inp.fs_ratio
+    } else {
+        preset.map(|c| c.fs_ratio).unwrap_or(GRID_FS_RATIO)
+    };
+    let line_ratio = if inp.line_ratio > 0.0 {
+        inp.line_ratio
+    } else {
+        preset.map(|c| c.line_ratio).unwrap_or(GRID_ROW_RATIO / fs_ratio)
+    };
     let cfg = GridConfig {
         columns: inp.columns.max(1),
         dir: inp.dir,
         margin: inp.margin,
+        fs_ratio,
+        line_ratio,
         line_scale: inp.line_scale,
     };
     // 整页：版框 / 天头 / 地脚也乘同一系数——否则「边框不缩放」会让内部
@@ -645,7 +755,7 @@ mod tests {
             head: 0.0,
             foot: 12.0,
             margin: 0.04,
-            line_scale: 1.0,
+            line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
             dir: GridDir::Vertical,
             fs_max: GRID_FS_MAX,
         }
@@ -789,7 +899,14 @@ mod tests {
         let (cw, ch) = content();
         // 传无限上限：这一条验的是「算式本身」，不该被 32px 的阅读上限干扰
         // （1276 宽单叶的字号本来会上百，触顶后列宽回缩，验不出公式）。
-        let cfg = GridConfig { columns: 12, ..GridConfig::default() };
+        // 显式给「旧口径」两个比例（0.75 字级 / 1.0 列宽行高）：这条验的是
+        // 算式本身，不该被行款预设的另一个比例搅进来。
+        let cfg = GridConfig {
+            columns: 12,
+            fs_ratio: 0.75,
+            line_ratio: 1.0 / 0.75,
+            ..GridConfig::default()
+        };
         let m = compute_grid(cw, ch, cfg, false, 1.0, 50.0, 0.0, 12.0, 0.0, f32::INFINITY);
         let inner_w = (cw - 50.0 - 2.0 * cw * 0.04).max(40.0);
         let expect_col = inner_w / 12.0;
@@ -804,13 +921,17 @@ mod tests {
     fn twelve_columns_no_overflow_or_overlap() {
         // 12 列：字格整张纸宽不超过内容区；且 row_h > fs 保证不重叠。
         let (cw, ch) = content();
+        // 两套都按各自的**行款**算（清版十二行 vs 八行疏朗本），才比得出
+        // 「列多则字小行密」；混用旧口径（0.75 / 行高=列宽）会得出反结论。
+        let qing = LayoutConfig::by_columns(12).unwrap();
         let m = compute_grid(
             cw,
             ch,
             GridConfig {
-                columns: 12,
-                dir: GridDir::Vertical,
-                margin: 0.04, line_scale: 1.0,
+                columns: qing.columns,
+                fs_ratio: qing.fs_ratio,
+                line_ratio: qing.line_ratio,
+                ..GridConfig::default()
             },
             true,
             1.0,
@@ -823,10 +944,85 @@ mod tests {
         assert!(m.row_h > m.fs, "12 列 row_h 必须 > fs");
         // 列越多越密：12 列的列宽必然小于 8 列。字号在两者都触 32px 上限时
         // 会相等——这正是上限的意思（不再随列数变大的那种「大字本」）。
-        let m8 = compute_grid(cw, ch, GridConfig::default(), true, 1.0, 50.0, 0.0, 12.0, 0.0, GRID_FS_MAX);
+        // 8 列按**八行疏朗本**的行款算（列数与两个比例都从行款表取），
+        // 才比得出「列多 → 字小行密」。
+        let song = LayoutConfig::by_columns(8).unwrap();
+        let m8 = compute_grid(
+            cw,
+            ch,
+            GridConfig {
+                columns: song.columns,
+                fs_ratio: song.fs_ratio,
+                line_ratio: song.line_ratio,
+                ..GridConfig::default()
+            },
+            true,
+            1.0,
+            50.0,
+            0.0,
+            12.0,
+            0.0,GRID_FS_MAX);
         assert!(m.col_w < m8.col_w + 0.01, "12 列列宽 {:.1} 应不大于 8 列 {:.1}", m.col_w, m8.col_w);
         assert!(m.fs <= m8.fs + 0.01, "12 列字级不该大于 8 列");
         assert!(m.rows >= m8.rows, "行高收紧后行数不减少");
+    }
+
+    #[test]
+    fn layout_presets_step_from_sparse_to_dense() {
+        // 四套古版行款：列数递增 → 字号比递减 → 行高比递减，
+        // 于是「行款越古越疏朗、越晚近越细密」——一键切换就能换开本。
+        let ps = LayoutConfig::presets();
+        assert_eq!(ps.len(), 4, "四套行款");
+        for w in ps.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            assert!(b.columns > a.columns, "列数应递增：{} → {}", a.columns, b.columns);
+            assert!(b.fs_ratio < a.fs_ratio, "字号比应递减：{} → {}", a.columns, b.columns);
+            assert!(b.line_ratio < a.line_ratio, "行高比应递减：{} → {}", a.columns, b.columns);
+            assert!(!a.desc.is_empty() && !a.label.is_empty(), "行款缺文案");
+        }
+        // 预设键可按名点名（含长名别名）。
+        assert!(LayoutConfig::by_preset("song8").is_some());
+        assert!(LayoutConfig::by_preset("letter14").is_some());
+        assert!(LayoutConfig::by_preset("qing_dynasty_12").is_some(), "长名别名也要认");
+        assert_eq!(
+            LayoutConfig::by_preset("song_dynasty_8").unwrap().columns,
+            8
+        );
+        assert!(LayoutConfig::by_preset("nope").is_none());
+    }
+
+    #[test]
+    fn font_size_and_row_height_follow_the_preset_ratios() {
+        // 不写死像素：fs = 可用宽/列数 × fontSizeRatio，row_h = fs × lineHeightRatio。
+        let (cw, ch) = content();
+        let mut prev_rows = 0usize;
+        for p in LayoutConfig::presets() {
+            let cfg = GridConfig {
+                columns: p.columns,
+                fs_ratio: p.fs_ratio,
+                line_ratio: p.line_ratio,
+                ..GridConfig::default()
+            };
+            // 单叶 + 无限上限：纯粹验行款比例，不被 32px 上限干扰。
+            let m = compute_grid(cw, ch, cfg, false, 1.0, 50.0, 0.0, 12.0, 0.0, f32::INFINITY);
+            let inner_w = (cw - 50.0 - 2.0 * cw * 0.04).max(40.0);
+            let expect_col = inner_w / p.columns as f32;
+            assert!(
+                (m.fs - expect_col * p.fs_ratio).abs() < 0.01,
+                "{} 列字号应 = 列宽 × {:.2}，实为 {:.2}",
+                p.columns, p.fs_ratio, m.fs
+            );
+            assert!(
+                (m.row_h - m.fs * p.line_ratio).abs() < 0.01,
+                "{} 列行高应 = 字号 × {:.2}，实为 {:.2}",
+                p.columns, p.line_ratio, m.row_h
+            );
+            // 行高必大于字号：竖排两字不上下重叠（行款保证 line_ratio > 1）。
+            assert!(m.row_h > m.fs, "{} 列 row_h({:.2}) 必须 > fs({:.2})", p.columns, m.row_h, m.fs);
+            // 行款越密，一列能排的字越多。
+            assert!(m.rows >= prev_rows, "{} 列行数 {} 少于上一档 {}", p.columns, m.rows, prev_rows);
+            prev_rows = m.rows;
+        }
     }
 
     #[test]
@@ -838,7 +1034,7 @@ mod tests {
             GridConfig {
                 columns: 14,
                 dir: GridDir::Vertical,
-                margin: 0.04, line_scale: 1.0,
+                margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
             },
             false,
             1.0,
@@ -861,7 +1057,7 @@ mod tests {
             GridConfig {
                 columns: 14,
                 dir: GridDir::Vertical,
-                margin: 0.04, line_scale: 1.0,
+                margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
             },
             false,
             1.0,
@@ -1063,7 +1259,7 @@ mod tests {
                     columns: c.columns,
                     dir: c.dir,
                     margin: c.margin,
-                    line_scale: 1.0,
+                    line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
                 },
                 false,
                 1.0,
@@ -1088,7 +1284,7 @@ mod tests {
                     columns: 8,
                     dir: GridDir::Vertical,
                     margin: 0.04,
-                    line_scale: scale,
+                    line_scale: scale, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
                 },
                 false,
                 1.0,

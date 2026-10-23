@@ -14,6 +14,7 @@ pub mod punct;
 pub mod importer;
 pub mod library;
 pub mod numcn;
+pub mod parsers;
 pub mod pipeline;
 pub mod ruby;
 pub mod trad;

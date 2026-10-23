@@ -903,12 +903,22 @@ impl Book {
                     if !show_punct && is_punct(c) {
                         continue;
                     }
+                    // **书名号在进排版引擎之前就换成竖排专用形**（v1.30.0）：
+                    // 《》→︽︾，且标成 `Attach`——它不独占一格，缩到正文 70%
+                    // 叠在相邻字的格右上角。渲染层因此不必再判横排原形，
+                    // 分页与渲染拿到的是同一个字符、同一套口径。
+                    let ch = title_mark(c);
+                    let kind = if is_title_mark(c) {
+                        GlyphKind::Attach
+                    } else {
+                        GlyphKind::Char
+                    };
                     out.push(Glyph {
                         chapter: ci,
                         para: pi,
                         offset: oi,
-                        ch: c,
-                        kind: GlyphKind::Char,
+                        ch,
+                        kind,
                     });
                 }
             }
@@ -931,6 +941,16 @@ pub enum GlyphKind {
     /// `Piece::Main` 里；`Page::glyphs` 的读序里它仍是 `Char`（保 charIndex
     /// 与检索、注文锚点一致）。见 [`crate::punct`]。
     Hang,
+    /// **书名号附着记号**（v1.30.0）：`︽ ︾ ︿ ﹀`。
+    ///
+    /// 书名号**绝不单独占据一个网格**——半格账记 0，由渲染层缩到正文
+    /// [`crate::punct::TITLE_FS_RATIO`]（0.7）叠画到**相邻字格**的右上角：
+    /// 开号（`︽`）领起书名，贴书名首字那一格；闭号（`︾`）收束书名，
+    /// 贴书名末字那一格。如此书名号永不落列首、也永不落列尾，行气不断。
+    ///
+    /// 与 `Hang` 的区别：`Hang` 是「列满了硬挤进末字」的兜底，画在格**右下角**；
+    /// `Attach` 是常态排版，画在格**右上角**、且字号是单独一档（0.7 而非 0.3）。
+    Attach,
 }
 
 /// 版面流里的一个字（带归属信息，便于查注释）。
@@ -1068,6 +1088,65 @@ pub fn title_mark(c: char) -> char {
     }
 }
 
+/// 书名号是否**开启**类（`︽ ︿ 《 〈`）：领起书名，宿主是**后一个字**。
+///
+/// v1.30.0 起书名号不再独占一格：它缩到正文 70%、叠加到相邻字的格右上角。
+/// 开号领起书名，故贴书名**首字**那一格（渲染层 look-behind）；
+/// 闭号收束书名，故贴书名**末字**那一格（渲染层 look-ahead，与 `Hang` 同路）。
+pub fn is_open_title(c: char) -> bool {
+    matches!(c, '︽' | '︿' | '《' | '〈')
+}
+
+/// 书名号是否**收束**类（`︾ ﹀ 》 〉`）。宿主是**前一个字**。
+pub fn is_close_title(c: char) -> bool {
+    matches!(c, '︾' | '﹀' | '》' | '〉')
+}
+
+/// **剔除没有文字包裹的空书名号**（v1.30.0，目录专用）。
+///
+/// 目录里常见 `︽︾`、`《》` 这种空壳（清洗漏下来的、或书名缺失），
+/// 竖排时它们会变成两个孤零零的小角标，把行气戳断——连壳删掉。
+///
+/// 只删**成对相邻**的空壳；`︽道德经︾` 这种有内容的原样保留。
+/// 落单的一个（如只有 `︽`）也删——没有包裹对象的书名号没有意义。
+pub fn strip_empty_title_marks(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out: Vec<char> = Vec::with_capacity(cs.len());
+    let mut i = 0usize;
+    while i < cs.len() {
+        if is_title_mark(cs[i]) {
+            // 向后扫：连续的书名号（含空壳与噪点空白）算一簇。
+            let mut j = i;
+            let mut has_text = false;
+            let mut close_seen = false;
+            while j < cs.len() {
+                let c = cs[j];
+                if is_open_title(c) {
+                    if close_seen {
+                        break; // 上一对已闭合，这是下一对的开始
+                    }
+                } else if is_close_title(c) {
+                    close_seen = true;
+                } else if c.is_whitespace() {
+                    // 空白不计作「包裹的文字」
+                } else {
+                    has_text = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !has_text {
+                // 空壳 / 落单：整簇丢掉
+                i = j;
+                continue;
+            }
+        }
+        out.push(cs[i]);
+        i += 1;
+    }
+    out.into_iter().collect()
+}
+
 /// 引号：直角引号 `「」『』` 与弯引号 `“”‘’`（含已是竖排异体的）。
 pub fn is_quote_mark(c: char) -> bool {
     matches!(
@@ -1141,6 +1220,166 @@ pub fn is_punct(c: char) -> bool {
             | '’'
     )
 }
+
+/// **竖排标点**：横排标点在竖排里要么躺倒（`:` `;`）、要么开口朝错方向
+/// （`“ ”` `（ ）`），必须换成 Unicode 的**竖排呈现形**（U+FE10–FE19 与
+/// U+FE41–FE44）——字库里存的就是转好的那一枚，GPUI 0.2.2 无元素级旋转，
+/// 这是唯一正解（v1.30.0 用户反馈「船山遗书：第一」的冒号极度突兀）。
+pub fn vertical_punct(c: char) -> char {
+    match c {
+        // 半角（EPUB 里常见未清洗的 ASCII 标点）
+        ':' => '︓', // U+FE13 竖排冒号
+        ';' => '︔', // U+FE14 竖排分号
+        '!' => '︕', // U+FE15 竖排叹号
+        '?' => '︖', // U+FE16 竖排问号
+        ',' => '︐', // U+FE10 竖排逗号
+        '.' => '︒', // U+FE12 竖排句号
+        '(' => '︵', // U+FE35 竖排左括号
+        ')' => '︶', // U+FE36 竖排右括号
+        '[' | '［' => '︗', // U+FE47 竖排左方括号
+        ']' | '］' => '︘', // U+FE48 竖排右方括号
+        // 全角横排标点 → 竖排形
+        '：' => '︓',
+        '；' => '︔',
+        '！' => '︕',
+        '？' => '︖',
+        '，' => '︐',
+        '。' => '︒',
+        '、' => '︑', // U+FE11 竖排顿号
+        '“' => '﹁',
+        '”' => '﹂',
+        '‘' => '﹃',
+        '’' => '﹄',
+        '（' => '︵',
+        '）' => '︶',
+        other => other,
+    }
+}
+
+/// 是否**竖排标点**（含横排原形与其竖排呈现形）：是就走句读那一档
+/// （[`crate::punct`] 的小字 + 右下角偏移），绝不与正文争格心。
+pub fn is_vertical_punct(c: char) -> bool {
+    matches!(
+        c,
+        ':' | ';' | '!' | '?' | ',' | '.' | '(' | ')' | '[' | ']'
+            | '：' | '；' | '！' | '，' | '。' | '、'
+            | '“' | '”' | '‘' | '’' | '（' | '）'
+            // 竖排呈现形本身
+            | '︓' | '︔' | '︕' | '︖' | '︐' | '︒' | '︑'
+            | '﹁' | '﹂' | '﹃' | '﹄' | '︵' | '︶' | '︗' | '︘'
+    )
+}
+
+/// **剔除残留的孤立注释标记**（v1.30.0）。
+///
+/// 清洗管线偶有漏网的 `[注]` / `[/注]` / `[ / 注 ]`（标签被截断、或原书
+/// 里本就写着这两个词），渲染时会变成四个方括号加一个「注」字的乱码，
+/// 且占掉四五个字格。这里按「成对才算注」的口径扫一遍：
+///   * 完整的 `[注]…[/注]` —— 原样保留（交给双行夹注渲染）；
+///   * 落单的 `[注]` / `[/注]` / 带空格的变体 —— 连壳删掉。
+pub fn strip_dangling_note_marks(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < n {
+        if chars[i] != '[' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // 试着读一个注标记（允许内部空白：`[注]` / `[ / 注 ]` / `[/注]` …）。
+        match read_note_marker(&chars, i) {
+            Some((MarkerKind::Open, span)) => {
+                // 向前找配对的收标记，按开标记深度计数，绝不跨层配对。
+                let mut depth = 1usize;
+                let mut j = i + span;
+                let mut close_end: Option<usize> = None;
+                while j < n {
+                    if chars[j] == '[' {
+                        if let Some((k, sp)) = read_note_marker(&chars, j) {
+                            match k {
+                                MarkerKind::Open => depth += 1,
+                                MarkerKind::Close => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        close_end = Some(j + sp);
+                                        break;
+                                    }
+                                }
+                            }
+                            j += sp;
+                            continue;
+                        }
+                    }
+                    j += 1;
+                }
+                if let Some(ce) = close_end {
+                    // 成对：整段（含两端标记）原样保留，并推进到配对收标记之后。
+                    out.extend(&chars[i..ce]);
+                    i = ce;
+                } else {
+                    // 落单的开标记：连壳删，推进过这个开标记。
+                    i += span;
+                }
+            }
+            Some((MarkerKind::Close, span)) => {
+                // 落单的收标记（前方没有对应的开）：连壳删。
+                i += span;
+            }
+            None => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// 注标记种类。
+enum MarkerKind {
+    Open,  // [注]
+    Close, // [/注]
+}
+
+/// 在 `chars[i]` 处读取一个注标记（允许方括号内空白），返回 `(种类, 字符长度)`。
+/// 读不到合法标记（如 `[[` 或 `[x]`）返回 `None`。
+fn read_note_marker(chars: &[char], i: usize) -> Option<(MarkerKind, usize)> {
+    let n = chars.len();
+    if chars.get(i) != Some(&'[') {
+        return None;
+    }
+    // 跳过 `[` 后的空白。
+    let mut k = i + 1;
+    while k < n && chars[k].is_whitespace() {
+        k += 1;
+    }
+    let close = chars.get(k) == Some(&'/');
+    if close {
+        k += 1;
+    }
+    // 收集非空白内容。
+    let mut inner = String::new();
+    while k < n && chars[k] != ']' {
+        if !chars[k].is_whitespace() {
+            inner.push(chars[k]);
+        }
+        k += 1;
+    }
+    if k >= n {
+        return None; // 没有收括号
+    }
+    if inner != "注" {
+        return None; // 不是注标记（可能是 `[拼音:…]` 以外的东西）
+    }
+    // 跳过 `]` 后的空白。
+    let mut end = k + 1;
+    while end < n && chars[end].is_whitespace() {
+        end += 1;
+    }
+    Some((if close { MarkerKind::Close } else { MarkerKind::Open }, end - i))
+}
+
 
 /// 点字弹出的工具条所锚定的字：记录该字的归属键、字符与点击处的窗口坐标。
 /// 坐标来自 `MouseDownEvent.position`，用于在点击位置附近浮起工具条。

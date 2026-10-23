@@ -56,6 +56,8 @@ pub enum SrcKind {
     Html,
     Json,
     Epub,
+    /// 古籍 TEI / 通用 XML：按白名单标签抽 textContent（见 `parsers::parse_xml`）。
+    Xml,
 }
 
 impl SrcKind {
@@ -66,6 +68,7 @@ impl SrcKind {
             SrcKind::Html => "html",
             SrcKind::Json => "json",
             SrcKind::Epub => "epub",
+            SrcKind::Xml => "xml",
         }
     }
 }
@@ -76,7 +79,8 @@ pub fn sniff_kind(name: &str, head: &str) -> SrcKind {
     if let Some(ext) = lower.rsplit('.').next() {
         match ext {
             "md" | "markdown" | "mdown" => return SrcKind::Markdown,
-            "html" | "htm" | "xhtml" | "xml" | "opf" | "xht" => return SrcKind::Html,
+            "html" | "htm" | "xhtml" | "opf" | "xht" => return SrcKind::Html,
+            "xml" | "tei" => return SrcKind::Xml,
             "json" => return SrcKind::Json,
             "epub" => return SrcKind::Epub,
             "txt" | "text" => return SrcKind::Txt,
@@ -85,8 +89,13 @@ pub fn sniff_kind(name: &str, head: &str) -> SrcKind {
     }
     // 大小写不敏感：`<!DOCTYPE HTML>` 也是 HTML。
     let t = head.trim_start().to_ascii_lowercase();
-    if t.starts_with("<!doctype html") || t.starts_with("<html") || t.starts_with("<?xml") {
+    if t.starts_with("<!doctype html") || t.starts_with("<html") {
         return SrcKind::Html;
+    }
+    if t.starts_with("<?xml") {
+        // XML 声明后面通常跟着 `<TEI` / `<book` 等古籍标签；没有 doctype 的
+        // 纯 `<xxx …>` 根节点也按 XML 处理（TEI / DocBook 等）。
+        return SrcKind::Xml;
     }
     if t.starts_with('{') || t.starts_with('[') {
         return SrcKind::Json;
@@ -1153,17 +1162,12 @@ pub fn parse_to_jiandu_format(name: &str, bytes: &[u8]) -> Result<Vec<RawChapter
 }
 
 /// 已知格式时直接解析字符串（测试与 EPUB 内部调用都走这里）。
+///
+/// v1.31.0 起统一走 [`crate::parsers::UniversalParser`]：按格式选策略解析，
+/// 再经过「古籍化后处理」绝对红线（`cleanup_ancient_text`）——数字汉字化、
+/// 标点竖排化、残留标签清理、页码过滤，六格式共用一道闸。
 pub fn parse_str(kind: SrcKind, text: &str) -> Result<Vec<RawChapter>> {
-    match kind {
-        SrcKind::Txt => Ok(parse_txt(text)),
-        SrcKind::Markdown => Ok(parse_markdown(text)),
-        SrcKind::Html => Ok(parse_html(text)),
-        SrcKind::Json => parse_jsonish(text),
-        // epub 是容器：先由 importer 拆出 xhtml，再逐份走竖排清洗管线
-        // （`vclean` 五阶段；比 `parse_html` 多出广告降噪 / ruby 注音 /
-        // 括号转夹注 / 页码孤行清理）。
-        SrcKind::Epub => Ok(crate::vclean::clean_epub(text)),
-    }
+    crate::parsers::UniversalParser::parse(kind, text)
 }
 
 /// 摘出 `[高亮]…[/高亮]`，返回（干净文本, [(起始字序, 字数, 文本)]）。
@@ -1367,8 +1371,6 @@ mod tests {
     }
 
     // ---- 解码 ----
-
-    #[test]
 
     #[test]
     fn decode_utf8_and_bom() {
@@ -1583,7 +1585,7 @@ mod tests {
     fn sniff_by_extension_and_content() {
         assert_eq!(sniff_kind("a.md", ""), SrcKind::Markdown);
         assert_eq!(sniff_kind("a.html", ""), SrcKind::Html);
-        assert_eq!(sniff_kind("a.xml", ""), SrcKind::Html);
+        assert_eq!(sniff_kind("a.xml", ""), SrcKind::Xml);
         assert_eq!(sniff_kind("noext", "<!DOCTYPE html><p>x</p>"), SrcKind::Html);
         assert_eq!(sniff_kind("noext", "{"), SrcKind::Json);
     }

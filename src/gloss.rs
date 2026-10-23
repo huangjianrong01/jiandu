@@ -147,6 +147,9 @@ impl Filler {
 pub fn piece_units(p: &Piece) -> usize {
     match p {
         Piece::Main(g) if g.is_hang() => 0,
+        // 书名号：附在相邻字的格上，自己不占格（v1.30.0）。
+        // 记 2 会让它独占一格——那正是「行气断裂」的由来。
+        Piece::Main(g) if g.kind == GlyphKind::Attach => 0,
         Piece::Main(_) => 2,
         Piece::Gap => 2,
         Piece::Gloss(s, ..) => (s.chars().count() + 1) / 2,
@@ -411,6 +414,33 @@ pub fn layout_book_from_opts(
                 }
             }
             i = end;
+            continue;
+        }
+
+        // ── 书名号：附在邻字格上，自己绝不占一格 ─────────────────────
+        // `︽ ︾` 半格账记 0，渲染时缩到 0.7 倍叠在邻字格的右上角。
+        // 关键是**别让它落单**：
+        //   · 开号 `︽` 的宿主是**后一个字**。若本列已放不下那个字（room < 2），
+        //     先换列再放 ︽——它随宿主一起到新列，绝不会孤零零留在列尾。
+        //   · 闭号 `︾` 的宿主是**前一个字**，那字已在本列，故 ︾ 自然跟进本列，
+        //     不会落列首。
+        // 用户口径：「书名号被错误拆列、方向不对」——拆列就是因为占了独立格。
+        if g.kind == GlyphKind::Attach {
+            let open = crate::types::is_open_title(g.ch);
+            if open && filler.room() < 2 && filler.used() > 0 {
+                cols_filled += 1;
+                if cols_filled >= page_limit {
+                    seal!();
+                    page_limit = cols;
+                    start_chapter = false;
+                } else if columns.last().map(|c| !c.is_empty()).unwrap_or(false) {
+                    columns.push(Vec::new());
+                }
+                filler.begin_column();
+            }
+            columns.last_mut().unwrap().push(Piece::Main(*g));
+            glyphs.push(*g);
+            i += 1;
             continue;
         }
 

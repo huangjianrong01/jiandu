@@ -64,11 +64,12 @@
 //! 朱印，再按「叶码 → 卷次 → 书名 → 篇题」的优先级把剩余高度分下去，
 //! 分不够就截字（篇题至少要两个字才肯露面），绝不溢出、绝不压字。
 
-/// 鱼尾宽 / 版心宽：约一列字宽的三成半（v1.28.0 由 0.70 再收一半）。
+/// 鱼尾宽 / **列宽**（v1.30.0 用户定：**0.7**）。
 ///
-/// 用户口径「鱼尾尺寸缩小 50%」——旧版在纸上是一大块墨，压过书口文字；
-/// 收到三成半后，鱼尾退成一枚记号，版心留白才透得过气。
-pub const FISHTAIL_W_RATIO: f32 = 0.36;
+/// 原先挂的是「版心宽的 0.36」：版心宽随列数变，鱼尾跟着忽大忽小，
+/// 且整体偏小（用户反馈「鱼尾太小」）。现在挂在字宽上——换任何行款，
+/// 鱼尾都是七分字宽，与字同进退；实际值再按版心宽封顶（不溢出中缝）。
+pub const FISHTAIL_W_RATIO: f32 = 0.70;
 /// 信笺（14 列）的鱼尾更宽：它独占一列，照参考图几乎顶满。
 pub const LETTER_TAIL_W_RATIO: f32 = 0.92;
 /// 版心鱼尾的**高 / 宽**：略竖长的黑鱼尾（太瘦长就成两条竖杠）。
@@ -140,14 +141,21 @@ pub fn heikou_h(cell_h: f32) -> f32 {
 }
 
 /// 版心（中缝）对鱼尾的尺寸。
-pub fn banxin_tail_size(gutter_w: f32, cell_h: f32) -> (f32, f32) {
-    tail_size(
-        gutter_w,
-        cell_h,
-        FISHTAIL_W_RATIO,
-        FISHTAIL_ASPECT,
-        FISHTAIL_H_MAX_CHARS,
-    )
+///
+/// **宽 = `col_w × FISHTAIL_W_RATIO`（0.7 列宽）**——v1.30.0 用户定：
+/// 旧版按版心宽的 0.36 取，鱼尾随列数忽大忽小（列多版心窄 → 鱼尾缩成
+/// 一粒），且整体偏小。挂在字宽上之后，换任何行款鱼尾都是「七分字宽」。
+///
+/// 仍以版心宽封顶（不得溢出中缝），并以 [`FISHTAIL_W_MIN`] 保底。
+pub fn banxin_tail_size(gutter_w: f32, cell_h: f32, col_w: f32) -> (f32, f32) {
+    let w = (col_w * FISHTAIL_W_RATIO)
+        .min((gutter_w - 2.0).max(FISHTAIL_W_MIN))
+        .max(FISHTAIL_W_MIN);
+    let h = (cell_h * FISHTAIL_H_CHARS)
+        .min(w * FISHTAIL_ASPECT)
+        .min(cell_h * FISHTAIL_H_MAX_CHARS)
+        .max(FISHTAIL_H_MIN);
+    (w, h)
 }
 
 /// 信笺中缝对鱼尾的尺寸（更宽、更横展）。
@@ -276,6 +284,9 @@ pub struct BanxinOpts<'a> {
     pub band_h: f32,
     /// 一格字的高（行高）。
     pub cell_h: f32,
+    /// **一列字的宽**（v1.30.0）：鱼尾宽按 `col_w × 0.7` 取，不再按版心宽的
+    /// 比例——版心宽随列数变，鱼尾跟着忽大忽小；挂在字宽上才稳。
+    pub col_w: f32,
     /// 正文字号。
     pub fs: f32,
     /// 书名（已去括号）。
@@ -298,7 +309,7 @@ pub struct BanxinOpts<'a> {
 /// 「叶码 → 卷次 → 书名 → 篇题」分。分不够就截字；篇题至少两个字
 /// 才肯露面（一个字的篇题不如不写）。
 pub fn layout(o: BanxinOpts) -> BanxinLayout {
-    let (tail_w, mut tail_h) = banxin_tail_size(o.gutter_w, o.cell_h);
+    let (tail_w, mut tail_h) = banxin_tail_size(o.gutter_w, o.cell_h, o.col_w);
     // 书口小字：极小号宋体——收在版心宽的一半以内，且不超过正文字号
     // 的三分之一（刻本书口字远小于正文）。
     let small = (o.gutter_w * 0.46).min(o.fs * 0.34).max(7.0);
@@ -413,21 +424,32 @@ mod tests {
     /// 一张典型纸面：版心宽 50（≈一行字宽）、字高 55、版心可用高 740。
     const GW: f32 = 50.0;
     const CH: f32 = 55.0;
+    /// 一列字宽（鱼尾宽按它取 0.7）。
+    /// 一列字宽（鱼尾宽按它取 0.7）。
+    const CW: f32 = 44.0;
     const BAND: f32 = 740.0;
 
     #[test]
     fn tail_never_wider_than_the_gutter() {
-        let (w, h) = banxin_tail_size(GW, CH);
+        let (w, h) = banxin_tail_size(GW, CH, CW);
         assert!(w <= GW, "鱼尾宽 {w} 超过界栏 {GW}");
         // 高按 0.50 字起算，但封顶在「宽 × 比例」——不会长成两条竖杠。
         assert!(h <= CH * FISHTAIL_H_MAX_CHARS + 0.01, "鱼尾高 {h} 超过 0.8 字");
-        // v1.28.0「缩小 50%」的修正：高四成字、宽三成半版心。
+        // 高四成字（v1.28.0「缩小 50%」的修正：旧版 0.95 字太笨重）。
         assert!(h <= CH * 0.52, "鱼尾仍嫌高（应 ≲ 半字）：{h}");
-        assert!(w <= GW * 0.40, "鱼尾仍嫌宽（应 ≲ 0.36 版心）：{w}");
         // 也不能瘦成一条线：至少要有三分之一个字高。
         assert!(h >= CH * 0.30, "鱼尾太瘦弱：{h}");
-        // 相对旧版（0.95 字 / 0.70 版心）确实缩到了五成上下。
         assert!(h < CH * 0.95 * 0.60, "没缩到位：{h}");
+        // v1.30.0：宽改挂**列宽**（`col_w × 0.7`），不再按版心比例——
+        // 版心宽随列数变，挂它会让鱼尾忽大忽小（列多 → 鱼尾缩成一粒）。
+        assert!(
+            (w - CW * FISHTAIL_W_RATIO).abs() < 0.01,
+            "鱼尾宽应为列宽 × {FISHTAIL_W_RATIO} = {:.1}，实为 {w}",
+            CW * FISHTAIL_W_RATIO
+        );
+        // 窄版心时按版心宽封顶，绝不溢出中缝（尖角因此仍在垂直中心线上）。
+        let (wn, _hn) = banxin_tail_size(20.0, CH, 44.0);
+        assert!(wn <= 20.0 - 2.0 + 0.01, "窄版心时鱼尾 {wn} 溢出中缝 20");
     }
 
     #[test]
@@ -606,6 +628,7 @@ mod tests {
             gutter_w: GW,
             band_h: BAND,
             cell_h: CH,
+            col_w: CW,
             fs: 37.6,
             book: "宋词三百首",
             juan: "卷五十一",
@@ -636,6 +659,7 @@ mod tests {
             gutter_w: GW,
             band_h: 260.0, // 极短的版心：只够鱼尾 + 叶码
             cell_h: CH,
+            col_w: CW,
             fs: 37.6,
             book: "宋词三百首",
             juan: "卷五十一",
@@ -662,6 +686,7 @@ mod tests {
             gutter_w: GW,
             band_h: BAND,
             cell_h: CH,
+            col_w: CW,
             fs: 37.6,
             book: "宋词三百首",
             juan: "卷五十一",
@@ -680,6 +705,7 @@ mod tests {
             gutter_w: 24.0, // 极窄屏
             band_h: 400.0,
             cell_h: 26.0,
+            col_w: 20.0,
             fs: 18.0,
             book: "宋词三百首",
             juan: "卷五十一",

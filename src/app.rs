@@ -289,6 +289,11 @@ pub struct Root {
     /// 自动档每帧重算；想锁死就在「版式」面板点具体列数（那会把这里置 false），
     /// 点回「自动」再放开。
     pub columns_auto: bool,
+    /// 窄屏小字提示是否已弹过（避免 `fit_sizes` 每帧重设 `notice` 把提示刷没）。
+    ///
+    /// 窄屏硬选 14 列时字号会跌破 `GRID_FS_MIN`（12px）——引擎已自动把它
+    /// 抬回 12px 并改为溢出滚动，但用户该知道「这一屏撑不下这套行款」。
+    pub min_font_noticed: bool,
     /// 自动换挡时**待恢复的阅读锚点**（章, 段, 偏移）。
     ///
     /// 拉窗口可能让自动列数跨档（8 → 12），一换档就是整本重排、页码全变。
@@ -486,6 +491,7 @@ impl Root {
             // 列数默认自动：按书的内容与可用宽算，不写死某一档。
             columns_auto: true,
             pending_anchor: None,
+            min_font_noticed: false,
             show_library: false,
             viewport_w: 1280.0,
             viewport_h: 860.0,
@@ -1042,6 +1048,14 @@ impl Root {
                             foot,
                             margin,
                             line_scale,
+                            // 试算每一档时按**该档的行款**取比例：八行本字大
+                            // 行宽、十四行信笺字小行密——打分才判得准。
+                            fs_ratio: crate::grid::LayoutConfig::by_columns(c)
+                                .map(|x| x.fs_ratio)
+                                .unwrap_or(crate::grid::GRID_FS_RATIO),
+                            line_ratio: crate::grid::LayoutConfig::by_columns(c)
+                                .map(|x| x.line_ratio)
+                                .unwrap_or(0.0),
                             dir,
                             fs_max,
                         })
@@ -1081,6 +1095,8 @@ impl Root {
         let facing = mode.spreads();
         // 当帧铺法：整页铺的也是一整叶（两叶 + 中缝），故与对开同为 Facing。
         self.duplex = if facing { Duplex::Facing } else { Duplex::Single };
+        // 当前版式（列数 + 该行款的字级 / 行高比例）。
+        let cur_cfg = self.current_layout();
         let fit_debug = std::env::var("JIANDU_FIT_DEBUG").is_ok();
         if fit_debug {
             eprintln!("[fit] vw={:.0} vh={:.0} content={:.0}x{:.0} cols={} auto={} avg={} facing={} focus={}", self.viewport_w, self.viewport_h, content_w, content_h, self.grid.columns, self.columns_auto, self.book.as_ref().map(|b| b.avg_chapter_chars()).unwrap_or(0), facing, self.focus_mode);
@@ -1099,6 +1115,10 @@ impl Root {
             foot,
             margin,
             line_scale,
+            // 行款比例（v1.30.0）：与列数一起决定字级与行高——切到八行本
+            // 不只是列变少，字也跟着大、行也跟着宽。
+            fs_ratio: cur_cfg.fs_ratio,
+            line_ratio: cur_cfg.line_ratio,
             dir,
             fs_max,
         });
@@ -1113,6 +1133,17 @@ impl Root {
         self.row_h = m.row_h;
         self.grid_rows = m.rows;
         self.grid_min_font = m.min_font_hit;
+        // 窄屏硬选多列（典型是手机竖屏选十四行信笺）：字号已被抬到 12px 下限，
+        // 纸面会溢出滚动——提示一句，别让用户以为排版坏了。
+        if m.min_font_hit && !self.min_font_noticed {
+            self.notice = format!(
+                "字已小到 {:.0}px（{} 列）· 建议横屏或使用平板阅读",
+                m.fs, m.columns
+            );
+            self.min_font_noticed = true;
+        } else if !m.min_font_hit {
+            self.min_font_noticed = false;
+        }
         if fit_debug {
             eprintln!(
                 "[fit] → fs={:.1} col_w={:.1} rows={} paper={:.0}x{:.0}",
@@ -2974,7 +3005,7 @@ mod tests {
         let cfg = GridConfig {
             columns,
             dir: GridDir::Vertical,
-            margin: 0.04, line_scale: 1.0,
+            margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
         };
         compute_grid(
             cw,
@@ -2994,7 +3025,7 @@ mod tests {
         let cfg = GridConfig {
             columns: 8,
             dir: GridDir::Vertical,
-            margin: 0.04, line_scale: 1.0,
+            margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
         };
         let m = compute_grid(
             VW,
@@ -3021,7 +3052,7 @@ mod tests {
         let cfg = GridConfig {
             columns: 8,
             dir: GridDir::Vertical,
-            margin: 0.04, line_scale: 1.0,
+            margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
         };
         let gap = crate::grid::gutter_w(VW, 8, ANCIENT_EDGE, cfg.margin);
         let m = compute_grid(
@@ -3080,7 +3111,7 @@ mod tests {
         let cfg = GridConfig {
             columns: 8,
             dir: GridDir::Vertical,
-            margin: 0.04, line_scale: 1.0,
+            margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
         };
         let m = compute_grid(
             cw,
