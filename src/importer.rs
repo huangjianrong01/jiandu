@@ -34,6 +34,8 @@ pub fn import_from_path(path: &Path) -> Result<Book> {
             ))
         }
     };
+    // 前言 / 序言 / 导读同样不进书架（epub 在自己的流程末尾已砍过一次）。
+    skip_front_matter(&mut book);
     // 没有目录的格式（txt / md / json）在这里统一按章节标题补齐。
     book.ensure_toc();
     // 书名统一夹到 12 字以内（自动识别 + 限长，书架 / 封面竖排区域有限）。
@@ -45,6 +47,50 @@ pub fn import_from_path(path: &Path) -> Result<Book> {
         book.author = clip_chars(&book.author, 12);
     }
     Ok(book)
+}
+
+/// **智能跳过前言**：把「总目录 / 版权页 / 书影 / 前言 / 目录」从卷首砍掉，
+/// 让书架第一页就是真正文。
+///
+/// 判据全在 `parsers::front_matter_cut`（题名 / 薄章 / 版权页元数据三道），
+/// 这里只负责动刀：章序前移 + 目录条目跟着重编号。
+/// 砍不砍得动由判据说了算，判据说不砍就一章不动。
+pub fn skip_front_matter(book: &mut Book) {
+    if book.chapters.len() <= 1 {
+        return;
+    }
+    let bodies: Vec<String> = book
+        .chapters
+        .iter()
+        .map(|c| {
+            c.paragraphs
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect();
+    let pairs: Vec<(&str, &str)> = book
+        .chapters
+        .iter()
+        .zip(bodies.iter())
+        .map(|(c, b)| (c.title.as_str(), b.as_str()))
+        .collect();
+    let cut = crate::parsers::front_matter_cut(&pairs);
+    if cut == 0 || cut >= book.chapters.len() {
+        return;
+    }
+    book.chapters.drain(..cut);
+    // 目录条目跟着前移；指向被砍掉那几章的条目整条丢。
+    let mut toc = std::mem::take(&mut book.toc);
+    toc.retain(|e| e.chapter >= cut);
+    for e in toc.iter_mut() {
+        e.chapter -= cut;
+    }
+    book.toc = toc;
+    if book.toc.is_empty() {
+        book.rebuild_toc_from_chapters();
+    }
 }
 
 pub fn file_stem(path: &Path) -> String {
@@ -727,6 +773,47 @@ pub fn import_epub(path: &Path) -> Result<Book> {
             }
         }
         book.toc = toc;
+    }
+
+    // ---- 收尾：智能跳过前言（目录润色之后题名最准，此时才动刀）----
+    //
+    // 现代 EPUB 把「总目录 / 版权页 / 书影 / 前言 / 目录」各做成独立的 spine
+    // 文件，逐文件清洗砍不掉（每份文件自己只有一章，看不出它是附件）；
+    // 而章名又要等目录（nav / ncx）润色完才从 `未知` 变成 `总目录` `前言`。
+    // 故这一刀放在最后：章序摆齐、题名就位，才看得出「正文从卷一开始」。
+    // 与管线里的 `drop_front_matter` 共用 `front_matter_cut`，判据不分叉。
+    {
+        let bodies: Vec<String> = book
+            .chapters
+            .iter()
+            .map(|c| {
+                c.paragraphs
+                    .iter()
+                    .map(|p| p.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        let pairs: Vec<(&str, &str)> = book
+            .chapters
+            .iter()
+            .zip(bodies.iter())
+            .map(|(c, b)| (c.title.as_str(), b.as_str()))
+            .collect();
+        let cut = crate::parsers::front_matter_cut(&pairs);
+        if cut > 0 && cut < book.chapters.len() {
+            book.chapters.drain(..cut);
+            // 目录条目跟着前移；指向被砍掉那几章的条目整条丢。
+            let mut toc = std::mem::take(&mut book.toc);
+            toc.retain(|e| e.chapter >= cut);
+            for e in toc.iter_mut() {
+                e.chapter -= cut;
+            }
+            book.toc = toc;
+            if book.toc.is_empty() {
+                book.rebuild_toc_from_chapters();
+            }
+        }
     }
 
     Ok(book)

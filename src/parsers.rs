@@ -64,7 +64,9 @@ impl AncientParser for HtmlParser {
     fn parse(&self, raw: &str) -> Result<Vec<RawChapter>> {
         // 预处理：整块丢弃 class 含广告 / 版权关键字的节点（见 [`drop_ad_nodes`]）。
         // `DROP_BLOCKS` 只按标签名（nav/footer/…）丢，class 层面的噪声靠这一步补。
-        Ok(parse_html(&drop_ad_nodes(raw)))
+        // 上标幽灵字与上标注号同理先过一遍 [`strip_sup_marks`]。
+        let html = strip_sup_marks(&drop_ad_nodes(raw));
+        Ok(drop_front_matter(parse_html(&html)))
     }
 }
 
@@ -182,7 +184,9 @@ impl AncientParser for EpubParser {
         SrcKind::Epub
     }
     fn parse(&self, raw: &str) -> Result<Vec<RawChapter>> {
-        Ok(clean_epub(raw))
+        // 上标幽灵字先吃掉再进五阶段——`<sup>` 一旦被当成「注」，
+        // 后面再想认出它是杂质就晚了（注文与正文已经混成一团）。
+        Ok(drop_front_matter(clean_epub(&strip_sup_marks(raw))))
     }
 }
 
@@ -293,7 +297,9 @@ pub fn cleanup_ancient_text(text: &str) -> String {
     let s = strip_html_residue(&s);
     // 5) 标点竖排化 + 书名号 / 省略号：只对标记之外的文本跑（标记保护）。
     let s = crate::vclean::map_outside_markers(&s, cleanup_punct_inner);
-    // 6) 孤立的 `[注]` 壳（不成对的）连壳删，保留完整 `[注]…[/注]` 夹注。
+    // 6) 单字杂质夹注（`[注]已[/注]` 这类上标残渣）连壳删。
+    let s = scrub_ghost_notes(&s);
+    // 7) 孤立的 `[注]` 壳（不成对的）连壳删，保留完整 `[注]…[/注]` 夹注。
     crate::types::strip_dangling_note_marks(&s)
 }
 
@@ -325,6 +331,9 @@ fn strip_page_lines(text: &str) -> String {
 /// 解析阶段已经剥过标签，这里只是兜底——漏网的 `&nbsp;`、`</p>` 残留尖括号
 /// 绝不能流进排版引擎（否则会被画成一串方括号 / 字面 `&amp;`）。
 fn strip_html_residue(s: &str) -> String {
+    // 上标先裁决（吃掉注号 / 幽灵字，长上标转夹注）——必须在**去标签之前**，
+    // 否则 `<sup>已</sup>` 剥完壳就变成一个和正文平起平坐的「已」字。
+    let s = strip_sup_marks(s);
     // `<br>` 先转成换行，避免前后正文黏成一团。
     let s = s
         .replace("<br>", "\n")
@@ -347,6 +356,440 @@ fn cleanup_punct_inner(seg: &str) -> String {
     let s = s.replace('（', "「").replace('）', "」");
     // 省略号 → 竖排省略号（…… 是横排躺倒的两点，竖排该是居中的竖点）。
     s.replace("……", "︙").replace('…', "︙")
+}
+
+// ------------------------------------------------------------------
+// 一、智能跳过前言：正文之前的「附件章」一律不进书架
+// ------------------------------------------------------------------
+
+/// 章题里出现这些词 → 它是出版社的附件，不是作者写的正文。
+///
+/// 现代 EPUB（尤其 PDF / 扫描转制本）在正文前塞了一堆东西：总目录、版权页、
+/// 书名页书影、前言、导读、目录…… 竖排里它们会被当成「第一章」排出来，
+/// 读者翻开《史记》先读到「图书在版编目（CIP）数据」——荒唐。
+///
+/// 匹配分两级（都只作用在**正文起手之前**的章，绝不误伤书中的《太史公自序》）：
+/// * 整题等于该词（`前 言` 去了空格后相等）；
+/// * 或**短题**（≤ [`FRONT_TITLE_MAX`] 字）里含有该词（`版权页` / `书名页书影`）。
+const FRONT_MATTER_HINTS: &[&str] = &[
+    // 序 / 前言 / 导读
+    "前言", "序言", "自序", "原序", "总序", "译序", "译者序", "推荐序", "代序", "新序", "序",
+    "导读", "导言", "引言", "弁言", "卷首语", "写在前面", "开篇寄语",
+    // 编者 / 出版方的话
+    "编者", "出版说明", "编例", "凡例", "例言", "体例", "使用说明", "排版说明",
+    // 版权 / 元数据
+    "版权", "图书在版编目", "CIP", "Cip", "cip", "版权页", "著作权", "ISBN", "isbn",
+    // 目录
+    "目录", "总目录", "目次", "Contents", "contents", "CONTENTS",
+    // 图版 / 书影（扫描本的插图页，标题常是「未知」「书名页书影」）
+    "书影", "插图", "图版", "扉页", "封面", "版权图",
+    // 作者简介 / 致谢
+    "作者简介", "作者小传", "编委", "鸣谢", "致谢", "内容简介", "内容提要", "提要", "摘要",
+];
+
+/// 能被 [`FRONT_MATTER_HINTS`] 按「含有」判定的章题长度上限。
+///
+/// 长题几乎都是正文（`太史公自序第七十` 十一个字，含「自序」却是《史记》
+/// 最后一章的正经内容）——只让短题走「含有」这条宽松路。
+const FRONT_TITLE_MAX: usize = 10;
+
+/// 「薄章」的内容字数上限：书影 / 插图页常只有一句图注，正文不会这么短。
+const THIN_CHAPTER_CHARS: usize = 120;
+/// 「薄章」的段落数上限。
+const THIN_CHAPTER_PARAS: usize = 2;
+
+/// 从正文起手处往前，最多允许砍掉多少章（前言不会比这更长；超了说明判据失灵）。
+const FRONT_CUT_MAX: usize = 40;
+
+/// **章题是不是「正文起手」**：`卷一 五帝本纪第一` / `第一百二十回` /
+/// `五帝本纪第一` / `卷十三　三代世表第一` 都算。
+///
+/// 判据宁窄勿宽——误判成正文起手会让前言漏进来，比多丢一章严重得多。
+/// 故只认「卷 / 第 + 数词」开头，以及史书专属的 本纪 / 世家 / 列传。
+pub fn is_body_start_title(title: &str) -> bool {
+    let t = title.trim();
+    if t.is_empty() || is_front_matter_title(t) {
+        return false;
+    }
+    let cs: Vec<char> = t.chars().collect();
+    // 「卷 + 数词」：`卷一`、`卷一百三十`、`卷十三　三代世表第一`。
+    if cs[0] == '卷' && starts_with_numeral(&cs[1..]) {
+        return true;
+    }
+    // 「第 + 数词 + 量词」：`第一回`、`卷第一百二十回` 之外的 `第一百二十回`。
+    if cs[0] == '第' {
+        let mut i = 1usize;
+        while i < cs.len() && (is_numeral_char(cs[i]) || cs[i] == '零') {
+            i += 1;
+        }
+        if i > 1 && i < cs.len() {
+            return matches!(
+                cs[i],
+                '卷' | '回' | '章' | '节' | '篇' | '折' | '出' | '部' | '集' | '册' | '話' | '话'
+            );
+        }
+    }
+    // 史书专属：`五帝本纪第一`、`陈涉世家`…（前面没有卷次时也认）。
+    t.contains("本纪") || t.contains("世家") || t.contains("列传")
+}
+
+/// `cs` 的开头是不是一串数词（汉字 / 阿拉伯数字 / 〇）。
+fn starts_with_numeral(cs: &[char]) -> bool {
+    let mut i = 0usize;
+    while i < cs.len() && (is_numeral_char(cs[i]) || cs[i] == '之') {
+        i += 1;
+    }
+    i > 0
+}
+
+/// 汉字数词 / 阿拉伯数字（供 [`is_body_start_title`] 数「卷几」）。
+fn is_numeral_char(c: char) -> bool {
+    matches!(
+        c,
+        '〇' | '零'
+            | '一'
+            | '二'
+            | '三'
+            | '四'
+            | '五'
+            | '六'
+            | '七'
+            | '八'
+            | '九'
+            | '十'
+            | '百'
+            | '千'
+            | '万'
+            | '两'
+            | '壹'
+            | '贰'
+            | '叁'
+            | '肆'
+            | '伍'
+            | '陆'
+            | '柒'
+            | '捌'
+            | '玖'
+            | '拾'
+    ) || c.is_ascii_digit()
+}
+
+/// **章题是不是前言 / 版权 / 目录这类附件**（见 [`FRONT_MATTER_HINTS`]）。
+pub fn is_front_matter_title(title: &str) -> bool {
+    let t = title.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // 去空白后再比对（`前　言` 与 `前言` 同罪）。
+    let tight: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+    if tight.is_empty() {
+        return false;
+    }
+    let n = tight.chars().count();
+    FRONT_MATTER_HINTS
+        .iter()
+        .any(|h| tight == *h || (n <= FRONT_TITLE_MAX && tight.contains(h)))
+}
+
+/// 这一章是不是「薄得不像正文」：图注页 / 空章 / 转场页。
+///
+/// 三条同时成立才算：段数极少、字数极少、**且没有句读**。
+/// 第三条是关键——`《陈太史评阅史记》　明崇祯元年刻本　书名页书影` 这种图注
+/// 一行到底没有句号，而 `读史须知：先读本纪。` 虽短却有句读，是真正文。
+pub fn is_thin_chapter(title: &str, body: &str) -> bool {
+    let _ = title; // 判据只看正文（题名另有 [`is_front_matter_title`] 把关）。
+    let body = body.trim();
+    if body.is_empty() {
+        return true;
+    }
+    let paras = body.lines().filter(|l| !l.trim().is_empty()).count();
+    if paras > THIN_CHAPTER_PARAS || body.chars().count() > THIN_CHAPTER_CHARS {
+        return false;
+    }
+    !body.chars().any(|ch| matches!(ch, '。' | '！' | '？' | '；'))
+}
+
+/// 正文开头出现这些词 → 这一章是版权页 / 出版信息页。
+///
+/// 版权页的题名常是 `未知`（扫描本没写 `<title>`），只能从内容认：
+/// 「图书在版编目（CIP）数据」「责任编辑」「开本 / 印张 / 定价」这些词
+/// 绝不会出现在真正文里。只看开头 [`FRONT_BODY_SCAN`] 字——元数据总在最前。
+const FRONT_BODY_HINTS: &[&str] = &[
+    "图书在版编目",
+    "CIP",
+    "ISBN",
+    "版权",
+    "著作权",
+    "责任编辑",
+    "策划编辑",
+    "封面设计",
+    "出版发行",
+    "出版社",
+    "印刷",
+    "开本",
+    "印张",
+    "字数",
+    "定价",
+    "书号",
+    "版次",
+    "翻印必究",
+];
+/// [`FRONT_BODY_HINTS`] 只扫正文开头这么多字。
+const FRONT_BODY_SCAN: usize = 240;
+
+/// 正文开头是不是出版社的元数据（见 [`FRONT_BODY_HINTS`]）。
+pub fn is_front_matter_body(body: &str) -> bool {
+    let head: String = body.chars().take(FRONT_BODY_SCAN).collect();
+    FRONT_BODY_HINTS.iter().any(|h| head.contains(h))
+}
+
+/// 这一章能不能安全地丢掉（前言 / 目录 / 版权 / 图注薄章）。
+fn is_droppable_leading(pair: &(&str, &str)) -> bool {
+    let (title, body) = *pair;
+    is_front_matter_title(title) || is_thin_chapter(title, body) || is_front_matter_body(body)
+}
+
+/// **该砍掉开头多少章**（0 = 一章都不砍）。
+///
+/// 入参是 `(章题, 正文)` 对——与 `RawChapter` / `types::Chapter` 都解耦，
+/// 故管线里（逐章）与导入时（整本书）能共用同一把刀，判据不会分叉。
+pub fn front_matter_cut(pairs: &[(&str, &str)]) -> usize {
+    if pairs.len() <= 1 {
+        return 0;
+    }
+    // 主判据：正文起手之前全砍。
+    if let Some(idx) = pairs.iter().position(|(t, _)| is_body_start_title(t)) {
+        if idx > 0 && idx <= FRONT_CUT_MAX && pairs[..idx].iter().all(is_droppable_leading) {
+            return idx;
+        }
+        return 0;
+    }
+    // 兜底：砍掉开头连续的前言章（按题名判，不按薄判——见 `drop_front_matter`）。
+    let lead = pairs
+        .iter()
+        .take_while(|(t, _)| is_front_matter_title(t))
+        .count();
+    if lead == 0 || lead == pairs.len() {
+        return 0;
+    }
+    lead
+}
+
+/// **智能跳过前言**：从「总目录 / 版权页 / 书影 / 前言 / 目录」一路砍到第一个
+/// 正文章（`卷一`、`本纪` …）为止。
+///
+/// 两道判据，都要成立才动刀（宁可漏删，绝不把正文当前言丢）：
+///
+/// 1. 找得到**正文起手**（[`is_body_start_title`]），且它在前 [`FRONT_CUT_MAX`] 章内；
+/// 2. 起手之前的每一章都确实是附件（[`is_droppable_leading`]）。
+///
+/// 找不到正文起手时的兜底：把开头**连续**的附件章砍掉（同样要求砍完还剩正文）。
+/// 砍空了就原样奉还——「解析不出章节」比「解析出空书」体面得多。
+pub fn drop_front_matter(chapters: Vec<RawChapter>) -> Vec<RawChapter> {
+    let pairs: Vec<(&str, &str)> = chapters
+        .iter()
+        .map(|c| (c.title.as_str(), c.content.as_str()))
+        .collect();
+    let cut = front_matter_cut(&pairs);
+    if cut == 0 {
+        return chapters;
+    }
+    chapters.into_iter().skip(cut).collect()
+}
+
+// ------------------------------------------------------------------
+// 二、清剿上标幽灵字：<sup> 要么吃掉、要么转成注，绝不裸进正文
+// ------------------------------------------------------------------
+
+/// 上标里的内容够这么长，才算一条「真注文」；短于此的一律是杂质。
+///
+/// 现代 EPUB 的 `<sup>` 九成是纯注号（`1`、`①`、`[3]`），剩下一成是转制时
+/// 漏出来的单字残渣（`<sup>已</sup>` 之类）——它们在竖排里是钉在字旁的一粒
+/// 小红字，把行气戳出一个洞。真正有价值的注文不会只有一两个字。
+const SUP_NOTE_MIN_CHARS: usize = 4;
+
+/// 上标的处理结论。
+enum SupVerdict {
+    /// 吃掉（空 / 注号 / 单字残渣）。
+    Drop,
+    /// 转成夹注（够长，像一条真注文）。
+    Note,
+}
+
+/// **吃掉 / 转注**：把所有 `<sup>` `<sub>` 就地裁决，正文里再没有上标。
+///
+/// * 空标签、纯注号（`1` `①` `[3]` `*`）→ 连内容一起删；
+/// * 单字 / 双字残渣（`已`、`注1`）→ 删（这就是「红色幽灵字」的源头）；
+/// * ≥ [`SUP_NOTE_MIN_CHARS`] 字 → 改写成 `<span class="note">`，由既有
+///   标签行走器转成 `[注]…[/注]` 双行夹注（上标里真有注文时不能白扔）。
+///
+/// 嵌套 `<sup>` 按深度配对找闭合；找不到闭合就把开标签丢掉，绝不把
+/// 后半本书吞进上标里。
+pub fn strip_sup_marks(html: &str) -> String {
+    let cs: Vec<char> = html.chars().collect();
+    let n = cs.len();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0usize;
+    while i < n {
+        if cs[i] != '<' {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        let Some(gt) = (i..n).find(|k| cs[*k] == '>') else {
+            out.extend(&cs[i..]);
+            break;
+        };
+        let raw: String = cs[i + 1..gt].iter().collect();
+        let closing = raw.trim_start().starts_with('/');
+        let name: String = raw
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        // 不是上标：原样放过（其余标签自有行走器处理）。
+        if name != "sup" && name != "sub" {
+            out.extend(&cs[i..gt + 1]);
+            i = gt + 1;
+            continue;
+        }
+        // 孤儿闭合标签：丢。
+        if closing {
+            i = gt + 1;
+            continue;
+        }
+        let (from, to, next) = match matching_tag_close(&cs, gt + 1, &name) {
+            Some(t) => t,
+            // 没闭合：只丢这一枚开标签，后面的内容照常收（不能因坏标签吞掉半本书）。
+            None => {
+                i = gt + 1;
+                continue;
+            }
+        };
+        let inner: String = cs[from..to].iter().collect();
+        match sup_verdict(&plain_text_of(&inner)) {
+            SupVerdict::Drop => {}
+            SupVerdict::Note => {
+                let text = plain_text_of(&inner);
+                out.push_str(&format!("<span class=\"note\">{text}</span>"));
+            }
+        }
+        i = next;
+    }
+    out
+}
+
+/// 上标内容的裁决（见 [`strip_sup_marks`]）。
+fn sup_verdict(text: &str) -> SupVerdict {
+    if text.is_empty() || is_note_marker(text) {
+        return SupVerdict::Drop;
+    }
+    if text.chars().count() >= SUP_NOTE_MIN_CHARS {
+        return SupVerdict::Note;
+    }
+    SupVerdict::Drop
+}
+
+/// 是不是「纯注号」：只有数字 / 圈号 / 星号 / 括号，没有任何实义文字。
+///
+/// `1`、`12`、`①`、`[3]`、`*`、`†` 都是；`注1` 不是（带了个汉字）。
+fn is_note_marker(text: &str) -> bool {
+    let cs: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if cs.is_empty() {
+        return false;
+    }
+    cs.iter().all(|c| {
+        c.is_ascii_digit()
+            || matches!(
+                *c,
+                '①' | '②' | '③' | '④' | '⑤' | '⑥' | '⑦' | '⑧' | '⑨' | '⑩' | '⑪' | '⑫' | '⑬'
+                    | '⑭' | '⑮' | '⑯' | '⑰' | '⑱' | '⑲' | '⑳' | '⓪' | '*' | '†' | '‡'
+                    | '§' | '※' | '[' | ']' | '(' | ')' | '〔' | '〕' | '【' | '】' | '·'
+                    | '.' | '-'
+            )
+    })
+}
+
+/// 从 `pos` 起找 `name` 的配对闭合标签，返回 `(内容起, 内容止, 闭合后位置)`。
+fn matching_tag_close(cs: &[char], pos: usize, name: &str) -> Option<(usize, usize, usize)> {
+    let mut depth = 1i32;
+    let mut i = pos;
+    let from = pos;
+    while i < cs.len() {
+        if cs[i] != '<' {
+            i += 1;
+            continue;
+        }
+        let Some(gt) = (i..cs.len()).find(|k| cs[*k] == '>') else {
+            return None;
+        };
+        let raw: String = cs[i + 1..gt].iter().collect();
+        let closing = raw.trim_start().starts_with('/');
+        let self_close = raw.trim_end().ends_with('/');
+        let tn: String = raw
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let next = gt + 1;
+        if tn != name {
+            i = next;
+            continue;
+        }
+        if closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some((from, i, next));
+            }
+        } else if !self_close {
+            depth += 1;
+        }
+        i = next;
+    }
+    None
+}
+
+/// 上标内部的纯文本（去标签 + 还原实体 + 压空白）。
+fn plain_text_of(inner: &str) -> String {
+    let s = crate::pipeline::decode_entities(&crate::pipeline::strip_tags(inner));
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// **清剿单字杂质**：把 `[注]已[/注]` 这类独字夹注从正文流里摘掉。
+///
+/// 上标幽灵字的第二道闸——有些书的上标早在转制阶段就被压成了标记，进到
+/// 这里时已经是 `[注]X[/注]`。真注文不会只有一个字（`锡：赐。` 四个字起），
+/// 独字且不带任何标点的，一律是残渣。
+pub fn scrub_ghost_notes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("[注]") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + "[注]".len()..];
+        match tail.find("[/注]") {
+            Some(i) => {
+                let body = &tail[..i];
+                let after = &tail[i + "[/注]".len()..];
+                let t = body.trim();
+                let ghost = !t.is_empty() && t.chars().count() <= 1;
+                if ghost {
+                    // 吃掉：连壳带字一起丢，不留空壳。
+                } else {
+                    out.push_str(&format!("[注]{body}[/注]"));
+                }
+                rest = after;
+            }
+            // 没有收口：剩下的原样吐出（交给后面的落单壳清理）。
+            None => {
+                out.push_str(&rest[at..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 // ------------------------------------------------------------------
@@ -656,6 +1099,117 @@ mod tests {
         assert!(!c.content.contains("var x"), "script 未滤：{}", c.content);
         assert!(!c.content.contains("<"), "残留尖括号：{}", c.content);
         assert!(!c.content.contains("style"), "style 未剥：{}", c.content);
+    }
+
+    // ── 智能跳过前言 ────────────────────────────────────────────────
+
+    /// 《史记》实况：总目录 / 版权页 / 书影 / 前言 / 目录 全部砍掉，从卷一开始。
+    #[test]
+    fn front_matter_is_skipped_before_juan_one() {
+        let chapters = vec![
+            RawChapter::new("总目录", "史记（精注全译）（第一册）"),
+            RawChapter::new("版权页", "图书在版编目（CIP）数据 史记"),
+            RawChapter::new("未知", "《陈太史评阅史记》　明崇祯元年刻本　书名页书影"),
+            RawChapter::new("未知", "《陈太史评阅史记》　明崇祯元年刻本　序书影"),
+            RawChapter::new("前言", "作为有着五千年悠久文明历史的国度"),
+            RawChapter::new("目录", "卷一 五帝本纪第一 卷二 夏本纪第二"),
+            RawChapter::new("卷一　五帝本纪第一", "黄帝者，少典之子，姓公孙，名曰轩辕。"),
+            RawChapter::new("卷二　夏本纪第二", "夏禹，名曰文命。"),
+        ];
+        let out = drop_front_matter(chapters);
+        assert_eq!(out.len(), 2, "前言未跳过：{out:?}");
+        assert_eq!(out[0].title, "卷一　五帝本纪第一");
+        assert!(!out.iter().any(|c| c.title.contains("前言")), "前言漏网：{out:?}");
+        assert!(!out.iter().any(|c| c.content.contains("CIP")), "版权页漏网：{out:?}");
+    }
+
+    /// 书中的《太史公自序》是正经正文（最后一章），绝不能被当成前言丢掉。
+    #[test]
+    fn self_preface_inside_the_book_survives() {
+        let chapters = vec![
+            RawChapter::new("前言", "前言正文若干。"),
+            RawChapter::new("卷一　五帝本纪第一", "黄帝者，少典之子。"),
+            RawChapter::new("卷一百三十　太史公自序第七十", "太史公曰：先人有言。"),
+        ];
+        let out = drop_front_matter(chapters);
+        assert_eq!(out.len(), 2, "不该动书里的自序：{out:?}");
+        assert!(out.iter().any(|c| c.title.contains("太史公自序")));
+    }
+
+    /// 判据失灵时原样奉还：正文起手之前若夹着不像附件的章，一刀都不砍。
+    #[test]
+    fn ambiguous_leading_chapter_blocks_the_cut() {
+        let chapters = vec![
+            RawChapter::new("出版说明", "本书由某某整理。"),
+            RawChapter::new("读史须知", "读史须知：先读本纪，再读世家。"),
+            RawChapter::new("卷一　五帝本纪第一", "黄帝者。"),
+        ];
+        let out = drop_front_matter(chapters);
+        assert_eq!(out.len(), 3, "不该砍：{out:?}");
+    }
+
+    /// 短章集（道德经八十一章）不会被「薄章」判据误杀。
+    #[test]
+    fn short_chapter_collections_survive() {
+        let chapters: Vec<RawChapter> = (1..=8)
+            .map(|i| RawChapter::new(format!("第{i}章"), "道可道，非常道。"))
+            .collect();
+        let out = drop_front_matter(chapters);
+        assert_eq!(out.len(), 8, "短章被误删：{out:?}");
+    }
+
+    // ── 清剿上标幽灵字 ──────────────────────────────────────────────
+
+    /// 单字上标（`司马迁<sup>已</sup>`）连字带壳吃掉，也不许变成夹注。
+    #[test]
+    fn sup_ghost_char_is_eaten() {
+        let s = strip_sup_marks("<p>司马迁<sup>已</sup>曰：某事。</p>");
+        assert!(!s.contains('已'), "幽灵字未清：{s}");
+        assert!(!s.contains("note"), "不该转成注：{s}");
+        assert!(s.contains("司马迁"), "正文被误伤：{s}");
+    }
+
+    /// 纯注号上标（`1` / `①` / `[3]`）同样吃掉。
+    #[test]
+    fn sup_note_markers_are_eaten() {
+        for mark in ["1", "12", "①", "[3]", "*"] {
+            let s = strip_sup_marks(&format!("<p>正文<sup>{mark}</sup>续。</p>"));
+            assert!(!s.contains(mark), "注号未清：{s}");
+        }
+    }
+
+    /// 够长的上标是真注文：转成 `[注]…[/注]` 夹注，不白扔。
+    #[test]
+    fn sup_real_note_becomes_gloss() {
+        let s = strip_sup_marks("<p>某事<sup>司马贞索隐曰：此事可疑</sup>。</p>");
+        assert!(s.contains(r#"<span class="note">司马贞索隐曰：此事可疑</span>"#), "未转注：{s}");
+        assert!(!s.contains("<sup"), "残留上标：{s}");
+    }
+
+    /// 上标不闭合（坏标签）时只丢开标签，绝不吞掉后面的正文。
+    #[test]
+    fn unclosed_sup_does_not_swallow_the_page() {
+        let s = strip_sup_marks("<p>前<sup>已</p><p>后段正文仍在。</p>");
+        assert!(s.contains("后段正文仍在"), "后半页被吞：{s}");
+    }
+
+    /// 正文流里的独字夹注（`[注]已[/注]`）也要被刮掉。
+    #[test]
+    fn ghost_single_char_gloss_is_scrubbed() {
+        let s = scrub_ghost_notes("司马迁[注]已[/注]曰：某事。");
+        assert_eq!(s, "司马迁曰：某事。", "独字夹注未清：{s}");
+        // 真注文（哪怕只有四个字、带标点）必须留下。
+        let s = scrub_ghost_notes("锡[注]锡：赐。[/注]玄圭。");
+        assert!(s.contains("[注]锡：赐。[/注]"), "真注文被误删：{s}");
+    }
+
+    /// 端到端：`<sup>` 幽灵字经全管线后既不裸奔也不成注。
+    #[test]
+    fn sup_ghost_vanishes_through_the_whole_cleanup() {
+        let s = cleanup_ancient_text("司马迁<sup>已</sup>曰：迁生龙门。");
+        assert!(!s.contains('已'), "幽灵字残留：{s}");
+        assert!(!s.contains("[注]"), "不该成注：{s}");
+        assert!(s.contains("司马迁"), "正文被误伤：{s}");
     }
 
     /// 网页实弹：若本地有真实抓取的网页，跑一遍并断言干净（无文件则跳过）。

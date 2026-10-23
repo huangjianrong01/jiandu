@@ -1031,11 +1031,24 @@ fn is_han_numeral(c: char) -> bool {
 /// 注意第一步不是降噪而是**抽注文**：脚注体装在 `<aside>` 里，降噪会把它们
 /// 一并删掉，注号就只能退回一个光秃秃的数字了。
 pub fn clean_epub(html: &str) -> Vec<RawChapter> {
-    let notes = collect_footnotes(html);
-    let s = stage1_denoise(html);
+    // `<sup>` 幽灵字先吃掉（见 `parsers::strip_sup_marks`）：导入走的是逐份
+    // xhtml 直接调本函数，不经过 `UniversalParser`，这道闸必须装在这里。
+    let html = crate::parsers::strip_sup_marks(html);
+    let notes = collect_footnotes(&html);
+    let s = stage1_denoise(&html);
     let s = stage4_marks_with(&s, &notes);
     let chapters = pipeline::parse_html_raw(&s);
-    stage5_chapters(chapters)
+    let chapters: Vec<RawChapter> = stage5_chapters(chapters)
+        .into_iter()
+        .map(|mut c| {
+            // 独字夹注（`[注]已[/注]` / `[注]商[/注]`）也是上标残渣的一种：
+            // 竖排里它是一个人孤零零占半列的杂质，连壳带字吃掉。
+            c.content = crate::parsers::scrub_ghost_notes(&c.content);
+            c
+        })
+        .collect();
+    // 前言 / 目录 / 版权页 / 书影：正文起手之前的一律不进书架。
+    crate::parsers::drop_front_matter(chapters)
 }
 
 // ------------------------------------------------------------------
