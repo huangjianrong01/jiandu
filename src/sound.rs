@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// 音效总开关（样式面板 / 设置里可关）。
+/// 音效总开关（版字面板 / 设置里可关）。
 static ENABLED: AtomicBool = AtomicBool::new(true);
 /// 上次播放的毫秒时间戳（节流用）。
 static LAST_MS: AtomicU64 = AtomicU64::new(0);

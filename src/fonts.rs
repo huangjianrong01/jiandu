@@ -447,7 +447,7 @@ pub fn modern_chain(choice: FontChoice) -> Vec<&'static str> {
             "sans-serif",
         ],
         // 宋体 / 楷体 / 等宽 / 西文：横笺里也照本族取字。
-        // `MODERN` 组只列黑体，但字体页把 `CLASSIC` 一并陈列，选中的楷体
+        // `MODERN` 组只列黑体，但版字页把 `CLASSIC` 一并陈列，选中的楷体
         // 若在横笺里退化成系统黑体，用户会以为「换了字体没生效」。
         FontChoice::WenJinMincho
         | FontChoice::MengYuanSerif

@@ -119,32 +119,6 @@ pub fn arrow_key_turns(key: &str) -> Option<bool> {
     }
 }
 
-/// 样式面板的标签页：**样式**（纸色 / 墨色 / 标注）与**版字**（列数 / 字体 /
-/// 字级 / 留白）。
-///
-/// v1.35.0 合并：原先「版式」面板（独立浮层里的 8/10/12/14 四档）与「字体」
-/// 页各管一套字号相关设置，功能重叠；现在两处合成 **版字** 一页，
-/// 列数只认 [`crate::reader::COLUMN_OPTS`] 这一张表（值 = `Option<usize>`）。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum StyleTab {
-    /// 纸墨：纸色 / 墨色 / 丝栏 / 标注 / 简繁 / 翻阅方式。
-    Style,
-    /// 版字：列数 / 字体 / 字级 / 留白（版式与字体合并后的一页）。
-    Banzi,
-}
-
-impl StyleTab {
-    pub fn label(&self) -> &'static str {
-        match self {
-            StyleTab::Style => "样式",
-            StyleTab::Banzi => "版字",
-        }
-    }
-
-    /// 两页：样式与版字（新增页签只需在这里加一项，标签行自动跟上）。
-    pub const ALL: [StyleTab; 2] = [StyleTab::Style, StyleTab::Banzi];
-}
-
 /// 拖拽选区的字键：(chapter, para, offset)。字典序即阅读顺序。
 pub type GlyphKey = (usize, usize, usize);
 
@@ -235,7 +209,7 @@ impl FontChoice {
         }
     }
 
-    /// 正文字体组（字体页的竖排字牌按此顺序陈列）：
+    /// 正文字体组（版字页的竖排字牌按此顺序陈列）：
     /// 两款大字库宋体打头，楷体 / 黑体 / 等宽 / 西文随后——一套字体覆盖
     /// 正文、批注、标题、混排西文四类角色，不必再装一堆零散字库。
     pub const CLASSIC: [FontChoice; 7] = [
@@ -306,6 +280,19 @@ impl FontPreset {
         }
     }
 
+    /// **正文字体 → 所属预设**（v1.35.0：面板只剩「字体」一行，这是它与
+    /// 行高 / 批注字体之间换算的**唯一**公式）。
+    ///
+    /// 楷体属「写体」（行间要更松、注配玄冬楷书），其余都按匠体排。
+    /// 面板上「排版字体」那一行已删——它和「字体」行写的是同一个
+    /// `font_ancient`，留着只会互相打脸（见 `Root::set_font`）。
+    pub fn for_main(c: FontChoice) -> FontPreset {
+        match c {
+            FontChoice::XuandongKaishu | FontChoice::LXGWWenKai => FontPreset::Kai,
+            _ => FontPreset::Song,
+        }
+    }
+
     /// 存档用的下标（与 `ALL` 同源，越界回落首项）。
     pub fn index(self) -> usize {
         FontPreset::ALL
@@ -354,7 +341,7 @@ impl ZoomLevel {
         }
     }
 
-    /// 样式面板上的**古称**：蝇头 / 中楷 / 大字 / 榜书。
+    /// 版字面板上的**古称**：蝇头 / 中楷 / 大字 / 榜书。
     ///
     /// 面板里再写「小 / 中 / 大 / 特大」是尺规语言，写「蝇头 / 榜书」才是
     /// 书林语言——前者在描述字号，后者在描述一本书的气象。
@@ -416,7 +403,7 @@ impl CardLayout {
     }
 }
 
-/// 丝栏（竖排列间那道界行）的颜色：样式面板三选一。
+/// 丝栏（竖排列间那道界行）的颜色：版字面板三选一。
 /// 影印本里三路都常见：乌丝栏（黑口本一路）、金丝栏（佳椠 / 写经）、
 /// 朱丝栏（写经体一路）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

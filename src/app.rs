@@ -9,7 +9,7 @@ use crate::library::Library;
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
     Book, CardLayout, Duplex, FontChoice, FontPreset, Glyph, GlyphHit, GlyphKey, GlyphKind,
-    MarkKind, Note, NoteKind, NoteSource, RuleColor, Script, StyleTab,
+    MarkKind, Note, NoteKind, NoteSource, RuleColor, Script,
 };
 use gpui::{
     div, px, rgb, AsyncApp, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
@@ -154,7 +154,8 @@ pub struct Root {
     pub toc_target: bool,
     /// 是否正在播放目录滑入 / 滑出动画。
     pub toc_animating: bool,
-    /// 样式面板是否展开。
+    /// 「版字」面板是否展开（v1.35.0：样式与版式两页合并为一页，
+    /// 面板只剩一张纸，故不再有「当前页签」这个状态）。
     pub show_style: bool,
     /// 专注模式：隐藏工具栏、状态栏与目录，沉浸阅读。
     pub focus_mode: bool,
@@ -257,7 +258,7 @@ pub struct Root {
     pub share_layout: CardLayout,
     /// 分享卡底色索引（见 reader::SHARE_BGS）。
     pub share_bg: usize,
-    /// 丝栏（竖排列间界行）颜色：乌丝栏 / 金丝栏 / 朱丝栏，样式面板可选。
+    /// 丝栏（竖排列间界行）颜色：乌丝栏 / 金丝栏 / 朱丝栏，版字面板可选。
     pub rule_color: RuleColor,
     /// 分享卡在窗口内容区里的矩形 (x, y, w, h)，渲染时写入，
     /// 保存 / 分享图片时据此只截卡片，而不是整块屏幕。
@@ -290,8 +291,6 @@ pub struct Root {
     pub sel_char: Option<char>,
     /// 正文 / 小字注释的配色方案。
     pub palette: InkPalette,
-    /// 样式面板当前标签页：样式 / 字体。
-    pub style_tab: StyleTab,
     /// 标点显隐：true 显示句读（朱色小字），false 隐藏（同时影响分页）。
     pub show_punct: bool,
     /// 生僻字显示：true 时给生僻字标注读音。
@@ -335,7 +334,7 @@ pub struct Root {
     pub viewport_w: f32,
     pub viewport_h: f32,
     /// 单张页面的实际渲染宽度（由 fit_sizes 按最终字号算出）。
-    /// 样式面板用它取宽，保证与单页纸面严格等宽。
+    /// 版字面板用它取宽，保证与单页纸面严格等宽。
     pub page_w: f32,
     /// 单张页面的实际渲染高度（网格引擎 outer_h；`leaf_origin` 定位注文用）。
     pub page_h: f32,
@@ -511,7 +510,6 @@ impl Root {
             touched_glyph: false,
             sel_char: None,
             palette: InkPalette::Ink,
-            style_tab: StyleTab::Style,
             show_punct: true,
             show_rare: false,
             han_digits: false,
@@ -576,15 +574,10 @@ impl Root {
         }
         // 开发用：JIANDU_PANEL=style|banzi|toc|notes|help 直接把某个面板摊开，
         // 便于逐面板截图核对（顶栏默认隐身，脚本点不到）。
-        // v1.35.0：独立的「版式」浮层已并入样式面板的「版字」页，`grid` 档
-        // 改指「展开样式面板并切到版字页」。
+        // v1.35.0：样式与版式已合并为唯一一张「版字」纸，三个档名同义。
         if let Ok(v) = std::env::var("JIANDU_PANEL") {
             match v.as_str() {
-                "grid" | "banzi" => {
-                    root.show_style = true;
-                    root.style_tab = StyleTab::Banzi;
-                }
-                "style" => root.show_style = true,
+                "grid" | "banzi" | "style" => root.show_style = true,
                 "toc" => root.open_toc(),
                 "notes" => root.show_notes_panel = true,
                 "help" => root.show_help = true,
@@ -689,15 +682,12 @@ impl Root {
                 }
             }
         }
-        // 开发用：展开样式面板 / 切到版字页。
-        if std::env::var("JIANDU_STYLE_OPEN").is_ok() {
+        // 开发用：展开「版字」面板（JIANDU_BANZI_OPEN 取代旧的
+        // JIANDU_GRID_OPEN——独立版式浮层已并入这一张纸）。
+        if std::env::var("JIANDU_STYLE_OPEN").is_ok()
+            || std::env::var("JIANDU_BANZI_OPEN").is_ok()
+        {
             root.show_style = true;
-        }
-        // 开发用：展开样式面板并直接停在「版字」页（v1.35.0 取代旧的
-        // JIANDU_GRID_OPEN——独立版式浮层已并入这一页）。
-        if std::env::var("JIANDU_BANZI_OPEN").is_ok() {
-            root.show_style = true;
-            root.style_tab = StyleTab::Banzi;
         }
         // 开发用：直接进入专注模式。
         if std::env::var("JIANDU_FOCUS").is_ok() {
@@ -712,9 +702,6 @@ impl Root {
             root.layout_key = "standard14";
             root.grid.columns = 14;
             root.duplex = Duplex::Single;
-        }
-        if std::env::var("JIANDU_FONT_TAB").is_ok() {
-            root.style_tab = StyleTab::Banzi;
         }
         // 开发用：JIANDU_NOTE_ZOOM=x,y 在给定窗口坐标直接弹出注文放大卡
         // （模拟点击注文块；本机合成鼠标点击被 macOS TCC 拦，无法端到端
@@ -794,11 +781,28 @@ impl Root {
         }
     }
 
+    /// **切换正文字体**——面板里「字体」这一行的唯一入口。
+    ///
+    /// v1.35.0 去重：原先「排版字体」（预设，一键换一对）与「字体」（单换
+    /// 正文）两行都写 `font_ancient`，各写各的、互相打脸——在字体行挑了
+    /// 楷体，预设行还亮着「刻本宋体」。现在只留「字体」一行，`set_font`
+    /// 一个入口把四件事一次做完（与 `set_font_preset` 同源）：
+    ///   1. 换**正文**字体；
+    ///   2. 归位**排版预设**（楷体 → 写体，其余 → 匠体），行高缩放随之；
+    ///   3. 换**批注**字体（永远与正文不同体，见 `FontPreset::note_choice`）；
+    ///   4. **重算尺寸**（`fit_sizes`）——行高 / 行数 / 字号全部重算。
     pub fn set_font(&mut self, c: FontChoice) {
         match self.script {
             Script::Ancient => self.font_ancient = c,
             Script::Modern => self.font_modern = c,
         }
+        // 楷体是「写体」，行间要更松（`preset_line_scale`）；其余按匠体排。
+        self.font_preset = FontPreset::for_main(c);
+        let preset = self.font_preset;
+        self.font_note = preset.note_choice();
+        self.grid.line_scale = crate::fonts::preset_line_scale(preset);
+        self.fit_sizes();
+        self.persist();
     }
 
     /// 批注字体（楷体），与正文宋体分开。
@@ -808,26 +812,6 @@ impl Root {
 
     pub fn set_note_font(&mut self, c: FontChoice) {
         self.font_note = c;
-        self.persist();
-    }
-
-    /// **切换排版字体**（刻本宋体 ↔ 手写楷体）——重绘链在这里闭合。
-    ///
-    /// 字体不是「换个族名就完了」：不同字体的 em box 不同，行高一变，
-    /// 每列能排几行就变、整本书的分页也就变。所以一次切换要走完四步：
-    ///   1. 换**正文**字体（`main_choice`）；
-    ///   2. 换**批注**字体（`note_choice`，永远与正文不同款，层次不丢）；
-    ///   3. 换**行高缩放**（`fonts::preset_line_scale`：楷体笔势舒展，
-    ///      行间要更松，否则上下两字粘连）；
-    ///   4. **重算尺寸**（`fit_sizes`）——行高 / 行数 / 字号全部重算。
-    /// 分页是每帧按新尺寸重排的（`layout_pages`），故不必显式重排；
-    /// 渲染下一帧自会拿新的 `font_preset` 取族名。
-    pub fn set_font_preset(&mut self, p: FontPreset) {
-        self.font_preset = p;
-        self.font_ancient = p.main_choice();
-        self.font_note = p.note_choice();
-        self.grid.line_scale = crate::fonts::preset_line_scale(p);
-        self.fit_sizes();
         self.persist();
     }
 
@@ -1022,7 +1006,7 @@ impl Root {
         // 让算出的纸高(content_h)正好等于正文区可用高——这样纸张撑满、不再
         // 有「居中才能遮丑」的残余留白（见 render_ancient 的天头地脚非对称）。
         let v_reserve = if self.focus_mode { 0.0 } else { 70.0 };
-        // 样式面板为浮层（可盖住正文下部），不为它预留高度，正文始终铺满。
+        // 版字面板为浮层（可盖住正文下部），不为它预留高度，正文始终铺满。
         let content_h = (self.viewport_h - v_reserve).max(220.0);
         // 目录改为浮层，不占水平空间。
         let content_w = (self.viewport_w - pad).max(220.0);
@@ -1313,7 +1297,7 @@ impl Root {
     /// **列数的唯一读口**（v1.35.0）：`None` = 自动（按书与可用宽每帧算），
     /// `Some(n)` = 锁死 n 列。
     ///
-    /// 原先「版式」浮层读 `layout_key`、样式面板读 `grid.columns` +
+    /// 原先「版式」浮层读 `layout_key`、版字面板读 `grid.columns` +
     /// `columns_auto`，两处各自判断、同一件事两副面孔；现在 UI 一律只读这
     /// 一处，写入只走 [`set_columns_pref`]。底层引擎仍照旧吃
     /// `grid.columns` + `columns_auto`，换算在这里做一次，引擎零改动。
@@ -1805,7 +1789,7 @@ impl Root {
             .unwrap_or(0)
     }
 
-    /// 设字级档位（样式面板的「蝇头 / 中楷 / 大字 / 榜书」）。
+    /// 设字级档位（版字面板的「蝇头 / 中楷 / 大字 / 榜书」）。
     ///
     /// `zoom` 存的是倍率，档位由 `ZoomLevel::from_zoom` 反推，
     /// 所以这里只需把倍率落到该档的 `factor()` 上，排版下一帧自动重算。
