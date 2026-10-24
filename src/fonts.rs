@@ -11,6 +11,9 @@
 //! 放进 `resources/fonts/` 或装进系统即可选中。GPUI 通过字体族名称在
 //! 系统里查找；未安装时沿回退链落到最接近的系统字体，避免「豆腐块」。
 //!
+//! **唯一例外**：齐伋体（`assets/fonts/qiji.ttf`，约 14 MB 的明刻本活字），
+//! 用户要求随包静态打包——见 `register_bundled_fonts` 里的 `include_bytes!`。
+//!
 //! 关键点：GPUI 0.2.2 的 `font_family` 只接受**一个**族名（没有 CSS 式
 //! 的 fallback 列表），所以「回退链」必须由我们自己挑：启动时把系统可用
 //! 字体名缓存下来，`family_for` 返回链上第一个真正存在的族名。
@@ -218,6 +221,8 @@ pub fn preset_line_scale(preset: FontPreset) -> f32 {
 /// 目录里其它 `.ttf/.otf/.ttc` 也会被扫描注册，这里只是常见命名的白名单。
 ///
 /// 只有用户**自己放进来**的才注册——默认一个都不打包，App 体积才压得住。
+/// （齐伋体是例外：用 `include_bytes!` 静态编入二进制，见 `register_bundled_fonts`，
+/// 不在此白名单里。）
 const BUNDLED: &[&str] = &[
     // 正文：大字符集宋体
     "WenJinMinchoP0-Regular.ttf",
@@ -251,6 +256,17 @@ fn font_dirs() -> Vec<PathBuf> {
 
 /// 在应用启动时调用：注册随包字体（存在才注册），并缓存系统字体名。
 pub fn register_bundled_fonts(cx: &mut App) {
+    // 齐伋体：用户要求**静态打包**——用 `include_bytes!` 把字体编译进二进制，
+    // 离线运行 / 免安装包都自带，不依赖用户在系统里安装这款字体。
+    // 族名取自字体内部 name 表（Windows nameID 1 = `QIJI`），`pick_font`
+    // 据此在回退链里命中它。
+    {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/fonts/qiji.ttf"
+        ));
+        let _ = cx.text_system().add_fonts(vec![bytes.to_vec().into()]);
+    }
     let mut seen: Vec<String> = Vec::new();
     for dir in font_dirs() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -423,6 +439,17 @@ pub fn ancient_chain(choice: FontChoice) -> Vec<&'static str> {
             "STSong",
             "serif",
         ],
+        // —— 齐伋体：明刻本活字风格（随包字体，族名 QIJI）——
+        FontChoice::Qiji => vec![
+            "QIJI",
+            "Qiji",
+            "qiji",
+            "齊伋體",
+            "QijiFont",
+            "Songti SC",
+            "STSong",
+            "serif",
+        ],
         // 宋体 / 其它
         _ => vec![
             "SimSun",
@@ -455,6 +482,7 @@ pub fn modern_chain(choice: FontChoice) -> Vec<&'static str> {
         | FontChoice::LXGWWenKai
         | FontChoice::ShangguMono
         | FontChoice::LatinModern
+        | FontChoice::Qiji
         | FontChoice::SongTi
         | FontChoice::SourceHanSerif
         | FontChoice::ZhuqueFangsong

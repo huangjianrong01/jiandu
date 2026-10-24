@@ -800,6 +800,22 @@ fn leaf_no(page_no: usize, fg: u32, song: &SharedString) -> Div {
         .child(SharedString::from(format!("第{page_no}葉")))
 }
 
+/// 朱批录里的一条：带跳转锚点（`key`）或兜底页码（`page`）。
+struct NoteEntry {
+    /// 章 · 段 · 偏移三件套锚点；`None` = 页笔记（无 charIndex）。
+    key: Option<(usize, usize, usize)>,
+    /// 锚点跨度（个字数），闪高时点亮这一串。
+    len: usize,
+    /// 兜底页码（页笔记用）。
+    page: Option<usize>,
+    /// 品类标签：眉批 / 夹注 / 通假 / 专名 / 地名 / 书名 / 着重 / 划线 / 页记。
+    kind: &'static str,
+    /// 原文引用（朱砂细线旁的那一句）。
+    quote: String,
+    /// 批注内容（眉批 / 夹注正文）。
+    content: String,
+}
+
 fn build_note_index(book: &Book) -> NoteIndex {
     let mut map = HashMap::new();
     let mut n = 0usize;
@@ -1567,9 +1583,9 @@ impl Root {
                                 self.show_traditional = !self.show_traditional;
                                 cx.notify();
                             }
-                            // 字体切换：⌘F。
+                            // 全文检索：⌘F（与顶部「檢索」同款，走状态机开合）。
                             "f" | "F" => {
-                                self.cycle_font();
+                                self.set_ui_state(AppUIState::Search);
                                 cx.notify();
                             }
                             // 主题切换：⌘P。
@@ -4387,7 +4403,12 @@ impl Root {
         // 检索命中：朱砂红衬底，当前那一处更重、其余较淡（用 `mix` 兑出
         // 半透感，不依赖 opacity —— 深色主题下也稳）。
         let hit = if g.kind == GlyphKind::Char {
-            self.search_state_at(g.chapter, g.para, g.offset)
+            // 抵达高亮优先：朱批录 / 搜索跳转后那一下，比检索命中更重一档。
+            if self.flash_state_at(g.chapter, g.para, g.offset) == Some(true) {
+                Some(true)
+            } else {
+                self.search_state_at(g.chapter, g.para, g.offset)
+            }
         } else {
             None
         };
@@ -4958,6 +4979,22 @@ impl Root {
                 this.export_markdown_file(cx);
             }),
         );
+        let pdf_page_btn = action("本叶为 PDF").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                // 截当前纸面 → 包成单页 PDF → 弹系统保存框。
+                this.export_pdf_current(window, cx);
+            }),
+        );
+        let pdf_book_btn = action("全书为 PDF").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                // 逐页翻面截屏 → 合成多页 PDF → 弹系统保存框。
+                this.export_pdf_full(window, cx);
+            }),
+        );
 
         div()
             .flex()
@@ -4977,7 +5014,9 @@ impl Root {
                     .items_center()
                     .gap(px(4.0))
                     .child(png_btn)
-                    .child(md_btn),
+                    .child(md_btn)
+                    .child(pdf_page_btn)
+                    .child(pdf_book_btn),
             )
             .child(SharedString::from(right))
     }
@@ -5971,19 +6010,34 @@ impl Root {
     ///
     /// 输入框套 `ime::InputField` —— 中文输入法不走 keydown，
     /// 只有挂了 InputHandler 才能把组好的「长安」送回草稿。
+    /// **全文检索**：右滑侧栏，古风单行输入（宣纸底 + 朱砂下划线），下列
+    /// 结果列表——每条「前文摘录」，命中词以朱砂标出；点一条即瞬跳到该处
+    /// 并点亮「抵达」高亮（复用检索命中的朱砂衬底模式）。
     fn render_search_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
+        let vw = self.viewport_w;
+        let slide = self.search_slide.clamp(0.0, 1.0);
+        let panel_w = (vw * 0.34).clamp(280.0, 420.0);
+        let off = -(1.0 - slide) * panel_w;
+        let zhu = sheet_zhu(t);
+        let ink = t.ink();
+        let ink_soft = t.ink_soft();
+        let paper_veil = ((t.paper() & 0xFFFFFF) << 8) | 0xF0;
+        let sept = crate::theme::mix(t.paper(), t.ink(), 0.16);
+
         let q = self.search_draft.trim().to_string();
+        let qlen = q.chars().count();
         let n = self.search_hits.len();
-        let label = if q.is_empty() {
-            "输入字词后回车检索".to_string()
+        let hint = if q.is_empty() {
+            "輸入字詞後回車檢索".to_string()
         } else if n == 0 {
             format!("未找到「{q}」")
         } else {
-            format!("「{q}」共 {n} 处 · 第 {}/{n}", self.search_idx + 1)
+            format!("「{q}」共 {n} 處 · 第 {}/{n}", self.search_idx + 1)
         };
 
-        // 输入框：草稿按光标切成两段，中间立一根朱色光标。
+        // 输入框：草稿按光标切成两段，中间立一根朱砂光标；外层只用一道
+        // 朱砂下划线（无白框、无圆角、无底色块）——古风单行输入。
         let draft = self.search_draft.clone();
         let cursor = self.search_cursor.min(draft.chars().count());
         let before: String = draft.chars().take(cursor).collect();
@@ -5993,76 +6047,189 @@ impl Root {
             .flex_row()
             .items_center()
             .text_size(px(14.0))
-            .text_color(rgb(t.ink()))
+            .text_color(rgb(ink))
             .child(SharedString::from(before))
-            .child(div().w(px(1.5)).h(px(16.0)).bg(rgb(t.accent())))
+            .child(div().w(px(1.5)).h(px(16.0)).bg(rgb(zhu)))
             .child(SharedString::from(after));
-
         let input = crate::ime::InputField::new(
             div()
-                .w(px(200.0))
-                .p_2()
+                .w(px(panel_w - 48.0))
+                .px_1()
+                .py_2()
                 .bg(rgb(t.paper()))
-                .border_1()
-                .border_color(rgb(t.frame()))
-                .rounded(px(3.0))
+                .border_b_1()
+                .border_color(rgb(zhu))
                 .child(box_body),
             self.search_focus.clone(),
             cx.entity(),
         );
 
-        let btn_go = small_button("检索", false, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| this.run_search(cx)),
-        );
-        let btn_prev = small_button("‹ 上一处", false, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| this.search_prev(cx)),
-        );
-        let btn_next = small_button("下一处 ›", false, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| this.search_next(cx)),
-        );
-        let btn_close = small_button("关闭", false, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                this.show_search = false;
-                this.clear_search();
+        let btn_prev = self
+            .search_link("‹ 上一處", t)
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.search_prev(cx)));
+        let btn_next = self
+            .search_link("下一處 ›", t)
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.search_next(cx)));
+        let btn_close = self
+            .search_link("收", t)
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.set_ui_state(AppUIState::None);
                 cx.notify();
-            }),
-        );
+            }));
+
+        // 结果列表：每条从书稿正文摘一段「前文 + 命中 + 后文」，命中词朱砂标出。
+        let mut list = div()
+            .id(SharedString::from("search-result-list"))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_y_scroll();
+        if n == 0 && !q.is_empty() {
+            list = list.child(
+                div()
+                    .p_4()
+                    .text_size(px(11.0))
+                    .text_color(rgb(ink_soft))
+                    .child(SharedString::from("全文未檢得此詞。")),
+            );
+        } else if n == 0 {
+            list = list.child(
+                div()
+                    .p_4()
+                    .text_size(px(11.0))
+                    .text_color(rgb(ink_soft))
+                    .child(SharedString::from("輸入字詞，即檢即得。")),
+            );
+        }
+        for i in 0..n {
+            let (c, p, o) = self.search_hits[i];
+            // 从书稿摘上下文（无论该处是否在当前页都摘得出来）。
+            let ctx: Option<(String, String, String)> = self.book.as_ref().and_then(|b| {
+                let para = b.chapters.get(c)?.paragraphs.get(p)?;
+                let chars: Vec<char> = para.text.chars().collect();
+                let len = chars.len();
+                if o >= len {
+                    return None;
+                }
+                let qs = qlen.min(len - o).max(1);
+                let s = o.saturating_sub(6);
+                let e = ((o + qs) + 6).min(len);
+                let shown = |r: std::ops::Range<usize>| -> String {
+                    chars[r].iter().map(|ch| self.shown(*ch)).collect()
+                };
+                Some((shown(s..o), shown(o..o + qs), shown(o + qs..e)))
+            });
+            let ctx = match ctx {
+                Some(c) => c,
+                None => ("".into(), q.clone(), "".into()),
+            };
+            let cur = i == self.search_idx;
+            let mut row = div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .p_3()
+                .cursor_pointer()
+                .border_b_1()
+                .border_color(rgb(sept))
+                .when(cur, |d| d.bg(rgb(crate::theme::mix(t.paper(), zhu, 0.10))))
+                .hover(|d| d.bg(rgb(crate::theme::mix(t.paper(), zhu, 0.06))))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.goto_hit(i, cx);
+                }));
+            // 一行：前文（淡墨）+ 命中（朱砂）+ 后文（淡墨）。
+            let mut line = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(12.0))
+                .child(div().text_color(rgb(ink_soft)).child(SharedString::from(ctx.0)))
+                .child(
+                    div()
+                        .text_color(rgb(zhu))
+                        .child(SharedString::from(ctx.1)),
+                )
+                .child(div().text_color(rgb(ink_soft)).child(SharedString::from(ctx.2)));
+            row = row.child(line);
+            if cur {
+                row = row.child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(rgb(zhu))
+                        .child(SharedString::from("▸ 當前")),
+                );
+            }
+            list = list.child(row);
+        }
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(sept))
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(zhu))
+                    .child(SharedString::from("檢 索")),
+            )
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(rgb(ink_soft))
+                    .child(SharedString::from(hint)),
+            );
 
         div()
             .absolute()
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(42.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .right(px(off))
+            .w(px(panel_w))
             .flex()
-            .flex_row()
-            .justify_center()
+            .flex_col()
+            .bg(rgba(paper_veil))
+            .border_l_1()
+            .border_color(rgb(sept))
+            .child(header)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
-                    .p_3()
-                    .bg(rgb(t.chrome()))
-                    .border_1()
-                    .border_color(rgb(t.frame()))
-                    .rounded(px(4.0))
+                    .gap(px(8.0))
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(sept))
                     .child(input)
-                    .child(btn_go)
                     .child(btn_prev)
                     .child(btn_next)
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(t.ink_soft()))
-                            .child(SharedString::from(label)),
-                    )
                     .child(btn_close),
             )
+            .child(list)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+    }
+
+    /// 检索侧栏里的极简文字链接（无底无框，悬停转朱砂）。
+    fn search_link(&self, label: &'static str, t: Theme) -> Div {
+        div()
+            .px(px(4.0))
+            .cursor_pointer()
+            .text_size(px(11.0))
+            .text_color(rgb(t.chrome_text()))
+            .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+            .child(SharedString::from(label))
     }
 
     /// 点字查字浮层：所点字用大字立在朱印旁，下附 charIndex、选中文本、
@@ -7652,189 +7819,236 @@ impl Root {
             }))
     }
 
+    /// 朱批录：从书稿里收齐四类批注（眉批 / 夹注·通假 / 专名·书名线·着重 / 划线），
+    /// 外加「页笔记」（无 charIndex，只按页码跳），每条都带上跳转锚点。
+    fn note_entries(&self) -> Vec<NoteEntry> {
+        let mut out = Vec::new();
+        if let Some(b) = &self.book {
+            for h in &b.head_notes {
+                out.push(NoteEntry {
+                    key: Some(h.key),
+                    len: 1,
+                    page: None,
+                    kind: "眉批",
+                    quote: self.quote_at(h.key, 10),
+                    content: h.text.clone(),
+                });
+            }
+            for (ci, ch) in b.chapters.iter().enumerate() {
+                for (pi, p) in ch.paragraphs.iter().enumerate() {
+                    for n in &p.notes {
+                        if n.kind == NoteKind::Ruby {
+                            continue; // 注音不是批注
+                        }
+                        let len = n.len.max(1);
+                        let key = n.char_index(ci, pi);
+                        let quote = self.quote_at(key, len);
+                        let (kind, content) = match n.kind {
+                            NoteKind::Note => ("夹注", n.text.clone()),
+                            NoteKind::Tongjia => ("通假", n.text.clone()),
+                            NoteKind::Person => ("专名", "人名专名线".into()),
+                            NoteKind::Place => ("地名", "地名专名线".into()),
+                            NoteKind::Book => ("书名", "书名波浪线".into()),
+                            NoteKind::Emph => ("着重", "朱砂圈点".into()),
+                            NoteKind::Ruby => ("", String::new()),
+                        };
+                        out.push(NoteEntry {
+                            key: Some(key),
+                            len,
+                            page: None,
+                            kind,
+                            quote,
+                            content,
+                        });
+                    }
+                }
+            }
+        }
+        for k in &self.underlines {
+            out.push(NoteEntry {
+                key: Some(*k),
+                len: 1,
+                page: None,
+                kind: "划线",
+                quote: self.quote_at(*k, 6),
+                content: String::new(),
+            });
+        }
+        let mut pages: Vec<(usize, String)> =
+            self.notes.iter().map(|(k, v)| (*k, v.clone())).collect();
+        pages.sort_by_key(|(k, _)| *k);
+        for (pg, txt) in pages {
+            out.push(NoteEntry {
+                key: None,
+                len: 0,
+                page: Some(pg),
+                kind: "页记",
+                quote: String::new(),
+                content: txt,
+            });
+        }
+        out
+    }
+
+    /// 按锚点从书稿正文里摘一段原文——无论该字是否在当前页都摘得出来。
+    fn quote_at(&self, key: (usize, usize, usize), len: usize) -> String {
+        if let Some(b) = &self.book {
+            if let Some(ch) = b.chapters.get(key.0) {
+                if let Some(p) = ch.paragraphs.get(key.1) {
+                    return p.text.chars().skip(key.2).take(len.max(1)).collect();
+                }
+            }
+        }
+        String::new()
+    }
+
+    /// **朱批录**：右滑侧栏，半透明宣纸底，朱砂细线列出全部批注；点一条即
+    /// 收栏、瞬跳到该 charIndex 并点亮「抵达」高亮。
     fn render_notes_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let vw = self.viewport_w;
         let vh = self.viewport_h;
-        let page = self.page;
-        let existing = self.notes.get(&page).cloned().unwrap_or_default();
+        let slide = self.notes_slide.clamp(0.0, 1.0);
+        let panel_w = (vw * 0.36).clamp(300.0, 440.0);
+        let off = -(1.0 - slide) * panel_w;
+        let zhu = sheet_zhu(t);
+        let ink = t.ink();
+        let ink_soft = t.ink_soft();
+        // 半透明宣纸底：纸色 94% 不透明（GPUI 无 backdrop-filter，用纸色近似磨砂）。
+        let paper_veil = ((t.paper() & 0xFFFFFF) << 8) | 0xF0;
+        // 极细墨线（条目分隔）：纸 + 墨 16%。
+        let sept = crate::theme::mix(t.paper(), t.ink(), 0.16);
+        let song = self.main_family();
 
-        let shown: String = if !existing.is_empty() {
-            existing.clone()
-        } else {
-            "（这一葉还没有笔记）".to_string()
-        };
-        // 笔记内容按当前繁简开关转繁／简，再竖排显示（仿古人批注）。
-        let existing_trad: String = existing.chars().map(|c| self.shown(c)).collect();
+        let entries = self.note_entries();
+        let count = entries.len();
 
-        // 「第 N 葉的笔记」区：静态展示已有笔记；写笔记统一走正文上方的
-        // 浮层编辑框（直接盖在文本上输入，不占用面板、不遮正文）。
-        let note_box = if existing.is_empty() {
-            div()
-                .w(px(328.0))
-                .p_2()
-                .bg(rgb(t.paper()))
-                .border_1()
-                .border_color(rgb(t.rule()))
-                .rounded(px(4.0))
-                .text_size(px(12.0))
-                .text_color(rgb(t.ink_soft()))
-                .child(SharedString::from(shown))
-        } else {
-            // 竖排繁体：按字身折列，长笔记自动成多列，overflow_hidden 防止撑破面板。
-            div()
-                .w(px(328.0))
-                .p_2()
-                .overflow_hidden()
-                .bg(rgb(t.paper()))
-                .border_1()
-                .border_color(rgb(t.rule()))
-                .rounded(px(4.0))
-                .child(crate::shelf::vertical_block(
-                    &existing_trad,
-                    300.0,
-                    132.0,
-                    13.0,
-                    t.ink(),
-                    FontWeight::NORMAL,
-                ))
-        };
+        let mut list = div()
+            .id(SharedString::from("notes-list"))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_y_scroll();
+        if entries.is_empty() {
+            list = list.child(
+                div()
+                    .p_4()
+                    .text_size(px(11.0))
+                    .text_color(rgb(ink_soft))
+                    .child(SharedString::from(
+                        "尚無批注。讀中點字即興批點，或框選正文落墨。",
+                    )),
+            );
+        }
+        for (i, e) in entries.into_iter().enumerate() {
+            let kind = e.kind;
+            let quote = e.quote;
+            let content = e.content;
+            let key = e.key;
+            let len = e.len;
+            let page = e.page;
+            let row = div()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .p_3()
+                .cursor_pointer()
+                .border_b_1()
+                .border_color(rgb(sept))
+                .when(i == 0, |s| s.border_t_1().border_color(rgb(sept)))
+                .hover(|s| s.bg(rgb(crate::theme::mix(t.paper(), zhu, 0.06))))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(k) = key {
+                        this.jump_to_key(k, len, cx);
+                    } else if let Some(pg) = page {
+                        this.jump_to_page(pg, cx);
+                    }
+                }));
+            let mut head = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(zhu))
+                        .child(SharedString::from(kind.to_string())),
+                );
+            if !quote.is_empty() {
+                head = head.child(
+                    div()
+                        .flex_1()
+                        .text_size(px(11.5))
+                        .text_color(rgb(ink_soft))
+                        .child(SharedString::from(quote)),
+                );
+            }
+            let mut row = row.child(head);
+            if !content.is_empty() {
+                row = row.child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(ink))
+                        .child(SharedString::from(content)),
+                );
+            } else if kind == "划线" {
+                row = row.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(zhu))
+                        .child(SharedString::from("（朱線）")),
+                );
+            }
+            list = list.child(row);
+        }
 
-        let mut page_btns = div()
+        // 表头：朱批录 + 条数（朱砂宋体），另一侧一句极小提示「點選可躍」。
+        let header = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap_2()
-            .child(small_button("✎ 写笔记", false, t).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.start_note_edit_at(None);
-                    cx.notify();
-                }),
-            ));
-        if !existing.is_empty() {
-            page_btns = page_btns.child(small_button("清除", false, t).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.set_note(this.page, String::new());
-                    cx.notify();
-                }),
-            ));
-        }
-
-        let mut list = div().flex().flex_col().gap_1();
-        let mut notes: Vec<(usize, String)> =
-            self.notes.iter().map(|(k, v)| (*k, v.clone())).collect();
-        notes.sort_by_key(|(k, _)| *k);
-        if notes.is_empty() {
-            list = list.child(
+            .justify_between()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(sept))
+            .child(
                 div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(t.ink_soft()))
-                    .child(SharedString::from("还没有笔记，写下第一笔吧。")),
+                    .font_family(song.clone())
+                    .text_size(px(12.5))
+                    .text_color(rgb(zhu))
+                    .child(SharedString::from(format!("朱批錄 {count}"))),
+            )
+            .child(
+                div()
+                    .font_family(song.clone())
+                    .text_size(px(9.5))
+                    .text_color(rgb(ink_soft))
+                    .child(SharedString::from("點選可躍")),
             );
-        }
-        for (p, txt) in notes {
-            let label: String = txt.chars().take(20).map(|c| self.shown(c)).collect();
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        small_button(&format!("第{}葉", p + 1), false, t).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.page = p;
-                                this.show_notes_panel = false;
-                                this.persist();
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(11.0))
-                            .text_color(rgb(t.ink()))
-                            .child(SharedString::from(label)),
-                    ),
-            );
-        }
-
-        let panel = div()
-            .w(px(360.0))
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_4()
-            .bg(rgb(t.chrome()))
-            .border_1()
-            .border_color(rgb(t.frame()))
-            .rounded(px(8.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .text_color(rgb(t.accent()))
-                            .child(SharedString::from("筆 記")),
-                    )
-                    .child(small_button("关闭", false, t).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.show_notes_panel = false;
-                            cx.notify();
-                        }),
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(10.5))
-                            .text_color(rgb(t.ink_soft()))
-                            .child(SharedString::from(format!("第 {} 葉的笔记", page + 1))),
-                    )
-                    .child(note_box),
-            )
-            .child(page_btns)
-            .child(div().h(px(1.0)).bg(rgb(t.chrome_line())))
-            .child(
-                div()
-                    .text_size(px(10.5))
-                    .text_color(rgb(t.ink_soft()))
-                    .child(SharedString::from("全部笔记")),
-            )
-            .child(list);
 
         div()
             .absolute()
             .top(px(0.0))
-            .left(px(0.0))
-            .w(px(vw))
-            .h(px(vh))
+            .bottom(px(0.0))
+            .right(px(off))
+            .w(px(panel_w))
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x14100ACC))
-            .child(panel)
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.show_notes_panel = false;
-                cx.notify();
-            }))
+            .flex_col()
+            .bg(rgba(paper_veil))
+            .border_l_1()
+            .border_color(rgb(sept))
+            .child(header)
+            .child(list)
+            // 拦住冒泡：点面板内不触发外层（页面）的翻页 / 关闭。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
     }
 
     /// **「版字」面板**：列数 · 字级 · 字体 · 批注 · 留白 · 纸边 · 页面 ·

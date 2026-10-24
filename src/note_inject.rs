@@ -41,9 +41,11 @@ pub fn inject_inline_note_at_key(
             {
                 n.text = text.to_string(); // 同字已有夹注：覆盖而非重复
                 n.source = source;
+                n.anchor = Some((chapter, para, offset)); // v1.49.0：落盘即记 charIndex
             } else {
                 let mut note = Note::new(offset, NoteKind::Note, text);
                 note.source = source;
+                note.anchor = Some((chapter, para, offset)); // v1.49.0：朱批录跳转凭据
                 p.notes.push(note);
             }
         }

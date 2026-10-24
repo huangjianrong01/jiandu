@@ -139,6 +139,26 @@ pub enum AppUIState {
     Share,
 }
 
+/// PDF 导出作业：逐页截屏 → 合成多页 PDF（v1.49.0）。
+///
+/// 由 `render` 的 `pdf_animating` 分支逐帧驱动：每帧要么翻到下一面等画好，
+/// 要么把当前纸面截成 PNG 存起来，直到截满 `total` 面再由 `pdf_finalize` 合成。
+/// 截屏只取 `page_rect`（纸面区域），故工具栏 / 侧栏即便残留也不会入图。
+pub struct PdfJob {
+    /// 要截的总页数（本叶 = 1；全书 = 全书页数）。
+    pub total: usize,
+    /// 已截页数（下一面要截的页码）。
+    pub idx: usize,
+    /// 已截下的临时 PNG 路径（合成后清理）。
+    pub pages: Vec<std::path::PathBuf>,
+    /// true = 全书（逐页翻）；false = 仅当前面。
+    pub full: bool,
+    /// 本次导出的时间戳令牌，避免临时文件名撞车。
+    pub token: u64,
+    /// 导出前的阅读位置，导出结束后还原，免得全书导出把视线甩到最后一面。
+    pub origin_page: usize,
+}
+
 pub struct Root {
     pub library: Library,
     pub screen: Screen,
@@ -469,6 +489,27 @@ pub struct Root {
     /// 当前这一处命中的跨度 `(chapter, para, start, len)`：高亮比其它命中重一档。
     pub search_cur: Option<(usize, usize, usize, usize)>,
 
+    /// 朱批录 / 搜索跳转后的「抵达」高亮：短暂朱砂衬底，提示用户已跳到该处。
+    /// 口径与 `search_cur` 一致 `(chapter, para, offset, len)`。
+    pub note_flash: Option<(usize, usize, usize, usize)>,
+    /// 朱批录侧栏滑入 / 滑出动画（与 `toc_slide` 同理）。
+    pub notes_slide: f32,
+    pub notes_target: bool,
+    pub notes_animating: bool,
+    /// 检索侧栏滑入 / 滑出动画。
+    pub search_slide: f32,
+    pub search_target: bool,
+    pub search_animating: bool,
+
+    /// PDF 导出作业（逐页截屏 → 合成多页 PDF）。`Some` 表示正在导出，
+    /// `render` 的 `pdf_animating` 分支会逐帧翻面 + 截屏。
+    pub pdf_job: Option<PdfJob>,
+    /// PDF 导出是否在「逐帧翻面 / 截屏」推进中（驱动 `request_animation_frame`）。
+    pub pdf_animating: bool,
+    /// PDF 导出的「预热」标记：第一帧只负责让「无面板」状态先画出来，
+    /// 下一帧才开始截，避免截到上一帧还带着面板的画面。
+    pub pdf_warm: bool,
+
     /// 全书统计（章数, 字数）：开卷时算一次，供章末「篇·章·字」小表的
     /// 「全書」一行使用（逐帧扫全书太贵）。
     pub book_stat: (usize, usize),
@@ -647,6 +688,16 @@ impl Root {
             search_idx: 0,
             search_keys: std::collections::HashSet::new(),
             search_cur: None,
+            note_flash: None,
+            notes_slide: 0.0,
+            notes_target: false,
+            notes_animating: false,
+            search_slide: 0.0,
+            search_target: false,
+            search_animating: false,
+            pdf_job: None,
+            pdf_animating: false,
+            pdf_warm: false,
             book_stat: (0, 0),
             shelf_view: ShelfView::TitleSlip,
             shelf_sort: ShelfSort::Recent,
@@ -2230,6 +2281,159 @@ impl Root {
         .detach();
     }
 
+    /// 『导出为 PDF（本叶）』：截当前纸面 → 包成单页 PDF → 弹系统保存框。
+    pub fn export_pdf_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_pdf_export(window, cx, false);
+    }
+
+    /// 『导出为 PDF（全书）』：逐页翻面截屏 → 合成多页 PDF → 弹系统保存框。
+    pub fn export_pdf_full(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_pdf_export(window, cx, true);
+    }
+
+    /// 启动 PDF 导出：收起所有面板（免得被截进纸面），登记作业，预热一帧。
+    fn begin_pdf_export(&mut self, window: &mut Window, cx: &mut Context<Self>, full: bool) {
+        if self.book.is_none() {
+            self.notice = "尚未打开书籍，无法导出".to_string();
+            cx.notify();
+            return;
+        }
+        // 导出前收起所有面板 / 浮层，纸面只留正文。
+        self.set_ui_state(AppUIState::None);
+        self.close_transient_ui();
+        let total = if full {
+            self.paginate().len().max(1)
+        } else {
+            1
+        };
+        let token = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.pdf_job = Some(PdfJob {
+            total,
+            idx: 0,
+            pages: Vec::new(),
+            full,
+            token,
+            origin_page: self.page,
+        });
+        self.pdf_animating = true;
+        self.pdf_warm = true;
+        self.notice = if full {
+            format!("正在印制全书 PDF…（0/{total}）")
+        } else {
+            "正在印制本叶 PDF…".to_string()
+        };
+        cx.notify();
+        // 第一帧由 `render` 的 pdf_animating 分支接管。
+        window.request_animation_frame();
+    }
+
+    /// PDF 合成收尾：把临时 PNG 合成为临时 PDF，弹系统保存框，落盘后给古风提示。
+    /// 在 `render` 循环截满所有页后调用（主线程），内部用后台任务跑 I/O 不卡 UI。
+    fn pdf_finalize(&mut self, job: PdfJob, cx: &mut Context<Self>) {
+        // 还原阅读位置：全书导出翻遍了每一面，结束时跳回原位。
+        self.page = job.origin_page;
+        let full = job.full;
+        if job.pages.is_empty() {
+            self.notice = "未能截得任何页面，导出取消".to_string();
+            cx.notify();
+            return;
+        }
+        let title = self
+            .book
+            .as_ref()
+            .map(|b| b.title.clone())
+            .unwrap_or_else(|| "笺读".to_string());
+        let default = if full {
+            format!("笺读_{}_全书.pdf", crate::exporter::safe_file_stem(&title))
+        } else {
+            format!(
+                "笺卡_{}_{}.pdf",
+                crate::exporter::safe_file_stem(&title),
+                self.page + 1
+            )
+        };
+        let pages = job.pages;
+        cx.spawn(
+            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    // 先把临时 PNG 合成一份临时 PDF。
+                    let tmp_pdf = std::env::temp_dir().join(format!(
+                        "jiandu-pdf-out-{}.pdf",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    ));
+                    let built = cx
+                        .background_executor()
+                        .spawn({
+                            let pages = pages.clone();
+                            let tmp_pdf = tmp_pdf.clone();
+                            async move { crate::pdf::pngs_to_pdf(&pages, &tmp_pdf) }
+                        })
+                        .await;
+                    // 临时 PNG 使命结束，先清掉（无论成败）。
+                    for p in &pages {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    let Ok(tmp_pdf) = built else {
+                        let e = built.unwrap_err();
+                        this.update(&mut cx, |this, cx| {
+                            this.notice = format!("合成 PDF 失败：{e}");
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    };
+                    // 弹系统保存对话框。
+                    let picked = cx
+                        .background_executor()
+                        .spawn({
+                            let default = default.clone();
+                            async move {
+                                crate::exporter::pick_save_path(
+                                    "导出为 PDF",
+                                    &default,
+                                    "PDF 文档",
+                                    &["pdf"],
+                                )
+                            }
+                        })
+                        .await;
+                    let Some(dest) = picked else {
+                        let _ = std::fs::remove_file(&tmp_pdf);
+                        this.update(&mut cx, |this, cx| {
+                            this.notice = "已取消保存".to_string();
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    };
+                    let dest = crate::exporter::with_extension(dest, "pdf");
+                    let res = crate::exporter::copy_file(&tmp_pdf, &dest);
+                    let _ = std::fs::remove_file(&tmp_pdf);
+                    this.update(&mut cx, |this, cx| {
+                        this.notice = match res {
+                            Ok(p) => format!(
+                                "{}已印成 PDF：{}",
+                                if full { "全书" } else { "本叶" },
+                                p.display()
+                            ),
+                            Err(e) => format!("保存失败：{e}"),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
     /// 某章的第一面页码；找不到就回 0。
     pub fn page_of_chapter(&self, chapter: usize) -> usize {
         let pages = self.paginate();
@@ -2398,6 +2602,12 @@ impl Root {
         if !self.show_search {
             self.clear_search();
         }
+        // 侧栏滑入 / 滑出：开 → 目标态拉满并播动画；关 → 目标态归零、
+        // 由 `render` 逐帧把 slide 推回 0 后再卸载面板（与 `toc_slide` 同款）。
+        self.notes_target = self.show_notes_panel;
+        self.notes_animating = self.show_notes_panel || self.notes_slide > 0.0;
+        self.search_target = self.show_search;
+        self.search_animating = self.show_search || self.search_slide > 0.0;
         self.close_transient_ui();
     }
 
@@ -2755,14 +2965,74 @@ impl Root {
         }
     }
 
+    /// 渲染层查询：该字是否落在「抵达」高亮里（朱批录 / 搜索跳转后那一下）。
+    /// 口径与 `search_state_at` 同，但优先级更高——它是「刚跳到这」的强提示。
+    pub fn flash_state_at(&self, chapter: usize, para: usize, offset: usize) -> Option<bool> {
+        if let Some((c, p, s, len)) = self.note_flash {
+            if c == chapter && p == para && offset >= s && offset < s + len {
+                return Some(true);
+            }
+        }
+        None
+    }
+
+    /// 点亮一枚「抵达」高亮，约 1.4s 后自动熄灭（提示用户已跳到该处）。
+    ///
+    /// 用 `target` 快照防「快速连点两条」时后一条的定时器把前一条的
+    /// 高亮误熄——只熄灭与自己同款的那个。
+    pub fn flash_note(&mut self, key: (usize, usize, usize), len: usize, cx: &mut Context<Self>) {
+        self.note_flash = Some((key.0, key.1, key.2, len.max(1)));
+        let target = self.note_flash;
+        cx.notify();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1400))
+                    .await;
+                let _ = this.update(&mut cx, |this, cx| {
+                    if this.note_flash == target {
+                        this.note_flash = None;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 朱批录 / 搜索结果的一键跳转：瞬移该锚点所在面、收起侧栏、点亮抵达高亮。
+    ///
+    /// `key` 是「章 · 段 · 偏移」三件套（`HeadNote::key` / `Note::char_index`
+    /// 都按此口径），与分页锚点同源，故换列数也能找回去。页笔记没有 charIndex，
+    /// 走 `jump_to_page` 只翻面不闪高。
+    pub fn jump_to_key(&mut self, key: (usize, usize, usize), len: usize, cx: &mut Context<Self>) {
+        if let Some(pg) = self.page_of_key(key) {
+            self.page = pg;
+        }
+        self.show_notes_panel = false;
+        self.show_search = false;
+        self.clear_selection();
+        self.popup = None;
+        self.flash_note(key, len, cx);
+        cx.notify();
+    }
+
+    /// 只翻面（页笔记用：没有 charIndex，无法闪高具体字）。
+    pub fn jump_to_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        self.page = page;
+        self.show_notes_panel = false;
+        self.popup = None;
+        cx.notify();
+    }
+
     /// 一列 `rows` 字 = `rows×2` 格、一面 `cols` 列；注文过长会跨列流转，
     /// 排版结果与阅读器里的列布局完全一致（两边同走 `gloss::layout_book`）。
     /// `cols` / `rows` 全部来自网格引擎——同一套分页逻辑适配任意列数。
     pub fn paginate(&self) -> Vec<Vec<Glyph>> {
         self.layout_pages()
             .into_iter()
-            .map(|p| p.glyphs)
-            .collect()
+            .map(|p| p.glyphs)            .collect()
     }
 
     /// 排出「面 → 列 → 片」的完整树（阅读器渲染用）。
@@ -3876,6 +4146,113 @@ impl Render for Root {
                 }
             } else {
                 window.request_animation_frame();
+            }
+        }
+        // 朱批录侧栏滑入 / 滑出（与 toc 同款逐帧推进）。
+        if self.notes_animating {
+            let dir = if self.notes_target { 1.0 } else { -1.0 };
+            let step = 0.12;
+            let next = (self.notes_slide + dir * step).clamp(0.0, 1.0);
+            self.notes_slide = next;
+            if (self.notes_target && next >= 1.0) || (!self.notes_target && next <= 0.0) {
+                self.notes_animating = false;
+                if !self.notes_target {
+                    self.show_notes_panel = false;
+                }
+            } else {
+                window.request_animation_frame();
+            }
+        }
+        // 检索侧栏滑入 / 滑出。
+        if self.search_animating {
+            let dir = if self.search_target { 1.0 } else { -1.0 };
+            let step = 0.12;
+            let next = (self.search_slide + dir * step).clamp(0.0, 1.0);
+            self.search_slide = next;
+            if (self.search_target && next >= 1.0) || (!self.search_target && next <= 0.0) {
+                self.search_animating = false;
+                if !self.search_target {
+                    self.show_search = false;
+                }
+            } else {
+                window.request_animation_frame();
+            }
+        }
+        // PDF 导出：逐帧翻面 + 截屏（见 `begin_pdf_export` / `pdf_finalize`）。
+        if self.pdf_animating {
+            if self.pdf_warm {
+                // 预热帧：只让「无面板」状态先画出来，下一帧再截，
+                // 免得截到上一帧还带着面板的画面。顺手翻到第一面。
+                self.pdf_warm = false;
+                match self.pdf_job.as_ref() {
+                    Some(job) => {
+                        let target = if job.full { job.idx } else { self.page };
+                        if self.page != target {
+                            self.page = target;
+                        }
+                        window.request_animation_frame();
+                    }
+                    None => {
+                        self.pdf_animating = false;
+                    }
+                }
+            } else {
+                // 取作业参数（无作业则安全退出，不 panic）。
+                // 用 `if let` 而非 `let … else { return }`：`render` 必须返回元素，
+                // 裸 `return;` 会破坏 `-> impl IntoElement` 的返回类型。
+                if let Some(job) = self.pdf_job.as_ref() {
+                    // 先取出作业参数（不可变借用，随即释放，避免与下面的截屏借用打架）。
+                    let (full, idx, token, need_flip) = {
+                        let target = if job.full { job.idx } else { self.page };
+                        (job.full, job.idx, job.token, self.page != target)
+                    };
+                    if need_flip {
+                        // 翻到目标面，等下一帧画好再截。
+                        self.page = if full { idx } else { self.page };
+                        window.request_animation_frame();
+                    } else {
+                        // 屏幕此刻显示的正是 target 面 → 截下纸面。
+                        let tmp = std::env::temp_dir()
+                            .join(format!("jiandu-pdf-{}-{}.png", token, idx));
+                        let captured = self.capture_page_png(window, &tmp);
+                        let done = if let Some(job) = self.pdf_job.as_mut() {
+                            match captured {
+                                Ok(()) => job.pages.push(tmp),
+                                Err(e) => {
+                                    self.notice = format!("第 {} 葉截屏失败：{}", idx + 1, e);
+                                }
+                            }
+                            job.idx += 1;
+                            if job.full && job.idx < job.total {
+                                self.page = job.idx; // 预备下一面翻页
+                            }
+                            job.pages.len() >= job.total
+                        } else {
+                            true
+                        };
+                        if done {
+                            self.pdf_animating = false;
+                            if let Some(job) = self.pdf_job.take() {
+                                self.pdf_finalize(job, cx);
+                            }
+                        } else {
+                            if let Some(job) = &self.pdf_job {
+                                self.notice = if job.full {
+                                    format!(
+                                        "正在印制全书 PDF…（{}/{}）",
+                                        job.pages.len(),
+                                        job.total
+                                    )
+                                } else {
+                                    "正在印制本叶 PDF…".to_string()
+                                };
+                            }
+                            window.request_animation_frame();
+                        }
+                    }
+                } else {
+                    self.pdf_animating = false;
+                }
             }
         }
         let family = fonts::family_for(self.current_font(), self.script);

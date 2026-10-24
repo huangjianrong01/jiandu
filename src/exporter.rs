@@ -371,6 +371,7 @@ mod tests {
             len: 1,
             text: "雎鸠，水鸟也".into(),
             source: crate::types::NoteSource::Original,
+            anchor: None,
         });
         c.paragraphs.push(p);
         b.chapters.push(c);

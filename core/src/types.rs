@@ -174,6 +174,8 @@ pub enum FontChoice {
     LatinModern,
     /// 系统默认
     SystemDefault,
+    /// 齐伋体（明刻本活字风貌，木味古拙，自带古籍刻本气韵；随包静态打包）
+    Qiji,
 
     // —— 旧版遗留：仅为兼容旧存档与内部兜底，UI 已不再陈列 ——
     SongTi,
@@ -197,6 +199,7 @@ impl FontChoice {
             FontChoice::ShangguMono => "尚古等宽",
             FontChoice::LatinModern => "西文数字",
             FontChoice::SystemDefault => "默认字体",
+            FontChoice::Qiji => "齐伋体",
             // 旧版遗留
             FontChoice::SongTi => "宋体",
             FontChoice::SourceHanSerif => "思源宋体",
@@ -212,7 +215,7 @@ impl FontChoice {
     /// 正文字体组（版字页的竖排字牌按此顺序陈列）：
     /// 两款大字库宋体打头，楷体 / 黑体 / 等宽 / 西文随后——一套字体覆盖
     /// 正文、批注、标题、混排西文四类角色，不必再装一堆零散字库。
-    pub const CLASSIC: [FontChoice; 7] = [
+    pub const CLASSIC: [FontChoice; 8] = [
         FontChoice::WenJinMincho,
         FontChoice::MengYuanSerif,
         FontChoice::XuandongKaishu,
@@ -220,6 +223,7 @@ impl FontChoice {
         FontChoice::SourceHanSans,
         FontChoice::ShangguMono,
         FontChoice::LatinModern,
+        FontChoice::Qiji,
     ];
 
     /// **批注字体**组：楷体二选一（玄冬楷书 / 霞鹜文楷）。
@@ -524,6 +528,14 @@ pub struct Note {
     /// 夹注来源：原本注 / 用户注。缺省为原本注，兼容旧书稿（无此字段）。
     #[serde(default)]
     pub source: NoteSource,
+    /// **保存时记下的 charIndex 锚点**（章, 段, 偏移）——朱批录一键跳转
+    /// 凭它定位（与 `HeadNote::key` / `page_anchor()` 同一口径）。
+    ///
+    /// v1.49.0 立：用户新写 / 改写的注文在落盘时由注入点回填；书稿解析
+    /// 出来的原本注没有此字段（`None`），届时按「所在章段 + `at`」兜底
+    /// 推导（见 [`Note::char_index`]）——旧 JSON 因此无需迁移。
+    #[serde(default)]
+    pub anchor: Option<(usize, usize, usize)>,
 }
 
 fn one_len() -> usize {
@@ -539,6 +551,7 @@ impl Note {
             text: text.into(),
             len: 1,
             source: NoteSource::Original,
+            anchor: None,
         }
     }
 
@@ -550,6 +563,7 @@ impl Note {
             text: text.into(),
             len: 1,
             source: NoteSource::User,
+            anchor: None,
         }
     }
 
@@ -561,7 +575,15 @@ impl Note {
             text: text.into(),
             len: len.max(1),
             source: NoteSource::Original,
+            anchor: None,
         }
+    }
+
+    /// 这条注的 **charIndex 锚点**：保存时记的就用记下的；旧注没有记录，
+    /// 按「所在章段 + 段内偏移」推导——与 `page_anchor()` / `HeadNote::key`
+    /// 同一口径，故朱批录跳转、切列数回找都走得通。
+    pub fn char_index(&self, chapter: usize, para: usize) -> (usize, usize, usize) {
+        self.anchor.unwrap_or((chapter, para, self.at))
     }
 }
 
