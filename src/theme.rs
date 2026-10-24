@@ -29,73 +29,42 @@ pub struct PaperTheme {
 
 /// 主题配置表：顺序即面板按钮顺序，下标即 `Theme` 的编号。
 ///
-/// 全系低饱和「中国传统国色」：纸、墨、界行都压一档，正文才立得住。
-/// 原为四套（宣纸 / 米黄 / 青简 / 夜读），v1.22.0 又补四套国色
-/// （鱼肚白 / 竹影绿 / 茶驼色 / 黛蓝笺）——共八色。新增只在此加一行。
+/// **纸色固定四套**（宣纸 / 米黄 / 青简 / 夜读），与「墨色」四套
+/// （墨朱 / 松墨 / 赭朱 / 暗金）一一联动（见 [`Theme::linked_palette`]）。
+/// 每套纸的 `text` / `note` 即联动墨色的浅纸取值，选「墨朱」组时直接取这里。
+/// 新增配色只在此加一行（同时给 `Theme` 加一个变体）。
 pub const PAPER_THEMES: &[PaperTheme] = &[
     PaperTheme {
         id: "xuanzhi",
         name: "宣纸",
         paper: 0xF5F0E6,
-        text: 0x2F3535,
-        note: 0xB23A30,  // 朱砂红
+        text: 0x2F3535,  // 墨朱·正文
+        note: 0xB23A30,  // 墨朱·批注（朱砂红）
         border: 0x2F3535, // 乌丝栏
     },
     PaperTheme {
         id: "mihuang",
         name: "米黄",
         paper: 0xF2E6D0,
-        text: 0x222B2D,
-        note: 0x5C7C7F,
+        text: 0x3D352F,  // 赭朱·正文
+        note: 0xA63F2E,  // 赭朱·批注
         border: 0x4A6B5D, // 绿丝栏
     },
     PaperTheme {
         id: "qingjian",
         name: "青简",
         paper: 0xD8E2DB,
-        text: 0x1A2421,
-        note: 0x6A5A4B,
-        border: 0x1A2421,
+        text: 0x222B2D,  // 松墨·正文
+        note: 0x8C3A3A,  // 松墨·批注
+        border: 0x222B2D,
     },
     PaperTheme {
         id: "yedou",
         name: "夜读",
         paper: 0x1A1C1D,
-        text: 0xDCD6CD, // 月白
-        note: 0xA68E5C, // 秋香
+        text: 0xDCD6CD, // 暗金·正文（月白）
+        note: 0xA68E5C, // 暗金·批注（秋香）
         border: 0x4A4D4F, // 灰丝栏
-    },
-    PaperTheme {
-        id: "yudu",
-        name: "鱼肚白",
-        paper: 0xF7F8F4, // 极简清冷
-        text: 0x2F3535, // 松烟墨
-        note: 0xC0392B,  // 朱红
-        border: 0x8E9596,
-    },
-    PaperTheme {
-        id: "zhuying",
-        name: "竹影绿",
-        paper: 0xDEE4D6, // 幽静禅意
-        text: 0x293326,  // 深墨绿
-        note: 0x9A3B3B,  // 沉朱砂
-        border: 0x65725E,
-    },
-    PaperTheme {
-        id: "chahe",
-        name: "茶驼色",
-        paper: 0xE2D3C3, // 老书岁月
-        text: 0x3D352F,  // 焦墨
-        note: 0xA63F2E,  // 赭红
-        border: 0x7A6859,
-    },
-    PaperTheme {
-        id: "dailan",
-        name: "黛蓝笺",
-        paper: 0xC8D8E4, // 浅灰蓝，婉约高级
-        text: 0x1E2C3A,  // 藏青
-        note: 0x8B3A3A,  // 胭脂红
-        border: 0x566C80,
     },
 ];
 
@@ -136,22 +105,14 @@ pub fn sat(c: u32) -> f32 {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
-    /// 宣纸：米白偏暖，最像常见的影印本。
+    /// 宣纸：米白偏暖，最像常见的影印本（联动「墨朱」）。
     Xuan,
-    /// 米黄：更黄一些，旧书味重。
+    /// 米黄：更黄一些，旧书味重（联动「赭朱」）。
     Mi,
-    /// 青简：青灰纸配竹青界行。
+    /// 青简：青灰纸配竹青界行（联动「松墨」）。
     Qing,
-    /// 夜读：暖调深底。
+    /// 夜读：暖调深底（联动「暗金」）。
     Ye,
-    /// 鱼肚白：极简清冷，低饱和国色（v1.22.0）。
-    YuDu,
-    /// 竹影绿：幽静禅意，低饱和国色。
-    ZhuYing,
-    /// 茶驼色：老书岁月，低饱和国色。
-    ChaHe,
-    /// 黛蓝笺：婉约高级，低饱和国色。
-    DaiLan,
 }
 
 impl Default for Theme {
@@ -162,15 +123,11 @@ impl Default for Theme {
 
 impl Theme {
     /// 顺序必须与 [`PAPER_THEMES`] 完全一致——下标即主题编号。
-    pub const ALL: [Theme; 8] = [
+    pub const ALL: [Theme; 4] = [
         Theme::Xuan,
         Theme::Mi,
         Theme::Qing,
         Theme::Ye,
-        Theme::YuDu,
-        Theme::ZhuYing,
-        Theme::ChaHe,
-        Theme::DaiLan,
     ];
 
     /// 面板上显示的名字（直接取配置表，免得两套名字不同步）。
@@ -185,10 +142,19 @@ impl Theme {
             Theme::Mi => 1,
             Theme::Qing => 2,
             Theme::Ye => 3,
-            Theme::YuDu => 4,
-            Theme::ZhuYing => 5,
-            Theme::ChaHe => 6,
-            Theme::DaiLan => 7,
+        }
+    }
+
+    /// 「纸色 → 墨色」智能联动的默认配对（任务四：一键换肤）。
+    ///
+    /// 宣纸→墨朱、米黄→赭朱、青简→松墨、夜读→暗金；用户随后仍可手动
+    /// 把墨色切到任意一套（手动覆盖默认联动）。
+    pub fn linked_palette(self) -> InkPalette {
+        match self {
+            Theme::Xuan => InkPalette::Ink,
+            Theme::Mi => InkPalette::Ochre,
+            Theme::Qing => InkPalette::Forest,
+            Theme::Ye => InkPalette::Gold,
         }
     }
 
@@ -384,24 +350,20 @@ pub fn mix(a: u32, b: u32, k: f32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// 正文 / 小字注释的配色方案。
+/// 正文 / 小字注释的配色方案（墨色）。固定四套，与纸色一一联动。
 ///
-/// 参照 09 图版字面板里成对的色块：一组两色，前者为正文，后者为小字注释。
-/// 繁体批注取 `note`，通假（借字）取 `gloss`。
+/// 一组两色：**前者为正文（`ink`）、后者为小字注释（`note`）**。
+/// 渲染时正文用 `ink`、夹注 / 句读 / 眉批用 `note`——两者严格分色，
+/// 绝不能正文注文一个色（任务三·生死攸关）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InkPalette {
-    /// 墨黑正文 · 朱红批注 · 靛蓝通假（默认，最接近常见刻本）
+    /// 墨黑正文 · 朱红批注（默认，最接近常见刻本；浅纸直取纸主题 text/note）
     Ink,
-    /// 深墨绿正文 · 砖红批注 · 靛蓝通假（09 图所选）
+    /// 墨绿正文 · 砖红批注（联动青简）
     Forest,
-    /// 赭褐正文 · 朱红批注 · 靛蓝通假
+    /// 赭褐正文 · 朱红批注（联动米黄）
     Ochre,
-    /// 靛青正文 · 靛蓝批注
-    Indigo,
-    /// 紫棠正文 · 洋红批注
-    Plum,
-    /// 暗金正文 · 米白注文（新增的一组：夜读下最靓——金墨配纸色；
-    /// 浅纸下注文自动兑淡为淡金，避免米白隐进纸里）
+    /// 暗金正文 · 米白/金批注（联动夜读；浅纸走暗金，深底走月白+秋香）
     Gold,
 }
 
@@ -412,12 +374,10 @@ impl Default for InkPalette {
 }
 
 impl InkPalette {
-    pub const ALL: [InkPalette; 6] = [
+    pub const ALL: [InkPalette; 4] = [
         InkPalette::Ink,
         InkPalette::Forest,
         InkPalette::Ochre,
-        InkPalette::Indigo,
-        InkPalette::Plum,
         InkPalette::Gold,
     ];
 
@@ -426,84 +386,70 @@ impl InkPalette {
             InkPalette::Ink => "墨朱",
             InkPalette::Forest => "松墨",
             InkPalette::Ochre => "赭朱",
-            InkPalette::Indigo => "靛青",
-            InkPalette::Plum => "紫棠",
             InkPalette::Gold => "暗金",
         }
     }
 
     /// 正文色。夜读（深底）时提亮，避免黑底黑字。
     ///
-    /// **墨朱组（默认）直接取纸主题的正文色**（配置表 `textColor`）——
-    /// 「纸—墨」是一套设计好的搭配，不该再被组内硬编码覆盖；
-    /// 其余墨色组（松墨 / 赭朱 / 靛青 / 紫棠 / 暗金）仍是读者自选的组内配色。
+    /// **墨朱组（默认）直接取纸主题的正文色**（`PAPER_THEMES` 的 `text`）——
+    /// 「纸—墨」是一套设计好的搭配；其余墨色组是读者自选的组内配色。
     pub fn ink(self, t: Theme) -> u32 {
         if matches!(self, InkPalette::Ink) {
             return t.ink();
         }
         if t.is_dark() {
             return match self {
-                InkPalette::Ink => 0xDCCFB8,
-                InkPalette::Forest => 0xBCD3B6,
+                InkPalette::Ink => 0xDCD6CD,
+                InkPalette::Forest => 0xC2D0BC,
                 InkPalette::Ochre => 0xD9C2A2,
-                InkPalette::Indigo => 0xC2D2E6,
-                InkPalette::Plum => 0xDAC2E0,
-                InkPalette::Gold => 0xD9B55F,
+                InkPalette::Gold => 0xDCD6CD, // 月白（深底正文）
             };
         }
         match self {
-            InkPalette::Ink => 0x2A241E,
-            InkPalette::Forest => 0x24402F,
-            InkPalette::Ochre => 0x4A3520,
-            InkPalette::Indigo => 0x233A52,
-            InkPalette::Plum => 0x3E2A46,
-            InkPalette::Gold => 0x7A5C1E,
+            InkPalette::Ink => 0x2F3535,
+            InkPalette::Forest => 0x222B2D,
+            InkPalette::Ochre => 0x3D352F,
+            InkPalette::Gold => 0x7A5C1E, // 暗金（浅纸正文）
         }
     }
 
-    /// 小字注文（繁体、夹注）的颜色：默认组取纸主题的夹注色（`noteColor`），
-    /// 与正文严格分色（见 [`InkPalette::ink`] 的说明）。
+    /// 小字注文（繁体、夹注、句读、眉批）的颜色：默认组取纸主题的夹注色
+    /// （`PAPER_THEMES` 的 `note`），与正文严格分色。
     pub fn note(self, t: Theme) -> u32 {
         if matches!(self, InkPalette::Ink) {
             return t.note();
         }
         if t.is_dark() {
             return match self {
-                InkPalette::Indigo => 0x8FA8D0,
-                InkPalette::Plum => 0xD08AB0,
-                InkPalette::Gold => 0xD79A6B,
-                _ => 0xD08163,
+                InkPalette::Ink => 0xA68E5C,
+                InkPalette::Forest => 0xD08163,
+                InkPalette::Ochre => 0xD08163,
+                InkPalette::Gold => 0xA68E5C, // 秋香（深底批注）
             };
         }
         match self {
-            InkPalette::Ink => 0xA33B2B,
-            InkPalette::Forest => 0xA8442E,
-            InkPalette::Ochre => 0xB23A2E,
-            InkPalette::Indigo => 0x3E5A8A,
-            InkPalette::Plum => 0xB0417A,
-            InkPalette::Gold => 0xAD5A33,
+            InkPalette::Ink => 0xB23A30,
+            InkPalette::Forest => 0x8C3A3A,
+            InkPalette::Ochre => 0xA63F2E,
+            InkPalette::Gold => 0xAD5A33, // 淡金（浅纸批注）
         }
     }
 
-    /// 双行夹注的小字色：**由正文墨色向纸色兑淡一档**（见 `mix`）。
+    /// 双行夹注的小字色：**用 `note` 色向纸色兑淡一档**（见 `mix`）。
     ///
-    /// 刻本里的夹注小字与正文同墨，因字小、墨薄，看上去就是「淡一点」。
-    /// 这里把这件事显式算出来：正文字色按当前纸色明暗自动切换——
-    /// 浅纸 → 墨色向纸兑淡（更浅）；深底 → 墨色向底色沉下去（更沉），
-    /// 永远比正文淡一档，又不淡到看不清。
-    /// 暗金组是唯一定死成对色的：深底下用米白（金墨的绝配），
-    /// 浅纸上米白会隐进纸色，仍走兑淡（得到一枚淡金）。
+    /// 刻本里的夹注小字与正文同墨，因字小、墨薄，看上去就是「淡一点」；
+    /// 但这里刻意让夹注**保持 `note` 的色相**（朱红 / 砖红 / 秋香），
+    /// 只是向纸色沉一档做「薄墨」感——正文纯正文色、夹注纯注文色，
+    /// 两套笔永远不混（任务三）。
     pub fn z_note(self, t: Theme, back: bool) -> u32 {
-        if matches!(self, InkPalette::Gold) && t.is_dark() {
-            return 0xEFE6CE; // 米白
-        }
         // 墨朱组（默认）：双行夹注直接用纸主题的夹注色——进入夹注分支就
-        // 换这支笔（正文 `textColor` / 夹注 `noteColor` 严格分色）。
+        // 换这支笔（正文 `text` / 夹注 `note` 严格分色）。
         if matches!(self, InkPalette::Ink) {
             return t.note();
         }
         let paper = if back { t.paper_back() } else { t.paper() };
-        mix(self.ink(t), paper, Z_NOTE_FADE)
+        mix(self.note(t), paper, Z_NOTE_FADE)
     }
 
     /// 通假（借字）标注色。
@@ -552,23 +498,19 @@ mod tests {
         for p in InkPalette::ALL {
             let ink = p.ink(Theme::Ye);
             let note = p.z_note(Theme::Ye, false);
-            if matches!(p, InkPalette::Gold) {
-                // 暗金组深底走成对色：米白。
-                assert_eq!(note, 0xEFE6CE);
-            } else {
-                assert!(
-                    lum(note) < lum(ink),
-                    "{p:?} 深底夹注应比正文沉：ink={ink:06X} note={note:06X}"
-                );
-            }
+            assert!(
+                lum(note) < lum(ink),
+                "{p:?} 深底夹注应比正文沉：ink={ink:06X} note={note:06X}"
+            );
         }
     }
 
     #[test]
     fn gold_group_pairs_gold_ink_with_off_white_note() {
-        // 新墨色组：深底正文暗金（亮金墨）、夹注米白。
-        assert_eq!(InkPalette::Gold.ink(Theme::Ye), 0xD9B55F);
-        assert_eq!(InkPalette::Gold.z_note(Theme::Ye, false), 0xEFE6CE);
+        // 暗金组：深底正文月白（0xDCD6CD）、批注秋香（0xA68E5C）。
+        assert_eq!(InkPalette::Gold.ink(Theme::Ye), 0xDCD6CD);
+        // 深底夹注 = 0xA68E5C 向夜读深纸兑淡 0.38 档。
+        assert_eq!(InkPalette::Gold.z_note(Theme::Ye, false), 0x716344);
         // 浅纸：正文暗金可读，夹注自动兑淡（淡金，但仍比正文淡）。
         let ink = InkPalette::Gold.ink(Theme::Xuan);
         assert!(lum(ink) < 128.0, "浅纸暗金正文要够深：{ink:06X}");
@@ -576,10 +518,11 @@ mod tests {
     }
 
     #[test]
-    fn eight_paper_themes_are_registered_and_indexed() {
+    fn four_paper_themes_are_registered_and_indexed() {
         // 主题数与配置表严格同长：加一套配色，两边必须同时加。
         assert_eq!(Theme::ALL.len(), PAPER_THEMES.len());
-        assert_eq!(PAPER_THEMES.len(), 8);
+        assert_eq!(PAPER_THEMES.len(), 4);
+        assert_eq!(InkPalette::ALL.len(), 4);
         for (i, t) in Theme::ALL.iter().copied().enumerate() {
             let p = t.paper_theme();
             assert_eq!(t.index(), i, "{:?} 下标错位", t);
@@ -588,10 +531,8 @@ mod tests {
             assert_eq!(t.ink(), p.text);
             assert_eq!(t.note(), p.note);
             assert_eq!(t.rule_ink(), p.border);
-        }
-        // 四套国色都注册了（id 反查得到）。
-        for id in ["yudu", "zhuying", "chahe", "dailan"] {
-            assert_eq!(PaperTheme::by_id(id).id, id);
+            // 纸色与墨色智能联动：每套纸都有默认墨色配对。
+            assert_eq!(t.linked_palette().ink(t), p.text, "{:?} 联动墨色错位", t);
         }
     }
 
@@ -650,19 +591,11 @@ mod tests {
 
     #[test]
     fn paper_themes_are_the_single_source_of_truth() {
-        assert_eq!(PAPER_THEMES.len(), 8);
+        assert_eq!(PAPER_THEMES.len(), 4);
         let ids: Vec<&str> = PAPER_THEMES.iter().map(|p| p.id).collect();
-        assert_eq!(
-            ids,
-            vec![
-                "xuanzhi", "mihuang", "qingjian", "yedou", "yudu", "zhuying", "chahe", "dailan"
-            ]
-        );
+        assert_eq!(ids, vec!["xuanzhi", "mihuang", "qingjian", "yedou"]);
         let names: Vec<&str> = PAPER_THEMES.iter().map(|p| p.name).collect();
-        assert_eq!(
-            names,
-            vec!["宣纸", "米黄", "青简", "夜读", "鱼肚白", "竹影绿", "茶驼色", "黛蓝笺"]
-        );
+        assert_eq!(names, vec!["宣纸", "米黄", "青简", "夜读"]);
         // 四色齐全、互不重复（纸 / 正文 / 夹注 / 界栏）。
         for p in PAPER_THEMES {
             assert!(luma(p.paper) != luma(p.text), "{} 纸与正文同色", p.id);

@@ -37,12 +37,12 @@ pub(crate) const SHARE_BGS: [(u32, u32, u32); 4] = [
     (0xF2EAD6, 0x2B2622, 0x8A8175), // 宣纸
 ];
 
-/// 字书浮签的纸色透明度（v1.42.0）：**0.90**。
+/// 字书浮签的纸色透明度（v1.43.0）：**0.92**。
 ///
-/// 原先是 0.98，几乎不透光，压在正文上像贴了块白板。降到 0.90 之后
+/// 原先是 0.98，几乎不透光，压在正文上像贴了块白板。降到 0.92 之后
 /// 背后的字能**若隐若现**——一张压在书页上的笺本来就该透出底下的字，
-/// 但再低释义就发灰了，故九成为界。
-const WASHI_ALPHA: u32 = 0xE6;
+/// 但再低释义就发灰了，故九二为界。
+const WASHI_ALPHA: u32 = 0xEB;
 
 /// 朱砂红：笺读的落款印泥色（印在分享笺左下角）。
 pub(crate) const CINNABAR: u32 = 0xC3272D;
@@ -116,12 +116,6 @@ pub const HOVER_LOOKUP: std::time::Duration = std::time::Duration::from_millis(5
 /// 眉批字号 = 正文字号 × 此比例。用户定「正文的 40%」：再大就压过正文、
 /// 再小在 Retina 上糊成一团。下限 9px 由渲染处兜住。
 pub const HEAD_NOTE_FS_RATIO: f32 = 0.40;
-/// 眉批墨色：**半透明朱砂** `rgba(178, 58, 48, 0.8)`。
-///
-/// GPUI 0.2.2 的 `rgba` 收单枚 `0xRRGGBBAA`（alpha 在低字节），0.8 ≈ 0xCC。
-/// 半透明而非实色：天头那点纸色透出来，才像毛笔蘸朱砂写上去的，
-/// 而不是贴了一张印刷贴纸。
-pub const HEAD_NOTE_INK: u32 = 0xB23A30CC;
 /// 天头窄于此（px）就不开写：专注模式几乎不留天头，免得点一下就误进输入态。
 pub const HEAD_BAND_MIN: f32 = 10.0;
 /// 眉批排布的另两个常量（`HEAD_NOTE_STEP` / `HEAD_NOTE_V_TOL`）放在
@@ -213,6 +207,86 @@ fn clip_chars(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+/// 康熙/說文原文是一整条**无换行**的长串（`【唐韻】…【集韻】…　又…），
+/// 直接灌进一个 div 就成了「一坨砖」。这里按**书证起手**切段：
+///
+/// 1. 遇 `　`（原书的段间记号 U+3000）即断；
+/// 2. 在【唐韻】【集韻】【說文】等「字书/韵书」起手前断；
+/// 3. 随文的引书（【爾雅】【詩·秦風】之类）**不**单独立段——它们本就是
+///    在解释上一条义项，断开反而碎；
+/// 4. 连续的纯标签孤儿段（`【集韻】` 还没接上正文）并入下一段，免得
+///    `【唐韻】【集韻】` 被拆成两截。
+fn split_zishu_paragraphs(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    const HEADS: [&str; 11] = [
+        "唐韻", "廣韻", "集韻", "韻會", "正韻", "說文", "玉篇", "類篇", "字彙", "正字通",
+        "韻補",
+    ];
+    let chars: Vec<char> = s.chars().collect();
+    let mut segs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\u{3000}' {
+            if !cur.trim().is_empty() {
+                segs.push(cur.trim().to_string());
+            }
+            cur.clear();
+            i += 1;
+            continue;
+        }
+        if c == '【' {
+            let end = chars[i..].iter().position(|&x| x == '】').map(|p| i + p);
+            if let Some(e) = end {
+                let name: String = chars[i + 1..e].iter().collect();
+                if HEADS.iter().any(|h| name.starts_with(h)) && !cur.trim().is_empty() {
+                    segs.push(cur.trim().to_string());
+                    cur.clear();
+                }
+            }
+            cur.push(c);
+            i += 1;
+            continue;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    if !cur.trim().is_empty() {
+        segs.push(cur.trim().to_string());
+    }
+    // 合并纯标签孤儿段（并入紧随其后的那一段）。
+    let mut merged: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for seg in segs {
+        let orphan = seg.starts_with('【')
+            && !seg.contains('。')
+            && !seg.contains('，')
+            && seg.chars().count() <= 10;
+        if orphan {
+            pending.push_str(&seg);
+        } else {
+            let mut s = if pending.is_empty() {
+                seg
+            } else {
+                format!("{pending}{seg}")
+            };
+            pending.clear();
+            merged.push(std::mem::take(&mut s));
+        }
+    }
+    if !pending.is_empty() {
+        if let Some(last) = merged.last_mut() {
+            last.push_str(&pending);
+        } else {
+            merged.push(pending);
+        }
+    }
+    merged
 }
 
 /// **竖排一列**：把一串字自上而下叠成一列（古籍竖排的通用写法）。
@@ -4263,17 +4337,12 @@ impl Root {
             )
     }
 
-    /// 句读墨色（Invariant 3 的颜色一侧）：亮纸上用暗朱砂 / 熟褐
-    /// `#9A3B3B`（用户定「深沉、不要太鲜艳」）；深底主题（夜读等）
-    /// 向纸色提亮一档，否则整粒沉进深纸里看不见。
-    fn punct_ink(&self, back: bool) -> u32 {
-        let t = self.theme;
-        let paper = if back { t.paper_back() } else { t.paper() };
-        if t.is_dark() {
-            crate::theme::mix(crate::punct::PUNCT_INK, paper, 0.45)
-        } else {
-            crate::punct::PUNCT_INK
-        }
+    /// 句读墨色（Invariant 3 的颜色一侧）：**强制用 `palette.note`**——
+    /// 句读标点与夹注、眉批同属「批注语汇」，必须跟正文（`palette.ink`）严格分色，
+    /// 绝不能正文注文一个色（任务三·生死攸关）。`note` 自身已按纸色明暗
+    /// 自动切换（深底提亮、浅纸压深），无需再手算。
+    fn punct_ink(&self, _back: bool) -> u32 {
+        self.palette.note(self.theme)
     }
 
     /// 正文单字格：主字 + 旁注（繁体/通假）+ 句读朱点。
@@ -5012,6 +5081,8 @@ impl Root {
         let fs = (self.size_ancient * HEAD_NOTE_FS_RATIO).max(9.0);
         let lh = fs * 1.06;
         let family = self.note_family();
+        // T3：眉批（天头批注）强制走 note_color，与正文套印分离。
+        let head_ink = (self.palette.note(self.theme) << 8) | 0xCC;
 
         let mut layer = div()
             .absolute()
@@ -5021,7 +5092,7 @@ impl Root {
             .h(px(bh))
             .font_family(family)
             .text_size(px(fs))
-            .text_color(rgba(HEAD_NOTE_INK));
+            .text_color(rgba(head_ink));
 
         for n in self.head_notes.iter() {
             if n.key != key {
@@ -5033,7 +5104,7 @@ impl Root {
                     .absolute()
                     .left(px(x))
                     .top(px(y))
-                    .child(Self::head_note_column(&n.text, fs, lh, None)),
+                    .child(Self::head_note_column(&n.text, fs, lh, None, head_ink)),
             );
         }
 
@@ -5053,7 +5124,7 @@ impl Root {
                             // 输入层：焦点落在此元素上，`InputHandler` 才把
                             // 输入法组好的汉字送回 `note_draft`（见 `ime.rs`）。
                             .child(crate::ime::InputField::new(
-                                Self::head_note_column(&draft, fs, lh, Some(cur)),
+                                Self::head_note_column(&draft, fs, lh, Some(cur), head_ink),
                                 self.note_focus.clone(),
                                 cx.entity(),
                             )),
@@ -5075,12 +5146,12 @@ impl Root {
 
     /// 一列竖排小字（眉批的「字柱」）：逐字换行成列，`cursor` 为 Some 时在
     /// 第 cur 字前插一道朱色细横标（竖排里光标就是字上方的一道横线）。
-    fn head_note_column(text: &str, fs: f32, lh: f32, cursor: Option<usize>) -> Div {
+    fn head_note_column(text: &str, fs: f32, lh: f32, cursor: Option<usize>, ink: u32) -> Div {
         let mut col = div().flex().flex_col().items_center();
         let n = text.chars().count();
         for (i, ch) in text.chars().enumerate() {
             if cursor == Some(i) {
-                col = col.child(div().w(px(fs)).h(px(1.5)).bg(rgba(HEAD_NOTE_INK)));
+                col = col.child(div().w(px(fs)).h(px(1.5)).bg(rgba(ink)));
             }
             col = col.child(
                 div()
@@ -5093,7 +5164,7 @@ impl Root {
         }
         // 光标在串尾：补一道横线，否则末尾看不见落点。
         if cursor == Some(n) {
-            col = col.child(div().w(px(fs)).h(px(1.5)).bg(rgba(HEAD_NOTE_INK)));
+            col = col.child(div().w(px(fs)).h(px(1.5)).bg(rgba(ink)));
         }
         col
     }
@@ -5385,34 +5456,49 @@ impl Root {
             .map(|z| z.word.clone())
             .or_else(|| entry.as_ref().map(|e| e.word.clone()))
             .unwrap_or_else(|| hit.ch.to_string());
-        let pinyin = zishu
-            .as_ref()
-            .filter(|z| !z.pinyin.is_empty())
-            .map(|z| z.pinyin.clone())
-            .or_else(|| entry.as_ref().map(|e| e.pinyin.clone()))
-            .unwrap_or_default();
+        let pinyin = {
+            let raw = zishu
+                .as_ref()
+                .filter(|z| !z.pinyin.is_empty())
+                .map(|z| z.pinyin.clone())
+                .or_else(|| entry.as_ref().map(|e| e.pinyin.clone()))
+                .unwrap_or_default();
+            // 清掉首尾的占位横线/空白：旧字书兜底没拼音时会落下一根孤立的
+            // 「—」破折号，既丑又像拼音的一部分，去掉。
+            let t = raw
+                .trim()
+                .trim_matches(|c| matches!(c, '—' | '–' | '-' | '_' | '|' | '/' | '／' | '　'))
+                .trim();
+            if t.is_empty() {
+                String::new()
+            } else {
+                t.to_string()
+            }
+        };
 
         // ── 横排便签的度量（v1.42.0）────────────────────────────────────
         //
         // 尺寸账的来历（v1.41.0 立、v1.42.0 收紧）：
         //   · 定宽 400 → **336**：一次只摊一部字书（分页之后），卡片就不必
         //     为「康熙 + 說文」两段并排留那么宽；窄一档，正文少糊掉一片。
-        //   · 纸色 α=0.98 → **0.90**（`WASHI_ALPHA`）：背后那行字要**若隐
+        //   · 纸色 α=0.90 → **0.92**（`WASHI_ALPHA`）：背后那行字要更**若隐
         //     若现**，才像一张压在书页上的笺，不像一块白板。
         //   · 按钮行 22 → **18**、字号 11.5 → **11**、钮间距 12 → **9**。
         //   · 三截硬账不变：字头条（含朱丝线）与按钮行固定高，中间正文区
         //     `flex_1 + overflow_y_scroll` 自滚，按钮永在卡内。
-        let pad = 12.0;
+        let pad = 11.0;
         let max_w = 336.0f32.min(vw - 24.0);
         let inner_w = max_w - pad * 2.0 - 2.0; // 扣掉内边距与边框
         let fs = 13.5f32; // 正文（释义）字号
-        let line_h = fs * 1.62; // 行距（同时写进 `line_height`，账实相符）
+        // 行距：v1.42 起是 1.62，本轮再 +20% → 1.944，长串释义不再挤成一坨砖。
+        let line_h = fs * 1.944;
+        let para_gap = 6.5; // 段间留白：在【唐韻】等书证起手前断开，肉眼能分段
         let head_fs = 30.0; // 字头大字
-        let py_fs = 14.0; // 拼音（无衬线，独成一列不跟汉字抢宽度）
+        let py_fs = 13.0; // 拼音（无衬线，独成一列不跟汉字抢宽度）
         let tab_fs = 12.5; // 页签「康熙 / 說文」
         let tab_h = tab_fs * 1.9;
         let head_row_h = head_fs * 1.25;
-        let head_block_h = head_row_h + 7.0; // 字头条 + 朱丝线
+        let head_block_h = head_row_h + 4.0; // 字头条（已去掉压在拼音下的朱丝线）
         let btn_row_h = 18.0;
         let sec_gap = 8.0;
         let max_h = (vh * 0.82).clamp(220.0, 520.0);
@@ -5452,11 +5538,12 @@ impl Root {
                 }
             }
         };
-        let body_show = if body_src.is_empty() {
-            "（本地字書未收，可点「考據原典」上漢典）".to_string()
+        // 把一整条长串切成「书证」小段（【唐韻】…【集韻】…　又…），段前留白，
+        // 不再糊成一坨砖。单页上限四千字，再长也不值得在浮签里读。
+        let paras_all: Vec<String> = if body_src.is_empty() {
+            vec!["（本地字書未收，可点「考據原典」上漢典）".to_string()]
         } else {
-            // 脏数据兜底：单页上限四千字，再长也不值得在浮签里读。
-            clip_chars(&body_src, 4000)
+            split_zishu_paragraphs(&clip_chars(&body_src, 4000))
         };
 
         let lines_of = |s: &str| -> usize {
@@ -5466,30 +5553,56 @@ impl Root {
                 (s.chars().count() + per_line - 1) / per_line
             }
         };
+        // 段间留白折算成「行」计入行预算，避免段多了把卡撑过上限。
+        let gap_lines = (para_gap / line_h).ceil();
         // 正文区在「卡封顶」时能容下多少行（页签与字头条占的地方先扣掉）。
         let body_h_at = |h: f32| -> f32 {
             (h - pad * 2.0 - tab_h - sec_gap - head_block_h - sec_gap * 2.0 - btn_row_h - 2.0)
                 .max(48.0)
         };
-        let mut lines = lines_of(&body_show).max(1);
-        let h_for = |l: usize| -> f32 {
-            pad * 2.0 + tab_h + sec_gap + head_block_h + sec_gap * 2.0 + l as f32 * line_h
-                + btn_row_h
-                + 2.0
-        };
-        if h_for(lines) > max_h {
-            lines = ((body_h_at(max_h) / line_h).floor() as usize).max(3);
+        // 贪心选段：能整段塞进预算就整段塞，塞不下的最后一段按需截断。
+        let avail = ((body_h_at(max_h) / line_h).floor() as f32).max(3.0);
+        let mut chosen: Vec<String> = Vec::new();
+        let mut lines_total: f32 = 0.0;
+        let mut first = true;
+        for p in &paras_all {
+            let l = lines_of(p).max(1) as f32;
+            let add = if first { l } else { l + gap_lines };
+            if lines_total + add <= avail {
+                lines_total += add;
+                chosen.push(p.clone());
+                first = false;
+            } else {
+                let room = (avail - lines_total - if first { 0.0 } else { gap_lines }).floor()
+                    as usize;
+                if room >= 1 {
+                    let seg = clip_chars(p, room * per_line);
+                    if !seg.is_empty() {
+                        chosen.push(seg);
+                        lines_total += room as f32 + if first { 0.0 } else { gap_lines };
+                    }
+                }
+                break;
+            }
         }
-        let body_text = clip_chars(&body_show, lines * per_line);
-        // 定稿高度：按**截断后文本**的估算行数收，而不是按行数预算收——
-        // 照预算收会在按钮上方留出一大块死白，像卡片被截了一刀。
-        let h = h_for(lines_of(&body_text).max(1)).min(max_h);
+        if chosen.is_empty() {
+            chosen.push(clip_chars(&body_src, (avail as usize).max(1) * per_line));
+        }
+        // 定稿高度：按**实际选段**的行预算收（含段间折算），不要硬撑到上限，
+        // 否则按钮上方空出一块死白，像卡片被截了一刀。
+        let h = {
+            let l = lines_total.max(1.0);
+            (pad * 2.0 + tab_h + sec_gap + head_block_h + sec_gap * 2.0 + l * line_h
+                + btn_row_h
+                + 2.0)
+                .min(max_h)
+        };
         let w = max_w;
 
         // ── 卡面配色：宣纸 + 朱砂 + 暖墨 ────────────────────────────────
         //
         // 纸色固定取宣纸白（#F5F0E6）；深底主题下向纸面兑一档，免得夜里弹出
-        // 一块刺眼的亮板。透明度取 `WASHI_ALPHA`（0.90）：**要能看见底下的
+        // 一块刺眼的亮板。透明度取 `WASHI_ALPHA`（0.92）：**要能看见底下的
         // 正文**——压在书页上的笺本来就该透出后面的字，太实就成了白板。
         let paper_hex = if t.is_dark() {
             crate::theme::mix(0xF5F0E6, t.paper(), 0.28)
@@ -5512,6 +5625,12 @@ impl Root {
                 crate::theme::mix(0xF2ECE0, paper_hex, 0.06),
                 crate::theme::mix(0xF2ECE0, paper_hex, 0.16),
             )
+        };
+        // 拼音用深灰（不再用朱砂红）：读音是辅助信息，朱砂太跳会盖过释义。
+        let py_ink = if lum > 128 {
+            crate::theme::mix(0x55514B, paper_hex, 0.08)
+        } else {
+            crate::theme::mix(0xB8B2A8, paper_hex, 0.12)
         };
 
         // ── 智能避让：绕开被查的那个字（有选区则绕开整段选区）─────────
@@ -5556,8 +5675,10 @@ impl Root {
                 let on = which == tab;
                 // 选中的那一签下面压一根朱丝线（GPUI 0.2.2 无 `border_b_1`，
                 // 故用一枚 1px 的细条；未选中的那签让条透明，高度才对齐）。
+                // 选中态：朱砂下划线「强化」——加粗到 1.5px、alpha 提到 0xDC，
+                // 仍属「极细」，但比上一版那种半透明 1px 清楚得多。
                 let rule = if on {
-                    rgba((zhu << 8) | 0xC8)
+                    rgba((zhu << 8) | 0xDC)
                 } else {
                     rgba((zhu << 8) | 0x00)
                 };
@@ -5583,9 +5704,9 @@ impl Root {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(1.0))
+                    .gap(px(2.0))
                     .child(text)
-                    .child(div().w_full().h(px(1.0)).bg(rule));
+                    .child(div().w_full().h(px(1.5)).bg(rule));
                 if !src_empty && !on {
                     slip = slip
                         .cursor_pointer()
@@ -5624,7 +5745,7 @@ impl Root {
                 .font_family(latin_family.clone())
                 .text_size(px(py_fs))
                 .line_height(px(py_fs * 1.35))
-                .text_color(rgb(zhu))
+                .text_color(rgb(py_ink))
                 .whitespace_nowrap()
                 .child(SharedString::from(pinyin.clone()));
             if long {
@@ -5644,21 +5765,38 @@ impl Root {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(4.0))
                     .child(head_glyph)
                     .child(py)
             }
         };
+        // 字头条：纯字头 + 拼音，**不再压一根朱丝线**——那根线正好落在
+        // 拼音下方，看着像「拼音后面多了一条横线符号」，用户要求去掉。
         let head_block = div()
             .w_full()
             .flex_none()
             .flex()
             .flex_col()
-            .gap(px(5.0))
-            .child(py_row)
-            .child(div().w_full().h(px(1.0)).bg(rgba((zhu << 8) | 0x2E)));
+            .gap(px(4.0))
+            .child(py_row);
 
-        // 正文：一段宋体释义，行高写死（与预算同数），超长自滚。
+        // 正文：一段段宋体释义，段间留白；行高写死（与预算同数），超长自滚。
+        let mut body_col = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(para_gap));
+        for p in &chosen {
+            body_col = body_col.child(
+                div()
+                    .w(px(inner_w))
+                    .font_family(main_family.clone())
+                    .text_size(px(fs))
+                    .line_height(px(line_h))
+                    .text_color(rgb(ink_body))
+                    .child(SharedString::from(p.clone())),
+            );
+        }
         let body_area = div()
             .id("jiandu-lookup-body")
             .w_full()
@@ -5666,17 +5804,7 @@ impl Root {
             .min_h(px(0.0))
             .overflow_y_scroll()
             .scrollbar_width(px(3.0))
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .w(px(inner_w))
-                    .font_family(main_family.clone())
-                    .text_size(px(fs))
-                    .line_height(px(line_h))
-                    .text_color(rgb(ink_body))
-                    .child(SharedString::from(body_text)),
-            );
+            .child(body_col);
 
         // ── 底部一行：考據原典 / 拓印 / 檢索 / 收（小字，宋体，紧凑）────
         let zdic = crate::dict::zdic_url(&word);
@@ -8323,48 +8451,35 @@ impl Root {
         let mut row = div().flex().flex_row().flex_wrap().items_start().gap(px(16.0));
         for p in InkPalette::ALL {
             let on = self.palette == p;
+            // 墨色图标：**一枚完整的圆，左半正文色、右半批注色**——像双色
+            // 套印（太极 / 套印的并置），一眼就是「这组墨是正文+批注两色」。
+            let half = |c: u32| {
+                div()
+                    .flex_1()
+                    .h_full()
+                    .bg(rgb(c))
+            };
+            let icon = div()
+                .w(px(20.0))
+                .h(px(20.0))
+                .rounded_full()
+                .overflow_hidden()
+                .flex()
+                .flex_row()
+                .child(half(p.ink(t)))
+                .child(half(p.note(t)))
+                .when(on, |d| d.border_2().border_color(rgb(sheet_zhu(t))))
+                .when(!on, |d| d.border_1().border_color(rgb(t.rule())));
             let chip = div()
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(2.0))
+                .gap(px(3.0))
                 .cursor_pointer()
                 .text_color(rgb(if on { sheet_zhu(t) } else { t.chrome_text() }))
-                .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(3.0))
-                        .child(
-                            div()
-                                .w(px(9.0))
-                                .h(px(9.0))
-                                .rounded_full()
-                                .bg(rgb(p.ink(t))),
-                        )
-                        .child(
-                            div()
-                                .w(px(9.0))
-                                .h(px(9.0))
-                                .rounded_full()
-                                .bg(rgb(p.note(t))),
-                        ),
-                )
+                .hover(|s| if on { s } else { s.text_color(rgb(p.ink(t))) })
+                .child(icon)
                 .child(div().text_size(px(10.5)).child(SharedString::from(p.label())))
-                .child(
-                    div()
-                        .w(px(18.0))
-                        .h(px(1.0))
-                        .flex()
-                        .justify_center()
-                        .child(if on {
-                            hairline(18.0, t.ink())
-                        } else {
-                            div().w(px(0.0)).h(px(1.0))
-                        }),
-                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
@@ -8512,20 +8627,24 @@ impl Root {
         self.persist();
     }
 
-    /// 循环切换纸色主题。
+    /// 循环切换纸色主题（同时联动默认墨色）。
     fn cycle_theme(&mut self) {
         let idx = Theme::ALL.iter().position(|x| *x == self.theme).unwrap_or(0);
         self.theme = Theme::ALL[(idx + 1) % Theme::ALL.len()];
+        self.palette = self.theme.linked_palette();
         self.persist();
     }
 
     /// 切到第 `i` 套纸面主题（配置表 `PAPER_THEMES` 下标）。
-    /// 换纸即重排（纸色变了、夹注兑淡基点也变），随后由调用方 notify 重绘。
+    /// 换纸即重排（纸色变了、夹注兑淡基点也变）；并智能联动墨色——
+    /// 每套纸都有默认墨色配对（宣纸→墨朱 / 米黄→赭朱 / 青简→松墨 /
+    /// 夜读→暗金），一键换肤；用户随后仍可手动把墨色切到任意一套。
     fn set_theme(&mut self, i: usize) {
         let Some(next) = Theme::ALL.get(i).copied() else {
             return;
         };
         self.theme = next;
+        self.palette = next.linked_palette();
         self.fit_sizes();
         self.persist();
     }
