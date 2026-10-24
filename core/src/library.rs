@@ -51,6 +51,11 @@ pub struct ShelfEntry {
     /// 其它值即用户自定的书单名（「自定义书单」页签按它聚合）。
     #[serde(default)]
     pub category: String,
+    /// **章节仓库 id**（v1.50.0 流式架构）：`Some` 表示这本书的正文落在
+    /// `~/.jiandu/chapters.db` 里，开卷时按章取回；`None` 表示老条目
+    /// （正文整本在 json / txt 里），走旧的一次性读取。
+    #[serde(default)]
+    pub store_id: Option<String>,
     /// 注者（校注 / 集注 / 笺注者）；空表示无。
     #[serde(default)]
     pub annotator: String,
@@ -473,6 +478,71 @@ impl Library {
             edition: String::new(),
             chapters: book.chapters.len(),
             chapter_title: String::new(),
+            store_id: None,
+        });
+        self.save();
+        Ok(self.books.len() - 1)
+    }
+
+    /// **流式导入的收尾**（v1.50.0）：后台线程已经把正文逐章落盘，
+    /// 这里只负责「登记入架」——把骨架书稿（含 `store_id`）写成 json，
+    /// 建一条书架条目。
+    ///
+    /// 之所以拆成两步：解析落盘在后台线程（百万字要跑几秒），
+    /// 而 `Library` 归主线程所有，不能跨线程改。
+    pub fn admit_streamed(
+        &mut self,
+        src: &Path,
+        book: &Book,
+        store_id: &str,
+    ) -> Result<usize> {
+        let dir = Self::books_dir();
+        std::fs::create_dir_all(&dir).context("无法创建书架目录")?;
+        let stem = src
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("book")
+            .to_string();
+        let mut dst = dir.join(format!("{stem}.json"));
+        if dst.exists() {
+            let mut n = 2;
+            loop {
+                let cand = dir.join(format!("{stem}-{n}.json"));
+                if !cand.exists() {
+                    dst = cand;
+                    break;
+                }
+                n += 1;
+            }
+        }
+        // 骨架 json：题名 / 目录 / 通假表 / 眉批 + `store_id`，正文不入库
+        // （正文在 `chapters.db` 里，按章取回）。
+        crate::importer::write_book_json(book, &dst)?;
+
+        let accent = if book.cover.accent != 0 {
+            book.cover.accent
+        } else {
+            accent_of(&book.title)
+        };
+        self.books.push(ShelfEntry {
+            path: dst,
+            title: book.title.clone(),
+            author: book.author.clone(),
+            accent,
+            seal: book.cover.seal_or_default(),
+            last_page: 0,
+            total_pages: 0,
+            script: "ancient".into(),
+            duplex: "single".into(),
+            last_read: 0,
+            notes: std::collections::HashMap::new(),
+            underlines: Vec::new(),
+            category: String::new(),
+            annotator: String::new(),
+            edition: String::new(),
+            chapters: book.chapters.len(),
+            chapter_title: String::new(),
+            store_id: Some(store_id.to_string()),
         });
         self.save();
         Ok(self.books.len() - 1)
@@ -628,6 +698,7 @@ pub(crate) mod tests {
             edition: String::new(),
             chapters: 0,
             chapter_title: String::new(),
+            store_id: None,
         }
     }
 

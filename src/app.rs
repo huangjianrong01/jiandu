@@ -226,6 +226,11 @@ pub struct Root {
     pub toc_scroll: ScrollHandle,
     /// 是否需要「滚到当前卷」（每次开目录置一次，滚完即清）。
     pub toc_need_scroll: bool,
+    /// **后台导入任务**（v1.50.0）：不为空表示「正在刻印」。
+    ///
+    /// 百万字的丛书解析要跑几秒，绝不能堵在主线程上；进度与结果都放在
+    /// `Arc<Mutex<…>>` 里，主线程每帧读一次（见 `poll_import`）。
+    pub import_job: Option<ImportJob>,
     /// 目录面板滑入 / 滑出动画进度（0 = 完全收起，1 = 完全展开）。
     pub toc_slide: f32,
     /// 目录动画的目标态（true = 展开）。
@@ -553,6 +558,82 @@ pub struct Root {
     pub shelf_batch_confirm: bool,
 }
 
+/// **后台导入任务**（v1.50.0 流式架构）。
+///
+/// 百万字的丛书（如《资治通鉴》全套）解析 + 清洗 + 落盘要跑好几秒，
+/// 绝不能堵在主线程上——那会连进度条都画不出来。所以真正干活的是
+/// `std::thread::spawn` 出来的那条线程，主线程每帧只来 `take_done()`
+/// 探头看一眼；进度与结果都藏在 `Arc<Mutex<…>>` 里。
+pub struct ImportJob {
+    /// 正在刻印的书名（文件名兜底，此时还不知道真书名）。
+    pub name: String,
+    pct: std::sync::Arc<std::sync::Mutex<f32>>,
+    label: std::sync::Arc<std::sync::Mutex<String>>,
+    done: std::sync::Arc<
+        std::sync::Mutex<Option<std::result::Result<(Book, String, PathBuf), String>>>,
+    >,
+}
+
+impl ImportJob {
+    /// 起一条后台线程：流式解析 → 逐章落盘 → 结果塞进 `done`。
+    pub fn start(path: PathBuf) -> Self {
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("书")
+            .to_string();
+        let pct = std::sync::Arc::new(std::sync::Mutex::new(0.0f32));
+        let label = std::sync::Arc::new(std::sync::Mutex::new("雕版刻印中".to_string()));
+        let done = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+        let p = path.clone();
+        let pct2 = pct.clone();
+        let lab2 = label.clone();
+        let done2 = done.clone();
+        std::thread::spawn(move || {
+            let cb = move |v: f32, s: String| {
+                if let Ok(mut g) = pct2.lock() {
+                    *g = v;
+                }
+                if let Ok(mut g) = lab2.lock() {
+                    *g = s;
+                }
+            };
+            let r = crate::stream::import_streaming(&p, Some(Box::new(cb)))
+                .map(|(book, id)| (book, id, p.clone()))
+                .map_err(|e| e.to_string());
+            if let Ok(mut g) = done2.lock() {
+                *g = Some(r);
+            }
+        });
+
+        Self {
+            name,
+            pct,
+            label,
+            done,
+        }
+    }
+
+    /// 当前进度（0.0~1.0）。
+    pub fn pct(&self) -> f32 {
+        self.pct.lock().map(|g| *g).unwrap_or(0.0)
+    }
+
+    /// 当前进度文案（「雕版刻印中」/「刻版」……）。
+    pub fn label(&self) -> String {
+        self.label
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "雕版刻印中".to_string())
+    }
+
+    /// 取走结果（只可能成功一次；没完成返回 `None`）。
+    pub fn take_done(&self) -> Option<std::result::Result<(Book, String, PathBuf), String>> {
+        self.done.lock().ok().and_then(|mut g| g.take())
+    }
+}
+
 impl Root {
     pub fn new(_cx: &mut Context<Self>) -> Self {
         let mut library = Library::load();
@@ -603,6 +684,7 @@ impl Root {
             show_toc: false,
             toc_scroll: ScrollHandle::new(),
             toc_need_scroll: false,
+            import_job: None,
             toc_slide: 0.0,
             toc_target: false,
             toc_animating: false,
@@ -1863,6 +1945,24 @@ impl Root {
         self.sync_current_chapter();
     }
 
+    /// 取一本书的完整 `Book`（v1.50.0）。
+    ///
+    /// * **虚拟化条目**（`store_id` 有值）：读骨架 json（只有题名与目录），
+    ///   再 `stream::hydrate_all` 按章把正文取回来——正文平时根本不在内存；
+    /// * **老条目**：走旧的一次性导入（json / txt 整本读入）。
+    fn load_book_for(entry: &crate::library::ShelfEntry) -> anyhow::Result<Book> {
+        if let Some(sid) = &entry.store_id {
+            let text = std::fs::read_to_string(&entry.path)?;
+            let mut book: Book = serde_json::from_str(&text)
+                .map_err(|e| anyhow::anyhow!("书稿残损：{e}"))?;
+            book.store_id = Some(sid.clone());
+            book.ensure_toc();
+            crate::stream::hydrate_all(&mut book);
+            return Ok(book);
+        }
+        crate::importer::import_from_path(&entry.path)
+    }
+
     /// 打开书架上第 idx 本书：直接进正文上次读的那一面，并恢复进度与笔记。
     pub fn open_book(&mut self, idx: usize) {
         let Some(entry) = self.library.books.get(idx).cloned() else {
@@ -1870,7 +1970,7 @@ impl Root {
         };
         let nt = entry.notes.clone();
         let ul = entry.underlines.clone();
-        match crate::importer::import_from_path(&entry.path) {
+        match Self::load_book_for(&entry) {
             Ok(mut book) => {
                 book.ensure_toc();
                 self.current = idx;
@@ -2008,28 +2108,110 @@ impl Root {
         };
     }
 
-    /// 把文件导入书架。
+    /// 把文件导入书架（v1.50.0：**后台流式导入**）。
+    ///
+    /// 这里**不解析**——解析交给 `ImportJob` 那条线程（逐章落盘），
+    /// 主线程立刻返回，用户看到的是「雕版刻印中…」。落盘完成后由
+    /// `poll_import` 登记入架。
+    ///
+    /// md / html / json 这些通常不大的格式也走同一条路（流式管线内部对
+    /// 它们仍是「整篇解析 + 逐章落盘」），口径统一，不必维护两套入口。
     pub fn add_import(&mut self, path: PathBuf) {
-        match self.library.import_path(&path) {
-            Ok(i) => {
-                let title = self
-                    .library
-                    .books
-                    .get(i)
-                    .map(|b| b.title.clone())
-                    .unwrap_or_default();
-                self.notice = format!("已上架：{title}");
+        if self.import_job.is_some() {
+            self.notice = "还有一部书正在刻印，请稍候".into();
+            return;
+        }
+        self.notice.clear();
+        self.import_job = Some(ImportJob::start(path));
+    }
+
+    /// 每帧看一眼后台导入：**没完**就继续画进度，**完了**就登记入架。
+    pub fn poll_import(&mut self, cx: &mut Context<Self>) {
+        let Some(job) = self.import_job.take() else {
+            return;
+        };
+        let Some(res) = job.take_done() else {
+            // 没完成：任务放回去，请求下一帧继续刷进度条。
+            self.import_job = Some(job);
+            cx.notify();
+            return;
+        };
+        match res {
+            Ok((book, sid, src)) => {
+                let title = book.title.clone();
+                match self.library.admit_streamed(&src, &book, &sid) {
+                    Ok(_) => self.notice = format!("已上架：{title}"),
+                    Err(e) => self.notice = format!("导入失败：{e}"),
+                }
             }
             Err(e) => {
-                let msg = e.to_string();
-                // JSON 格式错误已是古籍风浮窗文案，原样弹出；其余错误补「导入失败：」。
-                self.notice = if msg.contains("竹简散乱") {
-                    msg
+                // JSON 格式错误已是古籍风浮窗文案，原样弹出；其余补「导入失败：」。
+                self.notice = if e.contains("竹简散乱") {
+                    e
                 } else {
-                    format!("导入失败：{msg}")
+                    format!("导入失败：{e}")
                 };
             }
         }
+        cx.notify();
+    }
+
+    /// 导入进度浮层（v1.50.0）：极简三行——一句「雕版刻印中… 34%」、
+    /// 文件名、一道朱砂细线。不做转圈动画，不做现代进度对话框。
+    fn import_overlay(name: &str, label: &str, pct: f32) -> Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::SongTi,
+            crate::types::Script::Ancient,
+        );
+        let pct_i = (pct * 100.0).round() as i32;
+        let bar_w = 210.0;
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0x14100A55))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(9.0))
+                    .px(px(34.0))
+                    .py(px(24.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(0xF5F0E6))
+                    .child(
+                        div()
+                            .font_family(song.clone())
+                            .text_size(px(15.0))
+                            .text_color(rgb(0x2A241E))
+                            .child(SharedString::from(format!("{label}… {pct_i}%"))),
+                    )
+                    .child(
+                        div()
+                            .font_family(song.clone())
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x9A9184))
+                            .child(SharedString::from(name.to_string())),
+                    )
+                    .child(
+                        div()
+                            .w(px(bar_w))
+                            .h(px(2.0))
+                            .bg(rgb(0xC9BDA6))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(px(bar_w * pct.clamp(0.0, 1.0)))
+                                    .bg(rgb(0xC3272D)),
+                            ),
+                    ),
+            )
     }
 
     /// 从内置书库下载一本书到书架（离线可用：书库随二进制内置）。
@@ -4265,6 +4447,8 @@ impl Render for Root {
         // 藏印只在阅读正文时出现：书架 / 封面是另一套书衣视觉，专注模式要
         // 把整幅纸面还给正文（一枚红印也嫌吵）。
         let show_seal = self.screen == Screen::Reading && !self.focus_mode;
+        // v1.50.0：每帧探一眼后台导入（完成就登记入架，没完成就刷新进度）。
+        self.poll_import(cx);
         let screen = self.render_screen(cx);
         // 开发用：JIANDU_SAVE_SHARE=1 时，分享卡渲染到第 3 帧后自动存一张，
         // 便于核对裁剪区域（前两帧还没上屏，截不到）。
@@ -4300,6 +4484,14 @@ impl Render for Root {
         // 被它整块盖住（第一版就是这样，印根本看不见）。印章只在左下角
         // 一小块，压不到居中的浮层。
         root = root.child(screen);
+        // 「雕版刻印中… 34%」：盖在最上层，导入期间挡住操作，免得重复点导入。
+        let import_ui = self
+            .import_job
+            .as_ref()
+            .map(|j| (j.name.clone(), j.label(), j.pct()));
+        if let Some((name, label, pct)) = import_ui {
+            root = root.child(Self::import_overlay(&name, &label, pct));
+        }
         if show_seal {
             root = root.child(
                 div()

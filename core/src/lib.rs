@@ -27,6 +27,10 @@ pub mod pdf;
 pub mod pipeline;
 pub mod prefs;
 pub mod ruby;
+/// 章节仓库（`store`）与流式导入（`stream`）：v1.50.0 为百万字丛书加的
+/// 「边解析边落盘、按章取回」通道。
+pub mod store;
+pub mod stream;
 pub mod trad;
 pub mod theme;
 pub mod types;

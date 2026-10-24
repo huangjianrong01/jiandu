@@ -769,7 +769,42 @@ pub struct Book {
     /// 换留白档、改列数之后位置自动等比跟随，不用回写存储值。
     #[serde(default)]
     pub head_notes: Vec<HeadNote>,
+    /// **章节仓库 id**（v1.50.0「流式 + 虚拟化」）：百万字的丛书正文
+    /// **不驻内存**——导入时边解析边落盘到 `~/.jiandu/chapters.db`，
+    /// 读书时按章取回、读完即还。`Some(id)` 表示这本书走虚拟化：
+    /// `chapters[i].paragraphs` 平时是空的，正文在库里；
+    /// `None` 表示全书在内存（小书 / 旧 JSON / 导出用）。
+    #[serde(default)]
+    pub store_id: Option<String>,
+    /// 每章字数。骨架模式下 `chapters[i].paragraphs` 为空，
+    /// 进度、跳章偏移、字数统计全靠这张表，不必把正文拉回内存。
+    #[serde(default)]
+    pub chapter_chars: Vec<usize>,
     pub chapters: Vec<Chapter>,
+}
+
+impl Book {
+    /// 这本书是不是「虚拟化」的（正文在库里、不在内存）。
+    pub fn is_virtual(&self) -> bool {
+        self.store_id.is_some()
+    }
+
+    /// 第 i 章**是否已把正文取回内存**。
+    pub fn chapter_loaded(&self, i: usize) -> bool {
+        self.chapters
+            .get(i)
+            .map(|c| !c.paragraphs.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// 卸下一章的正文（把内存还给系统）。章题与目录不动，
+    /// 需要时按 `store_id` + 章号再取回即可。
+    pub fn unload_chapter(&mut self, i: usize) {
+        if let Some(c) = self.chapters.get_mut(i) {
+            c.paragraphs.clear();
+            c.paragraphs.shrink_to_fit();
+        }
+    }
 }
 
 /// 同一处再写一条眉批时**向左挪一列**的距离（占纸面宽的比例）。
@@ -845,11 +880,18 @@ impl Book {
             tongjia: BTreeMap::new(),
             toc: Vec::new(),
             head_notes: Vec::new(),
+            store_id: None,
+            chapter_chars: Vec::new(),
             chapters: Vec::new(),
         }
     }
 
     pub fn total_chars(&self) -> usize {
+        // 骨架模式（正文在库里、chapters 是空壳）：走 `chapter_chars` 账，
+        // **不必**为了数数把百万字正文拉回内存。
+        if !self.chapter_chars.is_empty() && self.chapter_chars.len() == self.chapters.len() {
+            return self.chapter_chars.iter().sum();
+        }
         self.chapters.iter().map(|c| c.char_count()).sum()
     }
 

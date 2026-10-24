@@ -1412,6 +1412,59 @@ pub fn chapters_to_book(fallback_title: &str, author: &str, chapters: Vec<RawCha
     book
 }
 
+/// **单章限长切片**（v1.50.0 流式架构的硬闸门）。
+///
+/// 一章超过 `limit`（5000 字）就切成两章、三章……**只切在段落边界**：
+/// 段是古籍排版的最小完整单位，切开段落会连累段首缩进与夹注的 `offset`
+/// 记账（夹注是挂在段内字偏移上的），故宁可让某一章略超上限，也绝不把
+/// 一段劈成两半。
+///
+/// 续章题名沿用原章名——目录里连续几条同名卷目，正是「卷帙浩繁」的本色，
+/// 比自造「（续一）」这种现代标记干净。
+pub fn split_oversized_chapter(title: &str, paras: Vec<Paragraph>, limit: usize) -> Vec<Chapter> {
+    let limit = limit.max(1);
+    // 先数总字数：不超限就原样返回，连 clone 都不做。
+    let total: usize = paras.iter().map(|p| p.text.chars().count()).sum();
+    if total <= limit {
+        return vec![Chapter {
+            title: title.to_string(),
+            paragraphs: paras,
+        }];
+    }
+    let mut out: Vec<Chapter> = Vec::new();
+    let mut cur: Vec<Paragraph> = Vec::new();
+    let mut n = 0usize;
+    for p in paras {
+        let c = p.text.chars().count();
+        // 手上这章再加这一段就超了 → 先封章，段归下一章。
+        // 单段本身超限（罕见：整段无换行的长文）时也只能整段入章，
+        // 绝不切段（见上：切段会毁掉夹注的 offset）。
+        if n > 0 && n + c > limit {
+            out.push(Chapter {
+                title: title.to_string(),
+                paragraphs: std::mem::take(&mut cur),
+            });
+            n = 0;
+        }
+        n += c;
+        cur.push(p);
+    }
+    if !cur.is_empty() {
+        out.push(Chapter {
+            title: title.to_string(),
+            paragraphs: cur,
+        });
+    }
+    out
+}
+
+/// 无章节的大书**按字数切片**（v1.50.0）：整本没有一条章题时，按 `limit`
+/// 字一刀刀切成等长的卷，免得百万字全压在一章里——那样取回一章就等于
+/// 把整本书拉回内存，虚拟化彻底失效。
+pub fn slice_by_chars(title: &str, paras: Vec<Paragraph>, limit: usize) -> Vec<Chapter> {
+    split_oversized_chapter(title, paras, limit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,7 +30,7 @@ mod zen_kit;
 // UI 层（app / reader / shelf）代码零改动。
 pub use jiandu_core::{
     banxin, content, dict, grid, importer, library, numcn, parsers, pdf, pipeline, prefs, ruby,
-    trad, theme, types, vclean, west,
+    store, stream, trad, theme, types, vclean, west,
 };
 
 use app::Root;

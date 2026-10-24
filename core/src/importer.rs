@@ -10,6 +10,7 @@
 //!   `道〖宇宙万物的本原〗可道`      -> 普通注（圈号注释）
 //!   `不见≪现≫可欲`                 -> 通假标（靛蓝）
 
+use crate::stream::{ChapterSink, MAX_CHAPTER_CHARS};
 use crate::types::{Book, Chapter, Note, NoteKind, Paragraph, TocEntry};
 use anyhow::{anyhow, Context, Result};
 use std::io::Read;
@@ -1256,6 +1257,388 @@ fn html_to_text(html: &str) -> String {
     out
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.50.0 **流式导入**：解析出一章就交给 `ChapterSink`（落盘并释放），
+// 绝不把整本书攒在内存里。以下三个入口与上面那套「攒成 Book 再返回」的
+// 旧入口并存——旧入口给小书 / 导出 / 单测用，新入口给百万字丛书用。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 按扩展名分派的**流式**导入。返回的是骨架 `Book`（只有题名与目录），
+/// 正文已随解析逐章落盘。
+pub fn import_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut book = match ext.as_str() {
+        "txt" | "text" => import_txt_into(path, sink)?,
+        "epub" => import_epub_into(path, sink)?,
+        // md / html / json 一般是单篇或结构化小书：走旧解析（整体读入），
+        // 解析完立刻逐章交出去落盘、随即释放——内存峰值只多出「一份原文」。
+        other => {
+            let full = match other {
+                "md" | "markdown" => import_md(path)?,
+                "html" | "htm" | "xhtml" | "xml" => import_html(path)?,
+                "json" => import_json(path)?,
+                _ => {
+                    return Err(anyhow!(
+                        "不支持的格式：.{other}（支持 md / txt / html / xml / epub / json）"
+                    ))
+                }
+            };
+            let mut skeleton = Book::new(&full.title, &full.author);
+            skeleton.cover = full.cover.clone();
+            skeleton.tongjia = full.tongjia.clone();
+            skeleton.head_notes = full.head_notes.clone();
+            for ch in full.chapters {
+                sink.push(ch);
+            }
+            skeleton
+        }
+    };
+    // 行内夹注标记、前言跳过、目录补齐、书名限长——与旧入口同一套收尾。
+    // 注意此时 `book.chapters` 还是空的（正文在库里），故这几步里凡是
+    // 要读正文的（前言判据）都在 `import_*_into` 内部对着 sink 做过了。
+    skip_front_matter_skeleton(&mut book, sink);
+    book.ensure_toc();
+    book.title = clip_chars(&book.title, 12);
+    if book.cover.title.chars().count() > 12 {
+        book.cover.title = clip_chars(&book.cover.title, 12);
+    }
+    if book.author.chars().count() > 12 {
+        book.author = clip_chars(&book.author, 12);
+    }
+    Ok(book)
+}
+
+/// 骨架书的前言跳过：判据读的是 sink 里的**题名 + 样本**，
+/// 动刀动的是库里的章（不把正文拉回内存）。
+fn skip_front_matter_skeleton(book: &mut Book, sink: &mut dyn ChapterSink) {
+    let titles = sink.titles();
+    if titles.len() <= 1 {
+        return;
+    }
+    let pairs: Vec<(&str, &str)> = titles
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), sink.sample(i)))
+        .collect::<Vec<_>>();
+    // ① 夹在正文中间的散页（书商插的「目录」「书影」）。
+    let stray = crate::parsers::stray_front_indices(&pairs);
+    if !stray.is_empty() {
+        sink.drop_at(&stray);
+    }
+    // ② 卷首那一串连续的前言（题名表重新取一次：上面可能刚砍过散页）。
+    let titles = sink.titles();
+    let pairs: Vec<(&str, &str)> = titles
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), sink.sample(i)))
+        .collect();
+    let cut = crate::parsers::front_matter_cut(&pairs);
+    if cut > 0 && cut < pairs.len() {
+        sink.drop_front(cut);
+    }
+    // ③ 目录条目再按题名扫一道。
+    let mut toc = std::mem::take(&mut book.toc);
+    toc.retain(|e| !crate::parsers::is_front_matter_title(&e.title));
+    book.toc = toc;
+}
+
+/// TXT **流式**导入：按行读（`BufReader::read_until`），绝不整本读进内存。
+///
+/// 编码先探一次头（8KB）：UTF-8 就按 UTF-8，否则按 GBK（老书 txt 多为
+/// GBK）。换行符在两种编码里都不会落在多字节序列中间，故逐行解码安全。
+pub fn import_txt_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> {
+    use std::io::BufRead;
+
+    let utf8 = detect_utf8(path);
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("打开 txt 失败: {}", path.display()))?;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+
+    let fallback = file_stem(path);
+    let mut cur_title: String = "正文".into();
+    let mut paras: Vec<Paragraph> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut done: usize = 0;
+    let mut head: Vec<String> = Vec::new(); // 前几行留着认书名 / 作者
+
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        done += n;
+        // 每读满 256KB 报一次进度（别每汇报一次就打断解析）。
+        if done % (256 * 1024) < n {
+            sink.advance(done, "刻版");
+        }
+        let line = if utf8 {
+            String::from_utf8_lossy(&buf).into_owned()
+        } else {
+            encoding_rs::GBK.decode(&buf).0.into_owned()
+        };
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if head.len() < 6 {
+            head.push(l.to_string());
+        }
+        // 章题：交掉手上的一章，另起一章。
+        if crate::pipeline::is_chapter_head(l) && l.chars().count() <= 40 {
+            if !paras.is_empty() {
+                sink.push(Chapter {
+                    title: cur_title.clone(),
+                    paragraphs: std::mem::take(&mut paras),
+                });
+            }
+            cur_title = l.to_string();
+            continue;
+        }
+        paras.push(crate::pipeline::paragraph_of(l));
+        // **硬上限**：攒够 5000 字就交出去——整本没有一条章题的书（扫描本
+        // 常见）靠这一刀切成等长的卷，绝不会攒成百万字的一章。
+        let acc: usize = paras.iter().map(|p| p.text.chars().count()).sum();
+        if acc >= MAX_CHAPTER_CHARS {
+            sink.push(Chapter {
+                title: cur_title.clone(),
+                paragraphs: std::mem::take(&mut paras),
+            });
+        }
+    }
+    if !paras.is_empty() {
+        sink.push(Chapter {
+            title: cur_title,
+            paragraphs: paras,
+        });
+    }
+    sink.advance(done.max(1), "刻版");
+
+    let (title, author) = detect_title_author(&head.join("\n"));
+    let title = if title.is_empty() {
+        fallback
+    } else {
+        title
+    };
+    let mut book = Book::new(&title, &author);
+    book.cover.title = title.clone();
+    Ok(book)
+}
+
+/// 探一下文件是不是 UTF-8（只看头 8KB，比读全书便宜得多）。
+fn detect_utf8(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return true;
+    };
+    let mut head = vec![0u8; 8192];
+    let Ok(n) = f.read(&mut head) else {
+        return true;
+    };
+    head.truncate(n);
+    if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return true;
+    }
+    std::str::from_utf8(&head).is_ok()
+}
+
+/// EPUB **流式**导入：按 spine 顺序**逐篇**读一个 zip 条目、清洗、切片、
+/// 交 sink 落盘，然后立刻丢掉这一篇——内存里从不存在第二篇。
+///
+/// 与 `import_epub` 同一套工序（vclean 五阶段清洗、nav/ncx 目录润色），
+/// 差别只在「章往哪儿放」：旧的是 `book.chapters.push`，新的是
+/// `sink.push`（落盘即弃）。
+pub fn import_epub_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("打开 epub 失败: {}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(file).context("epub 不是合法的 zip 容器")?;
+
+    let container =
+        read_zip_text(&mut zip, "META-INF/container.xml").context("缺少 META-INF/container.xml")?;
+    let opf_path = find_attr(&container, "full-path")
+        .ok_or_else(|| anyhow!("container.xml 里没有 full-path"))?;
+    let opf = read_zip_text(&mut zip, &opf_path).context("读取 OPF 失败")?;
+    let title = crate::vclean::clean_book_title(
+        &extract_tag_text(&opf, "dc:title").unwrap_or_else(|| file_stem(path)),
+    );
+    let author = extract_tag_text(&opf, "dc:creator").unwrap_or_default();
+
+    let base_dir = {
+        let p = Path::new(&opf_path);
+        p.parent().map(|d| d.to_path_buf()).unwrap_or_default()
+    };
+    let base_prefix = base_dir.to_string_lossy().replace('\\', "/");
+    let join = |href: &str| -> String {
+        if base_prefix.is_empty() {
+            href.to_string()
+        } else {
+            format!("{}/{}", base_prefix, href)
+        }
+    };
+
+    let spine_ids = extract_spine_ids(&opf);
+    let items = extract_items(&opf);
+    let manifest: std::collections::HashMap<String, String> = items
+        .iter()
+        .map(|(id, (href, _, _))| (id.clone(), href.clone()))
+        .collect();
+
+    let mut book = Book::new(title.clone(), author);
+    book.cover.title = title.clone();
+
+    let mut ordered: Vec<String> = Vec::new();
+    for id in &spine_ids {
+        if let Some(href) = manifest.get(id) {
+            ordered.push(join(href));
+        }
+    }
+    if ordered.is_empty() {
+        ordered.extend(items.iter().map(|(_, (h, _, _))| join(h)));
+    }
+
+    let mut file_to_chapter: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let total = ordered.len().max(1);
+    // **书眉去重**（流式版）：旧路径靠 `vclean::purge_running_headers`
+    // 在全书到齐之后横扫一遍删重复段；流式下全书从不同时在场，故改成
+    // **边走边记**：短段的出现次数攒够 3 次，往后见一次删一次（书眉是
+    // 每叶都印的，正文里同一句短话不会连着出现这么多回）。
+    // 只针对 ≤16 字的短段——长段不可能是书眉，绝不误伤正文。
+    let mut header_seen: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    for (fi, raw_href) in ordered.iter().enumerate() {
+        let file_key = normalize_href(raw_href);
+        sink.advance(fi * 1_000_000 / total, "雕版");
+        let Ok(html) = read_zip_text(&mut zip, &file_key) else {
+            continue;
+        };
+        // 逐篇清洗（vclean 五阶段），清洗完 `html` 立刻离开作用域。
+        let subs = crate::vclean::clean_epub(&html);
+        if subs.iter().all(|c| c.content.trim().is_empty()) {
+            continue;
+        }
+        let guessed = extract_html_title(&html).unwrap_or_else(|| {
+            Path::new(&file_key)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("章")
+                .to_string()
+        });
+        let mut first_idx: Option<usize> = None;
+        for c in subs {
+            let t = if c.title == "正文" {
+                guessed.clone()
+            } else {
+                c.title.clone()
+            };
+            let mut chapter = Chapter {
+                title: t,
+                paragraphs: Vec::new(),
+            };
+            for line in c.content.lines() {
+                let l = line.trim();
+                if !l.is_empty() {
+                    chapter.paragraphs.push(crate::pipeline::paragraph_of(l));
+                }
+            }
+            // 书眉：同一句短段见到第 4 回起，直接剔掉（见上 `header_seen`）。
+            chapter.paragraphs.retain(|p| {
+                let t = p.text.trim();
+                if t.chars().count() > 16 {
+                    return true;
+                }
+                let n = header_seen.entry(t.to_string()).or_insert(0);
+                *n += 1;
+                *n <= 3
+            });
+            if !chapter.paragraphs.is_empty() {
+                if first_idx.is_none() {
+                    first_idx = Some(sink.len());
+                }
+                // **交出去**：切片 + 落盘 + 释放，这一章的正文到此为止。
+                sink.push(chapter);
+            }
+        }
+        if let Some(i) = first_idx {
+            file_to_chapter.insert(file_key.clone(), i);
+        }
+    }
+
+    if sink.is_empty() {
+        return Err(anyhow!("epub 中未解析出正文"));
+    }
+
+    // ---- 目录：EPUB3 nav 优先，回退 EPUB2 ncx ----
+    let nav_href = items
+        .iter()
+        .find(|(_, (_, _, props))| props.split_whitespace().any(|p| p == "nav"))
+        .map(|(_, (h, _, _))| join(h));
+    let ncx_href = spine_toc_id(&opf)
+        .and_then(|id| manifest.get(&id).cloned())
+        .map(|h| join(&h))
+        .or_else(|| {
+            items
+                .iter()
+                .find(|(_, (h, mtype, _))| {
+                    mtype.contains("ncx") || h.to_ascii_lowercase().ends_with(".ncx")
+                })
+                .map(|(_, (h, _, _))| join(h))
+        });
+
+    let mut toc: Vec<TocEntry> = Vec::new();
+    if let Some(href) = nav_href {
+        if let Ok(nav) = read_zip_text(&mut zip, &href) {
+            let entries = parse_nav_toc(&nav, &base_prefix);
+            toc = resolve_toc(entries, &file_to_chapter);
+        }
+    }
+    if toc.is_empty() {
+        if let Some(href) = ncx_href {
+            if let Ok(ncx) = read_zip_text(&mut zip, &href) {
+                let entries = parse_ncx_toc(&ncx, &base_prefix);
+                toc = resolve_toc(entries, &file_to_chapter);
+            }
+        }
+    }
+
+    if toc.is_empty() {
+        // 没有目录：题名就用落盘时记下的那些。
+        let titles = sink.titles();
+        toc = titles
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TocEntry {
+                title: t.clone(),
+                chapter: i,
+                level: 1,
+                start_char_index: None,
+            })
+            .collect();
+    } else {
+        // 用目录标题改写库里的章题（正文早已落盘，改的是库里的 title 列）。
+        for e in &toc {
+            if let Some(t) = sink.titles().get(e.chapter).cloned() {
+                if t.trim().is_empty() || looks_like_filename(&t) {
+                    sink.set_title(e.chapter, &e.title);
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for e in &toc {
+            if seen.insert(e.chapter) {
+                sink.set_title(e.chapter, &e.title);
+            }
+        }
+    }
+    book.toc = toc;
+    Ok(book)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
