@@ -1095,61 +1095,29 @@ impl Root {
                             }
                         }
                         if held >= LONG_PRESS {
-                            // 长按查词：**坐标反查**为主，元素命中为辅。
-                            //
-                            // 元素命中（字格自带 `on_mouse_down`）落在格子正中时最准，
-                            // 但点在格子缝隙、夹注旁边、或拖选刚结束那一下，元素不一定
-                            // 命中——那就长按没反应了。故补一条纯几何的路：只用
-                            // (x, y) 反推落在哪一叶哪一列哪一行（`glyph_hit_at`），
-                            // 直接得到 charIndex `(chapter, para, offset)` 与那个
-                            // 字在屏幕上的矩形（浮签避让要用）。
-                            let mut got: Option<(GlyphKey, char, String, Option<(f32, f32, f32, f32)>)> =
-                                None;
-                            if this.touched_glyph && this.sel_char.is_some() {
-                                let key = this.sel_focus.or(this.sel_anchor).unwrap_or((0, 0, 0));
-                                let ch = this.sel_char.unwrap_or(' ');
-                                let text = if this.has_selection() {
-                                    this.selected_text()
-                                } else {
-                                    ch.to_string()
-                                };
-                                got = Some((key, ch, text, None));
-                            }
-                            if got.is_none() {
-                                if let Some(gb) = this.glyph_hit_at(ux, uy) {
-                                    let key = gb.key();
-                                    let ch = gb.glyph.ch;
-                                    // 词组：从命中字起取 4 字交给词典做最长匹配
-                                    // （「长安」成一条词，而不是「长」+「安」）。
-                                    let mut text = this.text_from(key, 4);
-                                    if text.is_empty() {
-                                        text = ch.to_string();
-                                    }
-                                    got = Some((key, ch, text, Some((gb.x, gb.y, gb.w, gb.h))));
-                                }
-                            }
-                            if let Some((key, ch, mut text, rect)) = got {
-                                // 有选区就以选区为准：拖选后长按，查的是选的那段。
-                                if this.has_selection() {
-                                    text = this.selected_text();
-                                }
-                                this.bubble = Some(GlyphHit {
-                                    key,
-                                    ch,
-                                    text: text.clone(),
-                                    x: ux,
-                                    y: uy,
-                                });
-                                // 长按直接呼出「字义浮签」：本地字书释义 + charIndex
-                                // + 选中文本 + 在线查阅，一步到位（复制 / 检索并入
-                                // 浮签底部）。`rect` 是那个字的屏幕矩形——浮签据此
-                                // 避让，绝不把它压在底下。
-                                this.open_lookup(key, ch, text, Some((ux, uy)), rect);
-                                this.dragging = false;
-                                this.popup = None;
-                                cx.notify();
-                                return;
-                            }
+                            // （v1.49.1）长按不再自动查词——与拖选 / 点字一致，只
+                            // 呼出「选词工具条」（横排竖字那一枚），字典交由工具条
+                            // 「查典」按钮呼出。本字或拖选段都认：取当前选区首字。
+                            let key = this.sel_focus.or(this.sel_anchor).unwrap_or((0, 0, 0));
+                            let ch = this.sel_char.unwrap_or(' ');
+                            let text = if this.has_selection() {
+                                this.selected_text()
+                            } else {
+                                ch.to_string()
+                            };
+                            this.popup = Some(GlyphHit {
+                                key,
+                                ch,
+                                text,
+                                x: ux,
+                                y: uy,
+                            });
+                            // 同一时刻只留一层浮签：长按不再开字典，旧字典签先收掉。
+                            this.bubble = None;
+                            this.close_lookup();
+                            this.dragging = false;
+                            cx.notify();
+                            return;
                         }
                         // 是否翻页：碰过正文 / 拖动中 / 位移过大，一律不翻。
                         let fwd = crate::types::tap_turns_page(
@@ -1366,12 +1334,6 @@ impl Root {
         // 且与版框上的书耳、顶栏的「目录」重复——书名与卷目入口都不缺，
         // 只剩一块飘在留白里的牌子碍眼。书耳仍在（左半叶左上角）。
 
-        // 点字弹出的工具条：仅在点击正文某字时出现，点别处自动收起。
-        // 互斥（v1.46.0）：任一顶层面板开着就强制隐藏，防止事件穿透误触。
-        if self.popup.is_some() && !self.any_overlay_open() {
-            root = root.child(self.render_glyph_menu(cx));
-        }
-
         // 开发用：`JIANDU_LOOKUP=1` 时开卷自动对叶面上第一个命中的字开一次
         // 查词浮签——与 `JIANDU_HEAD_NOTE` 同款调试开关，便于核对浮签版式
         // 与避让，不影响正常交互（只在 `bubble` 为空时生效一次）。
@@ -1399,6 +1361,14 @@ impl Root {
         // （`render_head_notes`），不能再压一张浮层卡片上去。
         if self.note_editing && self.head_anchor.is_none() {
             root = root.child(self.render_note_editor(cx));
+        }
+
+        // 选词工具条（横排竖字那一枚）：必须画在**所有阅读浮层之后**——
+        // 即最高 z-index，绝不被字典卡 / 注文卡 / 笔记框盖住（v1.49.1 修复
+        // 「拖选后字典把工具条吃掉、工具条出不来」的根因）。互斥：任一顶层面板
+        // 开着就强制隐藏，防止事件穿透误触。
+        if self.popup.is_some() && !self.any_overlay_open() {
+            root = root.child(self.render_glyph_menu(cx));
         }
 
         root

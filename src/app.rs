@@ -1086,34 +1086,11 @@ impl Root {
                     if g2.key() != key {
                         return;
                     }
-                    if this.note_editing || this.dragging {
-                        return;
-                    }
-                    // 工具条（点字弹的那条）让位：同一时刻只留一层浮签。
-                    if this.popup.is_some() {
-                        this.popup = None;
-                    }
-                    let ch = g2.glyph.ch;
-                    let mut text = this.text_from(key, 4);
-                    if text.is_empty() {
-                        text = ch.to_string();
-                    }
-                    this.bubble = Some(GlyphHit {
-                        key,
-                        ch,
-                        text: text.clone(),
-                        x,
-                        y,
-                    });
-                    this.open_lookup(
-                        key,
-                        ch,
-                        text,
-                        Some((x, y)),
-                        Some((g2.x, g2.y, g2.w, g2.h)),
-                    );
-                    this.hover_card = true;
-                    cx.notify();
+                    // （v1.49.1）自动查词已禁用：拖选 / 点字 / 悬停都不再自动浮出
+                    // 字书浮签——字典只由选词工具条的「查典」按钮呼出，选中文字
+                    // 的逻辑与查词逻辑彻底解耦。悬停仍清掉过期代号（见上方），但
+                    // 绝不在此开签。
+                    return;
                 });
             }
         })
