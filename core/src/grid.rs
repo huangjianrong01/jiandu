@@ -163,7 +163,8 @@ pub struct LayoutConfig {
     /// 每面列数（竖排=竖列数）：8 / 10 / 12 / 14。
     pub columns: usize,
     /// **每列目标字数**（v1.32.0 古版行款）：半叶 `columns` 行、每行
-    /// `target_chars` 字——宋版「半叶八行，行十五字」即 8 列 × 15 字。
+    /// `target_chars` 字——宋版「半叶八行，行十四字」即 8 列 × 14 字
+    /// （v1.48.0 四档锁死：8→14 / 10→20 / 12→22 / 14→26）。
     ///
     /// 这是**神圣不可违**的行款：字号与行高由它反算（`row_h = 可用高 /
     /// target_chars`），排版引擎绝不为了塞满屏幕而拆散每列字数。
@@ -200,30 +201,30 @@ pub const LAYOUT_CONFIGS: &[LayoutConfig] = &[
     LayoutConfig {
         key: "standard8", preset: "song8",
         label: "八行疏朗本", desc: "宋版：字大，行距宽",
-        // 行款：半叶八行，行十五字。
-        columns: 8, target_chars: 15, fs_ratio: 0.82, line_ratio: 1.20,
+        // 行款：半叶八行，行十四字（v1.48.0 用户定调锁死，旧值 15）。
+        columns: 8, target_chars: 14, fs_ratio: 0.82, line_ratio: 1.20,
         dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
     },
     LayoutConfig {
         key: "standard10", preset: "ming10",
         label: "十行经典本", desc: "明版：适中",
-        // 行款：半叶十行，行十九字。
-        columns: 10, target_chars: 19, fs_ratio: 0.80, line_ratio: 1.15,
+        // 行款：半叶十行，行二十字（v1.48.0，旧值 19）。
+        columns: 10, target_chars: 20, fs_ratio: 0.80, line_ratio: 1.15,
         dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
     },
     LayoutConfig {
         key: "standard12", preset: "qing12",
         label: "十二行密排本", desc: "清版：密集",
-        // 行款：半叶十二行，行二十一字。
+        // 行款：半叶十二行，行二十二字（v1.48.0，旧值 21）。
         // v1.31.x：字号比 0.70 → 0.78，让字更贴满字格、呈「字阵」的致密感，
         // 不再显得空旷（列数恒为 12，只调字 / 格比例）。
-        columns: 12, target_chars: 21, fs_ratio: 0.78, line_ratio: 1.10,
+        columns: 12, target_chars: 22, fs_ratio: 0.78, line_ratio: 1.10,
         dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
     },
     LayoutConfig {
         key: "standard14", preset: "letter14",
         label: "十四行信笺本", desc: "信笺：极密",
-        // 行款：半叶十四行，行二十六字。
+        // 行款：半叶十四行，行二十六字（v1.48.0 沿用旧值）。
         columns: 14, target_chars: 26, fs_ratio: 0.72, line_ratio: 1.05,
         dir: GridDir::Vertical, margin: 0.04, show_fish_tail: false,
     },
@@ -1076,9 +1077,11 @@ mod tests {
             free.fs,
             capped.fs
         );
-        // 行款不被上限拆散：封顶只压字号，每列仍是 21 字。
-        assert_eq!(capped.chars_per_col, 21);
-        assert_eq!(free.chars_per_col, 21);
+        // 行款不被上限拆散：封顶只压字号，每列仍是行款锁定的字数
+        // （v1.48.0 起 12 列本 = 22 字；读配置而非写死，防下次调行款又红）。
+        let want_chars = cfg.target_chars;
+        assert_eq!(capped.chars_per_col, want_chars);
+        assert_eq!(free.chars_per_col, want_chars);
     }
 
     #[test]
@@ -1112,17 +1115,18 @@ mod tests {
         // 每列字数神圣：未被兜底时 rows 恒等于 target_chars。
         let (cw, ch) = content();
         // 传无限上限：这一条验的是「算式本身」，不该被 32px 的阅读上限干扰。
+        // 行款取 12 列本的锁定值（v1.48.0：22 字/列）。
         let cfg = GridConfig {
             columns: 12,
-            target_chars: 21,
+            target_chars: 22,
             ..GridConfig::default()
         };
         let m = compute_grid(cw, ch, cfg, false, 1.0, 50.0, 0.0, 12.0, 0.0, f32::INFINITY);
         let inner_w = (cw - 50.0 - 2.0 * cw * 0.04).max(40.0);
-        // ① 行款目标 = 21 字/列，且实实在在排满（行款没被拆）。
-        assert_eq!(m.target_chars, 21);
-        assert_eq!(m.chars_per_col, 21, "行款应排满每列 21 字");
-        assert_eq!(m.rows, 21);
+        // ① 行款目标 = 22 字/列，且实实在在排满（行款没被拆）。
+        assert_eq!(m.target_chars, 22);
+        assert_eq!(m.chars_per_col, 22, "行款应排满每列 22 字");
+        assert_eq!(m.rows, 22);
         // ② 字号 = 行高 × 0.85（字面必须略小于行高，竖排不粘连）。
         assert!((m.fs - m.row_h * FS_OF_ROW).abs() < 0.01, "fs 非 row_h×{FS_OF_ROW}");
         assert!(m.row_h > m.fs, "row_h({}) 必须大于 fs({})", m.row_h, m.fs);

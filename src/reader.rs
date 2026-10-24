@@ -549,9 +549,9 @@ type NoteIndex = HashMap<(usize, usize, usize), usize>;
 /// 早先是两枚 `<rect>` 实心黑块（33×12），既不合刻本形制，视觉上也极
 /// 重；中间一度改用贝塞尔画「燕尾」，画成了圆滚滚的黑桃 / 蝙蝠翅膀。
 /// 现在整枚只有 `M` / `L` / `Z`（`banxin::fishtail_svg`），尺寸由
-/// `banxin::banxin_tail_size` 按「宽不越界栏、高约 1.2 倍行高」算好
-/// 传进来。墨色渲染层给 `#333333` 深灰——黑鱼尾不取纯黑。见
-/// app::ensure_assets。
+/// `banxin::banxin_tail_size` 算好传进来（v1.48.0：宽 = 列宽 × 0.46、
+/// 高 = 0.22 字，凹口 0.76 深——更小更锐）。墨色渲染层给 `#333333`
+/// 深灰——黑鱼尾不取纯黑。见 app::ensure_assets。
 fn banxin_tail(w: f32, h: f32, top: bool, color: u32) -> Div {
     let path = if top {
         "banxin_top.svg"
@@ -767,7 +767,7 @@ fn chapters_ended_at(pages: &[Page], idx: usize) -> Vec<usize> {
 }
 
 /// 葉码用汉字数字：刊本叶码写作「一、二 … 十、十一 … 二十」，不用阿拉伯数字。
-/// 行款信息（状态栏「半叶八行，行十五字」）与兜底提示也借它转汉字。
+/// 行款信息（状态栏「半叶八行，行十四字」）与兜底提示也借它转汉字。
 pub(crate) fn han_num(n: usize) -> String {
     const D: [&str; 10] = ["〇", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
     match n {
@@ -2060,12 +2060,15 @@ impl Root {
         clip_chars(s.trim(), max)
     }
 
-    /// 目录侧栏右栏的**朱批区**（v1.47.0：与目录干净的左右分栏）。
+    /// 目录侧栏右栏的**朱批区**（v1.47.0 左右分栏 · v1.48.0 底色融合）。
     ///
     /// 汇集全书各面上被划过的句子（朱批），摘录原文 + 叶码 + 批注：
     ///   * 摘录一律繁体、竖排折列——竖排首列在右、横排首列在左；
     ///   * 每枚朱批前领一枚空心朱砂小圈，下引一道极细朱线；
     ///   * 点任一条即跳到那一叶。
+    ///
+    /// v1.48.0：空态改竖排小楷「暂无朱批，待君落笔」；栏底与目录面板
+    /// 同一层素宣，两栏只隔一道极细墨线（不再有第二块深浅底 + 生硬分割）。
     #[allow(non_snake_case)]
     fn render_toc_column(
         &self,
@@ -2079,7 +2082,11 @@ impl Root {
         let MOON_DIM: u32 = t.ink_soft();
         let VERMILION: u32 = sheet_zhu(t);
         let LINE: u32 = t.rule();
-        let COL_BG: u32 = crate::theme::mix(t.paper(), 0x000000, 0.05); // 比面板略深的栏底
+        // v1.48.0 视觉融合：朱批栏与目录面板**同一层素宣**（不再是「略深一档」
+        // 的第二块底）——摊开来是一整张纸，两栏之间只留一道极细墨线。
+        let COL_BG: u32 = crate::theme::mix(t.paper(), 0xFFFFFF, 0.05);
+        // 极细墨线：纸色兑 16% 墨——比界行还淡一档，只作「两栏的分宜」。
+        let SEPT: u32 = crate::theme::mix(t.paper(), t.ink(), 0.16);
         // 字体：摘录 / 叶码 / 计数一律走**与正文同款**的书体（宋体），
         // 提示语走楷体——整栏不再有系统默认黑体的现代后台味。
         let song = crate::fonts::family_for(self.current_font(), Script::Ancient);
@@ -2094,21 +2101,6 @@ impl Root {
             .px_3()
             .py_3()
             .overflow_y_scroll();
-
-        // 楷体小字（提示语 / 空态）：GPUI 不自动折行，按每行字数手动折。
-        let kai_lines = |s: &str, per: usize| {
-            let mut d = div().flex().flex_col().gap(px(3.0));
-            for line in wrap_lines(s, per) {
-                d = d.child(
-                    div()
-                        .font_family(kai.clone())
-                        .text_size(px(11.0))
-                        .text_color(rgb(MOON_DIM))
-                        .child(SharedString::from(line)),
-                );
-            }
-            d
-        };
 
         // 划线按「面」聚合：一面上连续划过的字合成一条，便于回看。
         let mut marks: Vec<(usize, String, Option<String>)> = Vec::new();
@@ -2130,11 +2122,32 @@ impl Root {
         }
         let count = marks.len();
         if marks.is_empty() {
-            // 空态：极简楷体小字，一行起、一行承，不摆卡片、不画边框。
-            list = list.child(kai_lines(
-                "尚无朱批。框选正文，点选上方工具之「朱批」，起笔处将落一朱点。",
-                15,
-            ));
+            // 空态（v1.48.0 古风化）：**竖排**小楷「暂无朱批，待君落笔」——
+            // 一字一格自上而下，像天头一句还没落笔的候白；不摆卡片、不画框，
+            // 更不是横排的现代说明书。
+            let mut vcol = div().flex().flex_col().items_center();
+            for c in "暂无朱批，待君落笔".chars() {
+                vcol = vcol.child(
+                    div()
+                        .h(px(17.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .font_family(kai.clone())
+                        .text_size(px(11.5))
+                        .text_color(rgb(MOON_DIM))
+                        .child(SharedString::from(c.to_string())),
+                );
+            }
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_center()
+                    .pt(px(30.0))
+                    .child(vcol),
+            );
         }
         // 摘录：繁体 + 竖排（自右向左成列），字号与正文同源的宋体，
         // 前列右起——与古籍眉批的读序一致。
@@ -2250,8 +2263,9 @@ impl Root {
             .justify_between()
             .px_3()
             .py_2()
+            // 表头与列表之间也只留一道极细墨线（v1.48.0：去生硬分割线）。
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(SEPT))
             .child(
                 div()
                     .font_family(song.clone())
@@ -2264,7 +2278,7 @@ impl Root {
                     .font_family(song.clone())
                     .text_size(px(9.5))
                     .text_color(rgb(MOON_DIM))
-                    .child(SharedString::from("点选可跃")),
+                    .child(SharedString::from("點選可躍")),
             );
 
         let col = div()
@@ -2273,10 +2287,11 @@ impl Root {
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(COL_BG)) // 实色：比面板略深一档，两栏分明
-            // 分栏分隔线永远画在朝目录的左侧（目录恒在左、朱批恒在右）。
+            // v1.48.0：与目录面板同一层素宣——不再是第二块深浅不一的底。
+            .bg(rgb(COL_BG))
+            // 分栏只隔一道极细墨线（目录恒在左、朱批恒在右，线恒画左侧）。
             .border_l_1()
-            .border_color(rgb(LINE));
+            .border_color(rgb(SEPT));
         col.child(head).child(list)
     }
 
@@ -3792,13 +3807,13 @@ impl Root {
     ///
     /// ```text
     ///   上黑口（粗墨一道）
-    ///   上鱼尾（∧ 口朝下）
+    ///   上鱼尾（∧ 口朝下）        ← v1.48.0：中心落在版心高 1/4 处
     ///   书名   宋词三百首     ← 极小号宋体，竖排
     ///   卷次   卷五十一
     ///   篇题   （余量有多少排多少）
     ///          ⋯⋯
     ///   叶码   五十
-    ///   下鱼尾（∨ 口朝上）
+    ///   下鱼尾（∨ 口朝上）        ← v1.48.0：中心落在版心高 3/4 处
     ///   下黑口（粗墨一道）
     /// ```
     ///
@@ -3871,9 +3886,12 @@ impl Root {
         let lay = crate::banxin::layout(crate::banxin::BanxinOpts {
             // 鱼尾与书口字都按**内芯宽**排：不得探出两条细线。
             gutter_w: core_w,
-            // 可用高 = 内芯高 − 上下黑口 − 口下气口；`banxin::layout`
-            // 再扣两枚鱼尾与段间留白，剩下的才是文字。
-            band_h: (core_h - heikou * 2.0 - cell_h * 0.14).max(40.0),
+            // v1.48.0：可用高 = 两枚鱼尾**中心之间**的那段版心（1/4 ↔ 3/4，
+            // 即半幅内芯高 + 一枚鱼尾）——鱼尾挪位后，书口文字的预算跟着
+            // 换成「夹在两枚鱼尾之间」的量，`banxin::layout` 再扣鱼尾与
+            // 段间留白，剩下的才是文字。
+            band_h: (core_h * 0.5 + crate::banxin::banxin_tail_size(core_w, cell_h, self.col_w).1)
+                .max(40.0),
             cell_h,
             // v1.30.0：鱼尾宽按「列宽 × 0.7」取（见 `banxin_tail_size`）。
             col_w: self.col_w,
@@ -3891,8 +3909,13 @@ impl Root {
         // 横笺里也不会退化成黑体。
         let family = crate::fonts::family_for(self.current_font(), Script::Ancient);
         // 版心内芯：全部走**流式布局**（旧版用绝对定位钉线，纸一伸缩就漂）。
-        // 自上而下：上黑口 → 口下气口 → 上鱼尾 → 书名/卷次/篇题 →
-        //          叶码 → 下鱼尾 → 下黑口。
+        // ── v1.48.0：鱼尾不再死贴上下黑口 ──────────────────────────
+        // 收官指令「中心点移至版心高度的 1/4 和 3/4 处」：上鱼尾中心落在
+        // `0.25·core_h`、下鱼尾中心落在 `0.75·core_h`（上下镜像）。算法：
+        // 上黑口 + 定位垫 + 半枚鱼尾 = 0.25·core_h，故垫高 =
+        // `0.25·core_h − heikou − tail_h/2`；下侧同一数值，黑口留在原位
+        // （纸口那道墨不动，动的只是鱼尾）。
+        let pad = (core_h * 0.25 - heikou - lay.tail_h * 0.5).max(2.0);
         let mut col = div()
             .w(px(core_w))
             .h(px(core_h))
@@ -3901,11 +3924,10 @@ impl Root {
             .items_center();
         // 上黑口：紧贴内框细线之内的一道粗墨。
         col = col.child(div().w_full().h(px(heikou)).bg(rgb(t.fish_ink())));
-        // 口下气口：黑口与上鱼尾之间留一成字高，书口才成「黑口 → 鱼尾
-        // → 书名」三层，而不是全糊在口上。
-        col = col.child(div().h(px(cell_h * 0.14)));
+        // 上鱼尾定位垫：把上鱼尾中心推到版心 1/4 处（不再是口下一丁点）。
+        col = col.child(div().h(px(pad)));
         // 上鱼尾：凹口朝下（直线多边形，深灰 `#333333`，见 `banxin_tail`）。
-        // 尺寸由 `banxin::layout` 按「宽不越界栏、高约 1.2 倍行高」算好。
+        // 尺寸由 `banxin::layout` 按「宽不越界栏」算好（v1.48.0 已缩小）。
         col = col.child(banxin_tail(lay.tail_w, lay.tail_h, true, t.fish_ink()));
         col = col.child(div().h(px(lay.gap)));
         // 书名 → 卷次 → 篇题（极小号宋体，一字一格竖排）。每段之间留一道
@@ -3926,6 +3948,8 @@ impl Root {
         col = col.child(div().h(px(lay.gap)));
         // 下鱼尾：∨ 口朝上，与上鱼尾开口相对。
         col = col.child(banxin_tail(lay.tail_w, lay.tail_h, false, t.fish_ink()));
+        // 下鱼尾定位垫：与上侧镜像，下鱼尾中心因此落在版心 3/4 处。
+        col = col.child(div().h(px(pad)));
         // 下黑口：与上黑口对称，压在内框细线之上。
         col = col.child(div().w_full().h(px(heikou)).bg(rgb(t.fish_ink())));
 
@@ -5033,22 +5057,100 @@ impl Root {
             .left(px(0.0))
             .w(px(bw))
             .h(px(bh))
-            .font_family(family)
+            .font_family(&family)
             .text_size(px(fs))
             .text_color(rgba(head_ink));
 
-        for n in self.head_notes.iter() {
+        for (idx, n) in self.head_notes.iter().enumerate() {
             if n.key != key {
                 continue;
             }
-            let (x, y) = Self::head_note_pos(n.u, n.v, n.text.chars().count(), bw, bh, fs, lh);
-            layer = layer.child(
-                div()
-                    .absolute()
-                    .left(px(x))
-                    .top(px(y))
-                    .child(Self::head_note_column(&n.text, fs, lh, None, head_ink)),
+            // v1.48.0：正在改写的那条暂时收起——草稿就地竖排占它的位，
+            // 原文与草稿绝不叠在同一处（`head_edit` 由 commit / cancel 消费）。
+            if self.head_edit == Some(idx) {
+                continue;
+            }
+            let n_chars = n.text.chars().count();
+            let (x, y) = Self::head_note_pos(n.u, n.v, n_chars, bw, bh, fs, lh);
+            // 命中区比字柱略宽：天头批注是小字，给个宽松好点的框。
+            // 点它 = 唤醒管理态（再点一次 = 就地改写），**不是**新建——
+            // 与「点空白起新批」的分野就在这一层（防误触）。
+            let mut note_box = div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(fs * 3.6))
+                .cursor_pointer()
+                .child(Self::head_note_column(&n.text, fs, lh, None, head_ink));
+            // v1.48.0 唤醒态：字柱下方挂一枚**极小古风菜单**——纯文字
+            // 「改 / 删」，无底无框（与现代白框菜单划清界限）；删 朱砂。
+            if self.head_active == Some(idx) {
+                let menu = div()
+                    .w(px(fs * 3.4))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(7.0))
+                    .pt(px(2.0))
+                    .child(
+                        div()
+                            .font_family(family.clone())
+                            .text_size(px(10.5))
+                            .text_color(rgba(((self.palette.note(self.theme) << 8) | 0xAA)))
+                            .cursor_pointer()
+                            .child(SharedString::from("改"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    // 清掉 capture 阶段记下的天头按下，免得
+                                    // 随后那次 mouse-up 又在原地起一条新批。
+                                    this.head_press = None;
+                                    this.press_at = None;
+                                    this.open_head_note_edit(idx);
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font_family(family.clone())
+                            .text_size(px(11.0))
+                            .text_color(rgba(((self.palette.note(self.theme) << 8) | 0xCC)))
+                            .cursor_pointer()
+                            // 「删」不用 ✕（U+2715）：楷书字体多缺此字形，
+                            // 渲染成零宽——按钮看着像丢了（v1.48.0 实测）。
+                            .child(SharedString::from("删"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.head_press = None;
+                                    this.press_at = None;
+                                    this.delete_head_note(idx);
+                                    cx.notify();
+                                }),
+                            ),
+                    );
+                note_box = note_box.child(menu);
+            }
+            note_box = note_box.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    // 吞掉天头「新建」的按下记录：这一下点的是已有眉批。
+                    this.head_press = None;
+                    this.press_at = None;
+                    if this.head_active == Some(idx) {
+                        // 已唤醒 → 再点字柱本身 = 就地改写。
+                        this.open_head_note_edit(idx);
+                    } else {
+                        this.head_active = Some(idx);
+                    }
+                    cx.notify();
+                }),
             );
+            layer = layer.child(note_box);
         }
 
         // 正在写的那条：就地竖排 + 光标，并套 IME 输入层接中文。

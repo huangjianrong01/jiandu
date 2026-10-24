@@ -304,6 +304,14 @@ pub struct Root {
     pub head_anchor: Option<((usize, usize, usize), f32, f32)>,
     /// 按下时是否落在天头里（capture 阶段记下归一化 (u, v)，抬起时开写）。
     pub head_press: Option<(f32, f32)>,
+    /// v1.48.0 眉批管理：当前**唤醒**的眉批下标——点在天头某条朱砂眉批上
+    /// 即置位，该条字柱下方随即挂出一枚极小古风菜单「改 / ✕」；
+    /// 点天头空白处起新批时清零。与「新建」互不冲突（防误触的关键）。
+    pub head_active: Option<usize>,
+    /// v1.48.0 眉批管理：正在**改写**的那条眉批下标（`None` = 新建）。
+    /// 非空时 `commit_note_edit` 走「原位换文」而不是 push 新条；
+    /// 渲染侧据此把原条暂时收起，避免原文与草稿叠在同一处。
+    pub head_edit: Option<usize>,
     /// 浮层笔记框的锚点（窗口坐标）；None 时按视口居中偏上放置。
     pub note_pos: Option<(f32, f32)>,
     /// 刚打开笔记框的这一次点击：抬起时不要立刻「自动保存」把它关掉。
@@ -577,6 +585,8 @@ impl Root {
             head_notes: Vec::new(),
             head_anchor: None,
             head_press: None,
+            head_active: None,
+            head_edit: None,
             note_pos: None,
             note_suppress_commit: false,
             rename_idx: None,
@@ -758,10 +768,23 @@ impl Root {
                 root.underlines.insert(k);
             }
         }
-        // 开发用：直接打开分享面板，便于核对版式 / 底色 / 开关。
-        if std::env::var("JIANDU_SHARE_OPEN").is_ok() {
-            root.show_share_panel = true;
+    // 开发用：直接打开分享面板，便于核对版式 / 底色 / 开关。
+    if std::env::var("JIANDU_SHARE_OPEN").is_ok() {
+        root.show_share_panel = true;
+    }
+    // 开发用：注入两条**纯内存**眉批并唤醒管理菜单（改 / ✕），便于截图
+    // 核对眉批管理交互（v1.48.0）。不回写书稿 JSON；若真的删了它们，
+    // 回写时以内存集合为准——演示数据可随手删净。
+    if std::env::var("JIANDU_HEAD_NOTE").is_ok() {
+        if let Some(key) = root.page_anchor() {
+            root.head_notes
+                .push(crate::types::HeadNote::new(key, 0.30, 0.08, "眉批：與《索隱》異"));
+            root.head_notes
+                .push(crate::types::HeadNote::new(key, 0.30, 0.32, "再批：疑有衍文"));
+            root.head_active = Some(0);
+            root.notice = "眉批演示：点字柱唤醒，再点『改 / ✕』".to_string();
         }
+    }
         // 开发用：指定分享卡版式 / 底色，便于逐项核对。
         if let Ok(v) = std::env::var("JIANDU_SHARE_LAYOUT") {
             root.share_layout = match v.as_str() {
@@ -1618,6 +1641,10 @@ impl Root {
         };
         self.cancel_note_edit();
         self.head_anchor = Some((key, u, v));
+        // v1.48.0：起新批即退出「改写」与「唤醒」态——点空白是新建，
+        // 点已有眉批才是管理（防误触，见 `head_active`）。
+        self.head_edit = None;
+        self.head_active = None;
         self.note_draft.clear();
         self.note_cursor = 0;
         self.note_editing = true;
@@ -1626,6 +1653,42 @@ impl Root {
         self.note_suppress_commit = true;
         self.popup = None;
         self.notice = "眉批：键入后 ⏎ 落笔，Esc 弃".to_string();
+    }
+
+    /// v1.48.0 眉批管理：**就地改写**一条已有眉批（预填草稿，⏎ 原位换文）。
+    ///
+    /// 位置（u/v）原样不动——改写不重新避让，否则 `free_u` 会把自己撞开；
+    /// 原条在编辑期间暂时收起（`head_edit`），草稿就地竖排显示。
+    pub fn open_head_note_edit(&mut self, idx: usize) {
+        let Some(n) = self.head_notes.get(idx).cloned() else {
+            return;
+        };
+        self.cancel_note_edit();
+        self.head_anchor = Some((n.key, n.u, n.v));
+        self.head_edit = Some(idx);
+        self.head_active = None;
+        self.note_draft = n.text.clone();
+        self.note_cursor = n.text.chars().count();
+        self.note_editing = true;
+        self.note_suppress_commit = true;
+        self.popup = None;
+        self.notice = "改眉批：⏎ 落笔，Esc 弃".to_string();
+    }
+
+    /// v1.48.0 眉批管理：**抹掉**一条眉批——数据、书稿 JSON、画布三处同时
+    /// 消失（`persist_book_json` 回写，下次开卷不再有它）。
+    pub fn delete_head_note(&mut self, idx: usize) {
+        if idx >= self.head_notes.len() {
+            return;
+        }
+        self.head_notes.remove(idx);
+        if let Some(book) = self.book.as_mut() {
+            book.head_notes = self.head_notes.clone();
+        }
+        self.persist_book_json();
+        self.head_active = None;
+        self.head_edit = None;
+        self.notice = format!("已抹眉批 · 尚余 {} 条", self.head_notes.len());
     }
 
     /// 存一条天头眉批：同位置已有就**向左挪一列**，挪出左缘绕回右缘；
@@ -1803,6 +1866,9 @@ impl Root {
                 self.head_notes = book.head_notes.clone();
                 self.head_anchor = None;
                 self.head_press = None;
+                // v1.48.0：换书即退出眉批管理 / 改写态（下标是属于上一本书的）。
+                self.head_active = None;
+                self.head_edit = None;
                 // 开发用：JIANDU_HEAD_NOTE=1 会在**第一帧渲染时**自动题两条
                 // 同位置的眉批（第二条自动向左让开一列）——注入点放在
                 // `render_head_notes` 里，因为此刻才有页锚点（开卷那一刻
@@ -2295,6 +2361,9 @@ impl Root {
         self.lookup_at = None;
         self.note_editing = false;
         self.head_anchor = None;
+        // v1.48.0：眉批管理态随浮层一起收（改写态更甚——草稿不跨面板存活）。
+        self.head_edit = None;
+        self.head_active = None;
         self.sel_anchor = None;
         self.sel_focus = None;
         self.note_zoom = None;
@@ -3128,14 +3197,30 @@ impl Root {
     pub fn commit_note_edit(&mut self) {
         // ★ 天头眉批优先：草稿是就地写在天头上的，⏎ 存进 `head_notes`
         //   而不是夹注 / 页眉批注（判断只认 `head_anchor` 一枚开关）。
+        //   v1.48.0：`head_edit` 非空 = 改写已有眉批（原位换文 / 清空即抹）。
         if let Some((key, u, v)) = self.head_anchor.take() {
             let text = std::mem::take(&mut self.note_draft);
+            let edit_idx = self.head_edit.take();
             self.note_editing = false;
             self.note_suppress_commit = false;
             self.note_cursor = 0;
             self.note_pos = None;
             if text.trim().is_empty() {
-                self.notice = "已取消眉批".to_string();
+                // 清空原文 = 抹掉这条（改写写空即删，不留看不见的空条）。
+                if let Some(idx) = edit_idx {
+                    self.delete_head_note(idx);
+                } else {
+                    self.notice = "已取消眉批".to_string();
+                }
+            } else if let Some(idx) = edit_idx.filter(|i| *i < self.head_notes.len()) {
+                if let Some(n) = self.head_notes.get_mut(idx) {
+                    n.text = text;
+                }
+                if let Some(book) = self.book.as_mut() {
+                    book.head_notes = self.head_notes.clone();
+                }
+                self.persist_book_json();
+                self.notice = format!("眉批已改 · 共 {} 条", self.head_notes.len());
             } else {
                 self.push_head_note(key, u, v, text);
             }
@@ -3187,6 +3272,8 @@ impl Root {
         self.note_edit_note = None;
         self.note_inject_key = None;
         self.head_anchor = None;
+        // v1.48.0：放弃改写也退出改写态（否则下一条新批会被当成改写）。
+        self.head_edit = None;
         self.note_draft.clear();
         self.note_cursor = 0;
         self.note_pos = None;
@@ -3908,7 +3995,7 @@ mod tests {
             // 行款字数：按列数查行款表（v1.32.0）。
             target_chars: crate::grid::LayoutConfig::by_columns(columns)
                 .map(|c| c.target_chars)
-                .unwrap_or(21),
+                .unwrap_or(22),
             // 留白默认档「中（75%）」（v1.33.0）。
             banxin_ratio: crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT],
         };
@@ -3931,7 +4018,7 @@ mod tests {
             columns: 8,
             dir: GridDir::Vertical,
             margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
-            target_chars: 15,
+            target_chars: 14,
             banxin_ratio: crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT],
         };
         let m = compute_grid(
@@ -3960,7 +4047,7 @@ mod tests {
             columns: 8,
             dir: GridDir::Vertical,
             margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
-            target_chars: 15,
+            target_chars: 14,
             banxin_ratio: crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT],
         };
         let gap = crate::grid::gutter_w(VW, 8, ANCIENT_EDGE, cfg.margin);
@@ -4025,7 +4112,7 @@ mod tests {
             columns: 8,
             dir: GridDir::Vertical,
             margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
-            target_chars: 15,
+            target_chars: 14,
             banxin_ratio: crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT],
         };
         let m = compute_grid(

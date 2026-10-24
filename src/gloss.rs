@@ -130,6 +130,13 @@ impl Filler {
         self.units = (self.units + 2).min(self.cap);
     }
 
+    /// 撤出若干半格（v1.48.0 禁则撤退专用）：列尾整组后撤时，本列账目
+    /// 同步减少——那组片（正字 + 挂件）已迁往下一列，再记在本列头上
+    /// 会让列高虚涨、后面的注块包围盒整体下移（点注文就点不准）。
+    pub fn rewind(&mut self, units: usize) {
+        self.units = self.units.saturating_sub(units);
+    }
+
     /// 预留顶部若干「行」给卷首题署（书名·卷次 + 署名）独占，
     /// 正文从预留带之下接着排。只扣「半格」账，不改列容量；
     /// 调用方已把预留行数收敛到 ≤ 列容量的一半以内，不会把整列吃空。
@@ -475,6 +482,64 @@ pub fn layout_book_from_opts(
             glyphs.push(*g);
             i += 1;
             continue;
+        }
+        // ── 禁则撤退（v1.48.0）：列满而列尾无可挂挤的正字时，整组后撤 ───
+        // 挤压不成只剩三种情形：列尾是夹注块、是已挤过一枚的 `Hang`
+        // （「。」之后又来个「」」）、或是书名号附着片（︾）。旧行为是
+        // 让句读换列——列顶补一枚 Gap 后它仍算「飞进了下一列」，且平白
+        // 吃掉一格。古版的做法是**本列少排一字**：把列尾那枚正字
+        // （连同挂在它后面的片）整组撤到下一列列首，句读紧随其后落在
+        // 列内第二格——绝不孤零零顶在下一列顶端。
+        //
+        // 行款锁死（8 列 14 字 / 10 列 20 字 / 12 列 22 字 / 14 列 26 字）
+        // 之下这是规则允许的瑕疵：偶见 13 字列，状态栏仍报锁死值
+        // （它读 LayoutConfig，不数实际列内容）。
+        //
+        // 只在本列已满（`room() < 2`）且列内确有正字可撤（`k > 0`，
+        // 正字不在列首——在列首的话句读本就不会顶头）时触发；
+        // 找不到正字（纯注文列）时退回旧行为，绝不硬撤。
+        let retreat_k = if head_bad && !tail_bad && !squeeze && filler.room() < 2 && filler.used() > 0
+        {
+            columns
+                .last()
+                .and_then(|c| c
+                    .iter()
+                    .rposition(|p| matches!(p, Piece::Main(m) if m.kind == GlyphKind::Char)))
+                .filter(|&k| k > 0)
+        } else {
+            None
+        };
+        if let Some(k) = retreat_k {
+            let col = columns.last_mut().unwrap();
+            // `moved[0]` 是宿主正字；其后是挂在它后面的片（Hang / Attach /
+            // Gloss / 缩进占位——注块紧跟宿主字，挤压与书名号也贴在它后面）。
+            let moved: Vec<Piece> = col.split_off(k);
+            for p in &moved {
+                filler.rewind(piece_units(p));
+            }
+            // 读序同步后撤：后撤组里带读序的片（正字 / 挤压标点 / 缩进，
+            // 书名号与夹注不进读序）恰是 `glyphs` 队尾那几枚——成批弹出
+            // 再逆序还原，**不假设队尾一定是宿主字**（组里可能带缩进）。
+            let n_glyphs = moved
+                .iter()
+                .filter(|p| matches!(p, Piece::Main(m) if m.kind != GlyphKind::Attach))
+                .count();
+            let mut tail: Vec<Glyph> = (0..n_glyphs)
+                .map(|_| glyphs.pop().expect("后撤组的字必在读序里"))
+                .collect();
+            tail.reverse();
+            roll_column!();
+            // 回填：按原次序把整组放回新列列首，读序与列内次序都不变。
+            for p in &moved {
+                columns.last_mut().unwrap().push(p.clone());
+                filler.push_cells(piece_units(p));
+            }
+            for tg in tail {
+                glyphs.push(tg);
+            }
+            // **不 `continue`**：句读本体接着走下面的常规落位。新列列首
+            // 是正字，它已不在列顶；`push_main` 放不下时（整组占满新列
+            // 的极端）会自动再换列并走避头让位——那是纯注文列的既有退路。
         }
         // 避尾：本字恰好会填满当前列（成为列底末字）且属避尾类时，提前收列，
         // 让它落下一列列首（开合类标点居列首合规）。仅当前列已有内容才收，
@@ -1979,6 +2044,198 @@ mod tests {
         }
         // 一字不丢：读序里它仍是正文字。
         assert_eq!(pages.iter().map(|p| p.glyphs.len()).sum::<usize>(), flow.len());
+    }
+
+    /// 列尾是**夹注块**时，紧跟的句读不换列顶空、也不飞下一列顶端：
+    /// 整组后撤——宿主字连它的注块一起迁到下一列列首，本列少排一字
+    /// （行款锁死下规则允许的瑕疵），句读落在列内第二格之后。
+    ///
+    /// 布局推演（rows=7 → 每列 14 半格；流前两枚是段首缩进）：
+    ///   列1 = 缩进×2 + 甲乙丙丁戊（14 半格，满）
+    ///   列2 = 己庚辛壬癸子（12）+ 子的夹注（1）= 13，room=1
+    ///   「。」到达：列尾是注块，挤不进 → 后撤
+    ///   列2 剩 己庚辛壬癸（10）；列3 = 子 + 注块 + 。
+    #[test]
+    fn note_tailed_column_retreats_the_group_instead_of_marooning_the_punct() {
+        let mut b = Book::new("撤退", "佚名");
+        b.chapters.push(Chapter {
+            title: "一".into(),
+            paragraphs: vec![Paragraph::plain("甲乙丙丁戊己庚辛壬癸子。丑寅卯辰巳午未申酉")],
+        });
+        let flow = flow_of(&b);
+        // 只给「子」（段内 offset 10）挂一条夹注。
+        let pages = layout_book(
+            &flow,
+            |g| {
+                (g.kind == GlyphKind::Char && g.offset == 10).then(|| {
+                    (
+                        "夹注".to_string(),
+                        NoteSource::Original,
+                        *g,
+                    )
+                })
+            },
+            8,
+            7,
+            0,
+        );
+        let brief = |c: &Vec<Piece>| -> String {
+            c.iter()
+                .map(|p| match p {
+                    Piece::Main(g) if g.is_hang() => format!("⌞{}", g.ch),
+                    Piece::Main(g) => g.ch.to_string(),
+                    Piece::Gap => "·".to_string(),
+                    Piece::Gloss(s, ..) => format!("[{}]", s.chars().count()),
+                })
+                .collect()
+        };
+        let col2 = &pages[0].columns[1];
+        assert_eq!(brief(col2), "己庚辛壬癸", "后撤后本列少排一字：{}", brief(col2));
+        let col3 = &pages[0].columns[2];
+        // 下一列列首是宿主正字，句读绝不孤零零顶在列顶；后撤腾出的
+        // 列容由后续正字接着排（行款照旧锁死）。
+        assert!(
+            brief(col3).starts_with("子[2]。"),
+            "整组后撤 + 句读跟进：{}",
+            brief(col3)
+        );
+        assert!(
+            matches!(col3.first(), Some(Piece::Main(g)) if g.kind == GlyphKind::Char && g.ch == '子'),
+            "列首必须是宿主正字：{}",
+            brief(col3)
+        );
+        // 句读是普通正字格（不再是 Hang——它已不是「第 N 字」）。
+        let dot = col3
+            .iter()
+            .find(|p| matches!(p, Piece::Main(g) if g.ch == '。'))
+            .expect("句读应在后撤组之后");
+        assert!(
+            matches!(dot, Piece::Main(g) if g.kind == GlyphKind::Char),
+            "句读应是跟进的正字格：{}",
+            brief(col3)
+        );
+        // 读序守恒且顺序不变。
+        let flat: Vec<&Glyph> = pages.iter().flat_map(|p| p.glyphs.iter()).collect();
+        assert_eq!(flat.len(), flow.len());
+        for (a, c) in flat.iter().zip(flow.iter()) {
+            assert_eq!((a.chapter, a.para, a.offset, a.ch), (c.chapter, c.para, c.offset, c.ch));
+        }
+        // 任何列不超容。
+        for pg in &pages {
+            for c in &pg.columns {
+                assert!(c.iter().map(piece_units).sum::<usize>() <= 14, "列超容：{}", brief(c));
+            }
+        }
+    }
+
+    /// 连发两枚收束句读（「。」之后又来个「」」）：第一枚挤压进末字，
+    /// 第二枚挤无可挤（同格不许叠两枚）——**整组后撤**：宿主字连第一枚
+    /// 句读一起迁到下一列列首，第二枚跟在组后，绝不飞进下一列顶端。
+    #[test]
+    fn double_punct_retreats_the_group_to_the_next_column() {
+        let mut b = Book::new("连发", "佚名");
+        b.chapters.push(Chapter {
+            title: "一".into(),
+            paragraphs: vec![Paragraph::plain("甲乙丙丁戊己庚辛壬癸子丑。」寅卯辰巳午未申酉")],
+        });
+        let flow = flow_of(&b);
+        // rows=7 → 每列 14 半格；列1 = 缩进×2 + 甲乙丙丁戊，列2 = 己庚辛壬癸子丑。
+        let pages = layout_book(&flow, |_| None, 8, 7, 0);
+        let brief = |c: &Vec<Piece>| -> String {
+            c.iter()
+                .map(|p| match p {
+                    Piece::Main(g) if g.is_hang() => format!("⌞{}", g.ch),
+                    Piece::Main(g) => g.ch.to_string(),
+                    Piece::Gap => "·".to_string(),
+                    Piece::Gloss(s, ..) => format!("[{}]", s.chars().count()),
+                })
+                .collect()
+        };
+        let col2 = &pages[0].columns[1];
+        assert_eq!(brief(col2), "己庚辛壬癸子", "后撤后本列少排一字：{}", brief(col2));
+        let col3 = &pages[0].columns[2];
+        // 宿主字 + 它带着的第一枚挤压句读 + 跟进的新句读，次序即读序；
+        // 后撤腾出的列容由后续正字接着排（行款照旧锁死）。
+        assert!(
+            brief(col3).starts_with("丑⌞。」"),
+            "连发句读整组后撤：{}",
+            brief(col3)
+        );
+        assert!(
+            matches!(col3.first(), Some(Piece::Main(g)) if g.kind == GlyphKind::Char && g.ch == '丑'),
+            "列首必须是宿主正字：{}",
+            brief(col3)
+        );
+        // 一字不丢、顺序不变。
+        let flat: Vec<&Glyph> = pages.iter().flat_map(|p| p.glyphs.iter()).collect();
+        assert_eq!(flat.len(), flow.len());
+        for (a, c) in flat.iter().zip(flow.iter()) {
+            assert_eq!((a.chapter, a.para, a.offset, a.ch), (c.chapter, c.para, c.offset, c.ch));
+        }
+    }
+
+    /// 禁则总检（v1.48.0）：密集标点 + 半数字挂夹注，多种列 / 行配置下——
+    ///   * 任何列的首片不得是避头类标点，也不得是挤压标点（列顶永不顶头）；
+    ///   * 满列且非末列的列尾不得是避尾类标点；
+    ///   * 一字不丢、一序不乱、任何列不超容。
+    /// 覆盖「挤压 / 撤退 / 避尾让位」三条禁则路径的交汇。
+    #[test]
+    fn kinsoku_rules_hold_with_notes_across_layouts() {
+        let text = "道可道，名可名；非常道：「甲乙」。（丙丁）《戊己》『庚辛』——壬癸！\
+子丑？寅卯、辰巳。午未……申酉「戌亥」（子丑）寅卯，辰巳！午未？申酉、戌亥。子丑……";
+        let mut b = Book::new("禁则总检", "佚名");
+        b.chapters.push(Chapter {
+            title: "一".into(),
+            paragraphs: vec![Paragraph::plain(text)],
+        });
+        let flow = flow_of(&b);
+        for cols in [6usize, 8, 10, 12] {
+            for rows in [6usize, 9, 12] {
+                let pages = layout_book(
+                    &flow,
+                    |g| {
+                        (g.kind == GlyphKind::Char && g.offset % 2 == 0)
+                            .then(|| ("夹注夹注".to_string(), NoteSource::Original, *g))
+                    },
+                    cols,
+                    rows,
+                    0,
+                );
+                let flat: Vec<&Glyph> = pages.iter().flat_map(|p| p.glyphs.iter()).collect();
+                assert_eq!(flat.len(), flow.len(), "{cols}x{rows} 禁则丢字");
+                for (a, c) in flat.iter().zip(flow.iter()) {
+                    assert_eq!(
+                        (a.chapter, a.para, a.offset, a.ch),
+                        (c.chapter, c.para, c.offset, c.ch),
+                        "{cols}x{rows} 读序错乱"
+                    );
+                }
+                let cols_all: Vec<&Vec<Piece>> =
+                    pages.iter().flat_map(|p| p.columns.iter()).collect();
+                let last = cols_all.len() - 1;
+                let cap = rows * 2;
+                for (ci, col) in cols_all.iter().enumerate() {
+                    let units: usize = col.iter().map(piece_units).sum();
+                    assert!(units <= cap, "{cols}x{rows} 第{ci}列超容");
+                    if let Some(Piece::Main(g)) = col.first() {
+                        assert!(
+                            !g.is_hang() && !is_head_prohibited(g.ch),
+                            "{cols}x{rows} 第{ci}列列首顶了避头符『{}』",
+                            g.ch
+                        );
+                    }
+                    if units >= cap && ci != last {
+                        if let Some(Piece::Main(g)) = col.last() {
+                            assert!(
+                                !is_tail_prohibited(g.ch),
+                                "{cols}x{rows} 第{ci}列列底落了避尾符『{}』",
+                                g.ch
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ---- Z 字型流转引擎：溢出 / 同页流转 / 跨页 pendingNote ----
