@@ -115,6 +115,30 @@ impl ShelfSort {
     }
 }
 
+/// 顶层 UI 状态机（v1.45.0 交互重构 · 任务一）。
+///
+/// 同一时刻只允许一个「顶层面板」打开（版字 / 检索 / 朱批 / 帮助 / 目录 /
+/// 分享），打开任一面板会强制关闭其它面板与所有底层瞬态浮层（选词工具条、
+/// 字义浮签、天头输入框、选区等）。`None` 表示纯阅读态。`ui_state` 是这些
+/// 分散布尔开关的权威镜像，所有开合都走 [`Root::set_ui_state`]。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AppUIState {
+    /// 纯阅读（无面板）。
+    None,
+    /// 版字（列数 / 字体 / 字级 / 留白 / 纸墨 / 标注）。
+    Style,
+    /// 全文检索。
+    Search,
+    /// 朱批（笔记侧栏）。
+    Notes,
+    /// 帮助。
+    Help,
+    /// 目录（卷目）侧栏。
+    Toc,
+    /// 分享卡片浮层。
+    Share,
+}
+
 pub struct Root {
     pub library: Library,
     pub screen: Screen,
@@ -419,6 +443,8 @@ pub struct Root {
     // ---- 全文检索 ----
     /// 检索面板是否展开。
     pub show_search: bool,
+    /// 顶层 UI 状态机镜像（见 [`AppUIState`]）。
+    pub ui_state: AppUIState,
     /// 检索框草稿与光标（字符下标）。
     pub search_draft: String,
     pub search_cursor: usize,
@@ -602,6 +628,7 @@ impl Root {
             line_modern: 26.0,
             rename_test_done: false,
             show_search: false,
+            ui_state: AppUIState::None,
             search_draft: String::new(),
             search_cursor: 0,
             search_focus: _cx.focus_handle(),
@@ -2259,10 +2286,76 @@ impl Root {
     /// 只设状态、不播动画本身——真正的逐帧推进在 `RootView::render` 里借
     /// `window.request_animation_frame` 完成，所以这里不需要 `window`，
     /// 键盘快捷键、鼠标回调都能直接调用。已展开 / 正在展开则幂等返回。
+    /// 强制收起所有「底层瞬态浮层」：选词工具条、字义浮签、长按气泡、天头
+    /// 输入框、文本选区、夹注菜单、注文放大卡。打开任一顶层面板前调用，杜绝
+    /// 叠层乱弹（v1.45.0 交互重构 · 任务一）。
+    pub fn close_transient_ui(&mut self) {
+        self.popup = None;
+        self.bubble = None;
+        self.lookup_at = None;
+        self.note_editing = false;
+        self.head_anchor = None;
+        self.sel_anchor = None;
+        self.sel_focus = None;
+        self.note_zoom = None;
+        self.note_menu = None;
+        self.dragging = false;
+        self.hover_card = false;
+    }
+
+    /// 全局 UI 状态机：同一时刻只开一个顶层面板，并强制关闭所有底层瞬态浮层。
+    /// 再点同一个已开面板 = 收起（`None`）。所有顶栏按钮 / 快捷键的开合都应
+    /// 走这里，保证互斥一致（v1.45.0 交互重构 · 任务一）。
+    pub fn set_ui_state(&mut self, s: AppUIState) {
+        // 以「当前该面板是否真的开着」决定切换：避免其它路径（点面板内关闭
+        // 钮、快捷键等）关掉面板后 `ui_state` 失同步，导致再点同一钮开不了。
+        let on = match s {
+            AppUIState::Style => self.show_style,
+            AppUIState::Search => self.show_search,
+            AppUIState::Notes => self.show_notes_panel,
+            AppUIState::Help => self.show_help,
+            AppUIState::Toc => self.show_toc,
+            AppUIState::Share => self.show_share_panel,
+            AppUIState::None => false,
+        };
+        let s = if on { AppUIState::None } else { s };
+        self.ui_state = s;
+        self.show_style = matches!(s, AppUIState::Style);
+        self.show_search = matches!(s, AppUIState::Search);
+        self.show_notes_panel = matches!(s, AppUIState::Notes);
+        self.show_help = matches!(s, AppUIState::Help);
+        self.show_toc = matches!(s, AppUIState::Toc);
+        self.show_share_panel = matches!(s, AppUIState::Share);
+        if !self.show_search {
+            self.clear_search();
+        }
+        self.close_transient_ui();
+    }
+
+    /// 是否有任一顶层面板 / 浮层开着——用于选词工具条等瞬态浮签的**互斥隐藏**
+    /// （打开『版字』/『目录』等顶部面板时，强制收起选词工具条，防事件穿透误触）。
+    pub fn any_overlay_open(&self) -> bool {
+        self.show_style
+            || self.show_toc
+            || self.show_search
+            || self.show_notes_panel
+            || self.show_help
+            || self.show_share_panel
+            || self.show_library
+    }
+
     pub fn open_toc(&mut self) {
         if self.show_toc && self.toc_target {
             return;
         }
+        // 互斥：开目录前收起其它顶层面板与底层瞬态浮层。
+        self.show_style = false;
+        self.show_search = false;
+        self.show_notes_panel = false;
+        self.show_help = false;
+        self.show_share_panel = false;
+        self.ui_state = AppUIState::Toc;
+        self.close_transient_ui();
         self.show_toc = true;
         self.toc_target = true;
         self.toc_animating = true;
@@ -2284,6 +2377,7 @@ impl Root {
         }
         self.toc_target = false;
         self.toc_animating = true;
+        self.ui_state = AppUIState::None;
         // 极端情况：侧栏可见但 slide 已为 0（不应发生），直接收。
         if self.toc_slide <= 0.0 {
             self.show_toc = false;

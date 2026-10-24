@@ -7,7 +7,7 @@
 //!   * 段落分隔 —— 段首空两格（首行缩进），不再放置任何段落标记符。
 
 use crate::app::{
-    Root, Screen, ANCIENT_EDGE, ANCIENT_TITLE_COL,
+    AppUIState, Root, Screen, ANCIENT_EDGE, ANCIENT_TITLE_COL,
 };
 use crate::dict;
 use crate::gloss::{Page, Piece};
@@ -450,13 +450,13 @@ fn zhu_dashed(w: f32, color: u32) -> Div {
 /// （原来那枚灰底「关闭」按钮，是面板里最像网页控件的一颗。）
 fn panel_close(t: Theme) -> Div {
     div()
-        .px(px(2.0))
+        .px(px(5.0))
         .py(px(2.0))
         .cursor_pointer()
-        .text_size(px(10.5))
+        .text_size(px(14.0))
         .text_color(rgb(t.ink_soft()))
         .hover(|s| s.text_color(rgb(sheet_zhu(t))))
-        .child(SharedString::from("收起"))
+        .child(SharedString::from("✕"))
 }
 
 /// 面板的**选项文字**：整块面板的基本单位。
@@ -1408,7 +1408,8 @@ impl Root {
         // 只剩一块飘在留白里的牌子碍眼。书耳仍在（左半叶左上角）。
 
         // 点字弹出的工具条：仅在点击正文某字时出现，点别处自动收起。
-        if self.popup.is_some() {
+        // 互斥（v1.46.0）：任一顶层面板开着就强制隐藏，防止事件穿透误触。
+        if self.popup.is_some() && !self.any_overlay_open() {
             root = root.child(self.render_glyph_menu(cx));
         }
 
@@ -1653,10 +1654,9 @@ impl Root {
                                 self.show_rare = !self.show_rare;
                                 cx.notify();
                             }
-                            // 版字面板：⌘E（同时收起目录 / 帮助）。
+                            // 版字面板：⌘E（走全局状态机：开版字即关其它面板与浮层）。
                             "e" | "E" => {
-                                self.show_help = false;
-                                self.show_style = !self.show_style;
+                                self.set_ui_state(AppUIState::Style);
                                 cx.notify();
                             }
                             // 目录：⌘L（同时收起样式 / 帮助）。
@@ -1698,23 +1698,25 @@ impl Root {
                                 self.popup = None;
                                 cx.notify();
                             }
-                            // 专注模式：⌘Z（同时收起样式 / 目录 / 帮助）。
+                            // 专注模式：⌘Z（收起样式 / 目录 / 帮助，进入时清底层浮层）。
                             "z" | "Z" => {
                                 self.focus_mode = !self.focus_mode;
                                 self.show_style = false;
                                 self.close_toc();
                                 self.show_help = false;
+                                if self.focus_mode {
+                                    self.close_transient_ui();
+                                }
                                 cx.notify();
                             }
-                            // 笔记面板（侧栏）：⌘K。
+                            // 笔记面板（侧栏）：⌘K（走全局状态机）。
                             "k" | "K" => {
-                                self.show_notes_panel = !self.show_notes_panel;
-                                self.note_editing = false;
+                                self.set_ui_state(AppUIState::Notes);
                                 cx.notify();
                             }
-                            // 帮助：⌘/。
+                            // 帮助：⌘/（走全局状态机）。
                             "/" => {
-                                self.show_help = !self.show_help;
+                                self.set_ui_state(AppUIState::Help);
                                 cx.notify();
                             }
                             // 划线：⌘U。有选区划选区；无选区划本页第一个正文字。
@@ -1797,19 +1799,22 @@ impl Root {
         col
     }
 
+    #[allow(non_snake_case)]
     fn render_toc_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let vw = self.viewport_w;
         let vh = self.viewport_h;
         let Some(book) = self.book.as_ref() else {
             return div();
         };
-        // 古风夜色面板配色：深靛底 + 月白字 + 朱砂当前章，三色压出一档层次。
-        const PANEL_BG: u32 = 0x1E2A3C;
-        const PANEL_BG2: u32 = 0x223146; // 略浅的底，用于表头 / 当前竹简条
-        const MOON: u32 = 0xE8EEF2; // 月白：章名字色
-        const MOON_DIM: u32 = 0x9FB0C4; // 月白兑暗：小字 / 叶码 / 提示
-        const VERMILION: u32 = 0xD0634E; // 朱砂红：当前章 / 标记
-        const LINE: u32 = 0x33445C; // 分隔线
+        // 面板配色（v1.46.0）：半透明宣纸底 + 墨字 + 朱砂当前章——与纸面同调，
+        // 不再用深靛夜色（那套压在和纸阅读界里太跳）。
+        let t = self.theme;
+        let PANEL_BG: u32 = t.paper();
+        let PANEL_BG2: u32 = crate::theme::mix(t.paper(), 0xFFFFFF, 0.06); // 表头 / 当前条
+        let MOON: u32 = t.ink(); // 章名字色
+        let MOON_DIM: u32 = t.ink_soft(); // 小字 / 叶码 / 提示
+        let VERMILION: u32 = sheet_zhu(t); // 朱砂红：当前章 / 标记
+        let LINE: u32 = t.rule(); // 分隔线
         let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
 
         // 目录条目先克隆出来：后面要用 &mut self 构建侧栏（划线跳页），
@@ -1837,8 +1842,8 @@ impl Root {
         // 当前章：用后台悄悄对齐好的 current_chapter，目录朱砂红点落在准确卷目上。
         let cur_chapter = self.current_chapter;
 
-        // 侧栏宽度：占视口 82%、上限 520、下限 280；满高抽屉。
-        let panel_w = (vw * 0.82).min(520.0).max(280.0);
+        // 侧栏宽度：占视口 37%、上限 400、下限 260——窄侧栏，留住 0.618 正文视野。
+        let panel_w = (vw * 0.37).min(400.0).max(260.0);
         let head_h = 52.0;
         let strip_h = (vh - head_h).max(160.0);
 
@@ -2022,7 +2027,7 @@ impl Root {
                 .justify_between()
                 .h(px(head_h))
                 .px_4()
-                .bg(rgb(PANEL_BG2))
+                .bg(rgba((PANEL_BG2 << 8) | 0xEC))
                 .border_b_1()
                 .border_color(rgb(LINE))
                 .child(meta)
@@ -2043,7 +2048,7 @@ impl Root {
                 .justify_between()
                 .h(px(head_h))
                 .px_4()
-                .bg(rgb(PANEL_BG2))
+                .bg(rgba((PANEL_BG2 << 8) | 0xEC))
                 .border_b_1()
                 .border_color(rgb(LINE))
                 .child(
@@ -2082,7 +2087,7 @@ impl Root {
             .w(px(panel_w))
             .flex()
             .flex_col()
-            .bg(rgb(PANEL_BG))
+            .bg(rgba((PANEL_BG << 8) | 0xEC))
             .border_l_1()
             .border_color(rgb(LINE))
             .overflow_hidden()
@@ -2133,6 +2138,7 @@ impl Root {
     ///   * 竖排（从右到左）：目录条在最左，划线栏紧贴其右；
     ///   * 横排（从左到右）：镜像——划线栏在最左，目录条在其右。
     /// 点任一条即跳到那一叶。
+    #[allow(non_snake_case)]
     fn render_toc_column(
         &self,
         pages: &[Vec<Glyph>],
@@ -2140,12 +2146,12 @@ impl Root {
         w: f32,
         cx: &mut Context<Self>,
     ) -> Div {
-        const MOON: u32 = 0xE8EEF2;
-        const MOON_DIM: u32 = 0x9FB0C4;
-        const VERMILION: u32 = 0xD0634E;
-        const LINE: u32 = 0x33445C;
-        const COL_BG: u32 = 0x18222F; // 比面板更深的栏底，拉开层次
-
+        let t = self.theme;
+        let MOON: u32 = t.ink();
+        let MOON_DIM: u32 = t.ink_soft();
+        let VERMILION: u32 = sheet_zhu(t);
+        let LINE: u32 = t.rule();
+        let COL_BG: u32 = crate::theme::mix(t.paper(), 0x000000, 0.05); // 比面板略深的栏底
         // 字体：摘录 / 叶码 / 计数一律走**与正文同款**的书体（宋体），
         // 提示语走楷体——整栏不再有系统默认黑体的现代后台味。
         let song = crate::fonts::family_for(self.current_font(), Script::Ancient);
@@ -2339,7 +2345,7 @@ impl Root {
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(COL_BG));
+            .bg(rgba((COL_BG << 8) | 0xEC));
         // 朝目录的一侧画分隔线：竖排（栏在目录右侧）画左边，横排（栏在目录左侧）画右边。
         col = if rtl {
             col.border_l_1().border_color(rgb(LINE))
@@ -2415,6 +2421,7 @@ impl Root {
         left = left.child(item("书阁", false).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
                 this.back_to_shelf();
                 cx.notify();
             }),
@@ -2423,6 +2430,7 @@ impl Root {
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 // 展开 / 收起侧栏（带滑入滑出动画）。
+                cx.stop_propagation();
                 if this.show_toc {
                     this.close_toc();
                 } else {
@@ -2443,14 +2451,19 @@ impl Root {
         mid = mid.child(item("版字", self.show_style).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
-                this.show_style = !this.show_style;
+                cx.stop_propagation();
+                this.set_ui_state(AppUIState::Style);
                 cx.notify();
             }),
         ));
         mid = mid.child(item("专注", false).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
                 this.focus_mode = !this.focus_mode;
+                if this.focus_mode {
+                    this.close_transient_ui();
+                }
                 cx.notify();
             }),
         ));
@@ -2461,12 +2474,12 @@ impl Root {
         right = right.child(item("检索", self.show_search).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
-                this.show_search = !this.show_search;
+                cx.stop_propagation();
+                // 走全局状态机：开检索即关其它面板与底层浮层；再点一次收起。
+                this.set_ui_state(AppUIState::Search);
                 if this.show_search {
                     // 焦点交给检索框，否则输入法没有落点、打不进中文。
                     window.focus(&this.search_focus);
-                } else {
-                    this.clear_search();
                 }
                 cx.notify();
             }),
@@ -2474,14 +2487,16 @@ impl Root {
         right = right.child(item("朱批", self.show_notes_panel).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
-                this.show_notes_panel = !this.show_notes_panel;
+                cx.stop_propagation();
+                this.set_ui_state(AppUIState::Notes);
                 cx.notify();
             }),
         ));
         right = right.child(item("帮助", self.show_help).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
-                this.show_help = !this.show_help;
+                cx.stop_propagation();
+                this.set_ui_state(AppUIState::Help);
                 cx.notify();
             }),
         ));
@@ -6260,15 +6275,15 @@ impl Root {
         let anchor_rect = Some((anchor.x, anchor.y, anchor.w, anchor.h));
         let hit_xy = (hit.x, hit.y);
 
-        // ── 尺寸：一条窄签 ────────────────────────────────────────────
+        // ── 尺寸：一条横排圆角面板（钮内文字竖排）────────────────────
         let fs = 14.5f32;
-        let item_w = fs * 1.7;
-        let item_h = fs * 2.24; // 两字一钮
-        let gap = 7.0;
+        let item_w = fs * 1.5;
+        let item_h = fs * 2.5; // 两字一钮（竖排）
+        let gap = 8.0; // 钮间距
         let pad = 6.0;
         let n: f32 = 7.0; // 查典 / 朱批 / 夹注 / 拓印 / 人名 / 地名 / 书名
-        let w = pad * 2.0 + item_w + 2.0;
-        let h = pad * 2.0 + item_h * n + gap * (n - 1.0) + 2.0;
+        let w = pad * 2.0 + item_w * n + gap * (n - 1.0) + 2.0;
+        let h = pad * 2.0 + item_h + 2.0;
         let place = crate::hit::place_card(
             &anchor,
             w,
@@ -6292,7 +6307,7 @@ impl Root {
                     .w(px(item_w))
                     .text_color(rgb(t.ink()))
                     .cursor_pointer()
-                    .hover(move |s| s.text_color(rgb(t.accent()))),
+                    .hover(move |s| s.text_color(rgb(sheet_zhu(t)))),
             );
         };
         push_btn("查典", &mut items);
@@ -6411,19 +6426,19 @@ impl Root {
             }),
         );
 
-        // ── 纸签本体 ──────────────────────────────────────────────────
-        let paper_washi = rgba((t.paper() << 8) | 0xF2);
-        // 钮与钮之间**只用留白**分档（不画线、不加框）：一枚钮就是签上的
-        // 一行字，靠呼吸感隔开，比一根根细线更像手写的书签。
-        let mut col = div()
+        // ── 面板本体：横排圆角面板，钮内文字竖排 ──────────────────────
+        let paper_washi = rgba((t.paper() << 8) | 0xFA); // 半透明宣纸底（≈0.98）
+        // 钮与钮之间**只用留白**分档（不画线、不加框）：一枚钮就是面板上的
+        // 一列字，靠呼吸感隔开；面板整体横排，文字逐列竖读。
+        let mut row = div()
             .flex()
-            .flex_col()
+            .flex_row()
             .items_center()
-            .justify_start()
+            .justify_center()
             .gap(px(gap))
             .child(b_query);
         for b in [b_note, b_gloss, b_copy, b_person, b_place, b_book] {
-            col = col.child(b);
+            row = row.child(b);
         }
 
         div()
@@ -6432,14 +6447,18 @@ impl Root {
             .top(px(place.top))
             .w(px(w))
             .h(px(h))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
             .bg(paper_washi)
             .border_1()
-            .border_color(rgb(t.accent()))
-            .rounded(px(2.0))
+            .border_color(rgb(sheet_zhu(t)))
+            .rounded(px(7.0))
             .shadow_sm()
             .p(px(pad))
-            .child(col)
-            // 签内不冒泡：否则一点钮，根容器的「点别处收起」就把签收了。
+            .child(row)
+            // 面板内不冒泡：否则一点钮，根容器的「点别处收起」就把面板收了。
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_this, _, _, cx| {
@@ -7808,8 +7827,8 @@ impl Root {
     ///   丝栏 → `RuleColor::ALL`；标注 → `StyleAct`。
     fn render_style_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
-        // 面板宽度与「单张页面」严格等宽：直接取 fit_sizes 算出的实际页宽。
-        let style_w = self.page_w;
+        // 面板宽度：比「单张页面」略收一档，紧凑不撑满（v1.46.0 瘦身）。
+        let style_w = (self.page_w * 0.80).max(360.0);
 
         // ---- 抬头：一个名字 + 一枚关闭 ----
         //
@@ -7839,17 +7858,16 @@ impl Root {
         // 面板像一张**薄纸**：半透明宣纸底（纸色 + 95% 不透明）+ 一道极淡墨边，
         // 悬浮在古籍之上。GPUI 0.2.2 没有 backdrop-filter，纸底本色已足够
         // 「透」，再用一层柔和投影把它托起来（影子只向下，不四散）。
-        // 纸色更透（0xEC）：让面板像蒙了一层极薄的宣纸，叠在书页上呈
-        // 磨砂感，不再是死板的纯灰白块。顶部再压一道 1px 高光，浮起纸缘。
-        let paper_veil = ((t.paper() & 0xFFFFFF) << 8) | 0xEC;
+        // 纸色更透（0xF6）：磨砂比 v1.44 再弱一档，更贴近「一张素纸」。
+        let paper_veil = ((t.paper() & 0xFFFFFF) << 8) | 0xF6;
         let mut sheet = div()
             .relative()
             .w(px(style_w))
             .flex()
             .flex_col()
-            .gap(px(8.0))
-            .px(px(18.0))
-            .py(px(14.0))
+            .gap(px(5.0))
+            .px(px(14.0))
+            .py(px(10.0))
             .bg(rgba(paper_veil))
             .border_1()
             .border_color(rgba(((t.rule() & 0xFFFFFF) << 8) | 0x33))
@@ -8479,22 +8497,21 @@ impl Root {
         let mut row = div().flex().flex_row().flex_wrap().items_start().gap(px(16.0));
         for p in InkPalette::ALL {
             let on = self.palette == p;
-            // 墨色图标：**两枚完美贴合的半圆**（左=正文色、右=批注色），
-            // 中间留 1px 浅色缝隙，双色过渡自然、精致，像套印的阴阳并置；
-            // 整体比旧版略放大，更见笔意。
-            let seam = if t.is_dark() { 0x4A4D4F } else { 0xFFFFFF };
+            // 墨色图标：**两枚等大的圆并排**（左=正文色、右=注文色），
+            // 中间 2px 缝隙；选中时外围套一圈极细朱砂框（v1.46.0）。
+            let dot = |c: u32| div().w(px(16.0)).h(px(16.0)).rounded_full().bg(rgb(c));
             let icon = div()
-                .w(px(24.0))
-                .h(px(24.0))
-                .rounded_full()
-                .overflow_hidden()
                 .flex()
                 .flex_row()
-                .child(div().flex_1().h_full().bg(rgb(p.ink(t))))
-                .child(div().w(px(1.0)).h_full().bg(rgb(seam)))
-                .child(div().flex_1().h_full().bg(rgb(p.note(t))))
+                .items_center()
+                .gap(px(2.0))
+                .p(px(2.0))
+                .rounded_full()
+                .border_1()
+                .border_color(rgba(0x00000000))
                 .when(on, |d| d.border_2().border_color(rgb(sheet_zhu(t))))
-                .when(!on, |d| d.border_1().border_color(rgb(t.rule())));
+                .child(dot(p.ink(t)))
+                .child(dot(p.note(t)));
             let chip = div()
                 .flex()
                 .flex_col()
@@ -8604,15 +8621,7 @@ impl Root {
                         .child(SharedString::from(c.to_string())),
                 );
             }
-            face = face
-                .child(col)
-                // 竖线槽：未选宽 0，位置固定，切换时不推挤邻居。
-                .child(
-                    div()
-                        .w(px(1.0))
-                        .h(px((label.chars().count() as f32) * 13.0))
-                        .bg(rgb(if on { t.chrome_line() } else { 0x00000000 })),
-                );
+            face = face.child(col);
             let card = div()
                 .id(SharedString::from(format!("font-{}", label)))
                 .child(face);
