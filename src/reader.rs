@@ -476,14 +476,17 @@ fn ink_option(label: &'static str, on: bool, t: Theme) -> Div {
         .child(div().text_size(px(12.0)).child(SharedString::from(label)))
         .child(
             div()
-                .w(px(18.0))
-                .h(px(1.0))
+                .h(px(4.0))
                 .flex()
                 .justify_center()
                 .child(if on {
-                    hairline(18.0, t.ink())
+                    div()
+                        .w(px(4.0))
+                        .h(px(4.0))
+                        .rounded_full()
+                        .bg(rgb(sheet_zhu(t)))
                 } else {
-                    div().w(px(0.0)).h(px(1.0))
+                    div().w(px(4.0)).h(px(4.0))
                 }),
         )
 }
@@ -7836,8 +7839,11 @@ impl Root {
         // 面板像一张**薄纸**：半透明宣纸底（纸色 + 95% 不透明）+ 一道极淡墨边，
         // 悬浮在古籍之上。GPUI 0.2.2 没有 backdrop-filter，纸底本色已足够
         // 「透」，再用一层柔和投影把它托起来（影子只向下，不四散）。
-        let paper_veil = ((t.paper() & 0xFFFFFF) << 8) | 0xF2;
+        // 纸色更透（0xEC）：让面板像蒙了一层极薄的宣纸，叠在书页上呈
+        // 磨砂感，不再是死板的纯灰白块。顶部再压一道 1px 高光，浮起纸缘。
+        let paper_veil = ((t.paper() & 0xFFFFFF) << 8) | 0xEC;
         let mut sheet = div()
+            .relative()
             .w(px(style_w))
             .flex()
             .flex_col()
@@ -7857,6 +7863,15 @@ impl Root {
             // 面板文字一律走**正文宋体**（原来用思源黑体，正是「生硬」的根源）：
             // 面板贴在宋版书页下方，字要与书页同一种笔意。
             .font_family(self.main_family())
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(1.0))
+                    .bg(rgba(0xFFFFFF33)),
+            )
             .child(head);
 
         // ---- 列数：八行 / 十行 / 十二行 / 十四行 / 自动 ----
@@ -8054,7 +8069,7 @@ impl Root {
                 .rounded_full()
                 .bg(rgb(pt.paper))
                 .border_1()
-                .border_color(rgb(if on { sheet_zhu(t) } else { pt.border }));
+                .border_color(rgb(t.chrome_line()));
             themes_row = themes_row.child(
                 div()
                     .id(SharedString::from(format!("theme-{}-{}", pt.id, i)))
@@ -8164,20 +8179,33 @@ impl Root {
 
         // ---- 实时反馈：引擎当下算出的列数 / 版心 / 列宽 / 字号 / 每面行款 ----
         // 自动档每帧换挡，这一行是「当前到底排成什么样」的唯一凭据。
+        // 层次化：**版心% 与 天头:地脚** 用半透明朱砂微微高亮（核心参数），
+        // 其余（列数 / 列宽 / 字号 / 行数）用淡墨，让这行字有主次感。
+        let cols_auto = if self.columns_auto { "（自动）" } else { "" };
+        let banxin = self.banxin_ratio * 100.0;
+        let ratio = self.margin_top / self.margin_bot.max(0.01);
+        let zhu = rgba((sheet_zhu(t) << 8) | 0xCC);
+        let soft = rgb(t.ink_soft());
+        let seg = |s: String, z: bool| {
+            div()
+                .text_color(if z { zhu } else { soft })
+                .whitespace_nowrap()
+                .child(SharedString::from(s))
+        };
         sheet = sheet.child(
             div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.0))
                 .text_size(px(10.5))
-                .text_color(rgb(t.ink_soft()))
-                .child(SharedString::from(format!(
-                    "{} 列{} · 版心 {:.0}% · 列宽 {:.0} · 字号 {:.0} · 每面 {} 行 · 天头:地脚 {:.1}:1",
-                    self.grid.columns,
-                    if self.columns_auto { "（自动）" } else { "" },
-                    self.banxin_ratio * 100.0,
-                    self.col_w,
-                    self.size_ancient,
-                    self.grid_rows,
-                    self.margin_top / self.margin_bot.max(0.01),
-                ))),
+                .child(seg(format!("{} 列{}", self.grid.columns, cols_auto), false))
+                .child(seg(format!("版心 {:.0}%", banxin), true))
+                .child(seg(format!("列宽 {:.0}", self.col_w), false))
+                .child(seg(format!("字号 {:.0}", self.size_ancient), false))
+                .child(seg(format!("每面 {} 行", self.grid_rows), false))
+                .child(seg(format!("天头:地脚 {:.1}:1", ratio), true)),
         );
         // ---- 底行：两枚**纯文字**动作（分享图片 / 分享文字）----
         // 原来那两个灰色大方框是面板里最重的色块；现在只剩一行字，字旁一枚
@@ -8451,23 +8479,20 @@ impl Root {
         let mut row = div().flex().flex_row().flex_wrap().items_start().gap(px(16.0));
         for p in InkPalette::ALL {
             let on = self.palette == p;
-            // 墨色图标：**一枚完整的圆，左半正文色、右半批注色**——像双色
-            // 套印（太极 / 套印的并置），一眼就是「这组墨是正文+批注两色」。
-            let half = |c: u32| {
-                div()
-                    .flex_1()
-                    .h_full()
-                    .bg(rgb(c))
-            };
+            // 墨色图标：**两枚完美贴合的半圆**（左=正文色、右=批注色），
+            // 中间留 1px 浅色缝隙，双色过渡自然、精致，像套印的阴阳并置；
+            // 整体比旧版略放大，更见笔意。
+            let seam = if t.is_dark() { 0x4A4D4F } else { 0xFFFFFF };
             let icon = div()
-                .w(px(20.0))
-                .h(px(20.0))
+                .w(px(24.0))
+                .h(px(24.0))
                 .rounded_full()
                 .overflow_hidden()
                 .flex()
                 .flex_row()
-                .child(half(p.ink(t)))
-                .child(half(p.note(t)))
+                .child(div().flex_1().h_full().bg(rgb(p.ink(t))))
+                .child(div().w(px(1.0)).h_full().bg(rgb(seam)))
+                .child(div().flex_1().h_full().bg(rgb(p.note(t))))
                 .when(on, |d| d.border_2().border_color(rgb(sheet_zhu(t))))
                 .when(!on, |d| d.border_1().border_color(rgb(t.rule())));
             let chip = div()
@@ -8514,14 +8539,17 @@ impl Root {
                     .child(div().text_size(px(13.0)).child(SharedString::from(label)))
                     .child(
                         div()
-                            .w(px(24.0))
-                            .h(px(1.0))
+                            .h(px(4.0))
                             .flex()
                             .justify_center()
                             .child(if on {
-                                hairline(24.0, t.ink())
+                                div()
+                                    .w(px(4.0))
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(rgb(sheet_zhu(t)))
                             } else {
-                                div().w(px(0.0)).h(px(1.0))
+                                div().w(px(4.0)).h(px(4.0))
                             }),
                     )
                     .on_mouse_down(
@@ -8554,7 +8582,7 @@ impl Root {
             .flex_row()
             .flex_wrap()
             .items_start()
-            .gap(px(12.0))
+            .gap(px(16.0))
             .py_1();
         for choice in opts {
             let on = cur == choice;
@@ -8583,7 +8611,7 @@ impl Root {
                     div()
                         .w(px(1.0))
                         .h(px((label.chars().count() as f32) * 13.0))
-                        .bg(rgb(if on { t.ink() } else { 0x00000000 })),
+                        .bg(rgb(if on { t.chrome_line() } else { 0x00000000 })),
                 );
             let card = div()
                 .id(SharedString::from(format!("font-{}", label)))
