@@ -13,7 +13,8 @@ use crate::types::{
 };
 use gpui::{
     div, px, rgb, AsyncApp, Context, Div, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, WeakEntity, Window,
+    KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled,
+    WeakEntity, Window,
 };
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -221,6 +222,10 @@ pub struct Root {
     pub current_chapter: usize,
     /// 目录面板是否展开（true = 该渲染目录层）。
     pub show_toc: bool,
+    /// 底部竖排目录的滚动柄：开目录时用它滚到当前在读的那一卷。
+    pub toc_scroll: ScrollHandle,
+    /// 是否需要「滚到当前卷」（每次开目录置一次，滚完即清）。
+    pub toc_need_scroll: bool,
     /// 目录面板滑入 / 滑出动画进度（0 = 完全收起，1 = 完全展开）。
     pub toc_slide: f32,
     /// 目录动画的目标态（true = 展开）。
@@ -446,8 +451,6 @@ pub struct Root {
     /// 整页模式的当帧缩放系数（其余模式恒为 1.0）：供 UI 与调试查看
     /// 「整叶被缩到了几成」。
     pub full_scale: f32,
-    /// 书库面板是否展开（书架上下载更多书）。
-    pub show_library: bool,
     /// 窗口内容区尺寸（每帧由 render 写入，供铺满屏计算）。
     pub viewport_w: f32,
     pub viewport_h: f32,
@@ -598,6 +601,8 @@ impl Root {
             page: 0,
             current_chapter: 0,
             show_toc: false,
+            toc_scroll: ScrollHandle::new(),
+            toc_need_scroll: false,
             toc_slide: 0.0,
             toc_target: false,
             toc_animating: false,
@@ -668,7 +673,6 @@ impl Root {
             columns_auto: true,
             pending_anchor: None,
             min_font_noticed: false,
-            show_library: false,
             viewport_w: 1280.0,
             viewport_h: 860.0,
             page_w: 640.0,
@@ -789,6 +793,7 @@ impl Root {
             root.show_toc = true;
             root.toc_target = true;
             root.toc_slide = 1.0;
+            root.toc_need_scroll = true;
         }
         if std::env::var("JIANDU_NOTES_OPEN").is_ok() {
             root.show_notes_panel = true;
@@ -2597,7 +2602,6 @@ impl Root {
             || self.show_notes_panel
             || self.show_help
             || self.show_share_panel
-            || self.show_library
     }
 
     pub fn open_toc(&mut self) {
@@ -2615,6 +2619,9 @@ impl Root {
         self.show_toc = true;
         self.toc_target = true;
         self.toc_animating = true;
+        // v1.49.3：每次开目录都重新定位——滚到当前在读的那一卷，
+        // 而不是永远从第一卷起手。
+        self.toc_need_scroll = true;
         if self.toc_slide <= 0.0 {
             self.toc_slide = 0.0;
         }

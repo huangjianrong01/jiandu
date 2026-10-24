@@ -16,8 +16,9 @@ use crate::app::{
 use crate::fonts::FontRole;
 use crate::library::{ellipsis, ShelfEntry};
 use gpui::{
-    div, prelude::*, px, rgb, rgba, Animation, AnimationExt, BoxShadow, Context, Div, FontWeight,
-    KeyDownEvent, MouseButton, MouseMoveEvent, ParentElement, SharedString, Styled,
+    canvas, div, point, prelude::*, px, rgb, rgba, Animation, AnimationExt, AnyElement, App, Bounds,
+    BoxShadow, Context, Div, FontWeight, KeyDownEvent, MouseButton, MouseMoveEvent, ParentElement,
+    PathBuilder, Pixels, SharedString, Stateful, Styled, Window,
 };
 use std::time::Duration;
 
@@ -59,6 +60,13 @@ const SLIP_TITLE_H: f32 = 132.0;
 /// 角上竖排小字（作者 / 进度）的字号与可用高。
 const MINI_FS: f32 = 9.5;
 const MINI_H: f32 = 52.0;
+
+/// v1.49.3 极简书衣：宣纸底 + 淡墨线框，内里只一枚竖排书名。
+const CARD_BG: u32 = 0xF7F1E3;
+/// 淡墨描边（线框书衣的那道边）。
+const CARD_EDGE: u32 = 0x8C8474;
+/// 封面上的书名墨色。
+const CARD_INK: u32 = 0x2A241E;
 
 /// 书衣的右下角微小投影：只往右下偏一点点、模糊很小——「微弱立体感」，
 /// 不是现代 UI 那种大团弥散阴影。`spread` 取负让影子收在书衣里面。
@@ -605,7 +613,6 @@ impl Root {
     /// 书架：题签网格（默认）/ 书脊列表，配分类页签、搜索、排序。
     pub(crate) fn render_shelf(&mut self, cx: &mut Context<Self>) -> Div {
         let entries = self.shelf_filtered();
-        let counts = self.shelf_counts();
 
         let mut root = div()
             .flex()
@@ -614,30 +621,32 @@ impl Root {
             .relative()
             .bg(rgb(SHELF_BG));
 
+        // v1.49.3：页签已并进顶栏这一条，不再单起第二行。
         root = root.child(self.render_shelf_top(cx));
-        root = root.child(self.render_shelf_tabs(&counts, cx));
         // v1.47.0：此处原有的「每日一句」旧组件已删除——顶栏品牌标语
         // （app.rs render_brand）已含同一句，书架中部再悬浮一份即重复。
 
-        let body = if entries.is_empty() {
-            self.render_shelf_empty(cx)
+        // 网格自己带滚动（`overflow_y_scroll` 会把 Div 变 Stateful<Div>），
+        // 书脊列表不带，故统一收成 AnyElement 再挂上去。
+        let body: AnyElement = if entries.is_empty() {
+            self.render_shelf_empty(cx).into_any_element()
         } else {
             match self.shelf_view {
-                ShelfView::TitleSlip => self.render_slip_grid(&entries, cx),
-                ShelfView::Spine => self.render_spine_list(&entries, cx),
+                ShelfView::TitleSlip => self.render_slip_grid(&entries, cx).into_any_element(),
+                ShelfView::Spine => self.render_spine_list(&entries, cx).into_any_element(),
             }
         };
-        root = root.child(div().flex_1().overflow_hidden().child(body));
+        // 滚动交回网格自己（v1.49.4）：顶栏与页签是**固定不动**的兄弟节点，
+        // 只有下面这堵书墙会滚；`min_h(0)` 是 flex 子项能滚起来的前提，
+        // 缺了它子项会被内容撑高、滚动条永不出现。
+        root = root.child(div().flex_1().min_h(px(0.0)).child(body));
         // 批量管理：底部浮出一条操作栏（全选 / 删除所选 / 退出）。
         if self.shelf_manage {
             root = root.child(self.render_batch_bar(cx));
         }
         root = root.child(self.render_shelf_status());
 
-        // 浮层：书库 / 重命名 / 改归类 / 展开书名。
-        if self.show_library {
-            root = root.child(self.render_library_panel(cx));
-        }
+        // 浮层：重命名 / 改归类 / 展开书名（「书库」浮层 v1.49.3 已整体删除）。
         if self.rename_idx.is_some() {
             root = root.child(self.render_rename_dialog(cx));
         }
@@ -698,117 +707,135 @@ impl Root {
         v
     }
 
-    /// 各页签的本数：全部 / 经 / 史 / 子 / 集 / 自定。
-    fn shelf_counts(&self) -> Vec<(&'static str, usize)> {
-        let mut v: Vec<(&'static str, usize)> = vec![
-            ("全部", self.library.books.len()),
-            ("经", 0),
-            ("史", 0),
-            ("子", 0),
-            ("集", 0),
-            ("自定", 0),
-        ];
-        for e in &self.library.books {
-            let k = e.cat_key();
-            if let Some(slot) = v.iter_mut().find(|(name, _)| *name == k) {
-                slot.1 += 1;
-            }
-        }
-        v
-    }
-
-    /// 顶栏：品牌 · 继续阅读 · 搜索 · 排序 · 视图 · 导入 · 书库。
+    /// 顶栏（v1.49.4 全新）：**就三样**——左边一枚大标题「书架」，右边
+    /// 一枚放大镜 + 一枚「编辑」；下面一行才是胶囊页签。
+    ///
+    /// 排序 / 视图 / 题签 / 整理 / 导入 那一串文字钮全部撤掉（整理＝「编辑」），
+    /// 天头这才空得下来。搜索框不常驻：点放大镜才在标题右侧展开下划线
+    /// 输入框，写完再点一次收起。
+    ///
+    /// 顶栏与页签**固定在顶部**：它们是 `flex_col` 里独立的兄弟节点，
+    /// 只有下面那层网格会滚，滚多远天头都不动。
     fn render_shelf_top(&mut self, cx: &mut Context<Self>) -> Div {
-        let sort = self.shelf_sort;
-        let view = self.shelf_view;
-        let has_any = self
-            .library
-            .books
-            .iter()
-            .any(|e| e.last_read > 0 || e.last_page > 0);
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::SongTi,
+            crate::types::Script::Ancient,
+        );
         let managing = self.shelf_manage;
+        let searching = self.shelf_searching;
+
+        // 大标题：一枚「书架」，宋体、墨色、19px——不是 logo，就是一行字。
+        let title = div()
+            .font_family(song.clone())
+            .text_size(px(19.0))
+            .text_color(rgb(INK))
+            .child(SharedString::from("书架"));
+
+        // 「编辑 / 完成」：极小号宋体，无底无框，进整理态转朱。
+        let edit = div()
+            .font_family(song.clone())
+            .text_size(px(12.0))
+            .text_color(rgb(if managing { CINNABAR } else { INK_SOFT }))
+            .cursor_pointer()
+            .hover(|s| s.text_color(rgb(CINNABAR)))
+            .child(SharedString::from(if managing { "完成" } else { "编辑" }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_shelf_manage();
+                    cx.notify();
+                }),
+            );
 
         let mut bar = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(14.0))
-            .px(px(18.0))
-            .py(px(7.0))
-            .bg(rgb(SHELF_PAPER))
-            .border_b_1()
-            .border_color(rgb(HAIR))
-            .child(self.render_brand(cx))
-            .child(div().flex_1());
+            .gap(px(16.0))
+            .px(px(40.0))
+            .pt(px(18.0))
+            .pb(px(12.0))
+            .bg(rgb(SHELF_BG))
+            .child(title);
 
-        if has_any {
-            // 「继续阅读」是一枚**朱砂印章**（方印、朱底白字、竖排两字），
-            // 不是带底色的现代胶囊按钮。
-            bar = bar.child(
-                seal_chip("续读", 34.0).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.shelf_continue();
-                        cx.notify();
-                    }),
-                ),
-            );
+        // 搜索：未点开时只是一枚放大镜；点开后原地展开下划线输入框。
+        if searching {
+            bar = bar.child(self.render_shelf_search(cx));
         }
+        bar = bar.child(div().flex_1());
+        // 右侧两件：**放大镜**、**编辑**（就这两样，多一枚都是噪音）。
+        bar = bar.child(self.render_search_icon(searching, cx));
+        bar = bar.child(edit);
 
-        bar = bar
-            .child(self.render_shelf_search(cx))
+        // 第二行：胶囊页签（全部 / 经 / 史 / 子 / 集）。
+        let tabs = div()
+            .px(px(40.0))
+            .pb(px(16.0))
+            .bg(rgb(SHELF_BG))
+            .child(self.render_shelf_tabs(cx));
+
+        div().flex().flex_col().child(bar).child(tabs)
+    }
+    /// 放大镜（搜索）：GPUI 0.2.2 没有图标集，这枚是 canvas 画的——
+    /// 一圈细边 + 一根斜柄，16px，淡墨、悬停朱砂。
+    fn render_search_icon(&self, on: bool, cx: &mut Context<Self>) -> Div {
+        let ink = if on { CINNABAR } else { INK_SOFT };
+        div()
+            .w(px(20.0))
+            .h(px(20.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.65))
             .child(
-                shelf_button(&format!("排序 · {}", sort.label()), false).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.shelf_sort = this.shelf_sort.next();
-                        cx.notify();
-                    }),
-                ),
+                canvas(
+                    |_b: Bounds<Pixels>, _w: &mut Window, _c: &mut App| (),
+                    move |bounds: Bounds<Pixels>, _s: (), window: &mut Window, _c: &mut App| {
+                        let ox = f32::from(bounds.origin.x);
+                        let oy = f32::from(bounds.origin.y);
+                        let bw = f32::from(bounds.size.width);
+                        let bh = f32::from(bounds.size.height);
+                        let r = bw * 0.30;
+                        let cx0 = ox + bw * 0.42;
+                        let cy0 = oy + bh * 0.42;
+                        // 镜圈：四段二次曲线凑圆（与句读小圈同一套系数）。
+                        let k = r * 0.9142;
+                        let mut b = PathBuilder::stroke(px(1.2));
+                        b.move_to(point(px(cx0 + r), px(cy0)));
+                        b.curve_to(point(px(cx0), px(cy0 + r)), point(px(cx0 + k), px(cy0 + k)));
+                        b.curve_to(point(px(cx0 - r), px(cy0)), point(px(cx0 - k), px(cy0 + k)));
+                        b.curve_to(point(px(cx0), px(cy0 - r)), point(px(cx0 - k), px(cy0 - k)));
+                        b.curve_to(point(px(cx0 + r), px(cy0)), point(px(cx0 + k), px(cy0 - k)));
+                        b.close();
+                        if let Ok(path) = b.build() {
+                            window.paint_path(path, rgb(ink));
+                        }
+                        // 柄：从圈的右下斜出去。
+                        let mut h = PathBuilder::stroke(px(1.2));
+                        h.move_to(point(px(cx0 + r * 0.72), px(cy0 + r * 0.72)));
+                        h.line_to(point(px(ox + bw * 0.86), px(oy + bh * 0.86)));
+                        if let Ok(path) = h.build() {
+                            window.paint_path(path, rgb(ink));
+                        }
+                    },
+                )
+                .w(px(20.0))
+                .h(px(20.0)),
             )
-            .child(
-                shelf_button(&format!("视图 · {}", view.label()), false).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.shelf_view = this.shelf_view.toggled();
-                        this.shelf_expand = None;
-                        cx.notify();
-                    }),
-                ),
-            )
-            .child(
-                // 整理（批量管理）：进去后点书衣是勾选，底部浮出「全选 / 反选 /
-                // 删除所选」。开着的时候按钮转朱色，免得忘了自己还在勾选态。
-                // 门有两处：顶栏这一枚，以及**在任一书衣上右键**（见
-                // `render_slip_card`）——想删哪本就在哪本上直接动手。
-                shelf_button(if managing { "整理 · 开" } else { "整理" }, managing).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.toggle_shelf_manage();
-                        cx.notify();
-                    }),
-                ),
-            )
-            .child(shelf_button("导入", false).on_mouse_down(
+            .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
-                    this.import_dialog(cx)
-                }),
-            ))
-            .child(shelf_button("书库", false).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.show_library = !this.show_library;
+                    this.shelf_searching = !this.shelf_searching;
+                    if !this.shelf_searching {
+                        this.shelf_query.clear();
+                        this.shelf_query_cursor = 0;
+                    }
                     cx.notify();
                 }),
-            ));
-        bar
+            )
     }
 
     /// 书架搜索框：未激活时是一枚「搜索」按钮，点开后变成可接中文的输入框。
@@ -885,76 +912,59 @@ impl Root {
             )
     }
 
-    /// 分类页签：全部 / 经 / 史 / 子 / 集 / 自定（带本数）。
-    fn render_shelf_tabs(
-        &mut self,
-        counts: &[(&'static str, usize)],
-        cx: &mut Context<Self>,
-    ) -> Div {
+    /// 分类页签（v1.49.4 全新）：**胶囊**——全部 / 经 / 史 / 子 / 集。
+    ///
+    /// 选中：朱砂实底 + 白字；未选：只有一圈淡墨细边。不再挂本数，
+    /// 也不再有下划线 tab 那套现代后台的做派。
+    fn render_shelf_tabs(&mut self, cx: &mut Context<Self>) -> Div {
         let cur = self.shelf_cat.clone();
-        let mut row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(22.0))
-            .px(px(18.0))
-            .pt(px(8.0))
-            .bg(rgb(SHELF_PAPER))
-            .border_b_1()
-            .border_color(rgb(HAIR));
-
-        for (name, n) in counts.iter() {
-            let name = *name;
-            let selected = match (&cur, name) {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::SongTi,
+            crate::types::Script::Ancient,
+        );
+        let mut row = div().flex().flex_row().items_center().gap(px(10.0));
+        for (key, label) in [
+            ("全部", "全部"),
+            ("经", "经"),
+            ("史", "史"),
+            ("子", "子"),
+            ("集", "集"),
+        ] {
+            let selected = match (&cur, key) {
                 (None, "全部") => true,
-                (Some(c), _) => c == name,
+                (Some(c), _) => c == key,
                 _ => false,
             };
-            // 页签下的那道线：选中是**极细朱线**，未选是**虚墨线**——
-            // 原来不分选中与否都是一根 2px 实线，那是现代 tab 的样子。
-            let line_w = name.chars().count() as f32 * 13.0 + 18.0;
-            let tab = div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(4.0))
-                .pb(px(6.0))
+            let pill = div()
+                .px(px(14.0))
+                .py(px(5.0))
+                .rounded_full()
                 .cursor_pointer()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_end()
-                        .gap(px(4.0))
-                        .child(text(name, 13.0, if selected { CINNABAR } else { INK_SOFT }))
-                        .child(text(&n.to_string(), 9.5, INK_FAINT)),
-                )
-                .child(if selected {
-                    hair_line_full(CINNABAR)
-                } else {
-                    div()
-                        .w(px(line_w))
-                        .flex()
-                        .justify_center()
-                        .child(hair_dashed(line_w, INK_FAINT))
-                })
+                // 选中：朱砂实底 + 白字；未选：素纸底 + 淡墨边。
+                .bg(rgb(if selected { CINNABAR } else { SHELF_PAPER }))
+                .border_1()
+                .border_color(rgb(if selected { CINNABAR } else { HAIR }))
+                .font_family(song.clone())
+                .text_size(px(12.0))
+                .text_color(rgb(if selected { 0xFFFFFF } else { INK_SOFT }))
+                .child(SharedString::from(label))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.shelf_cat = if name == "全部" {
+                        this.shelf_cat = if key == "全部" {
                             None
                         } else {
-                            Some(name.to_string())
+                            Some(key.to_string())
                         };
+                        this.shelf_expand = None;
                         cx.notify();
                     }),
                 );
-            row = row.child(tab);
+            row = row.child(pill);
         }
         row
     }
-
     /// 整理（批量管理）的底部操作栏：已选册数 · 全选 / 反选 / 清选 · 删除 · 退出。
     ///
     /// 控件一律走「极小字 + 朱砂」，不做灰底胶囊——与书衣同一套古风语汇。
@@ -1071,24 +1081,46 @@ impl Root {
         b
     }
 
-fn render_slip_grid(
+    /// 书架**流式网格**（v1.49.4 全新）：彻底废弃固定列数。
+    ///
+    /// 卡片**定宽**（160 上下）且严格 **3:4**，`flex-wrap` 自己折行：窗口宽
+    /// 就一排排 6 本、窄了自动降到 4 本 / 3 本，卡片**绝不拉伸变形**——
+    /// 旧版「按列数均分」把书衣拉成海报，正是被嫌弃的地方。
+    ///
+    /// 外层再套一层**垂直滚动**：书目过百也不挤，滚轮 / 触控板上下丝滑；
+    /// 滚动条压成 2px 的极细一线，不做现代那条宽滑轨，免得污了书架。
+    fn render_slip_grid(
         &mut self,
         entries: &[(usize, ShelfEntry)],
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> Stateful<Div> {
+        let vw = self.viewport_w;
+        let side = 40.0;
+        let gap = 28.0;
+        let avail = (vw - side * 2.0).max(240.0);
+        // 先按「基准 160 + gap」算这一排塞得下几本，再把余下的零头摊回卡片宽，
+        // 于是卡片永远落在 112~176 之间：宽屏多排、窄屏少排，比例恒为 3:4。
+        let cols = ((avail + gap) / (160.0 + gap)).floor().max(1.0);
+        let w = ((avail - gap * (cols - 1.0)) / cols).clamp(112.0, 176.0);
+        let h = w * 4.0 / 3.0; // 严格 3:4
         let mut grid = div()
             .flex()
             .flex_row()
             .flex_wrap()
             .items_start()
-            .gap(px(18.0))
-            .p(px(18.0));
+            .justify_center()
+            .gap(px(gap))
+            .px(px(side))
+            .py(px(24.0));
         for (idx, e) in entries {
-            grid = grid.child(self.render_slip_card(*idx, e, cx));
+            grid = grid.child(self.render_slip_card(*idx, e, w, h, cx));
         }
         div()
+            .id(SharedString::from("shelf-grid-scroll"))
             .size_full()
-            .overflow_hidden()
+            .overflow_y_scroll()
+            // 2px：若隐若现的一条细线，不抢书衣的戏。
+            .scrollbar_width(px(2.0))
             .child(grid)
             // 鼠标落在书与书之间的空当：撤掉悬停。书衣自己会
             // stop_propagation，故悬在书上时这一条不会执行。
@@ -1101,62 +1133,106 @@ fn render_slip_grid(
             }))
     }
 
-    /// 一枚**书衣**：瓷青布面，右侧一条书脊线，左上角贴宣纸题签
-    /// （书名竖排；西文书名横排），左下角竖排作者、右侧竖排卷册与进度。
-    /// 悬停时底部淡入半透明的管理栏。
-    fn render_slip_card(&mut self, idx: usize, e: &ShelfEntry, cx: &mut Context<Self>) -> Div {
+    /// 一枚**书衣**（v1.49.3 第三次重做，照极简书架参考图）。
+    ///
+    /// 只留三件东西，全都贴着纸边：
+    ///   * **素色布面**：五档沉静的旧色轮转，一根多余的线都不画；
+    ///   * **左上题签**：一枚白底竖条，书名竖排宋体摆在里面（线装书的招牌）；
+    ///   * **右缘作者**：极小号淡字竖排，像书脊上那一行小注；
+    ///   * 左下角一行「已读 N%」白字（未读不显示），不在封面上写 0%。
+    /// 卡片**下方**只有一行居中的书名——作者不再重复。
+    /// 一枚**书衣**（v1.49.4 全新重写）：圆角封面 + 绝对定位三件套。
+    ///
+    /// 封面＝一枚圆角矩形的**干净纯色**（五档古纸色轮转），一条多余的边框
+    /// 线都不画；里头三样东西全部 `absolute` 定位、各贴一角：
+    ///   * **左上题签**（上、左各 12）：白底小矩形，书名竖排宋体，字号较大；
+    ///   * **右缘作者**（右 12、上 16）：极小号浅灰，竖排一行小注；
+    ///   * **左下进度**（下、左各 12）：极小号「已读 N%」，未读的书不写。
+    /// 封面**下方**只有一行居中的横排书名——作者、题签、卷次一概不再重复。
+    fn render_slip_card(
+        &mut self,
+        idx: usize,
+        e: &ShelfEntry,
+        w: f32,
+        h: f32,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let prog = e.progress();
+        let started = prog > 0.0005;
         let pct = (prog * 100.0).round() as i32;
-        let author = e.author_line();
-        let volume = e.volume_line();
-        // 批量管理态：点书衣是「勾选」，不是「翻书」。
         let manage = self.shelf_manage;
         let picked = manage && self.is_picked(idx);
-
-        // 题签里的书名：中文竖排单列（长名自动缩字号），西文横排折行。
-        let (title_inner, truncated) = slip_title(
-            &e.title,
-            SLIP_W - 12.0,
-            SLIP_TITLE_H,
-            17.0,
-            SLIP_INK,
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::SongTi,
+            crate::types::Script::Ancient,
         );
-        let mut title_area = div().flex().justify_center().child(title_inner);
-        if truncated {
-            // 书名放不下：点题签上的书名展开全名（点别处仍是打开书）。
-            title_area = title_area.cursor_pointer().on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.shelf_expand = Some(idx);
-                    cx.notify();
-                }),
-            );
-        }
+        // 封面色：五档**干净的古纸色**轮转——不做深色布面、不描边、不加纹，
+        // 只在明度上错开一点点，让一排书有呼吸而不花哨。
+        const PAPERS: [u32; 5] = [0xEAE0C8, 0xE4E3D4, 0xF0E6D2, 0xE1DBCD, 0xEEE8DB];
+        let cloth = PAPERS[idx % PAPERS.len()];
+
+        // 题签：白底小矩形，宽约封面三成二、高约四成六。
+        let slip_w = (w * 0.32).clamp(40.0, 62.0);
+        let slip_h = (h * 0.46).clamp(76.0, 140.0);
+        let title = vertical_block(
+            &e.title,
+            slip_w - 10.0,
+            slip_h - 14.0,
+            (slip_w * 0.30).clamp(12.0, 17.0),
+            0x241F1A,
+            FontWeight::MEDIUM,
+        );
 
         let card = div()
             .relative()
-            .w(px(CARD_W))
-            .h(px(CARD_H))
+            .w(px(w))
+            .h(px(h))
             .overflow_hidden()
-            .bg(rgb(CLOTH))
-            .border_1()
-            // 选中：书衣收一道朱边，一眼看出勾了哪几本。
-            .border_color(rgb(if picked { CINNABAR } else { CLOTH_EDGE }))
-            .rounded(px(2.0))
-            .shadow(book_shadow())
+            .rounded(px(10.0))
+            .bg(rgb(cloth))
+            // 整理态勾中：收一圈朱边（常态一条线都不画）。
+            .when(picked, |d| d.border_1().border_color(rgb(CINNABAR)))
             .cursor_pointer()
-            // 书脊线：右侧一条深灰竖线。竖排自右向左翻，书脊就在右。
+            // ① 左上题签：上、左各 12，白底小矩形，里面竖排书名。
             .child(
                 div()
                     .absolute()
-                    .top(px(0.0))
-                    .right(px(0.0))
-                    .w(px(SPINE_W))
-                    .h_full()
-                    .bg(rgb(CLOTH_SPINE)),
+                    .top(px(12.0))
+                    .left(px(12.0))
+                    .w(px(slip_w))
+                    .h(px(slip_h))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(2.0))
+                    .bg(rgb(0xFFFFFF))
+                    .child(title),
             )
-            // 勾选框：右上角一枚方形小印。
+            // ② 右缘作者：右 12、上 16，极小号浅灰竖排——像书脊那行小注。
+            .child(
+                div()
+                    .absolute()
+                    .right(px(12.0))
+                    .top(px(16.0))
+                    .max_h(px(h * 0.56))
+                    .overflow_hidden()
+                    .child(vertical_mini(&e.author_line(), h * 0.56, 8.5, 0x9A9184)),
+            )
+            // ③ 左下进度：下、左各 12，极小号；未读的书不写「已读 0%」。
+            .when(started, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left(px(12.0))
+                        .bottom(px(12.0))
+                        .font_family(song.clone())
+                        .text_size(px(9.0))
+                        .text_color(rgb(0x8A8272))
+                        .child(SharedString::from(format!("已读 {pct}%"))),
+                )
+            })
+            // 整理态：右上角一枚勾选印。
             .when(manage, |d| {
                 d.child(
                     div()
@@ -1166,51 +1242,6 @@ fn render_slip_grid(
                         .child(Self::pick_box(picked)),
                 )
             })
-            // 题签：左上角一枚淡淡的宣纸小签。
-            .child(
-                div()
-                    .absolute()
-                    .top(px(16.0))
-                    .left(px(14.0))
-                    .w(px(SLIP_W))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .pt(px(7.0))
-                    .pb(px(8.0))
-                    .px(px(4.0))
-                    .gap(px(6.0))
-                    .bg(rgb(SLIP_PAPER))
-                    .border_1()
-                    .border_color(rgb(SLIP_EDGE))
-                    .rounded(px(1.0))
-                    // 顶端一道朱丝短线：题签的压印收头。
-                    .child(div().w(px(14.0)).h(px(2.0)).bg(rgb(CINNABAR)))
-                    .child(title_area),
-            )
-            // 左下角：竖排极小作者名。
-            .child(
-                div()
-                    .absolute()
-                    .left(px(16.0))
-                    .bottom(px(14.0))
-                    .child(vertical_mini(&author, MINI_H, MINI_FS, CLOTH_FAINT)),
-            )
-            // 右侧：竖排极小的卷册与进度（两列，右起先是卷册）。
-            .child(
-                div()
-                    .absolute()
-                    .right(px(24.0))
-                    .top(px(30.0))
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .gap(px(6.0))
-                    // 竖排自右向左读：卷册在右、进度在左（flex_row 是左→右
-                    // 排，故先给进度、再给卷册）。
-                    .child(vertical_mini(&format!("{pct}%"), 150.0, 9.0, 0xC98174))
-                    .child(vertical_mini(&volume, 150.0, 9.0, CLOTH_FAINT)),
-            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -1223,7 +1254,6 @@ fn render_slip_grid(
                     cx.notify();
                 }),
             )
-            // 右键：直接进整理态并勾上这一本——不必先去顶栏开「整理」。
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _, _, cx| {
@@ -1233,24 +1263,38 @@ fn render_slip_grid(
                 }),
             );
 
+        // 封面下：**只有书名**——居中、横排、常规字号。作者与其余标签全删。
+        let name_line = div()
+            .w(px(w))
+            .flex()
+            .justify_center()
+            .pt(px(10.0))
+            .child(
+                div()
+                    .font_family(song)
+                    .text_size(px(13.0))
+                    .text_color(rgb(INK))
+                    .child(SharedString::from(clip_title_w(&e.title, w - 4.0, 13.0))),
+            );
+
         let hovered = self.shelf_hover == Some(idx);
         let confirming = self.delete_confirm == Some(idx);
-        let mut outer = div().relative().w(px(CARD_W)).h(px(CARD_H)).child(card);
-        // 批量管理态不浮「归类 / 改名 / 删除」：那三条是单本操作，
-        // 会和勾选抢点击。
+        let mut outer = div()
+            .relative()
+            .w(px(w))
+            .flex()
+            .flex_col()
+            .child(card)
+            .child(name_line);
         if (hovered || confirming) && !manage {
-            let bar = self.render_manage_bar(idx, cx);
+            let bar = self.render_manage_bar(idx, w, cx);
             let seq = self.shelf_hover_seq;
-            // 换 ElementId（带上悬停序号）才能让淡入动画重新起一段；
-            // 用同一个 id 的话动画早跑完了，再浮现就是硬生生地出现。
             outer = outer.child(bar.with_animation(
                 SharedString::from(format!("shelf-manage-{idx}-{seq}")),
                 Animation::new(Duration::from_millis(180)),
                 |bar, delta| bar.opacity(delta),
             ));
         }
-        // 悬停登记：卡片吞掉这次 mouse_move（stop_propagation），
-        // 网格容器那条「落在空当就撤掉悬停」的处理器便不会执行。
         outer.on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
             if this.shelf_hover != Some(idx) {
                 this.shelf_hover = Some(idx);
@@ -1731,7 +1775,6 @@ fn render_slip_grid(
 
         // ② Esc：收起浮层 / 清掉展开态 / 取消删除确认。
         if k == "escape" || k == "Escape" || k == "esc" {
-            self.show_library = false;
             self.delete_confirm = None;
             self.shelf_expand = None;
             self.shelf_recat = None;
@@ -1920,125 +1963,6 @@ fn render_slip_grid(
             )
     }
 
-    /// 书库浮层：列出内置书库，点「下载」写入书架。
-    fn render_library_panel(&mut self, cx: &mut Context<Self>) -> Div {
-        let items = crate::content::catalog();
-        let mut list = div().flex().flex_col().gap_3().p_4();
-        for it in &items {
-            let key = it.key;
-            let file = format!("{key}.json");
-            let owned = self
-                .library
-                .books
-                .iter()
-                .any(|b| b.path.file_name().and_then(|s| s.to_str()) == Some(file.as_str()));
-            let info = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_size(px(14.0))
-                        .text_color(rgb(INK))
-                        .child(SharedString::from(clip_title_w(&it.title, 300.0, 14.0))),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(rgb(0x8A8175))
-                        .child(SharedString::from(clip_title_w(
-                            &format!("{} · {}", it.author, it.subtitle),
-                            320.0,
-                            10.5,
-                        ))),
-                );
-            let action = if owned {
-                div()
-                    .px_3()
-                    .py_1p5()
-                    .rounded(px(8.0))
-                    .bg(rgb(0xEFEDE7))
-                    .text_size(px(12.0))
-                    .text_color(rgb(0x8A8175))
-                    .child(SharedString::from("已在书架"))
-            } else {
-                small_button("⬇ 下载").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.download_book(key);
-                        cx.notify();
-                    }),
-                )
-            };
-            let row = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .p_3()
-                .bg(rgb(PAPER))
-                .border_1()
-                .border_color(rgb(FRAME))
-                .rounded(px(4.0))
-                .child(info)
-                .child(action);
-            list = list.child(row);
-        }
-
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x14100A99))
-            .child(
-                div()
-                    .w(px(460.0))
-                    .max_h(px(520.0))
-                    .flex()
-                    .flex_col()
-                    .bg(rgb(0xFEFDFC))
-                    .border_1()
-                    .border_color(rgb(FRAME))
-                    .rounded(px(8.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .p_4()
-                            .border_b_1()
-                            .border_color(rgb(0xE6E1D6))
-                            .child(
-                                div()
-                                    .text_size(px(15.0))
-                                    .text_color(rgb(CINNABAR))
-                                    .child(SharedString::from("书 库")),
-                            )
-                            .child(small_button("关闭").on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.show_library = false;
-                                    cx.notify();
-                                }),
-                            )),
-                    )
-                    .child(div().flex_1().overflow_hidden().child(list)),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.show_library = false;
-                    cx.notify();
-                }),
-            )
-    }
-
     /// 管理动作：归类 / 改名 / 删除；点过「删除」后变为二次确认态。
     /// 极小**楷体**（`FontRole::Note`），默认不露面——见 `render_manage_bar`。
     /// `ink` 是常态字色、`warn` 是「确认删除」的朱色——书衣上的管理栏压在
@@ -2101,13 +2025,13 @@ fn render_slip_grid(
     /// 悬停时**浮现在书衣底部**的半透明管理栏：内嵌 `manage_row`，
     /// 底是半透明的近黑（宣纸上的书衣本来就是暗的，压一层影子即可），
     /// 淡入动画由调用方的 `with_animation` 给。
-    fn render_manage_bar(&mut self, idx: usize, cx: &mut Context<Self>) -> Div {
+    fn render_manage_bar(&mut self, idx: usize, w: f32, cx: &mut Context<Self>) -> Div {
         let row = self.manage_row(idx, cx, 0xD8CFC0, 0xE0867A);
         div()
             .absolute()
             .left(px(4.0))
             .bottom(px(4.0))
-            .w(px(CARD_W - 8.0))
+            .w(px(w - 8.0))
             .h(px(26.0))
             .flex()
             .items_center()
@@ -2127,21 +2051,30 @@ fn render_slip_grid(
             }))
     }
 
+    /// 底栏（v1.49.3）：那条长长的新手提示**删了**——只在鼠标悬停到某本书
+    /// 上时才浮出一句；其余时间底栏只是一道留白 + 通知（notice）。
     fn render_shelf_status(&self) -> Div {
+        let hint = if self.shelf_manage {
+            "点书衣勾选 · 右键任一本直接勾选 · 「⋯」里可退出整理"
+        } else {
+            "悬停书衣可归类 / 改名 / 删除 · 右键任一本进整理"
+        };
+        let show_hint = self.shelf_hover.is_some() || self.shelf_manage;
         div()
             .flex()
             .items_center()
             .justify_between()
-            .p_3()
-            .bg(rgb(0xFEFDFC))
+            .px(px(26.0))
+            .py(px(8.0))
+            .bg(rgb(SHELF_PAPER))
             .border_t_1()
-            .border_color(rgb(0xE6E1D6))
-            .text_size(px(12.0))
-            .text_color(rgb(0x6B6357))
-            .child(SharedString::from(if self.shelf_manage {
-                "整理：点书衣勾选 · 右键任一本直接勾选 · 底部「全选 / 反选 / 删除所选」一次清架"
+            .border_color(rgb(HAIR))
+            .text_size(px(11.0))
+            .text_color(rgb(INK_FAINT))
+            .child(SharedString::from(if show_hint {
+                hint.to_string()
             } else {
-                "点题签开卷 · 书名过长点书名可展开 · 悬停书衣出「归类 / 改名 / 删除」· 右键任意书衣可整理 · 进度自动记住"
+                String::new()
             }))
             .child(SharedString::from(if self.notice.is_empty() {
                 String::new()
