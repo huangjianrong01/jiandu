@@ -19,6 +19,30 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+/// 字书浮签的**来源页签**（v1.42.0）：康熙 / 說文，一次只摊一部。
+///
+/// 浮签里不再两段并列——一次全摊会占掉半屏正文，且康熙动辄数百字，
+/// 说到文那段就被挤成一行半。改成分页：顶部两枚小签点一下换一部。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DictTab {
+    /// 《康熙字典》：历代韵书引文、反切、考證。
+    #[default]
+    Kangxi,
+    /// 《說文解字》：小篆本义。
+    Shuowen,
+}
+
+impl DictTab {
+    /// 页签上的两个字（繁体，与字书一致）。
+    pub fn label(self) -> &'static str {
+        match self {
+            DictTab::Kangxi => "康熙",
+            DictTab::Shuowen => "說文",
+        }
+    }
+
+}
+
 /// 当前所在界面。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
@@ -208,6 +232,15 @@ pub struct Root {
     /// `bubble`，故必须记一笔来源，否则悬停会把长按的签顶掉、或长按的签
     /// 把悬停永远堵死（v1.40.0 修）。
     pub hover_card: bool,
+    /// 字书浮签停在**哪一源**（v1.42.0）：康熙 / 說文二选一，顶部两枚小页签
+    /// 左右切换。
+    ///
+    /// 一次只显示一部，卡片就窄一半、短一截——长释义不再糊住整片正文。
+    /// 命中的那部若是空的（字书未收說文），自动落到另一部，页签不空转。
+    ///
+    /// 只在会话内记（不落 prefs）：切过的那一部会留着，连查几个字不必
+    /// 每次再点一次《說文》。
+    pub dict_tab: DictTab,
     /// 当前书的笔记：页序号 -> 正文。
     pub notes: std::collections::HashMap<usize, String>,
     /// 笔记面板是否展开。
@@ -505,6 +538,7 @@ impl Root {
             hover_key: None,
             hover_seq: 0,
             hover_card: false,
+            dict_tab: DictTab::default(),
             notes: std::collections::HashMap::new(),
             show_notes_panel: false,
             note_editing: false,

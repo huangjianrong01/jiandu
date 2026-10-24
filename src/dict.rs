@@ -348,16 +348,29 @@ pub fn tidy_zishu(s: &str) -> String {
 }
 
 /// 按一个字头查一条记录（`alias` 表已含繁简两种写法，故简繁都能命中）。
+///
+/// **同字兄弟回填**（v1.42.0）：排序第一优先是「繁体字头」——简写「学」要
+/// 落到「學」。但库里同一个字常有几条（「游」与「遊」），繁体那条的
+/// `pinyin` / `shuowen` 常常是 NULL，于是浮签上拼音整栏空白、《說文》那一
+/// 页也是空的（用户报的「游」没拼音，就是命中了缺字段的「遊」）。故在主行
+/// 选定之后，这两列再从**同一输入字**的其它字头里各补一次——补的是同一个
+/// 字的异体写法，不算串字。主行本身有值就用主行的。
 fn query_word(conn: &rusqlite::Connection, w: &str) -> Option<Zishu> {
     let mut st = conn
         .prepare(
             "SELECT d.word,
                     ifnull(d.content, ''),
-                    ifnull(d.pinyin, ''),
+                    ifnull(nullif(d.pinyin, ''),
+                           (SELECT d2.pinyin FROM dict d2 JOIN alias a2 ON d2.word = a2.head
+                            WHERE a2.word = ?1 AND nullif(d2.pinyin, '') IS NOT NULL
+                            LIMIT 1)),
                     ifnull(d.radical, ''),
                     ifnull(d.fanqie, ''),
                     ifnull(d.volume, ''),
-                    ifnull(d.shuowen, '')
+                    ifnull(nullif(d.shuowen, ''),
+                           (SELECT d3.shuowen FROM dict d3 JOIN alias a3 ON d3.word = a3.head
+                            WHERE a3.word = ?1 AND nullif(d3.shuowen, '') IS NOT NULL
+                            LIMIT 1))
              FROM alias a JOIN dict d ON d.word = a.head
              WHERE a.word = ?1
              ORDER BY (d.word = ifnull((SELECT trad FROM variant
@@ -372,7 +385,9 @@ fn query_word(conn: &rusqlite::Connection, w: &str) -> Option<Zishu> {
     Some(Zishu {
         word: r.get(0).unwrap_or_default(),
         kangxi: tidy_zishu(&r.get::<_, String>(1).unwrap_or_default()),
-        pinyin: r.get(2).unwrap_or_default(),
+        // 回填的子查询可能仍是 NULL（整字都没有拼音），`unwrap_or_default`
+        // 拿到 NULL 会退化成空串——浮签那一行就不画，不留空壳。
+        pinyin: r.get::<_, String>(2).unwrap_or_default(),
         radical: r.get(3).unwrap_or_default(),
         fanqie: r.get(4).unwrap_or_default(),
         volume: r.get(5).unwrap_or_default(),
@@ -446,6 +461,22 @@ pub fn rare_len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 拼音不能因为命中了繁体字头而丢：同一个字的兄弟字头要能回填。
+    ///
+    /// 「游」在库里有两条（游 / 遊），排序先取繁体字头「遊」，而「遊」那行
+    /// 的 `pinyin` 与 `shuowen` 都是 NULL——不回填的话浮签上「游」就没有
+    /// 拼音，切到《說文》那一页也是空的。
+    #[test]
+    fn zishu_backfills_pinyin_from_sibling_head() {
+        let z = query_dict('游').expect("字书应收录「游」");
+        assert_eq!(z.pinyin, "yóu", "拼音没回填：{:?}", z.pinyin);
+        assert!(!z.shuowen.is_empty(), "說文没回填：{:?}", z.shuowen);
+        // 主行有值时不能被兄弟行顶掉。
+        let du = query_dict('讀').expect("「讀」应收录");
+        assert_eq!(du.pinyin, "dú");
+        assert!(du.shuowen.contains("誦書也"));
+    }
 
     /// 字书原文的网页残渣必须洗掉：`<hr>` 之类的标签绝不进浮签。
     #[test]
