@@ -1677,12 +1677,15 @@ impl Root {
                     }
     }
 
-    /// 目录「竹简卷」（v1.49.3）：从底部升起的**半屏竖排抽屉**。
+    /// 目录「竖排卷帘」（v1.51.1）：从底部升起的**半屏竖排抽屉**。
     ///
-    /// 参照古籍**竹简册**的形制：一卷一枚**简条**，左右两道**界行**、上下
-    /// 各一枚**鱼尾**（尖相对），卷名竖排在简条正中；简条自右向左一枚枚
-    /// 并列（古籍读序），横向滑动翻检。当前在读的那一卷朱砂洗底 + 朱字朱
-    /// 鱼尾，一眼跳出来。
+    /// 全程只用 GPUI 原生 `div()` / `flex()` / `absolute()` / `px()`，
+    /// 一条边框都不描、一枚假鱼尾都不画——上一版给每卷套了左右界行和上下
+    /// 三角，294 卷并排就是一片条形码，正是要彻底删掉的东西。
+    ///   * **抽屉**：宣纸底、固定 400 高、贴屏底，顶上只留一条极细淡墨分割线；
+    ///   * **卷名**：逐字一格竖排（`flex_col`），从右往左一枚枚排开，列距 24；
+    ///   * **朱砂**：当前在读的那一卷字色转朱砂，其余保持墨色；
+    ///   * **顶栏**：正中一行极小字「共 N 卷」，右上角一枚手绘的极简 X。
     #[allow(non_snake_case)]
     fn render_toc_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let vw = self.viewport_w;
@@ -1691,13 +1694,15 @@ impl Root {
             return div();
         };
         let t = self.theme;
-        let paper_u: u32 = t.paper();
-        // 抽屉底：宣纸 + alpha 0xFA（98%）——留一丝透感，不做死白网页。
-        let DRAWER_BG: u32 = (paper_u << 8) | 0xFA;
-        let EDGE: u32 = (t.rule() << 8) | 0x59;
-        let MOON: u32 = t.ink();
-        let MOON_DIM: u32 = t.ink_soft();
-        let VERMILION: u32 = sheet_zhu(t);
+        // 抽屉底：宣纸 + alpha 0xF7（97%）——留一丝透感，不做死白网页。
+        let DRAWER_BG: u32 = (t.paper() << 8) | 0xF7;
+        // 顶上那条分割线：淡墨兑到很浅，只起「抽屉是另一张纸」的提示作用。
+        let EDGE: u32 = (t.rule() << 8) | 0x5A;
+        let INK: u32 = t.ink();
+        let INK_SOFT: u32 = t.ink_soft();
+        // 朱砂：rgb(178, 58, 48)——当前卷专用，其余卷一律墨色。
+        const VERMILION: u32 = 0xB23A30;
+
         let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
 
         // 目录条目先克隆出来：后面要用 &mut self 构建抽屉（跳页要改 self），
@@ -1711,75 +1716,89 @@ impl Root {
         // 当前章：用后台悄悄对齐好的 current_chapter，朱砂落在准确卷目上。
         let cur_chapter = self.current_chapter;
 
-        // 抽屉高：屏高 46%、clamp 300~560；slide 1 时底边齐屏底，0 时整块在屏外。
-        let h = (vh * 0.46).clamp(300.0, 560.0);
+        // 固定高 400；slide 1 时底边齐屏底，0 时整块落在屏外。
+        const H: f32 = 400.0;
+        const HEAD_H: f32 = 34.0;
         let slide = self.toc_slide.clamp(0.0, 1.0);
-        let off = -(1.0 - slide) * h;
+        let off = -(1.0 - slide) * H;
         // 上半屏遮罩随 slide 淡入：最重也只有 42% 黑，别把书页糊死。
         let mask: u32 = (0x000000 << 8) | ((0.42 * slide * 255.0) as u32).min(255);
 
-        const FS: f32 = 14.5; // 卷名字号
-        const PITCH: f32 = 20.0; // 字距（一格高）
+        const FS: f32 = 15.0; // 卷名字号
+        const PITCH: f32 = 22.0; // 一格高（字身 + 行气）
+        // 一列最多排几个字：抽屉高扣掉顶栏、上留白 12、下留白 28 再按格取整。
+        // 上一版扣得太松（只留 40），字数算多一格，末字正好被窗口底边切掉。
+        let per_col = (((H - HEAD_H - 56.0) / PITCH).floor() as usize).clamp(3, 20);
 
-        // ── 顶部一行：共 N 卷 · 回到卷首（正中极小字）；✕ 归右上角 ──
-        // 关闭归关闭，正中那行留给卷数与回卷首，不与下面的卷名抢视线。
-        let count_div = div()
-            .font_family(song.clone())
-            .text_size(px(9.0))
-            .text_color(rgb(MOON_DIM))
-            .child(SharedString::from(format!("共 {} 卷", toc.len())));
-        let back_div = div()
-            .font_family(song.clone())
-            .text_size(px(9.0))
-            .text_color(rgb(MOON_DIM))
-            .cursor_pointer()
-            .child(SharedString::from("回到卷首"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.goto_char_index(0);
-                    this.close_toc();
-                    cx.notify();
-                }),
+        // ── 顶栏：正中一行极小字「共 N 卷」，右上角一枚手绘 X ──
+        // X 用 canvas 画两笔，不用 ✕ 字符（U+2715 在中文回退字体里零宽消失）。
+        let close_x = canvas(
+            |_b: Bounds<Pixels>, _w: &mut Window, _c: &mut App| (),
+            move |bounds: Bounds<Pixels>, _s, window: &mut Window, _c: &mut App| {
+                let o = bounds.origin;
+                let side = px(11.0);
+                let x0 = o.x + px(2.5);
+                let y0 = o.y + px(2.5);
+                let mut p = PathBuilder::stroke(px(1.0));
+                p.move_to(point(x0, y0));
+                p.line_to(point(x0 + side, y0 + side));
+                p.move_to(point(x0 + side, y0));
+                p.line_to(point(x0, y0 + side));
+                if let Ok(path) = p.build() {
+                    window.paint_path(path, rgb(INK_SOFT));
+                }
+            },
+        )
+        .size_full();
+
+        let head = div()
+            .relative()
+            .w_full()
+            .h(px(HEAD_H))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .font_family(song.clone())
+                    .text_size(px(9.5))
+                    .text_color(rgb(INK_SOFT))
+                    .child(SharedString::from(format!("共 {} 卷", toc.len()))),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(14.0))
+                    .top(px((HEAD_H - 16.0) / 2.0))
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .cursor_pointer()
+                    .child(close_x)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_toc();
+                            cx.notify();
+                        }),
+                    ),
             );
-        let close_btn = div()
-            .font_family(song.clone())
-            .text_size(px(13.0))
-            .text_color(rgb(MOON_DIM))
-            .cursor_pointer()
-            .child(SharedString::from("关"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.close_toc();
-                    cx.notify();
-                }),
-            );
 
-        // 简条的**可用字高**：抽屉高减去顶部那行字、上下留白、两枚鱼尾。
-        let body_h = (h - 42.0 - 10.0).max(90.0);
-        let yuwei_h = (FS + 18.0) * 0.66 * 0.52;
-        let per_col = (((body_h - yuwei_h * 2.0 - 12.0) / PITCH).floor() as usize).clamp(3, 20);
-        // 简条宽：一个字宽 + 两侧界行的内衬，约一字半。
-        let strip_w = FS + 18.0;
-
+        // ── 卷名行：纯竖排文字，从右往左，横向滚动 ──
         let mut row = div()
             .id(SharedString::from("toc-drawer-row"))
             .flex()
             // **row-reverse**：第一卷落在最右，往后一枚枚往左排——古籍读序。
             .flex_row_reverse()
             .items_start()
-            // 列距 24：每条自带界行与上下鱼尾，条与条之间再留一道白就够了；
-            // 大缝会把「竹简并列」的连缀感拆散。
             .gap(px(24.0))
             .px(px(28.0))
-            .h(px(body_h))
+            .pt(px(12.0))
+            .pb(px(20.0))
             .flex_1()
             .min_h(px(0.0))
             .overflow_x_scroll()
-            .scrollbar_width(px(3.0))
+            .scrollbar_width(px(2.0))
             .track_scroll(&self.toc_scroll);
 
         if toc.is_empty() {
@@ -1791,33 +1810,28 @@ impl Root {
                     .pt(px(18.0))
                     .font_family(song.clone())
                     .text_size(px(12.0))
-                    .text_color(rgb(MOON_DIM))
+                    .text_color(rgb(INK_SOFT))
                     .child(SharedString::from("这本书没有目录")),
             );
         }
 
-        // 界行色：纸兑 20% 墨的一道极细线——就是古籍版面上那条「界行」。
-        let rule_c: u32 = (crate::theme::mix(paper_u, t.ink(), 0.20) << 8) | 0x66;
-        // 当前卷洗底：朱砂兑纸 10%，淡到只见一层暖意，不做成高亮块。
-        let wash_c: u32 = (crate::theme::mix(paper_u, VERMILION, 0.10) << 8) | 0x2E;
-
         for e in toc.iter() {
             let cur = e.chapter == cur_chapter;
             let jump = e.start_char_index.unwrap_or(0);
-            let fg = if cur { VERMILION } else { MOON };
+            let fg = if cur { VERMILION } else { INK };
             let shown = Self::toc_label(&e.title, per_col);
 
-            // 竖字列：逐字一格，自上而下；整列在简条内**竖直居中**。
+            // 一列就是一个卷名：逐字一格，自上而下，**没有任何边框**。
             let mut vcol = div().flex().flex_col().items_center();
             for c in shown.chars() {
                 // 竖排标点（直角引号 / 书名号 / 居中省略号）随目录字号缩一档。
                 let mark = matches!(c, '「' | '」' | '︽' | '︾' | '︙');
-                let size = if mark { FS * 0.82 } else { FS };
+                let size = if mark { FS * 0.8 } else { FS };
                 vcol = vcol.child(
                     div()
+                        .w(px(FS + 4.0))
                         .h(px(PITCH))
                         .flex()
-                        .flex_row()
                         .items_center()
                         .justify_center()
                         .font_family(song.clone())
@@ -1827,25 +1841,8 @@ impl Root {
                         .child(SharedString::from(c.to_string())),
                 );
             }
-
-            // 一枚「竹简」：左右两道界行、上下各一枚鱼尾（尖相对），字居中。
-            let col = div()
-                .relative()
-                .h_full()
-                .w(px(strip_w))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(5.0))
+            vcol = vcol
                 .flex_shrink_0()
-                .border_l_1()
-                .border_r_1()
-                .border_color(rgba(rule_c))
-                .when(cur, |d| d.bg(rgba(wash_c)))
-                .child(Self::toc_yuwei(strip_w * 0.66, fg, true))
-                .child(vcol)
-                .child(Self::toc_yuwei(strip_w * 0.66, fg, false))
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1856,11 +1853,11 @@ impl Root {
                         cx.notify();
                     }),
                 );
-            row = row.child(col);
+            row = row.child(vcol);
         }
 
-        // 自动定位（v1.49.3）：开目录时滚到**当前在读的那卷**——294 卷的目录
-        // 若永远从第一卷起手，读到后半本的人每次都得横滚半天才找得到自己。
+        // 自动定位：开目录时滚到**当前在读的那卷**——294 卷的目录若永远从
+        // 第一卷起手，读到后半本的人每次都得横滚半天才找得到自己。
         // `scroll_to_item` 只置一次「活动项」，真正落地在下一帧 prepaint
         // （子项 bounds 出来之后），故开一次目录只需置一次。
         if self.toc_need_scroll {
@@ -1872,44 +1869,16 @@ impl Root {
             self.toc_need_scroll = false;
         }
 
-        // 顶栏：正中那行字 + 右上角「关」。
-        let head = div()
-            .relative()
-            .h(px(42.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(count_div)
-                    .child(back_div),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .right(px(18.0))
-                    .top(px(0.0))
-                    .h(px(42.0))
-                    .flex()
-                    .items_center()
-                    .child(close_btn),
-            );
-
         let drawer = div()
             .absolute()
             .left(px(0.0))
             .right(px(0.0))
             .bottom(px(off))
-            .h(px(h))
+            .h(px(H))
             .flex()
             .flex_col()
             .bg(rgba(DRAWER_BG))
-            // 顶部圆角：像一张从底下抽上来的纸。
-            .rounded(px(14.0))
+            .rounded(px(12.0))
             .border_t_1()
             .border_color(rgba(EDGE))
             .overflow_hidden()
@@ -1941,56 +1910,6 @@ impl Root {
                 }),
             )
             .child(drawer)
-    }
-
-    /// 简条上的**鱼尾**（v1.49.3）：左右两片锐角三角、中间留一道「分叉」
-    /// 缝——就是古籍版心那个像鱼尾的记号，不是实心三角。
-    ///
-    /// `down = true` 尖朝下（简条上端那枚），`false` 尖朝上（下端那枚），
-    /// 上下两枚**尖相对**，把竖字列夹在中间。
-    fn toc_yuwei(w: f32, color: u32, down: bool) -> Div {
-        let h = (w * 0.52).max(6.0);
-        let gap = w * 0.07; // 中间分叉缝的半宽
-        div().w(px(w)).h(px(h)).child(
-            canvas(
-                |_b: Bounds<Pixels>, _w: &mut Window, _c: &mut App| (),
-                move |bounds: Bounds<Pixels>, _s, window: &mut Window, _c: &mut App| {
-                    let o = bounds.origin;
-                    let x0 = o.x;
-                    let y0 = o.y;
-                    // 尖朝下：底边在上、尖端在下；尖朝上则反过来。
-                    let (base_y, tip_y) = if down {
-                        (y0, y0 + px(h))
-                    } else {
-                        (y0 + px(h), y0)
-                    };
-                    let xl = x0;
-                    let xr = x0 + px(w);
-                    let xm = x0 + px(w * 0.5);
-                    let bl = x0 + px(w * 0.5 - gap);
-                    let br = x0 + px(w * 0.5 + gap);
-                    // 左半片
-                    let mut b = PathBuilder::fill();
-                    b.move_to(point(xl, base_y));
-                    b.line_to(point(bl, base_y));
-                    b.line_to(point(xm, tip_y));
-                    b.close();
-                    if let Ok(p) = b.build() {
-                        window.paint_path(p, rgb(color));
-                    }
-                    // 右半片
-                    let mut b2 = PathBuilder::fill();
-                    b2.move_to(point(br, base_y));
-                    b2.line_to(point(xr, base_y));
-                    b2.line_to(point(xm, tip_y));
-                    b2.close();
-                    if let Ok(p) = b2.build() {
-                        window.paint_path(p, rgb(color));
-                    }
-                },
-            )
-            .size_full(),
-        )
     }
 
     /// 目录题名的**竖排净化**（v1.49.3）：先剥书名号空壳、砍掉括注，再把

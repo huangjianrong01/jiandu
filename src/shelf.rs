@@ -1081,39 +1081,40 @@ impl Root {
         b
     }
 
-    /// 书架**流式网格**（v1.49.4 全新）：彻底废弃固定列数。
+    /// 书架**网格**（v1.51.1 全新）：卡片尺寸**写死**，靠 `flex-wrap` 折行。
     ///
-    /// 卡片**定宽**（160 上下）且严格 **3:4**，`flex-wrap` 自己折行：窗口宽
-    /// 就一排排 6 本、窄了自动降到 4 本 / 3 本，卡片**绝不拉伸变形**——
-    /// 旧版「按列数均分」把书衣拉成海报，正是被嫌弃的地方。
+    /// 卡片固定 **160 × 213**（严格 3:4），外层 `flex().flex_row().flex_wrap()
+    /// .gap(px(24))` 自己算一排排得下几本：宽屏一排 6 本，窗口缩窄自动降到
+    /// 5 / 4 / 3 本，卡片**绝不拉伸变形**。
     ///
-    /// 外层再套一层**垂直滚动**：书目过百也不挤，滚轮 / 触控板上下丝滑；
+    /// 旧版「按可用宽度把余头摊回卡片」是把 CSS 思路搬进 GPUI——摊完之后
+    /// 卡片宽变成小数、子元素的绝对定位基准跟着飘，边界就散了。这一版一律
+    /// 用 GPUI 原生 `px()` 常量，一行代码都不算宽度。
+    ///
+    /// 外面再套一层**垂直滚动**：书目过百也不挤，滚轮 / 触控板上下丝滑；
     /// 滚动条压成 2px 的极细一线，不做现代那条宽滑轨，免得污了书架。
     fn render_slip_grid(
         &mut self,
         entries: &[(usize, ShelfEntry)],
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let vw = self.viewport_w;
-        let side = 40.0;
-        let gap = 28.0;
-        let avail = (vw - side * 2.0).max(240.0);
-        // 先按「基准 160 + gap」算这一排塞得下几本，再把余下的零头摊回卡片宽，
-        // 于是卡片永远落在 112~176 之间：宽屏多排、窄屏少排，比例恒为 3:4。
-        let cols = ((avail + gap) / (160.0 + gap)).floor().max(1.0);
-        let w = ((avail - gap * (cols - 1.0)) / cols).clamp(112.0, 176.0);
-        let h = w * 4.0 / 3.0; // 严格 3:4
+        // 列距 24：书与书之间留一道白，一排书目才有呼吸。
+        const GAP: f32 = 24.0;
+        const SIDE: f32 = 40.0;
         let mut grid = div()
+            // 满宽必写：滚动容器里的子项若宽度塌成「内容宽」，折行就按内容
+            // 宽算、卡片会挤成一坨；钉成 100% 才按屏宽折行。
+            .w_full()
             .flex()
             .flex_row()
             .flex_wrap()
             .items_start()
             .justify_center()
-            .gap(px(gap))
-            .px(px(side))
+            .gap(px(GAP))
+            .px(px(SIDE))
             .py(px(24.0));
         for (idx, e) in entries {
-            grid = grid.child(self.render_slip_card(*idx, e, w, h, cx));
+            grid = grid.child(self.render_slip_card(*idx, e, cx));
         }
         div()
             .id(SharedString::from("shelf-grid-scroll"))
@@ -1133,30 +1134,24 @@ impl Root {
             }))
     }
 
-    /// 一枚**书衣**（v1.49.3 第三次重做，照极简书架参考图）。
+    /// 一枚**书衣**（v1.51.1 全新）：纯 GPUI 原生布局，尺寸全部写死。
     ///
-    /// 只留三件东西，全都贴着纸边：
-    ///   * **素色布面**：五档沉静的旧色轮转，一根多余的线都不画；
-    ///   * **左上题签**：一枚白底竖条，书名竖排宋体摆在里面（线装书的招牌）；
-    ///   * **右缘作者**：极小号淡字竖排，像书脊上那一行小注；
-    ///   * 左下角一行「已读 N%」白字（未读不显示），不在封面上写 0%。
-    /// 卡片**下方**只有一行居中的书名——作者不再重复。
-    /// 一枚**书衣**（v1.49.4 全新重写）：圆角封面 + 绝对定位三件套。
-    ///
-    /// 封面＝一枚圆角矩形的**干净纯色**（五档古纸色轮转），一条多余的边框
-    /// 线都不画；里头三样东西全部 `absolute` 定位、各贴一角：
-    ///   * **左上题签**（上、左各 12）：白底小矩形，书名竖排宋体，字号较大；
-    ///   * **右缘作者**（右 12、上 16）：极小号浅灰，竖排一行小注；
-    ///   * **左下进度**（下、左各 12）：极小号「已读 N%」，未读的书不写。
-    /// 封面**下方**只有一行居中的横排书名——作者、题签、卷次一概不再重复。
-    fn render_slip_card(
-        &mut self,
-        idx: usize,
-        e: &ShelfEntry,
-        w: f32,
-        h: f32,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    /// 三件事，都靠 `px()` 钉死，不再有任何「按父容器算出来」的宽高：
+    ///   * **封面**：`w(px(160)).h(px(213))` + `.relative()` + `.rounded(px(8))`
+    ///     + 素色底（五档古纸色轮转）。`relative()` 是里头三样绝对定位的基准；
+    ///   * **题签**：`absolute().top(10).left(10)`，白底小矩形，书名竖排；
+    ///   * **作者**：`absolute().top(10).right(10)`，极小字竖排；
+    ///   * **进度**：`absolute().bottom(10).left(10)`，未读的书不写。
+    /// 封面**下方**（外层 `flex_col`）只有一行居中的横排书名——作者与其余
+    /// 标签一概不再重复。
+    fn render_slip_card(&mut self, idx: usize, e: &ShelfEntry, cx: &mut Context<Self>) -> Div {
+        // 卡片尺寸：写死。3:4 的比例、160 的宽度，一排排几本交给 flex-wrap。
+        const W: f32 = 160.0;
+        const H: f32 = 213.0;
+        // 题签：白底小矩形，贴着封面的左上角。
+        const SLIP_W: f32 = 52.0;
+        const SLIP_H: f32 = 96.0;
+
         let prog = e.progress();
         let started = prog > 0.0005;
         let pct = (prog * 100.0).round() as i32;
@@ -1166,69 +1161,69 @@ impl Root {
             crate::types::FontChoice::SongTi,
             crate::types::Script::Ancient,
         );
-        // 封面色：五档**干净的古纸色**轮转——不做深色布面、不描边、不加纹，
-        // 只在明度上错开一点点，让一排书有呼吸而不花哨。
-        const PAPERS: [u32; 5] = [0xEAE0C8, 0xE4E3D4, 0xF0E6D2, 0xE1DBCD, 0xEEE8DB];
-        let cloth = PAPERS[idx % PAPERS.len()];
+        // 封面色：五档**深青布面**轮转。上一版用「古纸色」当底，与书架底色
+        // （0xEDE4D0）几乎同色，卡片边界整个消失、字像浮在空中——这是被骂
+        // 的根因。深青压得住白题签，边界一眼就框得死。
+        const CLOTH: [u32; 5] = [0x2F4858, 0x35494E, 0x3A4A44, 0x2E4348, 0x394451];
+        let cloth = CLOTH[idx % CLOTH.len()];
 
-        // 题签：白底小矩形，宽约封面三成二、高约四成六。
-        let slip_w = (w * 0.32).clamp(40.0, 62.0);
-        let slip_h = (h * 0.46).clamp(76.0, 140.0);
         let title = vertical_block(
             &e.title,
-            slip_w - 10.0,
-            slip_h - 14.0,
-            (slip_w * 0.30).clamp(12.0, 17.0),
+            SLIP_W - 8.0,
+            SLIP_H - 8.0,
+            15.0,
             0x241F1A,
             FontWeight::MEDIUM,
         );
 
         let card = div()
+            // 容器基准：里头三样东西的 absolute 全部相对这一枚封面定位。
             .relative()
-            .w(px(w))
-            .h(px(h))
-            .overflow_hidden()
-            .rounded(px(10.0))
+            .w(px(W))
+            .h(px(H))
+            .rounded(px(8.0))
             .bg(rgb(cloth))
+            .overflow_hidden()
+            .cursor_pointer()
             // 整理态勾中：收一圈朱边（常态一条线都不画）。
             .when(picked, |d| d.border_1().border_color(rgb(CINNABAR)))
-            .cursor_pointer()
-            // ① 左上题签：上、左各 12，白底小矩形，里面竖排书名。
+            // ① 左上题签：上、左各 10，白底小矩形，里面竖排书名。
             .child(
                 div()
                     .absolute()
-                    .top(px(12.0))
-                    .left(px(12.0))
-                    .w(px(slip_w))
-                    .h(px(slip_h))
+                    .top(px(10.0))
+                    .left(px(10.0))
+                    .w(px(SLIP_W))
+                    .h(px(SLIP_H))
+                    .p(px(4.0))
+                    .overflow_hidden()
                     .flex()
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .rounded(px(2.0))
                     .bg(rgb(0xFFFFFF))
                     .child(title),
             )
-            // ② 右缘作者：右 12、上 16，极小号浅灰竖排——像书脊那行小注。
+            // ② 右缘作者：右 10、上 10，极小号浅灰竖排——像书脊那行小注。
             .child(
                 div()
                     .absolute()
-                    .right(px(12.0))
-                    .top(px(16.0))
-                    .max_h(px(h * 0.56))
+                    .right(px(10.0))
+                    .top(px(10.0))
+                    .max_h(px(H * 0.52))
                     .overflow_hidden()
-                    .child(vertical_mini(&e.author_line(), h * 0.56, 8.5, 0x9A9184)),
+                    .child(vertical_mini(&e.author_line(), H * 0.52, 8.5, 0xBCB19C)),
             )
-            // ③ 左下进度：下、左各 12，极小号；未读的书不写「已读 0%」。
+            // ③ 左下进度：下、左各 10，极小号；未读的书不写「已读 0%」。
             .when(started, |d| {
                 d.child(
                     div()
                         .absolute()
-                        .left(px(12.0))
-                        .bottom(px(12.0))
+                        .left(px(10.0))
+                        .bottom(px(10.0))
                         .font_family(song.clone())
                         .text_size(px(9.0))
-                        .text_color(rgb(0x8A8272))
+                        .text_color(rgb(0xC8BCA4))
                         .child(SharedString::from(format!("已读 {pct}%"))),
                 )
             })
@@ -1265,7 +1260,7 @@ impl Root {
 
         // 封面下：**只有书名**——居中、横排、常规字号。作者与其余标签全删。
         let name_line = div()
-            .w(px(w))
+            .w(px(W))
             .flex()
             .justify_center()
             .pt(px(10.0))
@@ -1274,20 +1269,25 @@ impl Root {
                     .font_family(song)
                     .text_size(px(13.0))
                     .text_color(rgb(INK))
-                    .child(SharedString::from(clip_title_w(&e.title, w - 4.0, 13.0))),
+                    .child(SharedString::from(clip_title_w(&e.title, W - 4.0, 13.0))),
             );
 
         let hovered = self.shelf_hover == Some(idx);
         let confirming = self.delete_confirm == Some(idx);
         let mut outer = div()
             .relative()
-            .w(px(w))
+            .w(px(W))
+            // **不许压**：flex 行里默认 `flex_shrink: 1`，一排塞不下 6 本时
+            // GPUI 会把 160 的卡片压成 130，边界与比例全废。钉死「不收缩」，
+            // 塞不下就让 `flex_wrap` 折行。
+            .flex_shrink_0()
             .flex()
             .flex_col()
+            .items_center()
             .child(card)
             .child(name_line);
         if (hovered || confirming) && !manage {
-            let bar = self.render_manage_bar(idx, w, cx);
+            let bar = self.render_manage_bar(idx, W, cx);
             let seq = self.shelf_hover_seq;
             outer = outer.child(bar.with_animation(
                 SharedString::from(format!("shelf-manage-{idx}-{seq}")),

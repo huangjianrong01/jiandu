@@ -4446,7 +4446,9 @@ impl Render for Root {
         }
         // 藏印只在阅读正文时出现：书架 / 封面是另一套书衣视觉，专注模式要
         // 把整幅纸面还给正文（一枚红印也嫌吵）。
-        let show_seal = self.screen == Screen::Reading && !self.focus_mode;
+        // 目录抽屉展开时收起纸角那枚朱印：印是画在 screen **之后**的，
+        // 若不收，它会盖在抽屉左首列的末字上（看起来像脏点）。
+        let show_seal = self.screen == Screen::Reading && !self.focus_mode && !self.show_toc;
         // v1.50.0：每帧探一眼后台导入（完成就登记入架，没完成就刷新进度）。
         self.poll_import(cx);
         let screen = self.render_screen(cx);
