@@ -1678,74 +1678,10 @@ impl Root {
 
     /// 目录侧栏（从右侧滑入的古风卷目面板）。
     ///
-    /// 不画现代列表：章名以「竹简条」竖排、从右向左排列，宋体、月白；
-    /// 当前所在章用朱砂红标出（加粗 + 描边）。点击章即按该章首字下标
+    /// 不画现代列表：一卷一行、单列自上而下，题名横排一句读完，宋体、墨色；
+    /// 当前所在章用朱砂红标出（加粗 + 朱点）。点击章即按该章首字下标
     /// （`start_char_index`）重新排版并跳到第一叶。点面板外空白处平滑收起
     /// （由 `toc_slide` 驱动滑出动画）。
-    /// **目录章名专用竖排**（v1.30.0 立，v1.47.0 改折列）。
-    ///
-    /// 目录不与正文共用那套 100% 严格的字格：章名长短本就不齐（
-    /// 「十五卷 四书」四个字、「第一回 宴桃園豪傑三結義」十几个字），
-    /// 硬塞进等高格子只会互相迁就——长的被截断、短的底下空一大截。
-    ///
-    /// v1.47.0 起单走一条：
-    ///   * **折列竖排**：按 `per_col` 字一列折成若干竖列，读序与古籍一致——
-    ///     竖排（古文）首列在最右、横排（现代）首列在最左。长章名不再
-    ///     被单列拉成一整屏的高竹简，行高有界，列表才排得规整；
-    ///   * **高度由内容撑开**（`per_col * max_cols` 只是防失控的上限）；
-    ///   * **字距固定**（`gap`），列间距也固定，疏密一致；
-    ///   * **空书名号剔除**：`︽︾` / `《》` 里没裹字的一律删掉——目录里
-    ///     常见这种空壳，竖排时变成两个孤零零的小角标，把行气戳断；
-    ///   * 书名号用竖排形 `︽ ︾`、字号比正文小一档（0.7），不抢章名。
-    fn toc_title_columns(
-        title: &str,
-        fs: f32,
-        fg: u32,
-        bold: bool,
-        family: &SharedString,
-        rtl: bool,
-        per_col: usize,
-        max_cols: usize,
-    ) -> Div {
-        let clean = crate::types::strip_empty_title_marks(title);
-        let txt = clip_chars(&clean, per_col * max_cols);
-        let cols: Vec<String> = txt
-            .chars()
-            .collect::<Vec<char>>()
-            .chunks(per_col)
-            .map(|c| c.iter().collect::<String>())
-            .collect();
-        let mut row = div().flex().flex_row().items_start().gap(px(5.0));
-        // 竖排右起：首列在最右；横排左起：首列在最左。
-        let order: Vec<&String> = if rtl {
-            cols.iter().rev().collect()
-        } else {
-            cols.iter().collect()
-        };
-        for chunk in order {
-            let mut col = div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px((fs * 0.12).max(1.0)))
-                .font_family(family.clone());
-            for c in chunk.chars() {
-                let is_mark = crate::types::is_title_mark(c);
-                let shown = crate::types::title_mark(c);
-                let size = if is_mark { fs * crate::punct::TITLE_FS_RATIO } else { fs };
-                col = col.child(
-                    div()
-                        .text_size(px(size))
-                        .when(bold && !is_mark, |d| d.font_weight(FontWeight::BOLD))
-                        .text_color(rgb(fg))
-                        .child(SharedString::from(shown.to_string())),
-                );
-            }
-            row = row.child(col);
-        }
-        row
-    }
-
     #[allow(non_snake_case)]
     fn render_toc_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let vw = self.viewport_w;
@@ -1753,17 +1689,19 @@ impl Root {
         let Some(book) = self.book.as_ref() else {
             return div();
         };
-        // 面板配色（v1.47.0）：**实色宣纸**——透明度归零。
-        // v1.46.0 用 0xEC 毛玻璃 + 字节序写错的透明遮罩，背后的正文与界栏
-        // 直接穿透上来，正是「渲染灾难」的根源；现在整块面板是不透的素宣，
-        // 只靠明暗与纸面拉开层次（面板比纸面略亮、朱批栏略深一档）。
         let t = self.theme;
-        let PANEL_BG: u32 = crate::theme::mix(t.paper(), 0xFFFFFF, 0.05); // 面板底：素宣
-        let PANEL_BG2: u32 = crate::theme::mix(t.paper(), 0xFFFFFF, 0.10); // 表头：再亮一档
+        // 面板配色（v1.49.2）：**薄宣纸半透**——彻底废除「比纸面更亮的实色」，
+        // 改用与正文同款的宣纸 + 极淡磨砂半透明，像一张盖在书上的薄纸，
+        // 与左侧古籍排版融为一体，告别「现代白色网页」的割裂感。
+        // `rgba` 收 0xRRGGBBAA：底色取纸色，alpha≈0xE0（约 88%）留一丝透感，
+        // 背后的书页（paper_back 更深一档）微微透上来，面板不再死白。
+        let paper_u: u32 = t.paper();
+        let PANEL_BG: u32 = (paper_u << 8) | 0xE0; // 面板底：半透宣纸
+        let PANEL_BG2: u32 = (crate::theme::mix(paper_u, 0xFFFFFF, 0.06) << 8) | 0xEA; // 表头：再透一档
+        let PANEL_EDGE: u32 = (t.rule() << 8) | 0x4D; // 面板左缘 / 表头底线：极淡墨线
         let MOON: u32 = t.ink(); // 章名字色
         let MOON_DIM: u32 = t.ink_soft(); // 小字 / 叶码 / 提示
         let VERMILION: u32 = sheet_zhu(t); // 朱砂红：当前章 / 标记
-        let LINE: u32 = t.rule(); // 分隔线
         let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
 
         // 目录条目先克隆出来：后面要用 &mut self 构建侧栏（划线跳页），
@@ -1784,18 +1722,25 @@ impl Root {
         // 侧栏宽度：占视口 37%、上限 400、下限 260——窄侧栏，留住 0.618 正文视野。
         let panel_w = (vw * 0.37).min(400.0).max(260.0);
         let head_h = 52.0;
+        // 朱批栏宽：200 为常态，面板本身就窄时按 34% 收——朱批只是窄窄一条
+        // 批注栏，别反过来把目录挤成一条缝（294 卷的题名要读得完）。
+        let mk_w = 200.0_f32.min(panel_w * 0.34);
+        let list_w = panel_w - mk_w;
 
-        // ── 左栏：目录列表（v1.47.0 重写）────────────────────────────
-        // **只渲染纯文本的竖排章名**：鱼尾纹、「第N葉」方块全部删除——那些
-        // 花活正是「程序员控制台感」的根源。一列一行、自上而下：行首一枚
-        // 朱点标当前卷，章名竖排折列，层级用缩进分档；列表超长走鼠标滚轮
-        // 平滑滚动（`overflow_y_scroll` 与字典浮签同款自滚）。
+        // ── 左栏：目录列表（v1.49.2 重写）────────────────────────────
+        // **一卷一行、单列自上而下**：鱼尾纹、「第N葉」方块、竖排折列全部
+        // 删除——v1.47 那套「章名竖排折三列」把 294 卷挤成一堵竖字墙，
+        // 相邻卷目的字形彼此叠压，根本读不出去。现在每条只占一行、题名横排
+        // 一句读完，层级用缩进分档；列表超长走滚轮平滑滚动。
         let mut list = div()
             .id(SharedString::from("toc-list"))
             .flex_1()
             .flex()
             .flex_col()
             .overflow_y_scroll()
+            // v1.49.2：卷目动辄数百（478 卷也不怕），列表内部自滚；滚动条压到
+            // 3px 的极细一线，不做现代网页那种宽滑轨。
+            .scrollbar_width(px(3.0))
             .py_1();
         if toc.is_empty() {
             list = list.child(
@@ -1811,24 +1756,40 @@ impl Root {
             let cur = e.chapter == cur_chapter;
             // 跳转下标：优先用已算好的 start_char_index，缺失则退回章首面。
             let jump_idx = e.start_char_index.unwrap_or(0);
-            // 三档字号区分层级；章名一律竖排（6 字一列、至多 3 列）。
+            // 三档字号区分层级（不再折列）：一级卷目略大，三级最小。
             let fs = match e.level {
-                1 => 16.0,
-                2 => 14.0,
-                _ => 12.5,
+                1 => 13.0,
+                2 => 12.0,
+                _ => 11.0,
             };
             let fg = if cur { VERMILION } else { MOON };
-            let title = Self::toc_title_columns(&e.title, fs, fg, cur, &song, rtl, 6, 3);
+            // 题名横排一句读完：先剥书名号空壳，再按可用宽度裁字——宁可尾巴
+            // 断字，也不让长题名折行把行高撑歪（294 卷时才看得出整齐）。
+            let indent = (e.level.max(1) - 1) as f32 * 14.0;
+            let avail = (list_w - 24.0 - 5.0 - 9.0 - indent - 4.0).max(48.0);
+            let cap = ((avail / fs) as usize).max(4);
+            let label = crate::types::strip_empty_title_marks(&e.title);
+            let title = div()
+                .font_family(song.clone())
+                .text_size(px(fs))
+                .text_color(rgb(fg))
+                .when(cur, |d| d.font_weight(FontWeight::BOLD))
+                .child(SharedString::from(clip_chars(&label, cap)));
             // 行首固定槽：当前卷落一枚朱点，未选留空——槽宽恒定，章名左缘
             // 一律对齐，不会因「有无圆点」来回跳动。
             let dot = div()
                 .w(px(5.0))
                 .h(px(5.0))
-                .mt(px(3.0))
                 .flex_shrink_0()
                 .rounded_full()
                 .when(cur, |d| d.bg(rgb(VERMILION)));
-            let mut content = div().flex().flex_row().items_start().gap(px(9.0));
+            // 行首朱点与题名同一基线居中（items_center 已对齐，不再补 mt）。
+            let mut content = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(9.0))
+                .min_w(px(0.0));
             content = content.child(dot);
             // 层级缩进：二级进一格、三级进两格（固定宽槽，不推挤邻行）。
             for _ in 1..e.level.max(1) {
@@ -1841,7 +1802,8 @@ impl Root {
                     .flex_row()
                     .items_center()
                     .px_3()
-                    .py_2()
+                    // 单行行高：14 号字配 6px 上下留白，一卷一行，密而不挤。
+                    .py(px(6.0))
                     .cursor_pointer()
                     // 当前卷：极淡朱砂底 + 朱砂章名；未选行悬停：极淡墨底。
                     .when(cur, |d| d.bg(rgb(crate::theme::mix(t.paper(), VERMILION, 0.05))))
@@ -1864,7 +1826,7 @@ impl Root {
         }
 
         // 右栏：朱批（划线栏）——与目录**干净的左右分栏**，各占一栏。
-        let mk_col = self.render_toc_column(&pages, rtl, 200.0, cx);
+        let mk_col = self.render_toc_column(&pages, rtl, mk_w, cx);
 
         let title_div = div()
             .text_size(px(14.0))
@@ -1939,9 +1901,9 @@ impl Root {
                 .justify_between()
                 .h(px(head_h))
                 .px_4()
-                .bg(rgb(PANEL_BG2))
+                .bg(rgba(PANEL_BG2))
                 .border_b_1()
-                .border_color(rgb(LINE))
+                .border_color(rgba(PANEL_EDGE))
                 .child(meta)
                 .child(
                     div()
@@ -1960,9 +1922,9 @@ impl Root {
                 .justify_between()
                 .h(px(head_h))
                 .px_4()
-                .bg(rgb(PANEL_BG2))
+                .bg(rgba(PANEL_BG2))
                 .border_b_1()
-                .border_color(rgb(LINE))
+                .border_color(rgba(PANEL_EDGE))
                 .child(
                     div()
                         .flex()
@@ -2001,9 +1963,9 @@ impl Root {
             .w(px(panel_w))
             .flex()
             .flex_col()
-            .bg(rgb(PANEL_BG))
+            .bg(rgba(PANEL_BG))
             .border_l_1()
-            .border_color(rgb(LINE))
+            .border_color(rgba(PANEL_EDGE))
             .overflow_hidden()
             // 拦住冒泡：点面板内（章 / 划线 / 关闭钮）不触发外层遮罩的关闭。
             .on_mouse_down(
@@ -2067,12 +2029,14 @@ impl Root {
         let MOON: u32 = t.ink();
         let MOON_DIM: u32 = t.ink_soft();
         let VERMILION: u32 = sheet_zhu(t);
-        let LINE: u32 = t.rule();
-        // v1.48.0 视觉融合：朱批栏与目录面板**同一层素宣**（不再是「略深一档」
-        // 的第二块底）——摊开来是一整张纸，两栏之间只留一道极细墨线。
-        let COL_BG: u32 = crate::theme::mix(t.paper(), 0xFFFFFF, 0.05);
-        // 极细墨线：纸色兑 16% 墨——比界行还淡一档，只作「两栏的分宜」。
-        let SEPT: u32 = crate::theme::mix(t.paper(), t.ink(), 0.16);
+        // v1.49.2 视觉融合：朱批栏与目录面板**同一张半透薄宣**（不再是深浅不一的两块底），
+        // 摊开来是一整张盖在书上的薄纸，两栏之间只留一道极淡墨线。
+        let paper_u: u32 = t.paper();
+        let COL_BG: u32 = (paper_u << 8) | 0xE0; // 与目录面板同一层半透宣纸
+        // 极淡墨线：纸色兑 14% 墨 + 低 alpha——比界行还淡，只作「两栏的分宜」。
+        // v1.49.2：淡到 0x4D（约三成）——古籍本就用「界行」这条实线分栏，
+        // 不必改成虚线；把它压到近乎留白的一道墨痕，就不再有现代分割线的硬。
+        let SEPT: u32 = (crate::theme::mix(paper_u, t.ink(), 0.14) << 8) | 0x4D;
         // 字体：摘录 / 叶码 / 计数一律走**与正文同款**的书体（宋体），
         // 提示语走楷体——整栏不再有系统默认黑体的现代后台味。
         let song = crate::fonts::family_for(self.current_font(), Script::Ancient);
@@ -2086,7 +2050,8 @@ impl Root {
             .gap(px(14.0))
             .px_3()
             .py_3()
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .scrollbar_width(px(3.0));
 
         // 划线按「面」聚合：一面上连续划过的字合成一条，便于回看。
         let mut marks: Vec<(usize, String, Option<String>)> = Vec::new();
@@ -2128,10 +2093,13 @@ impl Root {
             }
             list = list.child(
                 div()
+                    .flex_1()
                     .flex()
                     .flex_row()
+                    // v1.49.2：横竖双向居中——竖排小楷落在朱批栏正中，像天头
+                    // 一句候白，而不是顶在栏顶的一行现代提示。
                     .justify_center()
-                    .pt(px(30.0))
+                    .items_center()
                     .child(vcol),
             );
         }
@@ -2251,7 +2219,7 @@ impl Root {
             .py_2()
             // 表头与列表之间也只留一道极细墨线（v1.48.0：去生硬分割线）。
             .border_b_1()
-            .border_color(rgb(SEPT))
+            .border_color(rgba(SEPT))
             .child(
                 div()
                     .font_family(song.clone())
@@ -2273,11 +2241,11 @@ impl Root {
             .h_full()
             .flex()
             .flex_col()
-            // v1.48.0：与目录面板同一层素宣——不再是第二块深浅不一的底。
-            .bg(rgb(COL_BG))
-            // 分栏只隔一道极细墨线（目录恒在左、朱批恒在右，线恒画左侧）。
+            // v1.49.2：与目录面板同一张半透薄宣——不再是第二块深浅不一的底。
+            .bg(rgba(COL_BG))
+            // 分栏只隔一道极淡墨线（目录恒在左、朱批恒在右，线恒画左侧）。
             .border_l_1()
-            .border_color(rgb(SEPT));
+            .border_color(rgba(SEPT));
         col.child(head).child(list)
     }
 
