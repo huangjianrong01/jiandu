@@ -563,7 +563,8 @@ pub(crate) mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = temp_home("epub");
         std::env::set_var("JIANDU_HOME", &home);
-        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples/daodejing-toc.epub");
+        // 样张在仓库根的 samples/（本 crate 在 core/，路径退一级）。
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../samples/daodejing-toc.epub");
         assert!(src.exists(), "样张 epub 应存在");
         let mut lib = Library::load();
         let idx = lib.import_path(&src).expect("导入 epub 应成功");

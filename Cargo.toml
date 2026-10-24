@@ -1,6 +1,9 @@
+[workspace]
+members = ["core"]
+
 [package]
 name = "jiandu"
-version = "1.46.0"
+version = "1.47.0"
 edition = "2021"
 description = "笺读 · 一个用 Rust + GPUI 写的原生中文阅读器（古文竖笺 / 现代横笺）"
 license = "MIT"
@@ -15,6 +18,9 @@ path = "src/main.rs"
 # 固定 crates.io 稳定版（0.2.2）——zed 的 main 分支 API 每天都在变，
 # 跟随它会导致「昨天还能编译、今天报一堆错」；固定版本保证可复现构建。
 gpui = "0.2.2"
+# 纯逻辑核心（v1.47.0 解耦）：网格排版 / 解析器 / 字典查询在此，
+# 零 GPUI 依赖，为移植 iOS 做准备。
+jiandu-core = { path = "core" }
 # 文本与结构
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

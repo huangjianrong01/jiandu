@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>古籍书签抽屉 · Bookmark Drawer 原型</title>
+<style>
+  :root{
+    --paper:#f3ead6;          /* 宣纸 */
+    --paper-deep:#e8dcc0;
+    --ink:#2b2620;            /* 墨 */
+    --ink-soft:#6b5d45;
+    --zhu:#b23a30;            /* 朱砂 */
+    --rule:rgba(120,90,60,.30);
+    --drawer-bg:rgba(243,234,214,.82);
+    --dw:300px;               /* 抽屉宽，由 JS 动态写入 */
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;height:100%;font-family:"Songti SC","STSong","Source Han Serif SC",serif;background:#cdbf9e;}
+  body{overflow:hidden;}
+
+  /* ===== 主阅读区（替代 Canvas 容器） ===== */
+  .stage{
+    position:relative;height:100vh;width:100%;
+    /* 挤压动画：展开/收起时只动 width（CSS 盒模型），不重算排版 */
+    transition:width .35s cubic-bezier(.22,1,.36,1);
+    overflow:hidden;
+  }
+  .paper{
+    position:absolute;inset:0;background:var(--paper);
+    box-shadow:inset 0 0 120px rgba(120,90,60,.12);
+    display:flex;
+  }
+  .book{
+    writing-mode:vertical-rl;          /* 竖排：右起、列向左排 */
+    text-orientation:upright;
+    height:100%;padding:56px 48px;
+    font-size:23px;line-height:2.0;letter-spacing:.04em;
+    column-width:56px;column-gap:30px; /* 列宽/列距，calculateGrid 会据此推算列数 */
+    color:var(--ink);overflow:hidden;
+  }
+  .book .ch{display:block;margin-block-end:.4em;font-weight:600;}
+  .hud{
+    position:absolute;top:14px;left:14px;z-index:5;
+    font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--ink-soft);
+    background:rgba(255,255,255,.45);padding:5px 9px;border-radius:7px;
+    border:1px solid var(--rule);white-space:nowrap;
+  }
+
+  /* ===== 暗色遮罩（窄屏覆盖模式用） ===== */
+  .mask{
+    position:fixed;inset:0;background:rgba(0,0,0,.2);
+    opacity:0;pointer-events:none;transition:opacity .3s ease;z-index:57;
+  }
+
+  /* ===== 抽屉面板 ===== */
+  .drawer{
+    position:fixed;top:0;right:0;height:100%;width:var(--dw);
+    background:var(--drawer-bg);
+    -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px); /* 高斯模糊 */
+    border-left:1px solid var(--rule);
+    box-shadow:-10px 0 36px rgba(0,0,0,.18);
+    transform:translateX(var(--dw));   /* 默认藏到屏幕右侧外 */
+    z-index:58;display:flex;flex-direction:column;color:var(--ink);
+    will-change:transform;
+  }
+  .drawer-head{
+    padding:18px 18px 12px;display:flex;align-items:center;gap:10px;
+    border-bottom:1px solid var(--rule);
+  }
+  .drawer-head .title{writing-mode:vertical-rl;font-size:20px;letter-spacing:.18em;color:var(--zhu);}
+  .drawer-head .sub{font-size:12px;color:var(--ink-soft);flex:1;}
+  .drawer-head .close{
+    width:30px;height:30px;border-radius:50%;border:1px solid var(--rule);
+    background:transparent;color:var(--ink-soft);font-size:16px;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .drawer-search{
+    margin:12px 18px;padding:8px 12px;border:1px solid var(--rule);border-radius:8px;
+    background:rgba(255,255,255,.5);font-size:13px;color:var(--ink);
+    display:flex;align-items:center;gap:8px;
+  }
+  .drawer-search input{flex:1;border:0;background:transparent;outline:none;font-size:13px;color:var(--ink);}
+  .drawer-list{flex:1;overflow-y:auto;padding:4px 14px 24px;}
+  .toc-group{font-size:12px;color:var(--ink-soft);margin:14px 4px 6px;letter-spacing:.1em;}
+  .toc-item{
+    position:relative;display:flex;align-items:center;gap:10px;
+    padding:11px 12px 11px 16px;margin:6px 0;border-radius:8px;cursor:pointer;
+    background:rgba(255,255,255,.32);transition:background .18s,transform .18s;
+  }
+  .toc-item:hover{background:rgba(178,58,48,.10);transform:translateX(-2px);}
+  .toc-item.active{background:rgba(178,58,48,.16);}
+  .toc-item .bm{                 /* 小书签标记 */
+    width:6px;height:34px;border-radius:3px;background:var(--zhu);flex:none;
+  }
+  .toc-item .name{writing-mode:vertical-rl;font-size:17px;letter-spacing:.06em;max-height:96px;overflow:hidden;}
+  .toc-item .pg{margin-left:auto;font-size:11px;color:var(--ink-soft);font-family:ui-monospace,monospace;}
+
+  /* ===== 右侧透明热区 + 朱砂书签 ===== */
+  .hotzone{
+    position:fixed;top:0;right:0;width:20px;height:100%;z-index:60;
+    cursor:ew-resize;touch-action:none;
+  }
+  .bookmark{
+    position:fixed;top:36%;right:0;width:46px;height:144px;z-index:62;
+    background:linear-gradient(165deg,#c64b40,#a8312a);
+    border-radius:9px 0 0 9px;
+    box-shadow:-3px 0 10px rgba(0,0,0,.28);
+    transform:translateX(23px);          /* 默认只露出一半（23px 在屏内，23px 压在热区/屏外） */
+    transition:transform .25s ease;
+    display:flex;align-items:center;justify-content:center;
+    color:#f3ead6;writing-mode:vertical-rl;font-size:24px;letter-spacing:.22em;
+    cursor:pointer;user-select:none;touch-action:none;will-change:transform;
+  }
+  .bookmark:active{filter:brightness(.95);}
+
+  .hint{position:fixed;bottom:14px;left:14px;z-index:40;font-size:12px;color:#5b4d38;
+    background:rgba(255,255,255,.4);padding:6px 10px;border-radius:8px;border:1px solid var(--rule);max-width:60vw;}
+</style>
+</head>
+<body>
+  <!-- 主阅读区（模拟 Canvas 容器） -->
+  <div class="stage" id="stage">
+    <div class="paper">
+      <div class="book" id="book"></div>
+    </div>
+    <div class="hud" id="hud">画布 — · 列数 —</div>
+  </div>
+
+  <!-- 遮罩（窄屏覆盖模式） -->
+  <div class="mask" id="mask"></div>
+
+  <!-- 抽屉：目录 / 书签 -->
+  <aside class="drawer" id="drawer">
+    <div class="drawer-head">
+      <div class="title">目次</div>
+      <div class="sub">书签抽屉 · 取代生硬弹窗</div>
+      <button class="close" id="closeBtn" aria-label="收起">×</button>
+    </div>
+    <div class="drawer-search">
+      <span>🔍</span><input id="search" placeholder="检索卷次 / 篇名…" />
+    </div>
+    <div class="drawer-list" id="list"></div>
+  </aside>
+
+  <!-- 右侧透明热区 + 朱砂书签 -->
+  <div class="hotzone" id="hotzone"></div>
+  <div class="bookmark" id="bookmark">笺读</div>
+
+  <div class="hint">桌面：悬停右侧热区→书签探出；点击/左拖书签开抽屉（不过半弹回）。&nbsp;移动：从屏幕最右 30px 边缘左滑跟手拖出（过 40% 自动展开）。</div>
+
+<script>
+"use strict";
+/* =========================================================================
+ * 古籍书签抽屉（Bookmark Drawer）
+ * 设计要点：
+ *   - 桌面：鼠标 hover 提示 + 点击/拖拽开合（阈值为抽屉宽 50%）
+ *   - 移动：屏幕最右 30px 边缘 touch 手势，跟手拖动（阈值为抽屉宽 40%）
+ *   - 宽屏：抽屉展开时主区 CSS width 平滑“挤压”；窄屏：覆盖 + 暗色遮罩
+ *   - 拖拽中只动 CSS（translateX / width），不重算排版；
+ *     动画结束（transitionend）→ requestAnimationFrame 重排 resizeCanvas + calculateGrid
+ * ========================================================================= */
+
+const stage    = document.getElementById('stage');
+const drawer   = document.getElementById('drawer');
+const bookmark = document.getElementById('bookmark');
+const hotzone  = document.getElementById('hotzone');
+const mask     = document.getElementById('mask');
+const closeBtn = document.getElementById('closeBtn');
+const search   = document.getElementById('search');
+const list     = document.getElementById('list');
+const hud      = document.getElementById('hud');
+
+const EDGE = 30;                 // 移动端右缘手势触发宽度
+const NARROW_BP = 600;           // 窄屏断点：覆盖模式
+
+let dw = computeDW();            // 抽屉宽度（px）
+let open = false;                // 是否展开
+let dragging = false;
+let dragStartX = 0;
+let dragStartReveal = 0;         // 起拖时已经露出的距离
+let reveal = 0;                  // 当前露出距离 0..dw
+
+function computeDW(){
+  const w = window.innerWidth;
+  if (w <= NARROW_BP) return Math.round(w * 0.82);   // 窄屏：占屏 82%
+  return Math.min(300, Math.round(w * 0.35));         // 宽屏：300px 或 35%
+}
+function isNarrow(){ return window.innerWidth <= NARROW_BP; }
+
+/* 把抽屉宽写入 CSS 变量与元素 */
+function applyDrawerWidth(){
+  document.documentElement.style.setProperty('--dw', dw + 'px');
+  drawer.style.width = dw + 'px';
+}
+
+/* 唯一的“露出量→视觉”映射：拖拽 / 开 / 关 全走这里 */
+function applyReveal(r){
+  reveal = Math.max(0, Math.min(dw, r));
+  // 抽屉：hidden=translateX(dw)，open=translateX(0)
+  drawer.style.transform = `translateX(${dw - reveal}px)`;
+  // 书签：闭=+23（半露），开=-(dw-23)（贴在抽屉左缘、半露），线性跟随
+  bookmark.style.transform = `translateX(${23 - reveal}px)`;
+  // 宽屏跟手挤压（仅 CSS width，不重算网格；reveal=0 时自动复位 100%）
+  if (!isNarrow()){
+    stage.style.width = `calc(100% - ${reveal}px)`;
+  }
+}
+
+/* 关掉所有过渡，准备跟手拖拽 */
+function freezeTransitions(){
+  drawer.style.transition = 'none';
+  bookmark.style.transition = 'none';
+  stage.style.transition = 'none';
+  mask.style.transition = 'none';
+}
+
+/* ---------------------------------------------------------------------------
+ * 拖拽核心：被鼠标(mousedown)与触摸(touchstart)共用
+ * ------------------------------------------------------------------------- */
+function beginDrag(clientX){
+  if (dragging) return;
+  dragging = true;
+  dragStartX = clientX;
+  dragStartReveal = open ? dw : 0;   // 从当前状态起拖
+  freezeTransitions();
+  document.body.style.userSelect = 'none';
+}
+
+function moveDrag(clientX){
+  if (!dragging) return;
+  const dx = dragStartX - clientX;          // 向左拖为正
+  applyReveal(dragStartReveal + dx);
+}
+
+function endDrag(){
+  if (!dragging) return;
+  dragging = false;
+  document.body.style.userSelect = '';
+  const threshold = dw * (isNarrow() ? 0.40 : 0.50);  // 移动 40% / 桌面 50%
+  if (reveal > threshold) openDrawer();
+  else                    closeDrawer();
+}
+
+/* ---------------------------------------------------------------------------
+ * 开 / 关（带过渡 + 收尾重排）
+ * ------------------------------------------------------------------------- */
+function openDrawer(){
+  open = true;
+  drawer.style.transition   = 'transform .35s cubic-bezier(.22,1,.36,1)';
+  bookmark.style.transition = 'transform .35s cubic-bezier(.22,1,.36,1)';
+  stage.style.transition    = isNarrow() ? 'none' : 'width .35s cubic-bezier(.22,1,.36,1)';
+  mask.style.transition     = 'opacity .3s ease';
+
+  applyReveal(dw);
+
+  if (isNarrow()){
+    // 窄屏：覆盖正文 + 暗色遮罩
+    stage.style.width = '100%';
+    mask.style.opacity = '1';
+    mask.style.pointerEvents = 'auto';
+  } else {
+    // 宽屏：挤压主区
+    mask.style.opacity = '0';
+    mask.style.pointerEvents = 'none';
+    stage.style.width = `calc(100% - ${dw}px)`;
+  }
+  onSettled();
+}
+
+function closeDrawer(){
+  open = false;
+  drawer.style.transition   = 'transform .35s cubic-bezier(.22,1,.36,1)';
+  bookmark.style.transition = 'transform .35s cubic-bezier(.22,1,.36,1)';
+  stage.style.transition    = isNarrow() ? 'none' : 'width .35s cubic-bezier(.22,1,.36,1)';
+  mask.style.transition     = 'opacity .3s ease';
+
+  applyReveal(0);
+  mask.style.opacity = '0';
+  mask.style.pointerEvents = 'none';
+  if (!isNarrow()) stage.style.width = '100%';
+  onSettled();
+}
+
+/* 动画结束后，用双 rAF 在下一帧重排：resizeCanvas + 重算网格（防掉帧） */
+function onSettled(){
+  let done = false;
+  const fire = () => {
+    if (done) return; done = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      resizeCanvas();
+      calculateGrid();
+    }));
+  };
+  drawer.addEventListener('transitionend', fire, { once:true });
+  setTimeout(fire, 420); // 兜底（transitionend 可能因无变化不触发）
+}
+
+/* ---------------------------------------------------------------------------
+ * 模拟 Canvas 自适应（替代 resizeCanvas / calculateGrid）
+ * 真实项目里这里应调用引擎 resizeCanvas() 与 calculate_grid()。
+ * ------------------------------------------------------------------------- */
+function resizeCanvas(){
+  // 这里仅确保 book 填满 stage（CSS 已自适应）；真实引擎需重设 canvas 尺寸。
+}
+function calculateGrid(){
+  const w = stage.clientWidth;
+  const colW = 56;                                  // 与 CSS column-width 对应
+  const cols = Math.max(1, Math.floor((w - 96) / colW));
+  hud.textContent = `画布宽 ${w}px · 推算列数 ${cols} · 列宽 ${colW}px`;
+}
+
+/* ====================== 事件绑定 ====================== */
+
+/* 桌面：热区 hover → 书签探出 10px 提示（不覆盖拖拽中的内联 transform） */
+hotzone.addEventListener('mouseenter', () => {
+  if (!open && !dragging) bookmark.style.transform = 'translateX(13px)';
+});
+hotzone.addEventListener('mouseleave', () => {
+  if (!open && !dragging) bookmark.style.transform = 'translateX(23px)';
+});
+
+/* 桌面：书签 鼠标按下/拖拽 开合 */
+bookmark.addEventListener('mousedown', (e) => { e.preventDefault(); beginDrag(e.clientX); });
+document.addEventListener('mousemove', (e) => { if (dragging) moveDrag(e.clientX); });
+document.addEventListener('mouseup',   () => { if (dragging) endDrag(); });
+
+/* 移动端：屏幕最右 EDGE px 边缘 touchstart → 开合手势（跟手） */
+document.addEventListener('touchstart', (e) => {
+  const t = e.touches[0];
+  if (!open && t.clientX >= window.innerWidth - EDGE){
+    e.preventDefault();
+    beginDrag(t.clientX);
+  }
+}, { passive:false });
+
+/* 移动端：在抽屉本体上左滑 → 收起（open 状态下也能拖） */
+drawer.addEventListener('touchstart', (e) => {
+  if (open){ e.preventDefault(); beginDrag(e.touches[0].clientX); }
+}, { passive:false });
+
+/* 移动端：跟手 move / 收尾 end —— 核心“手指滑到哪抽屉跟到哪” */
+document.addEventListener('touchmove', (e) => {
+  if (!dragging) return;
+  e.preventDefault();                       // 阻止页面滚动
+  moveDrag(e.touches[0].clientX);
+}, { passive:false });
+document.addEventListener('touchend', () => { if (dragging) endDrag(); });
+document.addEventListener('touchcancel', () => { if (dragging) endDrag(); });
+
+/* 关闭按钮 + 点遮罩关闭 */
+closeBtn.addEventListener('click', closeDrawer);
+mask.addEventListener('click', closeDrawer);
+
+/* 窗口尺寸变化：重算抽屉宽，并按当前开关态复位（开放则重新挤压） */
+window.addEventListener('resize', () => {
+  const wasOpen = open;
+  dw = computeDW();
+  applyDrawerWidth();
+  if (wasOpen){
+    applyReveal(dw);
+    if (!isNarrow()){
+      stage.style.width = `calc(100% - ${dw}px)`;
+      mask.style.opacity = '0'; mask.style.pointerEvents = 'none';
+    } else {
+      stage.style.width = '100%';
+      mask.style.opacity = '1'; mask.style.pointerEvents = 'auto';
+    }
+  } else {
+    applyReveal(0);
+    stage.style.width = '100%';
+    mask.style.opacity = '0';
+  }
+  calculateGrid();
+});
+
+/* ====================== 内容：目录 + 竖排正文 ====================== */
+const CHAPTERS = [
+  {g:'卷一 · 天文', items:[['天地玄黄','3'],['日月盈昃','9'],['寒来暑往','15']]},
+  {g:'卷二 · 人事', items:[['君子之道','22'],['三省吾身','28'],['温故知新','34']]},
+  {g:'卷三 · 山川', items:[['高山仰止','41'],['川流不息','47'],['登楼赋','53']]},
+  {g:'卷四 · 草木', items:[['兰之猗猗','60'],['竹解虚心','66'],['采薇采薇','72']]},
+  {g:'卷五 · 艺文', items:[['诗言志','80'],['书不尽言','86'],['乐而不淫','92']]},
+];
+(function renderTOC(){
+  let html = '';
+  for (const grp of CHAPTERS){
+    html += `<div class="toc-group">${grp.g}</div>`;
+    for (const [name, pg] of grp.items){
+      html += `<div class="toc-item"><span class="bm"></span><span class="name">${name}</span><span class="pg">p.${pg}</span></div>`;
+    }
+  }
+  list.innerHTML = html;
+  list.querySelectorAll('.toc-item').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      list.querySelectorAll('.toc-item').forEach(x=>x.classList.remove('active'));
+      el.classList.add('active');
+      if (!open) openDrawer();   // 选章即展开（若未开）
+    });
+  });
+})();
+
+(function renderBook(){
+  const poem =
+    '天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏闰余成岁律吕调阳云腾致雨露结为霜金生丽水玉出昆冈剑号巨阙珠称夜光。'+
+    '君子之道忠恕而已矣吾日三省吾身为人谋而不忠乎与朋友交而不信乎传不习乎温故而知新可以为师矣。'+
+    '高山仰止景行行止虽不能至心向往之川流不息渊深鱼跃登楼之赋极目千里。'+
+    '兰之猗猗扬扬其香不采而佩于兰何伤竹解虚心是我师焉采薇采薇亦采其棘。'+
+    '诗言志歌永言声依永律和声书不尽言言不尽意乐而不淫哀而不伤。';
+  const book = document.getElementById('book');
+  book.innerHTML = '<span class="ch">笺读 · 书签抽屉样张</span>' + poem;
+})();
+
+/* ====================== 初始化 ====================== */
+applyDrawerWidth();
+applyReveal(0);
+calculateGrid();
+</script>
+</body>
+</html>

@@ -543,39 +543,6 @@ fn text_action(label: &'static str, icon: ActionIcon, t: Theme) -> Div {
 
 /// 注释全局编号：(章, 段, 偏移) -> 序号。
 type NoteIndex = HashMap<(usize, usize, usize), usize>;
-
-/// 鱼尾纹：一枚分叉尾（top=true 朝下、false 朝上），贴竹简条两端。
-///
-/// 形状由 `app::ensure_assets()` 写到书架主目录的 SVG 提供，经 `svg()` + AssetSource 加载；
-/// SVG 内的 fill 仅决定 alpha（GPUI 用元素 text_color 重新上色），故这里用近黑着色。
-fn fish_tail(width: f32, top: bool) -> Div {
-    fish_tail_ink(width, top, 0x1A150F)
-}
-
-/// 鱼尾纹（指定墨色）：版框里用近墨色，目录里用默认近黑。
-fn fish_tail_ink(width: f32, top: bool, color: u32) -> Div {
-    let h = width / 1.846; // 与 viewBox 24×13 的宽高比一致，避免拉伸。
-    let path = if top {
-        "fishtail_top.svg"
-    } else {
-        "fishtail_bottom.svg"
-    };
-    div()
-        .w(px(width))
-        .h(px(h))
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_center()
-        .child(
-            svg()
-                .path(SharedString::from(path.to_string()))
-                .w(px(width))
-                .h(px(h))
-                .text_color(rgb(color)),
-        )
-}
-
 /// 版心「对鱼尾」（黑鱼尾）：**直线几何多边形**——顶边一刀平直、两侧
 /// 竖直下垂成尾翼、中央劈出 V 形凹口，上下两枚**开口相对**。
 ///
@@ -820,41 +787,17 @@ pub(crate) fn han_num(n: usize) -> String {
     }
 }
 
-/// 卷页标识「第27637葉」：极小**宋体** + 淡淡的一圈边框 + 起首一枚微小墨签。
+/// 叶码小字「第27637葉」：极小**宋体**、纯文本，无边框、无墨签。
 ///
-/// 叶码是精准定位用的，所以数字仍留阿拉伯写法（比汉字更好核对），但字体
-/// 换成与正文同源的宋体，外加一圈淡到几乎看不见的细框和一枚极细短竖——
-/// 整体像刊本天头那行木记，不再是系统默认的细小黑体字。
-fn leaf_chip(page_no: usize, cur: bool, song: &SharedString) -> Div {
-    const DIM: u32 = 0x9FB0C4; // 月白兑暗
-    const VERMILION: u32 = 0xD0634E; // 当前卷：朱砂
-    const CHIP_LINE: u32 = 0x3A4A61; // 淡边框
-    const TICK: u32 = 0x6C7C93; // 起首短竖（墨签）
-    let fg = if cur { VERMILION } else { DIM };
+/// v1.47.0：早先这枚叶码带一圈淡边框 + 起首短竖，做成了一枚「第N葉」小
+/// 方块——目录列表里那种黑白方块正是被用户判了死刑的「控制台感」。现在
+/// 只留一行小字（仅朱批区的页定位还在用，目录列表已彻底不显示叶码）。
+fn leaf_no(page_no: usize, fg: u32, song: &SharedString) -> Div {
     div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(2.0))
-        .px(px(2.5))
-        .py(px(0.5))
-        .mt(px(1.0))
-        .border_1()
-        .border_color(rgb(CHIP_LINE))
-        .rounded(px(1.5))
         .font_family(song.clone())
-        .child(
-            div()
-                .w(px(1.5))
-                .h(px(6.0))
-                .bg(rgb(if cur { VERMILION } else { TICK })),
-        )
-        .child(
-            div()
-                .text_size(px(9.5))
-                .text_color(rgb(fg))
-                .child(SharedString::from(format!("第{page_no}葉"))),
-        )
+        .text_size(px(9.5))
+        .text_color(rgb(fg))
+        .child(SharedString::from(format!("第{page_no}葉")))
 }
 
 fn build_note_index(book: &Book) -> NoteIndex {
@@ -1753,50 +1696,68 @@ impl Root {
     /// 当前所在章用朱砂红标出（加粗 + 描边）。点击章即按该章首字下标
     /// （`start_char_index`）重新排版并跳到第一叶。点面板外空白处平滑收起
     /// （由 `toc_slide` 驱动滑出动画）。
-    /// **目录章名专用竖排**（v1.30.0）。
+    /// **目录章名专用竖排**（v1.30.0 立，v1.47.0 改折列）。
     ///
-    /// 目录不与正文共用那套 100% 严格的字格：竹简条长短本就不齐（
-    /// 「十五卷 四书」四个字、「历代名家词集精华录卷十九」十几个字），
+    /// 目录不与正文共用那套 100% 严格的字格：章名长短本就不齐（
+    /// 「十五卷 四书」四个字、「第一回 宴桃園豪傑三結義」十几个字），
     /// 硬塞进等高格子只会互相迁就——长的被截断、短的底下空一大截。
     ///
-    /// 故这里单走一条：
-    ///   * **高度由内容撑开**（`max` 只是防失控的上限，不是等高指令）；
-    ///   * **字距固定**（`gap`），条与条之间的间距也固定（容器的 `gap`），
-    ///     疏密一致，看着仍是一束整齐的简；
+    /// v1.47.0 起单走一条：
+    ///   * **折列竖排**：按 `per_col` 字一列折成若干竖列，读序与古籍一致——
+    ///     竖排（古文）首列在最右、横排（现代）首列在最左。长章名不再
+    ///     被单列拉成一整屏的高竹简，行高有界，列表才排得规整；
+    ///   * **高度由内容撑开**（`per_col * max_cols` 只是防失控的上限）；
+    ///   * **字距固定**（`gap`），列间距也固定，疏密一致；
     ///   * **空书名号剔除**：`︽︾` / `《》` 里没裹字的一律删掉——目录里
     ///     常见这种空壳，竖排时变成两个孤零零的小角标，把行气戳断；
     ///   * 书名号用竖排形 `︽ ︾`、字号比正文小一档（0.7），不抢章名。
-    fn toc_title_column(
+    fn toc_title_columns(
         title: &str,
         fs: f32,
         fg: u32,
         bold: bool,
         family: &SharedString,
-        max_chars: usize,
+        rtl: bool,
+        per_col: usize,
+        max_cols: usize,
     ) -> Div {
         let clean = crate::types::strip_empty_title_marks(title);
-        let txt = clip_chars(&clean, max_chars);
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .items_center()
-            // 字距固定（不再按字格均分）：长章名自然排长、短的排短。
-            .gap(px((fs * 0.12).max(1.0)))
-            .pt_3()
-            .font_family(family.clone());
-        for c in txt.chars() {
-            let is_mark = crate::types::is_title_mark(c);
-            let shown = crate::types::title_mark(c);
-            let size = if is_mark { fs * crate::punct::TITLE_FS_RATIO } else { fs };
-            col = col.child(
-                div()
-                    .text_size(px(size))
-                    .when(bold && !is_mark, |d| d.font_weight(FontWeight::BOLD))
-                    .text_color(rgb(fg))
-                    .child(SharedString::from(shown.to_string())),
-            );
+        let txt = clip_chars(&clean, per_col * max_cols);
+        let cols: Vec<String> = txt
+            .chars()
+            .collect::<Vec<char>>()
+            .chunks(per_col)
+            .map(|c| c.iter().collect::<String>())
+            .collect();
+        let mut row = div().flex().flex_row().items_start().gap(px(5.0));
+        // 竖排右起：首列在最右；横排左起：首列在最左。
+        let order: Vec<&String> = if rtl {
+            cols.iter().rev().collect()
+        } else {
+            cols.iter().collect()
+        };
+        for chunk in order {
+            let mut col = div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px((fs * 0.12).max(1.0)))
+                .font_family(family.clone());
+            for c in chunk.chars() {
+                let is_mark = crate::types::is_title_mark(c);
+                let shown = crate::types::title_mark(c);
+                let size = if is_mark { fs * crate::punct::TITLE_FS_RATIO } else { fs };
+                col = col.child(
+                    div()
+                        .text_size(px(size))
+                        .when(bold && !is_mark, |d| d.font_weight(FontWeight::BOLD))
+                        .text_color(rgb(fg))
+                        .child(SharedString::from(shown.to_string())),
+                );
+            }
+            row = row.child(col);
         }
-        col
+        row
     }
 
     #[allow(non_snake_case)]
@@ -1806,11 +1767,13 @@ impl Root {
         let Some(book) = self.book.as_ref() else {
             return div();
         };
-        // 面板配色（v1.46.0）：半透明宣纸底 + 墨字 + 朱砂当前章——与纸面同调，
-        // 不再用深靛夜色（那套压在和纸阅读界里太跳）。
+        // 面板配色（v1.47.0）：**实色宣纸**——透明度归零。
+        // v1.46.0 用 0xEC 毛玻璃 + 字节序写错的透明遮罩，背后的正文与界栏
+        // 直接穿透上来，正是「渲染灾难」的根源；现在整块面板是不透的素宣，
+        // 只靠明暗与纸面拉开层次（面板比纸面略亮、朱批栏略深一档）。
         let t = self.theme;
-        let PANEL_BG: u32 = t.paper();
-        let PANEL_BG2: u32 = crate::theme::mix(t.paper(), 0xFFFFFF, 0.06); // 表头 / 当前条
+        let PANEL_BG: u32 = crate::theme::mix(t.paper(), 0xFFFFFF, 0.05); // 面板底：素宣
+        let PANEL_BG2: u32 = crate::theme::mix(t.paper(), 0xFFFFFF, 0.10); // 表头：再亮一档
         let MOON: u32 = t.ink(); // 章名字色
         let MOON_DIM: u32 = t.ink_soft(); // 小字 / 叶码 / 提示
         let VERMILION: u32 = sheet_zhu(t); // 朱砂红：当前章 / 标记
@@ -1826,106 +1789,80 @@ impl Root {
             .cloned()
             .collect();
         let pages = self.paginate();
-        // 章 → 首面叶码：**一次**分页建好映射，下面循环查表即可。
-        // 原先每条竹简都调一次 `page_of_chapter`，而它内部每次都全量
-        // 重排全书 —— N 条目录就是 N 次全书排版，面板一开就卡。
-        let mut chapter_page: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
-        for (i, p) in pages.iter().enumerate() {
-            if let Some(g) = p.first() {
-                chapter_page.entry(g.chapter).or_insert(i);
-            }
-        }
-        // 竖排（古文）目录从右到左：首章在最右，划线栏在右侧；
-        // 横排（现代）从左到右：首章在最左，划线栏在左侧。
+        // 竖排（古文）从右到左读：章名竖列首列在最右；
+        // 横排（现代）从左到右：首列在最左。
         let rtl = self.script == Script::Ancient;
-        // 当前章：用后台悄悄对齐好的 current_chapter，目录朱砂红点落在准确卷目上。
+        // 当前章：用后台悄悄对齐好的 current_chapter，朱砂落在准确卷目上。
         let cur_chapter = self.current_chapter;
 
         // 侧栏宽度：占视口 37%、上限 400、下限 260——窄侧栏，留住 0.618 正文视野。
         let panel_w = (vw * 0.37).min(400.0).max(260.0);
         let head_h = 52.0;
-        let strip_h = (vh - head_h).max(160.0);
 
-        let mut strip_nodes: Vec<Div> = Vec::new();
-        // 竖排从右到左：首章在最右，竹简条整体靠右排；
-        // 横排从左到右：首章在最左，竹简条靠左排。
-        let mut strips = div()
-            .id("toc-strips")
+        // ── 左栏：目录列表（v1.47.0 重写）────────────────────────────
+        // **只渲染纯文本的竖排章名**：鱼尾纹、「第N葉」方块全部删除——那些
+        // 花活正是「程序员控制台感」的根源。一列一行、自上而下：行首一枚
+        // 朱点标当前卷，章名竖排折列，层级用缩进分档；列表超长走鼠标滚轮
+        // 平滑滚动（`overflow_y_scroll` 与字典浮签同款自滚）。
+        let mut list = div()
+            .id(SharedString::from("toc-list"))
             .flex_1()
             .flex()
-            .flex_row()
-            .items_end()
-            .gap_2()
-            .p_3()
-            .overflow_x_scroll();
-        if rtl {
-            // 用「可伸缩的空白」把竹简条推到右边，而不是 justify_end：
-            // 章目多到溢出时 justify_end 会把左侧内容裁掉且滚不到，
-            // 空白 spacer 在空间不足时缩到 0，仍可从最左一条开始滚动。
-            strips = strips.child(div().flex_1());
-        }
-
+            .flex_col()
+            .overflow_y_scroll()
+            .py_1();
         if toc.is_empty() {
-            strip_nodes.push(
+            list = list.child(
                 div()
-                    .p_3()
+                    .p_4()
+                    .font_family(song.clone())
                     .text_size(px(12.0))
                     .text_color(rgb(MOON_DIM))
                     .child(SharedString::from("这本书没有目录")),
             );
         }
-
         for e in toc.iter() {
             let cur = e.chapter == cur_chapter;
-            let chapter = e.chapter;
             // 跳转下标：优先用已算好的 start_char_index，缺失则退回章首面。
             let jump_idx = e.start_char_index.unwrap_or(0);
-            // 竹简条宽度：整体加宽，手指点得准（尤其触屏），仍是细竹简。
-            // 三档只调宽度与字号区分层级，**高度统一**成一根根等高的竹简，
-            // 整束目录像真竹简一样整齐，不会因章名长短参差（占位符防跳动）。
-            let (w, fs) = match e.level {
-                1 => (46.0, 16.0),
-                2 => (40.0, 14.0),
-                _ => (34.0, 12.5),
+            // 三档字号区分层级；章名一律竖排（6 字一列、至多 3 列）。
+            let fs = match e.level {
+                1 => 16.0,
+                2 => 14.0,
+                _ => 12.5,
             };
             let fg = if cur { VERMILION } else { MOON };
-            // 章名走**目录专用排版**（`toc_title_column`）：高度按内容撑开，
-            // 不再把所有竹简压成等高——长短不一的章名各排各的，字距与条距
-            // 仍固定。这里只留一道防失控的上限（1.6 屏高），超长才截断。
-            let fish_h = w * 0.84 / 1.846;
-            let avail = (strip_h - fish_h * 2.0 - 26.0).max(16.0);
-            let max_chars = (avail * 1.6 / (fs + 4.0)).floor().max(2.0) as usize;
-            let title = Self::toc_title_column(&e.title, fs, fg, cur, &song, max_chars);
-            // 该章首页的叶码（小字），点这条简就跳到那一叶。查表，不再重排。
-            let page_no = chapter_page.get(&chapter).copied().unwrap_or(0) + 1;
-
-            let bg = if cur { PANEL_BG2 } else { PANEL_BG };
-            strip_nodes.push(
+            let title = Self::toc_title_columns(&e.title, fs, fg, cur, &song, rtl, 6, 3);
+            // 行首固定槽：当前卷落一枚朱点，未选留空——槽宽恒定，章名左缘
+            // 一律对齐，不会因「有无圆点」来回跳动。
+            let dot = div()
+                .w(px(5.0))
+                .h(px(5.0))
+                .mt(px(3.0))
+                .flex_shrink_0()
+                .rounded_full()
+                .when(cur, |d| d.bg(rgb(VERMILION)));
+            let mut content = div().flex().flex_row().items_start().gap(px(9.0));
+            content = content.child(dot);
+            // 层级缩进：二级进一格、三级进两格（固定宽槽，不推挤邻行）。
+            for _ in 1..e.level.max(1) {
+                content = content.child(div().w(px(14.0)).flex_shrink_0());
+            }
+            content = content.child(title);
+            list = list.child(
                 div()
-                    .flex_shrink_0()
-                    .w(px(w))
-                    // **不设固定高**：竹简长度由章名撑开（目录不与正文共用
-                    // 严格等高字格）。条底仍由容器的 `items_end` 对齐，
-                    // 一束简看着还是齐的。
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .items_center()
-                    .pb_2()
-                    .bg(rgb(bg))
-                    // 当前章描边加粗一档，朱砂红标出。
-                    .border_2()
-                    .border_color(rgb(if cur { VERMILION } else { LINE }))
-                    .rounded(px(3.0))
+                    .px_3()
+                    .py_2()
                     .cursor_pointer()
-                    // 鱼尾纹（月白，方能在深底上显形）。
-                    .child(fish_tail_ink(w * 0.84, true, MOON))
-                    .child(title)
-                    // 卷页标识：极小宋体 + 淡边框 + 起首的一枚微小墨签符号，
-                    // 像刊本天头那行「卷第幾葉」的木记，不再像系统默认小字。
-                    .child(leaf_chip(page_no, cur, &song))
-                    .child(div().flex_1())
-                    .child(fish_tail_ink(w * 0.84, false, MOON))
+                    // 当前卷：极淡朱砂底 + 朱砂章名；未选行悬停：极淡墨底。
+                    .when(cur, |d| d.bg(rgb(crate::theme::mix(t.paper(), VERMILION, 0.05))))
+                    .when(!cur, |d| {
+                        d.hover(|s| s.bg(rgb(crate::theme::mix(t.paper(), 0x000000, 0.04))))
+                    })
+                    .child(content)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -1940,19 +1877,8 @@ impl Root {
             );
         }
 
-        // 竹简条排序：竖排首章在最右（紧邻右侧划线栏），横排首章在最左。
-        if rtl {
-            for d in strip_nodes.into_iter().rev() {
-                strips = strips.child(d);
-            }
-        } else {
-            for d in strip_nodes {
-                strips = strips.child(d);
-            }
-        }
-
-        // 划线栏：与竹简条**并排平行**（同一条基线、同高），古风夜色配色。
-        let mk_col = self.render_toc_column(&pages, rtl, 220.0, cx);
+        // 右栏：朱批（划线栏）——与目录**干净的左右分栏**，各占一栏。
+        let mk_col = self.render_toc_column(&pages, rtl, 200.0, cx);
 
         let title_div = div()
             .text_size(px(14.0))
@@ -1981,8 +1907,8 @@ impl Root {
             }),
         );
         // **「⟲ 回到卷首」**（v1.38.0）：面板最上方一枚极小号文字钮——
-        // 无底无框、悬停转朱砂，与「目錄 / ✕」同一档视觉重量。目录拉到
-        // 一百多卷时，拖回最右那根竹简太费手，一键回卷首是刚需。
+        // 无底无框、悬停转朱砂，与「目錄 / ✕」同一档视觉重量。目录长到
+        // 要滚很久时，一键回卷首是刚需。
         let back_div = div()
             .font_family(song.clone())
             .text_size(px(10.0))
@@ -2027,7 +1953,7 @@ impl Root {
                 .justify_between()
                 .h(px(head_h))
                 .px_4()
-                .bg(rgba((PANEL_BG2 << 8) | 0xEC))
+                .bg(rgb(PANEL_BG2))
                 .border_b_1()
                 .border_color(rgb(LINE))
                 .child(meta)
@@ -2048,7 +1974,7 @@ impl Root {
                 .justify_between()
                 .h(px(head_h))
                 .px_4()
-                .bg(rgba((PANEL_BG2 << 8) | 0xEC))
+                .bg(rgb(PANEL_BG2))
                 .border_b_1()
                 .border_color(rgb(LINE))
                 .child(
@@ -2063,22 +1989,24 @@ impl Root {
                 .child(meta)
         };
 
-        // 书目主体：竹简条 + 划线栏，两栏平行并排。
-        //   竖排（从右到左）：目录条 → 划线（划线紧贴目录、居最右）；
-        //   横排（从左到右）：整体镜像，划线 → 目录条。
-        let mut body_row = div().flex().flex_row().flex_1().overflow_hidden();
-        body_row = if rtl {
-            body_row.child(strips).child(mk_col)
-        } else {
-            body_row.child(mk_col).child(strips)
-        };
+        // 书目主体：**干净的左右分栏**（v1.47.0）——目录占左、朱批占右，
+        // 不再随排版方向镜像，也不再横排挤压成一束竹简。
+        let body_row = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .overflow_hidden()
+            .child(list)
+            .child(mk_col);
 
         // 右侧滑入侧栏：用 toc_slide 计算右偏移与遮罩透明度。
         //   slide=1 → right=0（完全展开）；slide=0 → right=-panel_w（滑出屏外）。
         let slide = self.toc_slide.clamp(0.0, 1.0);
         let off = -(1.0 - slide) * panel_w;
         let mask_a = ((0.45 * slide * 255.0) as u32).min(255);
-        let mask = (mask_a << 24) | 0x000000;
+        // rgba() 收的是 0xRRGGBBAA——v1.46.0 误按 ARGB 写（`a << 24`），
+        // 遮罩实际全透明，背后的字直接透上面板。现在黑色遮罩按 RGBA 收口。
+        let mask = mask_a; // 0x000000AA：纯黑 + 该档透明度
         let panel = div()
             .absolute()
             .top(px(0.0))
@@ -2087,7 +2015,7 @@ impl Root {
             .w(px(panel_w))
             .flex()
             .flex_col()
-            .bg(rgba((PANEL_BG << 8) | 0xEC))
+            .bg(rgb(PANEL_BG))
             .border_l_1()
             .border_color(rgb(LINE))
             .overflow_hidden()
@@ -2132,12 +2060,12 @@ impl Root {
         clip_chars(s.trim(), max)
     }
 
-    /// 目录侧栏里与卷目**并排平行**的划线栏（古风夜色配色）。
+    /// 目录侧栏右栏的**朱批区**（v1.47.0：与目录干净的左右分栏）。
     ///
-    /// 两栏同高、共用一条基线，与竹简条平行排布：
-    ///   * 竖排（从右到左）：目录条在最左，划线栏紧贴其右；
-    ///   * 横排（从左到右）：镜像——划线栏在最左，目录条在其右。
-    /// 点任一条即跳到那一叶。
+    /// 汇集全书各面上被划过的句子（朱批），摘录原文 + 叶码 + 批注：
+    ///   * 摘录一律繁体、竖排折列——竖排首列在右、横排首列在左；
+    ///   * 每枚朱批前领一枚空心朱砂小圈，下引一道极细朱线；
+    ///   * 点任一条即跳到那一叶。
     #[allow(non_snake_case)]
     fn render_toc_column(
         &self,
@@ -2292,7 +2220,7 @@ impl Root {
                 .flex()
                 .flex_col()
                 .gap(px(3.0))
-                .child(leaf_chip(page + 1, false, &song));
+                .child(leaf_no(page + 1, MOON_DIM, &song));
             if let Some(n) = note {
                 foot = foot.child(
                     div()
@@ -2339,19 +2267,16 @@ impl Root {
                     .child(SharedString::from("点选可跃")),
             );
 
-        let mut col = div()
+        let col = div()
             .w(px(w))
             .flex_shrink_0()
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgba((COL_BG << 8) | 0xEC));
-        // 朝目录的一侧画分隔线：竖排（栏在目录右侧）画左边，横排（栏在目录左侧）画右边。
-        col = if rtl {
-            col.border_l_1().border_color(rgb(LINE))
-        } else {
-            col.border_r_1().border_color(rgb(LINE))
-        };
+            .bg(rgb(COL_BG)) // 实色：比面板略深一档，两栏分明
+            // 分栏分隔线永远画在朝目录的左侧（目录恒在左、朱批恒在右）。
+            .border_l_1()
+            .border_color(rgb(LINE));
         col.child(head).child(list)
     }
 

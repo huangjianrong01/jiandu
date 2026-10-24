@@ -6,45 +6,40 @@
 //!   * 古文竖笺：从右到左，每叶八行，朱丝栏，繁体标注、通假标注、注释脚注；
 //!   * 现代横笺：仅横线信笺，不设竖格；
 //!   * 单面 / 双面对开阅读。
+//!
+//! v1.47.0：纯逻辑已解耦至 `jiandu-core` crate（grid / parsers / dict 等），
+//! 本二进制只留 UI 层（app / reader / shelf）与绘制耦合的排版辅助。
 
 mod app;
-mod banxin;
-mod content;
-mod dict;
 mod exporter;
-mod pdf;
 mod fonts;
-mod grid;
 mod gloss;
 mod hit;
-mod note_inject;
-mod numcn;
-mod pipeline;
-mod parsers;
 mod ime;
-mod importer;
-mod library;
 mod lines;
-mod prefs;
+mod note_inject;
 mod punct;
 mod reader;
-mod ruby;
 mod shelf;
 mod sound;
-mod theme;
-mod trad;
-mod types;
-mod vclean;
-mod west;
 mod zen_kit;
+
+// 纯逻辑核心（v1.47.0 解耦）：`grid` / `parsers` / `dict` 等 17 个模块已
+// 独立为 `jiandu-core` crate（零 GPUI 依赖，见 core/）。这里把它们再导出
+// 回 crate 根——`crate::grid` / `crate::types` 等既有路径全部继续有效，
+// UI 层（app / reader / shelf）代码零改动。
+pub use jiandu_core::{
+    banxin, content, dict, grid, importer, library, numcn, parsers, pdf, pipeline, prefs, ruby,
+    trad, theme, types, vclean, west,
+};
 
 use app::Root;
 use anyhow::Result;
 use gpui::{
-    prelude::*, px, size, App, Application, AssetSource, Bounds, SharedString, TitlebarOptions,
-    WindowBounds, WindowOptions,
+    point, prelude::*, px, size, App, Application, AssetSource, Bounds, SharedString,
+    TitlebarOptions, WindowBounds, WindowOptions,
 };
-use library::Library;
+use jiandu_core::library::Library;
 use std::borrow::Cow;
 use std::path::PathBuf;
 
@@ -144,11 +139,17 @@ fn main() {
 }
 
 /// 书架 / 竖笺演示共用的窗口参数（标题、尺寸、居中）。
+///
+/// v1.47.0：macOS 交通灯（系统红黄绿圆点）禁用。GPUI 0.2.2 只暴露
+/// `TitlebarOptions::traffic_light_position`（移动、无隐藏 API），
+/// 故把三钮坐标推到窗口外（x/y 均 -10000pt，AppKit 自裁切）——
+/// 视觉上彻底消失，窗口控制改由 app.rs 的三枚淡墨线条钮负责。
 fn zen_window_options(bounds: Bounds<gpui::Pixels>) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
             title: Some("笺读 · JianDu".into()),
+            traffic_light_position: Some(point(px(-10000.0), px(-10000.0))),
             ..Default::default()
         }),
         ..Default::default()

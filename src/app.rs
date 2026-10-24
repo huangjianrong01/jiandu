@@ -12,8 +12,8 @@ use crate::types::{
     MarkKind, Note, NoteKind, NoteSource, RuleColor, Script,
 };
 use gpui::{
-    div, px, rgb, AsyncApp, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, SharedString, Styled, WeakEntity, Window,
+    div, px, rgb, AsyncApp, Context, Div, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, WeakEntity, Window,
 };
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -3465,24 +3465,138 @@ impl Root {
     }
 
     /// 顶部品牌条（三态共用）。
-    pub fn render_brand(&self) -> impl IntoElement {
-        div()
+    ///
+    /// v1.47.0 两处改动：
+    ///   * **标语动态化**：「笺读 JianDu」之后接**每日一句**（淡墨小字 +
+    ///     出处），替掉原来的静态标语「为阅读创造环境」；诗句限宽 400px、
+    ///     超长截断缀省略号，绝不被右侧的「续读」等钮挤走；
+    ///   * **窗口控制钮**：左上角三枚极简淡墨线条钮（✕ 关闭 / — 最小化 /
+    ///     □ 最大化），不用系统红黄绿圆点，悬停转朱砂；绑定 GPUI 原生
+    ///     窗口事件（remove_window / minimize_window / zoom_window）。
+    pub fn render_brand(&mut self, cx: &mut Context<Self>) -> Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::SongTi,
+            crate::types::Script::Ancient,
+        );
+        // 一枚窗口钮：18×18 命中区、无底无框，淡墨线条、悬停朱砂。
+        let mk_win_btn = |label: &'static str, fs: f32, act: u8, cx: &mut Context<Self>| -> Div {
+            div()
+                .w(px(18.0))
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .font_family(song.clone())
+                .text_size(px(fs))
+                .text_color(rgb(INK_SOFT))
+                .hover(|s| s.text_color(rgb(CINNABAR)))
+                .child(SharedString::from(label))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        match act {
+                            // 关闭：先落盘阅读进度，再走原生关窗 + 退进程。
+                            0 => {
+                                this.persist();
+                                window.remove_window();
+                                std::process::exit(0);
+                            }
+                            // 最小化 / 最大化：GPUI 原生平台事件。
+                            1 => window.minimize_window(),
+                            _ => window.zoom_window(),
+                        }
+                    }),
+                )
+        };
+        let mut bar = div()
             .flex()
             .items_center()
-            .gap_3()
+            .gap(px(16.0))
+            // 窗口控制三钮（组内紧挨，与品牌拉开一档）。
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(mk_win_btn("✕", 12.0, 0, cx))
+                    .child(mk_win_btn("—", 12.0, 1, cx))
+                    .child(mk_win_btn("□", 11.0, 2, cx)),
+            )
             .child(
                 div()
                     .text_size(px(16.0))
+                    .font_family(song.clone())
                     .text_color(rgb(CINNABAR))
                     .child(SharedString::from("笺读")),
             )
             .child(
                 div()
                     .text_size(px(11.0))
-                    .text_color(rgb(0x8A8175))
-                    .child(SharedString::from("JianDu · 为阅读创造环境")),
+                    .font_family(song.clone())
+                    .text_color(rgb(INK_SOFT))
+                    .child(SharedString::from("JianDu")),
             )
+            // 极细墨点：品牌与诗句之间的那枚「·」。
+            .child(
+                div()
+                    .w(px(3.0))
+                    .h(px(3.0))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(rgb(INK_FAINT)),
+            );
+        // 每日一句：诗句淡墨、出处更淡；取不到数据就退回静态标语。
+        match crate::shelf::daily_quote() {
+            Some((text, src)) => {
+                bar = bar
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_family(song.clone())
+                            .text_color(rgb(INK_SOFT))
+                            .child(SharedString::from(clip_to_width(&text, 11.0, 400.0))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_family(song.clone())
+                            .text_color(rgb(INK_FAINT))
+                            .child(SharedString::from(format!("—— {}", src))),
+                    );
+            }
+            None => {
+                bar = bar.child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_family(song.clone())
+                        .text_color(rgb(INK_SOFT))
+                        .child(SharedString::from("为阅读创造环境")),
+                );
+            }
+        }
+        bar
     }
+}
+
+/// 按**视觉宽度**截断（CJK 全角 ≈ 1em、西文 ≈ 0.55em），超宽则截断并缀
+/// 省略号——顶栏标语专用：每日一句再长也不能挤走右侧的「续读」等钮。
+fn clip_to_width(s: &str, fs: f32, max_w: f32) -> String {
+    let mut w = 0.0f32;
+    let mut out = String::new();
+    for c in s.chars() {
+        let cw = if (c as u32) < 0x2E80 { fs * 0.55 } else { fs };
+        // 给省略号留一个字身。
+        if w + cw > max_w - fs {
+            out.push('…');
+            return out;
+        }
+        w += cw;
+        out.push(c);
+    }
+    out
 }
 
 // ---- 行内草稿编辑（浮层笔记框 / 重命名框共用：GPUI 无文本输入元素，
@@ -3567,6 +3681,10 @@ pub const ANCIENT_TITLE_COL: f32 = 1.0;
 pub const PAPER: u32 = 0xF7F1E3;
 pub const PAPER_BACK: u32 = 0xEAE0C9;
 pub const INK: u32 = 0x2B2622;
+/// 次级墨（顶栏标语 / 每日一句 / 窗口钮的淡墨线条）。
+pub const INK_SOFT: u32 = 0x6B6357;
+/// 三级墨（出处等更淡一档的小字）。
+pub const INK_FAINT: u32 = 0x9A9184;
 pub const CINNABAR: u32 = 0xA63A2B;
 pub const INDIGO: u32 = 0x3E5A8A;
 pub const FRAME: u32 = 0x9A6B4F;

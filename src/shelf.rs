@@ -559,6 +559,40 @@ fn small_button(label: &str) -> Div {
         .child(SharedString::from(label.to_string()))
 }
 
+/// 每日一句的数据源（v1.46.0 立，v1.47.0 提为共用）：内置 JSON 按日期
+/// 取模轮换，取 `(正文, 出处)`。v1.47.0 起**只服务顶栏品牌标语**
+/// （app.rs `render_brand`）——书架中部那行旧小字（`render_daily_quote`）
+/// 因与之重复已删除，此函数是唯一幸存入口。
+pub(crate) fn daily_quote() -> Option<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Q {
+        text: String,
+        src: String,
+    }
+    // 内置 JSON（本地资源）：句 + 出处，按「今天」取模轮换。
+    const QUOTES: &str = r#"[
+        {"text":"学而时习之，不亦说乎。","src":"《论语·学而》"},
+        {"text":"大学之道，在明明德，在亲民，在止于至善。","src":"《礼记·大学》"},
+        {"text":"蒹葭苍苍，白露为霜。","src":"《诗经·秦风》"},
+        {"text":"路漫漫其修远兮，吾将上下而求索。","src":"《楚辞·离骚》"},
+        {"text":"穷则独善其身，达则兼善天下。","src":"《孟子·尽心上》"},
+        {"text":"海内存知己，天涯若比邻。","src":"《送杜少府之任蜀州》"},
+        {"text":"一蓑烟雨任平生。","src":"《定风波》"},
+        {"text":"山重水复疑无路，柳暗花明又一村。","src":"《游山西村》"}
+    ]"#;
+    let list: Vec<Q> = serde_json::from_str(QUOTES).unwrap_or_default();
+    if list.is_empty() {
+        return None;
+    }
+    let day = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        / 86_400) as usize;
+    let q = &list[day % list.len()];
+    Some((q.text.clone(), q.src.clone()))
+}
+
 impl Root {
     pub fn render_screen(&mut self, cx: &mut Context<Self>) -> Div {
         match self.screen {
@@ -569,61 +603,6 @@ impl Root {
     }
 
     /// 书架：题签网格（默认）/ 书脊列表，配分类页签、搜索、排序。
-    /// 首页「每日一句」（v1.46.0）：本地 JSON 按日期取模轮换，宋体、淡墨，
-    /// 极度克制——只在页签下压一行，不抢书目。
-    fn render_daily_quote(&self) -> Div {
-        #[derive(serde::Deserialize)]
-        struct Q {
-            text: String,
-            src: String,
-        }
-        // 内置 JSON（本地资源）：句 + 出处，按「今天」取模轮换。
-        const QUOTES: &str = r#"[
-            {"text":"学而时习之，不亦说乎。","src":"《论语·学而》"},
-            {"text":"大学之道，在明明德，在亲民，在止于至善。","src":"《礼记·大学》"},
-            {"text":"蒹葭苍苍，白露为霜。","src":"《诗经·秦风》"},
-            {"text":"路漫漫其修远兮，吾将上下而求索。","src":"《楚辞·离骚》"},
-            {"text":"穷则独善其身，达则兼善天下。","src":"《孟子·尽心上》"},
-            {"text":"海内存知己，天涯若比邻。","src":"《送杜少府之任蜀州》"},
-            {"text":"一蓑烟雨任平生。","src":"《定风波》"},
-            {"text":"山重水复疑无路，柳暗花明又一村。","src":"《游山西村》"}
-        ]"#;
-        let list: Vec<Q> = serde_json::from_str(QUOTES).unwrap_or_default();
-        if list.is_empty() {
-            return div();
-        }
-        let day = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-            / 86_400) as usize;
-        let q = &list[day % list.len()];
-        let song = crate::fonts::family_for(
-            crate::types::FontChoice::SongTi,
-            crate::types::Script::Ancient,
-        );
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_center()
-            .gap(px(8.0))
-            .py(px(8.0))
-            .font_family(song)
-            .child(
-                div()
-                    .text_size(px(12.5))
-                    .text_color(rgb(INK_SOFT))
-                    .child(SharedString::from(q.text.clone())),
-            )
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(rgb(INK_FAINT))
-                    .child(SharedString::from(format!("—— {}", q.src))),
-            )
-    }
-
     pub(crate) fn render_shelf(&mut self, cx: &mut Context<Self>) -> Div {
         let entries = self.shelf_filtered();
         let counts = self.shelf_counts();
@@ -637,8 +616,8 @@ impl Root {
 
         root = root.child(self.render_shelf_top(cx));
         root = root.child(self.render_shelf_tabs(&counts, cx));
-        // 每日一句：页签下压一行宋体淡墨（极度克制）。
-        root = root.child(self.render_daily_quote());
+        // v1.47.0：此处原有的「每日一句」旧组件已删除——顶栏品牌标语
+        // （app.rs render_brand）已含同一句，书架中部再悬浮一份即重复。
 
         let body = if entries.is_empty() {
             self.render_shelf_empty(cx)
@@ -759,7 +738,7 @@ impl Root {
             .bg(rgb(SHELF_PAPER))
             .border_b_1()
             .border_color(rgb(HAIR))
-            .child(self.render_brand())
+            .child(self.render_brand(cx))
             .child(div().flex_1());
 
         if has_any {
@@ -2333,7 +2312,7 @@ fn render_slip_grid(
                             }),
                         ),
                     )
-                    .child(self.render_brand()),
+                    .child(self.render_brand(cx)),
             )
             .child(
                 div()

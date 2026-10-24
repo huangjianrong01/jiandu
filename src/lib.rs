@@ -1,23 +1,15 @@
-//! 笺读 JianDu · 纯逻辑库目标。
+//! 笺读 JianDu · 库目标（v1.47.0 起为 `jiandu-core` 的门面）。
 //!
-//! 只暴露不依赖 GPUI 的纯模块（网格引擎、双行夹注排版、数据模型），
-//! 供单元测试与 `examples/` 下的控制台验证程序使用；
-//! 上层渲染（`app` / `reader`）仍在二进制目标 `src/main.rs`。
+//! v1.47.0 架构解耦：排版网格（grid）、解析器（parsers）、字典查询（dict）
+//! 等 17 个纯逻辑模块已独立成 `jiandu-core` crate（零 GPUI 依赖，可移植
+//! iOS）；本库透传它的全部模块，`jiandu::grid` 等老路径继续可用，
+//! `examples/` 下的控制台验证程序不受影响。
+//!
+//! 与绘制耦合的三个排版辅助（punct 的句读画笔需要 gpui）仍留在本库内。
 #![allow(dead_code)]
 
-pub mod content;
-pub mod dict;
+pub use jiandu_core::*;
+
 pub mod gloss;
-pub mod grid;
 pub mod hit;
 pub mod punct;
-pub mod importer;
-pub mod library;
-pub mod numcn;
-pub mod parsers;
-pub mod pipeline;
-pub mod ruby;
-pub mod trad;
-pub mod types;
-pub mod vclean;
-pub mod west;
