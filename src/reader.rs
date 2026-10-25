@@ -114,9 +114,28 @@ const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(500);
 pub const HOVER_LOOKUP: std::time::Duration = std::time::Duration::from_millis(500);
 
 // ── 天头眉批（v1.37.0）────────────────────────────────────────────
-/// 眉批字号 = 正文字号 × 此比例。用户定「正文的 40%」：再大就压过正文、
-/// 再小在 Retina 上糊成一团。下限 9px 由渲染处兜住。
-pub const HEAD_NOTE_FS_RATIO: f32 = 0.40;
+/// 眉批字号 = 正文字号 × 此比例。
+///
+/// v1.52.0 由 0.40 提到 **0.65**：40% 在 Retina 上只有十来个像素高，笔画
+/// 糊成一团像蚂蚁；65% 落在正文的六到七成之间——看得清，又仍比正文矮一档，
+/// 不至于压过版框里的正文。
+pub const HEAD_NOTE_FS_RATIO: f32 = 0.65;
+/// 眉批字号的**硬下限**（px）。
+///
+/// 窗口缩到很窄时正文会被压小，眉批若等比跟着缩就又变回蚂蚁了——
+/// 故此处兜一个 14px：无论正文缩到多小，眉批至少 14px，永远看得清。
+pub const HEAD_NOTE_FS_MIN: f32 = 14.0;
+/// 眉批的**行间距**倍率（字身 × 此值 = 一格高）。
+///
+/// 1.06 是「字挨字」，放大后笔画容易糊在一起；1.30 给字间留出一线空隙，
+/// 长批语逐字读下来不粘连。
+pub const HEAD_NOTE_LH_RATIO: f32 = 1.30;
+/// 眉批朱砂的**不透明度**（0x00~0xFF）。
+///
+/// v1.52.0 由 0xCC 提到 0xF2：字一小，半透明就显得发虚发粉；字放大后
+/// 更要压得住，得像真正的朱砂墨迹，而不是淡红影子。留 0xF2 而非全不透明，
+/// 是为了让纸纹隐约透上来，仍带一点「写在纸上」的意思。
+pub const HEAD_NOTE_INK_ALPHA: u32 = 0xF2;
 /// 天头窄于此（px）就不开写：专注模式几乎不留天头，免得点一下就误进输入态。
 pub const HEAD_BAND_MIN: f32 = 10.0;
 /// 眉批排布的另两个常量（`HEAD_NOTE_STEP` / `HEAD_NOTE_V_TOL`）放在
@@ -1694,8 +1713,8 @@ impl Root {
             return div();
         };
         let t = self.theme;
-        // 抽屉底：宣纸 + alpha 0xF7（97%）——留一丝透感，不做死白网页。
-        let DRAWER_BG: u32 = (t.paper() << 8) | 0xF7;
+        // 抽屉底：宣纸 + alpha 0xE6（约 90%）——磨砂半透的宣纸色，不做死白网页。
+        let DRAWER_BG: u32 = (t.paper() << 8) | 0xE6;
         // 顶上那条分割线：淡墨兑到很浅，只起「抽屉是另一张纸」的提示作用。
         let EDGE: u32 = (t.rule() << 8) | 0x5A;
         let INK: u32 = t.ink();
@@ -1792,13 +1811,13 @@ impl Root {
             .flex_row_reverse()
             .items_start()
             .gap(px(24.0))
-            .px(px(28.0))
+            .px(px(20.0))
             .pt(px(12.0))
             .pb(px(20.0))
             .flex_1()
             .min_h(px(0.0))
             .overflow_x_scroll()
-            .scrollbar_width(px(2.0))
+            .scrollbar_width(px(0.0))
             .track_scroll(&self.toc_scroll);
 
         if toc.is_empty() {
@@ -1869,16 +1888,27 @@ impl Root {
             self.toc_need_scroll = false;
         }
 
+        // 竹简目录：宽度锁定屏幕 61.8% 黄金比、水平居中。窗口拉伸时随视口
+        // 每帧重算，永不变形（见下方 `panel_w` / `panel_left`）。
+        let panel_w = vw * 0.618;
+        let panel_left = (vw - panel_w) / 2.0;
         let drawer = div()
             .absolute()
-            .left(px(0.0))
-            .right(px(0.0))
+            .left(px(panel_left))
+            .w(px(panel_w))
             .bottom(px(off))
             .h(px(H))
             .flex()
             .flex_col()
             .bg(rgba(DRAWER_BG))
-            .rounded(px(12.0))
+            // 悬浮质感：8px 圆角 + 极弱黑色投影，像一张浮在屏底的纸条。
+            .rounded(px(8.0))
+            .shadow(vec![gpui::BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.12),
+                offset: point(px(0.0), px(3.0)),
+                blur_radius: px(12.0),
+                spread_radius: px(0.0),
+            }])
             .border_t_1()
             .border_color(rgba(EDGE))
             .overflow_hidden()
@@ -2100,6 +2130,17 @@ impl Root {
                 cx.notify();
             }),
         ));
+        // v1.52.0：**导出**下拉。三件事（印制笺卡 PNG / 全书 PDF / 导出 MD）
+        // 原先散在底部状态栏，天头一收就找不着了；这里收成一枚「导出」，
+        // 菜单里逐条列出，点哪条都直接弹系统保存对话框。
+        right = right.child(item("导出", self.export_menu).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.export_menu = !this.export_menu;
+                cx.notify();
+            }),
+        ));
 
         let mut bar = div()
             .absolute()
@@ -2107,6 +2148,7 @@ impl Root {
             .left(px(0.0))
             .right(px(0.0))
             .h(px(BAR_H))
+            .relative()
             .flex()
             .flex_row()
             .items_center()
@@ -3267,7 +3309,9 @@ impl Root {
                         let ch = crate::types::bracket_to_quote(ch);
                         // 小字里的句读再收一档（v1.28.0）：全角句号与注文同号时
                         // 一个点顶半颗字，整块夹注糊成黑团——见 NOTE_PUNCT_RATIO。
-                        let char_fs = if crate::gloss::is_dot_punct(ch) {
+                        let char_fs = if crate::gloss::is_dot_punct(ch)
+                            || crate::types::is_punct(ch)
+                        {
                             nfs * crate::gloss::NOTE_PUNCT_RATIO
                         } else {
                             nfs
@@ -4703,7 +4747,19 @@ impl Root {
     /// 整层是绝对定位，**不参与任何排版**，故绝不会碰动三大铁律的几何。
     fn render_head_notes(&mut self, cx: &mut Context<Self>) -> Div {
         let dbg = std::env::var("JIANDU_HEAD_NOTE").is_ok();
+        if dbg {
+            eprintln!(
+                "[眉批] page_rect={:?} margin_top={} viewport={}x{}",
+                self.page_rect.get(),
+                self.margin_top,
+                self.viewport_w,
+                self.viewport_h
+            );
+        }
         let Some((_, _, bw, bh)) = self.head_band() else {
+            if dbg {
+                eprintln!("[眉批] 天头不可用（band=None，margin_top 太窄）");
+            }
             return div();
         };
         // 只画钉在**当前这一面**上的眉批：判据是该面首字的字键
@@ -4716,7 +4772,7 @@ impl Root {
         };
         // 开发用：JIANDU_HEAD_NOTE=1 自动题两条**同位置**的眉批（第二条
         // 应向左让开一列），便于核对天头渲染与防重叠。只动内存，不写 JSON。
-        if dbg && self.head_notes.is_empty() {
+        if dbg && !self.head_notes.iter().any(|n| n.key == key) {
             let (u, v) = (0.70f32, 0.18f32);
             self.head_notes.push(crate::types::HeadNote::new(
                 key,
@@ -4728,11 +4784,13 @@ impl Root {
             self.head_notes
                 .push(crate::types::HeadNote::new(key, u2, v, "再批：让开一列"));
         }
-        let fs = (self.size_ancient * HEAD_NOTE_FS_RATIO).max(9.0);
-        let lh = fs * 1.06;
-        let family = self.note_family();
+        // 字号：正文的 65%，但**不低于 14px**（正文缩得再小也看得清）。
+        let fs = (self.size_ancient * HEAD_NOTE_FS_RATIO).max(HEAD_NOTE_FS_MIN);
+        let lh = fs * HEAD_NOTE_LH_RATIO;
+        // 恒定楷体（不看夹注选了什么字体）：小字放大后宋体笔画发木，楷体才像墨迹。
+        let family = crate::fonts::head_family();
         // T3：眉批（天头批注）强制走 note_color，与正文套印分离。
-        let head_ink = (self.palette.note(self.theme) << 8) | 0xCC;
+        let head_ink = (self.palette.note(self.theme) << 8) | HEAD_NOTE_INK_ALPHA;
 
         let mut layer = div()
             .absolute()
@@ -4758,18 +4816,21 @@ impl Root {
             // 命中区比字柱略宽：天头批注是小字，给个宽松好点的框。
             // 点它 = 唤醒管理态（再点一次 = 就地改写），**不是**新建——
             // 与「点空白起新批」的分野就在这一层（防误触）。
+            // v1.52.0：倍率由 3.6 降到 2.2 —— 字号涨了 1.6 倍，倍率不改的话
+            // 命中框会跟着胀大 60%，空白处起新批就被它抢走了。降下来正好
+            // 让命中框的**绝对宽度**与放大前持平（0.40×3.6 ≈ 0.65×2.2）。
             let mut note_box = div()
                 .absolute()
                 .left(px(x))
                 .top(px(y))
-                .w(px(fs * 3.6))
+                .w(px(fs * 2.2))
                 .cursor_pointer()
                 .child(Self::head_note_column(&n.text, fs, lh, None, head_ink));
             // v1.48.0 唤醒态：字柱下方挂一枚**极小古风菜单**——纯文字
             // 「改 / 删」，无底无框（与现代白框菜单划清界限）；删 朱砂。
             if self.head_active == Some(idx) {
                 let menu = div()
-                    .w(px(fs * 3.4))
+                    .w(px(fs * 2.1))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -4778,8 +4839,10 @@ impl Root {
                     .child(
                         div()
                             .font_family(family.clone())
-                            .text_size(px(10.5))
-                            .text_color(rgba(((self.palette.note(self.theme) << 8) | 0xAA)))
+                            // v1.52.0：菜单字跟着长一档（10.5 → 12.0），
+                            // 免得字柱放大后「改 / 删」显得像两粒芝麻。
+                            .text_size(px(12.0))
+                            .text_color(rgba((self.palette.note(self.theme) << 8) | 0xCC))
                             .cursor_pointer()
                             .child(SharedString::from("改"))
                             .on_mouse_down(
@@ -4798,8 +4861,8 @@ impl Root {
                     .child(
                         div()
                             .font_family(family.clone())
-                            .text_size(px(11.0))
-                            .text_color(rgba(((self.palette.note(self.theme) << 8) | 0xCC)))
+                            .text_size(px(12.5))
+                            .text_color(rgba((self.palette.note(self.theme) << 8) | HEAD_NOTE_INK_ALPHA))
                             .cursor_pointer()
                             // 「删」不用 ✕（U+2715）：楷书字体多缺此字形，
                             // 渲染成零宽——按钮看着像丢了（v1.48.0 实测）。
@@ -4834,6 +4897,10 @@ impl Root {
                 }),
             );
             layer = layer.child(note_box);
+        }
+        if dbg {
+            let drawn = self.head_notes.iter().filter(|n| n.key == key).count();
+            eprintln!("[眉批] band={bw}x{bh} fs={fs} lh={lh} 画出={drawn} 共={}", self.head_notes.len());
         }
 
         // 正在写的那条：就地竖排 + 光标，并套 IME 输入层接中文。
@@ -4879,7 +4946,8 @@ impl Root {
         let n = text.chars().count();
         for (i, ch) in text.chars().enumerate() {
             if cursor == Some(i) {
-                col = col.child(div().w(px(fs)).h(px(1.5)).bg(rgba(ink)));
+                // 光标横线随字号加粗（原来死的 1.5px 在大字旁边细得看不见）。
+                col = col.child(div().w(px(fs)).h(px((fs * 0.10).max(2.0))).bg(rgba(ink)));
             }
             col = col.child(
                 div()
@@ -4892,7 +4960,7 @@ impl Root {
         }
         // 光标在串尾：补一道横线，否则末尾看不见落点。
         if cursor == Some(n) {
-            col = col.child(div().w(px(fs)).h(px(1.5)).bg(rgba(ink)));
+            col = col.child(div().w(px(fs)).h(px((fs * 0.10).max(2.0))).bg(rgba(ink)));
         }
         col
     }
@@ -5531,7 +5599,7 @@ impl Root {
             .flex_1()
             .min_h(px(0.0))
             .overflow_y_scroll()
-            .scrollbar_width(px(3.0))
+            .scrollbar_width(px(0.0))
             .child(body_col);
 
         // ── 底部一行：考據原典 / 拓印 / 檢索 / 收（小字，宋体，紧凑）────

@@ -395,19 +395,26 @@ mod tests {
                 && matches!(src, NoteSource::Original)),
             "原本夹注应标 Original"
         );
-        let mine = user
+        // 用户自加夹注可能因「列底换行」被拆成多段 `Piece::Gloss`（跨列续排，
+        // 见 `gloss::layout_book` 的「放不下的排下一列列首」）——这是正常版式，
+        // 不是 bug。故按来源聚合文本再判定，且逐段校验来源与宿主。
+        let user_pieces: Vec<&(&str, NoteSource, Glyph)> = user
             .iter()
-            .find(|(s, _, _)| s.contains("我加的注"))
-            .expect("用户夹注应进入版面");
-        assert!(
-            matches!(mine.1, NoteSource::User),
-            "用户自加夹注应标 User（渲染据此染深朱砂红）"
-        );
-        assert_eq!(
-            (mine.2.chapter, mine.2.para, mine.2.offset),
-            (host.chapter, host.para, host.offset),
-            "用户夹注应携带宿主字形，供右键改删定位"
-        );
+            .filter(|(_, src, _)| matches!(src, NoteSource::User))
+            .collect();
+        let mine_text: String = user_pieces.iter().map(|(s, _, _)| *s).collect();
+        assert!(mine_text.contains("我加的注"), "用户夹注应进入版面（可能跨列拆分）");
+        for (_, src, h) in user_pieces {
+            assert!(
+                matches!(src, NoteSource::User),
+                "用户自加夹注应标 User（渲染据此染深朱砂红）"
+            );
+            assert_eq!(
+                (h.chapter, h.para, h.offset),
+                (host.chapter, host.para, host.offset),
+                "用户夹注应携带宿主字形，供右键改删定位"
+            );
+        }
     }
 
     /// 局部重排不会重算前缀：前 N−1 面与全书重排的前 N−1 面完全相同。

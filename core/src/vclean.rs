@@ -199,41 +199,95 @@ fn is_footnote_block(attrs: &str) -> bool {
         .any(|w| matches!(w, "footnote" | "footnotes" | "endnote" | "endnotes" | "fn"))
 }
 
-/// 收集全部脚注体：`id` → 纯文本（已解实体、去标签、压空白）。
+/// 收集全部脚注体：`id` → 纯文本（已解实体、去标签、压空白、清回注链接）。
 ///
-/// 只认带 `id` 的块——没有 id 就没法被 `href` 引用，留着也无用。
+/// v1.52.0（P0-2 升级）：支持**嵌套**脚注容器。真实 EPUB（Pandoc / 中华书局
+/// 等）常用 `<div class="footnotes"><ol><li id="fn1">…</li></ol></div>`——
+/// 旧版只认「自身带 footnote 类又带 id」的顶层块，遇到这种容器（容器无 id、
+/// 注文在内部 `<li>` 上）会整块跳过、内层注文全丢。现改为：进入脚注容器后，
+/// 凡内部**带 id 的块级元素**逐条收为一条注文（按各自 id 键入），无论嵌套
+/// 几层。
+///
+/// 只收带 `id` 的元素——没有 id 就无法被 `href` 引用，留着也无用。
 fn collect_footnotes(html: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let low = html.to_ascii_lowercase();
+    // 栈：每层已开块是否为脚注容器，用于判定「此刻是否在脚注容器内」。
+    let mut stack: Vec<bool> = Vec::new();
     let mut from = 0usize;
-    while let Some(k) = low[from..].find('<') {
+    let len = html.len();
+    while from < len {
+        let Some(k) = low[from..].find('<') else { break; };
         let at = from + k;
         let (tag, attrs, closing, self_close) = read_tag(&html[at..], &low[at..]);
-        if closing || self_close {
+        if tag.is_empty() {
             from = at + 1;
             continue;
         }
-        if !BLOCK_CANDIDATES.contains(&tag.as_str()) || !is_footnote_block(&attrs) {
+        if !BLOCK_CANDIDATES.contains(&tag.as_str()) || self_close {
             from = at + 1;
             continue;
         }
-        let id = attr(&attrs, "id");
-        if id.is_empty() {
-            from = at + 1;
-            continue;
-        }
-        let Some(end) = matching_close(&low, at, &tag) else {
-            from = at + 1;
-            continue;
+        let open_end = match low[at..].find('>') {
+            Some(g) => at + g + 1,
+            None => {
+                from = at + 1;
+                continue;
+            }
         };
-        let body = between_open_close(&html[at..end], &low[at..end]);
-        let text = squeeze_spaces(&pipeline::decode_entities(&pipeline::strip_tags(body)));
-        if !text.is_empty() {
-            map.entry(id).or_insert(text);
+        if closing {
+            stack.pop();
+            from = at + 1;
+            continue;
         }
-        from = end;
+        let is_fn = is_footnote_block(&attrs);
+        let id = attr(&attrs, "id");
+        if is_fn {
+            // 脚注容器自身带 id：整块收为一条（罕见，但 Pandoc 偶尔如此）。
+            if !id.is_empty() {
+                if let Some(end) = matching_close(&low, at, &tag) {
+                    let body = between_open_close(&html[at..end], &low[at..end]);
+                    let text = strip_backlinks(&squeeze_spaces(&pipeline::decode_entities(
+                        &pipeline::strip_tags(body),
+                    )));
+                    if !text.is_empty() {
+                        map.entry(id).or_insert(text);
+                    }
+                }
+            }
+            stack.push(true);
+            from = open_end;
+            continue;
+        }
+        // 非脚注容器：处在脚注容器内且自身带 id → 收为一条注文，并整块跳过，
+        // 避免其内文被重复扫到。
+        if stack.iter().any(|b| *b) && !id.is_empty() {
+            if let Some(end) = matching_close(&low, at, &tag) {
+                let body = between_open_close(&html[at..end], &low[at..end]);
+                let text = strip_backlinks(&squeeze_spaces(&pipeline::decode_entities(
+                    &pipeline::strip_tags(body),
+                )));
+                if !text.is_empty() {
+                    map.entry(id).or_insert(text);
+                }
+                from = end;
+                continue;
+            }
+        }
+        stack.push(false);
+        from = open_end;
     }
     map
+}
+
+/// 清掉注文里的「回注链接」残渣：`↩`（U+21A9）`↑`（U+2191）`⇧` `↺` `↻` 等，
+/// 以及它们被 `strip_tags` 留下的空壳；随后压一次空白。
+fn strip_backlinks(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !matches!(c, '↩' | '↑' | '⇧' | '↺' | '↻'))
+        .collect();
+    squeeze_spaces(&cleaned)
 }
 
 /// `<ruby>` → 基字 + `[拼音:…]`。
@@ -319,8 +373,13 @@ fn split_ruby_inner(inner: &str) -> (String, String) {
 
 /// `<a …noteref…>1</a>` → `[注]注文[/注]`。
 ///
-/// `notes` 是 `href="#id"` 的落点表；取不到就退回链内文字（注号），
-/// 至少不让「1」变成正文里一个孤零零的阿拉伯数字。
+/// v1.52.0（P0-2 升级）：注脚判定放宽——除了显式 `noteref` 类，只要 `<a>`
+/// 的 `href="#id"` 命中一条**已收集的注文**，也当作注脚处理。这样中华书局等
+/// 用纯 `<a href="#note1">[1]</a>`（不带 noteref 类）的 EPUB 也能把注文精准
+/// 绑回正文，而不是把 `[1]` 当正文数字留下、注文整块被删。
+///
+/// 取不到注文（id 未收集 / 纯链接）时退回链内文字，至少不让「1」变成正文里
+/// 一个孤零零的阿拉伯数字。
 fn noteref_to_note(s: &str, notes: &HashMap<String, String>) -> String {
     let low = s.to_ascii_lowercase();
     let mut out = String::with_capacity(s.len());
@@ -336,7 +395,10 @@ fn noteref_to_note(s: &str, notes: &HashMap<String, String>) -> String {
             break;
         };
         let attrs = &low[at + 2..at + g];
-        if !is_noteref(attrs) {
+        let id = href_id(attrs);
+        // 注脚：要么显式 noteref 类，要么 href 指向一条已收集的注文。
+        let is_ref = is_noteref(attrs) || id.as_ref().map_or(false, |i| notes.contains_key(i));
+        if !is_ref {
             cursor = at + g + 1;
             continue;
         }
@@ -346,9 +408,9 @@ fn noteref_to_note(s: &str, notes: &HashMap<String, String>) -> String {
         let close_at = at + close;
         out.push_str(&s[rest_from..at]);
         let body = pipeline::strip_tags(&s[at + g + 1..close_at]);
-        let text = match href_id(attrs).and_then(|id| notes.get(&id).cloned()) {
-            Some(n) => n,
-            None => pipeline::decode_entities(body.trim()),
+        let text = match id.and_then(|i| notes.get(&i).cloned()) {
+            Some(n) => n, // 注文已抽，直接用
+            None => pipeline::decode_entities(body.trim()).to_string(), // 否则退回链内文字
         };
         if !text.trim().is_empty() {
             out.push_str(&format!("[注]{}[/注]", text.trim()));
@@ -433,6 +495,15 @@ pub(crate) fn map_outside_markers(s: &str, f: impl Fn(&str) -> String) -> String
     out
 }
 
+/// 是不是一个 CJK 统一表意文字（U+4E00–U+9FFF）。
+///
+/// 用于 P0-3 区分「汉字括注」与「拉丁拼音括注」：前者转 `[注]…[/注]`，
+/// 后者转 `[拼音:…]`。
+fn is_cjk_char(c: char) -> bool {
+    let u = c as u32;
+    (0x4E00..=0x9FFF).contains(&u)
+}
+
 /// 括注的开括号 → 对应的闭括号（`（）` `()` `［］` `[]` `【】` 五族）。
 fn paren_close(c: char) -> Option<char> {
     match c {
@@ -498,9 +569,18 @@ fn parens_to_note(s: &str) -> String {
                     && !inner_t.contains('[')
                     && !inner_t.chars().any(|c| paren_close(c).is_some());
                 if ok {
-                    out.push_str("[注]");
-                    out.push_str(inner_t);
-                    out.push_str("[/注]");
+                    // P0-3（v1.52.0）：括号里若是拉丁字母注音（拼音 / 罗马字），
+                    // 转 `[拼音:…]` 保留，绝不当成乱码删掉；中文括注仍是双行夹注
+                    // `[注]…[/注]`。判据：含 ASCII 字母且不含任何汉字。
+                    let is_pinyin = inner_t.chars().any(|c| c.is_ascii_alphabetic())
+                        && !inner_t.chars().any(is_cjk_char);
+                    if is_pinyin {
+                        out.push_str(&format!("[拼音:{}]", inner_t));
+                    } else {
+                        out.push_str("[注]");
+                        out.push_str(inner_t);
+                        out.push_str("[/注]");
+                    }
                 } else {
                     out.push('﹁');
                     out.push_str(&inner);
@@ -683,6 +763,9 @@ pub fn stage5_chapters(chapters: Vec<RawChapter>) -> Vec<RawChapter> {
         if lines.is_empty() {
             continue;
         }
+        // P0-1：诗词 / 硬回车防碎裂合并——连续短段（无终结标点、少于 10 字）
+        // 先并成整段，再送引擎，杜绝「一列只有一个字」。
+        crate::parsers::merge_poetry_lines(&mut lines);
         out.push(RawChapter::new(clean_text(&c.title), lines.join("\n")));
     }
     out
@@ -1603,7 +1686,11 @@ mod tests {
         )]);
         assert!(!out[0].content.contains("二〇一六一"), "{}", out[0].content);
         assert!(!out[0].content.contains("2016"), "{}", out[0].content);
-        assert_eq!(out[0].content.lines().count(), 2, "{}", out[0].content);
+        // 两位页码孤行已删；剩下的两条正文短句被 P0-1 诗词合并并成一行
+        // （「一列只有一个字」碎裂防护），但正文一字未丢、页码彻底清除。
+        assert!(out[0].content.contains("见牡丹盛开有感"), "{}", out[0].content);
+        assert!(out[0].content.contains("又一首"), "{}", out[0].content);
+        assert_eq!(out[0].content.lines().count(), 1, "{}", out[0].content);
     }
 
     #[test]

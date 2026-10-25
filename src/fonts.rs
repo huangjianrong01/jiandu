@@ -509,6 +509,29 @@ pub fn note_family(choice: FontChoice) -> SharedString {
     pick_font(&chain, AVAILABLE.get().map(|v| v.as_slice()).unwrap_or(&[]))
 }
 
+/// **天头眉批**的族名（v1.52.0）：恒定楷体，与 `font_note` 的选择无关。
+///
+/// 眉批是读者拿毛笔写在天头上的批语，字形必须是楷书才有「墨迹」的味道；
+/// 若随夹注一起退化成宋体 / 黑体，小字放大后笔画发木、辨识度反而更差。
+/// 链尾仍带 `Kaiti SC` / `STKaiti` / `serif` 三重兜底，未装开源楷体时
+/// 依然是系统楷体。
+const KAI_CHAIN: &[&str] = &[
+    "Xuandong Kaishu",
+    "XuandongKaishu",
+    "玄冬楷书",
+    "LXGW WenKai",
+    "LXGWWenKai",
+    "LXGW WenKai GB",
+    "霞鹜文楷",
+    "Kaiti SC",
+    "STKaiti",
+    "serif",
+];
+
+pub fn head_family() -> SharedString {
+    pick_font(&KAI_CHAIN, AVAILABLE.get().map(|v| v.as_slice()).unwrap_or(&[]))
+}
+
 /// 按当前模式与字体选择返回字体族名：回退链上第一个系统真正拥有的字体。
 ///
 /// GPUI 0.2.2 的 `font_family` 接受 `impl Into<SharedString>`（没有
@@ -595,6 +618,14 @@ mod tests {
         // 生僻字覆盖靠「大字库」：链里必须带大字符集宋体兜底。
         let chain = ancient_chain(FontChoice::WenJinMincho);
         assert!(chain.contains(&"Source Han Serif SC"));
+    }
+
+    #[test]
+    fn head_family_chain_is_kai_with_serif_fallback() {
+        // 眉批恒定楷体：链首是开源楷体、链里带系统楷体、链尾有 serif 兜底。
+        assert_eq!(KAI_CHAIN[0], "Xuandong Kaishu");
+        assert!(KAI_CHAIN.iter().any(|f| f.contains("Kaiti")));
+        assert!(KAI_CHAIN.contains(&"serif"));
     }
 
     #[test]

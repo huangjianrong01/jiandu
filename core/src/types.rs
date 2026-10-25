@@ -720,8 +720,8 @@ impl Chapter {
 /// epub 的 nav / ncx 里常有一层嵌套（卷 → 章），层级信息就存在这里。
 ///
 /// `start_char_index` 是该章首字在「版面流」里的全局字符下标：
-/// 版面流（`Book::to_flow`）在每段之前固定插入 2 个段首缩进占位，
-/// 所以这里累加的是「正文 + 2 × 段数」而非纯正文，才能与分页器的下标口径一致——
+/// 版面流（`Book::to_flow`）自 v1.52.0 起不再插入段首缩进占位（绝对顶格），
+/// 此处直接累加纯正文下标，与分页器的下标口径一致——
 /// 目录点击跳转时，引擎据此直接定位到该章开头的第一叶（见 `Root::goto_char_index`）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TocEntry {
@@ -908,9 +908,10 @@ impl Book {
 
     /// 把字键 `(chapter, para, offset)` 换算成**全书统一的字符下标**（charIndex）。
     ///
-    /// 与 `to_flow` / `flow_chars_of` 同一口径：段首两个缩进占位也计入，
-    /// 所以这个下标和「版面流里的第几个字」一一对应——长按浮签上显示的
-    /// 「第 N 字」就是它，可直接和目录的 `start_char_index` 对照。
+    /// 与 `to_flow` / `flow_chars_of` 同一口径：自 v1.52.0 起 `to_flow` 不再
+    /// 插入段首缩进占位（绝对顶格），此处直接按纯正文累加，所以这个下标和
+    /// 「版面流里的第几个字」一一对应——长按浮签上显示的「第 N 字」就是它，
+    /// 可直接和目录的 `start_char_index` 对照。
     pub fn flat_index(&self, key: GlyphKey) -> usize {
         let (ci, pi, off) = key;
         let mut acc = 0usize;
@@ -918,9 +919,9 @@ impl Book {
             if i == ci {
                 for (j, p) in ch.paragraphs.iter().enumerate() {
                     if j == pi {
-                        return acc + 2 + off;
+                        return acc + off;
                     }
-                    acc += p.text.chars().count() + 2;
+                    acc += p.text.chars().count();
                 }
                 return acc;
             }
@@ -984,13 +985,11 @@ impl Book {
         }
     }
 
-    /// 一章在版面流里占的字符数：正文 + 段首缩进占位（每段 2 个，与
-    /// `to_flow` 的插入口径一致），用于把「章」换算成「全局字符下标」。
+    /// 一章在版面流里占的字符数：自 v1.52.0 起 `to_flow` 不再插入段首缩进占位
+    /// （绝对顶格），此处直接按纯正文计数，与 `to_flow` 的口径一致——
+    /// 用于把「章」换算成「全局字符下标」。
     fn flow_chars_of(ch: &Chapter) -> usize {
-        ch.paragraphs
-            .iter()
-            .map(|p| p.text.chars().count() + 2)
-            .sum()
+        ch.paragraphs.iter().map(|p| p.text.chars().count()).sum()
     }
 
     /// 用章节标题重建平铺目录（同时算出每条的 start_char_index）。
@@ -1044,22 +1043,14 @@ impl Book {
     }
 
     /// 把全书拍平成字形流（供分页使用）。
-    /// 每段之前固定插入两个段首缩进占位，实现「首行缩进两个字」——
-    /// 横排 / 竖排一视同仁，不再提供开关。缩进占位只是一个
-    /// 字格的空白，不参与查注释。段首不再放置任何段落标记符。
+    /// **绝对顶格**：每段之前不再插入任何段首缩进占位——古籍竖排本就
+    /// 顶格起排，现代「首行缩进两个字」在此为刻意剔除（v1.52.0 起）。
+    /// 字符流里已无任何 `Indent` 占位，段与段之间只靠换行 / 列尾自然收束，
+    /// 正文第一列从版框顶缘起排。
     pub fn to_flow(&self, show_punct: bool) -> Vec<Glyph> {
         let mut out = Vec::new();
         for (ci, ch) in self.chapters.iter().enumerate() {
             for (pi, p) in ch.paragraphs.iter().enumerate() {
-                for _ in 0..2 {
-                    out.push(Glyph {
-                        chapter: ci,
-                        para: pi,
-                        offset: 0,
-                        ch: ' ',
-                        kind: GlyphKind::Indent,
-                    });
-                }
                 for (oi, c) in p.text.chars().enumerate() {
                     // 标点显隐：关闭时不产出标点字（offset 仍按原文计数，注文定位不受影响）。
                     if !show_punct && is_punct(c) {
@@ -1094,7 +1085,9 @@ impl Book {
 pub enum GlyphKind {
     /// 普通正文。
     Char,
-    /// 段首缩进占位（空一格，渲染为空白字格）。
+    /// 段首缩进占位：v1.52.0 起 `Book::to_flow` 已不再产出此变体（绝对顶格），
+    /// 此处保留仅作历史兼容——渲染 / 命中 / 注文注入等处的 `is_indent()` 过滤
+    /// 仍可安全调用（对当前流恒为 false）。
     Indent,
     /// **挤压标点**：本列已排满、紧随末字之后的收束型句读（。，、；？！」…）。
     ///
@@ -1730,14 +1723,15 @@ mod tests {
         assert!(!without.iter().any(|g| g.ch == '，'));
         // offset 仍按原文计数：注文所在 offset=0 的字仍在。
         assert!(without.iter().any(|g| g.offset == 0 && g.ch == '道'));
-        // 缩进占位不受标点开关影响。
-        assert_eq!(without.iter().filter(|g| g.is_indent()).count(), 2);
+        // v1.52.0 起不再产出段首缩进占位——流里应无任何 Indent 字形。
+        assert_eq!(without.iter().filter(|g| g.is_indent()).count(), 0);
     }
 
     #[test]
     fn toc_start_char_index_matches_flow() {
         // 目录的 start_char_index 必须与排版引擎的版面流下标口径一致，
-        // 否则「点章跳转」会落到错误的页。每章：正文 n 字 + 2 个段首缩进占位。
+        // 否则「点章跳转」会落到错误的页。v1.52.0 起每段不再塞段首缩进占位
+        // （绝对顶格），故第二章首字直接接在第一章正文之后。
         let mut b = Book::new("卷目校验", "佚名");
         b.chapters.push(Chapter {
             title: "一".into(),
@@ -1748,12 +1742,12 @@ mod tests {
             paragraphs: vec![Paragraph::plain("非常道")],
         });
         b.ensure_toc();
-        // 第一章首字在流 0；第二章首字在流 5（3 正文 + 2 缩进）。
+        // 第一章首字在流 0；第二章首字在流 3（紧接第一章 3 字正文，无缩进占位）。
         assert_eq!(b.toc[0].start_char_index, Some(0));
-        assert_eq!(b.toc[1].start_char_index, Some(5));
-        // 用 to_flow 反查：流下标 5 正指向第二章第 0 字。
+        assert_eq!(b.toc[1].start_char_index, Some(3));
+        // 用 to_flow 反查：流下标 3 正指向第二章第 0 字。
         let flow = b.to_flow(true);
-        let g = flow.get(5).expect("流下标 5 应命中第二章首字");
+        let g = flow.get(3).expect("流下标 3 应命中第二章首字");
         assert_eq!(g.chapter, 1);
         assert_eq!(g.offset, 0);
     }
@@ -1929,19 +1923,20 @@ mod tests {
             title: "二".into(),
             paragraphs: vec![Paragraph::plain("上善若水")],
         });
-        // 第一章：段① 2 缩进 + 3 字；段② 2 缩进 + 3 字。
-        assert_eq!(b.flat_index((0, 0, 0)), 2);
-        assert_eq!(b.flat_index((0, 0, 2)), 4);
-        assert_eq!(b.flat_index((0, 1, 0)), 7);
-        assert_eq!(b.flat_index((0, 1, 2)), 9);
-        // 第二章接在第一章之后：(3+2)+(3+2)=10 起，再加本段 2 个缩进。
-        assert_eq!(b.flat_index((1, 0, 0)), 12);
+        // 绝对顶格：每段不再有 2 个段首缩进占位，下标即纯正文累加。
+        // 第一章：段① 3 字；段② 3 字。
+        assert_eq!(b.flat_index((0, 0, 0)), 0);
+        assert_eq!(b.flat_index((0, 0, 2)), 2);
+        assert_eq!(b.flat_index((0, 1, 0)), 3);
+        assert_eq!(b.flat_index((0, 1, 2)), 5);
+        // 第二章接在第一章之后：3 + 3 = 6 起（无缩进占位）。
+        assert_eq!(b.flat_index((1, 0, 0)), 6);
         // 单调递增：阅读顺序即下标顺序。
         let keys = [(0, 0, 0), (0, 0, 1), (0, 1, 0), (1, 0, 0), (1, 0, 3)];
         let idx: Vec<usize> = keys.iter().map(|k| b.flat_index(*k)).collect();
-        assert_eq!(idx, vec![2, 3, 7, 12, 15]);
-        // 越界键不 panic（返回累计值）。
-        assert_eq!(b.flat_index((9, 9, 9)), 10 + 6);
+        assert_eq!(idx, vec![0, 1, 3, 6, 9]);
+        // 越界键不 panic（返回全书正文总数：6 + 4）。
+        assert_eq!(b.flat_index((9, 9, 9)), 10);
     }
 
     #[test]

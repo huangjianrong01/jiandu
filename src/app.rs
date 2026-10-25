@@ -556,6 +556,11 @@ pub struct Root {
     pub shelf_picked: Vec<usize>,
     /// 批量删除的二次确认（删多本是不可逆的，必须再问一句）。
     pub shelf_batch_confirm: bool,
+    /// 关窗钩子是否已挂（v1.52.0：改回系统红绿灯后，关闭前要落盘一次）。
+    pub close_hook_set: bool,
+    /// 顶栏「导出」下拉是否展开（v1.52.0）：把印制笺卡 / 全书 PDF / 导出
+    /// MD 三件事收进这一枚菜单，天头才不至于摆满按钮。
+    pub export_menu: bool,
 }
 
 /// **后台导入任务**（v1.50.0 流式架构）。
@@ -800,6 +805,8 @@ impl Root {
             shelf_manage: false,
             shelf_picked: Vec::new(),
             shelf_batch_confirm: false,
+            close_hook_set: false,
+            export_menu: false,
             notice: if count == 0 {
                 "书架空空，点「导入书籍」放一本进来".into()
             } else {
@@ -2738,6 +2745,8 @@ impl Root {
         self.note_menu = None;
         self.dragging = false;
         self.hover_card = false;
+        // v1.52.0：顶栏「导出」下拉也是瞬态的，随其余浮层一起收。
+        self.export_menu = false;
     }
 
     /// 全局 UI 状态机：同一时刻只开一个顶层面板，并强制关闭所有底层瞬态浮层。
@@ -3987,67 +3996,25 @@ impl Root {
         self.sel_char = None;
     }
 
-    /// 顶部品牌条（三态共用）。
+    /// 顶部品牌条（三态共用）：**笺读 · JianDu · 每日一句**。
     ///
-    /// v1.47.0 两处改动：
-    ///   * **标语动态化**：「笺读 JianDu」之后接**每日一句**（淡墨小字 +
-    ///     出处），替掉原来的静态标语「为阅读创造环境」；诗句限宽 400px、
-    ///     超长截断缀省略号，绝不被右侧的「续读」等钮挤走；
-    ///   * **窗口控制钮**：左上角三枚极简淡墨线条钮（✕ 关闭 / — 最小化 /
-    ///     □ 最大化），不用系统红黄绿圆点，悬停转朱砂；绑定 GPUI 原生
-    ///     窗口事件（remove_window / minimize_window / zoom_window）。
+    /// v1.47.0 立：品牌之后接**每日一句**（淡墨小字 + 出处），替掉静态标语
+    /// 「为阅读创造环境」；诗句限宽 400px、超长截断缀省略号，绝不挤走右侧
+    /// 内容。
+    ///
+    /// v1.52.0：**撤下自绘的窗口三钮**（✕ / — / □）——macOS 红绿灯已恢复
+    /// （见 `main.rs` 的 `zen_window_options`），再留一套自绘钮就是「两个
+    /// 关闭键」，既冗余又违背系统手感。关窗落盘改由 `render` 里挂的
+    /// `on_window_should_close` 负责。
     pub fn render_brand(&mut self, cx: &mut Context<Self>) -> Div {
         let song = crate::fonts::family_for(
             crate::types::FontChoice::SongTi,
             crate::types::Script::Ancient,
         );
-        // 一枚窗口钮：18×18 命中区、无底无框，淡墨线条、悬停朱砂。
-        let mk_win_btn = |label: &'static str, fs: f32, act: u8, cx: &mut Context<Self>| -> Div {
-            div()
-                .w(px(18.0))
-                .h(px(18.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .font_family(song.clone())
-                .text_size(px(fs))
-                .text_color(rgb(INK_SOFT))
-                .hover(|s| s.text_color(rgb(CINNABAR)))
-                .child(SharedString::from(label))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        match act {
-                            // 关闭：先落盘阅读进度，再走原生关窗 + 退进程。
-                            0 => {
-                                this.persist();
-                                window.remove_window();
-                                std::process::exit(0);
-                            }
-                            // 最小化 / 最大化：GPUI 原生平台事件。
-                            1 => window.minimize_window(),
-                            _ => window.zoom_window(),
-                        }
-                    }),
-                )
-        };
         let mut bar = div()
             .flex()
             .items_center()
             .gap(px(16.0))
-            // 窗口控制三钮（组内紧挨，与品牌拉开一档）。
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(mk_win_btn("✕", 12.0, 0, cx))
-                    .child(mk_win_btn("—", 12.0, 1, cx))
-                    .child(mk_win_btn("□", 11.0, 2, cx)),
-            )
             .child(
                 div()
                     .text_size(px(16.0))
@@ -4296,6 +4263,23 @@ impl Render for Root {
         let h = vp.height / unit;
         self.viewport_w = if w > 0.0 { w } else { 1280.0 };
         self.viewport_h = if h > 0.0 { h } else { 860.0 };
+        // v1.52.0：改回**系统红绿灯**后，「关闭」走的是 AppKit 的红叉，
+        // 不再经过自绘那枚钮（那里原本会先 persist 再退进程）。故在此挂一次
+        // 关窗钩子：红叉 / ⌘W 关闭前把阅读进度落盘，返回 true 放行关窗。
+        // 只需挂一次（on_window_should_close 是覆盖式注册，反复挂只是浪费）。
+        if !self.close_hook_set {
+            self.close_hook_set = true;
+            // on_window_should_close 的回调签名为 `Fn(&mut Window, &mut App) -> bool + 'static`，
+            // 因此必须捕获一个**拥有的** `Entity<Root>`（'static），而不能用 `cx.listener`
+            // 那种借用 `&mut Self` 的四参闭包。回调里通过 entity.update 再拿到 `this`。
+            let ent = cx.entity();
+            window.on_window_should_close(cx, move |_window, cx| {
+                ent.update(cx, |this, _cx| {
+                    this.persist();
+                });
+                true
+            });
+        }
         // 目录侧栏滑入 / 滑出：逐帧推进 toc_slide 直到到位，到位后
         // 若是「收起」则卸载侧栏。这里只改状态、不读窗口输入，
         // 真正的「下一帧」由 request_animation_frame 驱动，形成动画循环。
@@ -4714,9 +4698,9 @@ mod tests {
             let cap = if pg.start_chapter { cols - 1 } else { cols };
             assert!(pg.columns.len() <= cap, "某面超限：{} 列", pg.columns.len());
             if pg.start_chapter {
-                // 章首页的第一个字必须是该章的段首缩进占位。
+                // 章首页的第一个字必须是该章首字（顶格起排，不再有段首缩进占位）。
                 let first = pg.glyphs[0];
-                assert!(first.is_indent() && first.offset == 0);
+                assert!(!first.is_indent() && first.offset == 0);
             }
         }
         // ③ 至少跨了多面（否则测不出东西）。

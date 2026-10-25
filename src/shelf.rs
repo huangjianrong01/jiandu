@@ -567,28 +567,30 @@ fn small_button(label: &str) -> Div {
         .child(SharedString::from(label.to_string()))
 }
 
-/// 每日一句的数据源（v1.46.0 立，v1.47.0 提为共用）：内置 JSON 按日期
-/// 取模轮换，取 `(正文, 出处)`。v1.47.0 起**只服务顶栏品牌标语**
-/// （app.rs `render_brand`）——书架中部那行旧小字（`render_daily_quote`）
-/// 因与之重复已删除，此函数是唯一幸存入口。
+/// **每日一句**的数据源：本地 `assets/quotes.json`，按日期取模轮换。
+///
+/// v1.52.0：句库由「源码里写死 8 条」换成 **194 条的本地 JSON**
+/// （`assets/quotes.json`，字段 `text / author / source`），编译期
+/// `include_str!` 编进二进制——不必管 app bundle 里资源在哪，也不怕
+/// 用户挪动工作目录。
+///
+/// 轮换：**今天距 Unix 元日的天数 % 总条数**，同一天开多少次都是同一句，
+/// 过零点自然换下一句。
+///
+/// 两处消费：app.rs `render_brand`（顶栏品牌标语）与书架顶栏标题右侧
+/// （`render_shelf_top`）。
 pub(crate) fn daily_quote() -> Option<(String, String)> {
     #[derive(serde::Deserialize)]
     struct Q {
         text: String,
-        src: String,
+        #[serde(default)]
+        author: String,
+        #[serde(default)]
+        source: String,
     }
-    // 内置 JSON（本地资源）：句 + 出处，按「今天」取模轮换。
-    const QUOTES: &str = r#"[
-        {"text":"学而时习之，不亦说乎。","src":"《论语·学而》"},
-        {"text":"大学之道，在明明德，在亲民，在止于至善。","src":"《礼记·大学》"},
-        {"text":"蒹葭苍苍，白露为霜。","src":"《诗经·秦风》"},
-        {"text":"路漫漫其修远兮，吾将上下而求索。","src":"《楚辞·离骚》"},
-        {"text":"穷则独善其身，达则兼善天下。","src":"《孟子·尽心上》"},
-        {"text":"海内存知己，天涯若比邻。","src":"《送杜少府之任蜀州》"},
-        {"text":"一蓑烟雨任平生。","src":"《定风波》"},
-        {"text":"山重水复疑无路，柳暗花明又一村。","src":"《游山西村》"}
-    ]"#;
-    let list: Vec<Q> = serde_json::from_str(QUOTES).unwrap_or_default();
+    // 编译期编入：改句库只需动 assets/quotes.json 重新编译。
+    const QUOTES_JSON: &str = include_str!("../assets/quotes.json");
+    let list: Vec<Q> = serde_json::from_str(QUOTES_JSON).unwrap_or_default();
     if list.is_empty() {
         return None;
     }
@@ -598,7 +600,13 @@ pub(crate) fn daily_quote() -> Option<(String, String)> {
         .unwrap_or(0)
         / 86_400) as usize;
     let q = &list[day % list.len()];
-    Some((q.text.clone(), q.src.clone()))
+    // 出处：优先书名（加书名号），没有书名就退作者。
+    let src = if q.source.trim().is_empty() {
+        q.author.clone()
+    } else {
+        format!("《{}》", q.source)
+    };
+    Some((q.text.clone(), src))
 }
 
 impl Root {
@@ -748,29 +756,66 @@ impl Root {
                 }),
             );
 
+        // 每日一句：`daily_quote()` 按日期取模，格式「一蓑烟雨任平生。
+        // ——《定风波》」。极小号淡墨，紧挨大标题右侧——它只是今日的一点
+        // 意思，绝不能抢「书架」二字的风头。
+        let quote = div()
+            .font_family(song.clone())
+            .text_size(px(11.0))
+            .text_color(rgb(INK_FAINT))
+            .child(SharedString::from(match crate::shelf::daily_quote() {
+                Some((text, src)) => format!("{text} ——{src}"),
+                None => "为阅读创造环境".to_string(),
+            }));
+
+        // 「导入」：右上角搜索图标旁的一枚极简文字钮，点开系统文件选择器。
+        // 走的是 `Root::import_dialog` → 后台线程 `import_streaming`（流式
+        // 清洗管线，不是旧版整本读进内存那套），详见 app.rs。
+        let import_btn = div()
+            .font_family(song.clone())
+            .text_size(px(12.0))
+            .text_color(rgb(INK_SOFT))
+            .cursor_pointer()
+            .hover(|s| s.text_color(rgb(CINNABAR)))
+            .child(SharedString::from("导入"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.import_dialog(cx);
+                    cx.notify();
+                }),
+            );
+
         let mut bar = div()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(16.0))
-            .px(px(40.0))
+            // 左上留白 92px：v1.52.0 恢复系统红绿灯后，那三枚圆点就压在这
+            // 条天头的左端，标题必须让开，否则「书」字被红点盖住半个。
+            .pl(px(92.0))
+            .pr(px(40.0))
             .pt(px(18.0))
             .pb(px(12.0))
             .bg(rgb(SHELF_BG))
-            .child(title);
+            .child(title)
+            .child(quote);
 
         // 搜索：未点开时只是一枚放大镜；点开后原地展开下划线输入框。
         if searching {
             bar = bar.child(self.render_shelf_search(cx));
         }
         bar = bar.child(div().flex_1());
-        // 右侧两件：**放大镜**、**编辑**（就这两样，多一枚都是噪音）。
+        // 右侧三件：**导入**、**放大镜**、**编辑**（多一枚都是噪音）。
+        bar = bar.child(import_btn);
         bar = bar.child(self.render_search_icon(searching, cx));
         bar = bar.child(edit);
 
         // 第二行：胶囊页签（全部 / 经 / 史 / 子 / 集）。
         let tabs = div()
-            .px(px(40.0))
+            .pl(px(92.0))
+            .pr(px(40.0))
             .pb(px(16.0))
             .bg(rgb(SHELF_BG))
             .child(self.render_shelf_tabs(cx));
@@ -1121,7 +1166,7 @@ impl Root {
             .size_full()
             .overflow_y_scroll()
             // 2px：若隐若现的一条细线，不抢书衣的戏。
-            .scrollbar_width(px(2.0))
+            .scrollbar_width(px(0.0))
             .child(grid)
             // 鼠标落在书与书之间的空当：撤掉悬停。书衣自己会
             // stop_propagation，故悬在书上时这一条不会执行。

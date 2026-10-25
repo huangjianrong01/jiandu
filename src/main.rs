@@ -140,16 +140,21 @@ fn main() {
 
 /// 书架 / 竖笺演示共用的窗口参数（标题、尺寸、居中）。
 ///
-/// v1.47.0：macOS 交通灯（系统红黄绿圆点）禁用。GPUI 0.2.2 只暴露
-/// `TitlebarOptions::traffic_light_position`（移动、无隐藏 API），
-/// 故把三钮坐标推到窗口外（x/y 均 -10000pt，AppKit 自裁切）——
-/// 视觉上彻底消失，窗口控制改由 app.rs 的三枚淡墨线条钮负责。
+/// v1.52.0：**恢复 macOS 原生红绿灯**。
+///
+/// 上一版（v1.47.0）把 `traffic_light_position` 推到 (-10000, -10000)，
+/// 让系统三钮裁到窗口外，改由 app.rs 自绘三枚淡墨线条钮——Mac 用户少了
+/// 最熟悉的那三个圆点，全屏 / 最小化也没了系统手感。
+///
+/// 现在改回 `None`（即 AppKit 的标准位置：标题栏左上角 y≈13），
+/// app.rs 那三枚自绘钮同时撤下，避免「两套窗口钮」并存。
 fn zen_window_options(bounds: Bounds<gpui::Pixels>) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
             title: Some("笺读 · JianDu".into()),
-            traffic_light_position: Some(point(px(-10000.0), px(-10000.0))),
+            // 不写这一项（None）= 系统标准位置；要微调才给坐标。
+            traffic_light_position: None,
             ..Default::default()
         }),
         ..Default::default()

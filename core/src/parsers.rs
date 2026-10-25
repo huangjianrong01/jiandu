@@ -948,6 +948,87 @@ pub fn scrub_ghost_notes(text: &str) -> String {
 }
 
 // ------------------------------------------------------------------
+// P0-1：诗词 / 硬回车「防碎裂」合并
+// ------------------------------------------------------------------
+
+/// 诗词与短句的「硬回车」防碎裂合并（P0-1，v1.52.0 新增）。
+///
+/// 真实出版社（中华书局等）的 EPUB 常用无数个 `<br>` / `<p>` 强行断行来排
+/// 诗词，于是「床前明月光」「疑是地上霜」各占一段；更极端的是逐字断行，
+/// 一个字一段——送进竖排引擎就成了「一列只有一个字」的灾难。
+///
+/// 算法：扫描章节正文段落，把**连续**的「可并段」合并成一整段。
+/// 一段「可并」的判据（三条必须同时成立）：
+///   1. 字数 `< MAX_MERGE_CHARS`（默认 10，用户给定「少于 10 个字」）；
+///   2. **不以**终结标点收尾（。？！；… 及半角 !?; 都算收尾）；
+///   3. **不以**冒号 `：`/`：` 收尾，也**不**以开引号 / 开括号起头
+///      （「『（【《< 这些是「新一句 / 新一节」的起手，不能当成上一句的续行）。
+///
+/// 第 3 条专门防误并：像「子曰：」「（按）」「「子」曰」这类断行，若被并到
+/// 上一句会破坏句读；诗词的逐句 / 逐字断行都没有这些符号，照并不误。
+///
+/// 合并后的长段交给引擎：竖排里它作为**一个逻辑段**按字格铺排，过长时自然
+/// 折成下一列（与正常长段落同口径），不会再出现「一字一列」。
+///
+/// 注意：只动**正文段落**，章题在调用方单独处理，不在此合并。
+pub fn merge_poetry_lines(lines: &mut Vec<String>) {
+    const MAX_MERGE_CHARS: usize = 10;
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut buf = String::new();
+    for line in lines.drain(..) {
+        if is_poetry_mergeable(&line, MAX_MERGE_CHARS) {
+            if buf.is_empty() {
+                buf = line;
+            } else {
+                buf.push_str(&line);
+            }
+        } else {
+            if !buf.is_empty() {
+                out.push(std::mem::take(&mut buf));
+            }
+            out.push(line);
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    *lines = out;
+}
+
+/// 一段是否可并入相邻短段（见 [`merge_poetry_lines`] 的三条判据）。
+fn is_poetry_mergeable(line: &str, max_chars: usize) -> bool {
+    let n = line.chars().count();
+    if n == 0 || n >= max_chars {
+        return false;
+    }
+    // 末字符若是终结标点，说明这一句已收束，不可并入上一句。
+    let ends_terminal = line
+        .chars()
+        .next_back()
+        .map(is_terminal_punct)
+        .unwrap_or(false);
+    // 首字符若是开引号 / 开括号，视为新一句起手，不可并入上一句。
+    let starts_open = line.chars().next().map(is_open_marker).unwrap_or(false);
+    !ends_terminal && !starts_open
+}
+
+/// 终结标点：句读收尾（诗词整句应以它收束，故不算「断行待并」）。
+fn is_terminal_punct(c: char) -> bool {
+    matches!(
+        c,
+        '。' | '？' | '！' | '；' | '…' | '!' | '?' | ';' | '︰'
+    )
+}
+
+/// 开引号 / 开括号：新一句 / 新一节的起手，不能当作上一句的续行并进去。
+fn is_open_marker(c: char) -> bool {
+    matches!(
+        c,
+        '「' | '『' | '（' | '【' | '《' | '<' | '“' | '‘' | '(' | '[' | '{'
+    )
+}
+
+// ------------------------------------------------------------------
 // XML 解析（手写标签白名单抽取，与项目「不引重型 DOM 库」的取向一致）
 // ------------------------------------------------------------------
 

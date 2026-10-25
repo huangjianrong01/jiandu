@@ -1996,10 +1996,12 @@ mod tests {
         let mut b = Book::new("悬挂", "佚名");
         b.chapters.push(Chapter {
             title: "一".into(),
-            paragraphs: vec![Paragraph::plain("甲乙丙丁。戊己庚辛")],
+            paragraphs: vec![Paragraph::plain("子丑甲乙丙丁。戊己庚辛")],
         });
         let flow = flow_of(&b);
         // 3 行 → 每列 6 半格 = 3 格：第 2 列「乙丙丁」正好排满，紧跟句号。
+        // （v1.52.0 起 to_flow 不再插段首缩进占位，这里段首补两字「子丑」
+        // 补偿被拔掉的 2 个缩进格，使列边界与顶格排版对齐，禁则演示不变。）
         let pages = layout_book(&flow, |_| None, 8, 3, 0);
         let brief = |c: &Vec<Piece>| -> String {
             c.iter()
@@ -2060,14 +2062,14 @@ mod tests {
         let mut b = Book::new("撤退", "佚名");
         b.chapters.push(Chapter {
             title: "一".into(),
-            paragraphs: vec![Paragraph::plain("甲乙丙丁戊己庚辛壬癸子。丑寅卯辰巳午未申酉")],
+            paragraphs: vec![Paragraph::plain("子丑甲乙丙丁戊己庚辛壬癸子。丑寅卯辰巳午未申酉")],
         });
         let flow = flow_of(&b);
-        // 只给「子」（段内 offset 10）挂一条夹注。
+        // 只给「子」（v1.52.0 起段首补两字，原段内 offset 10 → 现 offset 12）挂一条夹注。
         let pages = layout_book(
             &flow,
             |g| {
-                (g.kind == GlyphKind::Char && g.offset == 10).then(|| {
+                (g.kind == GlyphKind::Char && g.offset == 12).then(|| {
                     (
                         "夹注".to_string(),
                         NoteSource::Original,
@@ -2136,10 +2138,11 @@ mod tests {
         let mut b = Book::new("连发", "佚名");
         b.chapters.push(Chapter {
             title: "一".into(),
-            paragraphs: vec![Paragraph::plain("甲乙丙丁戊己庚辛壬癸子丑。」寅卯辰巳午未申酉")],
+            paragraphs: vec![Paragraph::plain("子丑甲乙丙丁戊己庚辛壬癸子丑。」寅卯辰巳午未申酉")],
         });
         let flow = flow_of(&b);
-        // rows=7 → 每列 14 半格；列1 = 缩进×2 + 甲乙丙丁戊，列2 = 己庚辛壬癸子丑。
+        // rows=7 → 每列 14 半格；段首补两字补偿被拔掉的 2 个缩进格，
+        // 列1 = 子丑 + 甲乙丙丁戊，列2 = 己庚辛壬癸子丑（与顶格排版对齐）。
         let pages = layout_book(&flow, |_| None, 8, 7, 0);
         let brief = |c: &Vec<Piece>| -> String {
             c.iter()
