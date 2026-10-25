@@ -90,6 +90,23 @@ pub const FISHTAIL_W_RATIO: f32 = 0.46;
 /// 界栏线」交界处可能露出的 1px 白缝。高度与文字预算不受影响（`tail_w`
 /// 才是唯一改动的量，`tail_h` 仍由 `banxin_tail_size` 原值决定）。
 pub const FISHTAIL_OVERLAP: f32 = 2.0;
+/// 对鱼尾的**纵向呼吸量**（px）：上鱼尾整体上移、下鱼尾整体下移各这么多，
+/// 让两枚尖端与中间书口文字之间拉开一段修长舒朗的白口（v1.52.10 收官指令）。
+///
+/// 按**版心内芯高**的比例取值（`core_h × TAIL_BREATH_RATIO`），再夹在
+/// `TAIL_BREATH_MIN`～`TAIL_BREATH_MAX` 之间——版心高时多让一点、矮时少让，
+/// 但绝不至于让鱼尾贴回黑口（渲染层定位垫另有 `2px` 硬保底）。上下共用
+/// 同一个值，绝对对称。
+pub const TAIL_BREATH_RATIO: f32 = 0.015;
+/// 呼吸量下限（px）：版心再矮也至少让出这么多。
+pub const TAIL_BREATH_MIN: f32 = 2.0;
+/// 呼吸量上限（px）：版心再高也不多让（让太多书口文字区反而被压缩观感）。
+pub const TAIL_BREATH_MAX: f32 = 6.0;
+
+/// 版心内芯高 → 对鱼尾的纵向呼吸量（px）。上下两枚共用，保证绝对对称。
+pub fn tail_breath(core_h: f32) -> f32 {
+    (core_h * TAIL_BREATH_RATIO).clamp(TAIL_BREATH_MIN, TAIL_BREATH_MAX)
+}
 /// 信笺（14 列）的鱼尾更宽：它独占一列，照参考图几乎顶满。
 pub const LETTER_TAIL_W_RATIO: f32 = 0.92;
 /// 版心鱼尾的**高 / 宽**：略竖长的黑鱼尾（太瘦长就成两条竖杠）。

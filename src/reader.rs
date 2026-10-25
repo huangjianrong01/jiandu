@@ -1167,9 +1167,67 @@ impl Root {
                             }
                         }
                         if held >= LONG_PRESS {
-                            // （v1.49.1）长按不再自动查词——与拖选 / 点字一致，只
-                            // 呼出「选词工具条」（横排竖字那一枚），字典交由工具条
-                            // 「查典」按钮呼出。本字或拖选段都认：取当前选区首字。
+                            // ── v1.52.10：恢复长按查词 ────────────────────
+                            // v1.49.1 曾把长按改成「只弹选词工具条」，字典交由
+                            // 工具条的「查典」按钮呼出。现在恢复「长按即开字书
+                            // 浮签」，同时保留兜底：按在留白 / 标点上、一个字都
+                            // 没命中时，仍弹工具条（不至于长按毫无反应）。
+                            //
+                            // 取字两条路：① 元素命中（拖选 / 点字刚过）用选区
+                            // 首字或选区全文；② 否则用坐标反查 `glyph_hit_at`，
+                            // 落在格子缝隙、夹注旁边也能取到字。
+                            let mut got: Option<(
+                                crate::types::GlyphKey,
+                                char,
+                                String,
+                                Option<(f32, f32, f32, f32)>,
+                            )> = None;
+                            if this.touched_glyph && this.sel_char.is_some() {
+                                let key =
+                                    this.sel_focus.or(this.sel_anchor).unwrap_or((0, 0, 0));
+                                let ch = this.sel_char.unwrap_or(' ');
+                                let text = if this.has_selection() {
+                                    this.selected_text()
+                                } else {
+                                    ch.to_string()
+                                };
+                                got = Some((key, ch, text, None));
+                            }
+                            if got.is_none() {
+                                if let Some(gb) = this.glyph_hit_at(ux, uy) {
+                                    let key = gb.key();
+                                    let ch = gb.glyph.ch;
+                                    // 词组：从命中字起取 4 字交给词典做最长匹配。
+                                    let mut text = this.text_from(key, 4);
+                                    if text.is_empty() {
+                                        text = ch.to_string();
+                                    }
+                                    got = Some((key, ch, text, Some((gb.x, gb.y, gb.w, gb.h))));
+                                }
+                            }
+                            if let Some((key, ch, mut text, rect)) = got {
+                                // 有选区就以选区为准：拖选后长按查的是选的那段。
+                                if this.has_selection() {
+                                    text = this.selected_text();
+                                }
+                                this.bubble = Some(GlyphHit {
+                                    key,
+                                    ch,
+                                    text: text.clone(),
+                                    x: ux,
+                                    y: uy,
+                                });
+                                // 直接呼出字书浮签（本地字书释义 + charIndex +
+                                // 选中文本 + 在线查阅）。`rect` 是那个字的屏幕
+                                // 矩形，浮签据此避让，绝不把它压在底下。
+                                this.open_lookup(key, ch, text, Some((ux, uy)), rect);
+                                // 同一时刻只留一层浮签：工具条让位给字典签。
+                                this.popup = None;
+                                this.dragging = false;
+                                cx.notify();
+                                return;
+                            }
+                            // 兜底：一个字都没命中 → 仍弹选词工具条。
                             let key = this.sel_focus.or(this.sel_anchor).unwrap_or((0, 0, 0));
                             let ch = this.sel_char.unwrap_or(' ');
                             let text = if this.has_selection() {
@@ -1184,7 +1242,6 @@ impl Root {
                                 x: ux,
                                 y: uy,
                             });
-                            // 同一时刻只留一层浮签：长按不再开字典，旧字典签先收掉。
                             this.bubble = None;
                             this.close_lookup();
                             this.dragging = false;
@@ -3868,7 +3925,14 @@ impl Root {
         // 上黑口 + 定位垫 + 半枚鱼尾 = 0.25·core_h，故垫高 =
         // `0.25·core_h − heikou − tail_h/2`；下侧同一数值，黑口留在原位
         // （纸口那道墨不动，动的只是鱼尾）。
-        let pad = (core_h * 0.25 - heikou - lay.tail_h * 0.5).max(2.0);
+        // ── v1.52.10：纵向呼吸量 ──────────────────────────────────
+        // 收官指令「尖端离中间文字太近，缺呼吸感」：定位垫各再减去
+        // `tail_breath(core_h)`，上鱼尾整体上移、下鱼尾整体下移同一数值
+        // （绝对对称），让出的量全数落进中段的 `flex_1` 白口。呼吸量按
+        // 版心高取比例（2~6px），定位垫仍有 `2px` 硬保底——鱼尾绝不撞黑口；
+        // 中间书口文字被更长的白口托着，也绝不挤压。
+        let breath = crate::banxin::tail_breath(core_h);
+        let pad = (core_h * 0.25 - heikou - lay.tail_h * 0.5 - breath).max(2.0);
         let mut col = div()
             .w(px(core_w))
             .h(px(core_h))

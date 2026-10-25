@@ -1242,11 +1242,37 @@ impl Root {
                     if g2.key() != key {
                         return;
                     }
-                    // （v1.49.1）自动查词已禁用：拖选 / 点字 / 悬停都不再自动浮出
-                    // 字书浮签——字典只由选词工具条的「查典」按钮呼出，选中文字
-                    // 的逻辑与查词逻辑彻底解耦。悬停仍清掉过期代号（见上方），但
-                    // 绝不在此开签。
-                    return;
+                    // ── v1.52.10：恢复悬停查词 ────────────────────────
+                    // v1.49.1 曾把这条路整体禁用（怕字典签顶掉选词工具条）。
+                    // 现在的护栏改在**入口**：只要选词工具条（popup）在屏、
+                    // 或正在拖选 / 写字，就不抢——工具条该出来时一定出来；
+                    // 指针单纯在字上停稳（没点过）才浮出字书浮签。
+                    if this.note_editing || this.dragging || this.popup.is_some() {
+                        return;
+                    }
+                    let (ch, gx, gy, gw, gh) = (
+                        g2.glyph.ch,
+                        g2.x,
+                        g2.y,
+                        g2.w,
+                        g2.h,
+                    );
+                    // 词组：从命中字起取 4 字交给词典做最长匹配
+                    // （「长安」成一条词，而不是「长」+「安」）。
+                    let mut text = this.text_from(key, 4);
+                    if text.is_empty() {
+                        text = ch.to_string();
+                    }
+                    this.bubble = Some(GlyphHit {
+                        key,
+                        ch,
+                        text: text.clone(),
+                        x,
+                        y,
+                    });
+                    this.open_lookup(key, ch, text, Some((x, y)), Some((gx, gy, gw, gh)));
+                    this.hover_card = true;
+                    cx.notify();
                 });
             }
         })
