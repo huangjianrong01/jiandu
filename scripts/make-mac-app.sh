@@ -15,7 +15,7 @@ ROOT="$(pwd)"
 APP_NAME="笺读"
 BUNDLE_ID="com.jiandu.app"
 VERSION="1.52.1"
-BUILD_NUM="55"
+BUILD_NUM="56"
 MIN_MACOS="12.0"
 
 DIST="$ROOT/dist"

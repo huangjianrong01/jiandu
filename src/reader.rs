@@ -2105,13 +2105,19 @@ impl Root {
             }),
         ));
 
+        // v1.52.1 排障：常驻顶栏曾不显示，两因叠加——① `.absolute()` 与
+        // `.relative()` 并存（relative 覆盖 absolute，掉出绝对定位、被 flex_1
+        // 正文挤飞）；② 出场动画 `top(-BAR_H*(1-v))` 在 bar_shown 恒 true 时
+        // 不再重播、卡在 v=0 → top:-44 藏到窗顶外。现改：纯 absolute 钉 top:0、
+        // 去 relative、flex_none 防挤、去显隐动画（常驻无需滑入滑出），靠「最后
+        // 绘制的子节点」天然盖在纸面之上（GPUI 0.2.2 无 z_index API）。
         let mut bar = div()
             .absolute()
             .top(px(0.0))
             .left(px(0.0))
             .right(px(0.0))
             .h(px(BAR_H))
-            .relative()
+            .flex_none()
             .flex()
             .flex_row()
             .items_center()
@@ -2150,26 +2156,10 @@ impl Root {
                     .child(right),
             );
 
-        // 滑入 / 滑出：GPUI 0.2.2 只有元素级动画（没有 CSS transition），且
-        // 动画状态按元素 id 缓存——所以显隐各用一个 id，id 一变动画就从头播。
-        let shown = self.bar_shown;
-        let anim = Animation::new(std::time::Duration::from_millis(if shown { 220 } else { 160 }))
-            .with_easing(move |x: f32| {
-                if shown {
-                    1.0 - (1.0 - x).powi(3) // 出场：先快后慢，像纸片落上案头
-                } else {
-                    x * x // 收回：先慢后快，收起时不拖泥带水
-                }
-            });
-        let anim_id =
-            ElementId::NamedInteger(SharedString::from("jd-topbar"), if shown { 1 } else { 0 });
-
+        // v1.52.1：常驻顶栏不再有滑入 / 滑出动画（显隐已撤销，bar_shown 恒 true，
+        // 动画反而会把 top 卡在 -BAR_H 藏上窗顶）。直接静态 top:0 交付。
         let _ = total;
-        bar.with_animation(anim_id, anim, |d: Div, v: f32| {
-            // v: 0 → 1。shown 时由 -BAR_H 落回 0；hidden 时由 0 收进 -BAR_H。
-            d.top(px(-BAR_H * (1.0 - v)))
-        })
-        .into_any_element()
+        bar.into_any_element()
     }
 
     /// 跳到上一章 / 下一章的首面。
