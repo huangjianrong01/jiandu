@@ -23,7 +23,7 @@ use gpui::{
     canvas, div, point, prelude::*, px, rgb, rgba, svg, Animation, AnimationExt, AnyElement, App,
     BoxShadow, Bounds, Context, Div, ElementId, FontWeight, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow, ParentElement, PathBuilder, Pixels,
-    SharedString, Styled, Window,
+    SharedString, Stateful, Styled, Window,
 };
 use std::collections::HashMap;
 
@@ -911,6 +911,27 @@ impl Root {
             self.sync_current_chapter();
         }
         let t = self.theme;
+        // v1.52.3 窄屏首次提示（P3#8）：窄屏单叶阅读时纸面**贴右缘**、竖排
+        // 自右向左——冷启动用户完全找不到正文在哪儿。第一次进窄屏在底部
+        // 正中亮一句引导，点一下纸面即收；`narrow_hint_seen` 落盘，跨会话
+        // 只说一次（宽屏主用户永远看不到它）。
+        // 判据必须排在 fit_sizes 之后：duplex 由屏幕方向在 fit_sizes 里定。
+        let narrow_now = self.duplex != Duplex::Facing
+            && self.viewport_w > 1.0
+            && self.viewport_h > 1.0
+            && crate::grid::is_narrow(self.viewport_w, self.viewport_h);
+        if narrow_now && !self.narrow_hint_seen {
+            self.narrow_hint = true;
+            self.narrow_hint_seen = true;
+            // 落盘只做一次：字段随即置 true，本帧往后不再进这个分支。
+            let mut prefs = crate::prefs::Prefs::load();
+            prefs.narrow_hint_seen = true;
+            prefs.save();
+        }
+        if !narrow_now {
+            // 拉宽窗口 / 转横屏：引导当场收起（不留一句白话在宽屏上）。
+            self.narrow_hint = false;
+        }
         // 「面 → 列 → 片」一次排好：分页与切列同源（gloss::layout_book），
         // 双行夹注的跨列流转也在这里定型，渲染侧不再重算。
         let pages = self.layout_pages_timed();
@@ -1042,7 +1063,52 @@ impl Root {
                     this.touched_glyph = false;
                 },
             ))
-                .on_mouse_up(
+            // v1.52.3 拖选起手容差（P3#6）：按下落在字间留白 / 地脚 / 标点上时，
+            // 字格不会起锚——旧行为是「拖动划不选，松手还可能被算成翻页」，
+            // 通勤族用户第一天因此丢过 3 次阅读位置。现在：按住并位移超过
+            // 8px（与 `tap_turns_page` 同一个阈值）且尚未起锚，就按**按下点**
+            // 就近补一个起锚字，之后各字格的 move 处理器照旧延续选区。
+            // 只有真按着（pressed_button）才补；松手后的单纯移动不打扰阅读。
+            .on_mouse_move(cx.listener(
+                move |this, event: &MouseMoveEvent, _window, cx| {
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        return;
+                    }
+                    // 已起锚（按在字上）/ 正在写眉批 / 这本就是一次天头按下：
+                    // 都不归这里管。
+                    if this.dragging
+                        || this.touched_glyph
+                        || this.note_editing
+                        || this.head_press.is_some()
+                    {
+                        return;
+                    }
+                    let Some((px_, py_)) = this.press_at else {
+                        return;
+                    };
+                    let (mx, my) = (
+                        event.position.x.to_f64() as f32,
+                        event.position.y.to_f64() as f32,
+                    );
+                    if (mx - px_).abs() < 8.0 && (my - py_).abs() < 8.0 {
+                        return; // 小幅抖动：仍是「点」，留给抬起判翻页 / 长按。
+                    }
+                    // 按下点就近补锚：只认正文可点字（与字格按下同一条规则）。
+                    let Some(gb) = this.glyph_hit_near(px_, py_) else {
+                        return;
+                    };
+                    if gb.glyph.kind != GlyphKind::Char || is_punct(gb.glyph.ch) {
+                        return;
+                    }
+                    this.sel_anchor = Some(gb.key());
+                    this.sel_focus = Some(gb.key());
+                    this.sel_char = Some(gb.glyph.ch);
+                    this.dragging = true;
+                    this.popup = None;
+                    cx.notify();
+                },
+            ))
+            .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
                         let (ux, uy) = (
@@ -1232,6 +1298,15 @@ impl Root {
                 this.note_zoom = None;
                 // 点夹注菜单之外：收起「修改 / 删除」菜单（同理）。
                 this.note_menu = None;
+                // 导出下拉点外部即收（v1.52.3，P2#4）：顶栏那枚「导出」展开后，
+                // 点纸面任何一处都该收起来——它与气泡菜单是同一类浮层。
+                // （工具条上其它入口都走 set_ui_state → close_transient_ui，已覆盖；
+                //  菜单项自身 stop_propagation，不受影响。）
+                this.export_menu = false;
+                // 导出收尾话看完即走：下一次点纸面就清（v1.52.3）。
+                this.export_toast = None;
+                // 窄屏引导同理：点一下纸面即收（v1.52.3）。
+                this.narrow_hint = false;
                 cx.notify();
             }),
         );
@@ -1261,19 +1336,34 @@ impl Root {
         } else {
             root = root.child(body);
             // 左上角常驻「退出专注」（避开右上角的字书浮层）。
+            // v1.52.3 强化（P2#5）：原先是 11.5px 无框小签，夜里几乎看不见、
+            // 用户找不到出口。现在加大到 13px + 纸底细框 + 朱砂 hover，
+            // 常驻不依赖悬停；Esc 亦可退出（见按键处理与帮助面板）。
             root = root.child(
                 div()
                     .absolute()
-                    .top(px(12.0))
-                    .left(px(12.0))
+                    .top(px(14.0))
+                    .left(px(14.0))
                     .child(
-                        small_button("退出专注", false, t).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.focus_mode = false;
-                                cx.notify();
-                            }),
-                        ),
+                        div()
+                            .cursor_pointer()
+                            .px_3()
+                            .py_1p5()
+                            .rounded(px(7.0))
+                            .bg(rgb(t.chip()))
+                            .border_1()
+                            .border_color(rgb(t.chrome_line()))
+                            .text_size(px(13.0))
+                            .text_color(rgb(t.chrome_text()))
+                            .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+                            .child(SharedString::from("退出专注"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.focus_mode = false;
+                                    cx.notify();
+                                }),
+                            ),
                     ),
             );
         }
@@ -1813,6 +1903,9 @@ impl Root {
             let jump = e.start_char_index.unwrap_or(0);
             let fg = if cur { VERMILION } else { INK };
             let shown = Self::toc_label(&e.title, per_col);
+            // v1.52.3（P3#10）：题名被截断 / 砍过括注时，悬停显示横排全称。
+            let full = Self::toc_label_full(&e.title);
+            let need_tip = full != shown;
 
             // 一列就是一个卷名：逐字一格，自上而下，**没有任何边框**。
             let mut vcol = div().flex().flex_col().items_center();
@@ -1834,10 +1927,32 @@ impl Root {
                         .child(SharedString::from(c.to_string())),
                 );
             }
-            vcol = vcol
+            // 每列都给个 id（Stateful<Div>：tooltip 只挂在 Stateful 上）；
+            // 不截断的列没有 tooltip，白给一个 id 也无害。
+            let mut col = vcol
                 .flex_shrink_0()
                 .cursor_pointer()
-                .on_mouse_down(
+                .id(SharedString::from(format!("toc-col-{}", e.chapter)));
+            if need_tip {
+                // 原生 tooltip：浮层独立渲染，不受抽屉 overflow_hidden 裁剪；
+                // 只在悬停时构造（294 卷也不会常驻成本）。
+                let tip_title = full.clone();
+                let tip_bg = DRAWER_BG;
+                let tip_edge = EDGE;
+                let tip_ink = INK;
+                let tip_family = song.clone();
+                col = col.tooltip(move |_window, cx| {
+                    cx.new(|_| TocTip {
+                        title: tip_title.clone(),
+                        bg: tip_bg,
+                        edge: tip_edge,
+                        ink: tip_ink,
+                        family: tip_family.clone(),
+                    })
+                    .into()
+                });
+            }
+            let col = col.on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -1846,7 +1961,7 @@ impl Root {
                         cx.notify();
                     }),
                 );
-            row = row.child(vcol);
+            row = row.child(col);
         }
 
         // 自动定位：开目录时滚到**当前在读的那卷**——294 卷的目录若永远从
@@ -1945,6 +2060,25 @@ impl Root {
         } else {
             s.to_string()
         }
+    }
+
+    /// 目录题名的**横排全称**（v1.52.3，P3#10）：与 `toc_label` 同一套字形
+    /// 映射，但**不砍括注、不截断**——悬停浮签 `TocTip` 显示的就是它。
+    /// 两者不同（截断过 / 砍过括注）时才挂 tooltip，短题名不打扰。
+    fn toc_label_full(title: &str) -> String {
+        let raw = crate::types::strip_empty_title_marks(title);
+        let mut out = String::new();
+        for c in raw.chars() {
+            match c {
+                '【' | '“' | '“' => out.push('「'),
+                '】' | '”' | '”' => out.push('」'),
+                '《' | '〈' => out.push('︽'),
+                '》' | '〉' => out.push('︾'),
+                '…' | '⋯' => out.push('︙'),
+                _ => out.push(c),
+            }
+        }
+        out.trim().to_string()
     }
 
 
@@ -2110,8 +2244,21 @@ impl Root {
         // 各就各位；点哪条都直接调起原生保存对话框，点完即收。挂在 bar 容器
         // 内、绝对定位——bar 自身是 absolute 定位父层（top:0），故菜单的
         // top:BAR_H 正好落在栏下沿；靠「后绘制」天然盖在纸面之上。
-        let mitem = |label: &'static str| -> Div {
+        //
+        // v1.52.3：四条菜单项的点击**直接写死**调用 app.rs 的导出入口
+        // （`export_page_png` / `export_pdf_current` / `export_pdf_full` /
+        // `export_markdown_file`），监听器里的 `window` 就是 GPUI 传来的
+        // **真实窗口句柄**，原样透传——截图 / PDF 都以它为准。
+        // 为什么用 `on_mouse_down` 而不是 `on_click`：阅读根 div 上挂着
+        // `on_mouse_down`（点纸面收起导出菜单），若菜单项改用 on_click，
+        // 「按下」会先被根处理器收走菜单（`export_menu = false` → 卸载），
+        // 「抬起」时 hitbox 已不在新帧里，click 永远不触发。按下即触发 +
+        // `stop_propagation` 才是这条链上唯一可靠的接线。
+        // 每枚都给 `.id()`（Stateful<Div>，与目录竹简条同一形态），
+        // 命中测试与派发都走标准路径。
+        let mitem = |id: &'static str, label: &'static str| -> Stateful<Div> {
             div()
+                .id(SharedString::from(id))
                 .w_full()
                 .h(px(24.0))
                 .flex()
@@ -2136,39 +2283,40 @@ impl Root {
             .py(px(3.0))
             .text_size(px(12.0))
             .text_color(rgb(t.ink()));
-        menu = menu.child(mitem("导出当前页图片").on_mouse_down(
+        // ① 导出当前页图片：收菜单 → 直调 `export_page_png`（两段式：先收
+        //    面板画一帧干净纸面，再以真实窗口句柄截屏 → 弹保存框落盘 PNG）。
+        menu = menu.child(mitem("export-png", "导出当前页图片").on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 this.export_menu = false;
-                // 截当前纸面 → 弹系统保存对话框 → 落盘 PNG。
                 this.export_page_png(window, cx);
             }),
         ));
-        menu = menu.child(mitem("导出当前页PDF").on_mouse_down(
+        // ② 导出当前页 PDF：直调 `export_pdf_current`（真实窗口句柄）。
+        menu = menu.child(mitem("export-pdf-cur", "导出当前页PDF").on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 this.export_menu = false;
-                // 截当前纸面 → 包成单页 PDF → 弹系统保存框。
                 this.export_pdf_current(window, cx);
             }),
         ));
-        menu = menu.child(mitem("导出全书PDF").on_mouse_down(
+        // ③ 导出全书 PDF：直调 `export_pdf_full`（逐页翻面截屏 → 合成多页）。
+        menu = menu.child(mitem("export-pdf-full", "导出全书PDF").on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 this.export_menu = false;
-                // 逐页翻面截屏 → 合成多页 PDF → 弹系统保存框。
                 this.export_pdf_full(window, cx);
             }),
         ));
-        menu = menu.child(mitem("导出MD").on_mouse_down(
+        // ④ 导出 MD：直调 `export_markdown_file`（全书正文 + `[^n]` 脚注）。
+        menu = menu.child(mitem("export-md", "导出MD").on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.export_menu = false;
-                // 全书正文 + `[^n]` 脚注 → 弹保存对话框写成 .md。
                 this.export_markdown_file(cx);
             }),
         ));
@@ -4601,6 +4749,49 @@ impl Root {
                     cx.notify();
                 }),
             );
+        // v1.52.3：PDF / PNG 导出期间，底部正中浮一行极淡的进度读数（P2#3）——
+        // 全书导出要翻遍每一面（一万多叶就是一万多帧），没有读数用户以为卡死。
+        // 导出收尾话（成功路径 / 失败 / 取消）经 `export_toast` 送到同一个槽位，
+        // 下一次交互（点纸面 / 翻页）即清。平时这两行都不存在，
+        // v1.52.2 的「底部只留页码」不受影响。
+        let mut center = div().flex().flex_col().items_center();
+        if let Some(toast) = self.export_toast.clone() {
+            center = center.child(
+                div()
+                    .pb(px(1.5))
+                    .text_size(px(9.5))
+                    .text_color(rgb(sheet_zhu(t)))
+                    .child(SharedString::from(toast)),
+            );
+        } else if self.narrow_hint {
+            // v1.52.3 窄屏首次引导（P3#8）：一句白话，说完就收。
+            center = center.child(
+                div()
+                    .pb(px(1.5))
+                    .text_size(px(9.5))
+                    .text_color(rgb(sheet_zhu(t)))
+                    .child(SharedString::from("竖排自右向左，纸面贴右缘")),
+            );
+        } else if self.pdf_animating || self.png_export.is_some() {
+            let label = if self.png_export.is_some() {
+                "正在印制笺卡…".to_string()
+            } else {
+                match self.pdf_job.as_ref() {
+                    Some(j) if j.full => {
+                        format!("正在印制全书 PDF…（{} / {}）", j.pages.len(), j.total)
+                    }
+                    _ => "正在印制本叶 PDF…".to_string(),
+                }
+            };
+            center = center.child(
+                div()
+                    .pb(px(1.5))
+                    .text_size(px(9.5))
+                    .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.45)))
+                    .child(SharedString::from(label)),
+            );
+        }
+        center = center.child(page_chip);
         // v1.52.2 净化：底部只剩正中的「第 X 叶 / 共 X 叶」——字号极小、
         // 颜色极淡（chrome_text 再向栏底混一档），它只是全书坐标，不是仪表盘。
         // 右下那一长串配置信息与中段的四枚导出按钮全部撤掉：导出已收进顶栏
@@ -4616,7 +4807,7 @@ impl Root {
             .border_color(rgb(t.chrome_line()))
             .text_size(px(10.0))
             .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.35)))
-            .child(page_chip)
+            .child(center)
     }
 
     /// 把草稿按每行字符数折行，并标出光标落在哪一行、行内第几个字。
@@ -7356,7 +7547,17 @@ impl Root {
         let vw = self.viewport_w;
         let vh = self.viewport_h;
 
-        let mut list = div().flex().flex_col().px_4().pb_3();
+        // v1.52.3：内容增多（手势 / 导出 / 叶页口径），列表自身滚动防溢出裁切。
+        let mut list = div()
+            .id("help-sheet-list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .px_4()
+            .pb_3()
+            .overflow_y_scroll()
+            .scrollbar_width(px(0.0));
 
         list = list.child(help_sec("翻页", t));
         list = list.child(help_row("→ / ↓ / 点屏幕右半", "下一页", t));
@@ -7387,6 +7588,28 @@ impl Root {
         list = list.child(help_row("拖选文字", "连续划线（竖排同样支持）", t));
         list = list.child(help_row("⌘C", "复制（有选区复制选区，否则整页）", t));
         list = list.child(help_row("笔记框", "⏎ 保存 · Esc 取消 · ← → 移光标 · ⌘V 粘贴", t));
+
+        // v1.52.3：手势与导出入口、叶页口径补在面板最下方（12 用户模拟报告 P1 / P3#12）。
+        list = list.child(help_sec("手势", t));
+        list = list.child(help_row("长按正文约半秒", "气泡菜单：查字典 · 记笔记 · 加夹注 · 复制", t));
+        list = list.child(help_row("悬停文字约半秒", "字书浮签（本 → 繁 → 简 三级兜底）", t));
+        list = list.child(help_row("双击页码", "一键回到卷首", t));
+        list = list.child(help_row("按住天头拖拽", "题「眉批」（同列位置自动避让）", t));
+        list = list.child(help_row("点面板外空白", "收起目录 / 朱批 / 帮助 / 导出菜单", t));
+
+        list = list.child(help_sec("导出", t));
+        list = list.child(help_row("顶栏「导出」", "当前页图片 · 当前页PDF · 全书PDF · MD", t));
+
+        list = list.child(help_sec("叶与页", t));
+        list = list.child(
+            div()
+                .pt_1()
+                .text_size(px(11.0))
+                .text_color(rgb(t.ink_soft()))
+                .child(SharedString::from(
+                    "「叶」是纸的一面（版面），不是现代印刷页：单面模式一屏一叶；对开模式一屏两叶并排，自右向左读，翻一次跨两叶。",
+                )),
+        );
 
         let sheet = div()
             .w(px((vw * 0.52).clamp(380.0, 560.0)))
@@ -8605,6 +8828,40 @@ fn style_row(label: &'static str, chips: Div, t: Theme) -> Div {
                 .child(SharedString::from(label)),
         )
         .child(chips)
+}
+
+/// 目录悬停「全称」浮签（v1.52.3，P3#10）：竖排简条一格宽，卷名超长只能
+/// 截断（`toc_label` 还砍掉括注），校对员对着 294 卷的目录看不到全称。
+/// 挂 GPUI 原生 `tooltip`——位置 / 显隐由框架管，无需自维护 hover 状态，
+/// 也不受抽屉 `overflow_hidden` 裁剪（tooltip 在独立浮层）。
+struct TocTip {
+    /// 横排全称（含被 `toc_label` 砍掉的括注，如「卷三（上下）」）。
+    title: String,
+    /// 宣纸底（与抽屉同色，只是不透明）。
+    bg: u32,
+    /// 一线淡墨界框。
+    edge: u32,
+    /// 墨色正文。
+    ink: u32,
+    /// 宋体（与目录同字体）。
+    family: SharedString,
+}
+
+impl Render for TocTip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(420.0))
+            .px_3()
+            .py_2()
+            .rounded(px(6.0))
+            .bg(rgba(self.bg))
+            .border_1()
+            .border_color(rgba(self.edge))
+            .font_family(self.family.clone())
+            .text_size(px(12.5))
+            .text_color(rgb(self.ink))
+            .child(SharedString::from(self.title.clone()))
+    }
 }
 
 /// 帮助面板的一行快捷键：左侧键名（朱色小签），右侧功能说明。

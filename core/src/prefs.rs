@@ -86,6 +86,11 @@ pub struct Prefs {
     pub notes: bool,
     /// 翻页音效。
     pub sound: bool,
+    /// 窄屏（手机竖持 / 窗口拉窄）首次提示已看过（v1.52.3）：
+    /// 「竖排自右向左，纸面贴右缘」只说一次，跨会话不再唠叨。
+    /// 老存档没有这一项 → false（升级后第一次进窄屏会看到）。
+    #[serde(default)]
+    pub narrow_hint_seen: bool,
 }
 
 impl Default for Prefs {
@@ -118,6 +123,7 @@ impl Default for Prefs {
             layout_mode: 0,
             notes: true,
             sound: true,
+            narrow_hint_seen: false,
         }
     }
 }
@@ -281,6 +287,23 @@ mod tests {
         assert_eq!(FontPreset::from_index(p.font_preset), FontPreset::Kai);
         // 越界回落首项，不 panic。
         assert_eq!(FontPreset::from_index(99), FontPreset::Song);
+    }
+
+    #[test]
+    fn narrow_hint_seen_defaults_false_and_round_trips() {
+        // 窄屏提示只说一次：默认没看过；老存档没有这一项也按没看过（升级后
+        // 第一次进窄屏会看到那句「竖排自右向左，纸面贴右缘」）。
+        let p = Prefs::default();
+        assert!(!p.narrow_hint_seen);
+        let old = r#"{"theme":0,"palette":0,"font_ancient":0,"font_modern":0,"zoom":1.0,
+            "columns":12,"margin":0.06,"layout_key":"standard12",
+            "notes_inline":true,"trad":true,"tongjia":true,"punct":true,"rare":true,
+            "han_digits":false,"notes":true,"sound":true}"#;
+        let q: Prefs = serde_json::from_str(old).expect("老存档应能读进来");
+        assert!(!q.narrow_hint_seen, "老存档按未看过处理");
+        let s = serde_json::to_string(&p).expect("序列化");
+        let back: Prefs = serde_json::from_str(&s).expect("反序列化");
+        assert!(!back.narrow_hint_seen);
     }
 
     #[test]

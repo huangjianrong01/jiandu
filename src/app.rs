@@ -140,6 +140,19 @@ pub enum AppUIState {
     Share,
 }
 
+/// PNG 笺卡导出的两段式阶段（v1.52.3，见 `Root::png_export`）。
+///
+/// `screencapture` 截的是**屏幕**而不是渲染树：事件处理器里当场截，截到的
+/// 还是带着目录 / 浮层的旧帧。故先收面板、登记 `Warm`，等「无面板」纸面
+/// 真正合成上屏后的下一帧（`Shoot`）才截——与 PDF 的 `pdf_warm` 同序。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PngStage {
+    /// 面板刚收：本帧只负责把干净纸面画出来，不截。
+    Warm,
+    /// 干净纸面已上屏：本帧截屏 + 弹系统保存框。
+    Shoot,
+}
+
 /// PDF 导出作业：逐页截屏 → 合成多页 PDF（v1.49.0）。
 ///
 /// 由 `render` 的 `pdf_animating` 分支逐帧驱动：每帧要么翻到下一面等画好，
@@ -519,6 +532,26 @@ pub struct Root {
     /// 下一帧才开始截，避免截到上一帧还带着面板的画面。
     pub pdf_warm: bool,
 
+    /// PNG 笺卡导出的两段式作业（v1.52.3）：`Some(Warm)` = 面板已收、等一帧
+    /// 干净纸面；`Some(Shoot)` = 下一帧截屏 + 弹保存框。`None` = 空闲。
+    /// 修的是「开着目录点导出 PNG，图里带着目录」——`screencapture` 截屏幕，
+    /// 不等合成器翻页就会把浮层一起截进去（12 用户模拟报告 P2#2）。
+    pub png_export: Option<PngStage>,
+
+    /// 导出收尾的临时提示（v1.52.3）：成功路径 / 失败原因 / 用户取消，都送到
+    /// 底部正中间那行（与导出进度同一个槽位）——`notice` 只在书架底栏渲染，
+    /// 阅读视图里看不到，导出完用户不知道文件去了哪（P2#3）。
+    /// 下一次交互（点纸面 / 翻页）即清，不常驻。
+    pub export_toast: Option<String>,
+
+    /// 窄屏首次提示的显示态（v1.52.3，P3#8）：窄屏（手机竖持 / 窗口拉窄）
+    /// 单叶阅读时，纸面贴右缘、竖排自右向左——冷启动用户完全找不到正文，
+    /// 故第一次进窄屏在底部正中亮一句「竖排自右向左，纸面贴右缘」，
+    /// 点一下纸面即收。`narrow_hint_seen` 是持久档（只说一次）。
+    pub narrow_hint: bool,
+    /// 窄屏提示是否已看过（跨会话，落 `prefs.json` 的 `narrow_hint_seen`）。
+    pub narrow_hint_seen: bool,
+
     /// 全书统计（章数, 字数）：开卷时算一次，供章末「篇·章·字」小表的
     /// 「全書」一行使用（逐帧扫全书太贵）。
     pub book_stat: (usize, usize),
@@ -791,6 +824,10 @@ impl Root {
             pdf_job: None,
             pdf_animating: false,
             pdf_warm: false,
+            png_export: None,
+            export_toast: None,
+            narrow_hint: false,
+            narrow_hint_seen: prefs.narrow_hint_seen,
             book_stat: (0, 0),
             shelf_view: ShelfView::TitleSlip,
             shelf_sort: ShelfSort::Recent,
@@ -1370,6 +1407,12 @@ impl Root {
     /// 避让可直接拿去算。
     pub fn glyph_hit_at(&self, x: f32, y: f32) -> Option<crate::hit::GlyphBox> {
         let pages = self.layout_pages();
+        self.glyph_hit_in(&pages, x, y)
+    }
+
+    /// `glyph_hit_at` 的实段：排版由调用方给（一次排版多探几个点，见
+    /// `glyph_hit_near`——整书排版不便宜，不能每个候选点排一遍）。
+    fn glyph_hit_in(&self, pages: &[crate::gloss::Page], x: f32, y: f32) -> Option<crate::hit::GlyphBox> {
         if pages.is_empty() {
             return None;
         }
@@ -1412,6 +1455,47 @@ impl Root {
                 return Some(gb);
             }
             // 这一叶没命中（点在别的叶上）：继续试下一叶。
+        }
+        None
+    }
+
+    /// 按下点**就近**找一个字（v1.52.3 拖选起手容差，P3#6）：先原坐标，
+    /// 再按「半格四邻 → 一格四邻 → 半格对角 → 一格对角」由近及远探。
+    ///
+    /// 解决的是「按下落在字间留白 / 地脚 / 标点上，拖动划不选」：字格只在
+    /// 按下命中字时才起锚，落在缝里那一按 historically 什么都不发生，
+    /// 松手还可能被算成翻页（12 用户模拟报告：通勤族第一天丢过 3 次位置）。
+    /// 整书排版只做一次，八个候选点共用。
+    pub fn glyph_hit_near(&self, x: f32, y: f32) -> Option<crate::hit::GlyphBox> {
+        let pages = self.layout_pages();
+        if let Some(gb) = self.glyph_hit_in(&pages, x, y) {
+            return Some(gb);
+        }
+        let cw = self.col_w.max(1.0);
+        let ch = self.row_h.max(1.0);
+        // 由近及远：先四邻（半格 / 一格），再对角（半格 / 一格）。
+        let probes: [(f32, f32); 16] = [
+            (0.0, -0.5),
+            (0.0, 0.5),
+            (-0.5, 0.0),
+            (0.5, 0.0),
+            (0.0, -1.0),
+            (0.0, 1.0),
+            (-1.0, 0.0),
+            (1.0, 0.0),
+            (-0.5, -0.5),
+            (0.5, -0.5),
+            (-0.5, 0.5),
+            (0.5, 0.5),
+            (-1.0, -1.0),
+            (1.0, -1.0),
+            (-1.0, 1.0),
+            (1.0, 1.0),
+        ];
+        for (dx, dy) in probes {
+            if let Some(gb) = self.glyph_hit_in(&pages, x + dx * cw, y + dy * ch) {
+                return Some(gb);
+            }
         }
         None
     }
@@ -2042,6 +2126,8 @@ impl Root {
                 //  书衣只在书架这一侧看了。）
                 self.screen = Screen::Reading;
                 self.notice.clear();
+                // 换书即换场景：上一本的导出收尾话不留（v1.52.3）。
+                self.export_toast = None;
                 // 恢复进度后立刻对齐当前章，目录朱砂红点才不会错位。
                 self.sync_current_chapter();
             }
@@ -2351,16 +2437,39 @@ impl Root {
 
     /// 『印制笺卡（PNG）』按钮：截当前纸面 → 弹系统保存对话框 → 落盘。
     ///
-    /// 顺序**不能反**：先截后弹。保存面板一浮起，再截就截到面板自己了。
+    /// v1.52.3：**先收面板再截**（与 PDF 导出同序）。`screencapture` 截的是
+    /// 屏幕而非渲染树，事件处理器里当场截，截到的还是带着目录 / 浮层的旧帧
+    /// （12 用户模拟报告 P2#2）。故这里只收面板 + 登记两段式作业
+    /// （`png_export = Some(Warm)`），真正截屏在 `render` 循环的 `Shoot`
+    /// 分支——那时「无面板」纸面已合成上屏。
+    ///
+    /// 保存顺序**不能反**：先截后弹。保存面板一浮起，再截就截到面板自己了。
     /// 用户取消 = 正常结果：清掉临时文件、提示一句，不 panic、不报错红。
     pub fn export_page_png(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // 导出已在推进中：忽略重复点击（两段式作业会自行收尾）。
+        if self.png_export.is_some() {
+            return;
+        }
+        // 导出前收起所有面板 / 浮层，纸面只留正文（与 begin_pdf_export 同序）。
+        self.set_ui_state(AppUIState::None);
+        self.close_transient_ui();
+        self.png_export = Some(PngStage::Warm);
+        cx.notify();
+        // 第一帧由 `render` 的 png_export 分支接管。
+        window.request_animation_frame();
+    }
+
+    /// PNG 笺卡导出的实段（`PngStage::Shoot` 帧由 `render` 循环调用）：
+    /// 此刻屏幕上正是「无面板」的干净纸面，截下 → 弹系统保存框 → 落盘。
+    fn export_page_png_shoot(&mut self, window: &Window, cx: &mut Context<Self>) {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let tmp = std::env::temp_dir().join(format!("jiandu-card-{secs}.png"));
         if let Err(e) = self.capture_page_png(window, &tmp) {
-            self.notice = e;
+            self.notice = e.clone();
+            self.export_toast = Some(e);
             cx.notify();
             return;
         }
@@ -2394,6 +2503,7 @@ impl Root {
                         let _ = std::fs::remove_file(&tmp);
                         this.update(&mut cx, |this, cx| {
                             this.notice = "已取消保存".to_string();
+                            this.export_toast = Some("已取消保存".to_string());
                             cx.notify();
                         })
                         .ok();
@@ -2403,10 +2513,12 @@ impl Root {
                     let res = crate::exporter::copy_file(&tmp, &dest);
                     let _ = std::fs::remove_file(&tmp);
                     this.update(&mut cx, |this, cx| {
-                        this.notice = match res {
+                        let msg = match res {
                             Ok(p) => format!("已印制笺卡：{}", p.display()),
                             Err(e) => format!("保存失败：{e}"),
                         };
+                        this.notice = msg.clone();
+                        this.export_toast = Some(msg);
                         cx.notify();
                     })
                     .ok();
@@ -2557,6 +2669,8 @@ impl Root {
                         let e = built.unwrap_err();
                         this.update(&mut cx, |this, cx| {
                             this.notice = format!("合成 PDF 失败：{e}");
+                            // v1.52.3：阅读视图不渲染 notice，收尾话送 export_toast。
+                            this.export_toast = Some(format!("合成 PDF 失败：{e}"));
                             cx.notify();
                         })
                         .ok();
@@ -2581,6 +2695,7 @@ impl Root {
                         let _ = std::fs::remove_file(&tmp_pdf);
                         this.update(&mut cx, |this, cx| {
                             this.notice = "已取消保存".to_string();
+                            this.export_toast = Some("已取消保存".to_string());
                             cx.notify();
                         })
                         .ok();
@@ -2590,7 +2705,7 @@ impl Root {
                     let res = crate::exporter::copy_file(&tmp_pdf, &dest);
                     let _ = std::fs::remove_file(&tmp_pdf);
                     this.update(&mut cx, |this, cx| {
-                        this.notice = match res {
+                        let msg = match res {
                             Ok(p) => format!(
                                 "{}已印成 PDF：{}",
                                 if full { "全书" } else { "本叶" },
@@ -2598,6 +2713,8 @@ impl Root {
                             ),
                             Err(e) => format!("保存失败：{e}"),
                         };
+                        this.notice = msg.clone();
+                        this.export_toast = Some(msg);
                         cx.notify();
                     })
                     .ok();
@@ -3382,6 +3499,10 @@ impl Root {
         self.page = new;
         self.clear_selection();
         self.popup = None;
+        // 翻页也是「下一次交互」：导出收尾话随翻页清掉（v1.52.3）。
+        self.export_toast = None;
+        // 窄屏引导也跟着走：用户已经在读书了，不用再教（v1.52.3）。
+        self.narrow_hint = false;
         self.persist();
         cx.notify();
     }
@@ -4404,6 +4525,21 @@ impl Render for Root {
                     }
                 } else {
                     self.pdf_animating = false;
+                }
+            }
+        }
+        // PNG 笺卡导出：两段式（先收面板画一帧干净纸面，下一帧才截屏）——v1.52.3。
+        // `screencapture` 截的是屏幕：Warm 帧只画不截，等干净纸面合成上屏，
+        // Shoot 帧才动手，免得图里挂着目录 / 浮层（P2#2）。
+        if let Some(stage) = self.png_export {
+            match stage {
+                PngStage::Warm => {
+                    self.png_export = Some(PngStage::Shoot);
+                    window.request_animation_frame();
+                }
+                PngStage::Shoot => {
+                    self.png_export = None;
+                    self.export_page_png_shoot(window, cx);
                 }
             }
         }
