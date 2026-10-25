@@ -173,6 +173,19 @@ pub struct PdfJob {
     pub origin_page: usize,
 }
 
+/// 把 `catch_unwind` 捕获的 panic 负载转成可读字符串（`&str` / `String` 优先，
+/// 其它类型回退为「未知错误」）。导出路径在事件处理器与异步任务两处 FFI 边界
+/// 都用它把 panic 降级为界面提示，避免 `panic_cannot_unwind` 强杀进程。
+pub(crate) fn panic_payload_to_string(e: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = e.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = e.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "未知错误".to_string()
+    }
+}
+
 pub struct Root {
     pub library: Library,
     pub screen: Screen,

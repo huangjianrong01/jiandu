@@ -2290,7 +2290,14 @@ impl Root {
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 this.export_menu = false;
-                this.export_page_png(window, cx);
+                // 外层 `catch_unwind`：事件处理器 panic 会撞上 GPUI↔ObjC 的
+                // FFI 边界被 `panic_cannot_unwind` 强杀，故在此拦一道，降级为提示。
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    this.export_page_png(window, cx);
+                }));
+                if let Err(e) = r {
+                    this.report_export_panic(e, cx);
+                }
             }),
         ));
         // ② 导出当前页 PDF：直调 `export_pdf_current`（真实窗口句柄）。
@@ -2299,7 +2306,12 @@ impl Root {
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 this.export_menu = false;
-                this.export_pdf_current(window, cx);
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    this.export_pdf_current(window, cx);
+                }));
+                if let Err(e) = r {
+                    this.report_export_panic(e, cx);
+                }
             }),
         ));
         // ③ 导出全书 PDF：直调 `export_pdf_full`（逐页翻面截屏 → 合成多页）。
@@ -2308,7 +2320,12 @@ impl Root {
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 this.export_menu = false;
-                this.export_pdf_full(window, cx);
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    this.export_pdf_full(window, cx);
+                }));
+                if let Err(e) = r {
+                    this.report_export_panic(e, cx);
+                }
             }),
         ));
         // ④ 导出 MD：直调 `export_markdown_file`（全书正文 + `[^n]` 脚注）。
@@ -2317,7 +2334,12 @@ impl Root {
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.export_menu = false;
-                this.export_markdown_file(cx);
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    this.export_markdown_file(cx);
+                }));
+                if let Err(e) = r {
+                    this.report_export_panic(e, cx);
+                }
             }),
         ));
 
@@ -2381,6 +2403,27 @@ impl Root {
         // 动画反而会把 top 卡在 -BAR_H 藏上窗顶）。直接静态 top:0 交付。
         let _ = total;
         bar.into_any_element()
+    }
+
+    /// 导出点击处理器被 `catch_unwind` 兜住后的统一收尾：把 panic 转成界面提示，
+    /// 并清掉半途残留的导出作业（PNG / PDF），避免渲染继续翻面 / 截屏死循环。
+    ///
+    /// 为什么需要它：笺读的事件处理器从 AppKit(ObjC) 事件循环经 GPUI 回调进
+    /// Rust，一旦处理器 panic，Rust 展开无法越过这条 FFI 边界，运行时会直接
+    /// `panic_cannot_unwind` 强杀进程（abort 不打印、不展开），表现为「点一下
+    /// 导出就整个退出、什么都没留下」。在监听器最外层用 `catch_unwind` 拦一道，
+    /// 把任何 panic 降级成一条可读提示而非进程死亡；exact 行号留给 panic.log。
+    fn report_export_panic(&mut self, e: Box<dyn std::any::Any + Send>, cx: &mut Context<Self>) {
+        let msg = crate::app::panic_payload_to_string(e);
+        let text = format!("导出出错：{msg}");
+        self.notice = text.clone();
+        self.export_toast = Some(text);
+        // 清掉半途残留的导出作业，避免渲染继续翻面 / 截屏死循环。
+        self.png_export = None;
+        self.pdf_job = None;
+        self.pdf_animating = false;
+        self.export_menu = false;
+        cx.notify();
     }
 
     /// 跳到上一章 / 下一章的首面。

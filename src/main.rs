@@ -73,6 +73,14 @@ impl AssetSource for JianDuAssets {
 }
 
 fn main() {
+    // 全局 panic 钩子：把 panic 位置 + 回溯落盘，便于定位崩溃根因。
+    // 背景：笺读的事件处理器经 GPUI 从 AppKit(ObjC) 事件循环回调进 Rust，
+    // 一旦处理器 panic，Rust 展开无法越过这条 FFI 边界，运行时会直接
+    // `panic_cannot_unwind` 强杀进程（abort 不打印、不展开），表现为
+    // 「点一下就整个退出、什么都没留下」却看不到任何报错。此钩子在 abort
+    // 之前把确切位置与回溯写进 ~/.jiandu/panic.log，同时前台也打印一份。
+    install_panic_logger();
+
     // 命令行模式：`jiandu --convert 输入 --out 输出`
     //   epub -> json / txt / md 的批量转换，不开窗口。
     let args: Vec<String> = std::env::args().collect();
@@ -159,6 +167,39 @@ fn zen_window_options(bounds: Bounds<gpui::Pixels>) -> WindowOptions {
         }),
         ..Default::default()
     }
+}
+
+/// 安装全局 panic 钩子：在进程被 `panic_cannot_unwind` 强杀（abort）之前，
+/// 把 panic 的发生时间、位置、信息与完整回溯写进 `~/.jiandu/panic.log`，
+/// 同时向前台（stderr）也打印一份，确保无终端的 GUI 启动也能拿到证据。
+fn install_panic_logger() {
+    let home = Library::home();
+    let _ = std::fs::create_dir_all(&home);
+    let log_path = home.join("panic.log");
+    std::panic::set_hook(Box::new(move |info| {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "未知位置".to_string());
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "非字符串 panic 负载".to_string()
+        };
+        let bt = std::backtrace::Backtrace::force_capture();
+        let entry = format!(
+            "==== panic @ {secs} (unix) ====\n位置：{loc}\n信息：{msg}\n回溯：\n{bt}\n\n"
+        );
+        // 落盘优先；写失败也不影响打印。
+        let _ = std::fs::write(&log_path, &entry);
+        eprintln!("{entry}");
+    }));
 }
 
 /// 处理命令行；返回 `Some(退出码)` 表示是 CLI 任务，不必开窗口。
