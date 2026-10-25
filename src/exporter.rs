@@ -234,15 +234,36 @@ pub fn convert(input: &Path, out: &Path) -> Result<PathBuf> {
 /// 吞掉（顶多提示一句「已取消」），绝不能 `unwrap` / `expect`，否则取消
 /// 一次就 panic 闪退。
 ///
-/// 阻塞式 API：macOS 后端内部会把面板派发到主线程再等结果，所以即使在
-/// GPUI 的后台 executor 上调用也是安全的（与导入对话框同一条路子）。
+/// # ⚠️ 必须在主线程调用（v1.52.4 血的教训）
+///
+/// rfd 0.14.1 的 macOS 后端：同步 `save_file()` → `run_on_main` → 若当前
+/// 不在主线程，走 `dispatch::Queue::main().exec_sync(panel.runModal)`。
+/// GPUI 主线程此刻正忙着自己的事件循环 / 渲染，`dispatch_sync` 的 block
+/// 要么根本排不上、要么嵌套 modal session 与 GPUI run loop 不兼容导致
+/// `runModal` 立刻返回非 1 —— 两种结果都是 `save_file()` 静默返回
+/// `None`，调用方只当「用户取消」，于是**点了导出什么都没发生、也不报错**。
+///
+/// 正确做法：在 GPUI **前台 executor**（`cx.spawn` 的 async 体本身就在
+/// 主线程被 poll）里直接调用本函数——`is_main_thread()` 为 true，
+/// `run_on_main` 直接同步跑模态面板，与原生 App 行为一致。
+/// **不要**再包一层 `cx.background_executor().spawn(...)`。
 pub fn pick_save_path(title: &str, file_name: &str, filter_name: &str, exts: &[&str]) -> Option<PathBuf> {
-    rfd::FileDialog::new()
+    let mut dlg = rfd::FileDialog::new()
         .set_title(title)
         // 默认文件名：调用方拼好「笺卡_书名_页码.png」这类名字传进来。
         .set_file_name(file_name)
-        .add_filter(filter_name, exts)
-        .save_file()
+        .add_filter(filter_name, exts);
+    // 默认目录兜底：定位到用户桌面。NSSavePanel 在没有显式目录时会落到
+    // App 的当前工作目录（从 Finder /  Dock 启动时可能是 `/`，从 dist
+    // 目录旁启动时甚至是 App 包内部）——用户直接点「存储」后根本找不到
+    // 文件，表现为「点了导出但没生成」。
+    if let Some(home) = std::env::var_os("HOME") {
+        let desktop = Path::new(&home).join("Desktop");
+        if desktop.is_dir() {
+            dlg = dlg.set_directory(desktop);
+        }
+    }
+    dlg.save_file()
 }
 
 /// 把路径**补上**指定扩展名（用户手打了不带后缀的名字时兜底）。

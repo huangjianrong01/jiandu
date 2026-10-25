@@ -2328,29 +2328,28 @@ impl Root {
     }
 
     /// 弹出系统文件选择器导入书籍。
-    pub fn import_dialog(&mut self, cx: &mut Context<Self>) {        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+    pub fn import_dialog(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
             // AsyncApp 是 Clone：把「借用的上下文」换成「owned 句柄」，
             // async move 块才能安全持有它跨 await（借用不能进 'static future）。
             let mut cx = cx.clone();
             async move {
-                let picked = cx
-                    .background_executor()
-                    .spawn(async {
-                        rfd::FileDialog::new()
-                            .set_title("导入书籍到书架")
-                            // 统一管线支持的所有格式都在这里列上：html / xml
-                            // 走同一条清洗链（剥 script/nav、em 转夹注）。
-                            .add_filter(
-                                "书籍 (md / txt / html / xml / epub / json)",
-                                &[
-                                    "md", "markdown", "txt", "html", "htm", "xhtml", "xml",
-                                    "epub", "json",
-                                ],
-                            )
-                            .add_filter("全部文件", &["*"])
-                            .pick_files()
-                    })
-                    .await;
+                // v1.52.4：**前台直调**（与导出保存框同一修复）——rfd 同步
+                // pick_files 必须跑在主线程，过 background_executor 会被
+                // GPUI 主循环挤掉、静默返回 None（点了「导入」没反应）。
+                let picked = rfd::FileDialog::new()
+                    .set_title("导入书籍到书架")
+                    // 统一管线支持的所有格式都在这里列上：html / xml
+                    // 走同一条清洗链（剥 script/nav、em 转夹注）。
+                    .add_filter(
+                        "书籍 (md / txt / html / xml / epub / json)",
+                        &[
+                            "md", "markdown", "txt", "html", "htm", "xhtml", "xml",
+                            "epub", "json",
+                        ],
+                    )
+                    .add_filter("全部文件", &["*"])
+                    .pick_files();
 
                 if let Some(paths) = picked {
                     this.update(&mut cx, |this, cx| {
@@ -2487,17 +2486,18 @@ impl Root {
             move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
-                    let picked = cx
-                        .background_executor()
-                        .spawn(async move {
-                            crate::exporter::pick_save_path(
-                                "印制笺卡（PNG）",
-                                &default,
-                                "PNG 图片",
-                                &["png"],
-                            )
-                        })
-                        .await;
+                    // v1.52.4：**前台直调**，不再过 background_executor。
+                    // rfd 同步 save_file 靠 dispatch_sync(main) 跑模态面板，
+                    // 推后台线程会被 GPUI 主循环挤掉 → 静默返回 None（看似
+                    // 「点了导出没反应」）。cx.spawn 的 async 体由 GPUI 前台
+                    // executor 在主线程 poll，is_main_thread() 为 true，
+                    // 面板即原生模态显示。详见 exporter::pick_save_path 注释。
+                    let picked = crate::exporter::pick_save_path(
+                        "印制笺卡（PNG）",
+                        &default,
+                        "PNG 图片",
+                        &["png"],
+                    );
                     let Some(dest) = picked else {
                         // 用户点了取消：这不是错误。
                         let _ = std::fs::remove_file(&tmp);
@@ -2540,16 +2540,16 @@ impl Root {
             |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
-                    let res = cx
-                        .background_executor()
-                        .spawn(async move {
-                            crate::exporter::export_markdown_picked(
-                                &book,
-                                "导出纯文本（MD）",
-                                &file_name,
-                            )
-                        })
-                        .await;
+                    // v1.52.4：**前台直调**（与 PNG/PDF 同一修复）——rfd
+                    // 同步 save_file 必须跑在主线程；过 background_executor
+                    // 会被 GPUI 主循环挤掉、静默返回 None，表现为「点了
+                    // 导出什么都没发生」。to_markdown 是毫秒级 CPU 活儿，
+                    // 放前台同步做不卡 UI。
+                    let res = crate::exporter::export_markdown_picked(
+                        &book,
+                        "导出纯文本（MD）",
+                        &file_name,
+                    );
                     this.update(&mut cx, |this, cx| {
                         this.notice = match res {
                             Ok(Some(p)) => format!("已导出 Markdown：{}", p.display()),
@@ -2676,21 +2676,16 @@ impl Root {
                         .ok();
                         return;
                     };
-                    // 弹系统保存对话框。
-                    let picked = cx
-                        .background_executor()
-                        .spawn({
-                            let default = default.clone();
-                            async move {
-                                crate::exporter::pick_save_path(
-                                    "导出为 PDF",
-                                    &default,
-                                    "PDF 文档",
-                                    &["pdf"],
-                                )
-                            }
-                        })
-                        .await;
+                    // 弹系统保存对话框。v1.52.4：**前台直调**（与 PNG/MD
+                    // 同一修复）——rfd 同步 save_file 必须跑在主线程，
+                    // 过 background_executor 会被 GPUI 主循环挤掉、静默
+                    // 返回 None，表现为「点了导出什么都没发生」。
+                    let picked = crate::exporter::pick_save_path(
+                        "导出为 PDF",
+                        &default,
+                        "PDF 文档",
+                        &["pdf"],
+                    );
                     let Some(dest) = picked else {
                         let _ = std::fs::remove_file(&tmp_pdf);
                         this.update(&mut cx, |this, cx| {
