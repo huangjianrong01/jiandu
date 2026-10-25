@@ -16,27 +16,16 @@ use crate::lines;
 use crate::theme::{InkPalette, Theme};
 use crate::trad;
 use crate::types::{
-    is_punct, underline_run_start, Book, CardLayout, Duplex, FontChoice, Glyph, GlyphHit,
-    GlyphKind, MarkKind, NoteKind, NoteSource, Script, TocEntry,
+    is_punct, underline_run_start, Book, Duplex, FontChoice, Glyph, GlyphHit, GlyphKind,
+    MarkKind, NoteKind, NoteSource, Script, TocEntry,
 };
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, rgba, svg, Animation, AnimationExt, AnyElement, App,
-    BoxShadow, Bounds, Context, Div, ElementId, FontWeight, KeyDownEvent, MouseButton,
+    AsyncApp, BoxShadow, Bounds, Context, Div, ElementId, FontWeight, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow, ParentElement, PathBuilder, Pixels,
-    SharedString, Stateful, Styled, Window,
+    SharedString, Stateful, Styled, WeakEntity, Window,
 };
 use std::collections::HashMap;
-
-/// 分享卡底色：(底色, 正文字色, 落款 / 日期色)。对应分享面板的**四枚圆形**。
-///
-/// 原先五块（含靛青）：靛蓝是现代后台系统的颜色，与「古卷雅韵」相冲，
-/// 故只留墨夜 / 朱漆 / 松烟 / 宣纸四色——正好四枚圆，一排排得开。
-pub(crate) const SHARE_BGS: [(u32, u32, u32); 4] = [
-    (0x161310, 0xE9E2D2, 0xA8957A), // 墨夜
-    (0x2A1512, 0xF0DFD2, 0xC49A83), // 朱漆
-    (0x14211B, 0xDDEAE0, 0x93AE9E), // 松烟
-    (0xF2EAD6, 0x2B2622, 0x8A8175), // 宣纸
-];
 
 /// 字书浮签的纸色透明度（v1.43.0）：**0.92**。
 ///
@@ -45,28 +34,15 @@ pub(crate) const SHARE_BGS: [(u32, u32, u32); 4] = [
 /// 但再低释义就发灰了，故九二为界。
 const WASHI_ALPHA: u32 = 0xEB;
 
-/// 朱砂红：笺读的落款印泥色（印在分享笺左下角）。
-pub(crate) const CINNABAR: u32 = 0xC3272D;
-
-/// 分享面板「朱砂印章」按钮的**外框**：比印面大一圈，悬停放大时从中心
-/// 向外长，不会推挤旁边的控件（定位算式也按这个高度算面板总高）。
-pub(crate) const SEAL_BOX: f32 = 52.0;
-/// 朱砂印章的印面边长：古印是方的，不做圆角胶囊。
-const SEAL_SIZE: f32 = 44.0;
-
 /// 用户自加夹注的**深朱砂红**字色（#C62828）。
 ///
 /// 与古籍原本的夹注（墨色兑淡）区分开：用户注用朱砂系，一眼可辨，
-/// 且可右键 / 长按改删。比落款印泥色 `CINNABAR` 略深一档，避免二者混同。
+/// 且可右键 / 长按改删。比落款印泥色略深一档，避免二者混同。
 pub(crate) const USER_NOTE_INK: u32 = 0xC62828;
 
 /// 用户夹注底衬：深朱砂向纸色兑淡的比例（0.88 ≈ 只剩一成多朱砂）。
 /// 要求「极其微弱」——只作可辨识的淡红提示，不抢正文。
 const USER_NOTE_BG_FADE: f32 = 0.88;
-
-/// 分享卡高度系数：卡片高 = 视口高 × 此值（再给控制面板让位收一档）。
-/// 「高度」滑杆已按用户要求连同代码删除，取原五档的中高档一档定值。
-pub(crate) const SHARE_CARD_H_FRAC: f32 = 0.84;
 
 /// 一叶的渲染几何与模式：默认取自当前阅读视图（`LeafGeo::current`）；
 /// **晒本长图**按卡片可用面积另算一套传进来（`render_ancient` 的
@@ -154,67 +130,6 @@ fn circled(n: usize) -> String {
     } else {
         format!("({n})")
     }
-}
-
-/// 0–99 的整数转中文数字（用于分享卡日期的月 / 日）。
-fn cn_small(n: usize) -> String {
-    const D: [&str; 10] = ["〇", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
-    match n {
-        0..=9 => D[n].to_string(),
-        10 => "十".to_string(),
-        11..=19 => format!("十{}", D[n - 10]),
-        20..=99 => {
-            let tens = D[n / 10];
-            if n % 10 == 0 {
-                format!("{tens}十")
-            } else {
-                format!("{tens}十{}", D[n % 10])
-            }
-        }
-        _ => n.to_string(),
-    }
-}
-
-/// 把「2026-10-18」转成「二〇二六年十月十八日」；解析失败返回空串。
-fn cn_date_from_str(ymd: &str) -> String {
-    let p: Vec<&str> = ymd.split('-').collect();
-    if p.len() != 3 {
-        return String::new();
-    }
-    let (Ok(m), Ok(d)) = (p[1].parse::<usize>(), p[2].parse::<usize>()) else {
-        return String::new();
-    };
-    if p[0].is_empty() || !p[0].chars().all(|c| c.is_ascii_digit()) {
-        return String::new();
-    }
-    let ys: String = p[0]
-        .chars()
-        .map(|c| match c {
-            '0' => "〇",
-            '1' => "一",
-            '2' => "二",
-            '3' => "三",
-            '4' => "四",
-            '5' => "五",
-            '6' => "六",
-            '7' => "七",
-            '8' => "八",
-            '9' => "九",
-            _ => "",
-        })
-        .collect();
-    format!("{ys}年{}月{}日", cn_small(m), cn_small(d))
-}
-
-/// 取系统当前日期（YYYY-MM-DD），失败返回空串。
-fn today_ymd() -> String {
-    std::process::Command::new("date")
-        .arg("+%Y-%m-%d")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
 }
 
 /// 按字符数截断：超长缀省略号（目录章名等竖排短文本用）。
@@ -387,8 +302,8 @@ fn small_button(label: &str, on: bool, t: Theme) -> Div {
 // 现在整块面板改用水墨语汇——**无底、无框、无圆角**，只留一行字与一道
 // 极细的线；选中态只做两件事：文字转朱砂、字下压一道 1px 墨线。
 
-/// 面板选中的朱砂（用户指定 #B23A30）：比落款印泥 `CINNABAR` 略沉一档，
-/// 落在宣纸上像一枚旧朱印，不刺眼。
+/// 面板选中的朱砂（用户指定 #B23A30）：比落款印泥
+/// `crate::share::CINNABAR` 略沉一档，落在宣纸上像一枚旧朱印，不刺眼。
 const ZHU_BASE: u32 = 0xB23A30;
 
 /// 章题列的字号 / 正文字号：**1.2**（v1.28.0 用户口径「标题字号略大于
@@ -495,56 +410,6 @@ fn ink_option(label: &'static str, on: bool, t: Theme) -> Div {
                     div().w(px(4.0)).h(px(4.0))
                 }),
         )
-}
-
-/// 纯文字动作旁的小图标：一律**线框**，不填色。
-#[derive(Clone, Copy)]
-enum ActionIcon {
-    /// 分享图片：一个画框，框底一道地平线。
-    Frame,
-    /// 分享文字：一枚简册（框内两道竖简）。
-    Slips,
-}
-
-/// 版字面板底部的**纯文字动作**：一行字 + 一枚 12px 线框符号。
-/// 没有背景、没有边框、没有内边距堆出来的「按钮形状」；悬停只加深字色。
-fn text_action(label: &'static str, icon: ActionIcon, t: Theme) -> Div {
-    let line = ((t.ink() & 0xFFFFFF) << 8) | 0x8C;
-    let mut glyph = div()
-        .w(px(12.0))
-        .h(px(12.0))
-        .border_1()
-        .border_color(rgba(line))
-        .flex()
-        .items_end()
-        .justify_center()
-        .pb(px(1.5));
-    match icon {
-        ActionIcon::Frame => {
-            glyph = glyph.child(div().w(px(5.0)).h(px(1.0)).bg(rgba(line)));
-        }
-        ActionIcon::Slips => {
-            glyph = glyph.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(1.5))
-                    .child(div().w(px(1.0)).h(px(5.0)).bg(rgba(line)))
-                    .child(div().w(px(1.0)).h(px(5.0)).bg(rgba(line))),
-            );
-        }
-    }
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.0))
-        .cursor_pointer()
-        .text_size(px(11.5))
-        .text_color(rgb(t.ink_soft()))
-        .hover(|s| s.text_color(rgb(t.ink())))
-        .child(glyph)
-        .child(div().child(SharedString::from(label)))
 }
 
 /// 注释全局编号：(章, 段, 偏移) -> 序号。
@@ -662,7 +527,7 @@ pub(crate) fn banxin_seal(w: f32, h: f32) -> Div {
         .w(px(w))
         .h(px(h))
         .border_1()
-        .border_color(rgb(CINNABAR))
+        .border_color(rgb(crate::share::CINNABAR))
         .flex()
         .flex_col()
         .items_center()
@@ -673,14 +538,14 @@ pub(crate) fn banxin_seal(w: f32, h: f32) -> Div {
                 .path(SharedString::from("seal_jian.svg".to_string()))
                 .w(px(gw))
                 .h(px(gh))
-                .text_color(rgb(CINNABAR)),
+                .text_color(rgb(crate::share::CINNABAR)),
         )
         .child(
             svg()
                 .path(SharedString::from("seal_du.svg".to_string()))
                 .w(px(gw))
                 .h(px(gh))
-                .text_color(rgb(CINNABAR)),
+                .text_color(rgb(crate::share::CINNABAR)),
         )
 }
 
@@ -1435,6 +1300,10 @@ impl Root {
         if self.show_toc && !self.focus_mode {
             root = root.child(self.render_toc_sheet(cx));
         }
+        // 书签浮层：底部滑出抽屉（收藏当前页 + 列表跳转 / 删除）。
+        if self.show_bookmarks && !self.focus_mode {
+            root = root.child(self.render_bookmark_sheet(cx));
+        }
         // 版字面板浮层：点工具栏「样式」展开，宽度与单张页面一致，
         // 可盖住正文下部（像照片说明压在照片上），但全部样式内容完整显示。
         if self.show_style && !self.focus_mode {
@@ -2114,6 +1983,288 @@ impl Root {
             .child(drawer)
     }
 
+    /// 书签抽屉（v1.53.0）：底部滑出，列出全部书签；点一行跳回该页，点「删」移除。
+    ///
+    /// 与目录栏同款底部抽屉（slide 动画 + 半透遮罩），但内容从「竖排的一列列卷名」
+    /// 换成「横排的一行行书签」（每项：章节名 + 一句摘录 + 删）。书签按阅读顺序
+    /// （chapter/para/offset 字典序）排列，找起来顺；当前页的书签章节名转朱砂。
+    fn render_bookmark_sheet(&mut self, cx: &mut Context<Self>) -> Div {
+        let vw = self.viewport_w;
+        let vh = self.viewport_h;
+        let t = self.theme;
+        // 抽屉底：宣纸 + alpha 0xF2（与目录栏同档磨砂半透）。
+        let DRAWER_BG: u32 = (t.paper() << 8) | 0xF2;
+        let EDGE: u32 = (t.rule() << 8) | 0x5A;
+        let INK: u32 = t.ink();
+        let INK_SOFT: u32 = t.ink_soft();
+        // 朱砂：当前点 / 主动作 / 删除-hover 用。
+        const VERMILION: u32 = 0xB23A30;
+
+        const H: f32 = 400.0;
+        const HEAD_H: f32 = 34.0;
+        let slide = self.bookmarks_slide.clamp(0.0, 1.0);
+        let off = -(1.0 - slide) * H;
+        let mask: u32 = (0x000000 << 8) | ((0.42 * slide * 255.0) as u32).min(255);
+
+        let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
+        // 当前页锚点只算一次，逐行比对是否「正读到此」这枚书签。
+        let cur_anchor = self.page_anchor();
+
+        // 顶部标题行：左「＋ 收藏此页」（再收一枚当前页），中「書籤 N」，右「收」。
+        let head = div()
+            .relative()
+            .w_full()
+            .h(px(HEAD_H))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(14.0))
+                    .top(px((HEAD_H - 16.0) / 2.0))
+                    .h(px(16.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .font_family(song.clone())
+                    .text_size(px(11.0))
+                    .text_color(rgb(VERMILION))
+                    .hover(|s| s.text_color(rgb(INK)))
+                    .child(SharedString::from("＋ 收藏此页"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.add_bookmark_current();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .font_family(song.clone())
+                    .text_size(px(9.5))
+                    .text_color(rgb(INK_SOFT))
+                    .child(SharedString::from(format!("書籤 {}", self.bookmarks.len()))),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(14.0))
+                    .top(px((HEAD_H - 16.0) / 2.0))
+                    .h(px(16.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .font_family(song.clone())
+                    .text_size(px(11.0))
+                    .text_color(rgb(INK_SOFT))
+                    .hover(|s| s.text_color(rgb(VERMILION)))
+                    .child(SharedString::from("收"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_bookmarks();
+                            cx.notify();
+                        }),
+                    ),
+            );
+
+        // 书签列表：竖排的一行行，自上而下，可纵向滚动（Stateful<Div> 才挂滚动）。
+        let mut list = div()
+            .id(SharedString::from("bookmark-list"))
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .scrollbar_width(px(3.0))
+            .track_scroll(&self.bookmarks_scroll)
+            .px(px(14.0))
+            .py(px(6.0));
+
+        // 按阅读顺序排（chapter/para/offset 字典序 = 阅读顺序），找起来顺。
+        let mut bms: Vec<&crate::library::Bookmark> = self.bookmarks.iter().collect();
+        bms.sort_by(|a, b| {
+            (a.chapter, a.para, a.offset).cmp(&(b.chapter, b.para, b.offset))
+        });
+
+        if bms.is_empty() {
+            list = list.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .pt(px(20.0))
+                    .font_family(song.clone())
+                    .text_size(px(12.0))
+                    .text_color(rgb(INK_SOFT))
+                    .child(SharedString::from(
+                        "还没有书签。点「＋ 收藏此页」记下这一页。",
+                    )),
+            );
+        }
+
+        for bm in bms {
+            let id_jump = bm.id.clone();
+            let id_del = bm.id.clone();
+            let ch_title = if bm.chapter_title.is_empty() {
+                "未题卷".to_string()
+            } else {
+                bm.chapter_title.clone()
+            };
+            // 摘录截断：一行装不下就砍尾缀省略号（GPUI 文本不自动省略）。
+            let excerpt_full = if bm.excerpt.is_empty() {
+                "（无摘录）".to_string()
+            } else {
+                bm.excerpt.clone()
+            };
+            let excerpt: String = {
+                let chars: Vec<char> = excerpt_full.chars().collect();
+                if chars.len() > 40 {
+                    let mut s: String = chars[..39].iter().collect();
+                    s.push('…');
+                    s
+                } else {
+                    excerpt_full
+                }
+            };
+            // 当前页书签：章节名转朱砂，一眼可辨「正读到此」。
+            let is_cur = cur_anchor.map(|a| (a.0, a.1, a.2))
+                == Some((bm.chapter, bm.para, bm.offset));
+            let ch_fg = if is_cur { VERMILION } else { INK_SOFT };
+
+            let mut row = div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .px(px(8.0))
+                .py(px(9.0))
+                .border_b_1()
+                .border_color(rgba(EDGE))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        let target = this
+                            .bookmarks
+                            .iter()
+                            .find(|x| x.id == id_jump)
+                            .cloned();
+                        if let Some(b) = target {
+                            this.jump_to_bookmark(&b);
+                        }
+                        this.close_bookmarks();
+                        cx.notify();
+                    }),
+                );
+
+            // 左：章节名（小字）在上、摘录（大字）在下。
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .font_family(song.clone())
+                            .text_size(px(11.0))
+                            .text_color(rgb(ch_fg))
+                            .child(SharedString::from(ch_title)),
+                    )
+                    .child(
+                        div()
+                            .font_family(song.clone())
+                            .text_size(px(13.0))
+                            .text_color(rgb(INK))
+                            .child(SharedString::from(excerpt)),
+                    ),
+            );
+
+            // 右：「删」——CJK 单字按钮（hover 转朱砂）；stop_propagation 拦住整行跳转。
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .h(px(20.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(8.0))
+                    .cursor_pointer()
+                    .font_family(song.clone())
+                    .text_size(px(12.0))
+                    .text_color(rgb(INK_SOFT))
+                    .hover(|s| s.text_color(rgb(VERMILION)))
+                    .child(SharedString::from("删"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.remove_bookmark(&id_del);
+                            cx.notify();
+                        }),
+                    ),
+            );
+
+            list = list.child(row);
+        }
+
+        let drawer = div()
+            .absolute()
+            .left(px(0.0))
+            .w(px(vw))
+            .bottom(px(off))
+            .h(px(H))
+            .flex()
+            .flex_col()
+            .bg(rgba(DRAWER_BG))
+            .rounded(px(8.0))
+            .shadow(vec![gpui::BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.12),
+                offset: point(px(0.0), px(3.0)),
+                blur_radius: px(12.0),
+                spread_radius: px(0.0),
+            }])
+            .border_t_1()
+            .border_color(rgba(EDGE))
+            .overflow_hidden()
+            // 拦住冒泡：点抽屉内不该顺下去触发外层遮罩的「关闭」或翻页。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(head)
+            .child(list);
+
+        // 上半屏遮罩：点空白处平滑收起抽屉（透明度随 slide 淡入）。
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w(px(vw))
+            .h(px(vh))
+            .bg(rgba(mask))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    // 拦住冒泡：否则关闭后事件继续传到正文区，会顺带翻一页。
+                    cx.stop_propagation();
+                    this.close_bookmarks();
+                    cx.notify();
+                }),
+            )
+            .child(drawer)
+    }
+
     /// 目录题名的**竖排净化**（v1.49.3）：先剥书名号空壳、砍掉括注，再把
     /// 现代标点换成竖排形（黑括号→直角引号、书名号→︽︾、省略号→︙），
     /// 最后按简条能容纳的字数截断——宁可尾巴断字，也不让长题名撑破简条。
@@ -2246,6 +2397,15 @@ impl Root {
                 } else {
                     this.open_toc();
                 }
+                cx.notify();
+            }),
+        ));
+        // 书签：顶栏一枚入口，点一下收藏当前页并滑出书签抽屉（再点收起）。
+        left = left.child(item("书签", self.show_bookmarks).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_bookmarks();
                 cx.notify();
             }),
         ));
@@ -2694,7 +2854,7 @@ impl Root {
 
     /// 章题（展示用）：源数据里的【】在此一律显作「」——
     /// 章题列、中缝篇题、卷首题署、分享题识都经这一道。
-    fn chapter_title(&self, chapter: usize) -> String {
+    pub fn chapter_title(&self, chapter: usize) -> String {
         self.book
             .as_ref()
             .and_then(|b| b.chapters.get(chapter))
@@ -7146,595 +7306,114 @@ impl Root {
     ///      夹注强制行内（晒本一律带注）。
     ///
     /// 返回 `(纸面 Div, 纸宽, 纸高)`；无书 / 空页 / 切片校验失败返回 `None`。
-    fn sunben_sheet(
-        &self,
-        box_w: f32,
-        box_h: f32,
-        cx: &mut Context<Self>,
-    ) -> Option<(Div, f32, f32)> {
-        let book = self.book.as_ref()?;
-        let pages = self.layout_pages();
-        let cur = pages.get(self.page)?;
-        let first = cur.glyphs.first()?;
-        let last = cur.glyphs.last()?;
-        let flow = book.to_flow(self.show_punct);
-        // ① 切片：当前叶首字在流里的位置（整段逐字校验——段首缩进占位
-        // 两两全同，必须连 kind 一起比对才能定准）。
-        let i0 = flow.iter().position(|g| same_glyph(g, first))?;
-        let n = cur.glyphs.len();
-        if i0 + n > flow.len() {
-            return None;
+    /// 打开分享面板（版字面板「分享图片」入口）。
+    ///
+    /// **快照语义**（用户 v1.53.0 明令「点不同模板时阅读界面不变」）：
+    /// 正文与元信息在此刻一次性定格——有选区取选区（跨叶也按阅读顺序
+    /// 收全），无选区取本叶。之后用户在面板里点任何模板 / 页签 / 开关，
+    /// 都只改 `share_*` 态：不翻页、不改排版、不碰字体设置，阅读界面
+    /// 一动不动。
+    pub fn open_share_panel(&mut self, cx: &mut Context<Self>) {
+        if self.book.is_none() {
+            self.notice = "尚未打开书籍，无从分享".to_string();
+            cx.notify();
+            return;
         }
-        if !cur
-            .glyphs
-            .iter()
-            .enumerate()
-            .all(|(k, g)| same_glyph(&flow[i0 + k], g))
-        {
-            return None;
-        }
-        let slice = &flow[i0..i0 + n];
-
-        // ② 续排：列数减一（长图更竖）。
-        //    夹注经 gloss 闭包行内化——晒本一律带注，与 notes_inline 无关，
-        //    但尊重「显示注释」总开关（note_chars_with_source 内部已判）。
-        let cols2 = self.grid.columns.saturating_sub(1).max(3);
-        let gloss = |g: &Glyph| -> Option<crate::gloss::GlossPayload> {
-            self.note_chars_with_source(*g)
-                .map(|(s, src)| (s.to_string(), src, *g))
-        };
-        let mut rows2 = 4usize;
-        let laid = loop {
-            let reserve = if cur.start_chapter {
-                crate::gloss::inscription_reserve(self.chapter_inscription_need(), rows2)
-            } else {
-                0
-            };
-            let ps = crate::gloss::layout_book_from(slice, &gloss, cols2, rows2, reserve, cur.start_chapter);
-            if ps.len() <= 1 || rows2 >= 60 {
-                break ps.into_iter().next();
-            }
-            rows2 += 1;
-        }?;
-
-        // ③ 几何：纸宽 = 纸边 46（16×2 留白 + 框 3×4 + 内框 1×2）+ 列总宽；
-        //    纸高 = 46 + 行数×行高 + 地脚。字格同时受卡宽 / 卡高约束取小，
-        //    地脚里随字号伸缩的那部分（0.36×字号比）一并代入高度约束。
-        let ratio = crate::grid::GRID_ROW_RATIO; // 1.1
-        let fs_ratio = crate::grid::GRID_FS_RATIO; // 0.75
-        // 章首页的章题列已含在 cols2 里（limit+1），不再额外加中缝列。
-        let cols_total = cols2 as f32;
-        let by_w = (box_w - 46.0) / cols_total;
-        let by_h = (box_h - 56.0) / (rows2 as f32 * ratio + 0.36 * fs_ratio);
-        let mut cell_w = by_w.min(by_h).max(8.0);
-        // 最小字号保护：字被压到下限时放大字格（与 compute_grid 同策）。
-        if cell_w * fs_ratio < crate::grid::GRID_FS_MIN {
-            cell_w = crate::grid::GRID_FS_MIN / fs_ratio;
-        }
-        let fs = (cell_w * fs_ratio).clamp(crate::grid::GRID_FS_MIN, crate::grid::GRID_FS_MAX);
-        let cell_h = cell_w * ratio;
-        let foot_h = (fs * 0.36).max(9.0) + 10.0;
-        let sheet_w = 46.0 + cols_total * cell_w;
-        let sheet_h = 46.0 + rows2 as f32 * cell_h + foot_h;
-
-        // ④ 渲染：单叶（四边全封闭，如单独一叶刻纸）；叶码用当前叶号；
-        //    章末统计表按「切片之后是否紧跟新章」判（与原页的
-        //    chapters_ended_here 同果——切片末尾即原叶末尾）。
-        let ends_chapter = match flow.get(i0 + n) {
-            Some(g) => g.chapter != last.chapter,
-            None => true,
-        };
-        let stats: Vec<ChapStat> = if ends_chapter {
-            self.chapter_stat(last.chapter).into_iter().collect()
-        } else {
-            Vec::new()
-        };
-        let geo = LeafGeo {
-            cell_w,
-            cell_h,
-            rows: rows2,
-            fs,
-            // 晒本是单叶长图，无叶内中缝，恒不画鱼尾。
-            show_fish_tail: false,
-            notes_inline: true,
-            interactive: false,
-        };
-        let sheet = self.render_ancient(
-            &laid.glyphs,
-            &laid.columns,
-            false,
-            laid.start_chapter,
-            self.page,
-            LeafHalf::Alone,
-            &stats,
-            geo,
-            cx,
-        );
-        Some((sheet, sheet_w, sheet_h))
-    }
-
-    fn render_share_sheet(&mut self, cx: &mut Context<Self>) -> Div {
-        let t = self.theme;
-        let vw = self.viewport_w;
-        let vh = self.viewport_h;
         let pages = self.paginate();
-        let glyphs: Vec<Glyph> = pages.get(self.page).cloned().unwrap_or_default();
-        let chapter = glyphs.first().map(|g| g.chapter).unwrap_or(0);
-        let chap_title = self.chapter_title(chapter);
-        let book_title = self
+        let mut body: Vec<char> = Vec::new();
+        let mut from_sel = false;
+        let mut leaf_no = self.page;
+        let mut chap_idx = 0usize;
+
+        if self.has_selection() {
+            if let Some((a, b)) = self.selection_range() {
+                // 全叶扫描：选区可能跨叶，按阅读顺序一路收干净。
+                'scan: for (pi, pg) in pages.iter().enumerate() {
+                    for g in pg.iter() {
+                        if g.kind != GlyphKind::Char || g.is_indent() {
+                            continue;
+                        }
+                        let k = (g.chapter, g.para, g.offset);
+                        if k >= a && k <= b {
+                            if body.is_empty() {
+                                // 选区首字落在哪叶哪章，元信息就以它为准。
+                                leaf_no = pi;
+                                chap_idx = g.chapter;
+                            }
+                            body.push(self.shown(g.ch));
+                        }
+                    }
+                }
+                from_sel = !body.is_empty();
+            }
+        }
+        if !from_sel {
+            // 无选区：本叶正文（繁简形态与阅读界面一致）。
+            let glyphs: Vec<Glyph> = pages.get(self.page).cloned().unwrap_or_default();
+            if let Some(first) = glyphs.first() {
+                chap_idx = first.chapter;
+            }
+            body = glyphs
+                .iter()
+                .filter(|g| !g.is_indent())
+                .map(|g| self.shown(g.ch))
+                .collect();
+            leaf_no = self.page;
+        }
+
+        self.share_body = body;
+        self.share_from_sel = from_sel;
+        self.share_leaf = leaf_no;
+        self.share_book = self
             .book
             .as_ref()
             .map(|b| b.title.clone())
             .unwrap_or_default();
-        let author = self
+        self.share_author = self
             .book
             .as_ref()
             .map(|b| b.author.clone())
             .unwrap_or_default();
-        let body: Vec<char> = glyphs
-            .iter()
-            .filter(|g| !g.is_indent())
-            .map(|g| self.shown(g.ch))
-            .collect();
-
-        // 晒本：卡片 = 当前叶（含夹注）按真实版式重排的竖长纸，尺寸由
-        // 内容与可用面积定（下面文字卡的固定比例不适用）。
-        let scroll = self.share_layout == CardLayout::Scroll;
-        let sunben: Option<(Div, f32, f32)> = if scroll {
-            let box_w = (vw - 60.0).max(280.0);
-            let box_h = (vh - 200.0).max(260.0);
-            Some(
-                self.sunben_sheet(box_w, box_h, cx)
-                    .unwrap_or_else(|| (Self::sunben_placeholder(t), 400.0, 300.0)),
-            )
-        } else {
-            None
-        };
-
-        let (bg, ink, mute) = SHARE_BGS[self.share_bg.min(SHARE_BGS.len() - 1)];
-        // 卡片高度按视口比例取定值（「高度」滑杆已删），并给控制面板留位。
-        let card_h = sunben
-            .as_ref()
-            .map(|s| s.2)
-            .unwrap_or_else(|| (vh * SHARE_CARD_H_FRAC).min(vh - 250.0).max(280.0));
-        // 笺是竖长书衣比例；其余版式沿用横长比例。
-        let card_w = sunben.as_ref().map(|s| s.1).unwrap_or_else(|| match self.share_layout {
-            CardLayout::Note => (card_h * 0.72).clamp(260.0, 460.0),
-            _ => (card_h * 0.66).clamp(300.0, 600.0),
-        });
-        let fs = (card_h / 40.0).clamp(12.0, 24.0);
-        // 单字行高：GPUI 的默认行高约 1.4×字号，再加上 gap_1(4px)。
-        // 少算行高会让最后几行溢出卡片（分享卡底部被裁掉半行字）。
-        let line_h = fs * 1.42 + 4.0;
-
-        // ---- 题识列 / 日期列 / 朱印：版式共用（笺也共用同一组装）----
-        // 题识：章节 / 书名 / 作者 按开关拼接（书名仍夹 12 字）。
-        let mut sign_text = String::new();
-        if self.share_show_chapter && !chap_title.is_empty() {
-            sign_text.push_str(&format!("{} · ", chap_title));
-        }
-        if self.share_show_title {
-            sign_text.push_str(&clip_chars(&book_title, 12));
-        }
-        if self.share_show_author && !author.is_empty() {
-            sign_text.push_str(&format!(" · {}", clip_chars(&author, 8)));
-        }
-        let sign_cap = ((card_h - 56.0) / 15.0).floor().max(8.0) as usize;
-        let sign_text = clip_chars(sign_text.trim_matches([' ', '·']), sign_cap);
-        let sign = share_sign(&sign_text, mute);
-
-        // 日期角标：竖排中文日期立于最右（可关）。
-        let date_text = cn_date_from_str(&today_ymd());
-        let date_col = share_date_col(&date_text, self.share_show_date, mute);
-
-        // 朱印：题识列底部那枚 30×30 小印。
-        let seal = share_seal(t);
-
-        // ---- 正文：按版式排（笺 / 竖排分列 / 单列竖排；只要竖排）----
-        // 晒本的「正文」是真实版面长图（sunben），不在此列。
-        let grid = match self.share_layout {
-            CardLayout::Scroll => div(),
-            CardLayout::Columns => {
-                // 先按高度算「一列最多几个字」，再按宽度收紧列数：
-                // 卡片宽度有限，题识列与日期列又必须留位置，否则 flex 会把
-                // 两侧的落款挤成 0 宽（分享卡上书名、日期直接消失）。
-                let per_col_h = ((card_h - 44.0) / line_h).floor().max(4.0) as usize;
-                let avail_w = (card_w - 32.0 - 64.0).max(fs * 4.0);
-                let max_cols = (avail_w / (fs + 8.0)).floor().max(2.0);
-                let need_cols = (body.len() as f32 / per_col_h as f32).ceil().max(1.0);
-                let per_col = if need_cols > max_cols {
-                    (body.len() as f32 / max_cols).ceil().max(4.0) as usize
-                } else {
-                    per_col_h
-                };
-                let cols: Vec<Vec<char>> = body.chunks(per_col).map(|c| c.to_vec()).collect();
-                let mut g = div().flex().flex_row().items_start().gap_2();
-                for col in cols.iter().rev() {
-                    let mut c = div().flex().flex_col().items_center().gap_1();
-                    for ch in col {
-                        c = c.child(
-                            div()
-                                .text_size(px(fs))
-                                .text_color(rgb(ink))
-                                .child(SharedString::from(ch.to_string())),
-                        );
-                    }
-                    g = g.child(c);
-                }
-                g
-            }
-            CardLayout::Single => {
-                let cap = ((card_h - 44.0) / line_h).floor().max(4.0) as usize;
-                let mut c = div().flex().flex_col().items_center().gap_1();
-                for ch in body.iter().take(cap) {
-                    c = c.child(
-                        div()
-                            .text_size(px(fs))
-                            .text_color(rgb(ink))
-                            .child(SharedString::from(ch.to_string())),
-                    );
-                }
-                c
-            }
-            CardLayout::Note => {
-                // 笺：竖丝栏 8/10/12/14 列自适应（列数按分享内容挑最小值）。
-                // 题识列 / 日期列 / 朱印走下方通用组装，不单独成卡。
-                note_paper(card_w, card_h, &body, ink, mute)
-            }
-        };
-
-        // 晒本：纸面即卡片（自带纸色 / 版框 / 界行 / 夹注，不套文字卡外壳）。
-        let card = if let Some((sheet, _, _)) = sunben {
-            sheet
-        } else {
-            div()
-                .w(px(card_w))
-                .h(px(card_h))
-                .flex()
-                .flex_row()
-                .justify_center()
-                .items_start()
-                .gap_4()
-                .p_4()
-                .bg(rgb(bg))
-                .border_1()
-                .border_color(rgb(0x5A4A38))
-                .rounded(px(3.0))
-                .overflow_hidden()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_between()
-                        .flex_shrink_0()
-                        .h_full()
-                        .child(div())
-                        .child(sign)
-                        .child(seal),
-                )
-                .child(grid)
-                .child(date_col)
-        };
-
-        // ---- 控制面板：极简留白（无底色、无边框、无方框）----
-        //
-        // 书名 / 作者 / 章节 / 日期不再是按钮，而是**一排极小的浅灰文字**：
-        // 文字本身就是开关（点一下收起该元素），选中稍亮、未选淡到几乎
-        // 融进底色——信息还在，但不再有「现代后台系统」那种控件感。
-        let metas: Vec<(String, bool, ShareAct)> = [
-            (
-                clip_chars(&book_title, 14).to_string(),
-                self.share_show_title,
-                ShareAct::Title,
-            ),
-            (
-                clip_chars(&author, 10).to_string(),
-                self.share_show_author,
-                ShareAct::Author,
-            ),
-            (
-                clip_chars(&chap_title, 12).to_string(),
-                self.share_show_chapter,
-                ShareAct::Chapter,
-            ),
-            (date_text.clone(), self.share_show_date, ShareAct::Date),
-        ]
-        .into_iter()
-        .filter(|(s, _, _)| !s.is_empty())
-        .collect();
-        let mut meta = div().flex().flex_row().items_center().gap(px(10.0)).flex_1();
-        for (i, (text, on, act)) in metas.into_iter().enumerate() {
-            if i > 0 {
-                meta = meta.child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(rgba(0xB9AE9C40))
-                        .child(SharedString::from("·")),
-                );
-            }
-            meta = meta.child(
-                div()
-                    .id(SharedString::from(format!("share-meta-{i}")))
-                    .cursor_pointer()
-                    .text_size(px(10.5))
-                    .text_color(rgba(if on { 0xD8CFC0D9 } else { 0x8A837866 }))
-                    .hover(|s| s.text_color(rgba(0xF2EAD6FF)))
-                    .child(SharedString::from(text))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            match act {
-                                ShareAct::Title => this.share_show_title = !this.share_show_title,
-                                ShareAct::Author => {
-                                    this.share_show_author = !this.share_show_author
-                                }
-                                ShareAct::Chapter => {
-                                    this.share_show_chapter = !this.share_show_chapter
-                                }
-                                ShareAct::Date => this.share_show_date = !this.share_show_date,
-                            }
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-
-        // 版式：**只有线条图标**——没有方框、没有底色，选中靠线的明暗。
-        let mut layouts = div().flex().flex_row().items_center().gap(px(16.0));
-        for (lay, label) in [
-            (CardLayout::Note, "八行笺"),
-            (CardLayout::Columns, "竖排分列"),
-            (CardLayout::Single, "单列竖排"),
-            (CardLayout::Scroll, "晒本"),
-        ] {
-            let on = self.share_layout == lay;
-            // 选中 = 近白的亮线；未选中 = 淡到快融进底色的灰线。
-            // 不靠方框与底色区分——那正是要丢掉的「现代控件感」。
-            let fg = if on { 0xF2EAD6 } else { 0x6E6659 };
-            let icon = match lay {
-                CardLayout::Note => div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(1.0))
-                    .child(bar(11.0, 2.0, fg))
-                    .child(bar(11.0, 2.0, fg))
-                    .child(bar(11.0, 2.0, fg))
-                    .child(bar(11.0, 2.0, fg)),
-                CardLayout::Columns => div()
-                    .flex()
-                    .flex_row()
-                    .items_end()
-                    .gap_1()
-                    .child(bar(2.0, 13.0, fg))
-                    .child(bar(2.0, 13.0, fg))
-                    .child(bar(2.0, 13.0, fg)),
-                CardLayout::Single => div()
-                    .w(px(13.0))
-                    .h(px(13.0))
-                    .border_2()
-                    .border_color(rgb(fg))
-                    .rounded(px(1.0)),
-                // 晒本：一张竖长纸，纸上两道字列。
-                CardLayout::Scroll => div()
-                    .w(px(11.0))
-                    .h(px(14.0))
-                    .border_2()
-                    .border_color(rgb(fg))
-                    .rounded(px(1.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(1.5))
-                    .child(bar(1.5, 8.0, fg))
-                    .child(bar(1.5, 8.0, fg)),
-            };
-            layouts = layouts.child(
-                div()
-                    .id(SharedString::from(format!("share-lay-{label}")))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(26.0))
-                    .h(px(26.0))
-                    .rounded(px(13.0))
-                    .cursor_pointer()
-                    // 悬停只给一圈几乎看不见的晕（8% 白），不是按钮底色。
-                    .hover(|s| s.bg(rgba(0xF2EAD614)))
-                    .child(icon)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.share_layout = lay;
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-
-        // 葉号：极小号浅灰，与元信息同一档（不再做成标签 / 色块）。
-        let leaf_tag = div()
-            .text_size(px(10.5))
-            .text_color(rgba(0x8A83788C))
-            .child(SharedString::from(format!("第 {} 葉", self.page + 1)));
-
-        // 底色：**四枚 20px 的圆**，圆心一色、边上极细白描边；选中时外面
-        // 多一圈朱砂细环作「光晕」。原先的方块 + 粗边是后台系统的样子。
-        let mut swatches = div().flex().flex_row().items_center().gap(px(13.0));
-        for (i, (bgc, _, _)) in SHARE_BGS.iter().enumerate() {
-            let on = i == self.share_bg;
-            swatches = swatches.child(
-                div()
-                    .id(SharedString::from(format!("share-bg-{i}")))
-                    .w(px(28.0))
-                    .h(px(28.0))
-                    .rounded(px(14.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    // 选中：外面那圈光晕（朱砂细环）。
-                    .when(on, |d| {
-                        d.border_1().border_color(rgba(0xC3272DCC))
-                    })
-                    .hover(|s| s.border_1().border_color(rgba(0xF2EAD64D)))
-                    .child(
-                        div()
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .rounded(px(10.0))
-                            .bg(rgb(*bgc))
-                            .border_1()
-                            .border_color(rgba(0xFFFFFF59)),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.share_bg = i;
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-
-        // 控制条：**一行**。左四枚圆、中一行极小浅灰字、右线条图标。
-        // 没有容器底色、没有边框、没有内边距——控件直接浮在磨砂底上。
-        let controls_h: f32 = 30.0;
-        let controls = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap(px(18.0))
-            .h(px(controls_h))
-            .child(swatches)
-            .child(meta)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(14.0))
-                    .child(leaf_tag)
-                    .child(layouts),
-            );
-
-        // ---- 动作：**两枚朱砂印章**，落在卡片右下角 ----
-        // 主印朱底白字（保存图片），副印白线框（分享图片）。悬停微微放大。
-        // 「分享文字」撤了：导出界面里它就是个无关按钮。
-        let save = self.seal_button("保存", true).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| {
-                cx.stop_propagation();
-                this.save_share_image(window, cx);
-            }),
-        );
-        let share_img = self.seal_button("分享", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| {
-                cx.stop_propagation();
-                this.share_image_to_clipboard(window, cx);
-            }),
-        );
-        let seals = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .child(share_img)
-            .child(save);
-
-        // 卡片与印章用绝对坐标定位（而不是 flex 居中）：保存 / 分享图片
-        // 要按 `share_card_rect` 这块矩形裁图，渲染位置必须与算式严格一致。
-        //
-        // 印章**必须落在卡片矩形之外**（贴着右下角外侧）——若浮在卡片上，
-        // 截出来的图会带一枚朱印，导出就废了。
-        let seal_box_w = 100.0;
-        let total_h = card_h + 20.0 + SEAL_BOX;
-        let top = ((vh - total_h) * 0.5).max(0.0);
-        let left = ((vw - card_w) * 0.5).max(0.0);
-        // 控制条：左侧与卡片对齐，右侧给印章让出位置。
-        let controls_w = (card_w - seal_box_w - 16.0).max(200.0);
-        let seal_left = left + card_w - seal_box_w + 4.0;
-        self.share_card_rect = Some((left, top, card_w, card_h));
-
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .w(px(vw))
-            .h(px(vh))
-            // 磨砂玻璃：GPUI 0.2.2 没有 backdrop-filter，用 80% 不透明的
-            // 近黑（rgba(20,20,20,.8)）压住背景——肉眼看就是一层深色磨砂。
-            .bg(rgba(0x141414CC))
-            // 右上角 ✕：面板是全屏覆盖且点空白不收起（防误触丢失选择），
-            // 所以关闭必须有个常驻的明确出口；Esc 也有同样效果。
-            // 同样去边框去底色，只留一个淡淡的 ✕。
-            .child(
-                div()
-                    .absolute()
-                    .top(px(16.0))
-                    .right(px(20.0))
-                    .w(px(26.0))
-                    .h(px(26.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(13.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgba(0xF2EAD614)))
-                    .child(
-                        div()
-                            .text_size(px(14.0))
-                            .text_color(rgba(0xB9AE9C99))
-                            .child(SharedString::from("✕")),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.show_share_panel = false;
-                            cx.notify();
-                        }),
-                    ),
-            )
-            // 卡片：深色柔和阴影把它从磨砂底上「浮」起来。
-            .child(
-                div()
-                    .absolute()
-                    .left(px(left))
-                    .top(px(top))
-                    .child(card.shadow_lg()),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(left))
-                    .top(px(top + card_h + 22.0))
-                    .w(px(controls_w))
-                    .child(controls),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(seal_left))
-                    .top(px(top + card_h + 14.0))
-                    .child(seals),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_this, _, _, _cx| {
-                    // 点面板空白处不关闭分享面板（避免误触丢失选择）。
-                }),
-            )
+        self.share_chap = self.chapter_title(chap_idx);
+        self.share_date = crate::share::cn_date_today();
+        // 走全局状态机：开分享即收其它顶层面板与瞬态浮层。
+        self.set_ui_state(AppUIState::Share);
+        cx.notify();
     }
 
+    /// 题识文本：章节 · 书名 · 作者，按三个开关取舍（竖排列宽有限，裁短）。
+    fn share_sign_text(&self) -> String {
+        let mut s = String::new();
+        if self.share_show_chapter && !self.share_chap.is_empty() {
+            s.push_str(&self.share_chap);
+        }
+        if self.share_show_title && !self.share_book.is_empty() {
+            if !s.is_empty() {
+                s.push_str(" · ");
+            }
+            s.push_str(&clip_chars(&self.share_book, 12));
+        }
+        if self.share_show_author && !self.share_author.is_empty() {
+            if !s.is_empty() {
+                s.push_str(" · ");
+            }
+            s.push_str(&clip_chars(&self.share_author, 8));
+        }
+        clip_chars(s.trim(), 16)
+    }
+
+    /// **分享面板**（v1.53.0 原生重写）。
+    ///
+    /// 与旧版的根本区别：卡片不再「截阅读页原图 + 半透明遮罩」，而是由
+    /// [`crate::share::build_card`] 用**纯色背景 + 重排版文字**现场画出
+    /// ——四套模板只换四色参数，8/10/12/14 列自适应纸张，横排 / 竖排
+    /// 双方向，左下角恒有一枚朱砂「笺讀」印。
+    ///
+    /// 手机框只是**预览外壳**：`share_card_rect` 记的是卡片本体的矩形，
+    /// 保存 / 分享图片时只截那一块——框、阴影、遮罩都进不了图。
+    ///
+    /// 「点模板时阅读界面不变」：面板全部读快照字段（`share_body` 等），
+    /// 控件只写 `share_*` 态；阅读视图的页 / 列 / 字体一个都不碰。
     /// 帮助面板：快捷键与操作说明一览（点工具栏「帮助」或按 ⌘/ 打开）。
     fn render_help_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
@@ -7860,6 +7539,11 @@ impl Root {
 
     /// 朱批录：从书稿里收齐四类批注（眉批 / 夹注·通假 / 专名·书名线·着重 / 划线），
     /// 外加「页笔记」（无 charIndex，只按页码跳），每条都带上跳转锚点。
+
+    /// **朱批录**：右滑侧栏，半透明宣纸底，朱砂细线列出全部批注；点一条即
+    /// 收栏、瞬跳到该 charIndex 并点亮「抵达」高亮。
+    /// 朱批录：从书稿里收齐四类批注（眉批 / 夹注·通假 / 专名·书名线·着重 / 划线），
+    /// 外加「页笔记」（无 charIndex，只按页码跳），每条都带上跳转锚点。
     fn note_entries(&self) -> Vec<NoteEntry> {
         let mut out = Vec::new();
         if let Some(b) = &self.book {
@@ -7930,6 +7614,8 @@ impl Root {
     }
 
     /// 按锚点从书稿正文里摘一段原文——无论该字是否在当前页都摘得出来。
+
+    /// 按锚点从书稿正文里摘一段原文——无论该字是否在当前页都摘得出来。
     fn quote_at(&self, key: (usize, usize, usize), len: usize) -> String {
         if let Some(b) = &self.book {
             if let Some(ch) = b.chapters.get(key.0) {
@@ -7943,6 +7629,7 @@ impl Root {
 
     /// **朱批录**：右滑侧栏，半透明宣纸底，朱砂细线列出全部批注；点一条即
     /// 收栏、瞬跳到该 charIndex 并点亮「抵达」高亮。
+
     fn render_notes_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let vw = self.viewport_w;
@@ -8088,6 +7775,689 @@ impl Root {
                     cx.stop_propagation();
                 }),
             )
+    }
+
+    /// **「版字」面板**：列数 · 字级 · 字体 · 批注 · 留白 · 纸边 · 页面 ·
+    /// 纸色 · 墨色 · 丝栏 · 标注——**一张纸、一页**，没有第二处入口。
+    ///
+    /// v1.35.0 终局合并：原先「版式」浮层（8/10/12/14 四档）、版字面板的
+    /// 「字体」页与「样式」页是三副面孔——列数两处写、字体三行写，`set_font`
+    /// 与 `set_font_preset` 各改各的，UI 上还互相打脸。现在全部并到这一页，
+    /// 每一项只认一个数据源、只留一行控件：
+    ///   列数 → 模块级 [`COLUMN_OPTS`]（值 `Option<usize>`，None = 自动）；
+    ///   字级 → `ZoomLevel::ALL` → `set_zoom_level`；
+    ///   字体 → `FontChoice::CLASSIC` → `Root::set_font`（正文 + 批注 +
+    ///          行高一次换完，见 `set_font` 的注释）；
+    ///   批注 → `FontChoice::NOTE` → `set_note_font`（字体行的二次微调）；
+    ///   留白 → `banxin_ratio`；纸边 → `grid.margin`；页面 → `LayoutMode`；
+    ///   纸色 → `theme::PAPER_THEMES`；墨色 → `InkPalette::ALL`；
+    ///   丝栏 → `RuleColor::ALL`；标注 → `StyleAct`。
+
+    fn render_share_sheet(&mut self, cx: &mut Context<Self>) -> Div {
+        let vw = self.viewport_w;
+        let vh = self.viewport_h;
+        let columns = crate::share::norm_columns(self.grid.columns);
+        let card_h = crate::share::card_h_for(vh, self.share_h);
+        let card_w = (card_h * crate::share::card_ratio(columns))
+            .clamp(240.0, (vw - 96.0).max(260.0));
+
+        // ---- 分享卡本体（预览与截图共用同一元素，位置即 share_card_rect）----
+        let sign = self.share_sign_text();
+        let spec = crate::share::CardSpec {
+            body: &self.share_body,
+            sign: &sign,
+            date: &self.share_date,
+            show_sign: self.share_show_title || self.share_show_author || self.share_show_chapter,
+            show_date: self.share_show_date,
+            dir: self.share_dir,
+            tpl_idx: self.share_tpl,
+            family: crate::share::card_family(self.share_font, self.main_family()),
+            columns,
+            w: card_w,
+            h: card_h,
+        };
+        let card = crate::share::build_card(&spec);
+
+        // ---- 手机框（预览外壳）：卡片钉在框内，框不进截图 ----
+        let bezel = 13.0f32;
+        let phone_w = card_w + bezel * 2.0;
+        let phone_h = card_h + bezel * 2.0;
+        let phone_left = ((vw - phone_w) * 0.5).max(8.0);
+        let phone_top = 84.0;
+        let card_left = phone_left + bezel;
+        let card_top = phone_top + bezel;
+        // 截图矩形 = 卡片本体（写入渲染态，供保存 / 分享图片读取）。
+        self.share_card_rect = Some((card_left, card_top, card_w, card_h));
+
+        // ---- 抬头：标题 + 副题（参考分享面板图）----
+        let title = div()
+            .absolute()
+            .top(px(22.0))
+            .left(px(0.0))
+            .w(px(vw))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .text_size(px(20.0))
+                    .text_color(rgb(0xF2EAD6))
+                    .child(SharedString::from("分 享")),
+            )
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgba(0xB9AE9CCC))
+                    .child(SharedString::from("折简相寄，共赏千年墨香")),
+            );
+
+        // 右上角「收」：全屏覆盖层必须有个常驻明确出口（Esc 同样收）。
+        let close = div()
+            .absolute()
+            .top(px(18.0))
+            .right(px(20.0))
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(13.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgba(0xF2EAD614)))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgba(0xB9AE9CCC))
+                    .child(SharedString::from("收")),
+            )
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.show_share_panel = false;
+                cx.notify();
+            }));
+
+        // ---- 手机框 + 卡片 ----
+        let phone = div()
+            .absolute()
+            .left(px(phone_left))
+            .top(px(phone_top))
+            .w(px(phone_w))
+            .h(px(phone_h))
+            .relative()
+            .bg(rgb(0x0A0908))
+            .border_1()
+            .border_color(rgba(0xF2EAD61F))
+            .rounded(px(26.0))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(bezel))
+                    .top(px(bezel))
+                    .child(card.shadow_lg()),
+            );
+
+        // ---- 图注：模板名 · 列数 · 方向 · 字数（自适应纸张的可见凭据）----
+        let cap = format!(
+            "{} · {}列 · {} · {}",
+            crate::share::tpl(self.share_tpl).name,
+            han_num(columns),
+            self.share_dir.label(),
+            if self.share_from_sel {
+                format!("所选 {} 字", self.share_body.len())
+            } else {
+                format!("本叶 {} 字", self.share_body.len())
+            },
+        );
+        let caption = div()
+            .absolute()
+            .top(px(phone_top + phone_h + 8.0))
+            .left(px(0.0))
+            .w(px(vw))
+            .flex()
+            .flex_row()
+            .justify_center()
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgba(0x8A8378CC))
+                    .child(SharedString::from(cap)),
+            );
+
+        // ---- 页签：样式 / 字体 ----
+        let tabs_top = phone_top + phone_h + 30.0;
+        let tab_pill = |tab: crate::share::ShareTab| -> Stateful<Div> {
+            let on = self.share_tab == tab;
+            let mut d = div()
+                .id(SharedString::from(format!("share-tab-{:?}", tab)))
+                .px(px(16.0))
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(12.0))
+                .cursor_pointer()
+                .text_size(px(11.5))
+                .text_color(if on { rgb(0xF2EAD6) } else { rgba(0x8A8378B0) });
+            if on {
+                d = d.bg(rgba(0xF2EAD61F));
+            }
+            d.child(SharedString::from(tab.label())).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.share_tab = tab;
+                    cx.notify();
+                }),
+            )
+        };
+        let tabs = div()
+            .absolute()
+            .top(px(tabs_top))
+            .left(px(0.0))
+            .w(px(vw))
+            .flex()
+            .flex_row()
+            .justify_center()
+            .gap(px(10.0))
+            .child(tab_pill(crate::share::ShareTab::Style))
+            .child(tab_pill(crate::share::ShareTab::Font));
+
+        // ---- 控件区 ----
+        let ctrl_top = tabs_top + 34.0;
+        let controls = match self.share_tab {
+            crate::share::ShareTab::Style => {
+                // ① 元信息 chips：书名 / 作者 / 章节 / 日期（点即收起该元素）。
+                let chip = |label: String, on: bool, act: ShareAct| -> Stateful<Div> {
+                    let mut d = div()
+                        .id(SharedString::from(format!("share-chip-{:?}-{}", act, label)))
+                        .px(px(11.0))
+                        .h(px(22.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(11.0))
+                        .cursor_pointer()
+                        .text_size(px(10.5))
+                        .text_color(if on { rgb(0xF2EAD6E6) } else { rgba(0x8A8378A6) });
+                    d = if on {
+                        d.bg(rgba(0xF2EAD61A)).border_1().border_color(rgba(0xF2EAD652))
+                    } else {
+                        d.border_1().border_color(rgba(0xF2EAD62E))
+                    };
+                    d.child(SharedString::from(label)).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            match act {
+                                ShareAct::Title => this.share_show_title = !this.share_show_title,
+                                ShareAct::Author => {
+                                    this.share_show_author = !this.share_show_author
+                                }
+                                ShareAct::Chapter => {
+                                    this.share_show_chapter = !this.share_show_chapter
+                                }
+                                ShareAct::Date => this.share_show_date = !this.share_show_date,
+                            }
+                            cx.notify();
+                        }),
+                    )
+                };
+                let chips = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(8.0))
+                    .child(chip("书名".to_string(), self.share_show_title, ShareAct::Title))
+                    .child(chip("作者".to_string(), self.share_show_author, ShareAct::Author))
+                    .child(chip(
+                        "章节".to_string(),
+                        self.share_show_chapter,
+                        ShareAct::Chapter,
+                    ))
+                    .child(chip("日期".to_string(), self.share_show_date, ShareAct::Date));
+
+                // ② 方向图标：竖排右起（三竖）/ 横排居中（三横）。
+                let dir_icon = |dir: crate::share::ShareDir| -> Stateful<Div> {
+                    let on = self.share_dir == dir;
+                    let fg = if on { 0xF2EAD6u32 } else { 0x6E6659u32 };
+                    let icon = if dir.is_vertical() {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(3.0))
+                            .child(bar(2.0, 14.0, fg))
+                            .child(bar(2.0, 14.0, fg))
+                            .child(bar(2.0, 14.0, fg))
+                    } else {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(3.0))
+                            .child(bar(14.0, 2.0, fg))
+                            .child(bar(14.0, 2.0, fg))
+                            .child(bar(14.0, 2.0, fg))
+                    };
+                    div()
+                        .id(SharedString::from(format!("share-dir-{:?}", dir)))
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(14.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgba(0xF2EAD614)))
+                        .child(icon)
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.share_dir = dir;
+                            this.share_dir_touched = true;
+                            cx.notify();
+                        }))
+                };
+
+                // ③ 四套模板色板（圆 = 该模板底色；选中 = 外圈朱砂环）。
+                let mut swatches = div().flex().flex_row().items_center().gap(px(12.0));
+                for i in 0..crate::share::TEMPLATES.len() {
+                    let tpl = crate::share::tpl(i);
+                    let on = i == self.share_tpl;
+                    let mut dot = div()
+                        .id(SharedString::from(format!("share-tpl-{i}")))
+                        .w(px(26.0))
+                        .h(px(26.0))
+                        .rounded(px(13.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer();
+                    dot = if on {
+                        dot.border_1().border_color(rgb(crate::share::CINNABAR))
+                    } else {
+                        dot.border_1().border_color(rgba(0xF2EAD63D))
+                    };
+                    // 色面 = 该模板的底色；粗体模板（拓片金石）面上加一道
+                    // 点缀色细弧作「厚重」暗示——纯色圆 + 一圈淡白描边。
+                    let mut face = div()
+                        .w(px(18.0))
+                        .h(px(18.0))
+                        .rounded(px(9.0))
+                        .bg(rgb(tpl.bg))
+                        .border_1()
+                        .border_color(rgba(0xFFFFFF59));
+                    if tpl.bold {
+                        face = face.child(
+                            div()
+                                .w(px(8.0))
+                                .h(px(1.0))
+                                .rounded(px(0.5))
+                                .bg(rgb(tpl.accent)),
+                        );
+                    }
+                    swatches = swatches.child(
+                        dot.child(face).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.share_tpl = i;
+                                // 用户没手动指定过方向时，跟随模板的建议方向
+                                // （澄心堂纸 / 青绿山水 / 拓片金石竖排，夜读幽兰横排）。
+                                if !this.share_dir_touched {
+                                    this.share_dir = crate::share::tpl(i).suggest_dir;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    );
+                }
+
+                let group = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(18.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(dir_icon(crate::share::ShareDir::Vertical))
+                            .child(dir_icon(crate::share::ShareDir::Horizontal)),
+                    )
+                    .child(swatches);
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(chips)
+                    .child(group)
+            }
+            crate::share::ShareTab::Font => {
+                // 字体 chips：随阅读字体 / 齐伋 / 文津 / 梦源 / 玄冬楷 / 霞鹜文楷。
+                let mut rows = div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(8.0));
+                for (i, (label, _)) in crate::share::SHARE_FONTS.iter().enumerate() {
+                    let on = self.share_font == Some(i) || (self.share_font.is_none() && i == 0);
+                    let mut d = div()
+                        .id(SharedString::from(format!("share-font-{i}")))
+                        .px(px(12.0))
+                        .h(px(24.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(12.0))
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(if on { rgb(0xF2EAD6E6) } else { rgba(0x8A8378A6) });
+                    d = if on {
+                        d.bg(rgba(0xF2EAD61A)).border_1().border_color(rgba(0xF2EAD652))
+                    } else {
+                        d.border_1().border_color(rgba(0xF2EAD62E))
+                    };
+                    rows = rows.child(d.child(SharedString::from(*label)).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            // 0 = 随阅读字体（None）；其余映射到字体表。
+                            this.share_font = if i == 0 { None } else { Some(i) };
+                            cx.notify();
+                        }),
+                    ));
+                }
+                rows
+            }
+        };
+        let controls_box = div()
+            .absolute()
+            .top(px(ctrl_top))
+            .left(px(0.0))
+            .w(px(vw))
+            .child(controls);
+
+        // ---- 高度滑杆（竖，五档）：点轨道即落位 ----
+        // 绝对定位在右侧一列，坐标确定 → 点击位置可反算档位（无需元素相对坐标）。
+        let slider_h = 46.0f32;
+        let slider_w = 16.0f32;
+        let slider_left = (vw - 44.0).max(20.0);
+        let slider_top = ctrl_top + 6.0;
+        let frac = (self.share_h as f32 / 4.0).clamp(0.0, 1.0);
+        let fill_h = (slider_h * frac).max(3.0);
+        let slider = div()
+            .absolute()
+            .left(px(slider_left))
+            .top(px(slider_top))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(rgba(0x8A8378B0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .child(SharedString::from("高"))
+                    .child(SharedString::from("度")),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w(px(slider_w))
+                    .h(px(slider_h))
+                    .cursor_pointer()
+                    // 轨道
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(6.0))
+                            .top(px(0.0))
+                            .w(px(3.0))
+                            .h(px(slider_h))
+                            .rounded(px(1.5))
+                            .bg(rgba(0xF2EAD62E)),
+                    )
+                    // 已填充段（自下而上）
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(6.0))
+                            .bottom(px(0.0))
+                            .w(px(3.0))
+                            .h(px(fill_h))
+                            .rounded(px(1.5))
+                            .bg(rgba(0xF2EAD6B0)),
+                    )
+                    // 钮
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(3.0))
+                            .top(px((slider_h - fill_h - 4.0).max(0.0)))
+                            .w(px(9.0))
+                            .h(px(9.0))
+                            .rounded(px(4.5))
+                            .bg(rgb(0xF2EAD6)),
+                    )
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        // 轨道几何已知：按点击 y 反算档位（自下而上，五档）。
+                        let y = event.position.y.to_f64() as f32 - slider_top;
+                        let step = ((1.0 - y / slider_h) * 4.0).round().clamp(0.0, 4.0) as usize;
+                        this.share_h = step;
+                        cx.notify();
+                    })),
+            );
+
+        // ---- 三枚动作钮：保存图片 / 分享图片 / 分享文字 ----
+        let pill = |label: &'static str, kind: u8| -> Stateful<Div> {
+            let mut d = div()
+                .id(SharedString::from(format!("share-act-{label}")))
+                .px(px(18.0))
+                .h(px(34.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(17.0))
+                .cursor_pointer()
+                .text_size(px(12.0));
+            d = match kind {
+                0 => d.bg(rgb(crate::share::CINNABAR)).text_color(rgb(0xFFF8EC)),
+                1 => d.bg(rgb(0x2B2823)).text_color(rgb(0xF2EAD6)),
+                _ => d
+                    .border_1()
+                    .border_color(rgba(0xF2EAD659))
+                    .text_color(rgba(0xF2EAD6CC)),
+            };
+            d.child(SharedString::from(label))
+        };
+        let btn_save = pill("保存图片", 0).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.save_share_image(window, cx);
+            }),
+        );
+        let btn_img = pill("分享图片", 1).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.share_image_to_clipboard(window, cx);
+            }),
+        );
+        let btn_txt = pill("分享文字", 2).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.share_text_to_clipboard(cx);
+            }),
+        );
+        let buttons = div()
+            .absolute()
+            .bottom(px(24.0))
+            .left(px(0.0))
+            .w(px(vw))
+            .flex()
+            .flex_row()
+            .justify_center()
+            .gap(px(12.0))
+            .child(btn_save)
+            .child(btn_img)
+            .child(btn_txt);
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w(px(vw))
+            .h(px(vh))
+            // 磨砂深底：GPUI 0.2.2 无 backdrop-filter，用高不透明度近黑压住背景。
+            .bg(rgba(0x0E0D0CF2))
+            .child(title)
+            .child(close)
+            .child(phone)
+            .child(caption)
+            .child(tabs)
+            .child(controls_box)
+            .child(slider)
+            .child(buttons)
+            // 点面板空白处不关闭（防误触丢选择）；但拦住冒泡——绝不把这一下
+            // 透给阅读界面（用户明令：点模板时阅读界面不变）。
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }))
+    }
+
+    /// 保存分享卡：先截卡片（同步，此刻屏幕上正是卡片）→ 弹系统保存框
+    /// → 落盘 PNG。v1.52.4 同款修复：rfd 保存框必须**前台直调**
+    /// （`cx.spawn` 的 async 体跑在主线程），过 background_executor 会被
+    /// GPUI 主循环挤掉、静默返回 None。
+    fn save_share_image(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // 先截再收面板：截屏是同步的，先关面板要等下一帧才更新画面。
+        let shot = self.capture_card_png(window, "jiandu-share");
+        self.show_share_panel = false;
+        let tmp = match shot {
+            Ok(p) => p,
+            Err(e) => {
+                self.notice = e;
+                cx.notify();
+                return;
+            }
+        };
+        let default = format!(
+            "笺读分享_{}.png",
+            crate::exporter::safe_file_stem(if self.share_book.is_empty() {
+                "笺读"
+            } else {
+                &self.share_book
+            }),
+        );
+        cx.spawn(
+            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let picked = crate::exporter::pick_save_path(
+                        "保存分享图（PNG）",
+                        &default,
+                        "PNG 图片",
+                        &["png"],
+                    );
+                    let Some(dest) = picked else {
+                        let _ = std::fs::remove_file(&tmp);
+                        this.update(&mut cx, |this, cx| {
+                            this.notice = "已取消保存".to_string();
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    };
+                    let dest = crate::exporter::with_extension(dest, "png");
+                    let res = crate::exporter::copy_file(
+                        std::path::Path::new(&tmp),
+                        std::path::Path::new(&dest),
+                    );
+                    let _ = std::fs::remove_file(&tmp);
+                    this.update(&mut cx, |this, cx| {
+                        this.notice = match res {
+                            Ok(p) => format!("已保存分享图：{}", p.display()),
+                            Err(e) => format!("保存失败：{e}"),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// 分享图片：把截下的卡片放进系统剪贴板（微信 / 备忘录里 ⌘V 即得）。
+    fn share_image_to_clipboard(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let shot = self.capture_card_png(window, "jiandu-share");
+        self.show_share_panel = false;
+        match shot {
+            Ok(p) => {
+                let script = format!(
+                    "set the clipboard to (read (POSIX file \"{p}\") as TIFF picture)"
+                );
+                let ok = std::process::Command::new("osascript")
+                    .args(["-e", &script])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                self.notice = if ok {
+                    "分享图已复制到剪贴板，可直接粘贴".to_string()
+                } else {
+                    format!("图片已存到 {p}（剪贴板不可用）")
+                };
+            }
+            Err(e) => {
+                self.notice = e;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 分享文字：把快照正文（选区 / 本叶）拓印进剪贴板。
+    fn share_text_to_clipboard(&mut self, cx: &mut Context<Self>) {
+        let text: String = self.share_body.iter().collect();
+        self.show_share_panel = false;
+        if text.is_empty() {
+            self.notice = "没有可分享的文字".to_string();
+            cx.notify();
+            return;
+        }
+        let ok = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .and_then(|mut s| s.write_all(text.as_bytes()).ok())
+                    .ok_or_else(|| std::io::Error::other("写入失败"))?;
+                child.wait()
+            })
+            .map(|s| s.success())
+            .unwrap_or(false);
+        self.notice = if ok {
+            format!("已拓印 {} 字，可直接粘贴", text.chars().count())
+        } else {
+            "复制失败：找不到 pbcopy".to_string()
+        };
+        cx.notify();
     }
 
     /// **「版字」面板**：列数 · 字级 · 字体 · 批注 · 留白 · 纸边 · 页面 ·
@@ -8506,24 +8876,35 @@ impl Root {
                 .child(seg(format!("天头:地脚 {:.1}:1", ratio), true)),
         );
         // ---- 底行：两枚**纯文字**动作（分享图片 / 分享文字）----
-        // 原来那两个灰色大方框是面板里最重的色块；现在只剩一行字，字旁一枚
-        // 极小的线框符号（画框=图片，简册=文字），悬停时字色加深。
-        let share_img = text_action("分享图片", ActionIcon::Frame, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.show_share_panel = true;
-                cx.notify();
-            }),
-        );
-        let share_txt = text_action("分享文字", ActionIcon::Slips, t).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.copy_page_text();
-                cx.notify();
-            }),
-        );
+        // 没有灰底方框、没有图标，只有一行字；悬停时字色加深。
+        let share_img = div()
+            .cursor_pointer()
+            .text_size(px(11.5))
+            .text_color(rgb(t.ink_soft()))
+            .hover(|s| s.text_color(rgb(t.ink())))
+            .child(SharedString::from("分享图片"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.show_share_panel = true;
+                    cx.notify();
+                }),
+            );
+        let share_txt = div()
+            .cursor_pointer()
+            .text_size(px(11.5))
+            .text_color(rgb(t.ink_soft()))
+            .hover(|s| s.text_color(rgb(t.ink())))
+            .child(SharedString::from("分享文字"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.copy_page_text();
+                    cx.notify();
+                }),
+            );
         sheet = sheet.child(
             div()
                 .flex()
@@ -8619,104 +9000,6 @@ impl Root {
             }
             Err(e) => Err(format!("无法调用 screencapture：{e}")),
         }
-    }
-
-    /// 保存分享卡 / 晒本：截卡片到桌面 PNG，并收起面板。
-    fn save_share_image(&mut self, window: &Window, cx: &mut Context<Self>) {
-        // 先截再收面板：截屏是同步的，先关面板会让画面在下一帧才更新，
-        // 虽然大概率仍截到卡片，但顺序反了容易截到「已消失」的界面。
-        let sunben = self.share_layout == CardLayout::Scroll;
-        let prefix = if sunben { "jiandu-sunben" } else { "jiandu-card" };
-        let shot = self.capture_card_png(window, prefix);
-        self.show_share_panel = false;
-        self.notice = match shot {
-            Ok(p) => {
-                if sunben {
-                    format!("已保存晒本：{p}")
-                } else {
-                    format!("已保存分享卡：{p}")
-                }
-            }
-            Err(e) => e,
-        };
-        cx.notify();
-    }
-
-    /// 分享图片：把截下的卡片直接放进系统剪贴板，可在微信 / 备忘录里 ⌘V 粘贴。
-    fn share_image_to_clipboard(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let sunben = self.share_layout == CardLayout::Scroll;
-        let prefix = if sunben { "jiandu-sunben" } else { "jiandu-share" };
-        let shot = self.capture_card_png(window, prefix);
-        self.show_share_panel = false;
-        match shot {
-            Ok(p) => {
-                let script = format!(
-                    "set the clipboard to (read (POSIX file \"{p}\") as TIFF picture)"
-                );
-                let ok = std::process::Command::new("osascript")
-                    .args(["-e", &script])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                self.notice = if ok {
-                    if sunben {
-                        "晒本已复制到剪贴板，可直接粘贴".to_string()
-                    } else {
-                        "分享图已复制到剪贴板，可直接粘贴".to_string()
-                    }
-                } else {
-                    format!("图片已保存到 {p}（剪贴板不可用）")
-                };
-            }
-            Err(e) => {
-                self.notice = e;
-            }
-        }
-        cx.notify();
-    }
-
-    /// 版字面板底部的**纯文字动作**（分享图片 / 分享文字）已改为自由函数
-    /// `text_action`：没有灰底方框，只有一行字与一枚极小线框符号。
-    ///
-    /// 分享面板的**朱砂印章**按钮：一枚方印，`filled = true` 是朱底白字
-    /// （主动作：保存），`false` 是白线框（次动作：分享）。
-    ///
-    /// 印面上字**竖排**（走正文族名），不做圆角胶囊、不做图标——印就是印。
-    /// 悬停时印面 `+4px`，从中心向外微微放大（GPUI 0.2.2 没有元素级
-    /// transform，只能改尺寸；外框固定，故放大不挤旁边的控件）。
-    fn seal_button(&self, label: &'static str, filled: bool) -> Div {
-        let family = self.main_family();
-        let mut face = div()
-            .w(px(SEAL_SIZE))
-            .h(px(SEAL_SIZE))
-            .rounded(px(3.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(1.0))
-            .cursor_pointer();
-        face = if filled {
-            face.bg(rgb(CINNABAR))
-        } else {
-            face.border_1().border_color(rgba(0xF2EAD659))
-        };
-        for c in label.chars() {
-            face = face.child(
-                div()
-                    .font_family(family.clone())
-                    .text_size(px(13.0))
-                    .text_color(rgb(if filled { 0xFFF8EC } else { 0xF2EAD6 }))
-                    .child(SharedString::from(c.to_string())),
-            );
-        }
-        div()
-            .w(px(SEAL_BOX))
-            .h(px(SEAL_BOX))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(face.hover(|s| s.w(px(SEAL_SIZE + 4.0)).h(px(SEAL_SIZE + 4.0))))
     }
 
     /// 版字面板里的一组小选项（标注 / 简繁等开关）。
@@ -8967,14 +9250,8 @@ impl Root {
     }
 }
 
-/// 供未来扩展：字体权重占位，避免未使用告警。
-#[allow(dead_code)]
-fn _unused() {
-    let _ = FontWeight::MEDIUM;
-}
-
 /// 分享面板里「书名 / 作者 / 章节 / 日期」四个开关。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ShareAct {
     Title,
     Author,
@@ -9261,9 +9538,10 @@ fn note_paper(card_w: f32, card_h: f32, body: &[char], ink: u32, mute: u32) -> D
 #[cfg(test)]
 mod tests {
     use super::{
-        chapters_ended_at, cn_date_from_str, cn_small, first_empty_column, note_grid_plan,
-        sheet_side_pads, COLUMN_OPTS, BAR_H,
+        chapters_ended_at, first_empty_column, note_grid_plan, sheet_side_pads, COLUMN_OPTS, BAR_H,
     };
+    // 日期汉字化已随分享引擎搬到 `share`（旧分享卡删除时一并迁走）。
+    use crate::share::{cn_date_from_str, cn_small};
     use crate::gloss::{Page, Piece};
     use crate::grid::LeafHalf;
     use crate::types::{FontChoice, FontPreset};

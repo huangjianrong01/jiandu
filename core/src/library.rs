@@ -68,6 +68,31 @@ pub struct ShelfEntry {
     /// 上次读到的卷册标题（`touch` 时写入，书架直接显示，不必再开书）。
     #[serde(default)]
     pub chapter_title: String,
+    /// 书签：每枚记录定位三元组（chapter/para/offset）、章节名、一句摘录与
+    /// 创建时间。落档到书架，跨会话保留（v1.53.0 新增）。
+    #[serde(default)]
+    pub bookmarks: Vec<Bookmark>,
+}
+
+/// 一枚书签。
+///
+/// 定位用 `(chapter, para, offset)` 三元组——与 `Root::page_anchor` 同源，
+/// 换列数重新分页后仍可靠找回（见 `page_anchor`/`restore_anchor` 的设计意图）。
+/// 章节名与摘录在落档时快照下来，列表渲染直接显示，不必每次回查书稿。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Bookmark {
+    /// 稳定 id，删除时用；由纳秒时间戳生成，不会撞。
+    pub id: String,
+    /// 定位三元组。
+    pub chapter: usize,
+    pub para: usize,
+    pub offset: usize,
+    /// 章节名（落档时快照）。
+    pub chapter_title: String,
+    /// 一句简短的摘录（落档时快照）。
+    pub excerpt: String,
+    /// 创建时间（Unix 秒），排序用。
+    pub created: u64,
 }
 
 fn default_script() -> String {
@@ -402,6 +427,14 @@ impl Library {
         self.save();
     }
 
+    /// 保存一本书的书签（v1.53.0）。
+    pub fn save_bookmarks(&mut self, idx: usize, bookmarks: &[Bookmark]) {
+        if let Some(e) = self.books.get_mut(idx) {
+            e.bookmarks = bookmarks.to_vec();
+        }
+        self.save();
+    }
+
     /// 导入一本书：解析 -> 写入 books/ -> 加入书架。
     ///
     /// EPUB 会先解析成结构化 `Book`，再以 **JSON** 落盘（`books/<书名>.json`）：
@@ -478,6 +511,7 @@ impl Library {
             edition: String::new(),
             chapters: book.chapters.len(),
             chapter_title: String::new(),
+            bookmarks: Vec::new(),
             store_id: None,
         });
         self.save();
@@ -543,6 +577,7 @@ impl Library {
             chapters: book.chapters.len(),
             chapter_title: String::new(),
             store_id: Some(store_id.to_string()),
+            bookmarks: Vec::new(),
         });
         self.save();
         Ok(self.books.len() - 1)
@@ -698,6 +733,7 @@ pub(crate) mod tests {
             edition: String::new(),
             chapters: 0,
             chapter_title: String::new(),
+            bookmarks: Vec::new(),
             store_id: None,
         }
     }

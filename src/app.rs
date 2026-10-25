@@ -5,7 +5,7 @@
 
 use crate::fonts;
 use crate::grid::{GridConfig, GridDir, LayoutConfig};
-use crate::library::Library;
+use crate::library::{Bookmark, Library};
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
     Book, CardLayout, Duplex, FontChoice, FontPreset, Glyph, GlyphHit, GlyphKey, GlyphKind,
@@ -141,6 +141,8 @@ pub enum AppUIState {
     Toc,
     /// 分享卡片浮层。
     Share,
+    /// 书签抽屉。
+    Bookmarks,
 }
 
 /// PNG 笺卡导出的两段式阶段（v1.52.3，见 `Root::png_export`）。
@@ -266,6 +268,18 @@ pub struct Root {
     pub toc_target: bool,
     /// 是否正在播放目录滑入 / 滑出动画。
     pub toc_animating: bool,
+    /// 书签抽屉是否展开（true = 该渲染书签层）。
+    pub show_bookmarks: bool,
+    /// 当前这本书的书签（插入 / 跳转 / 删除，落档 `library.json`）。
+    pub bookmarks: Vec<Bookmark>,
+    /// 书签抽屉滑入 / 滑出动画进度（0 = 完全收起，1 = 完全展开）。
+    pub bookmarks_slide: f32,
+    /// 书签动画的目标态（true = 展开）。
+    pub bookmarks_target: bool,
+    /// 是否正在播放书签滑入 / 滑出动画。
+    pub bookmarks_animating: bool,
+    /// 书签列表滚动柄。
+    pub bookmarks_scroll: ScrollHandle,
     /// 「版字」面板是否展开（v1.35.0：样式与版式两页合并为一页，
     /// 面板只剩一张纸，故不再有「当前页签」这个状态）。
     pub show_style: bool,
@@ -412,15 +426,34 @@ pub struct Root {
     pub share_show_author: bool,
     pub share_show_chapter: bool,
     pub share_show_date: bool,
-    /// 分享卡文字版式（八行笺 / 竖排分列 / 单列竖排；只要竖排，横排已删）。
-    pub share_layout: CardLayout,
-    /// 分享卡底色索引（见 reader::SHARE_BGS）。
-    pub share_bg: usize,
-    /// 丝栏（竖排列间界行）颜色：乌丝栏 / 金丝栏 / 朱丝栏，版字面板可选。
-    pub rule_color: RuleColor,
+    /// 分享卡模板下标（见 `crate::share::TEMPLATES`：四套配色）。
+    pub share_tpl: usize,
+    /// 分享卡文字方向：竖排右起（复古）/ 横排居中（现代）。
+    pub share_dir: crate::share::ShareDir,
+    /// 用户是否手动指定过方向：手动后不再随模板的建议方向变。
+    pub share_dir_touched: bool,
+    /// 分享面板页签：样式 / 字体。
+    pub share_tab: crate::share::ShareTab,
+    /// 高度滑杆档位（0..=4，见 `crate::share::H_STEPS`）。
+    pub share_h: usize,
+    /// 分享卡正文字体：None = 跟随阅读字体（见 `crate::share::SHARE_FONTS`）。
+    pub share_font: Option<usize>,
+    /// 打开面板时**快照**的正文：有选区取选区，无选区取本叶。
+    /// 之后点任何模板 / 页签都只改分享态——阅读界面一动不动。
+    pub share_body: Vec<char>,
+    /// 快照内容是否来自选区（false = 本叶正文）。
+    pub share_from_sel: bool,
+    /// 快照的元信息：书名 / 作者 / 章节 / 叶号 / 中文日期。
+    pub share_book: String,
+    pub share_author: String,
+    pub share_chap: String,
+    pub share_leaf: usize,
+    pub share_date: String,
     /// 分享卡在窗口内容区里的矩形 (x, y, w, h)，渲染时写入，
     /// 保存 / 分享图片时据此只截卡片，而不是整块屏幕。
     pub share_card_rect: Option<(f32, f32, f32, f32)>,
+    /// 丝栏（竖排列间界行）颜色：乌丝栏 / 金丝栏 / 朱丝栏，版字面板可选。
+    pub rule_color: RuleColor,
     /// **当前纸面（整幅双叶）在窗口内容区里的矩形** (x, y, w, h)。
     ///
     /// 由阅读视图里一枚**不绘制任何东西**的测量探针在 prepaint 时写入
@@ -428,8 +461,6 @@ pub struct Root {
     /// 截图范围收得与纸面严丝合缝——不带上状态栏，也不裁掉半个版框。
     /// 它是渲染帧的**输出**而非输入，故不影响任何排版坐标。
     pub page_rect: Rc<Cell<Option<(f32, f32, f32, f32)>>>,
-    /// 开发用：自动存卡的帧计数（到第 3 帧才截）。
-    pub share_shot_frames: u8,
     /// 点字弹出的工具条所锚定的字（None 表示未弹出）。
     pub popup: Option<GlyphHit>,
     /// 拖拽选区的起点 / 焦点（(chapter, para, offset)）。
@@ -744,6 +775,12 @@ impl Root {
             toc_slide: 0.0,
             toc_target: false,
             toc_animating: false,
+            show_bookmarks: false,
+            bookmarks: Vec::new(),
+            bookmarks_slide: 0.0,
+            bookmarks_target: false,
+            bookmarks_animating: false,
+            bookmarks_scroll: ScrollHandle::new(),
             show_style: false,
             focus_mode: false,
             bar_shown: true,
@@ -787,12 +824,22 @@ impl Root {
             share_show_author: true,
             share_show_chapter: true,
             share_show_date: true,
-            share_layout: CardLayout::Note,
-            share_bg: 0,
+            share_tpl: 0,
+            share_dir: crate::share::ShareDir::Vertical,
+            share_dir_touched: false,
+            share_tab: crate::share::ShareTab::Style,
+            share_h: 2,
+            share_font: None,
+            share_body: Vec::new(),
+            share_from_sel: false,
+            share_book: String::new(),
+            share_author: String::new(),
+            share_chap: String::new(),
+            share_leaf: 0,
+            share_date: String::new(),
             rule_color: RuleColor::Wu,
             share_card_rect: None,
             page_rect: Rc::new(Cell::new(None)),
-            share_shot_frames: 0,
             popup: None,
             sel_anchor: None,
             sel_focus: None,
@@ -985,17 +1032,20 @@ impl Root {
             root.notice = "眉批演示：点字柱唤醒，再点『改 / ✕』".to_string();
         }
     }
-        // 开发用：指定分享卡版式 / 底色，便于逐项核对。
-        if let Ok(v) = std::env::var("JIANDU_SHARE_LAYOUT") {
-            root.share_layout = match v.as_str() {
-                "single" => CardLayout::Single,
-                "note" => CardLayout::Note,
-                "scroll" | "sunben" => CardLayout::Scroll,
-                _ => CardLayout::Columns,
-            };
+        // 开发用：指定分享卡模板 / 方向，便于逐项截图核对。
+        if let Ok(v) = std::env::var("JIANDU_SHARE_TPL") {
+            if let Ok(i) = v.parse::<usize>() {
+                if i < crate::share::TEMPLATES.len() {
+                    root.share_tpl = i;
+                }
+            }
         }
-        if let Ok(v) = std::env::var("JIANDU_SHARE_BG") {
-            root.share_bg = v.parse().unwrap_or(0);
+        if let Ok(v) = std::env::var("JIANDU_SHARE_DIR") {
+            root.share_dir = match v.as_str() {
+                "h" | "horizontal" => crate::share::ShareDir::Horizontal,
+                _ => crate::share::ShareDir::Vertical,
+            };
+            root.share_dir_touched = true;
         }
         // 开发用：指定丝栏色（0 乌 / 1 金 / 2 朱），便于逐色截图核对。
         if let Ok(v) = std::env::var("JIANDU_RULE") {
@@ -2151,6 +2201,7 @@ impl Root {
                 self.book = Some(book);
                 self.notes = nt;
                 self.underlines = ul.into_iter().collect();
+                self.bookmarks = entry.bookmarks.clone();
                 self.show_share_panel = false;
                 self.show_notes_panel = false;
                 self.note_editing = false;
@@ -2503,8 +2554,17 @@ impl Root {
         self.close_transient_ui();
         self.png_export = Some(PngStage::Warm);
         cx.notify();
-        // 第一帧由 `render` 的 png_export 分支接管。
-        window.request_animation_frame();
+        // ⚠️ 这里**不能**调 `window.request_animation_frame()`（v1.53.0 修崩）：
+        // GPUI 0.2.2 的 `request_animation_frame` 内部走
+        // `current_view().unwrap()`——`rendered_entity_stack` 只在 paint /
+        // prepaint 阶段非空；事件处理器（on_mouse_down → 本函数）里调用时
+        // 栈为空，`unwrap()` 直接 panic。panic 穿过 GPUI↔ObjC 的
+        // `handle_view_event` FFI 边界会被 `panic_cannot_unwind` 强杀
+        // （表现为「点导出就闪退」，见 ~/.jiandu/panic.log 的栈：
+        // begin_pdf_export → request_animation_frame → current_view）。
+        // 首帧改由 `cx.notify()` 触发重绘；`render` 里的 pdf/png 分支
+        // 身处绘制阶段，那时再 `request_animation_frame()` 才安全
+        // （目录滑入动画一直都是这么驱动的）。
     }
 
     /// PNG 笺卡导出的实段（`PngStage::Shoot` 帧由 `render` 循环调用）：
@@ -2660,8 +2720,13 @@ impl Root {
             "正在印制本叶 PDF…".to_string()
         };
         cx.notify();
-        // 第一帧由 `render` 的 pdf_animating 分支接管。
-        window.request_animation_frame();
+        // ⚠️ 同 `export_page_png`：**绝不**在事件处理器里调
+        // `window.request_animation_frame()`——GPUI 0.2.2 该函数内部
+        // `current_view().unwrap()` 只在绘制阶段有栈，此处调用必 panic
+        // 并撞 FFI 边界被强杀（v1.52.5 的「点 PDF 导出即闪退」根因，
+        // panic.log 栈：begin_pdf_export → request_animation_frame）。
+        // 首帧由 `cx.notify()` 的重绘驱动：`render` 的 pdf_animating
+        // 分支（绘制阶段，栈非空）会自己 request 下一帧，循环不断。
     }
 
     /// PDF 合成收尾：把临时 PNG 合成为临时 PDF，弹系统保存框，落盘后给古风提示。
@@ -2925,6 +2990,7 @@ impl Root {
             AppUIState::Help => self.show_help,
             AppUIState::Toc => self.show_toc,
             AppUIState::Share => self.show_share_panel,
+            AppUIState::Bookmarks => self.show_bookmarks,
             AppUIState::None => false,
         };
         let s = if on { AppUIState::None } else { s };
@@ -2935,6 +3001,7 @@ impl Root {
         self.show_help = matches!(s, AppUIState::Help);
         self.show_toc = matches!(s, AppUIState::Toc);
         self.show_share_panel = matches!(s, AppUIState::Share);
+        self.show_bookmarks = matches!(s, AppUIState::Bookmarks);
         if !self.show_search {
             self.clear_search();
         }
@@ -2944,6 +3011,8 @@ impl Root {
         self.notes_animating = self.show_notes_panel || self.notes_slide > 0.0;
         self.search_target = self.show_search;
         self.search_animating = self.show_search || self.search_slide > 0.0;
+        self.bookmarks_target = self.show_bookmarks;
+        self.bookmarks_animating = self.show_bookmarks || self.bookmarks_slide > 0.0;
         self.close_transient_ui();
     }
 
@@ -2956,6 +3025,7 @@ impl Root {
             || self.show_notes_panel
             || self.show_help
             || self.show_share_panel
+            || self.show_bookmarks
     }
 
     pub fn open_toc(&mut self) {
@@ -3000,6 +3070,135 @@ impl Root {
             self.show_toc = false;
             self.toc_animating = false;
         }
+    }
+
+    /// 呼出书签抽屉（从底部滑入）；与目录栏互斥（同一时刻只开一个顶层）。
+    pub fn open_bookmarks(&mut self) {
+        if self.show_bookmarks && self.bookmarks_target {
+            return;
+        }
+        self.show_style = false;
+        self.show_search = false;
+        self.show_notes_panel = false;
+        self.show_help = false;
+        self.show_toc = false;
+        self.show_share_panel = false;
+        self.ui_state = AppUIState::Bookmarks;
+        self.close_transient_ui();
+        self.show_bookmarks = true;
+        self.bookmarks_target = true;
+        self.bookmarks_animating = true;
+    }
+
+    /// 收起书签抽屉（向底部滑出）。
+    pub fn close_bookmarks(&mut self) {
+        if !self.show_bookmarks && !self.bookmarks_animating {
+            return;
+        }
+        if !self.show_bookmarks {
+            return;
+        }
+        self.bookmarks_target = false;
+        self.bookmarks_animating = true;
+        self.ui_state = AppUIState::None;
+        if self.bookmarks_slide <= 0.0 {
+            self.show_bookmarks = false;
+            self.bookmarks_animating = false;
+        }
+    }
+
+    /// 顶栏「书签」钮：抽屉开着就收起；没开则先收藏当前页（去重）再展开。
+    pub fn toggle_bookmarks(&mut self) {
+        if self.show_bookmarks {
+            self.close_bookmarks();
+        } else {
+            self.add_bookmark_current();
+            self.open_bookmarks();
+        }
+    }
+
+    /// 收藏当前页：以 `page_anchor` 三元组定位，记下章节名与一句摘录。
+    /// 同一字已收藏则跳过（去重），避免反复点同一个钮刷出一串重复书签。
+    pub fn add_bookmark_current(&mut self) {
+        let Some((chapter, para, offset)) = self.page_anchor() else {
+            return;
+        };
+        if self
+            .bookmarks
+            .iter()
+            .any(|b| (b.chapter, b.para, b.offset) == (chapter, para, offset))
+        {
+            return;
+        }
+        let chapter_title = self.chapter_title(chapter);
+        let excerpt = self.excerpt_at(chapter, para, offset);
+        let bm = Bookmark {
+            id: Self::new_bookmark_id(),
+            chapter,
+            para,
+            offset,
+            chapter_title,
+            excerpt,
+            created: crate::library::now_secs(),
+        };
+        self.bookmarks.push(bm);
+        self.save_bookmarks();
+    }
+
+    /// 删除一枚书签（按 id）。
+    pub fn remove_bookmark(&mut self, id: &str) {
+        self.bookmarks.retain(|b| b.id != id);
+        self.save_bookmarks();
+    }
+
+    /// 跳到某书签：按三元组找回它所在的那一面，再走 `goto_page`（自动对齐当前章）。
+    pub fn jump_to_bookmark(&mut self, bm: &Bookmark) {
+        if let Some(pi) = self.layout_pages().iter().position(|pg| {
+            pg.glyphs.iter().any(|g| {
+                (g.chapter, g.para, g.offset) == (bm.chapter, bm.para, bm.offset)
+            })
+        }) {
+            self.goto_page(pi);
+        }
+    }
+
+    /// 把当前书签落档到书架。
+    pub fn save_bookmarks(&mut self) {
+        let bms = self.bookmarks.clone();
+        self.library.save_bookmarks(self.current, &bms);
+    }
+
+    /// 当前段落里围绕锚点的一句摘录（去空白、截断），落档用。
+    fn excerpt_at(&self, chapter: usize, para: usize, offset: usize) -> String {
+        let Some(text) = self
+            .book
+            .as_ref()
+            .and_then(|b| b.chapters.get(chapter))
+            .and_then(|c| c.paragraphs.get(para))
+            .map(|p| p.text.clone())
+        else {
+            return String::new();
+        };
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            return String::new();
+        }
+        let start = offset.saturating_sub(8);
+        let end = (offset + 16).min(chars.len());
+        let slice: String = chars[start..end].iter().collect();
+        slice
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// 书签 id：纳秒时间戳，几乎不会撞。
+    fn new_bookmark_id() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("bm-{nanos}")
     }
 
     /// 分页（缓存由每次渲染即时计算，文本量级足够）。
@@ -4480,6 +4679,21 @@ impl Render for Root {
                 window.request_animation_frame();
             }
         }
+        // 书签抽屉滑入 / 滑出（与 toc 同款逐帧推进）。
+        if self.bookmarks_animating {
+            let dir = if self.bookmarks_target { 1.0 } else { -1.0 };
+            let step = 0.12;
+            let next = (self.bookmarks_slide + dir * step).clamp(0.0, 1.0);
+            self.bookmarks_slide = next;
+            if (self.bookmarks_target && next >= 1.0) || (!self.bookmarks_target && next <= 0.0) {
+                self.bookmarks_animating = false;
+                if !self.bookmarks_target {
+                    self.show_bookmarks = false;
+                }
+            } else {
+                window.request_animation_frame();
+            }
+        }
         // 检索侧栏滑入 / 滑出。
         if self.search_animating {
             let dir = if self.search_target { 1.0 } else { -1.0 };
@@ -4618,18 +4832,6 @@ impl Render for Root {
         // v1.50.0：每帧探一眼后台导入（完成就登记入架，没完成就刷新进度）。
         self.poll_import(cx);
         let screen = self.render_screen(cx);
-        // 开发用：JIANDU_SAVE_SHARE=1 时，分享卡渲染到第 3 帧后自动存一张，
-        // 便于核对裁剪区域（前两帧还没上屏，截不到）。
-        if std::env::var("JIANDU_SAVE_SHARE").is_ok()
-            && self.show_share_panel
-            && self.share_shot_frames < 3
-        {
-            self.share_shot_frames += 1;
-            if self.share_shot_frames == 3 {
-                let p = self.capture_card_png(window, "jiandu-card-test");
-                self.notice = format!("调试存卡：{p:?}");
-            }
-        }
         let key_focus = self.key_focus.clone();
         let mut root = div()
             .flex()

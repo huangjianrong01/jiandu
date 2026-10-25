@@ -20,6 +20,7 @@ mod lines;
 mod note_inject;
 mod punct;
 mod reader;
+mod share;
 mod shelf;
 mod sound;
 mod zen_kit;
