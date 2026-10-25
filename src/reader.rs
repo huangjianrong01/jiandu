@@ -554,10 +554,10 @@ type NoteIndex = HashMap<(usize, usize, usize), usize>;
 ///
 /// 早先是两枚 `<rect>` 实心黑块（33×12），既不合刻本形制，视觉上也极
 /// 重；中间一度改用贝塞尔画「燕尾」，画成了圆滚滚的黑桃 / 蝙蝠翅膀。
-/// 现在整枚只有 `M` / `L` / `Z`（`banxin::fishtail_svg`），尺寸由
-/// `banxin::banxin_tail_size` 算好传进来（v1.48.0：宽 = 列宽 × 0.46、
-/// 高 = 0.22 字，凹口 0.76 深——更小更锐）。墨色渲染层给 `#333333`
-/// 深灰——黑鱼尾不取纯黑。见 app::ensure_assets。
+/// 现在整枚只有 `M` / `L` / `Z`（`banxin::fishtail_svg`），`w × h` 由
+/// 渲染层算好传进来：高 = 0.22 字（宋版直线刀法），**宽 = 中缝全宽 +
+/// 外探**（`render_gutter` 里覆盖 `lay.tail_w`，两翼压住界栏）。墨色渲染
+/// 层给 `#222222` 深灰——黑鱼尾不取纯黑。见 app::ensure_assets。
 fn banxin_tail(w: f32, h: f32, top: bool, color: u32) -> Div {
     let path = if top {
         "banxin_top.svg"
@@ -3830,8 +3830,8 @@ impl Root {
         let book = self.book_title();
         let juan = format!("卷{}", han_num(chapter + 1));
         let page = han_num(page_idx + 1);
-        let lay = crate::banxin::layout(crate::banxin::BanxinOpts {
-            // 鱼尾与书口字都按**内芯宽**排：不得探出两条细线。
+        let mut lay = crate::banxin::layout(crate::banxin::BanxinOpts {
+            // 书口字、叶码、鱼尾高度仍按**内芯宽**排（文字不得探出两条细线）。
             gutter_w: core_w,
             // v1.48.0：可用高 = 两枚鱼尾**中心之间**的那段版心（1/4 ↔ 3/4，
             // 即半幅内芯高 + 一枚鱼尾）——鱼尾挪位后，书口文字的预算跟着
@@ -3840,7 +3840,8 @@ impl Root {
             band_h: (core_h * 0.5 + crate::banxin::banxin_tail_size(core_w, cell_h, self.col_w).1)
                 .max(40.0),
             cell_h,
-            // v1.30.0：鱼尾宽按「列宽 × 0.7」取（见 `banxin_tail_size`）。
+            // `col_w × 0.46` 只作鱼尾**高度的参考宽**（见 `banxin_tail_size`）；
+            // 鱼尾的**渲染宽**由下方 `lay.tail_w` 覆盖成中缝全宽，与排版无关。
             col_w: self.col_w,
             fs,
             book: &book,
@@ -3852,6 +3853,11 @@ impl Root {
             // 版心只留「鱼尾 + 书口字 + 叶码」，不再被一枚红印隔着。
             seal: false,
         });
+        // v1.52.9：鱼尾**渲染宽**改为「中缝全宽 + 外探」——两翼端点压在版心
+        // 左右界栏上（甚至略盖住界线），不再悬浮在中缝中央。`gw` 即中缝（版心）
+        // 全宽，等于两道界栏的间距；高度 `tail_h` 与文字预算沿用 `layout` 原值，
+        // 绝不动纵向尺寸与排版。
+        lay.tail_w = gw + crate::banxin::FISHTAIL_OVERLAP;
         // 书口小字**极小号宋体**：走正文字体（默认文津宋体）的回退链，
         // 横笺里也不会退化成黑体。
         let family = crate::fonts::family_for(self.current_font(), Script::Ancient);
@@ -3873,8 +3879,9 @@ impl Root {
         col = col.child(div().w_full().h(px(heikou)).bg(rgb(t.fish_ink())));
         // 上鱼尾定位垫：把上鱼尾中心推到版心 1/4 处（不再是口下一丁点）。
         col = col.child(div().h(px(pad)));
-        // 上鱼尾：凹口朝下（直线多边形，深灰 `#333333`，见 `banxin_tail`）。
-        // 尺寸由 `banxin::layout` 按「宽不越界栏」算好（v1.48.0 已缩小）。
+        // 上鱼尾：平顶实心条 + 底部中央深 V 白口，两鳍尖朝下（宋版直线刀法，
+        // 深灰 `#222222`，见 `banxin_tail`）。渲染宽 `lay.tail_w` 已覆盖为
+        // 中缝全宽 + 外探（两翼压住界栏），高度 `lay.tail_h` 沿用原值。
         col = col.child(banxin_tail(lay.tail_w, lay.tail_h, true, t.fish_ink()));
         col = col.child(div().h(px(lay.gap)));
         // 书名 → 卷次 → 篇题（极小号宋体，一字一格竖排）。每段之间留一道
@@ -3893,7 +3900,7 @@ impl Root {
             col = col.child(banxin_vtext(line, core_w, &family, t));
         }
         col = col.child(div().h(px(lay.gap)));
-        // 下鱼尾：∨ 口朝上，与上鱼尾开口相对。
+        // 下鱼尾：凹口在上缘、开口朝下，与上鱼尾相对成「对鱼尾」。
         col = col.child(banxin_tail(lay.tail_w, lay.tail_h, false, t.fish_ink()));
         // 下鱼尾定位垫：与上侧镜像，下鱼尾中心因此落在版心 3/4 处。
         col = col.child(div().h(px(pad)));
