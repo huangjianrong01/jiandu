@@ -1777,8 +1777,9 @@ impl Root {
             return div();
         };
         let t = self.theme;
-        // 抽屉底：宣纸 + alpha 0xE6（约 90%）——磨砂半透的宣纸色，不做死白网页。
-        let DRAWER_BG: u32 = (t.paper() << 8) | 0xE6;
+        // 抽屉底：宣纸 + alpha 0xF2（约 95%）——磨砂半透的宣纸色，比旧版
+        // 0xE6 更实一档，毛玻璃透视感更强，背后正文仍若隐若现、绝不糊死。
+        let DRAWER_BG: u32 = (t.paper() << 8) | 0xF2;
         // 顶上那条分割线：淡墨兑到很浅，只起「抽屉是另一张纸」的提示作用。
         let EDGE: u32 = (t.rule() << 8) | 0x5A;
         let INK: u32 = t.ink();
@@ -1841,6 +1842,31 @@ impl Root {
             .flex()
             .items_center()
             .justify_center()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(14.0))
+                    .top(px((HEAD_H - 16.0) / 2.0))
+                    .h(px(16.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .font_family(song.clone())
+                    .text_size(px(11.0))
+                    .text_color(rgb(INK_SOFT))
+                    .hover(|s| s.text_color(rgb(VERMILION)))
+                    .child(SharedString::from("卷首"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            // 回到卷首：charIndex 归零并重绘，抽屉同时收起。
+                            this.goto_char_index(0);
+                            this.close_toc();
+                            cx.notify();
+                        }),
+                    ),
+            )
             .child(
                 div()
                     .font_family(song.clone())
@@ -5459,8 +5485,20 @@ impl Root {
             Some(z) => crate::dict::tidy_zishu(&z.shuowen),
             None => entry.as_ref().map(|e| e.gloss.clone()).unwrap_or_default(),
         };
+        // 「简明」页签的源：高频常用字的一行现代语体概括（之乎者也为首的手写小表）。
+        let concise_src = crate::dict::concise_of(hit.ch)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let mut tab = self.dict_tab;
         let body_src = match tab {
+            crate::app::DictTab::Jianming => {
+                if concise_src.is_empty() && !kx_src.is_empty() {
+                    tab = crate::app::DictTab::Kangxi;
+                    kx_src.clone()
+                } else {
+                    concise_src.clone()
+                }
+            }
             crate::app::DictTab::Kangxi => {
                 if kx_src.is_empty() && !sw_src.is_empty() {
                     tab = crate::app::DictTab::Shuowen;
@@ -5607,11 +5645,16 @@ impl Root {
                 .items_center()
                 .justify_start()
                 .gap(px(14.0));
-            for which in [crate::app::DictTab::Kangxi, crate::app::DictTab::Shuowen] {
-                let src_empty = match which {
-                    crate::app::DictTab::Kangxi => kx_src.is_empty(),
-                    crate::app::DictTab::Shuowen => sw_src.is_empty(),
-                };
+        for which in [
+            crate::app::DictTab::Jianming,
+            crate::app::DictTab::Kangxi,
+            crate::app::DictTab::Shuowen,
+        ] {
+            let src_empty = match which {
+                crate::app::DictTab::Jianming => concise_src.is_empty(),
+                crate::app::DictTab::Kangxi => kx_src.is_empty(),
+                crate::app::DictTab::Shuowen => sw_src.is_empty(),
+            };
                 let on = which == tab;
                 // 选中的那一签下面压一根朱丝线（GPUI 0.2.2 无 `border_b_1`，
                 // 故用一枚 1px 的细条；未选中的那签让条透明，高度才对齐）。
@@ -5813,18 +5856,55 @@ impl Root {
                 cx.notify();
             }),
         );
-        let bar = div()
-            .w_full()
-            .flex_none()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_end()
-            .gap(px(9.0))
-            .child(btn_zdic)
-            .child(btn_copy)
-            .child(btn_search)
-            .child(btn_close);
+        // 三库皆空（简明 / 康熙 / 說文一个字都没查到）：底部整条换成醒目的
+        // 「前往汉典网在线考据」按钮——这是「三个字典均查无此字」时的唯一出路。
+        let has_any = !concise_src.is_empty() || !kx_src.is_empty() || !sw_src.is_empty();
+        let bar = if has_any {
+            div()
+                .w_full()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .gap(px(9.0))
+                .child(btn_zdic)
+                .child(btn_copy)
+                .child(btn_search)
+                .child(btn_close)
+        } else {
+            let zdic_u = zdic.clone();
+            let zdic_word = word.clone();
+            div()
+                .w_full()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(9.0))
+                .child(
+                    div()
+                        .font_family(main_family.clone())
+                        .text_size(px(12.5))
+                        .text_color(rgb(zhu))
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(rgb(ink_main)))
+                        .child(SharedString::from("前往汉典网在线考据"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if crate::app::open_external(&zdic_u) {
+                                    this.notice = format!("已用浏览器打开汉典：{zdic_word}");
+                                } else {
+                                    this.notice = "未能调用系统浏览器".to_string();
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                )
+        };
 
         // ── 便签本体：宣纸半透明 + 一根极细朱砂边 + 微弱阴影 ──────────
         div()

@@ -27,10 +27,12 @@ use std::rc::Rc;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DictTab {
     /// 《康熙字典》：历代韵书引文、反切、考證。
-    #[default]
     Kangxi,
     /// 《說文解字》：小篆本义。
     Shuowen,
+    /// 简明释义：高频常用字的现代语体一句话概括（之乎者也为首的手写小表）。
+    #[default]
+    Jianming,
 }
 
 impl DictTab {
@@ -39,6 +41,7 @@ impl DictTab {
         match self {
             DictTab::Kangxi => "康熙",
             DictTab::Shuowen => "說文",
+            DictTab::Jianming => "簡明",
         }
     }
 
@@ -1162,6 +1165,13 @@ impl Root {
         self.lookup_text = text;
         self.lookup_at = at;
         self.lookup_rect = rect;
+        // 智能默认页签：常用字（简明库有数据）开签先亮「简明」，生僻字
+        // （简明库无数据）退回「康熙」。用户之后仍可手动切换其余页签。
+        self.dict_tab = if crate::dict::concise_of(ch).is_some() {
+            DictTab::Jianming
+        } else {
+            DictTab::Kangxi
+        };
     }
 
     /// **悬停查词**（v1.38.0，v1.40.0 重做状态机）：鼠标在一个字上停满
