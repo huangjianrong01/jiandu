@@ -641,7 +641,7 @@ mod tests {
     fn fish_ink_is_dark_grey_not_black_and_visible_on_every_paper() {
         // 黑鱼尾：浅纸上就是 #333333（不取纯黑，纯黑太跳）。
         assert_eq!(Theme::Xuan.fish_ink(), crate::banxin::FISH_INK);
-        assert_eq!(crate::banxin::FISH_INK, 0x333333);
+        assert_eq!(crate::banxin::FISH_INK, 0x222222);
         // 深底（夜读）兑淡：鱼尾不能因为纸黑就整枚消失。
         let ye = Theme::Ye.fish_ink();
         assert_ne!(ye, crate::banxin::FISH_INK);

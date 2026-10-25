@@ -112,9 +112,9 @@ pub const HEIKOU_H_RATIO: f32 = 0.13;
 /// 黑口最薄处（px）：再薄的两道墨就糊成一条灰线了。
 pub const HEIKOU_H_MIN: f32 = 2.0;
 
-/// **黑鱼尾**的墨色：深灰 `#333333`，不是纯黑——纯黑在纸面上太跳，
-/// 也压过了正文的墨色。深底（夜读）时向纸色兑淡，否则整枚看不见。
-pub const FISH_INK: u32 = 0x333333;
+/// **黑鱼尾**（与黑口同料）的墨色：深灰黑 `#222222`，不是纯黑——纯黑在
+/// 纸面上太跳，也压过了正文的墨色。深底（夜读）时向纸色兑淡，否则整枚看不见。
+pub const FISH_INK: u32 = 0x222222;
 /// 折痕色：极淡的灰 `#999999`。
 pub const FOLD_INK: u32 = 0x999999;
 /// 折痕线宽（px）。
@@ -192,35 +192,37 @@ pub fn fold_dashes(len: f32, dash: f32) -> (usize, f32) {
     (n, gap.max(0.5))
 }
 
-/// 一枚鱼尾的**五个折点**（viewBox 坐标：宽 100、高 `h`）。
+/// 一枚鱼尾的折点（viewBox 坐标：宽 100、高 `h`，中心 x = 50）。
 ///
-/// 上鱼尾（`top = true`，顶边在 y=0、凹口朝下）：
+/// **严格按用户给定的绝对坐标**（围绕包围盒 `X=50, Y=0, W=100, H=h` 取
+/// 六点，第 6 点闭合回第 1 点，故此处只列 5 个），**绝不用任何贝塞尔**：
+///
+/// 上鱼尾（`top = true`，顶边在 y=0、尖口朝下）：
 ///
 /// ```text
-///   1 左上 (0, 0)  →  2 右上 (100, 0)  →  3 右翼下角 (100, h·0.6)
-///                  →  4 中心凹口 (50, h·0.3)  →  5 左翼下角 (0, h·0.6)
+///   1 左上 (0, 0)        →  2 右上 (100, 0)       // 顶边一刀平直
+///                     →  3 右翼 (100, 0.4·h)      // 右侧边翼向下到 0.4H
+///                     →  4 中心尖点 (50, 0.9·h)   // 核心：向下深凹到 0.9H（锐利）
+///                     →  5 左翼 (0, 0.4·h)        // 左侧边翼向下到 0.4H
 /// ```
 ///
-/// 下鱼尾是上鱼尾的**垂直镜像**（底边 `by = h·TAIL_WING`，凹口朝上），
-/// 故整枚 `y → span - y`（`span = h·TAIL_WING` 是形状实际占的高度）
-/// ——镜像只在这一处体现，不会再写反。
-///
-/// 全是 `f32` 常量运算，**绝无贝塞尔**：刻本的刀是直的，鱼尾就得是
-/// 直线多边形。要改形制动这两个骨架常量即可（`TAIL_WING` / `TAIL_APEX`）。
+/// 下鱼尾是上鱼尾的**垂直镜像**（`y → h − y`），开口朝上，与上鱼尾相对
+/// 成「对鱼尾」。要改形只改下面这两组字面坐标，不要再自己算比例。
 pub fn fishtail_points(top: bool, h: f32) -> [(f32, f32); 5] {
-    let span = h * TAIL_WING;
-    let apex = h * TAIL_APEX;
+    // 上鱼尾：用户给的六点（第 6 点闭合回第 1 点，故只列 5 个）。
     let up = [
-        (0.0, 0.0),    // 1 左上
-        (100.0, 0.0),  // 2 右上
-        (100.0, span), // 3 右翼下角
-        (50.0, apex),  // 4 中心凹口（锐角）
-        (0.0, span),   // 5 左翼下角
+        (0.0, 0.0),       // 1 左上 (X − W/2, Y)
+        (100.0, 0.0),     // 2 右上 (X + W/2, Y)
+        (100.0, 0.4 * h), // 3 右翼 (X + W/2, Y + 0.4H)
+        (50.0, 0.9 * h),  // 4 中心尖点 (X, Y + 0.9H)
+        (0.0, 0.4 * h),   // 5 左翼 (X − W/2, Y + 0.4H)
     ];
     if top {
         up
     } else {
-        up.map(|(x, y)| (x, span - y))
+        // 下鱼尾 = 上鱼尾绕水平中轴镜像（恰为用户给的
+        // (0,h)/(100,h)/(100,0.6h)/(50,0.1h)/(0,0.6h)）。
+        up.map(|(x, y)| (x, h - y))
     }
 }
 
@@ -236,11 +238,9 @@ pub fn fishtail_points(top: bool, h: f32) -> [(f32, f32); 5] {
 pub fn fishtail_svg(top: bool, aspect: f32) -> String {
     let a = aspect.clamp(0.45, 2.6);
     let h = 100.0 * a;
-    // 折点最深只到 `cy + 基准·TAIL_WING`，故基准放大到 `h / TAIL_WING`
-    // 再算——整枚等比放大到**铺满 viewBox**，形状一模一样，但不会在鱼尾
-    // 下方凭空多出一截留白把书口字挤走（`TAIL_WING = 1.0` 时基准即 `h`）。
-    let base = h / TAIL_WING;
-    let d: Vec<String> = fishtail_points(top, base)
+    // 六点折线多边形（`fishtail_points` 里是用户给定的绝对坐标），
+    // 只有 `M` / `L` / `Z`——绝无贝塞尔，直线刀刻的鱼尾。
+    let d: Vec<String> = fishtail_points(top, h)
         .iter()
         .enumerate()
         .map(|(i, (x, y))| {
@@ -249,7 +249,7 @@ pub fn fishtail_svg(top: bool, aspect: f32) -> String {
         })
         .collect();
     format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 {:.1}\"><path d=\"{} Z\" fill=\"#333333\"/></svg>",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 {:.1}\"><path d=\"{} Z\" fill=\"#222222\"/></svg>",
         h,
         d.join(" ")
     )
@@ -519,25 +519,24 @@ mod tests {
     #[test]
     fn fishtail_follows_the_five_point_skeleton() {
         let h = 100.0 * FISHTAIL_ASPECT;
-        // 上鱼尾：左上 → 右上 → 右翼下角 → 中心凹口 → 左翼下角。
+        // 上鱼尾：左上 → 右上 → 右翼(0.4H) → 中心尖点(0.9H) → 左翼(0.4H)。
         let up = fishtail_points(true, h);
         let want = [
             (0.0, 0.0),
             (100.0, 0.0),
-            (100.0, h * TAIL_WING),
-            (50.0, h * TAIL_APEX),
-            (0.0, h * TAIL_WING),
+            (100.0, 0.4 * h),
+            (50.0, 0.9 * h),
+            (0.0, 0.4 * h),
         ];
-        assert_eq!(up, want, "上鱼尾折点偏离刻本骨架：{up:?}");
-        // 凹口顶点必须比尾翼下缘**高**（浅），缺口才是锐角 V、开口朝下。
-        assert!(TAIL_APEX < TAIL_WING);
-        // 下鱼尾 = 上鱼尾的垂直镜像（绕形状自身的中轴翻，底边 by = span）。
-        let span = h * TAIL_WING;
+        assert_eq!(up, want, "上鱼尾折点偏离用户给定坐标：{up:?}");
+        // 中心尖点必须比两侧翼**低**（深），才是朝下的锐利尖口。
+        assert!(want[3].1 > want[2].1);
+        // 下鱼尾 = 上鱼尾的垂直镜像（y → h − y），开口朝上。
         let down = fishtail_points(false, h);
         for i in 0..5 {
             assert!((down[i].0 - want[i].0).abs() < 1e-6, "镜像不该动 x：{down:?}");
             assert!(
-                (down[i].1 - (span - want[i].1)).abs() < 1e-6,
+                (down[i].1 - (h - want[i].1)).abs() < 1e-6,
                 "下鱼尾必须是垂直镜像：{down:?}"
             );
         }
@@ -545,11 +544,10 @@ mod tests {
 
     #[test]
     fn both_tails_fill_their_own_box() {
-        // 两枚各自铺满自己的元素高（`fishtail_svg` 把基准放大到
-        // `h / TAIL_WING`）——不然鱼尾下方会凭空空出一截，把中间书口
-        // （叶码「二十三」）的地盘吃掉。
-        let h = 100.0 * FISHTAIL_ASPECT / TAIL_WING;
-        let span = h * TAIL_WING;
+        // 两枚鱼尾各自的包围盒（用户给定坐标）：
+        // 上鱼尾 y ∈ [0, 0.9·h]，下鱼尾 y ∈ [0.1·h, h]——尖口那侧留出 0.1·h 的
+        // 包围盒余量，正是用户「H 为包围盒、尖点达 0.9H」的设定。
+        let h = 100.0 * FISHTAIL_ASPECT;
         for top in [true, false] {
             let s = fishtail_svg(top, FISHTAIL_ASPECT);
             let d = s.split("d=\"").nth(1).unwrap().split('"').next().unwrap();
@@ -561,35 +559,42 @@ mod tests {
             let ys: Vec<f32> = nums.iter().skip(1).step_by(2).copied().collect();
             let lo = ys.iter().fold(f32::INFINITY, |a, b| a.min(*b));
             let hi = ys.iter().fold(f32::NEG_INFINITY, |a, b| a.max(*b));
-            // 包围盒正好是 [0, viewBox 高]：0 → 100×aspect。
-            assert!(lo.abs() < 0.01, "顶边没贴住：{lo}");
-            assert!((hi - span).abs() < 0.01, "底边没铺满：{hi} / {span}");
+            if top {
+                assert!(lo.abs() < 0.01, "上鱼尾顶边没贴住：{lo}");
+                assert!((hi - 0.9 * h).abs() < 0.01, "上鱼尾尖点应到 0.9H：{hi} / {}", 0.9 * h);
+            } else {
+                assert!((lo - 0.1 * h).abs() < 0.01, "下鱼尾尖点应到 0.1H：{lo} / {}", 0.1 * h);
+                assert!((hi - h).abs() < 0.01, "下鱼尾底边没贴住：{hi}");
+            }
         }
     }
 
     #[test]
     fn pair_opens_toward_each_other() {
-        // 上鱼尾：顶边一刀平直、两侧尾翼垂到下缘、中间 V 形凹口朝下；
-        // 下鱼尾是它的镜像——底边平直、尾翼向上、凹口朝上。两枚相对。
-        let h = 100.0 * FISHTAIL_ASPECT / TAIL_WING; // fishtail_svg 内部的基准
-        let span = h * TAIL_WING;
+        // 上鱼尾：顶边平直（y=0）、两侧翼到 0.4H、中心尖点到 0.9H（朝下）；
+        // 下鱼尾是镜像：底边平直（y=h）、两侧翼到 0.6H、中心尖点到 0.1H（朝上）。
+        // 两枚开口相对成「对鱼尾」。
+        let h = 100.0 * FISHTAIL_ASPECT;
         let up = fishtail_points(true, h);
         let down = fishtail_points(false, h);
-        // 上鱼尾：顶边（点 1/2）在 y=0，两个翼角（点 3/5）在 y=span。
+        // 上鱼尾：顶边在 y=0，两侧翼在 0.4H，中心尖点在 0.9H（比翼低＝朝下锐口）。
         assert_eq!(up[0].1, 0.0, "上鱼尾顶边应贴 y=0：{up:?}");
-        assert!((up[2].1 - span).abs() < 1e-6, "上鱼尾尾翼应垂到下缘：{up:?}");
-        // 下鱼尾：底边在 y=span，两个翼角在 y=0。
-        assert!((down[0].1 - span).abs() < 1e-6, "下鱼尾底边应在 y=span：{down:?}");
-        assert!(down[2].1.abs() < 1e-6, "下鱼尾尾翼应向上：{down:?}");
-        // 两枚的凹口顶点关于水平中轴互补（一枚的深 = 另一枚的浅）。
+        assert!((up[2].1 - 0.4 * h).abs() < 1e-6, "上鱼尾翼应在 0.4H：{up:?}");
+        assert!((up[3].1 - 0.9 * h).abs() < 1e-6, "上鱼尾尖点应在 0.9H：{up:?}");
+        // 下鱼尾：底边在 y=h，两侧翼在 0.6H，中心尖点在 0.1H（比翼高＝朝上锐口）。
+        assert!((down[0].1 - h).abs() < 1e-6, "下鱼尾底边应在 y=h：{down:?}");
+        assert!((down[2].1 - 0.6 * h).abs() < 1e-6, "下鱼尾翼应在 0.6H：{down:?}");
+        assert!((down[3].1 - 0.1 * h).abs() < 1e-6, "下鱼尾尖点应在 0.1H：{down:?}");
+        // 两枚的尖点关于水平中轴互补（一枚的深 = 另一枚的浅）。
         assert!(
-            (up[3].1 + down[3].1 - span).abs() < 1e-6,
-            "凹口不成镜像：{:?} {:?}",
+            (up[3].1 + down[3].1 - h).abs() < 1e-6,
+            "尖点不成镜像：{:?} {:?}",
             up,
             down
         );
-        // 凹口比尾翼浅，缺口才是锐角 V 而不是一条缝。
-        assert!(up[3].1 < up[2].1 && up[3].1 > 0.0, "凹口深度不对：{up:?}");
+        // 上鱼尾尖点比翼低（朝下），下鱼尾尖点比翼高（朝上）。
+        assert!(up[3].1 > up[2].1, "上鱼尾尖点应朝下：{up:?}");
+        assert!(down[3].1 < down[2].1, "下鱼尾尖点应朝上：{down:?}");
     }
 
     #[test]
