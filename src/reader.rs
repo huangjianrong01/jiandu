@@ -2105,6 +2105,74 @@ impl Root {
             }),
         ));
 
+        // v1.52.2：**导出下拉本体**。`export_menu` 为 true 时在「导出」钮正
+        // 下方画一枚极简纸签（宣纸 veil 底 + 一线界框 + 微阴影），四条导出
+        // 各就各位；点哪条都直接调起原生保存对话框，点完即收。挂在 bar 容器
+        // 内、绝对定位——bar 自身是 absolute 定位父层（top:0），故菜单的
+        // top:BAR_H 正好落在栏下沿；靠「后绘制」天然盖在纸面之上。
+        let mitem = |label: &'static str| -> Div {
+            div()
+                .w_full()
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .px(px(10.0))
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(zhu)))
+                .child(SharedString::from(label))
+        };
+        let mut menu = div()
+            .absolute()
+            .top(px(BAR_H + 4.0))
+            .right(px(12.0))
+            .w(px(128.0))
+            .bg(rgba(veil))
+            .border_1()
+            .border_color(rgba(sep_ink))
+            .rounded(px(3.0))
+            .shadow_sm()
+            .flex()
+            .flex_col()
+            .py(px(3.0))
+            .text_size(px(12.0))
+            .text_color(rgb(t.ink()));
+        menu = menu.child(mitem("导出当前页图片").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.export_menu = false;
+                // 截当前纸面 → 弹系统保存对话框 → 落盘 PNG。
+                this.export_page_png(window, cx);
+            }),
+        ));
+        menu = menu.child(mitem("导出当前页PDF").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.export_menu = false;
+                // 截当前纸面 → 包成单页 PDF → 弹系统保存框。
+                this.export_pdf_current(window, cx);
+            }),
+        ));
+        menu = menu.child(mitem("导出全书PDF").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.export_menu = false;
+                // 逐页翻面截屏 → 合成多页 PDF → 弹系统保存框。
+                this.export_pdf_full(window, cx);
+            }),
+        ));
+        menu = menu.child(mitem("导出MD").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.export_menu = false;
+                // 全书正文 + `[^n]` 脚注 → 弹保存对话框写成 .md。
+                this.export_markdown_file(cx);
+            }),
+        ));
+
         // v1.52.1 排障：常驻顶栏曾不显示，两因叠加——① `.absolute()` 与
         // `.relative()` 并存（relative 覆盖 absolute，掉出绝对定位、被 flex_1
         // 正文挤飞）；② 出场动画 `top(-BAR_H*(1-v))` 在 bar_shown 恒 true 时
@@ -2155,6 +2223,11 @@ impl Root {
                     .justify_end()
                     .child(right),
             );
+
+        // 导出下拉展开时挂到栏容器最末：绝对定位不占 flex 流，后绘制盖住纸面。
+        if self.export_menu {
+            bar = bar.child(menu);
+        }
 
         // v1.52.1：常驻顶栏不再有滑入 / 滑出动画（显隐已撤销，bar_shown 恒 true，
         // 动画反而会把 top 卡在 -BAR_H 藏上窗顶）。直接静态 top:0 交付。
@@ -4504,54 +4577,6 @@ impl Root {
             Script::Ancient => "叶",
             Script::Modern => "页",
         };
-        // 行款信息（v1.32.0）：版本学口径「半叶几行、行几字」——版式名 +
-        // 行款表的目标字数；触发最小字号保护（窗口过小）时改报实际排下的
-        // 字数，与「无法展示完整的 X 行 Y 字」提示互为印证。
-        // 列数不在行款表（用户自定档）时退回引擎实测行数，照样有行款可报。
-        let hangkou = crate::grid::LayoutConfig::by_columns(self.grid.columns)
-            .map(|c| {
-                if self.grid_min_font {
-                    format!(
-                        "{} · 半叶{}行，行{}字",
-                        c.label,
-                        han_num(self.grid.columns),
-                        han_num(self.grid_rows)
-                    )
-                } else {
-                    format!(
-                        "{} · 半叶{}行，行{}字",
-                        c.label,
-                        han_num(self.grid.columns),
-                        han_num(c.target_chars)
-                    )
-                }
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "半叶{}行，行{}字",
-                    han_num(self.grid.columns),
-                    han_num(self.grid_rows)
-                )
-            });
-        let mode = match self.script {
-            Script::Ancient => {
-                if self.notes_inline && self.show_notes {
-                    format!("古文竖笺 · {hangkou} · 双行小字夹注 · 从右到左")
-                } else {
-                    format!("古文竖笺 · {hangkou} · 四周双边 · 从右到左")
-                }
-            }
-            Script::Modern => "现代横笺 · 仅横线".to_string(),
-        };
-        let duplex = match self.duplex {
-            Duplex::Single => "单面",
-            Duplex::Facing => "双面对开",
-        };
-        let label = self
-            .book
-            .as_ref()
-            .map(|b| b.title.clone())
-            .unwrap_or_default();
         let left = format!("第 {} {} / 共 {} {}", self.page + 1, unit, total, unit);
         // 页码处**双击**＝一键回到卷首（v1.38.0）。
         //
@@ -4562,7 +4587,7 @@ impl Root {
         // 故这里判 `>= 2`；单击（click_count == 1）一律放行，不吞事件。
         let page_chip = div()
             .cursor_pointer()
-            .text_color(rgb(t.chrome_text()))
+            .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.35)))
             .hover(|s| s.text_color(rgb(sheet_zhu(t))))
             .child(SharedString::from(left.clone()))
             .on_mouse_down(
@@ -4576,90 +4601,22 @@ impl Root {
                     cx.notify();
                 }),
             );
-        let mut right = format!(
-            "{label} · {mode} · {duplex} · {} {}pt · {}{} · 点右半屏/→翻下页 · 点左半屏/←翻上页",
-            self.current_font().label(),
-            self.current_size() as i32,
-            t.label(),
-            if self.show_tongjia || self.show_notes {
-                " · 标注开"
-            } else {
-                " · 标注关"
-            },
-        );
-        if self.show_rare {
-            right.push_str(&format!(" · 生僻字{}", crate::dict::rare_len()));
-        }
-        if !self.show_punct {
-            right.push_str(" · 标点隐");
-        }
-        // 导出：**极简文字按钮**（无底无框，悬停转朱砂），落在状态栏中段。
-        // 状态栏是常驻的一条，`justify_between` 三格即「页码 ｜ 导出 ｜ 书信息」。
-        let action = |label: &'static str| -> Div {
-            div()
-                .px(px(8.0))
-                .cursor_pointer()
-                .text_size(px(11.5))
-                .text_color(rgb(t.chrome_text()))
-                .hover(|s| s.text_color(rgb(sheet_zhu(t))))
-                .child(SharedString::from(label))
-        };
-        let png_btn = action("印制笺卡（PNG）").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| {
-                cx.stop_propagation();
-                // 截当前纸面 → 弹系统保存对话框 → 落盘。
-                this.export_page_png(window, cx);
-            }),
-        );
-        let md_btn = action("导出纯文本（MD）").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _window, cx| {
-                cx.stop_propagation();
-                // 全书正文 + `[^n]` 脚注 → 弹保存对话框写成 .md。
-                this.export_markdown_file(cx);
-            }),
-        );
-        let pdf_page_btn = action("本叶为 PDF").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| {
-                cx.stop_propagation();
-                // 截当前纸面 → 包成单页 PDF → 弹系统保存框。
-                this.export_pdf_current(window, cx);
-            }),
-        );
-        let pdf_book_btn = action("全书为 PDF").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| {
-                cx.stop_propagation();
-                // 逐页翻面截屏 → 合成多页 PDF → 弹系统保存框。
-                this.export_pdf_full(window, cx);
-            }),
-        );
-
+        // v1.52.2 净化：底部只剩正中的「第 X 叶 / 共 X 叶」——字号极小、
+        // 颜色极淡（chrome_text 再向栏底混一档），它只是全书坐标，不是仪表盘。
+        // 右下那一长串配置信息与中段的四枚导出按钮全部撤掉：导出已收进顶栏
+        // 「导出」下拉（见 `render_reading_toolbar`），屏幕只留纯粹的古籍。
         div()
+            .flex_none()
             .flex()
             .items_center()
-            .justify_between()
+            .justify_center()
             .p_2p5()
             .bg(rgb(t.chrome()))
             .border_t_1()
             .border_color(rgb(t.chrome_line()))
-            .text_size(px(11.5))
-            .text_color(rgb(t.chrome_text()))
+            .text_size(px(10.0))
+            .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.35)))
             .child(page_chip)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(png_btn)
-                    .child(md_btn)
-                    .child(pdf_page_btn)
-                    .child(pdf_book_btn),
-            )
-            .child(SharedString::from(right))
     }
 
     /// 把草稿按每行字符数折行，并标出光标落在哪一行、行内第几个字。

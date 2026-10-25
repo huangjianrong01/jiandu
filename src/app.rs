@@ -559,8 +559,9 @@ pub struct Root {
     pub shelf_batch_confirm: bool,
     /// 关窗钩子是否已挂（v1.52.0：改回系统红绿灯后，关闭前要落盘一次）。
     pub close_hook_set: bool,
-    /// 顶栏「导出」下拉是否展开（v1.52.0）：把印制笺卡 / 全书 PDF / 导出
-    /// MD 三件事收进这一枚菜单，天头才不至于摆满按钮。
+    /// 顶栏「导出」下拉是否展开（v1.52.2）：底部四枚导出按钮已撤，全部
+    /// 收进这一枚菜单——当前页图片 / 当前页PDF / 全书PDF / MD，逐条直调
+    /// 原生保存对话框。渲染见 `reader::render_reading_toolbar`。
     pub export_menu: bool,
 }
 
