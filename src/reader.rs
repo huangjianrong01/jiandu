@@ -413,27 +413,13 @@ const SUB_TITLE_MAX: usize = 7;
 /// 既不占正文的地，也不会挤掉正文（能排几字按扣除后的余高算）。
 const TITLE_HEAD_CELLS: f32 = 2.0;
 
-/// 顶栏高度：一处定义——动画位移、触发带回差、命中判定全用它。
-pub(crate) const BAR_H: f32 = 44.0;
-/// 天头触发带：鼠标进到屏幕顶端这 30px 里，顶栏滑出。
-pub(crate) const BAR_HOT: f32 = 30.0;
-/// 退出回差：鼠标越过「栏底 + 26px」才收回，免得贴着栏底来回抖。
-pub(crate) const BAR_GAP: f32 = 26.0;
-
-/// 顶栏显隐的判据（**纯函数**，只有它决定收 / 放）。
+/// 顶栏高度：一处定义——动画位移、命中判定全用它。
 ///
-/// `y` 是鼠标的窗口纵坐标，`shown` 是当前是否已滑出，`pinned` 表示有面板开着。
-/// 关键在于**回差**：收着时门槛是 30px（须探到天头才出），打开时门槛放宽到
-/// 「栏底 + 26px」（贴在栏下沿也不算离开）——否则鼠标一离开字面就闪回收起，
-/// 点第二下都点不着。
-pub(crate) fn bar_wants_show(y: f32, shown: bool, pinned: bool) -> bool {
-    pinned
-        || if shown {
-            y <= BAR_H + BAR_GAP
-        } else {
-            y <= BAR_HOT
-        }
-}
+/// v1.52.1 起顶栏**常驻显示**：用户反馈「找不到工具」，故撤掉整套自动隐藏
+/// （触发带 `BAR_HOT` / 退出回差 `BAR_GAP` / 显隐判据 `bar_wants_show` /
+/// 面板留驻 `bar_pinned` 一并删除）。`bar_shown` 恒为 `true`，只有专注模式
+/// 会在渲染层把整块顶栏撤下（见 `Root::render` 的 `focus_mode` 分支）。
+pub(crate) const BAR_H: f32 = 44.0;
 
 /// 面板选中色的**实际取值**：深底主题（夜读）上这枚朱砂会沉进深纸看不见，
 /// 故向宣纸白提亮一档——界面色与纸面永远反色，不会出现「暗纸上的暗朱」。
@@ -1249,27 +1235,15 @@ impl Root {
                 cx.notify();
             }),
         );
-        // 顶栏「触天头即出」——**由鼠标位置驱动，不铺一条 30px 的命中带**。
-        //
-        // 为什么不在天头摆一张透明的触发条：那会在纸面上开一条 30px 的死区，
-        // 顶格的字点不动、翻页也失灵。改成在根元素上听 `mousemove`，只算 y：
-        //   · 收着时：进到 `BAR_HOT` 以内 → 滑出；
-        //   · 打开时：越过「栏底 + `BAR_GAP`」→ 收回（回差，防贴边抖动）；
-        //   · 任一面板开着（`bar_pinned`）→ 一律留住。
+        // 悬停查词：鼠标停在一个字上满 500ms 就浮出字书浮签。
+        // 只在**非专注模式**生效（专注模式连顶栏都收了，不该冒签）。
+        // v1.52.1 起顶栏常驻，此处不再驱动显隐——`bar_shown` 恒 true。
         // root 铺满整窗、又是冒泡链末端，鼠标在纸面任何一处都会到这里。
         root = root.on_mouse_move(cx.listener(
             |this, event: &MouseMoveEvent, _window, cx| {
-                let y = event.position.y.to_f64() as f32;
-                let want = bar_wants_show(y, this.bar_shown, this.bar_pinned());
-                if want != this.bar_shown {
-                    this.bar_shown = want;
-                    cx.notify();
-                }
-                // 悬停查词：鼠标停在一个字上满 500ms 就浮出字书浮签。
-                // 只在**非专注模式**生效（专注模式连顶栏都收了，不该冒签），
-                // 且排在顶栏显隐之后——两者都吃这一次 mousemove，互不干扰。
                 if !this.focus_mode {
                     let x = event.position.x.to_f64() as f32;
+                    let y = event.position.y.to_f64() as f32;
                     this.probe_hover(x, y, cx);
                 }
             },
@@ -1985,24 +1959,13 @@ impl Root {
     }
 
 
-    /// 任一面板开着 → 顶栏必须留住。
-    ///
-    /// 面板都从底边浮起，鼠标一移下去就把顶栏收走，用户会以为「点了没反应」；
-    /// 所以「有门开着」时显隐不受鼠标位置支配。分享卡是整屏深底导出界面，
-    /// 不算「开着的门」——那时顶栏该退场。
-    fn bar_pinned(&self) -> bool {
-        self.show_toc
-            || self.show_style
-            || self.show_search
-            || self.show_notes_panel
-            || self.show_help
-    }
-
     /// 顶栏（天头那张薄纸）的渲染。
     ///
     /// v1.26.0「沉浸式古风化」以后，它不再是布局里的一条横栏，而是**浮在
-    /// 纸面上的一张半透明宣纸**：默认收到天头之外（`top = -BAR_H`），
-    /// 鼠标触到天头 30px 才滑下来，读完即退——把整幅纸面还给正文。
+    /// 纸面上的一张半透明宣纸**。v1.52.1 起它**常驻显示**（`bar_shown` 恒
+    /// true）：开卷即滑出、不再随鼠标收回——用户反馈「找不到工具」，故把
+    /// 「触天头才出、读完即退」那套自动隐藏整块撤掉。只有专注模式会在渲染
+    /// 层把它整块撤下，把整幅纸面还给正文。
     ///
     /// 三组纯文字：书阁 · 目录 ｜ 版字 · 专注 ｜ 检索 · 朱批 · 帮助。
     ///
@@ -8900,32 +8863,20 @@ fn note_paper(card_w: f32, card_h: f32, body: &[char], ink: u32, mute: u32) -> D
 #[cfg(test)]
 mod tests {
     use super::{
-        bar_wants_show, chapters_ended_at, cn_date_from_str, cn_small, first_empty_column,
-        note_grid_plan, sheet_side_pads, COLUMN_OPTS, BAR_GAP, BAR_H, BAR_HOT,
+        chapters_ended_at, cn_date_from_str, cn_small, first_empty_column, note_grid_plan,
+        sheet_side_pads, COLUMN_OPTS, BAR_H,
     };
     use crate::gloss::{Page, Piece};
     use crate::grid::LeafHalf;
     use crate::types::{FontChoice, FontPreset};
 
-    /// 顶栏：贴着天头出、栏下沿附近赖着不走、深入纸面才收；有面板开着则永远不放。
+    /// 顶栏常驻：v1.52.1 起撤掉自动隐藏，`bar_shown` 开局即 `true` 且不再被
+    /// 鼠标位置改写（`BAR_HOT` / `BAR_GAP` / `bar_wants_show` 已删）。
     #[test]
-    fn topbar_has_hysteresis_and_stays_while_a_panel_is_open() {
-        // 收着时：只有探进天头 30px 才出来（鼠标停在 y=80 不动）。
-        assert!(bar_wants_show(0.0, false, false));
-        assert!(bar_wants_show(BAR_HOT, false, false));
-        assert!(!bar_wants_show(BAR_HOT + 1.0, false, false));
-        assert!(!bar_wants_show(400.0, false, false));
-        // 打开后：门槛放宽到「栏底 + 回差」，紧贴栏下沿也不会立刻收。
-        assert!(bar_wants_show(BAR_H + BAR_GAP, true, false));
-        assert!(bar_wants_show(BAR_HOT + 1.0, true, false));
-        assert!(!bar_wants_show(BAR_H + BAR_GAP + 1.0, true, false));
-        // 回差确实存在：同一个 y，收着时不弹、开着时不收。
-        let y = BAR_H + 10.0;
-        assert!(!bar_wants_show(y, false, false));
-        assert!(bar_wants_show(y, true, false));
-        // 任一面板开着：鼠标在屏幕最底下也要留住。
-        assert!(bar_wants_show(2000.0, false, true));
-        assert!(bar_wants_show(2000.0, true, true));
+    fn topbar_is_always_shown() {
+        // 判据本身已不存在，此处钉住「常驻」契约：高度仍是唯一定量，
+        // 显隐只剩专注模式在渲染层的一票（单测覆盖不到渲染，故只验常量在）。
+        assert_eq!(BAR_H, 44.0);
     }
 
     /// 「篇 / 章 / 字」只收在此叶收尾的章：跨叶未完的章不赶它，
