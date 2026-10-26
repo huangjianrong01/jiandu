@@ -12,7 +12,7 @@
 //!   2. **分章**  —— txt 认「第 X 章/回/卷/节」，无标识且超长按 3000 字切；
 //!   3. **降噪**  —— md 去代码块与图片、html 去 script/style/nav，只留正文骨架；
 //!   4. **古籍化**——半角标点转全角、引用 / em 转双行夹注 `[注]…[/注]`、
-//!                 加粗 / strong 转着重 `[高亮]…[/高亮]`、阿拉伯数字转汉字。
+//!      加粗 / strong 转着重 `[高亮]…[/高亮]`、阿拉伯数字转汉字。
 //!
 //! 最后 `chapters_to_book` 把 `[高亮]` 摘成 `Note`（`NoteKind::Emph`，渲染为
 //! 字右的朱砂圈点），`[注]` 留给排版引擎在布局时展开成双行夹注。
@@ -1317,7 +1317,9 @@ pub fn strip_digit_marks(s: &str) -> String {
 /// 都以同一份纯正文为准，绝不会互相错位。
 ///
 /// 返回（干净文本, [(着重起始字序, 字数, 文本)], [(夹注宿主字序, 注文)]）。
-pub fn split_body_marks(s: &str) -> (String, Vec<(usize, usize, String)>, Vec<(usize, String)>) {
+pub type EmphSpan = (usize, usize, String);
+pub type GlossMark = (usize, String);
+pub fn split_body_marks(s: &str) -> (String, Vec<EmphSpan>, Vec<GlossMark>) {
     let mut out = String::with_capacity(s.len());
     let mut spans = Vec::new();
     let mut notes = Vec::new();

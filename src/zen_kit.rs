@@ -487,9 +487,9 @@ fn render_text_columns(g: &GridGeom, text: &[char]) -> Div {
             .h(px(g.frame_h));
         let start = c * per_col;
         let end = (start + per_col).min(text.len());
-        for i in start..end {
+        for (i, &ch) in text[start..end].iter().enumerate() {
             // ✅ 雷区 1.3：每个字的 Y 显式 clamp——顶 ≥ 0，底 ≤ frame_h - row_h。
-            let y = ((i - start) as f32 * g.row_h).clamp(0.0, (g.frame_h - g.row_h).max(0.0));
+            let y = (i as f32 * g.row_h).clamp(0.0, (g.frame_h - g.row_h).max(0.0));
             col = col.child(
                 div()
                     .absolute()
@@ -502,7 +502,7 @@ fn render_text_columns(g: &GridGeom, text: &[char]) -> Div {
                     .justify_center()
                     .text_size(px(g.font))
                     .text_color(rgb(0x2B2622))
-                    .child(text[i].to_string()),
+                    .child(ch.to_string()),
             );
         }
         layer = layer.child(col);

@@ -796,6 +796,7 @@ fn clean_text(raw: &str) -> String {
 ///
 /// 位数**不设上限**：PDF 转出来的页码常是 `20161`、`20162` 这种「年份前缀
 /// + 页码」的五位串（v1.25.0 用户截图里的正是它），按「1~4 位」判会漏。
+///
 /// 整行只剩数字时，它绝不可能是正文——正文的数总归要挨着汉字。
 fn is_page_number(line: &str) -> bool {
     let t = line.trim();
@@ -925,13 +926,16 @@ fn squeeze_spaces(s: &str) -> String {
             }
             let prev = out.chars().last();
             let next = cs.get(j).copied();
-            if prev.is_some() && next.is_some() {
+            // 两边都得有字才谈得上「中西之间补空格」；用 if let 拆包，不 unwrap。
+            if let (Some(prev), Some(next)) = (prev, next) {
                 if ideographic {
                     out.push('\u{3000}');
-                } else if !crate::west::is_cjk(prev.unwrap()) && !crate::west::is_cjk(next.unwrap())
-                    && !out.ends_with(' ') {
-                        out.push(' ');
-                    }
+                } else if !crate::west::is_cjk(prev)
+                    && !crate::west::is_cjk(next)
+                    && !out.ends_with(' ')
+                {
+                    out.push(' ');
+                }
             }
             i = j;
             continue;

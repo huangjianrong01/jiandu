@@ -7,6 +7,9 @@
 //!
 //! 与绘制耦合的三个排版辅助（punct 的句读画笔需要 gpui）仍留在本库内。
 #![allow(dead_code)]
+// 排版函数按几何逐项传值（列宽 / 行高 / 天头 / 地脚…），硬拆成 struct
+// 反而掩盖每一项的物理意义——与 bin 的 crate 级政策同一口径。
+#![allow(clippy::too_many_arguments)]
 
 pub use jiandu_core::*;
 

@@ -585,6 +585,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // 钉的是常量档位关系（笔记框 > 检索框）
     fn note_cap_is_generous_but_bounded() {
         // 笔记框走 NOTE_MAX（500），比分名（12）/ 检索（64）宽得多：
         // 一段批注写得下，但也不会无限增长。

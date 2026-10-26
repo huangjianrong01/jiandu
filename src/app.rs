@@ -20,6 +20,13 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+/// **渲染帧 → 事件层的一次性矩形探针**（x, y, w, h）。
+///
+/// GPUI 的 `canvas` 不是交互元素，画完就走；凡是要「拿这一帧画在哪」去做
+/// 命中判断的（天头眉批带 `margin_bands`、纸面 `page_rect`），都在 prepaint
+/// 里往这枚 `Cell` 回填一次。渲染是输出、事件是输入，中间靠它过河。
+pub type RectProbe = Rc<Cell<Option<(f32, f32, f32, f32)>>>;
+
 /// 字书浮签的**来源页签**（v1.42.0）：康熙 / 說文，一次只摊一部。
 ///
 /// 浮签里不再两段并列——一次全摊会占掉半屏正文，且康熙动辄数百字，
@@ -400,7 +407,7 @@ pub struct Root {
     /// 画布本身不收鼠标事件（GPUI 的 `canvas` 不是交互元素），悬停命中要靠
     /// 这一枚探针把「天头带这一帧落在窗口何处」记下来——与 `page_rect`
     /// 同一个套路：渲染是输出，事件是输入，中间用一次绘制把矩形带出来。
-    pub margin_bands: [Rc<Cell<Option<(f32, f32, f32, f32)>>>; 2],
+    pub margin_bands: [RectProbe; 2],
     /// 正在写的眉批落点 `(key, u, v)`。
     ///
     /// `note_editing` 为 true 且此项为 Some 时，草稿**就地竖排**显示在天头
@@ -490,7 +497,7 @@ pub struct Root {
     /// （见 `reader::render_screen` 的 `stage` 包装层）。导出 PNG 据此把
     /// 截图范围收得与纸面严丝合缝——不带上状态栏，也不裁掉半个版框。
     /// 它是渲染帧的**输出**而非输入，故不影响任何排版坐标。
-    pub page_rect: Rc<Cell<Option<(f32, f32, f32, f32)>>>,
+    pub page_rect: RectProbe,
     /// 点字弹出的工具条所锚定的字（None 表示未弹出）。
     pub popup: Option<GlyphHit>,
     /// 拖拽选区的起点 / 焦点（(chapter, para, offset)）。
@@ -681,14 +688,15 @@ pub struct Root {
 /// 绝不能堵在主线程上——那会连进度条都画不出来。所以真正干活的是
 /// `std::thread::spawn` 出来的那条线程，主线程每帧只来 `take_done()`
 /// 探头看一眼；进度与结果都藏在 `Arc<Mutex<…>>` 里。
+/// 导入线程的最终产物：成功则（书稿, 书名, 落盘路径），失败则一句人话。
+type ImportOutcome = std::result::Result<(Book, String, PathBuf), String>;
+
 pub struct ImportJob {
     /// 正在刻印的书名（文件名兜底，此时还不知道真书名）。
     pub name: String,
     pct: std::sync::Arc<std::sync::Mutex<f32>>,
     label: std::sync::Arc<std::sync::Mutex<String>>,
-    done: std::sync::Arc<
-        std::sync::Mutex<Option<std::result::Result<(Book, String, PathBuf), String>>>,
-    >,
+    done: std::sync::Arc<std::sync::Mutex<Option<ImportOutcome>>>,
 }
 
 impl ImportJob {
@@ -1155,13 +1163,12 @@ impl Root {
                     let key = root
                         .book
                         .as_ref()
-                        .map(|b| {
+                        .and_then(|b| {
                             b.to_flow(true)
                                 .iter()
                                 .find(|g| g.kind == GlyphKind::Char)
                                 .map(|g| (g.chapter, g.para, g.offset))
                         })
-                        .flatten()
                         .unwrap_or((0, 0, 0));
                     root.note_menu = Some(crate::gloss::NoteMenu {
                         key,
@@ -1660,6 +1667,7 @@ impl Root {
     ///     （宽约一行字，见 `crate::grid::gutter_w`）。
     ///   * 章题列占「格内一列」：章首页 = 列数-1 个正文列 + 1 个章题列，
     ///     总宽仍是 列数×col_w，不额外外扩。
+    ///
     /// 少算任何一项，纸面就会超出视口被裁掉边框（双面对开尤其明显：
     /// 两叶各超宽一截，右叶的版框直接飞出屏幕）。
     pub fn fit_sizes(&mut self) {
@@ -4678,7 +4686,7 @@ pub fn draft_move(draft: &str, cursor: &mut usize, left: bool) {
 /// 双面对开两叶之间的「版心（中缝）」宽：约等于一行字宽，随列数走，
 /// 由 `grid::gutter_w(content_w, columns)` 统一算出——渲染层与引擎同源，
 /// 本文件不再另存副本（旧常量 `LEAF_GAP = 32` 已并入该函数）。
-
+///
 /// 古文竖笺纸面 chrome（横 / 纵共用）：sheet p_4(16×2=32) + 版框双边
 /// （外 3×2 + 中缝 3×2 + 内 1×2 = 14）+ 余量 ≈ 50。
 ///

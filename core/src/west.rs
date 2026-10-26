@@ -43,10 +43,12 @@ pub fn scan_digit_run(chars: &[char]) -> usize {
     let mut end = 1usize;
     while end < chars.len() {
         let c = chars[end];
-        if is_digit(c) || crate::numcn::is_transparent(c) {
-            end += 1;
-        } else if (is_west_dot(c) || is_west_hyphen(c) || matches!(c, ',' | '，' | ' '))
-            && chars[end..].iter().skip(1).any(|&x| is_digit(x))
+        // 数字 / 透明字符直接续；小数点 / 连字符 / 逗号空格只有「后面还跟着数字」
+        // 才算数的一部分（否则 `3.` 之后的 `.` 该断）。两条路都是 end += 1，合并。
+        if is_digit(c)
+            || crate::numcn::is_transparent(c)
+            || ((is_west_dot(c) || is_west_hyphen(c) || matches!(c, ',' | '，' | ' '))
+                && chars[end..].iter().skip(1).any(|&x| is_digit(x)))
         {
             end += 1;
         } else {

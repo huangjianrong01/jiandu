@@ -493,6 +493,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // 钉的是鱼尾凹口常量（< 0.5 才够锐）
     fn notch_is_a_sharp_v_not_a_shallow_dip() {
         // 宋版鱼尾：平顶实心条 + 底部中央深 V 白口。凹口顶点落在
         // TAIL_NOTCH_Y·h（< 0.5，即白口从下沿掏进过半幅），缺口才是刀刻

@@ -99,7 +99,7 @@ fn main() {
     let mut ok_alt = true;
     let mut off = 0usize;
     for len in &lens {
-        let half = (len + 1) / 2;
+        let half = len.div_ceil(2);
         let anchor = notes[off].y;
         for k in 0..*len {
             let (want_x, want_row) = if k < half {

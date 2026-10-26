@@ -184,7 +184,7 @@ fn main() {
     assert_eq!(idxs, want, "块内读序断档：跨列 / 跨页 note_idx 必须连续");
 
     // 右先左后：块内前 half=ceil(len/2) 字进右小列（sub=1），余下左小列。
-    let half = (note.chars().count() + 1) / 2;
+    let half = note.chars().count().div_ceil(2);
     let ok_rl = flat
         .iter()
         .filter(|c| c.note)

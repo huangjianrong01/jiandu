@@ -10,6 +10,7 @@
 ///   * 设置面板的颜色预览按钮由 [`PAPER_THEMES`] 遍历自动生成；
 ///   * 渲染层经 [`Theme::paper_theme`] 取这四色上色
 ///     （背景=纸色，界栏/版框=界栏色，正文=正文色，双行夹注=夹注色）。
+///
 /// 新增一套配色只在此加一行，UI 与渲染零改动。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PaperTheme {

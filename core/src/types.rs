@@ -25,6 +25,9 @@ impl Script {
             Script::Modern => "modern",
         }
     }
+    /// 与 serde 的反序列化同一口径（`Script` 只有两变体，不值得为它引入
+    /// `FromStr` 的 `Err` 类型）：解析不出「modern」就当古籍，不失败。
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         if s == "modern" {
             Script::Modern
@@ -1835,7 +1838,7 @@ mod tests {
         let k = (0usize, 0usize, 0usize);
         let first = HeadNote::new(k, 0.70, 0.22, "批一");
         // 同一位置第二条：必须向左挪（u 变小），不能原地叠上去。
-        let u2 = HeadNote::free_u(&[first.clone()], k, 0.70, 0.22);
+        let u2 = HeadNote::free_u(std::slice::from_ref(&first), k, 0.70, 0.22);
         assert!(u2 < 0.70 - 1e-6, "同位置没让开：u2 = {u2}");
         assert!(u2 > 0.0, "让出了左缘：u2 = {u2}");
         // 第三条继续往左。
@@ -1843,7 +1846,7 @@ mod tests {
         let u3 = HeadNote::free_u(&two, k, 0.70, 0.22);
         assert!(u3 < u2, "第三条没继续让：u3 = {u3} vs u2 = {u2}");
         // 纵向差得远（不在同一行气里）就不算挤——原位即可。
-        let u_far = HeadNote::free_u(&[first.clone()], k, 0.70, 0.90);
+        let u_far = HeadNote::free_u(std::slice::from_ref(&first), k, 0.70, 0.90);
         assert!((u_far - 0.70).abs() < 1e-6, "上下不挨着却被挪：{u_far}");
         // 另一面的眉批互不相干（key 不同）。
         let u_other = HeadNote::free_u(&[first], (3, 1, 7), 0.70, 0.22);

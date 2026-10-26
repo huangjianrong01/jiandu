@@ -528,6 +528,7 @@ fn query_word(conn: &rusqlite::Connection, w: &str) -> Option<Zishu> {
 ///   1. 库里的 `alias` 表——构建期用 macOS ICU 把字书里出现过的每个字批量
 ///      转成简体而建（2898 组），简写输入直接命中繁体字头；
 ///   2. `crate::trad` 的简繁对照——跨不出 ICU 那张表时再补一道。
+///
 /// 两道都不成（生僻字、标点、拉丁字母）就返回 `None`，浮签退回旧字书。
 pub fn query_dict(ch: char) -> Option<Zishu> {
     let guard = ZISHU.lock().ok()?;

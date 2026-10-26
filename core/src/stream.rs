@@ -358,6 +358,13 @@ impl MemSink {
 }
 
 #[cfg(test)]
+impl Default for MemSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
 impl ChapterSink for MemSink {
     fn push(&mut self, chapter: Chapter) {
         let n = chapter.char_count();

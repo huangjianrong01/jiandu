@@ -117,7 +117,7 @@ pub const HEAD_BAND_MIN: f32 = 10.0;
 /// 眉批排布的另两个常量（`HEAD_NOTE_STEP` / `HEAD_NOTE_V_TOL`）放在
 /// `types.rs` 的 `HeadNote` 旁边——`types` 是 lib 的一部分，而 `reader`
 /// 只在 bin 里，放那儿 types 反而够不着。
-
+///
 /// **纸面 → 字格坐标系的内缩**（px）：版框 3px + 内框 1px。
 ///
 /// `render_ancient` 里 `sheet` 先 `pt(margin_top)`、`pl(pl)`，再套版框
@@ -1151,12 +1151,14 @@ impl Root {
                             // 取字两条路：① 元素命中（拖选 / 点字刚过）用选区
                             // 首字或选区全文；② 否则用坐标反查 `glyph_hit_at`，
                             // 落在格子缝隙、夹注旁边也能取到字。
-                            let mut got: Option<(
+                            // 取字结果：(字形键, 字, 取到的文本, 命中矩形)。
+                            type Picked = (
                                 crate::types::GlyphKey,
                                 char,
                                 String,
                                 Option<(f32, f32, f32, f32)>,
-                            )> = None;
+                            );
+                            let mut got: Option<Picked> = None;
                             if this.touched_glyph && this.sel_char.is_some() {
                                 let key =
                                     this.sel_focus.or(this.sel_anchor).unwrap_or((0, 0, 0));
@@ -2382,7 +2384,7 @@ impl Root {
         let raw = crate::types::strip_empty_title_marks(title);
         // 括注（卷次 / 篇名）一律砍掉：竖排简条只有一格宽，塞不下。
         let cut = raw
-            .find(|c| matches!(c, '（' | '(' | '〔'))
+            .find(['（', '(', '〔'])
             .unwrap_or(raw.len());
         let raw = &raw[..cut];
         let mut out = String::new();
@@ -7934,9 +7936,6 @@ impl Root {
             }))
     }
 
-    /// 朱批录：从书稿里收齐四类批注（眉批 / 夹注·通假 / 专名·书名线·着重 / 划线），
-    /// 外加「页笔记」（无 charIndex，只按页码跳），每条都带上跳转锚点。
-
     /// **朱批录**：右滑侧栏，半透明宣纸底，朱砂细线列出全部批注；点一条即
     /// 收栏、瞬跳到该 charIndex 并点亮「抵达」高亮。
     /// 朱批录：从书稿里收齐四类批注（眉批 / 夹注·通假 / 专名·书名线·着重 / 划线），
@@ -8011,8 +8010,6 @@ impl Root {
     }
 
     /// 按锚点从书稿正文里摘一段原文——无论该字是否在当前页都摘得出来。
-
-    /// 按锚点从书稿正文里摘一段原文——无论该字是否在当前页都摘得出来。
     fn quote_at(&self, key: (usize, usize, usize), len: usize) -> String {
         if let Some(b) = &self.book {
             if let Some(ch) = b.chapters.get(key.0) {
@@ -8026,7 +8023,6 @@ impl Root {
 
     /// **朱批录**：右滑侧栏，半透明宣纸底，朱砂细线列出全部批注；点一条即
     /// 收栏、瞬跳到该 charIndex 并点亮「抵达」高亮。
-
     fn render_notes_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let vw = self.viewport_w;
@@ -8189,7 +8185,6 @@ impl Root {
     ///   留白 → `banxin_ratio`；纸边 → `grid.margin`；页面 → `LayoutMode`；
     ///   纸色 → `theme::PAPER_THEMES`；墨色 → `InkPalette::ALL`；
     ///   丝栏 → `RuleColor::ALL`；标注 → `StyleAct`。
-
     fn render_share_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let vw = self.viewport_w;
         let vh = self.viewport_h;

@@ -148,9 +148,7 @@ fn main() {
             })
             .expect("failed to open window");
         } else {
-            cx.open_window(zen_window_options(bounds), |_window, cx| {
-                cx.new(|cx| Root::new(cx))
-            })
+            cx.open_window(zen_window_options(bounds), |_window, cx| cx.new(Root::new))
             .expect("failed to open window");
         }
 

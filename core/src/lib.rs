@@ -15,6 +15,10 @@
 //! ⚠️ 铁律：本 crate 里**不得**引入任何 GPUI / 平台 UI 类型。
 #![allow(dead_code)]
 
+// 排版函数按几何逐项传值（列宽 / 行高 / 天头 / 地脚…），硬拆成 struct
+// 反而掩盖每一项的物理意义——与 bin 的 crate 级政策同一口径。
+#![allow(clippy::too_many_arguments)]
+
 pub mod banxin;
 /// **清洗器**（v1.54.0）：两遍扫描——去噪 + 重建语义，产出 IR。
 pub mod cleaner;

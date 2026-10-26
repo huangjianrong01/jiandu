@@ -436,9 +436,8 @@ fn take_own_marker(cs: &[char], i: usize) -> (String, usize) {
         }
         return (cs[i..].iter().collect(), cs.len());
     }
-    let len = if cs[i..].iter().take(4).collect::<String>() == "[/注]" {
-        4
-    } else if cs[i..].iter().take(4).collect::<String>() == "[高亮]" {
+    let head4: String = cs[i..].iter().take(4).collect();
+    let len = if head4 == "[/注]" || head4 == "[高亮]" {
         4
     } else if cs[i..].iter().take(5).collect::<String>() == "[/高亮]" {
         5
@@ -876,9 +875,7 @@ fn matching_tag_close(cs: &[char], pos: usize, name: &str) -> Option<(usize, usi
             i += 1;
             continue;
         }
-        let Some(gt) = (i..cs.len()).find(|k| cs[*k] == '>') else {
-            return None;
-        };
+        let gt = (i..cs.len()).find(|k| cs[*k] == '>')?;
         let raw: String = cs[i + 1..gt].iter().collect();
         let closing = raw.trim_start().starts_with('/');
         let self_close = raw.trim_end().ends_with('/');
@@ -1259,7 +1256,7 @@ mod tests {
         assert_eq!(purge_bracket_marks("甲〔〕乙〔丙"), "甲乙丙");
         assert_eq!(purge_bracket_marks("甲〕乙"), "甲乙");
         // 超长括注：只剥壳，不撑破版面
-        let long: String = std::iter::repeat('注').take(100).collect();
+        let long: String = std::iter::repeat_n('注', 100).collect();
         assert!(purge_bracket_marks(&format!("甲〔{long}〕乙")).contains(&long));
         let s = cleanup_ancient_text("贞观223年，卷十五第3回，共1980页");
         assert!(!s.contains('2'), "数字未转：{s}");

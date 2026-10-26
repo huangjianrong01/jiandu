@@ -760,6 +760,7 @@ pub fn note_boxes_in_column(
 ///     见 `grid::gutter_w`），整体居中——`back`（下一面）在左、当前面
 ///     在右，读序自右向左；
 ///   * 专注模式：工具栏 / 状态栏 / 留白皆 0，纸面贴屏。
+///
 /// `paper_w` / `paper_h` 是纸面尺寸（网格引擎 `outer_w` / `outer_h`）。
 /// 窄屏单叶时纸面与屏幕右缘之间留的一丝边（版心贴右，但不出血）。
 pub const LEAF_RIGHT_EDGE: f32 = 8.0;
@@ -1374,6 +1375,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // 钉的是注文标点比例常量（0 < r < 1）
     fn note_punct_is_a_size_smaller_than_the_note_text() {
         // 注文本身就是正文的一半；注里的句读再收一档（0.62），
         // 合起来约正文的 0.31——略小于正文句读（0.4×），小字里只剩一粒轻点。
@@ -1890,6 +1892,7 @@ mod tests {
     ///     一个空白格把它压到第二格（首片变成 Gap）；
     ///   * 任何「满列」且非末列的列尾（末片）不得是「避尾类」标点——
     ///     若本应居列底，分页会提前收列让它落下一列列首。
+    ///
     /// 任何一列的字数都不得超出该列容量（半格账）。
     ///
     /// 超容会让字溢出到版框外——阅读页底部那枚「挂在框外」的字就是这么来的。
@@ -2180,6 +2183,7 @@ mod tests {
     ///   * 任何列的首片不得是避头类标点，也不得是挤压标点（列顶永不顶头）；
     ///   * 满列且非末列的列尾不得是避尾类标点；
     ///   * 一字不丢、一序不乱、任何列不超容。
+    ///
     /// 覆盖「挤压 / 撤退 / 避尾让位」三条禁则路径的交汇。
     #[test]
     fn kinsoku_rules_hold_with_notes_across_layouts() {
@@ -2274,7 +2278,7 @@ mod tests {
             "同页流转列必须是纯注文列"
         );
         // 后续正文字另起新列（col 2），不挤回流注列。
-        let last_main = flat.iter().filter(|c| !c.note).next_back().unwrap();
+        let last_main = flat.iter().rfind(|c| !c.note).unwrap();
         assert_eq!(last_main.ch, '乙');
         assert_eq!(last_main.col, 2);
         // 列容量不超：每列已用高度 ≤ cap 半格。
@@ -2322,7 +2326,7 @@ mod tests {
         assert_eq!(first_of_page1.note_idx, 7, "读序跨页连续");
         // 正文字「乙」排在缓存注文全部落完之后（本块 5 个续排字把第 1 面
         // 两列排满，新正文只能落到第 2 面）。
-        let last_main = flat.iter().filter(|c| !c.note).next_back().unwrap();
+        let last_main = flat.iter().rfind(|c| !c.note).unwrap();
         assert!(
             last_main.page == 2 && last_main.col == 0,
             "新正文应排在缓存注文之后（实际第 {} 面第 {} 列）",
@@ -2433,8 +2437,7 @@ mod tests {
                 && a.ch == b.ch
                 && a.kind == b.kind
         };
-        for pi in 0..pages.len() {
-            let cur = &pages[pi];
+        for (pi, cur) in pages.iter().enumerate() {
             // 段首缩进占位每段两个、字段全同，切它定位会歧义——跳过
             // （真实阅读里页面以缩进开头也极少；晒本对这类叶走占位卡）。
             if matches!(cur.glyphs.first().map(|g| g.kind), Some(GlyphKind::Indent)) {

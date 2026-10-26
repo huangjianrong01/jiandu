@@ -163,9 +163,8 @@ fn md_with_footnotes(
         match n.kind {
             NoteKind::Emph => {
                 out.push_str("**");
-                for k in n.at..(n.at + n.len).min(cs.len()) {
-                    out.push(cs[k]);
-                }
+                let hi = (n.at + n.len).min(cs.len());
+                out.extend(cs[n.at..hi].iter());
                 out.push_str("**");
             }
             _ => {

@@ -233,9 +233,11 @@ mod tests {
     #[test]
     fn out_of_range_index_falls_back_to_first() {
         // 老存档里的下标可能因枚举扩容而越界：必须回落，不能 panic。
-        let mut p = Prefs::default();
-        p.theme = 99;
-        p.font_ancient = 99;
+        let p = Prefs {
+            theme: 99,
+            font_ancient: 99,
+            ..Prefs::default()
+        };
         assert_eq!(p.theme(), Theme::ALL[0]);
         assert_eq!(p.font_ancient(), FontChoice::CLASSIC[0]);
         // 思源黑体进了典籍组，取得到（用户要的字体确实可选）。
@@ -243,8 +245,11 @@ mod tests {
             .iter()
             .position(|f| *f == FontChoice::SourceHanSans)
             .expect("典籍字体组应含思源黑体");
-        p.font_ancient = i;
-        assert_eq!(p.font_ancient(), FontChoice::SourceHanSans);
+        let q = Prefs {
+            font_ancient: i,
+            ..Prefs::default()
+        };
+        assert_eq!(q.font_ancient(), FontChoice::SourceHanSans);
     }
 
     #[test]
@@ -315,13 +320,17 @@ mod tests {
         assert!((p.banxin_ratio() - 0.75).abs() < 1e-6);
         // 三档都取得到，且宽 < 中 < 窄（版心越来越满）。
         for (i, r) in crate::grid::BANXIN_RATIOS.iter().enumerate() {
-            let mut q = Prefs::default();
-            q.margin_tier = i;
+            let q = Prefs {
+                margin_tier: i,
+                ..Prefs::default()
+            };
             assert!((q.banxin_ratio() - r).abs() < 1e-6);
         }
         // 越界回落默认档，不 panic。
-        let mut q = Prefs::default();
-        q.margin_tier = 99;
+        let q = Prefs {
+            margin_tier: 99,
+            ..Prefs::default()
+        };
         assert!((q.banxin_ratio() - 0.75).abs() < 1e-6);
     }
 

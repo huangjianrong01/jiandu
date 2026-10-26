@@ -312,6 +312,9 @@ mod tests {
     }
 
     #[test]
+    // 断言的都是常量之间的关系（编译期就定死），钉的是「配色不许改艳」这条
+    // 设计约束，不是运行时状态——放行 clippy 的常量断言告警。
+    #[allow(clippy::assertions_on_constants)]
     fn ink_is_the_dead_cinnabar_the_user_asked_for() {
         // 暗朱砂 #9A3B3B：深沉、不鲜艳（比亮朱砂 C3272D 沉一档）。
         assert_eq!(PUNCT_INK, 0x9A3B3B);

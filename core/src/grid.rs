@@ -3,14 +3,14 @@
 //! 设计目标（见用户需求）：
 //!   1. 配置对象 [`GridConfig`]：列数 `columns`、方向 `dir`、四周留白比例 `margin`。
 //!   2. 动态网格计算 [`compute_grid`]：不写死像素——
-//!        colWidth = 可用宽 / 列数
-//!        fontSize = 0.75 × colWidth
-//!        rowHeight = 1.1 × colWidth
-//!        totalRows = floor(可用高 / rowHeight)
+//!      colWidth = 可用宽 / 列数
+//!      fontSize = 0.75 × colWidth
+//!      rowHeight = 1.1 × colWidth
+//!      totalRows = floor(可用高 / rowHeight)
 //!   3. 一套引擎兼容横竖排：方向只改变「读序」与「坐标映射」，格子几何完全一致。
-//!        · 竖排：遍历从右向左（列），从上向下（行）；
-//!        · 横排：遍历从上向下（行），从左向右（列）；
-//!        · 共用 [`cell_origin`] 计算 (x, y)、[`reading_order`] 计算读序。
+//!      · 竖排：遍历从右向左（列），从上向下（行）；
+//!      · 横排：遍历从上向下（行），从左向右（列）；
+//!      · 共用 [`cell_origin`] 计算 (x, y)、[`reading_order`] 计算读序。
 //!   4. 边界处理：最小字号 [`GRID_FS_MIN`]（窄屏 12 列也不至于小到看不清，
 //!      触发时 `min_font_hit` 为真，由渲染层开启单页滚动）。
 
@@ -266,6 +266,9 @@ impl LayoutConfig {
     ///
     /// v1.28.0 起为 **12 列**：10 列在常见的 1280–1600 宽窗口里字大行稀，
     /// 摊开像「大字盲人版」；12 列一行多两字，纸面立刻有了刻本该有的密度。
+    /// 名为 `default` 但不实现 `Default`：它返回的是**表里那一档的静态引用**，
+    /// 不是新造的值（`Default` 的语义是「造一个」），故不套 trait。
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> &'static LayoutConfig {
         Self::by_key("standard12").unwrap_or(&LAYOUT_CONFIGS[2])
     }
@@ -1616,6 +1619,7 @@ mod tests {
     /// 三档的版心率：宽（复古 60%）< 中（标准 75%）< 窄（满屏 90%），
     /// 默认档是「中」——既留古籍两侧留白的优雅，又保证现代屏幕阅读体验。
     #[test]
+    #[allow(clippy::assertions_on_constants)] // 钉的是三档版心率「宽 < 中 < 窄」
     fn banxin_ratio_tiers_step_from_retro_to_full() {
         assert_eq!(BANXIN_RATIOS.len(), 3, "三档");
         assert_eq!(BANXIN_TIER_DEFAULT, 1, "默认档 = 中");
@@ -1841,7 +1845,7 @@ mod frame_tests {
                     cw * 0.5
                 );
                 // ②-d 中缝宽度合理（立得住一对鱼尾，又不像一条马路）。
-                assert!(gw >= LEAF_GAP_MIN - 1e-6 && gw <= LEAF_GAP_MAX + 1e-6);
+                assert!((LEAF_GAP_MIN - 1e-6..=LEAF_GAP_MAX + 1e-6).contains(&gw));
             }
         }
     }
