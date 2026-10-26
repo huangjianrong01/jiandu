@@ -769,6 +769,19 @@ pub struct Book {
     /// 换留白档、改列数之后位置自动等比跟随，不用回写存储值。
     #[serde(default)]
     pub head_notes: Vec<HeadNote>,
+    /// **天头眉批（v1.55.0 新制）**：`anchor_char_index` 绝对锚定。
+    ///
+    /// 旧制 `head_notes` 存的是天头里的**归一化坐标** `u/v`——只记「写在天头
+    /// 哪个位置」，换列数重排就漂。新制存**被批的那个字在全书的第几个字**，
+    /// 天头画在哪个 x、引线连到哪个字，全由当帧版面**反算**（见
+    /// [`MarginNote`]）。旧数据在 `normalize_after_load` 里一律清空。
+    #[serde(default)]
+    pub margin_notes: Vec<MarginNote>,
+    /// **书稿 JSON 的格式版本号**（v1.55.0）。落盘时写 [`BOOK_SCHEMA_VERSION`]；
+    /// 读进来的老文件没有这个字段 → `#[serde(default)]` 得 0 → 判定为旧格式，
+    /// 旧的 `u/v` 眉批直接丢弃。以后再改结构，靠它做升级分叉。
+    #[serde(default)]
+    pub schema_version: u32,
     /// **章节仓库 id**（v1.50.0「流式 + 虚拟化」）：百万字的丛书正文
     /// **不驻内存**——导入时边解析边落盘到 `~/.jiandu/chapters.db`，
     /// 读书时按章取回、读完即还。`Some(id)` 表示这本书走虚拟化：
@@ -781,6 +794,151 @@ pub struct Book {
     #[serde(default)]
     pub chapter_chars: Vec<usize>,
     pub chapters: Vec<Chapter>,
+}
+
+/// **书稿 JSON 的当前格式版本号**。
+///
+/// * `0` —— v1.55.0 之前：天头眉批存归一化 `u/v`（`HeadNote`），无本字段。
+/// * `1` —— v1.55.0 起：眉批改用 `anchor_char_index` 绝对锚定（`MarginNote`）。
+///
+/// 读档时 `schema_version < 1` 即判为旧格式，旧的 `u/v` 眉批**直接丢弃**
+/// （用户明示：旧数据全是测试乱写的，不必迁移）。
+pub const BOOK_SCHEMA_VERSION: u32 = 1;
+
+/// **天头眉批（v1.55.0 新制）**：用**全书扁平字符索引**绝对锚定正文。
+///
+/// 与旧制 [`HeadNote`] 的根本差别：旧制存天头里的归一化坐标 `u/v`，位置是
+/// 「记下来的」；新制只存**被批的那个字在全书的第几个字**（`anchor_char_index`），
+/// 屏幕坐标永远由当帧版面**反算**出来——视口滚动、改字号、换列数、拖窗口，
+/// 都能重新算出那个字的物理位置，朱砂引线始终精准连到原字。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MarginNote {
+    /// 唯一标识（删改、悬停联动都靠它认人；新建取 `max(id)+1`）。
+    #[serde(default)]
+    pub id: u64,
+    /// **锚定正文的字符索引**（全书扁平下标，与 [`Book::flat_index`] 同口径）。
+    /// 这是核心字段：天头画在哪个 x、引线连到哪个字，全由它算出。
+    #[serde(default)]
+    pub anchor_char_index: usize,
+    /// 眉批正文。
+    #[serde(default)]
+    pub content: String,
+    /// 创建时间（Unix 秒）。
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+impl MarginNote {
+    pub fn new(id: u64, anchor_char_index: usize, content: impl Into<String>) -> Self {
+        Self {
+            id,
+            anchor_char_index,
+            content: content.into(),
+            created_at: margin_now_secs(),
+        }
+    }
+
+    /// **碰撞避让（防重叠）**：一批眉批在天头上的横向占位 `[(x0, x1)]`
+    /// → 各自落在第几条「车道」（lane）。**车道就是 Y 轴偏移**：
+    /// 同一车道同一高度，x 撞车的自动往下再开一条，于是后写的眉批依次下移，
+    /// 绝不会叠成一团墨（用户点名的要求）。
+    ///
+    /// 算法是**区间划分贪心**：按 x0 升序扫，每条放进「末端已空出来的最低车道」。
+    /// 纯函数、不碰存储，便于单测（见 `tests::margin_lanes_*`）。
+    /// 返回值与入参**同序**（入参不必预先排序）。
+    pub fn assign_lanes(spans: &[(f32, f32)]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..spans.len()).collect();
+        order.sort_by(|&a, &b| {
+            spans[a]
+                .0
+                .partial_cmp(&spans[b].0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // 每条车道当前占用到的 x 末端
+        let mut lane_end: Vec<f32> = Vec::new();
+        let mut out = vec![0usize; spans.len()];
+        for i in order {
+            let (x0, x1) = spans[i];
+            let mut lane = None;
+            for (li, end) in lane_end.iter_mut().enumerate() {
+                // 0.5px 容差：浮点毛刺不该逼出一条新车道
+                if x0 >= *end - 0.5 {
+                    *end = x1;
+                    lane = Some(li);
+                    break;
+                }
+            }
+            let li = match lane {
+                Some(l) => l,
+                None => {
+                    lane_end.push(x1);
+                    lane_end.len() - 1
+                }
+            };
+            out[i] = li;
+        }
+        out
+    }
+}
+
+/// 当前 Unix 秒（core 层不依赖上层 `library::now_secs`）。
+fn margin_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+impl Book {
+    /// [`Book::flat_index`] 的**逆运算**：全书扁平字符索引 → 字形键
+    /// `(章, 段, 段内偏移)`。
+    ///
+    /// 渲染层用它把 `anchor_char_index` 还原成「哪一章哪一段第几个字」，
+    /// 再在当页里找到那个字、算出屏幕物理坐标。口径与 `flat_index` 对称
+    /// （见 `tests::flat_index_roundtrip`）。
+    pub fn key_from_flat(&self, idx: usize) -> Option<GlyphKey> {
+        let mut acc = 0usize;
+        for (ci, ch) in self.chapters.iter().enumerate() {
+            let ch_len = Self::flow_chars_of(ch);
+            if idx < acc + ch_len {
+                let mut pacc = acc;
+                for (pi, p) in ch.paragraphs.iter().enumerate() {
+                    let plen = p.text.chars().count();
+                    if idx < pacc + plen {
+                        return Some((ci, pi, idx - pacc));
+                    }
+                    pacc += plen;
+                }
+                // 落在章内但超出所有段落（flow 里还有夹注等）：钉在该章末段首字。
+                let last = ch.paragraphs.len().saturating_sub(1);
+                return Some((ci, last, 0));
+            }
+            acc += ch_len;
+        }
+        None
+    }
+
+    /// 新眉批的下一个 id（现有最大 id + 1，从 1 起）。
+    pub fn next_margin_id(&self) -> u64 {
+        self.margin_notes.iter().map(|m| m.id).max().unwrap_or(0) + 1
+    }
+
+    /// **读档后规整**：旧格式的 `u/v` 眉批一律清空，版本号升到当前。
+    ///
+    /// 用户明示旧眉批全是测试乱写的，不做迁移——所以 `schema_version <
+    /// BOOK_SCHEMA_VERSION` 时直接 `head_notes.clear()`。顺带丢掉内容为空的
+    /// 残条（老 `u/v` 条目反序列化进来 `content` 是空串，正是这么被筛掉的）。
+    /// 幂等，可反复调用。
+    pub fn normalize_after_load(&mut self) -> bool {
+        let legacy = self.schema_version < BOOK_SCHEMA_VERSION;
+        if legacy {
+            self.head_notes.clear();
+        }
+        let before = self.margin_notes.len();
+        self.margin_notes.retain(|m| !m.content.trim().is_empty());
+        self.schema_version = BOOK_SCHEMA_VERSION;
+        legacy || self.margin_notes.len() != before
+    }
 }
 
 impl Book {
@@ -880,6 +1038,8 @@ impl Book {
             tongjia: BTreeMap::new(),
             toc: Vec::new(),
             head_notes: Vec::new(),
+            margin_notes: Vec::new(),
+            schema_version: BOOK_SCHEMA_VERSION,
             store_id: None,
             chapter_chars: Vec::new(),
             chapters: Vec::new(),
@@ -1590,6 +1750,95 @@ mod tests {
             )],
         });
         b
+    }
+
+    // ---- v1.55.0 新制：anchor_char_index 绝对锚定的天头眉批 ----
+
+    /// 两条眉批 x 撞车 → 后一条**下移一条车道**（Y 轴偏移），绝不叠字。
+    #[test]
+    fn margin_lanes_push_down_on_overlap() {
+        let lanes = MarginNote::assign_lanes(&[(10.0, 40.0), (15.0, 45.0)]);
+        assert_eq!(lanes, vec![0, 1], "x 重叠却没下移：{lanes:?}");
+    }
+
+    /// x 离得远 → 共用同一条车道（同一高度，不该无谓下移）。
+    #[test]
+    fn margin_lanes_share_when_far_apart() {
+        let lanes = MarginNote::assign_lanes(&[(10.0, 40.0), (200.0, 230.0)]);
+        assert_eq!(lanes, vec![0, 0], "相距很远却分了车道：{lanes:?}");
+    }
+
+    /// 三条全撞车 → 0 / 1 / 2 三条车道依次下移。
+    #[test]
+    fn margin_lanes_three_overlapping_stack() {
+        let lanes = MarginNote::assign_lanes(&[(10.0, 40.0), (12.0, 42.0), (14.0, 44.0)]);
+        assert_eq!(lanes, vec![0, 1, 2], "三条没依次下移：{lanes:?}");
+    }
+
+    /// 入参无需预先排序：**返回值仍与入参同序**，车道按 x 的实际先后派。
+    #[test]
+    fn margin_lanes_keeps_input_order() {
+        // 两条互相重叠、但入参是倒着给的：x 小的那条（入参第二个）拿车道 0，
+        // x 大的（入参第一个）被挤到车道 1 —— 结果与顺序无关，只与 x 有关。
+        let lanes = MarginNote::assign_lanes(&[(15.0, 45.0), (10.0, 40.0)]);
+        assert_eq!(lanes, vec![1, 0], "乱序入参车道派错了：{lanes:?}");
+        // 顺序换回来，同一对区间应得到同样的车道分配（只是顺序跟着换了）。
+        let lanes2 = MarginNote::assign_lanes(&[(10.0, 40.0), (15.0, 45.0)]);
+        assert_eq!(lanes2, vec![0, 1], "顺序变了车道也变了：{lanes2:?}");
+    }
+
+    /// `flat_index` 与 `key_from_flat` 必须互为逆运算——这是「绝对锚定」的地基。
+    #[test]
+    fn flat_index_roundtrip() {
+        let b = sample();
+        for k in [(0usize, 0usize, 0usize), (0, 0, 3), (0, 0, 7)] {
+            let idx = b.flat_index(k);
+            assert_eq!(b.key_from_flat(idx), Some(k), "索引 {idx} 还原不成 {k:?}");
+        }
+        // 越界索引不该凭空造出一个键。
+        assert!(b.key_from_flat(usize::MAX).is_none());
+    }
+
+    /// 眉批要能落 JSON、原样读回（本地持久化）。
+    #[test]
+    fn margin_note_json_roundtrip() {
+        let n = MarginNote::new(7, 1234, "批曰：此本与《索隐》异");
+        let s = serde_json::to_string(&n).expect("序列化失败");
+        let back: MarginNote = serde_json::from_str(&s).expect("反序列化失败");
+        assert_eq!(n, back);
+        assert!(s.contains("anchor_char_index"), "核心字段没落进 JSON：{s}");
+        assert_eq!(back.anchor_char_index, 1234);
+        assert_eq!(back.content, "批曰：此本与《索隐》异");
+    }
+
+    /// **旧格式（u/v 眉批）读档即清空**，版本号升到当前。
+    #[test]
+    fn legacy_head_notes_cleared_on_load() {
+        let mut b = sample();
+        b.schema_version = 0; // 伪造成老文件
+        b.head_notes.push(HeadNote::new((0, 0, 0), 0.5, 0.5, "旧测试批"));
+        // 老条目反序列化进来 content 是空串（字段名对不上），正是这么被筛掉的。
+        b.margin_notes.push(MarginNote {
+            id: 1,
+            anchor_char_index: 0,
+            content: String::new(),
+            created_at: 0,
+        });
+        b.normalize_after_load();
+        assert!(b.head_notes.is_empty(), "旧 u/v 眉批没被清空");
+        assert!(b.margin_notes.is_empty(), "空内容残条没被清掉");
+        assert_eq!(b.schema_version, BOOK_SCHEMA_VERSION, "版本号没升级");
+    }
+
+    /// 新格式（版本号已是当前）不该误伤正常眉批。
+    #[test]
+    fn current_schema_keeps_valid_margin_notes() {
+        let mut b = sample();
+        b.schema_version = BOOK_SCHEMA_VERSION;
+        b.margin_notes.push(MarginNote::new(1, 42, "真批语"));
+        b.normalize_after_load();
+        assert_eq!(b.margin_notes.len(), 1, "正常眉批被误删");
+        assert_eq!(b.margin_notes[0].anchor_char_index, 42);
     }
 
     /// 天头眉批**绝不允许叠字**：同一处再写一条，`u` 必须向左让开一列。

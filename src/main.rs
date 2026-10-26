@@ -17,6 +17,7 @@ mod gloss;
 mod hit;
 mod ime;
 mod lines;
+mod margin;
 mod note_inject;
 mod punct;
 mod reader;

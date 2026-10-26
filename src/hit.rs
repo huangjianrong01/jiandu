@@ -197,9 +197,22 @@ pub fn column_spans(items: &[Piece], cell_h: f32, west_mode: bool) -> Vec<Span> 
 /// 西文成组时一格两字并排（当前渲染退化为同槽位并排直立），故一格出
 /// **两个**盒，各占半格宽——反查能精确到那一个字符。段首缩进占位
 /// （`GlyphKind::Indent`）不渲染，不产盒。
+///
+/// `li` 是**布局序**（flex_row 里左数第几列），故 x = `li × cell_w`。
 pub fn glyph_boxes_in_column(
     items: &[Piece],
     li: usize,
+    cell_w: f32,
+    cell_h: f32,
+    west_mode: bool,
+) -> Vec<GlyphBox> {
+    boxes_in_column(items, li as f32 * cell_w, cell_w, cell_h, west_mode)
+}
+
+/// [`glyph_boxes_in_column`] 的实段：列左缘 x 由调用方直接给。
+fn boxes_in_column(
+    items: &[Piece],
+    x0: f32,
     cell_w: f32,
     cell_h: f32,
     west_mode: bool,
@@ -215,7 +228,7 @@ pub fn glyph_boxes_in_column(
                 }
                 out.push(GlyphBox {
                     glyph: g,
-                    x: li as f32 * cell_w,
+                    x: x0,
                     y: sp.y,
                     w: cell_w,
                     h: sp.h,
@@ -231,7 +244,7 @@ pub fn glyph_boxes_in_column(
                     }
                     out.push(GlyphBox {
                         glyph: *g,
-                        x: li as f32 * cell_w + slot as f32 * (cell_w / 2.0),
+                        x: x0 + slot as f32 * (cell_w / 2.0),
                         y: sp.y + cell as f32 * cell_h,
                         w: cell_w / 2.0,
                         h: cell_h,
@@ -243,6 +256,54 @@ pub fn glyph_boxes_in_column(
         }
     }
     out
+}
+
+/// 一叶里**全部正文字**的包围盒（纸面内坐标，原点 = 内框左上）。
+///
+/// 按**读序**逐列收集（`i = 0` 在最右），x 走 [`col_x`]（含信笺中缝那一列
+/// 的让位），章首开卷列顶部的卷首题署预留带整条下移——与
+/// [`glyph_at`] 反查用的是同一套坐标，故「点到的字」与「算出的字」是同一个。
+///
+/// 天头眉批的**绝对锚定**就靠它：`MarginNote::anchor_char_index` →
+/// `Book::key_from_flat` → 在 `Page` 里找这个 key 的盒 → 屏幕坐标。
+pub fn glyph_boxes_of_columns(columns: &[Vec<Piece>], f: &LeafFrame) -> Vec<GlyphBox> {
+    let mut out = Vec::new();
+    for i in 0..f.text_cols {
+        let items: &[Piece] = columns.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+        let x = col_x(f, i);
+        // 卷首题署预留带：带内的正文整体下移（与 `ancient_column` 的
+        // `top_skip` 同源），否则算出来的字会比屏幕上看到的高一截。
+        let skip = if f.start_chapter && i == 0 {
+            f.reserve as f32 * f.cell_h
+        } else {
+            0.0
+        };
+        for mut gb in boxes_in_column(items, x, f.cell_w, f.cell_h, f.west_mode) {
+            gb.y += skip;
+            out.push(gb);
+        }
+    }
+    out
+}
+
+/// 一叶里所有正文字的包围盒（[`glyph_boxes_of_columns`] 的 `Page` 版）。
+pub fn glyph_boxes(page: &Page, f: &LeafFrame) -> Vec<GlyphBox> {
+    glyph_boxes_of_columns(&page.columns, f)
+}
+
+/// **按字形键**在这一叶里找那个字的包围盒——`anchor_char_index` 落到屏幕
+/// 坐标的最后一步。
+///
+/// 键即 `(章, 段, 段内偏移)`，与 [`GlyphBox::key`] 同口径。不在本叶返回
+/// `None`（眉批锚的字不在当前这一面，这一帧就不画它）。
+pub fn glyph_box_of_columns(
+    columns: &[Vec<Piece>],
+    f: &LeafFrame,
+    key: (usize, usize, usize),
+) -> Option<GlyphBox> {
+    glyph_boxes_of_columns(columns, f)
+        .into_iter()
+        .find(|gb| gb.key() == key)
 }
 
 /// 读序号 `i` 的列在纸面里的左缘 x（flex_row 里「左数第几列」）。
@@ -674,6 +735,44 @@ mod tests {
         let hit = glyph_at(&page, cx + 30.0, 44.0 + 22.0, &f).expect("第二格右半应命中");
         assert_eq!(hit.glyph.ch, '8');
         assert!((hit.w - 20.0).abs() < 0.01, "西文半格宽");
+    }
+
+    #[test]
+    fn glyph_boxes_cover_every_column_in_reading_order() {
+        // 四列各两字：盒数 = 8，且读序 0（最右）的 x 最大。
+        let mut cols = Vec::new();
+        for i in 0..4 {
+            cols.push(vec![main_piece('字', i), main_piece('字', i + 10)]);
+        }
+        let f = frame();
+        let boxes = glyph_boxes_of_columns(&cols, &f);
+        assert_eq!(boxes.len(), 8);
+        assert!((boxes[0].x - col_x(&f, 0)).abs() < 0.01, "首盒应在最右列");
+        // 同一列内自上而下：y 递增。
+        assert!(boxes[1].y > boxes[0].y);
+    }
+
+    #[test]
+    fn glyph_box_of_key_finds_the_anchored_char() {
+        // 眉批锚定「第 1 列第 2 字」：必须原样找回来，这是绝对锚定的地基。
+        let mut cols = Vec::new();
+        for i in 0..4 {
+            cols.push(vec![main_piece('字', i), main_piece('字', i + 10)]);
+        }
+        let f = frame();
+        let gb = glyph_box_of_columns(&cols, &f, (0, 0, 11)).expect("第 1 列第 2 字");
+        assert_eq!(gb.key(), (0, 0, 11));
+        // 与反查（点这个位置得到哪个字）必须一致。
+        let hit = glyph_at(
+            &page_of(cols.clone()),
+            gb.x + gb.w * 0.5,
+            gb.y + gb.h * 0.5,
+            &f,
+        )
+        .expect("反查应命中同一处");
+        assert_eq!(hit.key(), gb.key(), "算出的字与点到的字不是同一个");
+        // 不在本叶的键 → None（这一帧不画）。
+        assert!(glyph_box_of_columns(&cols, &f, (9, 9, 9)).is_none());
     }
 
     #[test]

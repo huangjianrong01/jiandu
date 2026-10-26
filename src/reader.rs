@@ -118,6 +118,116 @@ pub const HEAD_BAND_MIN: f32 = 10.0;
 /// `types.rs` 的 `HeadNote` 旁边——`types` 是 lib 的一部分，而 `reader`
 /// 只在 bin 里，放那儿 types 反而够不着。
 
+/// **纸面 → 字格坐标系的内缩**（px）：版框 3px + 内框 1px。
+///
+/// `render_ancient` 里 `sheet` 先 `pt(margin_top)`、`pl(pl)`，再套版框
+/// （`border_3`）与内框（`border_1`），行格（也就是 [`crate::hit::GlyphBox`]
+/// 的原点）就落在纸面左上角往里这 4px 处。眉批挂在纸面上、按纸面坐标画，
+/// 故字格坐标要加这一个常数才能对齐——天头眉批的**绝对锚定**就差这一步。
+pub const FRAME_OFF: f32 = 4.0;
+
+/// 天头眉批画布的**一次绘制清单**：整份搬进 paint 闭包，闭包里不再碰 `self`
+/// （paint 阶段拿不到 `&mut Self`，也本就不该在绘制时改状态）。
+struct MarginPaint {
+    /// 眉批字号。
+    fs: f32,
+    /// 眉批行距（竖排逐字叠下，行距即字距）。
+    lh: f32,
+    /// 朱砂墨色（0xRRGGBB）。
+    ink: u32,
+    /// 悬停那条的高亮色（0xRRGGBB）。
+    hot: u32,
+    /// 字体族名（恒楷体：小字放大后宋体笔画发木）。
+    family: String,
+    /// 悬停中的眉批 id。
+    hover: Option<u64>,
+    items: Vec<MarginPaintItem>,
+}
+
+#[derive(Clone)]
+struct MarginPaintItem {
+    id: u64,
+    /// 这条眉批锚定的字形键（悬停联动时字格据此衬底）。
+    key: (usize, usize, usize),
+    bx: crate::margin::MarginBox,
+}
+
+/// 画天头眉批：**竖排小字 + 朱砂引线**，全部落在 canvas 上。
+///
+/// 字柱部分交回 `margin::MarginBox::col_text` / `col_x` 逐列逐字摆（刻本眉批
+/// 竖着写、写完一列往左再来一列）；引线用二次贝塞尔，控制点取自
+/// [`crate::margin::leader_ctrl`]——出笔竖直、收笔斜落，即使眉批被挤到下边
+/// 车道、与锚定字错开半列，也看得出是从哪条批语牵下来的。
+fn paint_margin_notes(
+    bounds: Bounds<Pixels>,
+    p: MarginPaint,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let o = bounds.origin;
+    let font = gpui::font(SharedString::from(p.family.clone()));
+    for it in p.items.iter() {
+        let b = &it.bx;
+        let on = p.hover == Some(it.id);
+        // ⚠️ `gpui::rgba` 收的是 **0xRRGGBBAA**（末字节是 alpha，见 gpui 的
+        // `color.rs`）——传 0xRRGGBB 会被当成 alpha=0 而**全透明**，画了也看不见。
+        // 故一律左移 8 位补上 alpha（旧眉批那套 `(ink << 8) | HEAD_NOTE_INK_ALPHA`
+        // 正是这么写的）。
+        let ink = if on {
+            rgba((p.hot << 8) | 0xFF)
+        } else {
+            rgba((p.ink << 8) | HEAD_NOTE_INK_ALPHA)
+        };
+        // ── 引线：字柱最后一列的底部 → 被批的那个字 ──
+        let (x0, y0) = (b.lx, b.y + b.h);
+        let (cxp, cyp) = crate::margin::leader_ctrl(x0, y0, b.ax, b.ay);
+        let mut path = PathBuilder::stroke(px(if on { 1.6 } else { 1.0 }));
+        path.move_to(point(o.x + px(x0), o.y + px(y0)));
+        path.curve_to(
+            point(o.x + px(b.ax), o.y + px(b.ay)),
+            point(o.x + px(cxp), o.y + px(cyp)),
+        );
+        if let Ok(built) = path.build() {
+            window.paint_path(built, ink);
+        }
+        // 落点一枚小朱点（3px）：一眼看出牵到哪个字，而不止是一条线。
+        let d = px(if on { 4.0 } else { 3.0 });
+        window.paint_quad(gpui::fill(
+            Bounds::new(
+                point(o.x + px(b.ax) - d / 2.0, o.y + px(b.ay) - d - px(1.5)),
+                gpui::size(d, d),
+            ),
+            ink,
+        ));
+        // ── 竖排字柱 ──
+        for k in 0..b.cols() {
+            let col_x = b.col_x(k);
+            for (r, ch) in b.col_text(k).chars().enumerate() {
+                let s = ch.to_string();
+                let run = gpui::TextRun {
+                    len: s.len(),
+                    font: font.clone(),
+                    color: ink.into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                // 借 `window` 组字（不可变），组完立刻还回去再画——
+                // 别把 `text_system()` 的借用拖到 `paint(&mut window)` 那边。
+                let line = window
+                    .text_system()
+                    .shape_line(SharedString::from(s), px(p.fs), &[run], None);
+                let _ = line.paint(
+                    point(o.x + px(col_x), o.y + px(b.y + r as f32 * p.lh)),
+                    px(p.lh),
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+}
+
 /// 圈号（1-20）。
 const CIRCLED: [&str; 20] = [
     "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩", "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰",
@@ -2884,6 +2994,243 @@ impl Root {
     // 古文竖笺：八列、从右到左、四周双边、双行小字夹注
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // 天头眉批（v1.55.0 新制）：canvas 绘制 + anchor_char_index 绝对锚定
+    // ------------------------------------------------------------------
+
+    /// **天头眉批的画布层**。
+    ///
+    /// 与旧制 `render_head_notes`（`div()` 绝对定位 + 归一化 `u/v`）的根本差别：
+    /// 这里**只认 `MarginNote::anchor_char_index`**——每帧拿当帧版面把「被批的
+    /// 那个字」反算成纸面坐标，再据此定字柱的 x 与引线的落点。于是翻页、
+    /// 改字号、换列数、换留白档，眉批都自己跟着那个字走，存储里一个像素
+    /// 都不必留（旧制存比例，缩放只是等比放大，其实并不知道批的是哪个字）。
+    ///
+    /// 两样东西**全部画在 canvas 上**，不再用 `div()` 摆字：
+    ///   * 竖排小字字柱（天头带内；撞车沿 Y 轴下移、超长自动分列，见
+    ///     [`crate::margin::layout_notes`]）；
+    ///   * 朱砂引线：二次贝塞尔，出笔竖直、收笔斜落到被批的那个字。
+    ///
+    /// 挂在 `sheet` 上、绝对定位铺满**天头带**（纸面上缘往下 `margin_top`
+    /// 那一条）：它的原点就是纸面左上角，故纸面坐标 = 画布坐标，字格坐标
+    /// 只需加一个版框内缩 [`FRAME_OFF`] 即可对齐。引线会画到带外（落到
+    /// 版框里的字上），GPUI 的 canvas 不设裁剪，故不受带高限制。
+    fn render_margin_layer(
+        &self,
+        columns: &[Vec<Piece>],
+        start_chapter: bool,
+        back: bool,
+        pl: f32,
+        band_w: f32,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mt = self.margin_top;
+        if self.focus_mode || mt < HEAD_BAND_MIN || self.margin_notes.is_empty() {
+            return div();
+        }
+        let Some(book) = self.book.as_ref() else {
+            return div();
+        };
+        // anchor_char_index → 字形键 → 本叶里的字盒 → 纸面坐标。
+        // 字盒每帧重算一次，故「滚动 / 改字号 / 换列数」之后仍精准。
+        let f = self.leaf_frame(&Page {
+            glyphs: Vec::new(),
+            start_chapter,
+            columns: Vec::new(),
+        });
+        let boxes = crate::hit::glyph_boxes_of_columns(columns, &f);
+        if boxes.is_empty() {
+            return div();
+        }
+        let mut inputs: Vec<crate::margin::MarginInput> = Vec::new();
+        let mut ids: Vec<u64> = Vec::new();
+        let mut keys: Vec<(usize, usize, usize)> = Vec::new();
+        for m in self.margin_notes.iter() {
+            let Some(key) = book.key_from_flat(m.anchor_char_index) else {
+                continue;
+            };
+            // 不在**这一叶**上：这一帧不画它（翻到那一叶时自然出现）。
+            let Some(gb) = boxes.iter().find(|b| b.key() == key) else {
+                continue;
+            };
+            inputs.push(crate::margin::MarginInput {
+                ax: pl + FRAME_OFF + gb.x + gb.w * 0.5,
+                ay: mt + FRAME_OFF + gb.y,
+                text: m.content.clone(),
+            });
+            ids.push(m.id);
+            keys.push(key);
+        }
+        if inputs.is_empty() {
+            return div();
+        }
+        let fs = (self.size_ancient * HEAD_NOTE_FS_RATIO).max(HEAD_NOTE_FS_MIN);
+        let lh = fs * HEAD_NOTE_LH_RATIO;
+        let laid = crate::margin::layout_notes(&inputs, band_w, mt, fs, lh);
+
+        let mut items: Vec<MarginPaintItem> = Vec::new();
+        for b in laid {
+            let src = b.src;
+            items.push(MarginPaintItem {
+                id: ids.get(src).copied().unwrap_or(0),
+                key: keys.get(src).copied().unwrap_or((0, 0, 0)),
+                bx: b,
+            });
+        }
+        if items.is_empty() {
+            return div();
+        }
+        let paint = MarginPaint {
+            fs,
+            lh,
+            ink: self.palette.note(self.theme),
+            hot: self.theme.accent(),
+            family: crate::fonts::head_family().to_string(),
+            hover: self.margin_hover,
+            items,
+        };
+        // 命中清单（随这一帧的版面一起搬进事件闭包，永不重算）：
+        // 悬停与按下各要一份，故建一次、克隆一份。
+        let hit_list: Vec<(u64, (usize, usize, usize), crate::margin::MarginBox)> = paint
+            .items
+            .iter()
+            .map(|it| (it.id, it.key, it.bx.clone()))
+            .collect();
+        let hit_list_click = hit_list.clone();
+        let slot = if back { 1usize } else { 0usize };
+        let probe = self.margin_bands[slot].clone();
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .h(px(mt))
+            .child(
+                canvas(
+                    move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+                        // 画布不收鼠标事件，故把「天头带这一帧落在窗口何处」
+                        // 记下来给悬停命中用（与 `page_rect` 同一套路）。
+                        let u = px(1.0);
+                        probe.set(Some((
+                            bounds.origin.x / u,
+                            bounds.origin.y / u,
+                            bounds.size.width / u,
+                            bounds.size.height / u,
+                        )));
+                        paint
+                    },
+                    |bounds: Bounds<Pixels>, paint: MarginPaint, window: &mut Window, cx: &mut App| {
+                        paint_margin_notes(bounds, paint, window, cx);
+                    },
+                )
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .h(px(mt)),
+            )
+            .on_mouse_move(cx.listener(
+                move |this, event: &MouseMoveEvent, _window, cx| {
+                    let Some((bx, by, _, _)) = this.margin_bands[slot].get() else {
+                        return;
+                    };
+                    let lx = event.position.x.to_f64() as f32 - bx;
+                    let ly = event.position.y.to_f64() as f32 - by;
+                    let hit = hit_list
+                        .iter()
+                        .find(|(_, _, b)| b.contains(lx, ly))
+                        .map(|(id, key, _)| (*id, *key));
+                    let want = hit.map(|(id, _)| id);
+                    if this.margin_hover != want {
+                        this.margin_hover = want;
+                        // 锚定的那个字一并记下：字格渲染只认键，不必查书稿。
+                        this.margin_hover_key = hit.map(|(_, key)| key);
+                        cx.notify();
+                    }
+                },
+            ))
+            // 点已有眉批 = 就地改写（预填原文，⏎ 换文 / 清空即删）。
+            // 必须**按下即触发**并吞掉：抬起时根容器的「点天头空白起新批」
+            // 会抢在前面（见 capture 阶段的 `head_press`）。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    let Some((bx, by, _, _)) = this.margin_bands[slot].get() else {
+                        return;
+                    };
+                    let lx = event.position.x.to_f64() as f32 - bx;
+                    let ly = event.position.y.to_f64() as f32 - by;
+                    let Some((id, _key)) = hit_list_click
+                        .iter()
+                        .find(|(_, _, b)| b.contains(lx, ly))
+                        .map(|(id, key, _)| (*id, *key))
+                    else {
+                        return; // 点在空白：照旧交给「天头起新批」。
+                    };
+                    cx.stop_propagation();
+                    // 吞掉 capture 阶段记下的天头按下，免得抬起时又起一条新批。
+                    this.head_press = None;
+                    this.press_at = None;
+                    this.start_margin_note_edit(id);
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// **正在写的那条眉批**：草稿就地竖排出现在天头留白里。
+    ///
+    /// 只有这一处仍是 `div()`：canvas 接不了中文输入法，输入框必须是真元素。
+    /// 位置与已存眉批同源（同一个 `anchor_char_index` → 字盒 → 纸面坐标），
+    /// 故⏎ 一存，字不挪窝，只是从「输入元素」换成「画布上的字 + 朱砂引线」。
+    fn render_margin_draft(
+        &self,
+        columns: &[Vec<Piece>],
+        start_chapter: bool,
+        pl: f32,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mt = self.margin_top;
+        let Some(at) = self.margin_draft_at else {
+            return div();
+        };
+        if !self.note_editing || self.focus_mode || mt < HEAD_BAND_MIN {
+            return div();
+        }
+        let Some(book) = self.book.as_ref() else {
+            return div();
+        };
+        let Some(key) = book.key_from_flat(at) else {
+            return div();
+        };
+        let f = self.leaf_frame(&Page {
+            glyphs: Vec::new(),
+            start_chapter,
+            columns: Vec::new(),
+        });
+        // 锚定的字不在这一叶：草稿就先不画（翻回去时自然出现）。
+        let Some(gb) = crate::hit::glyph_box_of_columns(columns, &f, key) else {
+            return div();
+        };
+        let fs = (self.size_ancient * HEAD_NOTE_FS_RATIO).max(HEAD_NOTE_FS_MIN);
+        let lh = fs * HEAD_NOTE_LH_RATIO;
+        let ax = pl + FRAME_OFF + gb.x + gb.w * 0.5;
+        let x = (ax - fs * 0.5).max(0.0);
+        let head_ink = (self.palette.note(self.theme) << 8) | HEAD_NOTE_INK_ALPHA;
+        let draft = self.note_draft.clone();
+        let cur = self.note_cursor;
+        div()
+            .absolute()
+            .left(px(x))
+            .top(px(0.0))
+            .font_family(&crate::fonts::head_family())
+            .text_size(px(fs))
+            .child(crate::ime::InputField::new(
+                Self::head_note_column(&draft, fs, lh, Some(cur), head_ink),
+                self.note_focus.clone(),
+                cx.entity(),
+            ))
+    }
+
     fn render_ancient(
         &self,
         glyphs: &[Glyph],
@@ -3202,6 +3549,24 @@ impl Root {
                 }
                 sheet = sheet.child(area);
             }
+        }
+
+        // ── 天头眉批（v1.55.0 新制）───────────────────────────────────────
+        // canvas 绘制 + `anchor_char_index` 绝对锚定：坐标每帧由当帧版面反算，
+        // 故翻页 / 改字号 / 换列数 / 换留白档都自动跟随。非交互（导出长图、
+        // 分享卡）不画——那两处不该带上阅读时随手写下的批语。
+        if geo.interactive {
+            sheet = sheet.child(self.render_margin_layer(
+                columns,
+                start_chapter,
+                back,
+                pl,
+                grid_w + pl + pr + FRAME_OFF * 2.0,
+                cx,
+            ));
+            // 正在写的那条：输入框就地落在天头（canvas 接不了 IME，故这一处
+            // 仍是元素）。存下来之后就归画布那一层画了。
+            sheet = sheet.child(self.render_margin_draft(columns, start_chapter, pl, cx));
         }
 
         sheet
@@ -4574,6 +4939,9 @@ impl Root {
         } else {
             None
         };
+        // 悬停联动（v1.55.0）：鼠标停在天头某条眉批上 → 它锚定的那个字衬
+        // 一层朱红。只比一次键，不查书稿——字格渲染里这是最省的判据。
+        let margin_hit = g.kind == GlyphKind::Char && self.margin_hover_key == Some(key);
         let mut cell = div()
             .w(px(cell_w))
             .h(px(cell_h))
@@ -4581,7 +4949,8 @@ impl Root {
             .flex_row()
             .items_center()
             .justify_center();
-        if marked || rare_py.is_some() || mark_line.is_some() || hit.is_some() || emph {
+        if marked || rare_py.is_some() || mark_line.is_some() || hit.is_some() || emph || margin_hit
+        {
             cell = cell.relative();
         }
         if let Some(is_cur) = hit {
@@ -4596,6 +4965,20 @@ impl Root {
                     .w(px(cell_w))
                     .h(px(cell_h))
                     .bg(rgb(crate::theme::mix(paper, t.accent(), k))),
+            );
+        }
+        if margin_hit && hit.is_none() {
+            // 眉批悬停的衬底：朱砂兑纸色，比「检索命中」再淡一档——
+            // 它是**提示**（这条批语说的是这个字），不是「选中」。
+            let paper = if back { t.paper_back() } else { t.paper() };
+            cell = cell.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .w(px(cell_w))
+                    .h(px(cell_h))
+                    .bg(rgb(crate::theme::mix(paper, t.accent(), 0.30))),
             );
         }
         // 专名 / 书名线画在句读与正文之下：先落线，字与标点压其上，
@@ -6642,7 +7025,9 @@ impl Root {
         let item_h = fs * 2.5; // 两字一钮（竖排）
         let gap = 8.0; // 钮间距
         let pad = 6.0;
-        let n: f32 = 7.0; // 查典 / 朱批 / 夹注 / 拓印 / 人名 / 地名 / 书名
+        // v1.55.0：加一枚「眉批」——选中文字后直接到天头题批，锚点取全书
+        // 扁平字符下标（见 `Root::start_margin_note`）。
+        let n: f32 = 8.0; // 查典 / 朱批 / 眉批 / 夹注 / 拓印 / 人名 / 地名 / 书名
         let w = pad * 2.0 + item_w * n + gap * (n - 1.0) + 2.0;
         let h = pad * 2.0 + item_h + 2.0;
         let place = crate::hit::place_card(
@@ -6673,6 +7058,7 @@ impl Root {
         };
         push_btn("查典", &mut items);
         push_btn("朱批", &mut items);
+        push_btn("眉批", &mut items);
         push_btn("夹注", &mut items);
         push_btn("拓印", &mut items);
         push_btn("人名", &mut items);
@@ -6731,6 +7117,17 @@ impl Root {
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 this.start_note_edit_at(Some(hit_xy));
+                this.popup = None;
+                cx.notify();
+            }),
+        );
+        let b_margin = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                // 天头眉批：锚点 = 选区起点的 charIndex，草稿就地出现在
+                // 天头留白里（不是模态窗口）。
+                this.start_margin_note();
                 this.popup = None;
                 cx.notify();
             }),
@@ -6798,7 +7195,7 @@ impl Root {
             .justify_center()
             .gap(px(gap))
             .child(b_query);
-        for b in [b_note, b_gloss, b_copy, b_person, b_place, b_book] {
+        for b in [b_note, b_margin, b_gloss, b_copy, b_person, b_place, b_book] {
             row = row.child(b);
         }
 

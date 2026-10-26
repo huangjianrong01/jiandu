@@ -371,6 +371,36 @@ pub struct Root {
     /// （`HeadNote::key` = 该面首字字键），改列数 / 改字号重新分页后仍
     /// 跟着那一面；位置存的是归一化比例，窗口缩放自动跟随。
     pub head_notes: Vec<crate::types::HeadNote>,
+    /// **v1.55.0 新制天头眉批**：`anchor_char_index` 绝对锚定（旧 `head_notes`
+    /// 的 u/v 坐标系已废弃，仅在读档时被清空，不再参与渲染）。
+    pub margin_notes: Vec<crate::types::MarginNote>,
+    /// **悬停联动**（v1.55.0）：鼠标停在哪一条眉批上（`MarginNote::id`）。
+    ///
+    /// 只记 id，不记坐标——坐标每帧由 `anchor_char_index` 反算，故悬停时
+    /// 哪怕正在翻页 / 改字号，高亮也钉在被批的那个字上。
+    pub margin_hover: Option<u64>,
+    /// [`Self::margin_hover`] 那条眉批所锚定的**字形键**。
+    ///
+    /// 与 `margin_hover` 一并置位：字格渲染只认键（它拿不到眉批表），
+    /// 这样「谁被高亮」的判断就是一次元组比较，不必逐帧查书稿。
+    pub margin_hover_key: Option<(usize, usize, usize)>,
+    /// **正在写的那条眉批锚在全书第几个字**（v1.55.0 新制）。
+    ///
+    /// 非空即表示「草稿是天头眉批」：⏎ 存进 `margin_notes`
+    /// （`anchor_char_index` = 此值），而不是旧 `head_notes` 的 `u/v`。
+    /// 判据只认这一枚开关，与旧制互不干扰——旧制走 `head_anchor`。
+    pub margin_draft_at: Option<usize>,
+    /// 正在**改写**的那条眉批的 id（新写为 `None`）。
+    ///
+    /// 与 `margin_draft_at` 配对：⏎ 时据此决定是追加一条，还是原位换文
+    /// （草稿清空即删，与旧制「改写写空即抹」同一口径）。
+    pub margin_edit_id: Option<u64>,
+    /// 天头带在窗口里的矩形（**由画布 prepaint 回填**）：右叶 / 左叶各一份。
+    ///
+    /// 画布本身不收鼠标事件（GPUI 的 `canvas` 不是交互元素），悬停命中要靠
+    /// 这一枚探针把「天头带这一帧落在窗口何处」记下来——与 `page_rect`
+    /// 同一个套路：渲染是输出，事件是输入，中间用一次绘制把矩形带出来。
+    pub margin_bands: [Rc<Cell<Option<(f32, f32, f32, f32)>>>; 2],
     /// 正在写的眉批落点 `(key, u, v)`。
     ///
     /// `note_editing` 为 true 且此项为 Some 时，草稿**就地竖排**显示在天头
@@ -804,6 +834,12 @@ impl Root {
             note_focus: _cx.focus_handle(),
             note_marked: None,
             head_notes: Vec::new(),
+            margin_notes: Vec::new(),
+            margin_hover: None,
+            margin_hover_key: None,
+            margin_draft_at: None,
+            margin_edit_id: None,
+            margin_bands: [Rc::new(Cell::new(None)), Rc::new(Cell::new(None))],
             head_anchor: None,
             head_press: None,
             head_active: None,
@@ -2000,6 +2036,101 @@ impl Root {
 
     /// 存一条天头眉批：同位置已有就**向左挪一列**，挪出左缘绕回右缘；
     /// 写完立刻回写书稿 JSON（下次开卷还在）。
+    /// **从当前选区起一条天头眉批**（v1.55.0 新制）。
+    ///
+    /// 链路就是「选区 → `flat_index` → `anchor_char_index`」：
+    /// 选区起点那个字的字形键经 `Book::flat_index` 换成全书扁平字符下标，
+    /// 存进 `MarginNote`。之后每一帧都由这个下标反算出那个字的屏幕坐标，
+    /// 翻页 / 改字号 / 换列数都不丢锚（见 `reader::render_margin_layer`）。
+    ///
+    /// 只进编辑态、不弹窗：草稿就地竖排显示在天头（由画布层排位）。
+    pub fn start_margin_note(&mut self) {
+        let Some(book) = self.book.as_ref() else {
+            self.notice = "尚未开卷".to_string();
+            return;
+        };
+        // 有拖选取选区起点，否则取当前悬停 / 点击的那一个字。
+        let key = self
+            .selection_range()
+            .map(|(a, _)| a)
+            .or(self.hover_key)
+            .or_else(|| self.page_anchor());
+        let Some(key) = key else {
+            self.notice = "先选中要批的文字".to_string();
+            return;
+        };
+        let at = book.flat_index(key);
+        self.cancel_note_edit();
+        self.margin_draft_at = Some(at);
+        self.note_draft.clear();
+        self.note_cursor = 0;
+        self.note_editing = true;
+        // 开写那一下的 mouseup 会重新命中正文，别让它「点别处自动保存」
+        // 把刚开的小框立刻关掉（与浮层笔记框同一个坑）。
+        self.note_suppress_commit = true;
+        self.popup = None;
+        self.notice = "眉批：⏎ 存 · Esc 弃".to_string();
+    }
+
+    /// **改写一条已有眉批**（按 id 找到它，草稿预填原文）。
+    ///
+    /// 锚点照旧由 `anchor_char_index` 决定，改的只是批语文字——故位置不动，
+    /// 换文后天头上的字柱与引线原样在那儿。
+    pub fn start_margin_note_edit(&mut self, id: u64) {
+        let Some(n) = self.margin_notes.iter().find(|m| m.id == id) else {
+            return;
+        };
+        let at = n.anchor_char_index;
+        let text = n.content.clone();
+        self.cancel_note_edit();
+        self.margin_draft_at = Some(at);
+        self.margin_edit_id = Some(id);
+        self.note_draft = text.replace(['\n', '\r'], " ");
+        self.note_cursor = self.note_draft.chars().count();
+        self.note_editing = true;
+        self.note_suppress_commit = true;
+        self.popup = None;
+        self.notice = "改眉批：⏎ 存 · 清空即删 · Esc 弃".to_string();
+    }
+
+    /// 存一条天头眉批（新制）：`anchor_char_index` 绝对锚定。
+    pub fn push_margin_note(&mut self, anchor: usize, text: String) {
+        let text: String = text.chars().filter(|c| !matches!(c, '\n' | '\r')).collect();
+        if text.trim().is_empty() {
+            return;
+        }
+        let id = self
+            .book
+            .as_ref()
+            .map(|b| b.next_margin_id())
+            .unwrap_or_else(|| self.margin_notes.iter().map(|m| m.id).max().unwrap_or(0) + 1);
+        self.margin_notes
+            .push(crate::types::MarginNote::new(id, anchor, text));
+        if let Some(book) = self.book.as_mut() {
+            book.margin_notes = self.margin_notes.clone();
+        }
+        self.persist_book_json();
+        self.notice = format!("已题眉批 · 共 {} 条", self.margin_notes.len());
+    }
+
+    /// 删一条天头眉批（按 id）。
+    pub fn delete_margin_note(&mut self, id: u64) {
+        let before = self.margin_notes.len();
+        self.margin_notes.retain(|m| m.id != id);
+        if self.margin_notes.len() == before {
+            return;
+        }
+        if self.margin_hover == Some(id) {
+            self.margin_hover = None;
+            self.margin_hover_key = None;
+        }
+        if let Some(book) = self.book.as_mut() {
+            book.margin_notes = self.margin_notes.clone();
+        }
+        self.persist_book_json();
+        self.notice = format!("眉批已删 · 余 {} 条", self.margin_notes.len());
+    }
+
     pub fn push_head_note(&mut self, key: (usize, usize, usize), u: f32, v: f32, text: String) {
         // 同一处已有 → 向左让开一列（判据见 `HeadNote::free_u`）。
         let u = crate::types::HeadNote::free_u(&self.head_notes, key, u, v);
@@ -2187,8 +2318,12 @@ impl Root {
                         })
                         .sum(),
                 );
+                // v1.55.0：读档先规整——旧格式（u/v 眉批）直接清空、版本号
+                // 升到当前。用户明示旧数据是测试乱写的，不做迁移。
+                book.normalize_after_load();
                 // 天头眉批开卷时从书稿里取一次（之后增删改都回写同一份）。
                 self.head_notes = book.head_notes.clone();
+                self.margin_notes = book.margin_notes.clone();
                 self.head_anchor = None;
                 self.head_press = None;
                 // v1.48.0：换书即退出眉批管理 / 改写态（下标是属于上一本书的）。
@@ -2442,10 +2577,10 @@ impl Root {
                     // 统一管线支持的所有格式都在这里列上：html / xml
                     // 走同一条清洗链（剥 script/nav、em 转夹注）。
                     .add_filter(
-                        "书籍 (md / txt / html / xml / epub / json)",
+                        "书籍 (md / txt / html / xml / epub / docx / json)",
                         &[
                             "md", "markdown", "txt", "html", "htm", "xhtml", "xml",
-                            "epub", "json",
+                            "epub", "docx", "json",
                         ],
                     )
                     .add_filter("全部文件", &["*"])
@@ -4006,7 +4141,35 @@ impl Root {
 
     /// 保存草稿并退出编辑态。
     pub fn commit_note_edit(&mut self) {
-        // ★ 天头眉批优先：草稿是就地写在天头上的，⏎ 存进 `head_notes`
+        // ★ v1.55.0 新制天头眉批**最先判**：草稿锚在 `anchor_char_index` 上，
+        //   ⏎ 存进 `margin_notes`（旧制 `head_anchor` 的 u/v 分支在其后，
+        //   两者互斥，互不干扰）。
+        if let Some(at) = self.margin_draft_at.take() {
+            let text = std::mem::take(&mut self.note_draft);
+            let edit_id = self.margin_edit_id.take();
+            self.note_editing = false;
+            self.note_suppress_commit = false;
+            self.note_cursor = 0;
+            self.note_pos = None;
+            match (text.trim().is_empty(), edit_id) {
+                // 改写写空 = 抹掉这条（不留看不见的空条）。
+                (true, Some(id)) => self.delete_margin_note(id),
+                (true, None) => self.notice = "已取消眉批".to_string(),
+                (false, Some(id)) => {
+                    if let Some(n) = self.margin_notes.iter_mut().find(|m| m.id == id) {
+                        n.content = text;
+                    }
+                    if let Some(book) = self.book.as_mut() {
+                        book.margin_notes = self.margin_notes.clone();
+                    }
+                    self.persist_book_json();
+                    self.notice = format!("眉批已改 · 共 {} 条", self.margin_notes.len());
+                }
+                (false, None) => self.push_margin_note(at, text),
+            }
+            return;
+        }
+        // 天头眉批（旧制 u/v）：草稿是就地写在天头上的，⏎ 存进 `head_notes`
         //   而不是夹注 / 页眉批注（判断只认 `head_anchor` 一枚开关）。
         //   v1.48.0：`head_edit` 非空 = 改写已有眉批（原位换文 / 清空即抹）。
         if let Some((key, u, v)) = self.head_anchor.take() {
@@ -4083,6 +4246,8 @@ impl Root {
         self.note_edit_note = None;
         self.note_inject_key = None;
         self.head_anchor = None;
+        self.margin_draft_at = None;
+        self.margin_edit_id = None;
         // v1.48.0：放弃改写也退出改写态（否则下一条新批会被当成改写）。
         self.head_edit = None;
         self.note_draft.clear();
