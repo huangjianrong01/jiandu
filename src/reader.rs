@@ -552,15 +552,32 @@ fn banxin_tail(w: f32, h: f32, top: bool, color: u32) -> Div {
                 }
                 let x0 = b.origin.x / unit;
                 let y0 = b.origin.y / unit;
-                // 五点直线多边形（宋版刀法，绝不贝塞尔）：平顶实心条 +
-                // 下缘中央一道**浅 V** 口（`TAIL_NOTCH_Y` 越大口越浅）。
+                // ── v1.59.0：路径显式化（`move_to` / `line_to` 逐点走）────
+                // 旧制一句 `add_polygon` 把整串点喂进去，几何点埋在向量里，
+                // 想单挪其中一点（比如把 V 口挪左挪右、把两翼收窄）就得翻
+                // 生成它的函数。改成逐点显式落笔后，**每一枚顶点在这里都是
+                // 一行独立坐标**——改形状只动这里，不动 `banxin` 的算法。
+                //
+                // 五点走法（宋版刀法，绝不贝塞尔）：
+                //   ① 左上 → ② 右上 → ③ 右下 → ④ 底缘中央（V 口尖）
+                //   → ⑤ 左下 → 合回 ①
+                // 上鱼尾 V 口开在**下缘**（朝下咬），下鱼尾镜像开在**上缘**。
                 let pts = crate::banxin::fishtail_points(top, bh);
-                let poly: Vec<_> = pts
-                    .iter()
-                    .map(|(fx, fy)| point(px(x0 + fx * bw / 100.0), px(y0 + *fy)))
-                    .collect();
+                let at = |fx: f32, fy: f32| point(px(x0 + fx * bw / 100.0), px(y0 + fy));
+                let (p1, p2, p3, p4, p5) = (
+                    at(pts[0].0, pts[0].1), // 左上平角
+                    at(pts[1].0, pts[1].1), // 右上平角：两翼端点压在左右界栏上
+                    at(pts[2].0, pts[2].1), // 右下
+                    at(pts[3].0, pts[3].1), // 中央 V 口尖（`TAIL_NOTCH_Y` 越深口越浅）
+                    at(pts[4].0, pts[4].1), // 左下
+                );
                 let mut pb = PathBuilder::fill();
-                pb.add_polygon(&poly, true);
+                pb.move_to(p1); // ① 起笔：左上一角
+                pb.line_to(p2); // ② 平顶横扫到右缘（满中缝宽）
+                pb.line_to(p3); // ③ 沿右缘下行到右下
+                pb.line_to(p4); // ④ 斜上咬进中央 V 口尖
+                pb.line_to(p5); // ⑤ 斜下回到左下
+                pb.line_to(p1); // 合笔：沿左缘回到起点，闭合
                 if let Ok(path) = pb.build() {
                     window.paint_path(path, rgb(color));
                 }
@@ -4843,10 +4860,27 @@ impl Root {
     /// 另外记号本身被 `punct::place` 夹在字格内（有单测钉死），
     /// 版框在字格之外，二者物理上不相交；中缝栏虽有
     /// `overflow_hidden`，但句读在两叶里、不在中缝里，淋不到。
-    fn punct_overlay(&self, ch: char, cell_w: f32, cell_h: f32, fs: f32, back: bool) -> Div {
+    /// 句读浮层。`hung = true` 时走**悬挂**落位（X 推到字格右缘，与末字错开）。
+    fn punct_overlay(
+        &self,
+        ch: char,
+        cell_w: f32,
+        cell_h: f32,
+        fs: f32,
+        back: bool,
+        hung: bool,
+    ) -> Div {
         // 几何（纯函数、有单测）：直径 = 正文 × 0.35、中心钉在格内
         // 70% × 70% 的右下象限，绝不居中、绝不溢出。
-        let m = crate::punct::place(fs, cell_w, cell_h, crate::punct::kind_of(ch));
+        // ── v1.59.0：悬挂句读（`hung`）改走 `place_hang` ──────────────
+        // 它是被挤进**末字格**的那枚，与末字共格；X 若仍取 70% 就压在末字
+        // 字身上，看着像叠字。推到 86% 才「挂」在字旁。它只在本格内取值，
+        // 绝不占列首格位——列首顶格（top_baseline）因此不受影响。
+        let m = if hung {
+            crate::punct::place_hang(fs, cell_w, cell_h, crate::punct::kind_of(ch))
+        } else {
+            crate::punct::place(fs, cell_w, cell_h, crate::punct::kind_of(ch))
+        };
         let ink = self.punct_ink(back);
         // 浮层铺满字格：canvas 的 paint 闭包收到的是**窗口坐标**的
         // bounds，把字格原点（ox/oy）加回记号中心即可。
@@ -5162,7 +5196,7 @@ impl Root {
             // 有单测），这里只照抄——**严禁**在这里回落字体字形或 SVG。
             cell = cell
                 .relative()
-                .child(self.punct_overlay(g.ch, cell_w, cell_h, fs, back));
+                .child(self.punct_overlay(g.ch, cell_w, cell_h, fs, back, false));
         } else if crate::west::is_west_hyphen(g.ch) {
             // 单独出现的连字符：竖排里旋转成一道竖线（丨）。
             cell = cell.child(
@@ -5182,6 +5216,15 @@ impl Root {
             cell = cell.child(
                 div()
                     .text_size(px(fs))
+                    // ── v1.59.0 首行顶格的**另一半**：行盒锁死 ──────────
+                    // 列容器已锚 `grid::top_baseline`，但光锚容器不够：字格的
+                    // 文字若不显式给定行高，行盒就跟着字体的默认行距走——宋体
+                    // 与楷体的默认行距不同，首字在格内的视觉起点便差出几像素，
+                    // 「换字体→首行下沉」就是这么来的。这里把行盒**显式钉成
+                    // 格高**（GPUI 没有 textBaseline 开关，line_height 就是
+                    // 它的等价物），字形在格内的位置只由格高决定，与字体无关。
+                    // 纯样式层：不改格宽高、不改分页、不改命中矩形。
+                    .line_height(px(cell_h))
                     .text_color(rgb(ink))
                     .child(SharedString::from(shown)),
             );
@@ -5191,7 +5234,7 @@ impl Root {
         if let Some(h) = hang {
             cell = cell
                 .relative()
-                .child(self.punct_overlay(h.ch, cell_w, cell_h, fs, back));
+                .child(self.punct_overlay(h.ch, cell_w, cell_h, fs, back, true));
         }
         // 书名号：贴**本格右上角**、0.7 倍正文。开号在本格（书名首字）、
         // 闭号也在本格（书名末字）——一格至多各一枚，绝不单独占列。

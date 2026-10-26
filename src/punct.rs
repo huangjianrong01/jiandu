@@ -42,6 +42,15 @@ pub const FS_RATIO: f32 = 0.35;
 pub const ANCHOR_X: f32 = 0.70;
 /// 句读落点 / 字格高：记号**中心**落在格高的 70% 处。
 pub const ANCHOR_Y: f32 = 0.70;
+/// **悬挂**句读的落点 / 字格宽（v1.59.0）：比常规更靠右，贴到字格右缘。
+///
+/// 常规句读独占一格，落 70% 是「格内右下」；悬挂句读是**挤进末字那一格**的，
+/// 它和末字共格——若仍落 70%，记号会压在末字的字身上，看着像「叠字」而不是
+/// 「悬挂」。推到 0.86，记号贴着字格右缘挂出去，与末字的字身在 X 上错开，
+/// 才是刻本里那枚「挂」在字旁的手写读点。
+pub const HANG_ANCHOR_X: f32 = 0.86;
+/// **悬挂**句读的落点 / 字格高：比常规更靠下，沉到末字的脚下。
+pub const HANG_ANCHOR_Y: f32 = 0.80;
 /// 线宽 / 记号直径：空心圈与弧线的粗细。
 ///
 /// 0.22 是「细而不虚」的一档：圈径 7.7px 时线宽 1.7px，内孔仍有 4.3px，
@@ -140,6 +149,31 @@ pub fn place(fs_body: f32, cell_w: f32, cell_h: f32, kind: PunctKind) -> PunctMa
     }
 }
 
+/// **悬挂**句读的落位（v1.59.0）：X 走 [`HANG_ANCHOR_X`]，与常规句读分家。
+///
+/// 只有**被挤压进末字格**的那枚句读走这里（分页层 `GlyphKind::Hang`）。
+/// 它不独占格位，故：
+///
+/// * X 推到字格右缘并与末字错开——这是「悬挂」，不是「叠在字上」；
+/// * 纵向沉到末字脚下（[`HANG_ANCHOR_Y`]）；
+/// * **绝不顶格**：X 只在本格内取值，永不落到列首格位上——悬挂标点的
+///   存在与否，完全不改变下一列首字的 `top_baseline`。
+///
+/// 夹紧规则与 [`place`] 同：整个记号（含线宽）不探出字格，绝不压到邻列。
+pub fn place_hang(fs_body: f32, cell_w: f32, cell_h: f32, kind: PunctKind) -> PunctMark {
+    let m = place(fs_body, cell_w, cell_h, kind);
+    let half = m.d * 0.5 + m.stroke;
+    let cx = (cell_w * HANG_ANCHOR_X).clamp(half, (cell_w - half).max(half));
+    let cy = (cell_h * HANG_ANCHOR_Y).clamp(half, (cell_h - half).max(half));
+    PunctMark {
+        kind,
+        d: m.d,
+        cx,
+        cy,
+        stroke: m.stroke,
+    }
+}
+
 /// **手绘**一枚句读：纯 `paint_path`，绝不调用字体的 `，。` 字形。
 ///
 /// `cx` / `cy` 是记号中心在**窗口**里的坐标（调用方把字格原点加好）。
@@ -219,6 +253,39 @@ mod tests {
         // 句号约正字三分之一高：一眼是「点」不是「字」。
         let m = place(34.0, 40.0, 44.0, PunctKind::Dot);
         assert!(m.d < 34.0 * 0.4, "句读仍偏大：{}", m.d);
+    }
+
+    /// 悬挂句读的 X 必须比常规更靠右——否则它压在末字身上，是「叠字」不是「悬挂」。
+    #[test]
+    fn hanged_punct_hangs_to_the_right_of_the_normal_one() {
+        for fs in [12.0, 21.9, 34.0, 60.0] {
+            let (cw, ch) = cell(fs);
+            let plain = place(fs, cw, ch, PunctKind::Dot);
+            let hung = place_hang(fs, cw, ch, PunctKind::Dot);
+            assert!(
+                hung.cx > plain.cx + 1e-6,
+                "悬挂未向右挂出：{} ≤ {}",
+                hung.cx,
+                plain.cx
+            );
+            assert!(hung.cy >= plain.cy - 1e-6, "悬挂未下沉：{hung:?}");
+            // 共格不叠字：记号右缘要把末字字身让出来（≥ 格宽 60%）。
+            assert!(hung.cx > cw * 0.60, "悬挂仍压在末字身上：{}", hung.cx);
+        }
+    }
+
+    /// **绝不顶格**：悬挂只在本格内取值，永不越到列首格位。
+    #[test]
+    fn hanged_punct_never_claims_a_head_cell() {
+        for fs in [12.0, 21.9, 34.0, 60.0] {
+            let (cw, ch) = cell(fs);
+            let m = place_hang(fs, cw, ch, PunctKind::Arc);
+            // 记号整体（含线宽）必须留在本格内：不探出右缘、不探出下缘。
+            let half = m.d * 0.5 + m.stroke;
+            assert!(m.cx + half <= cw + 0.01, "悬挂探出右缘：{m:?} / cw={cw}");
+            assert!(m.cy + half <= ch + 0.01, "悬挂探出下缘：{m:?} / ch={ch}");
+            assert!(m.cx - half >= -0.01, "悬挂探出左缘：{m:?}");
+        }
     }
 
     #[test]

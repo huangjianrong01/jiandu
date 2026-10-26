@@ -6,9 +6,14 @@
 //! 屏幕、窗口、权限全部无关。
 //!
 //! 两处必防雷（用户点名）：
-//! 1. **坐标系翻转**：`CGBitmapContextCreate` 出来的是 CG 坐标（原点**左下**、
-//!    y 向上），而版式数据是屏幕坐标（原点左上、y 向下）。不翻就整张上下颠倒。
-//!    故一开上下文就 `translate(0, h)` + `scale(1, -1)`，此后一律按左上原点落笔。
+//! 1. **坐标系换算（v1.59.0 重写，勿退回旧法）**：`CGBitmapContextCreate`
+//!    出来的是 CG 坐标（原点**左下**、y 向上），而版式数据是屏幕坐标（原点
+//!    左上、y 向下）。
+//!    ⚠️ **绝不能用 `translate(0,h) + scale(1,-1)` 翻 CTM** —— 那是 v1.58
+//!    的 bug：CTM 一翻，**字形也跟着被垂直镜像**，矩形对称看不出事，每个字
+//!    却被上下颠倒（用户实测「整个图是镜像反的、字是躺着的」）。
+//!    正解是**不动 CTM**，只把每个元素的 y 做一次换算（见 [`cg_y`]）：
+//!    矩形取「顶边 → CG 底边」，文字取「基线 → CG 基线」。字形因此恒为正向。
 //! 2. **CFRelease / 泄漏**：用到的 CoreFoundation 对象（`CGContext` /
 //!    `CGColorSpace` / `CTFont`）都是 Rust 侧 `TCFType` 包装，`Drop` 自动
 //!    `CFRelease`——不手动 retain、不用 `into_raw`、不 `mem::forget`。
@@ -55,8 +60,19 @@ fn pick_font(kind: ShareFont, fs: f64) -> Result<core_text::font::CTFont, String
     Err("系统里找不到可用的中文字体".to_string())
 }
 
-/// 一枚字的落笔点（字形原点 = 基线）：字格内居中，标点靠右上小盒。
-fn glyph_origin(c: &PlacedChar, asc: f64, desc: f64) -> (f64, f64) {
+/// 一枚字的落笔点（字形原点 = 基线）：**字形顶边贴住字格顶 `y`**。
+///
+/// CoreText 的基线语义：字形最高点 = `baseline − ascent`。要让最高点正好压在
+/// 字格顶 `y` 上，基线就得**往下沉一个 ascent**：
+///
+/// ```text
+/// baseline = y + ascent        // ← 屏幕坐标（左上原点，y 向下）
+/// ```
+///
+/// 直接把 `y` 当基线传进去是错的（那会把整字画到格顶**之上**）。列首字的
+/// `y` 就是版式层的 `y0`（＝ `share_layout::TOP_BASELINE`），故每列第一个字的
+/// **最高点**统统钉在同一条线上——这才是「首行顶格」。
+fn glyph_origin(c: &PlacedChar, asc: f64) -> (f64, f64) {
     let (gx, gy, gfs) = if c.punct {
         punct_box(c)
     } else {
@@ -64,12 +80,12 @@ fn glyph_origin(c: &PlacedChar, asc: f64, desc: f64) -> (f64, f64) {
     };
     let fs = gfs as f64;
     if c.punct {
-        // 句读：小盒左上起笔，基线压在盒底偏上（竖排句读挂右上角）。
+        // 句读：小盒内同样按「顶边贴盒顶」落，基线沉一个 ascent 的比例量。
         (gx as f64, gy as f64 + fs * 0.86)
     } else {
-        // 居中：字形盒（asc 上 / desc 下）的中心对齐字格中心。
+        // 横向：字形在字格里居中（左右均分）；纵向：顶边贴格顶（`+ asc`）。
         let x = gx as f64 + c.cell as f64 * 0.5 - fs * 0.5;
-        let baseline = gy as f64 + c.cell as f64 * 0.5 + (asc - desc) * 0.5;
+        let baseline = gy as f64 + asc;
         (x, baseline)
     }
 }
@@ -82,9 +98,14 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
     // ---- 位图上下文（Drop → CGContextRelease；ColorSpace 同理）----
     let space = CGColorSpace::create_device_rgb();
     let mut ctx = CGContext::create_bitmap_context(None, w, h, 8, w * 4, &space, BITMAP_INFO);
-    // 防雷 ①：翻成「左上原点、y 向下」，与 CardLayout 同构。
-    ctx.translate(0.0, h as f64);
-    ctx.scale(1.0, -1.0);
+    // 防雷 ①：**不翻 CTM**。整幅坐标仍走 CG 原生（原点左下、y 向上），
+    // 每个元素落笔前用 `cg_*` 把屏幕坐标（左上原点）换算过来。
+    // 位图缓冲的第 0 行是图像**顶行**，故「屏幕 y」与「缓冲行号」同序。
+    let hf = h as f64;
+    // 矩形顶边（屏幕 y）→ CG 底边 y：矩形整体镜像到下半平面。
+    let cg_top = move |y_top: f64, hgt: f64| hf - y_top - hgt;
+    // 基线（屏幕 y）→ CG 基线：**只做镜像，不做缩放**，字形因此保持正向。
+    let cg_base = move |y: f64| hf - y;
     ctx.set_allows_antialiasing(true);
     ctx.set_should_antialias(true);
 
@@ -100,7 +121,7 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
     for r in &l.rects {
         let (cr, cg, cb, ca) = rgba(r.color);
         let rect = CGRect::new(
-            &CGPoint::new(r.x as f64, r.y as f64),
+            &CGPoint::new(r.x as f64, cg_top(r.y as f64, r.h as f64)),
             &CGSize::new(r.w as f64, r.h as f64),
         );
         match r.stroke {
@@ -117,20 +138,20 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
     }
 
     // ---- 正文 / 批注 / 落款：逐字落笔 ----
-    let mut fonts: Vec<(i32, core_text::font::CTFont, f64, f64)> = Vec::new();
+    let mut fonts: Vec<(i32, core_text::font::CTFont, f64)> = Vec::new();
     for c in &l.chars {
         let key = (c.fs * 4.0).round() as i32;
-        let (font, asc, desc) = match fonts.iter().position(|(k, _, _, _)| *k == key) {
-            Some(i) => (fonts[i].1.clone(), fonts[i].2, fonts[i].3),
+        let (font, asc) = match fonts.iter().position(|(k, _, _)| *k == key) {
+            Some(i) => (fonts[i].1.clone(), fonts[i].2),
             None => {
                 let f = pick_font(l.font, c.fs as f64)?;
-                let a = f.ascent();
-                let d = f.descent();
-                fonts.push((key, f.clone(), a, d));
-                (f, a, d)
+                // 拿不到 ascent 就按字号的经验比例兜底，绝不因此崩整张卡。
+                let a = if f.ascent() > 0.0 { f.ascent() } else { c.fs as f64 * 0.88 };
+                fonts.push((key, f.clone(), a));
+                (f, a)
             }
         };
-        let (gx, gy) = glyph_origin(c, asc, desc);
+        let (gx, gy) = glyph_origin(c, asc);
         // char → CGGlyph：UTF-16 码元（古籍用字都在 BMP，一个码元够用）。
         let mut unit: [u16; 1] = [0];
         c.ch.encode_utf16(&mut unit);
@@ -143,7 +164,10 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
         ctx.set_rgb_fill_color(fr, fg, fb, 1.0);
         // `draw_glyphs` 按值取 context：`clone()` 底层是 `CGContextRetain`，
         // 随调用结束 drop（release），一增一减，绝不泄漏。
-        font.draw_glyphs(&[glyph], &[CGPoint::new(gx, gy)], ctx.clone());
+        // ⚠️ 竖排**不旋转字形**：方块汉字竖排靠「纵向依次排列」实现，
+        // 逐字落笔即可，转 90° 反而把字放倒。这里只把基线镜像到 CG 侧，
+        // 字形本身保持正向（CTM 未翻，故无镜像）。
+        font.draw_glyphs(&[glyph], &[CGPoint::new(gx, cg_base(gy))], ctx.clone());
     }
 
     // ---- 朱批引线 ----
@@ -152,14 +176,14 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
         ctx.set_rgb_stroke_color(r, g, b, a);
         ctx.set_line_width(ln.width as f64);
         ctx.begin_path();
-        ctx.move_to_point(ln.x1 as f64, ln.y1 as f64);
-        ctx.add_line_to_point(ln.x2 as f64, ln.y2 as f64);
+        ctx.move_to_point(ln.x1 as f64, cg_base(ln.y1 as f64));
+        ctx.add_line_to_point(ln.x2 as f64, cg_base(ln.y2 as f64));
         ctx.stroke_path();
     }
 
     // ---- 朱印 ----
     if let Some(s) = &l.seal {
-        paint_seal(&ctx, s, l.bg);
+        paint_seal(&ctx, s, l.bg, hf);
     }
 
     // ---- 取像素 → PNG ----
@@ -188,12 +212,14 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
 /// 朱砂方章：**纯色红方块 + 黑色「笺读」二字**（横排居中）。
 ///
 /// 先跑通闭环：不画鱼尾、不刻书名——印就是一枚朱砂底、墨字落款的方章。
-fn paint_seal(ctx: &CGContext, s: &PlacedSeal, _paper: u32) {
+fn paint_seal(ctx: &CGContext, s: &PlacedSeal, _paper: u32, h: f64) {
     let (r, g, b) = rgb(CINNABAR);
     let sz = s.size as f64;
     ctx.set_rgb_fill_color(r, g, b, 1.0);
+    // 方章是实心块，顶边镜像即可（对称图形，翻不翻看不出——但坐标必须换，
+    // 否则它会跑到画布上端去）。
     ctx.fill_rect(CGRect::new(
-        &CGPoint::new(s.x as f64, s.y as f64),
+        &CGPoint::new(s.x as f64, h - s.y as f64 - sz),
         &CGSize::new(sz, sz),
     ));
 
@@ -203,9 +229,9 @@ fn paint_seal(ctx: &CGContext, s: &PlacedSeal, _paper: u32) {
         Ok(f) => f,
         Err(_) => return, // 没有字体就不刻字，方块照样在——绝不因印文失败整张图。
     };
-    let asc = font.ascent();
-    let desc = font.descent();
-    let baseline = s.y as f64 + sz * 0.5 + (asc - desc) * 0.5;
+    // 印文基线：字形顶边贴住「方块内居中位」，再镜像到 CG 侧。
+    let asc = if font.ascent() > 0.0 { font.ascent() } else { fs * 0.88 };
+    let baseline = h - (s.y as f64 + sz * 0.5 - fs * 0.5 + asc);
     for (i, ch) in ['\u{7b46}', '\u{8b80}'].iter().enumerate() {
         let mut unit: [u16; 1] = [0];
         ch.encode_utf16(&mut unit);
@@ -276,5 +302,114 @@ mod tests {
                 println!("已出图：{}", dest.display());
             }
         }
+    }
+
+    /// **字形正向 + 绝对顶格**（v1.59.0 回归防线）
+    ///
+    /// 用两个上下不对称的探针字把「镜像」钉死：「丁」横在顶（墨迹重心偏上）、
+    /// 「上」横在底（重心偏下）。字形一旦被垂直镜像，两条断言必然崩。
+    #[test]
+    fn glyphs_are_upright_and_columns_start_on_the_baseline() {
+        let body: Vec<char> = "丁上道德經第一章道可道非常道名可名非常名無名天地之始有名萬物之母"
+            .chars()
+            .collect();
+        let red = vec![false; body.len()];
+        let spec = LayoutSpec {
+            body: &body,
+            red: &red,
+            note: "",
+            show_notes: false,
+            sign: "道德經 · 第一章",
+            show_sign: true,
+            date: "二〇二六年十月",
+            show_date: true,
+            columns: 12,
+            bg: ShareBg::Xuan,
+            frame: ShareFrame::None,
+            seal: ShareSeal::Twin,
+            seal_text: "笺讀",
+            font: ShareFont::Song,
+            w: 1080.0,
+            h: 1920.0,
+        };
+        let l = layout(&spec);
+        let png = render_png(&l).expect("离屏出图失败");
+        let img = image::load_from_memory(&png).expect("PNG 读不回来").to_rgb8();
+        let (iw, ih) = (img.width(), img.height());
+        let br = ((l.bg >> 16) & 0xFF) as i32;
+        let bgg = ((l.bg >> 8) & 0xFF) as i32;
+        let bb = (l.bg & 0xFF) as i32;
+        let is_ink = |x: u32, y: u32| {
+            let p = img.get_pixel(x, y);
+            (p[0] as i32 - br).abs() + (p[1] as i32 - bgg).abs() + (p[2] as i32 - bb).abs() > 120
+        };
+        // 某字格内墨迹重心：归一到 −1（格顶）… +1（格底）。
+        let bias = |ch: char| -> Option<f64> {
+            let c = l.chars.iter().find(|c| c.ch == ch)?;
+            let s = c.cell.max(1.0) as u32;
+            let (x0, y0) = (c.x.max(0.0) as u32, c.y.max(0.0) as u32);
+            let (mut sy, mut n) = (0.0f64, 0.0f64);
+            for y in y0..(y0 + s).min(ih) {
+                for x in x0..(x0 + s).min(iw) {
+                    if is_ink(x, y) {
+                        sy += (y - y0) as f64;
+                        n += 1.0;
+                    }
+                }
+            }
+            if n < 8.0 {
+                return None;
+            }
+            Some((sy / n / s as f64) * 2.0 - 1.0)
+        };
+        let ding = bias('丁').expect("「丁」没画上");
+        let shang = bias('上').expect("「上」没画上");
+        println!("探针字墨迹重心：丁={ding:+.3}（应为负＝偏上）　上={shang:+.3}（应为正＝偏下）");
+        // 印章（朱砂）重心应在左下。
+        let (mut sx, mut sy, mut sn) = (0.0f64, 0.0f64, 0.0f64);
+        for y in 0..ih {
+            for x in 0..iw {
+                let p = img.get_pixel(x, y);
+                if p[0] > 140 && p[1] < 110 && p[2] < 110 {
+                    sx += x as f64;
+                    sy += y as f64;
+                    sn += 1.0;
+                }
+            }
+        }
+        assert!(sn > 0.0, "没找到朱砂像素");
+        println!(
+            "朱砂重心：x={:.0}/{iw}　y={:.0}/{ih}（应偏左下）",
+            sx / sn,
+            sy / sn
+        );
+        // 首行顶格：**正文**每一列第一个字的 y 必须彼此相等。
+        // 落款 / 批注是小字（字号不同、位置也不同），先按「正文字号」剔掉，
+        // 否则会把左下角的落款误当成一列正文。
+        let body_fs = l
+            .chars
+            .iter()
+            .map(|c| c.fs)
+            .fold(0.0f32, f32::max);
+        let head: Vec<f32> = {
+            let mut seen = std::collections::HashSet::new();
+            l.chars
+                .iter()
+                .filter(|c| !c.punct && (c.fs - body_fs).abs() < 0.01)
+                .filter(|c| seen.insert((c.x * 4.0).round() as i64))
+                .map(|c| c.y)
+                .collect()
+        };
+        println!("各列首字 y：{head:?}");
+        assert!(head.len() >= 2, "列数太少，顶格无从验证：{}", head.len());
+        let y_first = head[0];
+        for y in &head {
+            assert!(
+                (y - y_first).abs() < 0.01,
+                "列首未对齐基准线：{y} ≠ {y_first}"
+            );
+        }
+        assert!(ding < 0.0, "「丁」重心偏下，字形被垂直镜像了：{ding:+.3}");
+        assert!(shang > 0.0, "「上」重心偏上，字形被垂直镜像了：{shang:+.3}");
     }
 }

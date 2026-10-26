@@ -147,6 +147,28 @@ pub const META_FS_RATIO: f32 = 0.40;
 /// 朱批引线宽（px，按卡片宽缩放后的值）。
 pub const LEAD_W: f32 = 1.0;
 
+/// **列首字的绝对基准线**（v1.59.0）：所有列的第一个字，顶边一律从它起算。
+///
+/// 取 0 是刻意的——基准线本身不带任何位移，位移只来自版框天头（见
+/// [`top_baseline`]）。渲染层（GPUI 预览 / CoreGraphics 出图）都只读这一个
+/// 常量，谁也不许就地加偏移：两处算法一旦分家，顶格就悄悄漂了。
+pub const TOP_BASELINE: f32 = 0.0;
+
+/// 列首基准线的**唯一取用口径**：`TOP_BASELINE + 版框内居中后的天头留白`。
+///
+/// 正文块在版框内垂直居中，多出来的余量落在天头与地脚各一半；这段留白是
+/// 基准线允许的唯一位移，且只由本函数给出。
+pub fn top_baseline(inner_y: f32, inner_h: f32, block_h: f32) -> f32 {
+    TOP_BASELINE + inner_y + ((inner_h - block_h) * 0.5).max(0.0)
+}
+
+/// **列首标点**（逗号 / 句号等）挂到版框**外侧**（最右列之右）时的横向外探量
+/// （字格比例）。标点被挂出去后**不再占列内格位**，正文首字因此仍钉在
+/// [`TOP_BASELINE`] 上——禁则（避头尾）绝不牺牲顶格。
+pub const HEAD_PUNCT_OUTSET: f32 = 0.30;
+/// 多枚列首标点连排时，在框外的纵向错开量（字格比例），避免叠成一坨。
+pub const HEAD_PUNCT_STEP: f32 = 0.60;
+
 /// 竖排里需要「靠右上安置」的标点（占半格、不顶格）。
 pub fn is_punct(c: char) -> bool {
     matches!(
@@ -244,15 +266,38 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
     let x0 = inner_x + ((inner_w - block_w - note_cols as f32 * cell) * 0.5).max(0.0)
         + note_cols as f32 * cell;
     // 铁律 1：列首 y 恒等于 y0 —— 每列都从这里起笔，绝不因列长而错动。
-    let y0 = inner_y + ((inner_h - block_h) * 0.5).max(0.0);
+    // 基准线只由 `top_baseline` 给出（`TOP_BASELINE` 是它的零点）。
+    let y0 = top_baseline(inner_y, inner_h, block_h);
 
     // ---- 正文：从右向左，逐格落字 ----
     let mut first_marked: Option<usize> = None;
+    // 列内占格游标：与「源串下标 i」分家——列首标点被挂出框外后**不占格位**，
+    // 故它不推进游标，正文首字因此仍落在 row 0（＝基准线）。
+    let (mut col, mut row, mut hung) = (0usize, 0usize, 0usize);
     for (i, &ch) in s.body.iter().enumerate().take(shown) {
-        let col = i / rows_used.max(1);
-        let row = i % rows_used.max(1);
-        let x = x0 + (cols_used as f32 - 1.0 - col as f32) * cell;
-        let y = y0 + row as f32 * cell;
+        // 禁则·列首标点悬挂（v1.59.0）：这一格若落在列首、且是句读，
+        // 就**不占格**，改挂到版框右缘之外（X 轴偏移），正文照旧顶格。
+        let head_punct = row == 0 && is_punct(ch);
+        let x = if head_punct {
+            inner_x + inner_w + cell * HEAD_PUNCT_OUTSET
+        } else {
+            x0 + (cols_used as f32 - 1.0 - col as f32) * cell
+        };
+        let y = if head_punct {
+            y0 + hung as f32 * cell * HEAD_PUNCT_STEP
+        } else {
+            y0 + row as f32 * cell
+        };
+        if head_punct {
+            hung += 1;
+        } else {
+            row += 1;
+            if row >= rows_used.max(1) {
+                row = 0;
+                col += 1;
+                hung = 0;
+            }
+        }
         let marked = s.red.get(i).copied().unwrap_or(false);
         if marked && first_marked.is_none() {
             first_marked = Some(i);
