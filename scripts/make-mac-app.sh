@@ -14,8 +14,8 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP_NAME="笺读"
 BUNDLE_ID="com.jiandu.app"
-VERSION="1.55.0"
-BUILD_NUM="69"
+VERSION="1.57.0"
+BUILD_NUM="101"
 MIN_MACOS="12.0"
 
 DIST="$ROOT/dist"
@@ -56,6 +56,15 @@ if [ -d "$ROOT/resources/fonts" ] && ls "$ROOT/resources/fonts"/*.otf "$ROOT/res
     echo "✓ 已打包随包字体：$(ls "$APP/Contents/Resources/fonts" | tr '\n' ' ')"
 else
     echo "· 无随包字体（将回退到系统宋体 / 思源，可在 resources/fonts/ 放入 .otf 后重新打包）"
+fi
+
+# ---- 4.5) 随包资源：内置书目（运行时读 Resources/books，方便热更新） ----
+if [ -d "$ROOT/resources/books" ] && ls "$ROOT/resources/books"/*.json >/dev/null 2>&1; then
+    mkdir -p "$APP/Contents/Resources/books"
+    cp "$ROOT/resources/books"/*.json "$APP/Contents/Resources/books/" 2>/dev/null || true
+    echo "✓ 已打包内置书目：$(ls "$APP/Contents/Resources/books" | tr '\n' ' ')"
+else
+    echo "· 无 resources/books/（内置书目将缺失，首启书架会空）"
 fi
 
 # ---- 5) App 图标：PNG → icns ----
@@ -184,12 +193,47 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 echo "✓ Info.plist 已写入"
 
-# ---- 7) ad-hoc 签名（本地运行更顺；联网分发需 Apple Developer 证书） ----
-codesign --force --deep --sign - "$APP" 2>/dev/null && echo "✓ ad-hoc 签名完成" || echo "· 跳过签名（不影响本地运行）"
-if codesign --verify --deep "$APP" 2>/dev/null; then
-    echo "✓ 签名校验通过"
+# ---- 7) 签名 ----
+if [ "${APPSTORE:-0}" = "1" ]; then
+    # —— App Store 分发：用正式的「3rd Party Mac Developer」证书 ——
+    APP_CERT="${APP_CERT:?请先设置 APP_CERT，例如 '3rd Party Mac Developer Application: Your Name (TEAMID)'}"
+    INSTALLER_CERT="${INSTALLER_CERT:?请先设置 INSTALLER_CERT，例如 '3rd Party Mac Developer Installer: Your Name (TEAMID)'}"
+    PROFILE="${PROVISIONING_PROFILE:-$ROOT/scripts/embedded.provisionprofile}"
+    if [ ! -f "$PROFILE" ]; then
+        echo "✗ 找不到 provisioning profile：$PROFILE"
+        echo "  在 Developer Portal 下载「Mac App Store」类型的 profile 放到此处，或设 PROVISIONING_PROFILE=路径"
+        exit 1
+    fi
+    cp "$PROFILE" "$APP/Contents/embedded.provisionprofile"
+    echo "✓ 已嵌入 provisioning profile"
+
+    # 用 entitlements + 强化运行时（App Store 必须）签名应用
+    codesign --force --deep --sign "$APP_CERT" \
+        --entitlements "$ROOT/jiandu.entitlements" \
+        --options runtime "$APP"
+    if codesign --verify --deep --strict "$APP" 2>/dev/null; then
+        echo "✓ App Store 应用签名校验通过"
+    else
+        echo "✗ 应用签名校验失败"
+        exit 1
+    fi
+
+    # 打包成 .pkg（用 Installer 证书），供上传 App Store Connect
+    PKG="$DIST/${APP_NAME}-${VERSION}-${BUILD_NUM}.pkg"
+    productbuild --sign "$INSTALLER_CERT" \
+        --component "$APP" /Applications \
+        "$PKG"
+    echo "✓ 已生成安装包：$PKG"
+    echo ""
+    echo "   下一步：用 Transporter（或 Xcode Organizer）上传 $PKG 到 App Store Connect。"
 else
-    echo "· 签名校验未通过（本地运行通常无碍；如报 sealed resource，重新执行本脚本即可）"
+    # —— 本地 / 直接分发：ad-hoc 签名 ——
+    codesign --force --deep --sign - "$APP" 2>/dev/null && echo "✓ ad-hoc 签名完成" || echo "· 跳过签名（不影响本地运行）"
+    if codesign --verify --deep "$APP" 2>/dev/null; then
+        echo "✓ 签名校验通过"
+    else
+        echo "· 签名校验未通过（本地运行通常无碍；如报 sealed resource，重新执行本脚本即可）"
+    fi
 fi
 
 # ---- 8) 收尾 ----

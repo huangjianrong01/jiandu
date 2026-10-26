@@ -1007,8 +1007,55 @@ pub fn purge_running_headers(chapters: &mut Vec<crate::types::Chapter>, book_tit
 ///
 /// 版心只有一格宽，书名多一个字就挤掉一个卷次；而 `dc:title` 里常带着
 /// 「历代名家词集精华录卷十九」这种整条书眉——从「卷」「册」「（」处截断。
+/// **英文连字符 → 中圆点**（v1.56.0）。
+///
+/// 网盘 / z-library 的文件名爱用 `--` 分词（「庄子--中华经典名著全…」），
+/// 版心只有一格宽，排出来是一串 hyphen，既西式又占格。古籍的正规分隔是
+/// 中圆点 `·`，故一律换算：`-` / `–` / `—` / `－` 等连字符（连续算一个）
+/// → 一个 `·`；行首行尾的杂线直接丢，不留下空点。
+pub fn hyphen_to_dot(s: &str) -> String {
+    let is_hyphen = |c: char| {
+        matches!(
+            c,
+            '-' | '‐' | '‑' | '‒' | '–' | '—' | '―' | '－' | '_'
+        )
+    };
+    let mut out = String::new();
+    let mut pending = false;
+    let mut just_dot = false;
+    for c in s.chars() {
+        if is_hyphen(c) {
+            pending = true;
+            continue;
+        }
+        if pending {
+            pending = false;
+            // 只在「前面已有字」时才落点：行首的连字符丢掉不留点。
+            // 落点前先抹掉点前的空白（`庄子 --内篇` → `庄子·内篇`）。
+            while out.ends_with(' ') || out.ends_with('　') {
+                out.pop();
+            }
+            if !out.is_empty() && !out.ends_with('·') {
+                out.push('·');
+                just_dot = true;
+            }
+        }
+        // 点后紧跟的空白吃掉：点两侧不留缝（「庄子 - 内篇」→「庄子·内篇」）。
+        if just_dot && c.is_whitespace() {
+            continue;
+        }
+        out.push(c);
+        just_dot = false;
+    }
+    // 结尾的连字符一律丢弃（`pending` 不再兑现）。
+    out
+}
+
 pub fn clean_book_title(raw: &str) -> String {
-    let t: String = raw
+    // v1.56.0：先做「连字符 → 中圆点」，再做下面的「遇 · 即截」——
+    // 「庄子--中华经典名著全…」因此收成「庄子」，而不是留一串 hyphen。
+    let t = hyphen_to_dot(raw);
+    let t: String = t
         .chars()
         .filter(|c| !matches!(c, '《' | '》' | '〈' | '〉' | '【' | '】' | '「' | '」'))
         .collect();
@@ -1783,4 +1830,24 @@ mod tests {
         // 短名不受影响。
         assert_eq!(clean_book_title("道德经"), "道德经");
     }
+
+    #[test]
+    fn hyphen_turns_into_middle_dot() {
+        assert_eq!(hyphen_to_dot("庄子--中华经典名著全…"), "庄子·中华经典名著全…");
+        assert_eq!(hyphen_to_dot("庄子 - 内篇"), "庄子·内篇");
+        assert_eq!(hyphen_to_dot("a-b"), "a·b");
+        // 行首 / 行尾的杂线直接丢，不留空点。
+        assert_eq!(hyphen_to_dot("-庄子"), "庄子");
+        assert_eq!(hyphen_to_dot("庄子-"), "庄子");
+        assert_eq!(hyphen_to_dot("庄子"), "庄子");
+        // 连续多个连字符只出一个点。
+        assert_eq!(hyphen_to_dot("庄子---内篇"), "庄子·内篇");
+    }
+
+    #[test]
+    fn book_title_cuts_at_the_dot_from_a_hyphen() {
+        // 「庄子--中华经典名著全…」→ 点 → 遇点即截 → 「庄子」。
+        assert_eq!(clean_book_title("庄子--中华经典名著全…"), "庄子");
+    }
+
 }

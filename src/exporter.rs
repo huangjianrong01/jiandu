@@ -332,6 +332,33 @@ pub fn export_markdown_picked(book: &Book, title: &str, file_name: &str) -> Resu
     write_bytes(&path, body.as_bytes()).map(Some)
 }
 
+/// **RFC 4180 字段转义**（v1.56.0 Anki 导出）。
+///
+/// 古籍正文里逗号、引号极常见（「…，…」「…」），不转义的话 Anki 导入
+/// 时列会直接错位。规则：字段里出现 逗号 / 双引号 / 换行 之一，整段用
+/// 双引号包起来，段内的双引号写成两个。
+pub fn csv_field(s: &str) -> String {
+    let need = s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r');
+    if need {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// 拼一行 CSV（两列及以上），末尾补 `\n`。Anki 导入不认表头，故不写。
+pub fn csv_line(cells: &[&str]) -> String {
+    let mut out = String::new();
+    for (i, c) in cells.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&csv_field(c));
+    }
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,4 +427,29 @@ mod tests {
         assert!(m.contains("[^1]: 注：雎鸠，水鸟也"), "应出现脚注定义");
         assert!(m.contains("**脚注**"), "章末应有脚注区");
     }
+
+    #[test]
+    fn csv_field_quotes_only_when_needed() {
+        // 全角标点（古籍里的「，」是 U+FF0C）不破坏 CSV 的列结构，不必加引号。
+        assert_eq!(csv_field("逍遥游"), "逍遥游");
+        assert_eq!(csv_field("北冥有鱼，其名为鲲"), "北冥有鱼，其名为鲲");
+        assert_eq!(csv_field("子曰「道」"), "子曰「道」");
+        // 半角逗号 / 双引号 / 换行 会错位，整段必须包起来。
+        assert_eq!(csv_field("北冥有鱼, 其名为鲲"), "\"北冥有鱼, 其名为鲲\"");
+        // 引号加倍：内部每一个 " 写成两个。
+        assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_field("上\n下"), "\"上\n下\"");
+    }
+
+    #[test]
+    fn csv_line_keeps_two_columns_even_with_commas() {
+        let line = csv_line(&["北冥有鱼, 其名为鲲", "【出处】《庄子·内篇》"]);
+        // 逗号只出现在被引号包住的字段里，列数恒为 2。
+        assert!(
+            line.starts_with("\"北冥有鱼, 其名为鲲\","),
+            "含半角逗号的字段必须被双引号包住：{line}"
+        );
+        assert!(line.ends_with('\n'));
+    }
+
 }

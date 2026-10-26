@@ -17,8 +17,9 @@ zip = "2"
 encoding_rs = "0.8"
 # 简繁对照表 / 惰性静态表
 once_cell = "1"
-# PDF 导出（zlib 流 + PNG 嵌入）
-flate2 = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
+# （PDF 导出已移除：v1.56.0，故 flate2 / image 不再需要）
 # 离线双引擎字典：《康熙字典》+《說文解字》合并库（bundled = 自编译 sqlite3）
 rusqlite = { version = "0.32.1", features = ["bundled"] }
+# 跨平台标准应用数据目录：macOS → ~/Library/Application Support
+# （App Sandbox 下系统透明重定向到容器，三态通用，避免硬编码 ~/.jiandu）
+dirs = "5"

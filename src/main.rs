@@ -41,8 +41,8 @@ mod zen_kit;
 // 回 crate 根——`crate::grid` / `crate::types` 等既有路径全部继续有效，
 // UI 层（app / reader / shelf）代码零改动。
 pub use jiandu_core::{
-    banxin, content, dict, grid, importer, library, numcn, parsers, pdf, pipeline, prefs, ruby,
-    store, stream, trad, theme, types, vclean, west,
+    banxin, content, dict, grid, importer, library, numcn, parsers, pipeline, prefs, ruby, store,
+    stream, trad, theme, types, vclean, west,
 };
 
 use app::Root;

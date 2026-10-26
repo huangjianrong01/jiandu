@@ -1,6 +1,7 @@
 //! 内置样张：《道德经》第一 ~ 三章（含封面、注释与通假标注）。
 
 use crate::types::{Book, Chapter, Cover, Note, NoteKind, Paragraph, TocEntry};
+use std::path::PathBuf;
 
 /// 书库目录项：内置可「下载」的一本书（随二进制分发，离线可用）。
 pub struct CatalogItem {
@@ -43,18 +44,65 @@ pub fn catalog_book(key: &str) -> Option<Book> {
     catalog().into_iter().find(|c| c.key == key).map(|c| c.book)
 }
 
-/// **首启内置全本《道德經》**（v1.56.0）。
+/// **首启内置书目**（v1.56.0）。
 ///
-/// 苹果审核必看：装完第一次打开不能是空书架，得有一本翻得动的真书。
-/// 选它的三条理由：① 公有领域，无版权风险；② 八十一章、五千余言，
-/// 竖排翻几叶就看得出排版的成色；③ 分「道經 / 德經」两篇，目录两级。
+/// 苹果审核必看：装完第一次打开不能是空书架，得有翻得动的真书。当前内置两本：
+/// 《道德經》（老子，八十一章）与《唐詩三百首》（蘅塘退士輯，七體三百餘詩）。
 ///
-/// 内容不是手搓的：正文由 `jiandu --convert` 走**与用户导入完全相同**的
-/// 清洗链路产出（解析 → IR → 清洗 → 引擎），再编译期 `include_str!` 编进
-/// 二进制，离线可用、不联网、不写沙盒外的任何地方。
+/// 资源加载走**运行时读 Resources**（不再 `include_str!`）：打包脚本会把
+/// `resources/books/*.json` 整目录拷进 `.app/Contents/Resources/books/`，App
+/// 启动按需读取。好处是以后随时往这个目录丢一本新 JSON 重新打包即可「热更新」
+/// 书目，不用改代码、不用重编二进制。
+///
+/// 书籍 JSON 本身仍由 `jiandu --convert` 走与用户导入完全相同的清洗链路产出，
+/// 公有领域、无版权风险、离线可用。
+///
+/// 文件名 stem 即书名 key（`daodejing` / `tangshi`），与 [`BUNDLED_BOOKS`] 对应。
+pub const BUNDLED_BOOKS: &[&str] = &["daodejing", "tangshi"];
+
+/// 按文件名 stem 读取内置书目（运行期从 Resources/books 取，不编进二进制）。
+///
+/// 查找顺序（任一命中即返回）：
+/// 1. `.app/Contents/Resources/books/<name>.json` —— 打包后正式运行；
+/// 2. 沿可执行文件向上回溯 `resources/books/<name>.json` —— 开发 / 测试态
+///    （`target/{debug,release}/jiandu` 一路回溯到仓库根 `resources`）；
+/// 3. `CARGO_MANIFEST_DIR/../resources/books` —— core crate 编译期目录兜底。
+pub fn bundled_book(name: &str) -> Option<Book> {
+    let file = format!("{name}.json");
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(p) = exe.parent() {
+            // `.app/Contents/MacOS/<exe>` → `../Resources/books`
+            candidates.push(p.join("../Resources/books").join(&file));
+            // 开发 / 测试态：沿可执行文件逐层向上的 `resources/books`
+            let mut d = Some(p.to_path_buf());
+            while let Some(dir) = d {
+                candidates.push(dir.join("resources/books").join(&file));
+                d = dir.parent().map(|x| x.to_path_buf());
+            }
+        }
+    }
+    if let Ok(man) = std::env::var("CARGO_MANIFEST_DIR") {
+        candidates.push(PathBuf::from(&man).join("../resources/books").join(&file));
+    }
+    for p in &candidates {
+        if let Ok(txt) = std::fs::read_to_string(p) {
+            if let Ok(book) = serde_json::from_str::<Book>(&txt) {
+                return Some(book);
+            }
+        }
+    }
+    None
+}
+
+/// 首启内置《道德經》全本（繁体，八十一章）。
 pub fn bundled_dao_de_jing() -> Option<Book> {
-    const JSON: &str = include_str!("../../resources/books/daodejing.json");
-    serde_json::from_str::<Book>(JSON).ok()
+    bundled_book("daodejing")
+}
+
+/// 首启内置《唐詩三百首》全本（繁体，按詩體分七類、三百餘首）。
+pub fn bundled_tangshi() -> Option<Book> {
+    bundled_book("tangshi")
 }
 
 pub fn sample_dao_de_jing() -> Book {
@@ -282,5 +330,44 @@ mod tests {
             .collect();
         assert_eq!(l1, vec!["道經", "德經"], "上下两篇");
         assert_eq!(book.toc.iter().filter(|e| e.level == 2).count(), 81);
+    }
+
+    /// 首启内置书目二：《唐詩三百首》必须解得开，且是全本、结构完整。
+    #[test]
+    fn bundled_tangshi_is_the_full_collection() {
+        let book = bundled_tangshi().expect("内置《唐詩三百首》资源应能解析");
+        assert_eq!(book.title, "唐詩三百首");
+        assert!(book.chapters.len() > 300, "三百餘首，实得 {}", book.chapters.len());
+        assert_eq!(book.schema_version, crate::types::BOOK_SCHEMA_VERSION);
+        // 每首诗至少一行、无未摘净标签、无零宽字符。
+        for c in &book.chapters {
+            assert!(!c.paragraphs.is_empty(), "空诗：{}", c.title);
+            for p in &c.paragraphs {
+                assert!(!p.text.contains("[注]"), "夹注标签没摘净：{}", p.text);
+                assert!(!p.text.contains('\u{200B}'), "零宽字符没清掉：{}", p.text);
+            }
+        }
+        // 两级目录：七種詩體（一級）+ 每首詩（二級）。
+        let l1: Vec<&str> = book
+            .toc
+            .iter()
+            .filter(|e| e.level == 1)
+            .map(|e| e.title.as_str())
+            .collect();
+        assert_eq!(l1.len(), 7, "七體：{:?}", l1);
+        assert_eq!(
+            book.toc.iter().filter(|e| e.level == 2).count(),
+            book.chapters.len(),
+            "每首诗都应在目录里"
+        );
+    }
+
+    /// 运行时加载器：开发态（无 .app 包）也能从仓库 resources/books 找到两本。
+    #[test]
+    fn bundled_book_loader_finds_resources_in_dev_tree() {
+        for name in BUNDLED_BOOKS {
+            let book = bundled_book(name).expect("开发态应能从 resources/books 读到");
+            assert!(!book.chapters.is_empty(), "{name} 解析后无章节");
+        }
     }
 }

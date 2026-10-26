@@ -22,7 +22,10 @@
 //! 的 panic 会穿过 `extern "C"` 边界被 `panic_cannot_unwind` 强杀，
 //! 连 jiandu 栈帧都留不下（见 `~/.jiandu/panic.log` 的实证）。
 
-use gpui::{div, px, rgb, rgba, Div, FontWeight, ParentElement, SharedString, Styled};
+use gpui::{
+    canvas, div, point, px, rgb, rgba, Div, FontWeight, ParentElement, PathBuilder, SharedString,
+    Styled, Window,
+};
 use crate::types::{FontChoice, Script};
 
 // ----------------------------------------------------------------------
@@ -193,8 +196,139 @@ pub fn tpl(i: usize) -> &'static ShareTpl {
     }
 }
 
-/// 朱砂红：左下角「笺讀」印的印泥色（四套模板通用，软件签名）。
+/// 朱砂红：左下角印的印泥色（各底色通用，软件签名）。
 pub const CINNABAR: u32 = 0xC3272D;
+
+// ----------------------------------------------------------------------
+// v1.56.0 新制：底色 / 版框 / 印章 三轴独立
+//
+// 旧制是「四套模板」——底色、版框、装饰被捆在一枚下标里，改底色就
+// 连带换框。用户 v1.56.0 明确要求三者各自成轴：背景三档、版框三档，
+// 任意组合都得成立。故旧 `TEMPLATES` 整套降级为历史数据（不再参与
+// 渲染，按「渐进式重构」保留），渲染一律走下面的三轴。
+// ----------------------------------------------------------------------
+
+/// 卡片底色三档。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShareBg {
+    /// 宣纸黄：最正统的古籍纸色，暖米黄。
+    Xuan,
+    /// 暗金黑：近墨的深褐金，夜间发朋友圈最压场。
+    Gold,
+    /// 极简纯白：现代极简，无一丝杂色。
+    Plain,
+}
+
+impl ShareBg {
+    pub const ALL: [ShareBg; 3] = [ShareBg::Xuan, ShareBg::Gold, ShareBg::Plain];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShareBg::Xuan => "宣纸黄",
+            ShareBg::Gold => "暗金黑",
+            ShareBg::Plain => "极简白",
+        }
+    }
+}
+
+/// 一套底色的四色：底 / 正文墨 / 落款淡墨 / 点缀朱砂。
+pub struct Palette {
+    pub bg: u32,
+    pub ink: u32,
+    pub meta: u32,
+    /// 点缀色（版框红线的取色：暗底上要提亮，否则朱砂发闷）。
+    pub accent: u32,
+}
+
+/// 底色 → 四色。数值逐档调过：暗金黑上的朱砂要提亮一档才不糊。
+pub fn palette(b: ShareBg) -> Palette {
+    match b {
+        ShareBg::Xuan => Palette {
+            bg: 0xF2E8D3,
+            ink: 0x2A2622,
+            meta: 0x8A7561,
+            accent: 0xB03A2E,
+        },
+        ShareBg::Gold => Palette {
+            bg: 0x1B1813,
+            ink: 0xE8DFC9,
+            meta: 0x9C8A6A,
+            accent: 0xC9553C,
+        },
+        ShareBg::Plain => Palette {
+            bg: 0xFFFFFF,
+            ink: 0x1A1A1A,
+            meta: 0x9A9A9A,
+            accent: 0xC3272B,
+        },
+    }
+}
+
+/// 版框三档：红线框 / 黑线框 / 无边框。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShareFrame {
+    /// 朱丝栏：红线双界框。
+    Red,
+    /// 乌丝栏：墨线双界框。
+    Black,
+    /// 无框：只留纸与字。
+    None,
+}
+
+impl ShareFrame {
+    pub const ALL: [ShareFrame; 3] = [ShareFrame::Red, ShareFrame::Black, ShareFrame::None];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShareFrame::Red => "红线框",
+            ShareFrame::Black => "黑线框",
+            ShareFrame::None => "无边框",
+        }
+    }
+}
+
+/// 版框取色：无框返回 `None`（调用方据此一层不画）。
+pub fn frame_ink(f: ShareFrame, p: &Palette) -> Option<u32> {
+    match f {
+        ShareFrame::Red => Some(p.accent),
+        ShareFrame::Black => Some(p.ink),
+        ShareFrame::None => None,
+    }
+}
+
+/// 印章两式：双鱼尾（软件标识）/ 书名篆意二字。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShareSeal {
+    /// 双鱼尾：白文满印，纸色挖出上下两枚鱼尾。
+    Twin,
+    /// 书名：朱文细边方印，内刻书名首二字。
+    Book,
+}
+
+impl ShareSeal {
+    pub const ALL: [ShareSeal; 2] = [ShareSeal::Twin, ShareSeal::Book];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShareSeal::Twin => "双鱼尾印",
+            ShareSeal::Book => "书名印",
+        }
+    }
+}
+
+/// 印文：取书名前两个有效字；书名空则回退「笺讀」。
+pub fn seal_chars(book: &str) -> String {
+    let s: String = book
+        .chars()
+        .filter(|c| !matches!(c, '《' | '》' | '·' | '（' | '）' | '(' | ')' | ' ' | '　' | '[' | ']'))
+        .take(2)
+        .collect();
+    if s.is_empty() {
+        "笺讀".to_string()
+    } else {
+        s
+    }
+}
 
 // ----------------------------------------------------------------------
 // 版面自适应
@@ -359,11 +493,23 @@ pub struct CardSpec<'a> {
     pub sign: &'a str,
     /// 中文日期（空串 = 不显示）。
     pub date: &'a str,
+    /// **朱批标记**：与 `body` 等长——第 i 个字是否被用户划了红线。
+    pub red: &'a [bool],
+    /// **眉批正文**（已按条数 / 字数裁切；空串 = 不画批注区）。
+    pub note: &'a str,
     pub show_sign: bool,
     pub show_date: bool,
+    /// 是否显示批注（朱批红字 + 眉批小字 + 引线）。关 = 只分享正文。
+    pub show_notes: bool,
     pub dir: ShareDir,
-    /// 模板下标。
-    pub tpl_idx: usize,
+    /// 底色（宣纸黄 / 暗金黑 / 极简白）。
+    pub bg: ShareBg,
+    /// 版框（红线 / 黑线 / 无框）。
+    pub frame: ShareFrame,
+    /// 印章式样。
+    pub seal: ShareSeal,
+    /// 印文（书名首二字，见 [`seal_chars`]）。
+    pub seal_text: &'a str,
     /// 正文字体族名（已做缺失回退）。
     pub family: SharedString,
     /// 阅读版式列数（8/10/12/14，决定内部列数与纸张比例）。
@@ -374,34 +520,32 @@ pub struct CardSpec<'a> {
 
 /// 组装一张分享卡（纯 GPUI 元素，零副作用、零 unwrap）。
 pub fn build_card(spec: &CardSpec) -> Div {
-    let t = tpl(spec.tpl_idx);
+    let p = palette(spec.bg);
     let w = if spec.w.is_finite() { spec.w } else { 360.0 }.max(160.0);
     let h = if spec.h.is_finite() { spec.h } else { 480.0 }.max(200.0);
     let pad = (w * 0.075).clamp(18.0, 46.0);
 
-    // 卡片本体：纯色底 + 裁切（装饰层用 absolute，溢出必须收）。
+    // 卡片本体：纯色底 + 裁切（版框 / 光晕都是 absolute，溢出必须收）。
     let mut card = div()
         .relative()
         .w(px(w))
         .h(px(h))
-        .bg(rgb(t.bg))
+        .bg(rgb(p.bg))
         .overflow_hidden();
-    // 青绿山水：通体贴边一道极细线框（边框在卡片本体上，不占内容层）。
-    if matches!(t.deco, Deco::Airy) {
-        card = card.border_1().border_color(rgb(t.accent));
-    }
 
-    // ---- 装饰层（先画，内容层后画压在上）----
-    for layer in deco_layers(t, w, h, pad) {
-        card = card.child(layer);
+    // ---- 版框（红线 / 黑线 / 无框；双线界框，刻本体例）----
+    if let Some(ink) = frame_ink(spec.frame, &p) {
+        for layer in frame_layers(ink, w, h, pad) {
+            card = card.child(layer);
+        }
     }
 
     // ---- 内容层 ----
     let inner_w = (w - pad * 2.0).max(80.0);
     let inner_h = (h - pad * 2.0).max(120.0);
     let content = match spec.dir {
-        ShareDir::Vertical => vertical_content(t, spec, inner_w, inner_h),
-        ShareDir::Horizontal => horizontal_content(t, spec, inner_w, inner_h),
+        ShareDir::Vertical => vertical_content(&p, spec, inner_w, inner_h),
+        ShareDir::Horizontal => horizontal_content(&p, spec, inner_w, inner_h),
     };
     card = card.child(
         div()
@@ -413,19 +557,51 @@ pub fn build_card(spec: &CardSpec) -> Div {
             .child(content),
     );
 
-    // ---- 朱砂印：左下角（软件签名，四模板通用）----
+    // ---- 朱砂印：左下角（软件签名，三底通用）----
     {
-        let seal_size = (w * 0.072).clamp(26.0, 38.0);
+        let seal_size = (w * 0.085).clamp(28.0, 44.0);
         let inset = (pad * 0.55).max(8.0);
         card = card.child(
             div()
                 .absolute()
                 .left(px(inset))
                 .bottom(px(inset))
-                .child(seal(t, spec.family.clone(), seal_size)),
+                .child(seal_div(
+                    spec.seal,
+                    p.bg,
+                    seal_size,
+                    spec.seal_text,
+                    spec.family.clone(),
+                )),
         );
     }
     card
+}
+
+/// 版框两层：外线淡、内线深，两线之间即「界行」——刻本的规矩。
+fn frame_layers(ink: u32, w: f32, h: f32, pad: f32) -> Vec<Div> {
+    let o1 = (pad * 0.38).max(5.0);
+    let o2 = (pad * 0.66).max(9.0);
+    vec![
+        div()
+            .absolute()
+            .left(px(o1))
+            .top(px(o1))
+            .w(px((w - o1 * 2.0).max(20.0)))
+            .h(px((h - o1 * 2.0).max(20.0)))
+            .border_1()
+            .border_color(rgba((ink << 8) | 0x4D))
+            .rounded(px(1.0)),
+        div()
+            .absolute()
+            .left(px(o2))
+            .top(px(o2))
+            .w(px((w - o2 * 2.0).max(20.0)))
+            .h(px((h - o2 * 2.0).max(20.0)))
+            .border_1()
+            .border_color(rgba((ink << 8) | 0xA6))
+            .rounded(px(1.0)),
+    ]
 }
 
 /// 装饰层：界框 / 丝栏由 `vertical_content` 画（要与列对齐），
@@ -501,8 +677,137 @@ fn deco_layers(t: &ShareTpl, w: f32, h: f32, pad: f32) -> Vec<Div> {
     out
 }
 
-/// 朱砂「笺讀」印：白文方印（朱砂底 + 纸色 Knock-out 二字竖排）。
-/// 字色取卡片底色——在任何模板上都是「印泥挖空露纸」的效果。
+/// **朱砂印（v1.56.0 Canvas 手绘）**：一整块 `canvas` 画印面，字层另起。
+///
+/// 两式：
+/// * [`ShareSeal::Twin`] —— **白文满印**：整方填朱砂，再用**纸色**挖出
+///   上下两枚鱼尾（图形取 `banxin::fishtail_points`，与版心鱼尾同一副刀法），
+///   中间留白口即「双鱼尾」标识；
+/// * [`ShareSeal::Book`] —— **朱文细边**：只描一圈朱砂方框，框内书名首
+///   二字由上层 div 以朱砂写出（印面干净、字口清楚）。
+///
+/// 挖白用的是**底色**而不是白：暗金黑上挖出的鱼尾是深褐而非纯白，
+/// 才像「印泥盖在纸上」，不像贴了块白胶布。
+pub fn seal_div(kind: ShareSeal, paper: u32, size: f32, text: &str, family: SharedString) -> Div {
+    let red = CINNABAR;
+    let ground = paper;
+    let chars: Vec<char> = if text.is_empty() {
+        "笺讀".chars().collect()
+    } else {
+        text.chars().take(2).collect()
+    };
+
+    let mut d = div().relative().w(px(size)).h(px(size));
+    // ---- 印面（Canvas）----
+    d = d.child(
+        canvas(
+            move |_b, _window, _cx| {},
+            move |b, _s, window: &mut Window, _cx| {
+                let unit = px(1.0);
+                let w = b.size.width / unit;
+                let h = b.size.height / unit;
+                let x0 = b.origin.x / unit;
+                let y0 = b.origin.y / unit;
+                // 印面是一方，四角略收 0.5px——不顶边才像盖上去的。
+                let square = [
+                    point(px(x0 + 0.5), px(y0 + 0.5)),
+                    point(px(x0 + w - 0.5), px(y0 + 0.5)),
+                    point(px(x0 + w - 0.5), px(y0 + h - 0.5)),
+                    point(px(x0 + 0.5), px(y0 + h - 0.5)),
+                ];
+                match kind {
+                    ShareSeal::Twin => {
+                        let mut sq = PathBuilder::fill();
+                        sq.add_polygon(&square, true);
+                        if let Ok(p) = sq.build() {
+                            window.paint_path(p, rgb(red));
+                        }
+                        // 双鱼尾挖白：上鱼尾贴内上沿，下鱼尾贴内下沿，中间白口。
+                        let inset = w * 0.15;
+                        let inner_w = (w - inset * 2.0).max(4.0);
+                        let inner_h = (h - inset * 2.0).max(8.0);
+                        let th = inner_h * 0.40;
+                        for (i, top) in [true, false].iter().enumerate() {
+                            let ty = y0 + inset + (i as f32) * (inner_h - th);
+                            paint_fishtail(
+                                window,
+                                *top,
+                                x0 + inset,
+                                ty,
+                                inner_w,
+                                th,
+                                rgb(ground),
+                            );
+                        }
+                    }
+                    ShareSeal::Book => {
+                        let mut sq = PathBuilder::stroke(px(1.3));
+                        sq.add_polygon(&square, true);
+                        if let Ok(p) = sq.build() {
+                            window.paint_path(p, rgb(red));
+                        }
+                    }
+                }
+            },
+        )
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
+        .w(px(size))
+        .h(px(size)),
+    );
+
+    // ---- 印文（仅朱文式；白文式的双鱼尾已由画布挖出）----
+    if matches!(kind, ShareSeal::Book) {
+        let mut col = div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w(px(size))
+            .h(px(size))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(0.5));
+        for c in chars.iter() {
+            col = col.child(
+                div()
+                    .font_family(family.clone())
+                    .text_size(px(size * 0.34))
+                    .text_color(rgb(red))
+                    .child(SharedString::from(c.to_string())),
+            );
+        }
+        d = d.child(col);
+    }
+    d
+}
+
+/// 在印面上画一枚鱼尾（直线多边形，绝不用贝塞尔——与版心鱼尾同一刀法）。
+fn paint_fishtail(
+    window: &mut Window,
+    top: bool,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: gpui::Rgba,
+) {
+    let pts = crate::banxin::fishtail_points(top, h);
+    let poly: Vec<gpui::Point<gpui::Pixels>> = pts
+        .iter()
+        .map(|(fx, fy)| point(px(x + fx * w / 100.0), px(y + *fy)))
+        .collect();
+    let mut b = PathBuilder::fill();
+    b.add_polygon(&poly, true);
+    if let Ok(path) = b.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// 旧制印：朱砂底 + 纸色挖出「笺讀」二字（v1.53.0）。
+/// 渲染已改用 [`seal_div`]，此函数按「渐进式重构」保留。
 fn seal(t: &ShareTpl, family: SharedString, size: f32) -> Div {
     let mut s = div()
         .w(px(size))
@@ -531,14 +836,22 @@ fn seal(t: &ShareTpl, family: SharedString, size: f32) -> Div {
 /// **8/10/12/14 列自适应纸张**：正文列数 = 阅读版式列数（归到四档），
 /// 每列字数由内容均分，字号随「列数 × 列高」双向收敛——列多则字小、
 /// 列少则字大，与阅读版面同一套版式逻辑。
-fn vertical_content(t: &ShareTpl, spec: &CardSpec, avail_w: f32, avail_h: f32) -> Div {
+fn vertical_content(p: &Palette, spec: &CardSpec, avail_w: f32, avail_h: f32) -> Div {
     let cols_style = norm_columns(spec.columns);
     let len = spec.body.len();
-    let base_fs = ((spec.h / 24.0).clamp(13.0, 26.0)) * t.fs_boost;
+    let base_fs = (spec.h / 24.0).clamp(13.0, 26.0);
     let sign_fs = base_fs * 0.60;
     let date_fs = base_fs * 0.58;
+    let note_fs = base_fs * 0.52;
 
-    // 落款列 / 日期列预留宽度（关时留 0，但仍留一点呼吸位）。
+    // 眉批区（朱砂小字 + 引线）只在「显示批注」且确有眉批时占位。
+    let show_note = spec.show_notes && !spec.note.is_empty();
+    let note_chars = if show_note {
+        spec.note.chars().count()
+    } else {
+        0
+    };
+
     let sign_w = if spec.show_sign && !spec.sign.is_empty() {
         sign_fs * 1.35
     } else {
@@ -549,34 +862,28 @@ fn vertical_content(t: &ShareTpl, spec: &CardSpec, avail_w: f32, avail_h: f32) -
     } else {
         0.0
     };
-    // 列间距：有丝栏的模板字距紧（乌丝栏替它呼吸），无丝栏的拉开发散。
-    let col_gap = if matches!(t.deco, Deco::Classic | Deco::Rubbing) {
-        5.0
-    } else {
-        16.0
-    };
-    let side_gap = 14.0;
+    let note_w = if show_note { note_fs * 1.55 } else { 0.0 };
+    let col_gap = 5.0;
+    let side_gap = 12.0;
 
-    // 正文列数：取版式列数与内容量的较小值（内容不足以填满时不硬撑空列）。
     let body_cols = cols_style.min(len.max(1)).max(1);
     let per_col = ((len as f32) / (body_cols as f32)).ceil().max(1.0) as usize;
 
-    // 字号双向收敛：先满足「每列 per_col 字放得下」，再满足「总宽放得下」。
+    // 字号双向收敛：先满足「每列 per_col 字放得下」，再满足「总宽放得下」
+    // （总宽把题识 / 眉批 / 日期三列都算进去——开了眉批正文自动让位）。
     let mut fs = base_fs;
     loop {
-        let pitch = fs * 1.62;
-        let ok_h = (per_col as f32) * pitch <= avail_h;
-        let col_w = fs + col_gap;
-        let total_w = sign_w + date_w + side_gap * 2.0 + (body_cols as f32) * col_w;
-        let ok_w = total_w <= avail_w;
-        if (ok_h && ok_w) || fs <= 9.0 {
+        let ok_h = (per_col as f32) * (fs * 1.62) <= avail_h;
+        let total_w =
+            sign_w + date_w + note_w + side_gap * 2.0 + (body_cols as f32) * (fs + col_gap);
+        if (ok_h && total_w <= avail_w) || fs <= 9.0 {
             break;
         }
         fs -= 0.5;
     }
     let fs = fs.min(30.0);
 
-    // 视觉顺序（左→右）：题识列、正文列（从右往左的逆序）、日期列。
+    // 视觉顺序（左→右）：题识列、正文列（倒序）、眉批列、日期列。
     let mut row = div()
         .flex()
         .flex_row()
@@ -594,13 +901,13 @@ fn vertical_content(t: &ShareTpl, spec: &CardSpec, avail_w: f32, avail_h: f32) -
                 .items_center()
                 .flex_shrink_0()
                 .w(px(sign_w))
-                .child(vcol(spec.sign, sign_fs, t.meta, spec.family.clone())),
+                .child(vcol(spec.sign, sign_fs, p.meta, spec.family.clone())),
         );
     }
 
     // 正文列：右起 → flex_row 里倒序 push（第一段落在最右）。
-    let chunks: Vec<&[char]> = spec.body.chunks(per_col.max(1)).collect();
-    for chunk in chunks.iter().rev() {
+    for (ci, chunk) in spec.body.chunks(per_col.max(1)).enumerate() {
+        let base = ci * per_col.max(1);
         let mut c = div()
             .flex()
             .flex_col()
@@ -608,25 +915,47 @@ fn vertical_content(t: &ShareTpl, spec: &CardSpec, avail_w: f32, avail_h: f32) -
             .flex_shrink_0()
             .w(px(fs + col_gap))
             .gap(px(col_gap * 0.55));
-        for ch in chunk.iter() {
-            c = c.child(char_box(*ch, fs, t.ink, t.bold, spec.family.clone()));
+        for (i, ch) in chunk.iter().enumerate() {
+            // 朱批：被划红线的字染朱砂、并在字右加一道细朱线（着重号）。
+            let marked = spec.show_notes && spec.red.get(base + i).copied().unwrap_or(false);
+            c = c.child(char_box(*ch, fs, p.ink, false, spec.family.clone(), marked));
         }
         row = row.child(c);
-        // 乌丝栏：列界一道极细淡墨（古籍朱丝栏的墨色版）。
-        if matches!(t.deco, Deco::Classic | Deco::Rubbing) {
-            let rule_c = if matches!(t.deco, Deco::Rubbing) {
-                rgba((t.accent << 8) | 0x30)
-            } else {
-                rgba((t.ink << 8) | 0x24)
-            };
-            row = row.child(
-                div()
-                    .w(px(0.5))
-                    .h_full()
-                    .bg(rule_c)
-                    .flex_shrink_0(),
-            );
-        }
+        // 乌丝栏：列界一道极细淡墨（朱丝栏的墨色版）。
+        row = row.child(
+            div()
+                .w(px(0.5))
+                .h_full()
+                .bg(rgba((p.ink << 8) | 0x24))
+                .flex_shrink_0(),
+        );
+    }
+
+    // 眉批列：一道朱砂细竖线（引线）把批语挂回正文，顶端一横挑向被批处。
+    if show_note {
+        let note_h = (note_chars as f32) * note_fs * 1.32;
+        row = row.child(
+            div()
+                .w(px(0.5))
+                .h(px(note_h.min(avail_h).max(4.0)))
+                .bg(rgba((CINNABAR << 8) | 0x77))
+                .flex_shrink_0(),
+        );
+        row = row.child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .flex_shrink_0()
+                .w(px(note_w))
+                .child(
+                    div()
+                        .w(px(note_w * 0.9))
+                        .h(px(0.5))
+                        .bg(rgba((CINNABAR << 8) | 0xBB)),
+                )
+                .child(vcol(spec.note, note_fs, CINNABAR, spec.family.clone())),
+        );
     }
 
     // 日期列：最右，顶天。
@@ -638,23 +967,22 @@ fn vertical_content(t: &ShareTpl, spec: &CardSpec, avail_w: f32, avail_h: f32) -
                 .items_center()
                 .flex_shrink_0()
                 .w(px(date_w))
-                .child(vcol(spec.date, date_fs, t.meta, spec.family.clone())),
+                .child(vcol(spec.date, date_fs, p.meta, spec.family.clone())),
         );
     }
     row
 }
 
 /// 横排居中内容：正文行居中，题识 / 日期小字居中垫在下方。
-fn horizontal_content(t: &ShareTpl, spec: &CardSpec, avail_w: f32, avail_h: f32) -> Div {
-    let base_fs = ((spec.h / 22.0).clamp(14.0, 28.0)) * t.fs_boost;
-    // 每行字数：至少 6 字，最多把可用宽度用满（CJK 字宽≈字号）。
+fn horizontal_content(p: &Palette, spec: &CardSpec, avail_w: f32, avail_h: f32) -> Div {
+    let base_fs = (spec.h / 22.0).clamp(14.0, 28.0);
     let mut fs = base_fs;
     let mut cpl;
     loop {
         cpl = ((avail_w / (fs * 1.06)).floor() as usize).max(6);
-        // 行数 × 行高 + 落款两行，要放得下卡片高。
         let lines = ((spec.body.len() as f32) / (cpl as f32)).ceil().max(1.0);
-        let need = lines * (fs * 1.9) + fs * 2.6;
+        // 行数 × 行高 + 落款两行 + 眉批一行，要放得下卡片高。
+        let need = lines * (fs * 1.9) + fs * 3.4;
         if need <= avail_h || fs <= 11.0 {
             break;
         }
@@ -671,8 +999,8 @@ fn horizontal_content(t: &ShareTpl, spec: &CardSpec, avail_w: f32, avail_h: f32)
         .h_full()
         .gap(px(fs * 0.9));
     let line_h = fs * 1.9;
-    for chunk in spec.body.chunks(cpl) {
-        let s: String = chunk.iter().collect();
+    for (ci, chunk) in spec.body.chunks(cpl).enumerate() {
+        let base = ci * cpl;
         let mut row = div()
             .flex()
             .flex_row()
@@ -681,11 +1009,33 @@ fn horizontal_content(t: &ShareTpl, spec: &CardSpec, avail_w: f32, avail_h: f32)
             .line_height(px(line_h))
             .font_family(spec.family.clone())
             .text_size(px(fs))
-            .text_color(rgb(t.ink));
-        if t.bold {
-            row = row.font_weight(FontWeight(750.0));
+            .text_color(rgb(p.ink));
+        // 按「是否被划红线」切成一段段同色 run：朱批段落染朱砂。
+        let mut run = String::new();
+        let mut run_red = spec.show_notes && spec.red.get(base).copied().unwrap_or(false);
+        for (i, ch) in chunk.iter().enumerate() {
+            let r = spec.show_notes && spec.red.get(base + i).copied().unwrap_or(false);
+            if r != run_red && !run.is_empty() {
+                row = row.child(hspan(&run, run_red, p));
+                run.clear();
+            }
+            run_red = r;
+            run.push(*ch);
         }
-        col = col.child(row.child(SharedString::from(s)));
+        if !run.is_empty() {
+            row = row.child(hspan(&run, run_red, p));
+        }
+        col = col.child(row);
+    }
+    // 眉批：正文下方一行朱砂小字（横排时引线即它上方那道留白的分界）。
+    if spec.show_notes && !spec.note.is_empty() {
+        col = col.child(
+            div()
+                .font_family(spec.family.clone())
+                .text_size(px(fs * 0.58))
+                .text_color(rgb(CINNABAR))
+                .child(SharedString::from(spec.note.to_string())),
+        );
     }
     // 落款：题识一行、日期一行，居中垫在正文下方。
     if spec.show_sign && !spec.sign.is_empty() {
@@ -693,7 +1043,7 @@ fn horizontal_content(t: &ShareTpl, spec: &CardSpec, avail_w: f32, avail_h: f32)
             div()
                 .font_family(spec.family.clone())
                 .text_size(px(fs * 0.62))
-                .text_color(rgb(t.meta))
+                .text_color(rgb(p.meta))
                 .child(SharedString::from(spec.sign.to_string())),
         );
     }
@@ -702,16 +1052,33 @@ fn horizontal_content(t: &ShareTpl, spec: &CardSpec, avail_w: f32, avail_h: f32)
             div()
                 .font_family(spec.family.clone())
                 .text_size(px(fs * 0.56))
-                .text_color(rgb(t.meta))
+                .text_color(rgb(p.meta))
                 .child(SharedString::from(spec.date.to_string())),
         );
     }
     col
 }
 
+/// 横排的一小段同色文字（`red = true` 即朱批段）。
+fn hspan(s: &str, red: bool, p: &Palette) -> Div {
+    div()
+        .text_color(rgb(if red { CINNABAR } else { p.ink }))
+        .child(SharedString::from(s.to_string()))
+}
+
 /// 单字槽位（竖排）：定宽定高，字身居中。
-fn char_box(c: char, fs: f32, ink: u32, bold: bool, family: SharedString) -> Div {
+fn char_box(
+    c: char,
+    fs: f32,
+    ink: u32,
+    bold: bool,
+    family: SharedString,
+    marked: bool,
+) -> Div {
+    // 朱批字：字身染朱砂（朱色 > 墨色，一眼可辨「这是我划的」）。
+    let color = if marked { CINNABAR } else { ink };
     let mut d = div()
+        .relative()
         .w(px(fs))
         .h(px(fs * 1.42))
         .flex()
@@ -719,10 +1086,22 @@ fn char_box(c: char, fs: f32, ink: u32, bold: bool, family: SharedString) -> Div
         .justify_center()
         .font_family(family)
         .text_size(px(fs))
-        .text_color(rgb(ink))
+        .text_color(rgb(color))
         .child(SharedString::from(c.to_string()));
     if bold {
         d = d.font_weight(FontWeight(750.0));
+    }
+    if marked {
+        // 着重线：竖排的着重号贴在字的右侧，一道细朱线。
+        d = d.child(
+            div()
+                .absolute()
+                .right(px(0.0))
+                .top(px(fs * 0.20))
+                .w(px(1.0))
+                .h(px(fs * 0.72))
+                .bg(rgba((CINNABAR << 8) | 0xCC)),
+        );
     }
     d
 }

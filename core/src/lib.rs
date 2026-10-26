@@ -7,7 +7,7 @@
 //!     `importer` / `library`：通假、脚注、前言智能跳过、上标幽灵字清剿）；
 //!   * 离线双引擎字典（`dict`：古汉语常用字 + 康熙/說文合并库）；
 //!   * 简繁对照（`trad` / `west`）、数字转汉字（`numcn`）、版心几何（`banxin`）、
-//!     纸墨主题数据（`theme`）、偏好（`prefs`）、PDF 导出（`pdf`）。
+//!     纸墨主题数据（`theme`）、偏好（`prefs`）。
 //!
 //! UI 层（仓库根的 `jiandu` bin：`app` / `reader` / `shelf`）只消费这里的
 //! 数据与计算结果，为将来移植 iOS（核心库原样复用、仅重写渲染层）做准备。
@@ -32,7 +32,6 @@ pub mod ir;
 pub mod library;
 pub mod numcn;
 pub mod parsers;
-pub mod pdf;
 pub mod pipeline;
 pub mod prefs;
 pub mod ruby;

@@ -159,8 +159,22 @@ pub fn piece_units(p: &Piece) -> usize {
         Piece::Main(g) if g.kind == GlyphKind::Attach => 0,
         Piece::Main(_) => 2,
         Piece::Gap => 2,
-        Piece::Gloss(s, ..) => s.chars().count().div_ceil(2),
+        // 双行夹注：**占格向上取整到整字格**（v1.56.0 顶格对齐）——注文
+        // 一行的高度是半格，行数成单就是 1.5 格，照实记账会把它后面的
+        // 正文首字推到半格上、整列往下漂半格。取整到整格后，注块之后的
+        // 正文首字**必落在 `grid::top_baseline` 的网格上**。
+        Piece::Gloss(s, ..) => gloss_units(s),
     }
+}
+
+/// 一段双行夹注**占几个半格单位**（v1.56.0）。
+///
+/// `rows = 字数.div_ceil(2)` 是注文的**行数**，每行半格；再 `div_ceil(2)*2`
+/// 即向上取整到**整字格**（2 单位 = 1 格）。渲染层（`reader::ancient_gloss`
+/// 的 `grid::ceil_to_cells`）与命中层（`note_boxes_in_column`）都用同一口径，
+/// 故「排版账」与「画面」永不脱节。
+pub fn gloss_units(text: &str) -> usize {
+    text.chars().count().div_ceil(2).div_ceil(2) * 2
 }
 
 /// 卷首题署预留行数：把「书名·卷次 + 1 行间隔 + 署名」的字符数收敛成
@@ -728,8 +742,8 @@ pub fn note_boxes_in_column(
                 idx += 1;
             }
             Piece::Gloss(text, src, host) => {
-                let rows = text.chars().count().div_ceil(2);
-                let h = rows as f32 * row_h;
+                // 与渲染 / 分页同口径：注块高取整到整格（v1.56.0）。
+                let h = gloss_units(text) as f32 * row_h;
                 out.push(NoteBox {
                     x: li as f32 * cell_w + pad + inset,
                     y,
@@ -1503,20 +1517,22 @@ mod tests {
 
     #[test]
     fn note_boxes_stack_top_down_in_column() {
-        // 列内：正文每字一个 cell_h，注块 = ceil(n/2) 个半格，自上而下累计。
+        // 列内：正文每字一个 cell_h，注块 = **取整到整字格**（v1.56.0 顶格
+        // 对齐：注文一行是半格，行数成单就是 1.5 格；照实高排会把它后面的
+        // 正文首字带下漂半格，故一律向上取整），自上而下累计。
         let col = vec![
             main_glyph(),                 // 占 0..cell_h
-            Piece::Gloss("甲乙".into(), NoteSource::Original, ghost()),   // 4 字 → 1 行 → cell_h/2
+            Piece::Gloss("甲乙".into(), NoteSource::Original, ghost()),   // 2 字 → 1 行 → 取整 1 整格
             main_glyph(),
-            Piece::Gloss("丙丁戊己".into(), NoteSource::Original, ghost()), // 4 字 → 2 行 → cell_h
+            Piece::Gloss("丙丁戊己".into(), NoteSource::Original, ghost()), // 4 字 → 2 行 → 1 整格
         ];
         let boxes = note_boxes_in_column(&col, 2, 46.0, 51.0, true);
         assert_eq!(boxes.len(), 2);
-        // 第一个注块：正文一字之后。
+        // 第一个注块：正文一字之后，占**一整格**（半格已向上取整）。
         assert!((boxes[0].y - 51.0).abs() < 0.01);
-        assert!((boxes[0].h - 25.5).abs() < 0.01);
-        // 第二个注块：又排了一个正文字 + 半个注块。
-        assert!((boxes[1].y - (51.0 + 25.5 + 51.0)).abs() < 0.01);
+        assert!((boxes[0].h - 51.0).abs() < 0.01);
+        // 第二个注块：又排了一个正文字 + 一个整格注块。
+        assert!((boxes[1].y - (51.0 + 51.0 + 51.0)).abs() < 0.01);
         assert!((boxes[1].h - 51.0).abs() < 0.01);
         // 宽 = 列宽 − 左侧留白 − 两侧细隙（见 NOTE_PAD_RATIO / NOTE_EDGE_INSET）；
         // x = 列序 li × 列宽 + 留白 + 左隙。

@@ -55,12 +55,12 @@
 //! > 归渲染层（`reader::render_gutter` 用定位垫把两枚鱼尾的中心钉在
 //! > 版心高的 1/4 与 3/4 处），本文件只管尺寸与形。
 //!
-//! ## 一之二、黑口：版心顶 / 底的粗黑块
+//! ## 一之二、黑口：已删
 //!
-//! 大黑口本子的版心，天头地脚各有一道**粗黑横块**（纸对折后书口处露出的
-//! 墨线），把整列书口夹住。渲染层按 `heikou_h` 在版心最顶 / 最底各铺一块
-//! `HEIKOU_H_RATIO` 字高的墨块——它与鱼尾同色（`FISH_INK`），上承版框、
-//! 下接地脚，中间才是鱼尾与书口字。
+//! v1.57.0 用户口径「不要出现上下两个黑块，清理他们以及他们的代码」：
+//! 版心天头 / 地脚那两道 `HEIKOU_H_RATIO` 厚的墨块**整块移除**（含常量、
+//! 尺寸函数与单测）。版心现在只剩「两枚鱼尾 + 书口字 + 折痕」——鱼尾
+//! 本身是中段的一枚实心梯形，不再与黑口叠成一坨方块。
 //!
 //! ## 二、折痕：极细实线
 //!
@@ -90,22 +90,24 @@ pub const FISHTAIL_W_RATIO: f32 = 0.46;
 /// 界栏线」交界处可能露出的 1px 白缝。高度与文字预算不受影响（`tail_w`
 /// 才是唯一改动的量，`tail_h` 仍由 `banxin_tail_size` 原值决定）。
 pub const FISHTAIL_OVERLAP: f32 = 2.0;
-/// 对鱼尾的**纵向呼吸量**（px）：上鱼尾整体上移、下鱼尾整体下移各这么多，
-/// 让两枚尖端与中间书口文字之间拉开一段修长舒朗的白口（v1.52.10 收官指令）。
+/// 对鱼尾的**纵向间距**（px）：上鱼尾整体上移「半个 gap」、下鱼尾整体下移
+/// 「半个 gap」，把两枚鱼尾之间（中段书口白口）拉开——纯版心装饰微调，
+/// 不动正文排版与锚点（`render_gutter` 的 flex 列里用 `flex_1` 吸收空量）。
 ///
-/// 按**版心内芯高**的比例取值（`core_h × TAIL_BREATH_RATIO`），再夹在
-/// `TAIL_BREATH_MIN`～`TAIL_BREATH_MAX` 之间——版心高时多让一点、矮时少让，
-/// 但绝不至于让鱼尾贴回黑口（渲染层定位垫另有 `2px` 硬保底）。上下共用
-/// 同一个值，绝对对称。
-pub const TAIL_BREATH_RATIO: f32 = 0.015;
-/// 呼吸量下限（px）：版心再矮也至少让出这么多。
-pub const TAIL_BREATH_MIN: f32 = 2.0;
-/// 呼吸量上限（px）：版心再高也不多让（让太多书口文字区反而被压缩观感）。
-pub const TAIL_BREATH_MAX: f32 = 6.0;
+/// `yuwei_gap(core_h)` 返回**两枚鱼尾中心之间的额外间距总量**（版心内芯高的
+/// 比例），上下各取一半（`yuwei_gap / 2`）对称外移，绝对对称。默认取版心高的
+/// `YUWEI_GAP_RATIO`（落在 2%~5% 区间、中值 4%），再夹在 `YUWEI_GAP_MIN`～
+/// `YUWEI_GAP_MAX` 之间——版心高时多让、矮时少让，但有 `2px` 硬保底绝不
+/// 让鱼尾贴回黑口。
+pub const YUWEI_GAP_RATIO: f32 = 0.04;
+/// 间距下限（px）：版心再矮也至少让出这么多。
+pub const YUWEI_GAP_MIN: f32 = 2.0;
+/// 间距上限（px）：版心再高也不多让（让太多书口文字区反而被压缩观感）。
+pub const YUWEI_GAP_MAX: f32 = 10.0;
 
-/// 版心内芯高 → 对鱼尾的纵向呼吸量（px）。上下两枚共用，保证绝对对称。
-pub fn tail_breath(core_h: f32) -> f32 {
-    (core_h * TAIL_BREATH_RATIO).clamp(TAIL_BREATH_MIN, TAIL_BREATH_MAX)
+/// 版心内芯高 → 对鱼尾中心之间的**额外间距总量**（px）。上下各取一半对称外移。
+pub fn yuwei_gap(core_h: f32) -> f32 {
+    (core_h * YUWEI_GAP_RATIO).clamp(YUWEI_GAP_MIN, YUWEI_GAP_MAX)
 }
 /// 信笺（14 列）的鱼尾更宽：它独占一列，照参考图几乎顶满。
 pub const LETTER_TAIL_W_RATIO: f32 = 0.92;
@@ -121,26 +123,22 @@ pub const FISHTAIL_H_CHARS: f32 = 0.22;
 pub const FISHTAIL_H_MAX_CHARS: f32 = 0.80;
 /// **骨架**：底部中央凹口顶点的纵向位置（占鱼尾高 `h` 的比例，0 = 顶边）。
 ///
-/// 上鱼尾是「平顶实心条 + 底部中央一道深 V 白口」：凹口顶点落在 `NOTCH·h`
-/// 处（即白口从版心下沿向上掏进 `(1−NOTCH)·h`，深过半幅），两枚实心鳍
-/// 尖因此垂到版心下沿、朝下的尖口极锐。下鱼尾绕水平中轴镜像，凹口落到
-/// `(1−NOTCH)·h`。要调形只改这一个字面比例。
-pub const TAIL_NOTCH_Y: f32 = 0.4;
+/// 上鱼尾是「平顶实心条 + 底部中央一道 V 白口」：凹口顶点落在 `NOTCH·h`
+/// 处（即白口从下沿向上掏进 `(1−NOTCH)·h`），两枚实心鳍尖垂到下沿。
+/// 下鱼尾绕水平中轴镜像，凹口落到 `(1−NOTCH)·h`。要调形只改这一个比例。
+///
+/// **v1.56.0 由 0.40 改为 0.80（深 V → 浅 V）**：0.40 时白口掏进过半幅，
+/// 整枚被劈成「两片窄鳍」，远看像缩小的倒三角（用户实测）。0.80 时只在
+/// 下缘**浅浅咬一口**（掏进 0.20·h），主体仍是饱满的实心黑梯形——这才是
+/// 宋版黑鱼尾的大气样子。
+pub const TAIL_NOTCH_Y: f32 = 0.80;
 /// 信笺鱼尾不追求字高比例（那会把横展的鱼尾拉成竖条）。
 pub const LETTER_TAIL_H_CHARS: f32 = 1.2;
 /// 下限：再窄的屏也认得出这是枚鱼尾。
 pub const FISHTAIL_W_MIN: f32 = 9.0;
 pub const FISHTAIL_H_MIN: f32 = 10.0;
 
-/// **黑口**的厚度 / 字高：版心天头、地脚各一道黑块（大黑口本子）。
-///
-/// v1.28.0 由 0.30 收到 **0.13**：0.30 字高在纸上是一条宽墨带，把版心
-/// 上下堵死；0.13 只是一道「口线」，翻书时够认、平时不抢戏。
-pub const HEIKOU_H_RATIO: f32 = 0.13;
-/// 黑口最薄处（px）：再薄的两道墨就糊成一条灰线了。
-pub const HEIKOU_H_MIN: f32 = 2.0;
-
-/// **黑鱼尾**（与黑口同料）的墨色：深灰黑 `#222222`，不是纯黑——纯黑在
+/// **黑鱼尾**的墨色：深灰黑 `#222222`，不是纯黑——纯黑在
 /// 纸面上太跳，也压过了正文的墨色。深底（夜读）时向纸色兑淡，否则整枚看不见。
 pub const FISH_INK: u32 = 0x222222;
 /// 折痕色：极淡的灰 `#999999`。
@@ -166,14 +164,6 @@ pub fn tail_size(gutter_w: f32, cell_h: f32, w_ratio: f32, aspect: f32, max_char
         .min(cell_h * max_chars)
         .max(FISHTAIL_H_MIN);
     (w, h)
-}
-
-/// 黑口厚度：版心天头 / 地脚那两道粗黑块。约三成字高，最薄 4px。
-///
-/// 它与鱼尾同色同料，但职责不同：鱼尾是「口的形」，黑口是「口的线」——
-/// 大黑口本子的书口，上下各压一道墨，翻书时一眼定位。
-pub fn heikou_h(cell_h: f32) -> f32 {
-    (cell_h * HEIKOU_H_RATIO).max(HEIKOU_H_MIN)
 }
 
 /// 版心（中缝）对鱼尾的**高度**尺寸。
@@ -348,9 +338,10 @@ pub fn layout(o: BanxinOpts) -> BanxinLayout {
     // 书口小字：极小号宋体——收在版心宽的一半以内，且不超过正文字号
     // 的三分之一（刻本书口字远小于正文）。
     let small = (o.gutter_w * 0.46).min(o.fs * 0.34).max(7.0);
-    // 书口字**逐字**竖排，行高给到字号的 1.40 倍——字与字之间留出明显
-    // 气口，绝不再「挤成一坨」（v1.31.x：1.22 → 1.40）。
-    let lh_small = small * 1.40;
+    // 书口字**逐字**竖排，行高给到字号的 1.62 倍——字与字之间留出明显
+    // 气口，绝不再「挤成一坨」（v1.31.x：1.22 → 1.40；v1.56.0 再拉开到
+    // 1.62：用户「书名和卷名的字距要稍微拉开一点」）。
+    let lh_small = small * 1.62;
     // 篇题比书口字大一档，但仍小于正文（它是版心里的题名，不是标题）。
     // v1.31.x 由 0.66 收到 0.56：中缝本就窄，篇题再大就压过书名卷次、显
     // 得乱；收到与正文约六成，仍认得出是一级题名。
@@ -493,12 +484,13 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::assertions_on_constants)] // 钉的是鱼尾凹口常量（< 0.5 才够锐）
-    fn notch_is_a_sharp_v_not_a_shallow_dip() {
-        // 宋版鱼尾：平顶实心条 + 底部中央深 V 白口。凹口顶点落在
-        // TAIL_NOTCH_Y·h（< 0.5，即白口从下沿掏进过半幅），缺口才是刀刻
-        // 的锐角 V；旧值把实心条画成「中央黑尖朝下、两侧镂空」——看着像砖头。
-        assert!(TAIL_NOTCH_Y < 0.5, "凹口太浅（{}），不够锐", TAIL_NOTCH_Y);
+    #[allow(clippy::assertions_on_constants)] // 钉的是鱼尾凹口常量（v1.56.0：浅 V）
+    fn notch_is_a_shallow_v_on_a_solid_trapezoid() {
+        // v1.56.0 用户定调：V 口要**浅**——只在下缘咬一小口，主体仍是饱满
+        // 的实心黑梯形。故 0.5 < NOTCH < 0.95：NOTCH 越大，掏进越浅。
+        // （旧口径是 NOTCH < 0.5 的深 V，实测看着像缩小的倒三角，已废。）
+        assert!(TAIL_NOTCH_Y > 0.5, "凹口太深（{}），鱼尾被劈成两片窄鳍", TAIL_NOTCH_Y);
+        assert!(TAIL_NOTCH_Y < 0.95, "凹口太浅（{}），看不出是鱼尾", TAIL_NOTCH_Y);
         // 顶边两点同在 y = 0：顶部平齐，不是尖顶也不是圆顶。
         let pts = fishtail_points(true, 100.0);
         assert_eq!(pts[0].1, 0.0);
@@ -509,20 +501,10 @@ mod tests {
         assert_eq!(pts[2].1, 100.0);
         assert_eq!(pts[4].1, 100.0);
         assert_eq!(pts[3].1, TAIL_NOTCH_Y * 100.0);
-        // 缺口半角 = atan(半宽 / 深)，像素空间里宽 = 100、深 = 100·(1 − NOTCH)。
+        // 浅 V：掏进深度 = (1 − NOTCH)·h，只在下缘一小口（v1.56.0 为 0.2·h）。
         let depth = 100.0 * (1.0 - TAIL_NOTCH_Y);
-        let half = (50.0 / depth).atan().to_degrees();
-        assert!(half * 2.0 <= 90.0, "缺口不够尖：{:.1}°", half * 2.0);
-    }
-
-    #[test]
-    fn heikou_is_a_thin_band_at_head_and_foot() {
-        // 一成三字高（v1.28.0 由 0.30 收到 0.13），且永不薄于 2px。
-        assert!((heikou_h(50.0) - 50.0 * HEIKOU_H_RATIO).abs() < 0.01);
-        assert_eq!(heikou_h(8.0), HEIKOU_H_MIN);
-        assert!(heikou_h(CH) <= CH * 0.16, "黑口仍嫌厚：{}", heikou_h(CH));
-        // 黑口 + 上鱼尾 + 书口字 + 叶码仍要塞得进一列版心。
-        assert!(heikou_h(CH) * 2.0 + CH < BAND);
+        assert!(depth < 30.0, "V 口掏进过深，鱼尾成倒三角：{depth}");
+        assert!(depth > 4.0, "V 口太浅，看不出鱼尾：{depth}");
     }
 
     #[test]
@@ -608,14 +590,16 @@ mod tests {
         // 上鱼尾：顶边贴 y=0，两鳍尖垂到底，凹口顶点在 0.4H（比翼高＝白口朝上掏进）。
         assert_eq!(up[0].1, 0.0, "上鱼尾顶边应贴 y=0：{up:?}");
         assert!((up[2].1 - h).abs() < 1e-6, "上鱼尾鳍尖应垂到 y=h：{up:?}");
-        assert!((up[3].1 - TAIL_NOTCH_Y * h).abs() < 1e-6, "上鱼尾凹口顶点应在 {:.2}H：{up:?}", TAIL_NOTCH_Y);
+        // 容差 0.01px：`NOTCH·h` 与 `h − NOTCH·h` 是两条不同的 f32 运算链，
+        // 在 130px 量级上差出 1e-5 属正常，1e-6 会把「对」判成「错」。
+        assert!((up[3].1 - TAIL_NOTCH_Y * h).abs() < 0.01, "上鱼尾凹口顶点应在 {:.2}H：{up:?}", TAIL_NOTCH_Y);
         // 下鱼尾：底边在 y=h，两鳍尖在 y=0，凹口顶点在 (1−NOTCH)H。
         assert!((down[0].1 - h).abs() < 1e-6, "下鱼尾底边应在 y=h：{down:?}");
         assert!((down[2].1 - 0.0).abs() < 1e-6, "下鱼尾鳍尖应在 y=0：{down:?}");
-        assert!((down[3].1 - (1.0 - TAIL_NOTCH_Y) * h).abs() < 1e-6, "下鱼尾凹口顶点应在 {:.2}H：{down:?}", 1.0 - TAIL_NOTCH_Y);
+        assert!((down[3].1 - (1.0 - TAIL_NOTCH_Y) * h).abs() < 0.01, "下鱼尾凹口顶点应在 {:.2}H：{down:?}", 1.0 - TAIL_NOTCH_Y);
         // 两枚的凹口顶点关于水平中轴互补（一枚的深 = 另一枚的浅）。
         assert!(
-            (up[3].1 + down[3].1 - h).abs() < 1e-6,
+            (up[3].1 + down[3].1 - h).abs() < 0.01,
             "凹口顶点不成镜像：{:?} {:?}",
             up,
             down

@@ -407,6 +407,46 @@ pub const ANCIENT_TOP_FRAC: f32 = 0.12;
 /// 撑变形（那正是用户点名「绝不允许」的漂移）。
 pub const TOP_OF_BOT: f32 = 1.5;
 
+// ── 列首基准线（v1.56.0 顶格对齐）───────────────────────────────────
+/// **列首字的绝对基准线**：每一列**第一个字的渲染起始 Y** 恒等于这一条
+/// 线——不因字体（宋 / 楷）、不因是否带拼音 / 夹注、不因避头尾禁则的挤压
+/// 而有半个像素的漂移。
+///
+/// 值为 0，意思是「紧贴行格第一格的上沿」；列内其它纵向位移（卷首题署
+/// 预留带、地脚）都在它**之上 / 之下**另计，绝不混进这一条线里。每一列
+/// 的起始绘制一律锚定 [`top_baseline`]，渲染层（`reader::render_column`）
+/// 只此一个入口，不得各自加 padding。
+pub const TOP_BASELINE: f32 = 0.0;
+
+/// **双行夹注在列首时允许向下的缩进**（字高比例，v1.56.0）。
+///
+/// 注文本就比正文低一号，压在列首时略降一点更像刻本；但夹注**占格向上
+/// 取整到整字格**（见 [`ceil_to_cells`]），故这一缩进只是注块内部的视觉
+/// 下沉——它之后的正文首字**仍落在基准线上**，绝不整列下移。
+pub const GLOSS_HEAD_INSET: f32 = 0.12;
+
+/// 列首基准线的**唯一取用口径**：`TOP_BASELINE + top_skip 格`。
+///
+/// `top_skip` 是卷首题署占的格数（章首页开卷列才非零）。渲染层一律用它
+/// 算列的 `pt()`，不许再出现 `cell_h * top_skip` 这种就地算式——两处算
+/// 法一旦分家，顶格对齐就悄悄漂了。
+pub fn top_baseline(top_skip_cells: f32, cell_h: f32) -> f32 {
+    TOP_BASELINE + top_skip_cells.max(0.0) * cell_h.max(0.0)
+}
+
+/// 把任意高度**向上取整到整字格**（v1.56.0）。
+///
+/// 双行夹注、数字串这类块的高度不是整格（夹注一行半格、三行就是 1.5 格），
+/// 若照实高往下排，它后面的正文首字就落在一个半格上——整列往下漂半格，
+/// 正是「顶格对不齐」的由来。取整到整格后，块内多出的那点空当自然成为
+/// 白口，基准线网格纹丝不动。
+pub fn ceil_to_cells(h: f32, cell_h: f32) -> f32 {
+    if cell_h <= 0.0 {
+        return h.max(0.0);
+    }
+    ((h / cell_h).ceil() * cell_h).max(cell_h)
+}
+
 // ── 留白三档（v1.33.0）：版心宽占单叶可用宽的比例 ────────────────────
 /// **版心率**：版心（界行文字区 + 版框）宽 ÷ 单叶可用宽。
 ///
@@ -1875,4 +1915,29 @@ mod frame_tests {
             assert!(s[0] && s[2], "{half:?} 上下横框断了");
         }
     }
+
+    #[test]
+    fn top_baseline_is_the_only_head_anchor() {
+        // 无预留：基准线就是 0（贴第一格上沿）。
+        assert_eq!(top_baseline(0.0, 40.0), 0.0);
+        // 有卷首题署预留：整格往上抬，绝不出现半格。
+        assert_eq!(top_baseline(3.0, 40.0), 120.0);
+        // 负数 / 非有限值兜底：不许把基准线算成负的（那会把字顶出纸外）。
+        assert_eq!(top_baseline(-2.0, 40.0), 0.0);
+        assert_eq!(top_baseline(1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn ceil_to_cells_snaps_half_cells_up() {
+        let cell = 40.0;
+        // 夹注 3 行（1.5 格）→ 2 整格；1 行（0.5 格）→ 1 整格。
+        assert_eq!(ceil_to_cells(60.0, cell), 80.0);
+        assert_eq!(ceil_to_cells(20.0, cell), 40.0);
+        // 整格原样返回，绝不无谓加高。
+        assert_eq!(ceil_to_cells(80.0, cell), 80.0);
+        assert_eq!(ceil_to_cells(40.0, cell), 40.0);
+        // 退化输入不 panic。
+        assert_eq!(ceil_to_cells(10.0, 0.0), 10.0);
+    }
+
 }

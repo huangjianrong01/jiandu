@@ -1,11 +1,16 @@
 //! 书架：书籍目录、导入、阅读档案持久化。
 //!
-//! 目录结构（默认 `~/.jiandu/`，可用环境变量 `JIANDU_HOME` 覆盖）：
+//! 目录结构（跨平台标准应用数据目录，macOS → `~/Library/Application Support/com.jiandu.app/`；
+//! 可用环境变量 `JIANDU_HOME` 覆盖，开发与测试大量依赖它）：
 //! ```text
-//! ~/.jiandu/
+//! ~/Library/Application Support/com.jiandu.app/
 //! ├── library.json      # 书架索引 + 每本书的阅读档案
 //! └── books/            # 导入的书籍副本
 //! ```
+//!
+//! **App Store 沙盒**：上述目录在沙盒下会被系统透明重定向到容器
+//! `Data/Library/Application Support/com.jiandu.app/`，同一份代码三态通用。
+//! 首次启动若发现旧的 `~/.jiandu/`，会把旧数据一次性迁移到新目录（保留旧目录不删）。
 
 use crate::types::Book;
 use anyhow::{Context, Result};
@@ -301,15 +306,52 @@ pub fn now_secs() -> u64 {
 
 impl Library {
     pub fn home() -> PathBuf {
+        // 开发 / 测试态可用 JIANDU_HOME 覆盖（保留，大量测试依赖它）。
         if let Ok(p) = std::env::var("JIANDU_HOME") {
             if !p.is_empty() {
                 return PathBuf::from(p);
             }
         }
-        let base = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        base.join(".jiandu")
+        // 跨平台标准应用数据目录：macOS → ~/Library/Application Support。
+        // App Sandbox 下系统会把这里透明重定向到容器
+        // Data/Library/Application Support，所以同一份代码在「开发态 / 普通分发态 /
+        // App Store 沙盒态」都能正确落盘，无需判环境。
+        let data = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("com.jiandu.app");
+        Self::migrate_legacy_home(&data);
+        data
+    }
+
+    /// 首次启动把旧的 `~/.jiandu/` 数据迁移到新的标准目录。
+    ///
+    /// 只在「新目录尚不存在」时做一次（幂等）；保留旧目录不删除，失败静默忽略——
+    /// 宁可多一份副本，也不冒丢失用户书架 / 阅读进度的险。
+    fn migrate_legacy_home(new_home: &Path) {
+        let legacy = match std::env::var("HOME") {
+            Ok(h) => PathBuf::from(h).join(".jiandu"),
+            Err(_) => return,
+        };
+        if !legacy.is_dir() || new_home.exists() {
+            return;
+        }
+        let _ = Self::copy_dir(&legacy, new_home);
+    }
+
+    /// 递归拷贝目录（仅文件，不进符号链接环），用于旧数据一次性迁移。
+    fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            let dst = to.join(entry.file_name());
+            if ft.is_dir() {
+                Self::copy_dir(&entry.path(), &dst)?;
+            } else if ft.is_file() {
+                std::fs::copy(entry.path(), &dst)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn books_dir() -> PathBuf {
@@ -583,23 +625,28 @@ impl Library {
         Ok(self.books.len() - 1)
     }
 
-    /// **首次启动的内置书目**（v1.56.0）：把内置全本《道德經》写进书架。
+    /// **首次启动的内置书目**（v1.56.0）：把内置全本《道德經》《唐詩三百首》写进书架。
     ///
     /// 只在书架为空时调一次（`Root::new`），之后用户爱删爱换都不再插手。
-    /// 正文来自 `content::bundled_dao_de_jing`（编译期编入的资源），解析
-    /// 不出来才退回旧的手搓样张——资源是 `include_str!` 编进去的，理论上
-    /// 不会发生，但宁可书架有书，也别开天窗。
+    /// 遍历 [`crate::content::BUNDLED_BOOKS`]，每本走与用户导入同一条清洗链路的
+    /// 产物（运行时从 Resources/books 读取）写入书架，解析不出才退回旧手搓样张——
+    /// 宁可书架有书，也别开天窗。返回**第一本**（《道德經》）的书架索引。
     pub fn seed_sample(&mut self) -> Result<usize> {
         let dir = Self::books_dir();
         std::fs::create_dir_all(&dir).context("无法创建书架目录")?;
-        let path = dir.join("daodejing.json");
-        let book = crate::content::bundled_dao_de_jing()
-            .unwrap_or_else(crate::content::sample_dao_de_jing);
-        if !path.exists() {
-            let json = serde_json::to_string_pretty(&book)?;
-            std::fs::write(&path, json).context("写入内置书目失败")?;
+        let mut first_idx = None;
+        for name in crate::content::BUNDLED_BOOKS {
+            let book = crate::content::bundled_book(name)
+                .unwrap_or_else(crate::content::sample_dao_de_jing);
+            let path = dir.join(format!("{name}.json"));
+            if !path.exists() {
+                let json = serde_json::to_string_pretty(&book)?;
+                std::fs::write(&path, json).context("写入内置书目失败")?;
+            }
+            let idx = self.import_path(&path)?;
+            first_idx.get_or_insert(idx);
         }
-        self.import_path(&path)
+        Ok(first_idx.unwrap_or(0))
     }
 
     /// 从内置书库下载一本书：把书内容写成 json 存入 books/，再加入书架。

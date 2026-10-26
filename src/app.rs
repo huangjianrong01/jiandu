@@ -165,25 +165,6 @@ pub enum PngStage {
     Shoot,
 }
 
-/// PDF 导出作业：逐页截屏 → 合成多页 PDF（v1.49.0）。
-///
-/// 由 `render` 的 `pdf_animating` 分支逐帧驱动：每帧要么翻到下一面等画好，
-/// 要么把当前纸面截成 PNG 存起来，直到截满 `total` 面再由 `pdf_finalize` 合成。
-/// 截屏只取 `page_rect`（纸面区域），故工具栏 / 侧栏即便残留也不会入图。
-pub struct PdfJob {
-    /// 要截的总页数（本叶 = 1；全书 = 全书页数）。
-    pub total: usize,
-    /// 已截页数（下一面要截的页码）。
-    pub idx: usize,
-    /// 已截下的临时 PNG 路径（合成后清理）。
-    pub pages: Vec<std::path::PathBuf>,
-    /// true = 全书（逐页翻）；false = 仅当前面。
-    pub full: bool,
-    /// 本次导出的时间戳令牌，避免临时文件名撞车。
-    pub token: u64,
-    /// 导出前的阅读位置，导出结束后还原，免得全书导出把视线甩到最后一面。
-    pub origin_page: usize,
-}
 
 /// 把 `catch_unwind` 捕获的 panic 负载转成可读字符串（`&str` / `String` 优先，
 /// 其它类型回退为「未知错误」）。导出路径在事件处理器与异步任务两处 FFI 边界
@@ -463,8 +444,22 @@ pub struct Root {
     pub share_show_author: bool,
     pub share_show_chapter: bool,
     pub share_show_date: bool,
-    /// 分享卡模板下标（见 `crate::share::TEMPLATES`：四套配色）。
+    /// 分享卡模板下标（旧制四套配色，v1.56.0 起不再参与渲染）。
     pub share_tpl: usize,
+    /// **底色**（v1.56.0）：下标见 [`crate::share::ShareBg::ALL`]。
+    pub share_bg: usize,
+    /// **版框**（v1.56.0）：下标见 [`crate::share::ShareFrame::ALL`]。
+    pub share_frame: usize,
+    /// **印章**（v1.56.0）：下标见 [`crate::share::ShareSeal::ALL`]。
+    pub share_seal: usize,
+    /// 是否连同**朱批 / 眉批**一起分享（关 = 只分享正文）。
+    pub share_show_notes: bool,
+    /// 快照：正文中每个字是否被划了红线（与 `share_body` 等长）。
+    pub share_red: Vec<bool>,
+    /// 快照：该段范围内用户写的眉批（已裁切合并）。
+    pub share_notes: Vec<String>,
+    /// 快照：印文（书名首二字，见 `crate::share::seal_chars`）。
+    pub share_seal_text: String,
     /// 分享卡文字方向：竖排右起（复古）/ 横排居中（现代）。
     pub share_dir: crate::share::ShareDir,
     /// 用户是否手动指定过方向：手动后不再随模板的建议方向变。
@@ -607,14 +602,6 @@ pub struct Root {
     pub search_target: bool,
     pub search_animating: bool,
 
-    /// PDF 导出作业（逐页截屏 → 合成多页 PDF）。`Some` 表示正在导出，
-    /// `render` 的 `pdf_animating` 分支会逐帧翻面 + 截屏。
-    pub pdf_job: Option<PdfJob>,
-    /// PDF 导出是否在「逐帧翻面 / 截屏」推进中（驱动 `request_animation_frame`）。
-    pub pdf_animating: bool,
-    /// PDF 导出的「预热」标记：第一帧只负责让「无面板」状态先画出来，
-    /// 下一帧才开始截，避免截到上一帧还带着面板的画面。
-    pub pdf_warm: bool,
 
     /// PNG 笺卡导出的两段式作业（v1.52.3）：`Some(Warm)` = 面板已收、等一帧
     /// 干净纸面；`Some(Shoot)` = 下一帧截屏 + 弹保存框。`None` = 空闲。
@@ -677,7 +664,7 @@ pub struct Root {
     /// 关窗钩子是否已挂（v1.52.0：改回系统红绿灯后，关闭前要落盘一次）。
     pub close_hook_set: bool,
     /// 顶栏「导出」下拉是否展开（v1.52.2）：底部四枚导出按钮已撤，全部
-    /// 收进这一枚菜单——当前页图片 / 当前页PDF / 全书PDF / MD，逐条直调
+    /// 收进这一枚菜单——当前页图片 / 当前章 Anki 卡片 / MD，逐条直调
     /// 原生保存对话框。渲染见 `reader::render_reading_toolbar`。
     pub export_menu: bool,
 }
@@ -869,6 +856,13 @@ impl Root {
             share_show_chapter: true,
             share_show_date: true,
             share_tpl: 0,
+            share_bg: 0,
+            share_frame: 0,
+            share_seal: 0,
+            share_show_notes: true,
+            share_red: Vec::new(),
+            share_notes: Vec::new(),
+            share_seal_text: crate::share::seal_chars(""),
             share_dir: crate::share::ShareDir::Vertical,
             share_dir_touched: false,
             share_tab: crate::share::ShareTab::Style,
@@ -928,9 +922,6 @@ impl Root {
             search_slide: 0.0,
             search_target: false,
             search_animating: false,
-            pdf_job: None,
-            pdf_animating: false,
-            pdf_warm: false,
             png_export: None,
             export_toast: None,
             narrow_hint: false,
@@ -2781,6 +2772,196 @@ impl Root {
     }
 
     /// 『导出纯文本（MD）』按钮：全书正文 + `[^n]` 脚注，弹系统保存对话框落盘。
+    /// **导出当前章为 Anki 卡片**（v1.56.0）。
+    ///
+    /// 逐句切出卡片：正面 = 句子正文；背面 = 【出处】书名·章名 + 【注释】
+    /// 该句范围内的双行夹注 + 【朱批】该句范围内的眉批与被划红线的字。
+    /// 落盘 `.csv`（Front / Back 两列，RFC 4180 转义），Anki 直接导入。
+    pub fn export_anki_chapter(&mut self, cx: &mut Context<Self>) {
+        let Some(book) = self.book.clone() else {
+            self.notice = "尚未打开书籍，无法导出卡片".to_string();
+            cx.notify();
+            return;
+        };
+        let ci = self.current_chapter.min(book.chapters.len().saturating_sub(1));
+        let chap = self.chapter_title(ci);
+        let source = if chap.is_empty() {
+            book.title.clone()
+        } else {
+            format!("{}·{}", book.title, chap)
+        };
+        let paras = match book.chapters.get(ci) {
+            Some(c) => c.paragraphs.clone(),
+            None => Vec::new(),
+        };
+        let mut csv = String::new();
+        let mut n = 0usize;
+        for (pi, p) in paras.iter().enumerate() {
+            let base = book.flat_index((ci, pi, 0));
+            let cs: Vec<char> = p.text.chars().collect();
+            let mut start = 0usize;
+            for (i, c) in cs.iter().enumerate() {
+                let brk = matches!(c, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n');
+                if !brk {
+                    continue;
+                }
+                Self::anki_push_card(
+                    &mut csv,
+                    &mut n,
+                    &book,
+                    &source,
+                    &cs,
+                    start,
+                    i + 1,
+                    base,
+                    ci,
+                    pi,
+                    &p.notes,
+                    &self.underlines,
+                );
+                start = i + 1;
+            }
+            if start < cs.len() {
+                Self::anki_push_card(
+                    &mut csv,
+                    &mut n,
+                    &book,
+                    &source,
+                    &cs,
+                    start,
+                    cs.len(),
+                    base,
+                    ci,
+                    pi,
+                    &p.notes,
+                    &self.underlines,
+                );
+            }
+        }
+        if n == 0 {
+            self.notice = "本章没有可制卡片的句子".to_string();
+            cx.notify();
+            return;
+        }
+        let stem = crate::exporter::safe_file_stem(&book.title);
+        let cstem = crate::exporter::safe_file_stem(&chap);
+        let default = if cstem.is_empty() {
+            format!("{stem}_卡片.csv")
+        } else {
+            format!("{stem}_{cstem}_卡片.csv")
+        };
+        let total = n;
+        cx.spawn(
+            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    // rfd 保存框必须前台直调（v1.52.4 铁律）：走 background
+                    // executor 会被 GPUI 主循环挤掉、静默返回 None。
+                    let picked = crate::exporter::pick_save_path(
+                        "导出 Anki 卡片（CSV）",
+                        &default,
+                        "CSV 表格",
+                        &["csv"],
+                    );
+                    let Some(dest) = picked else {
+                        this.update(&mut cx, |this, cx| {
+                            this.notice = "已取消导出".to_string();
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    };
+                    let dest = crate::exporter::with_extension(dest, "csv");
+                    let res = std::fs::write(&dest, csv.as_bytes());
+                    this.update(&mut cx, |this, cx| {
+                        this.notice = match res {
+                            Ok(()) => format!("已导出 {total} 张卡片，请在 Anki 中导入 CSV"),
+                            Err(e) => format!("写入失败：{e}"),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
+/// 往 CSV 里追加一张卡片（`[from, to)` 是段内字符区间）。
+///
+/// 短于两字的碎片（孤立的标点、空行）不成卡。注释 / 朱批都按**字符区间**
+/// 取：夹注看 `Note::at`，眉批看 `MarginNote::anchor_char_index`（全书扁平
+/// 下标，`base` 是本段首字的扁平下标），划线看 `(章, 段, 偏移)` 键。
+#[allow(clippy::too_many_arguments)]
+fn anki_push_card(
+    csv: &mut String,
+    n: &mut usize,
+    book: &crate::types::Book,
+    source: &str,
+    cs: &[char],
+    from: usize,
+    to: usize,
+    base: usize,
+    ci: usize,
+    pi: usize,
+    notes: &[crate::types::Note],
+    underlines: &std::collections::HashSet<(usize, usize, usize)>,
+) {
+    if to <= from || to > cs.len() {
+        return;
+    }
+    let front: String = cs[from..to].iter().collect();
+    let front = front.trim().to_string();
+    if front.chars().count() < 2 {
+        return;
+    }
+    let mut back = format!("【出处】{source}");
+
+    // 注释：夹注（Note）与通假（Tongjia）都算注文。
+    let mut gloss: Vec<String> = Vec::new();
+    for nt in notes.iter() {
+        let is_gloss = matches!(
+            nt.kind,
+            crate::types::NoteKind::Note | crate::types::NoteKind::Tongjia
+        );
+        if !is_gloss || nt.at < from || nt.at >= to {
+            continue;
+        }
+        if !nt.text.trim().is_empty() {
+            gloss.push(nt.text.trim().to_string());
+        }
+    }
+    if !gloss.is_empty() {
+        back.push_str("<br>【注释】");
+        back.push_str(&gloss.join("；"));
+    }
+
+    // 朱批：眉批（锚在字上）+ 被划红线的字。
+    let mut marks: Vec<String> = Vec::new();
+    for m in book.margin_notes.iter() {
+        if m.anchor_char_index >= base + from && m.anchor_char_index < base + to {
+            let t = m.content.trim();
+            if !t.is_empty() {
+                marks.push(t.to_string());
+            }
+        }
+    }
+    let red: String = (from..to)
+        .filter(|o| underlines.contains(&(ci, pi, *o)))
+        .map(|o| cs[o])
+        .collect();
+    if !red.is_empty() {
+        marks.push(format!("划线：{red}"));
+    }
+    if !marks.is_empty() {
+        back.push_str("<br>【朱批】");
+        back.push_str(&marks.join("；"));
+    }
+
+    csv.push_str(&crate::exporter::csv_line(&[&front, &back]));
+    *n += 1;
+}
+
     pub fn export_markdown_file(&mut self, cx: &mut Context<Self>) {
         let Some(book) = self.book.clone() else {
             self.notice = "尚未打开书籍，无法导出".to_string();
@@ -2818,163 +2999,6 @@ impl Root {
         .detach();
     }
 
-    /// 『导出为 PDF（本叶）』：截当前纸面 → 包成单页 PDF → 弹系统保存框。
-    pub fn export_pdf_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.begin_pdf_export(window, cx, false);
-    }
-
-    /// 『导出为 PDF（全书）』：逐页翻面截屏 → 合成多页 PDF → 弹系统保存框。
-    pub fn export_pdf_full(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.begin_pdf_export(window, cx, true);
-    }
-
-    /// 启动 PDF 导出：收起所有面板（免得被截进纸面），登记作业，预热一帧。
-    fn begin_pdf_export(&mut self, _window: &mut Window, cx: &mut Context<Self>, full: bool) {
-        if self.book.is_none() {
-            self.notice = "尚未打开书籍，无法导出".to_string();
-            cx.notify();
-            return;
-        }
-        // 导出前收起所有面板 / 浮层，纸面只留正文。
-        self.set_ui_state(AppUIState::None);
-        self.close_transient_ui();
-        let total = if full {
-            self.paginate().len().max(1)
-        } else {
-            1
-        };
-        let token = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.pdf_job = Some(PdfJob {
-            total,
-            idx: 0,
-            pages: Vec::new(),
-            full,
-            token,
-            origin_page: self.page,
-        });
-        self.pdf_animating = true;
-        self.pdf_warm = true;
-        self.notice = if full {
-            format!("正在印制全书 PDF…（0/{total}）")
-        } else {
-            "正在印制本叶 PDF…".to_string()
-        };
-        cx.notify();
-        // ⚠️ 同 `export_page_png`：**绝不**在事件处理器里调
-        // `window.request_animation_frame()`——GPUI 0.2.2 该函数内部
-        // `current_view().unwrap()` 只在绘制阶段有栈，此处调用必 panic
-        // 并撞 FFI 边界被强杀（v1.52.5 的「点 PDF 导出即闪退」根因，
-        // panic.log 栈：begin_pdf_export → request_animation_frame）。
-        // 首帧由 `cx.notify()` 的重绘驱动：`render` 的 pdf_animating
-        // 分支（绘制阶段，栈非空）会自己 request 下一帧，循环不断。
-    }
-
-    /// PDF 合成收尾：把临时 PNG 合成为临时 PDF，弹系统保存框，落盘后给古风提示。
-    /// 在 `render` 循环截满所有页后调用（主线程），内部用后台任务跑 I/O 不卡 UI。
-    fn pdf_finalize(&mut self, job: PdfJob, cx: &mut Context<Self>) {
-        // 还原阅读位置：全书导出翻遍了每一面，结束时跳回原位。
-        self.page = job.origin_page;
-        let full = job.full;
-        if job.pages.is_empty() {
-            self.notice = "未能截得任何页面，导出取消".to_string();
-            cx.notify();
-            return;
-        }
-        let title = self
-            .book
-            .as_ref()
-            .map(|b| b.title.clone())
-            .unwrap_or_else(|| "笺读".to_string());
-        let default = if full {
-            format!("笺读_{}_全书.pdf", crate::exporter::safe_file_stem(&title))
-        } else {
-            format!(
-                "笺卡_{}_{}.pdf",
-                crate::exporter::safe_file_stem(&title),
-                self.page + 1
-            )
-        };
-        let pages = job.pages;
-        cx.spawn(
-            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                let mut cx = cx.clone();
-                async move {
-                    // 先把临时 PNG 合成一份临时 PDF。
-                    let tmp_pdf = std::env::temp_dir().join(format!(
-                        "jiandu-pdf-out-{}.pdf",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0)
-                    ));
-                    let built = cx
-                        .background_executor()
-                        .spawn({
-                            let pages = pages.clone();
-                            let tmp_pdf = tmp_pdf.clone();
-                            async move { crate::pdf::pngs_to_pdf(&pages, &tmp_pdf) }
-                        })
-                        .await;
-                    // 临时 PNG 使命结束，先清掉（无论成败）。
-                    for p in &pages {
-                        let _ = std::fs::remove_file(p);
-                    }
-                    let Ok(tmp_pdf) = built else {
-                        let e = built.unwrap_err();
-                        this.update(&mut cx, |this, cx| {
-                            this.notice = format!("合成 PDF 失败：{e}");
-                            // v1.52.3：阅读视图不渲染 notice，收尾话送 export_toast。
-                            this.export_toast = Some(format!("合成 PDF 失败：{e}"));
-                            cx.notify();
-                        })
-                        .ok();
-                        return;
-                    };
-                    // 弹系统保存对话框。v1.52.4：**前台直调**（与 PNG/MD
-                    // 同一修复）——rfd 同步 save_file 必须跑在主线程，
-                    // 过 background_executor 会被 GPUI 主循环挤掉、静默
-                    // 返回 None，表现为「点了导出什么都没发生」。
-                    let picked = crate::exporter::pick_save_path(
-                        "导出为 PDF",
-                        &default,
-                        "PDF 文档",
-                        &["pdf"],
-                    );
-                    let Some(dest) = picked else {
-                        let _ = std::fs::remove_file(&tmp_pdf);
-                        this.update(&mut cx, |this, cx| {
-                            this.notice = "已取消保存".to_string();
-                            this.export_toast = Some("已取消保存".to_string());
-                            cx.notify();
-                        })
-                        .ok();
-                        return;
-                    };
-                    let dest = crate::exporter::with_extension(dest, "pdf");
-                    let res = crate::exporter::copy_file(&tmp_pdf, &dest);
-                    let _ = std::fs::remove_file(&tmp_pdf);
-                    this.update(&mut cx, |this, cx| {
-                        let msg = match res {
-                            Ok(p) => format!(
-                                "{}已印成 PDF：{}",
-                                if full { "全书" } else { "本叶" },
-                                p.display()
-                            ),
-                            Err(e) => format!("保存失败：{e}"),
-                        };
-                        this.notice = msg.clone();
-                        this.export_toast = Some(msg);
-                        cx.notify();
-                    })
-                    .ok();
-                }
-            },
-        )
-        .detach();
-    }
 
     /// 某章的第一面页码；找不到就回 0。
     pub fn page_of_chapter(&self, chapter: usize) -> usize {
@@ -4880,83 +4904,6 @@ impl Render for Root {
                 }
             } else {
                 window.request_animation_frame();
-            }
-        }
-        // PDF 导出：逐帧翻面 + 截屏（见 `begin_pdf_export` / `pdf_finalize`）。
-        if self.pdf_animating {
-            if self.pdf_warm {
-                // 预热帧：只让「无面板」状态先画出来，下一帧再截，
-                // 免得截到上一帧还带着面板的画面。顺手翻到第一面。
-                self.pdf_warm = false;
-                match self.pdf_job.as_ref() {
-                    Some(job) => {
-                        let target = if job.full { job.idx } else { self.page };
-                        if self.page != target {
-                            self.page = target;
-                        }
-                        window.request_animation_frame();
-                    }
-                    None => {
-                        self.pdf_animating = false;
-                    }
-                }
-            } else {
-                // 取作业参数（无作业则安全退出，不 panic）。
-                // 用 `if let` 而非 `let … else { return }`：`render` 必须返回元素，
-                // 裸 `return;` 会破坏 `-> impl IntoElement` 的返回类型。
-                if let Some(job) = self.pdf_job.as_ref() {
-                    // 先取出作业参数（不可变借用，随即释放，避免与下面的截屏借用打架）。
-                    let (full, idx, token, need_flip) = {
-                        let target = if job.full { job.idx } else { self.page };
-                        (job.full, job.idx, job.token, self.page != target)
-                    };
-                    if need_flip {
-                        // 翻到目标面，等下一帧画好再截。
-                        self.page = if full { idx } else { self.page };
-                        window.request_animation_frame();
-                    } else {
-                        // 屏幕此刻显示的正是 target 面 → 截下纸面。
-                        let tmp = std::env::temp_dir()
-                            .join(format!("jiandu-pdf-{}-{}.png", token, idx));
-                        let captured = self.capture_page_png(window, &tmp);
-                        let done = if let Some(job) = self.pdf_job.as_mut() {
-                            match captured {
-                                Ok(()) => job.pages.push(tmp),
-                                Err(e) => {
-                                    self.notice = format!("第 {} 葉截屏失败：{}", idx + 1, e);
-                                }
-                            }
-                            job.idx += 1;
-                            if job.full && job.idx < job.total {
-                                self.page = job.idx; // 预备下一面翻页
-                            }
-                            job.pages.len() >= job.total
-                        } else {
-                            true
-                        };
-                        if done {
-                            self.pdf_animating = false;
-                            if let Some(job) = self.pdf_job.take() {
-                                self.pdf_finalize(job, cx);
-                            }
-                        } else {
-                            if let Some(job) = &self.pdf_job {
-                                self.notice = if job.full {
-                                    format!(
-                                        "正在印制全书 PDF…（{}/{}）",
-                                        job.pages.len(),
-                                        job.total
-                                    )
-                                } else {
-                                    "正在印制本叶 PDF…".to_string()
-                                };
-                            }
-                            window.request_animation_frame();
-                        }
-                    }
-                } else {
-                    self.pdf_animating = false;
-                }
             }
         }
         // PNG 笺卡导出：两段式（先收面板画一帧干净纸面，下一帧才截屏）——v1.52.3。
