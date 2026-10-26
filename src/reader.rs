@@ -8534,13 +8534,22 @@ impl Root {
                         }))
                 };
 
-                // ③ 四套模板色板（圆 = 该模板底色；选中 = 外圈朱砂环）。
-                let mut swatches = div().flex().flex_row().items_center().gap(px(12.0));
-                for i in 0..crate::share::TEMPLATES.len() {
-                    let tpl = crate::share::tpl(i);
-                    let on = i == self.share_tpl;
+                // ③ v1.57.0 三轴控件：**背景三档** / **版框三档** / **展示朱批**开关。
+                //
+                // 旧制是「四套模板」捆绑（换底色连带换框），现在三轴各自成轴。
+                // 背景用圆点（圆面即该底色，选中加朱砂环），版框与朱批用 chip。
+                let mut bg_dots = div().flex().flex_row().items_center().gap(px(12.0));
+                for (i, b) in crate::share::ShareBg::ALL.iter().enumerate() {
+                    let on = i == self.share_bg;
+                    let face = div()
+                        .w(px(18.0))
+                        .h(px(18.0))
+                        .rounded(px(9.0))
+                        .bg(rgb(crate::share::palette(*b).bg))
+                        .border_1()
+                        .border_color(rgba(0xFFFFFF59));
                     let mut dot = div()
-                        .id(SharedString::from(format!("share-tpl-{i}")))
+                        .id(SharedString::from(format!("share-bg-{i}")))
                         .w(px(26.0))
                         .h(px(26.0))
                         .rounded(px(13.0))
@@ -8553,64 +8562,88 @@ impl Root {
                     } else {
                         dot.border_1().border_color(rgba(0xF2EAD63D))
                     };
-                    // 色面 = 该模板的底色；粗体模板（拓片金石）面上加一道
-                    // 点缀色细弧作「厚重」暗示——纯色圆 + 一圈淡白描边。
-                    let mut face = div()
-                        .w(px(18.0))
-                        .h(px(18.0))
-                        .rounded(px(9.0))
-                        .bg(rgb(tpl.bg))
-                        .border_1()
-                        .border_color(rgba(0xFFFFFF59));
-                    if tpl.bold {
-                        face = face.child(
-                            div()
-                                .w(px(8.0))
-                                .h(px(1.0))
-                                .rounded(px(0.5))
-                                .bg(rgb(tpl.accent)),
-                        );
-                    }
-                    swatches = swatches.child(
-                        dot.child(face).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.share_tpl = i;
-                                // 用户没手动指定过方向时，跟随模板的建议方向
-                                // （澄心堂纸 / 青绿山水 / 拓片金石竖排，夜读幽兰横排）。
-                                if !this.share_dir_touched {
-                                    this.share_dir = crate::share::tpl(i).suggest_dir;
-                                }
-                                cx.notify();
-                            }),
-                        ),
-                    );
+                    bg_dots = bg_dots.child(dot.child(face).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.share_bg = i;
+                            cx.notify();
+                        }),
+                    ));
                 }
 
-                let group = div()
+                // 版框 / 朱批：两枚 chip，点即切换。
+                let axis_chip = |label: &'static str, on: bool, act: u8| -> Stateful<Div> {
+                    let mut d = div()
+                        .id(SharedString::from(format!("share-axis-{act}")))
+                        .px(px(11.0))
+                        .h(px(22.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(11.0))
+                        .cursor_pointer()
+                        .text_size(px(10.5))
+                        .text_color(if on { rgb(0xF2EAD6E6) } else { rgba(0x8A8378A6) });
+                    d = if on {
+                        d.bg(rgba(0xF2EAD61A)).border_1().border_color(rgba(0xF2EAD652))
+                    } else {
+                        d.border_1().border_color(rgba(0xF2EAD62E))
+                    };
+                    d.child(SharedString::from(label)).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            match act {
+                                // 版框：在「红线框 → 黑线框 → 无边框」间循环。
+                                1 => {
+                                    let n = crate::share::ShareFrame::ALL.len();
+                                    this.share_frame = (this.share_frame + 1) % n;
+                                }
+                                // 展示朱批：把用户写的眉批 / 划线一起画进图里。
+                                _ => this.share_show_notes = !this.share_show_notes,
+                            }
+                            cx.notify();
+                        }),
+                    )
+                };
+                let frame_label = crate::share::ShareFrame::ALL
+                    .get(self.share_frame)
+                    .copied()
+                    .unwrap_or(crate::share::ShareFrame::Red)
+                    .label();
+                let axes = div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .justify_center()
-                    .gap(px(18.0))
+                    .gap(px(8.0))
+                    .child(axis_chip(frame_label, true, 1))
+                    .child(axis_chip("展示朱批", self.share_show_notes, 2));
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(chips)
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.0))
-                            .child(dir_icon(crate::share::ShareDir::Vertical))
-                            .child(dir_icon(crate::share::ShareDir::Horizontal)),
+                            .gap(px(18.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(dir_icon(crate::share::ShareDir::Vertical))
+                                    .child(dir_icon(crate::share::ShareDir::Horizontal)),
+                            )
+                            .child(bg_dots),
                     )
-                    .child(swatches);
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(12.0))
-                    .child(chips)
-                    .child(group)
+                    .child(axes)
             }
             crate::share::ShareTab::Font => {
                 // 字体 chips：随阅读字体 / 齐伋 / 文津 / 梦源 / 玄冬楷 / 霞鹜文楷。
@@ -8734,29 +8767,44 @@ impl Root {
                     })),
             );
 
-        // ---- 唯一动作钮：保存图片 ----
-        // v1.57.0：原「分享图片（进剪贴板）/ 分享文字（拓印正文）」两枚已删，
-        // 连带 `share_image_to_clipboard` / `share_text_to_clipboard` 两个函数。
-        let btn_save = div()
-            .id(SharedString::from("share-act-save"))
-            .px(px(18.0))
-            .h(px(34.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(17.0))
-            .cursor_pointer()
-            .text_size(px(12.0))
-            .bg(rgb(crate::share::CINNABAR))
-            .text_color(rgb(0xFFF8EC))
-            .child(SharedString::from("保存图片"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.save_share_image(window, cx);
-                }),
-            );
+        // ---- 两枚动作钮：保存到本地 / 复制到剪贴板 ----
+        //
+        // 两者都走 `share_paint` 的**离屏渲染**（1080×1920），与预览同源、
+        // 与屏幕无关——不再截屏。
+        let act_pill = |label: &'static str, primary: bool| -> Stateful<Div> {
+            let mut d = div()
+                .id(SharedString::from(format!("share-act-{label}")))
+                .px(px(18.0))
+                .h(px(34.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(17.0))
+                .cursor_pointer()
+                .text_size(px(12.0));
+            d = if primary {
+                d.bg(rgb(crate::share::CINNABAR)).text_color(rgb(0xFFF8EC))
+            } else {
+                d.border_1()
+                    .border_color(rgba(0xF2EAD659))
+                    .text_color(rgba(0xF2EAD6CC))
+            };
+            d.child(SharedString::from(label))
+        };
+        let btn_save = act_pill("保存到本地", true).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.save_share_png(cx);
+            }),
+        );
+        let btn_copy = act_pill("复制到剪贴板", false).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.copy_share_png(cx);
+            }),
+        );
         let buttons = div()
             .absolute()
             .bottom(px(24.0))
@@ -8766,7 +8814,8 @@ impl Root {
             .flex_row()
             .justify_center()
             .gap(px(12.0))
-            .child(btn_save);
+            .child(btn_save)
+            .child(btn_copy);
 
         div()
             .absolute()
@@ -8791,15 +8840,68 @@ impl Root {
             }))
     }
 
-    /// 保存分享卡：先截卡片（同步，此刻屏幕上正是卡片）→ 弹系统保存框
-    /// → 落盘 PNG。v1.52.4 同款修复：rfd 保存框必须**前台直调**
-    /// （`cx.spawn` 的 async 体跑在主线程），过 background_executor 会被
-    /// GPUI 主循环挤掉、静默返回 None。
-    fn save_share_image(&mut self, window: &Window, cx: &mut Context<Self>) {
-        // 先截再收面板：截屏是同步的，先关面板要等下一帧才更新画面。
-        let shot = self.capture_card_png(window, "jiandu-share");
-        self.show_share_panel = false;
-        let tmp = match shot {
+    /// 分享卡的字体语义（离屏渲染据此挑系统 PostScript 字体）。
+    ///
+    /// GPUI 侧的家族名（文津宋体 / 霞鹜文楷…）CoreText 不认，故按「楷 / 宋」
+    /// 两类语义落到系统字体上（`ShareFont::postscript_chain` 内再回退）。
+    fn share_font_kind(&self) -> crate::share_layout::ShareFont {
+        use crate::types::FontChoice;
+        let choice = self
+            .share_font
+            .and_then(|i| crate::share::SHARE_FONTS.get(i))
+            .and_then(|(_, c)| *c);
+        match choice {
+            Some(FontChoice::XuandongKaishu) | Some(FontChoice::LXGWWenKai) => {
+                crate::share_layout::ShareFont::Kai
+            }
+            _ => crate::share_layout::ShareFont::Song,
+        }
+    }
+
+    /// 按当前抽屉参数**离屏**渲染 1080×1920 的分享 PNG。
+    ///
+    /// 走 `share_layout::layout` → `share_paint::render_png`：纯 CoreGraphics
+    /// 位图，不读屏幕、不要权限、锁屏也能出图（旧 `screencapture` 方案已废）。
+    pub(crate) fn render_share_png(&self) -> Result<Vec<u8>, String> {
+        let body: Vec<char> = self.share_body.clone();
+        let note = self.share_notes.join("；");
+        let sign = self.share_sign_text();
+        let bg = crate::share::ShareBg::ALL
+            .get(self.share_bg)
+            .copied()
+            .unwrap_or(crate::share::ShareBg::Xuan);
+        let frame = crate::share::ShareFrame::ALL
+            .get(self.share_frame)
+            .copied()
+            .unwrap_or(crate::share::ShareFrame::Red);
+        let spec = crate::share_layout::LayoutSpec {
+            body: &body,
+            red: &self.share_red,
+            note: &note,
+            show_notes: self.share_show_notes,
+            sign: &sign,
+            show_sign: self.share_show_title || self.share_show_chapter,
+            date: &self.share_date,
+            show_date: self.share_show_date,
+            columns: self.grid.columns,
+            bg,
+            frame,
+            seal: crate::share::ShareSeal::Twin,
+            seal_text: "笺讀",
+            font: self.share_font_kind(),
+            w: 1080.0,
+            h: 1920.0,
+        };
+        let l = crate::share_layout::layout(&spec);
+        crate::share_paint::render_png(&l)
+    }
+
+    /// 保存到本地：离屏出图 → 弹系统保存框 → 落盘 PNG。
+    ///
+    /// rfd 保存框必须**前台直调**（`cx.spawn` 的 async 体跑在主线程），
+    /// 过 background_executor 会被 GPUI 主循环挤掉、静默返回 None。
+    fn save_share_png(&mut self, cx: &mut Context<Self>) {
+        let png = match self.render_share_png() {
             Ok(p) => p,
             Err(e) => {
                 self.notice = e;
@@ -8807,6 +8909,7 @@ impl Root {
                 return;
             }
         };
+        self.show_share_panel = false;
         let default = format!(
             "笺读分享_{}.png",
             crate::exporter::safe_file_stem(if self.share_book.is_empty() {
@@ -8820,13 +8923,12 @@ impl Root {
                 let mut cx = cx.clone();
                 async move {
                     let picked = crate::exporter::pick_save_path(
-                        "保存分享图（PNG）",
+                        "保存分享图（PNG 1080×1920）",
                         &default,
                         "PNG 图片",
                         &["png"],
                     );
                     let Some(dest) = picked else {
-                        let _ = std::fs::remove_file(&tmp);
                         this.update(&mut cx, |this, cx| {
                             this.notice = "已取消保存".to_string();
                             cx.notify();
@@ -8834,17 +8936,12 @@ impl Root {
                         .ok();
                         return;
                     };
-                    let dest = crate::exporter::with_extension(dest, "png");
-                    let res = crate::exporter::copy_file(
-                        std::path::Path::new(&tmp),
-                        std::path::Path::new(&dest),
-                    );
-                    let _ = std::fs::remove_file(&tmp);
+                    let msg = match std::fs::write(&dest, &png) {
+                        Ok(_) => format!("已保存分享图：{}", dest.display()),
+                        Err(e) => format!("保存失败：{e}"),
+                    };
                     this.update(&mut cx, |this, cx| {
-                        this.notice = match res {
-                            Ok(p) => format!("已保存分享图：{}", p.display()),
-                            Err(e) => format!("保存失败：{e}"),
-                        };
+                        this.notice = msg;
                         cx.notify();
                     })
                     .ok();
@@ -8852,6 +8949,48 @@ impl Root {
             },
         )
         .detach();
+    }
+
+    /// 复制到剪贴板：离屏出图 → 落临时 PNG → `osascript` 以 PNG 数据写粘贴板。
+    ///
+    /// 用 `«class PNGf»` 而不是 TIFF：微信 / 备忘录粘贴回来才是真 PNG，
+    /// 不会被转成 72dpi 的位图。
+    fn copy_share_png(&mut self, cx: &mut Context<Self>) {
+        let png = match self.render_share_png() {
+            Ok(p) => p,
+            Err(e) => {
+                self.notice = e;
+                cx.notify();
+                return;
+            }
+        };
+        self.show_share_panel = false;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir().join(format!("jiandu-share-{stamp}.png"));
+        if let Err(e) = std::fs::write(&tmp, &png) {
+            self.notice = format!("临时文件写入失败：{e}");
+            cx.notify();
+            return;
+        }
+        let script = format!(
+            "set the clipboard to (read (POSIX file \"{}\") as «class PNGf»)",
+            tmp.display()
+        );
+        let ok = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_file(&tmp);
+        self.notice = if ok {
+            "分享图已复制到剪贴板，可直接粘贴".to_string()
+        } else {
+            "复制失败：剪贴板不可用".to_string()
+        };
+        cx.notify();
     }
 
     /// **「版字」面板**：列数 · 字级 · 字体 · 批注 · 留白 · 纸边 · 页面 ·

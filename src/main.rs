@@ -32,6 +32,12 @@ mod note_inject;
 mod punct;
 mod reader;
 mod share;
+// v1.57.0：分享卡拆成「版式数据层 + 两个渲染后端」。
+//   share_layout  纯数据版式（零 GPUI / 零 macOS API，可单测）
+//   share_paint   CoreGraphics 离屏光栅 → 1080×1920 PNG（仅 macOS）
+mod share_layout;
+#[cfg(target_os = "macos")]
+mod share_paint;
 mod shelf;
 mod sound;
 mod zen_kit;
