@@ -8,12 +8,12 @@ use crate::grid::{GridConfig, GridDir, LayoutConfig};
 use crate::library::{Bookmark, Library};
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
-    Book, CardLayout, Duplex, FontChoice, FontPreset, Glyph, GlyphHit, GlyphKey, GlyphKind,
+    Book, Duplex, FontChoice, FontPreset, Glyph, GlyphHit, GlyphKey, GlyphKind,
     MarkKind, Note, NoteKind, NoteSource, RuleColor, Script,
 };
 use gpui::{
     div, px, rgb, AsyncApp, Context, Div, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled,
+    KeyDownEvent, ParentElement, Render, ScrollHandle, SharedString, Styled,
     WeakEntity, Window,
 };
 use std::cell::Cell;
@@ -2679,7 +2679,7 @@ impl Root {
     ///
     /// 保存顺序**不能反**：先截后弹。保存面板一浮起，再截就截到面板自己了。
     /// 用户取消 = 正常结果：清掉临时文件、提示一句，不 panic、不报错红。
-    pub fn export_page_png(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub fn export_page_png(&mut self, _window: &Window, cx: &mut Context<Self>) {
         // 导出已在推进中：忽略重复点击（两段式作业会自行收尾）。
         if self.png_export.is_some() {
             return;
@@ -2821,7 +2821,7 @@ impl Root {
     }
 
     /// 启动 PDF 导出：收起所有面板（免得被截进纸面），登记作业，预热一帧。
-    fn begin_pdf_export(&mut self, window: &mut Window, cx: &mut Context<Self>, full: bool) {
+    fn begin_pdf_export(&mut self, _window: &mut Window, cx: &mut Context<Self>, full: bool) {
         if self.book.is_none() {
             self.notice = "尚未打开书籍，无法导出".to_string();
             cx.notify();
@@ -4230,7 +4230,7 @@ impl Root {
             }
             None => {
                 self.set_note(self.page, text);
-                if self.notes.get(&self.page).is_some() {
+                if self.notes.contains_key(&self.page) {
                     self.notice = format!("已保存第 {} 葉笔记", self.page + 1);
                 } else {
                     self.notice = "笔记已清空".to_string();
@@ -4537,7 +4537,7 @@ impl Root {
     /// （见 `main.rs` 的 `zen_window_options`），再留一套自绘钮就是「两个
     /// 关闭键」，既冗余又违背系统手感。关窗落盘改由 `render` 里挂的
     /// `on_window_should_close` 负责。
-    pub fn render_brand(&mut self, cx: &mut Context<Self>) -> Div {
+    pub fn render_brand(&mut self, _cx: &mut Context<Self>) -> Div {
         let song = crate::fonts::family_for(
             crate::types::FontChoice::SongTi,
             crate::types::Script::Ancient,

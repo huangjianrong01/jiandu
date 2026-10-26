@@ -464,7 +464,7 @@ fn draw_fishtail(window: &mut Window, fx: f32, fy: f32, fw: f32, col_w: f32, top
 ///   * 每个字的 Y 再显式 clamp 到 [0, frame_h - row_h]（相对版框顶），双保险。
 fn render_text_columns(g: &GridGeom, text: &[char]) -> Div {
     let per_col = g.rows.max(1);
-    let total_cols = (text.len() + per_col - 1) / per_col;
+    let total_cols = text.len().div_ceil(per_col);
     // ✅ 坐标限制：列数截断到版框容量，超出的内容不渲染（翻页由上层负责）。
     let used_cols = total_cols.min(g.cols);
 

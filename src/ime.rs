@@ -591,7 +591,7 @@ mod tests {
         assert!(NOTE_MAX > SEARCH_MAX);
         let mut draft = String::new();
         let mut cursor = 0;
-        let long: String = std::iter::repeat('批').take(NOTE_MAX + 40).collect();
+        let long: String = "批".repeat(NOTE_MAX + 40);
         replace_utf16_limited(&mut draft, &mut cursor, None, &long, NOTE_MAX);
         assert_eq!(draft.chars().count(), NOTE_MAX);
         assert_eq!(cursor, NOTE_MAX);

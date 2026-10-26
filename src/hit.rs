@@ -21,6 +21,9 @@ use crate::gloss::{Page, Piece};
 use crate::types::{Glyph, GlyphKind};
 
 /// 一叶纸面的几何（反查用；与 `render_ancient` 同源）。
+// 字段是与渲染逐项对齐的**完整**几何（`rows` 供分页校验用），不一定都被
+// 反查读到，故整块不参与死代码检查。
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct LeafFrame {
     /// 字格宽（列宽）。
@@ -46,6 +49,9 @@ pub struct LeafFrame {
 }
 
 /// 一个字的包围盒（**纸面内坐标**：原点 = 该叶内框左上，与 `NoteBox` 同系）。
+// `contains` 与 `key` 是给反查 / 浮层避让用的公开几何接口，本 crate 内部
+// 未必每帧都走到，故整块不参与死代码检查。
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct GlyphBox {
     pub glyph: Glyph,
@@ -55,6 +61,7 @@ pub struct GlyphBox {
     pub h: f32,
 }
 
+#[allow(dead_code)]
 impl GlyphBox {
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
@@ -66,6 +73,7 @@ impl GlyphBox {
 }
 
 /// 一片在列内的纵向占位（半格账的结果）。
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Span {
     /// 该片在 `items` 里的下标。
@@ -167,7 +175,7 @@ pub fn column_spans(items: &[Piece], cell_h: f32, west_mode: bool) -> Vec<Span> 
                 i += 1;
             }
             Piece::Gloss(text, _, _) => {
-                let h = ((text.chars().count() + 1) / 2) as f32 * half;
+                let h = text.chars().count().div_ceil(2) as f32 * half;
                 out.push(Span {
                     index: i,
                     y,
@@ -199,6 +207,7 @@ pub fn column_spans(items: &[Piece], cell_h: f32, west_mode: bool) -> Vec<Span> 
 /// （`GlyphKind::Indent`）不渲染，不产盒。
 ///
 /// `li` 是**布局序**（flex_row 里左数第几列），故 x = `li × cell_w`。
+#[allow(dead_code)]
 pub fn glyph_boxes_in_column(
     items: &[Piece],
     li: usize,
@@ -287,6 +296,7 @@ pub fn glyph_boxes_of_columns(columns: &[Vec<Piece>], f: &LeafFrame) -> Vec<Glyp
 }
 
 /// 一叶里所有正文字的包围盒（[`glyph_boxes_of_columns`] 的 `Page` 版）。
+#[allow(dead_code)]
 pub fn glyph_boxes(page: &Page, f: &LeafFrame) -> Vec<GlyphBox> {
     glyph_boxes_of_columns(&page.columns, f)
 }
@@ -406,6 +416,7 @@ pub fn glyph_at(page: &Page, x: f32, y: f32, f: &LeafFrame) -> Option<GlyphBox> 
 // ------------------------------------------------------------------
 
 /// 被查的那个字在屏幕上的矩形（浮签要绕开它）。
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct Anchor {
     pub x: f32,
@@ -443,6 +454,7 @@ pub enum Vert {
 }
 
 /// 浮签落位结果（视口坐标）。
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct Placement {
     pub left: f32,
@@ -451,6 +463,7 @@ pub struct Placement {
     pub vert: Vert,
 }
 
+#[allow(dead_code)]
 impl Placement {
     pub fn rect(&self, w: f32, h: f32) -> (f32, f32, f32, f32) {
         (self.left, self.top, w, h)
@@ -555,6 +568,7 @@ pub fn place_card(
 /// 浮签是**竖排**的：第一列大字、第二列拼音、后几列释义。卡片高度先定
 /// （视口高的六成，但不越过视口），再按高度反推「一列能排几个字」，
 /// 最后才得出宽度——宽是算出来的，不是拍的，这样长释义才不会撑破屏幕。
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct CardMetrics {
     /// 卡片宽（含双线框与内边距）。
@@ -570,6 +584,7 @@ pub struct CardMetrics {
 }
 
 /// 竖排浮签的度量：按视口与释义长度反算。
+#[allow(dead_code)]
 pub fn card_metrics(gloss_len: usize, vw: f32, vh: f32) -> CardMetrics {
     // 释义字号：小字（13），行距 1.16 倍（竖排逐字叠下，行距即字距）。
     let gloss_fs = 13.0f32;
@@ -585,13 +600,13 @@ pub fn card_metrics(gloss_len: usize, vw: f32, vh: f32) -> CardMetrics {
     let cols = if gloss_len == 0 {
         1
     } else {
-        ((gloss_len + per_col_limit - 1) / per_col_limit).clamp(1, 8)
+        gloss_len.div_ceil(per_col_limit).clamp(1, 8)
     };
     // 每列字数：**均分**，让各列齐平（末列不至于只剩两个字）。
     let per_col = if gloss_len == 0 {
         per_col_limit
     } else {
-        ((gloss_len + cols - 1) / cols).min(per_col_limit).max(1)
+        gloss_len.div_ceil(cols).min(per_col_limit).max(1)
     };
     // 高度随内容收缩：短释义就是一张矮纸条，不硬撑到六成屏。
     let content_h = per_col as f32 * line;
@@ -609,6 +624,7 @@ pub fn card_metrics(gloss_len: usize, vw: f32, vh: f32) -> CardMetrics {
 }
 
 /// 两个矩形是否分离（测试的判据：浮签不得压住被查的字）。
+#[allow(dead_code)]
 pub fn disjoint(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
     let (ax, ay, aw, ah) = a;
     let (bx, by, bw, bh) = b;

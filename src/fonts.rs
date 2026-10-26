@@ -529,7 +529,7 @@ const KAI_CHAIN: &[&str] = &[
 ];
 
 pub fn head_family() -> SharedString {
-    pick_font(&KAI_CHAIN, AVAILABLE.get().map(|v| v.as_slice()).unwrap_or(&[]))
+    pick_font(KAI_CHAIN, AVAILABLE.get().map(|v| v.as_slice()).unwrap_or(&[]))
 }
 
 /// 按当前模式与字体选择返回字体族名：回退链上第一个系统真正拥有的字体。

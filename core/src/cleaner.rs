@@ -134,13 +134,12 @@ pub fn is_noise_para(s: &str) -> bool {
         return true;
     }
     // ② 网址 / 邮箱
-    if t.contains("http://") || t.contains("https://") || t.starts_with("www.") {
+    if ["http://", "https://"].iter().any(|s| t.contains(s)) || t.starts_with("www.") {
         return true;
     }
-    if t.contains(".com") || t.contains(".cn") || t.contains(".net") || t.contains(".org") {
-        if t.chars().any(|c| c == '/' || c == '.') && n <= 60 {
-            return true;
-        }
+    let tld = [".com", ".cn", ".net", ".org"];
+    if tld.iter().any(|s| t.contains(s)) && t.chars().any(|c| c == '/' || c == '.') && n <= 60 {
+        return true;
     }
     if n <= 40 && t.contains('@') && !t.contains(' ') && t.contains('.') {
         return true;
@@ -274,7 +273,7 @@ fn drop_nav_runs(blocks: &mut Vec<IrBlock>, titles: &[String]) {
     let nav_like = |b: &IrBlock| -> bool {
         let t = b.plain_text();
         let n = t.chars().count();
-        n > 0 && n <= 6 && !t.chars().any(is_sentence_punct) && titles.iter().any(|x| *x == t)
+        n > 0 && n <= 6 && !t.chars().any(is_sentence_punct) && titles.contains(&t)
     };
     let mut out: Vec<IrBlock> = Vec::with_capacity(blocks.len());
     let mut run: Vec<IrBlock> = Vec::new();
@@ -429,7 +428,7 @@ fn numbered_head(t: &str) -> Option<u8> {
         let inner = &cs[1..];
         let close = inner.iter().position(|c| matches!(c, '）' | ')'));
         if let Some(k) = close {
-            if k >= 1 && k <= 3 && inner[..k].iter().all(|c| is_cn_numeral(*c) || c.is_ascii_digit()) {
+            if (1..=3).contains(&k) && inner[..k].iter().all(|c| is_cn_numeral(*c) || c.is_ascii_digit()) {
                 return Some(3);
             }
         }
@@ -533,8 +532,7 @@ pub fn paren_to_note(s: &str) -> String {
                     if depth == 0 {
                         let body = buf.trim();
                         let n = body.chars().count();
-                        let ok = n >= 1
-                            && n <= 30
+                        let ok = (1..=30).contains(&n)
                             && !body.chars().any(is_sentence_punct)
                             && !body.contains(['（', '）', '(', ')']);
                         if ok {
@@ -772,7 +770,7 @@ pub fn clean_chapters(chapters: &[RawChapter], source: IrSource) -> Vec<RawChapt
                 c.title.as_str(),
                 c.paragraphs
                     .iter()
-                    .map(|p| crate::ir::para_to_line(p))
+                    .map(crate::ir::para_to_line)
                     .collect::<Vec<_>>()
                     .join("\n"),
             )
@@ -813,7 +811,7 @@ mod tests {
         assert!(is_noise_para("版权所有，翻印必究"));
         assert!(is_noise_para("下一页"));
         assert!(!is_noise_para("道可道，非常道。"));
-        assert_eq!(denoise_text("道​可​道"), "道可道");
+        assert_eq!(denoise_text("道\u{200B}可\u{200B}道"), "道可道");
         assert_eq!(denoise_text("&amp;道"), "&道");
     }
 

@@ -10,6 +10,16 @@
 //! v1.47.0：纯逻辑已解耦至 `jiandu-core` crate（grid / parsers / dict 等），
 //! 本二进制只留 UI 层（app / reader / shelf）与绘制耦合的排版辅助。
 
+// ── 交付态 lint 政策（v1.55.0 发布前净化）──────────────────────────
+// 以下两类的警告是**有意保留**的，不是遗漏，故在 crate 根统一放行，
+// 免得逐处加 `#[allow]` 把无关代码搅乱：
+//   * dead_code —— 旧分享卡 / Zen 长图 / 翻页音效等按「渐进式重构」要求
+//     留着不物理删除，接口保留到下一轮统一清理；
+//   * too_many_arguments —— 排版函数按几何逐项传值（列宽 / 行高 / 天头 /
+//     地脚…），硬拆成 struct 反而掩盖每一项的意义。
+#![allow(dead_code)]
+#![allow(clippy::too_many_arguments)]
+
 mod app;
 mod exporter;
 mod fonts;
@@ -38,7 +48,7 @@ pub use jiandu_core::{
 use app::Root;
 use anyhow::Result;
 use gpui::{
-    point, prelude::*, px, size, App, Application, AssetSource, Bounds, SharedString,
+    prelude::*, px, size, App, Application, AssetSource, Bounds, SharedString,
     TitlebarOptions, WindowBounds, WindowOptions,
 };
 use jiandu_core::library::Library;

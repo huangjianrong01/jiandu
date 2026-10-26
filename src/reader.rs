@@ -20,8 +20,8 @@ use crate::types::{
     MarkKind, NoteKind, NoteSource, Script, TocEntry,
 };
 use gpui::{
-    canvas, div, point, prelude::*, px, rgb, rgba, svg, Animation, AnimationExt, AnyElement, App,
-    AsyncApp, BoxShadow, Bounds, Context, Div, ElementId, FontWeight, KeyDownEvent, MouseButton,
+    canvas, div, point, prelude::*, px, rgb, rgba, svg, AnyElement, App,
+    AsyncApp, BoxShadow, Bounds, Context, Div, FontWeight, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow, ParentElement, PathBuilder, Pixels,
     SharedString, Stateful, Styled, WeakEntity, Window,
 };
@@ -670,7 +670,7 @@ pub(crate) fn banxin_seal(w: f32, h: f32) -> Div {
 /// 单列自适应收缩——耳片极窄，读的是个「形」与位置。
 fn book_ear(t: Theme, w: f32, h: f32, x: f32, top: f32, label: &str) -> Div {
     // 耳内小字：高出一成给行距，宽不超出耳片。
-    let fs = (w * 0.62).max(6.5).min(10.0);
+    let fs = (w * 0.62).clamp(6.5, 10.0);
     // 耳片只有一列宽：单列自适应（字号随耳高收缩，装不下才截断缀「…」）。
     let (efs, ecol, _cut) = crate::shelf::fit_single_column(label, h - 6.0, fs);
     div()
@@ -758,7 +758,7 @@ pub(crate) fn han_num(n: usize) -> String {
         11..=19 => format!("十{}", D[n % 10]),
         20..=99 => {
             let head = format!("{}十", D[n / 10]);
-            if n % 10 == 0 {
+            if n.is_multiple_of(10) {
                 head
             } else {
                 format!("{}{}", head, D[n % 10])
@@ -1815,11 +1815,11 @@ impl Root {
         let t = self.theme;
         // 抽屉底：宣纸 + alpha 0xF2（约 95%）——磨砂半透的宣纸色，比旧版
         // 0xE6 更实一档，毛玻璃透视感更强，背后正文仍若隐若现、绝不糊死。
-        let DRAWER_BG: u32 = (t.paper() << 8) | 0xF2;
+        let drawer_bg: u32 = (t.paper() << 8) | 0xF2;
         // 顶上那条分割线：淡墨兑到很浅，只起「抽屉是另一张纸」的提示作用。
-        let EDGE: u32 = (t.rule() << 8) | 0x5A;
-        let INK: u32 = t.ink();
-        let INK_SOFT: u32 = t.ink_soft();
+        let edge: u32 = (t.rule() << 8) | 0x5A;
+        let ink: u32 = t.ink();
+        let ink_soft: u32 = t.ink_soft();
         // 朱砂：rgb(178, 58, 48)——当前卷专用，其余卷一律墨色。
         const VERMILION: u32 = 0xB23A30;
 
@@ -1842,7 +1842,7 @@ impl Root {
         let slide = self.toc_slide.clamp(0.0, 1.0);
         let off = -(1.0 - slide) * H;
         // 上半屏遮罩随 slide 淡入：最重也只有 42% 黑，别把书页糊死。
-        let mask: u32 = (0x000000 << 8) | ((0.42 * slide * 255.0) as u32).min(255);
+        let mask: u32 = ((0.42 * slide * 255.0) as u32).min(255);
 
         const FS: f32 = 15.0; // 卷名字号
         const PITCH: f32 = 22.0; // 一格高（字身 + 行气）
@@ -1865,7 +1865,7 @@ impl Root {
                 p.move_to(point(x0 + side, y0));
                 p.line_to(point(x0, y0 + side));
                 if let Ok(path) = p.build() {
-                    window.paint_path(path, rgb(INK_SOFT));
+                    window.paint_path(path, rgb(ink_soft));
                 }
             },
         )
@@ -1889,7 +1889,7 @@ impl Root {
                     .cursor_pointer()
                     .font_family(song.clone())
                     .text_size(px(11.0))
-                    .text_color(rgb(INK_SOFT))
+                    .text_color(rgb(ink_soft))
                     .hover(|s| s.text_color(rgb(VERMILION)))
                     .child(SharedString::from("卷首"))
                     .on_mouse_down(
@@ -1907,7 +1907,7 @@ impl Root {
                 div()
                     .font_family(song.clone())
                     .text_size(px(9.5))
-                    .text_color(rgb(INK_SOFT))
+                    .text_color(rgb(ink_soft))
                     .child(SharedString::from(format!("共 {} 卷", toc.len()))),
             )
             .child(
@@ -1955,7 +1955,7 @@ impl Root {
                     .pt(px(18.0))
                     .font_family(song.clone())
                     .text_size(px(12.0))
-                    .text_color(rgb(INK_SOFT))
+                    .text_color(rgb(ink_soft))
                     .child(SharedString::from("这本书没有目录")),
             );
         }
@@ -1963,7 +1963,7 @@ impl Root {
         for e in toc.iter() {
             let cur = e.chapter == cur_chapter;
             let jump = e.start_char_index.unwrap_or(0);
-            let fg = if cur { VERMILION } else { INK };
+            let fg = if cur { VERMILION } else { ink };
             let shown = Self::toc_label(&e.title, per_col);
             // v1.52.3（P3#10）：题名被截断 / 砍过括注时，悬停显示横排全称。
             let full = Self::toc_label_full(&e.title);
@@ -1999,9 +1999,9 @@ impl Root {
                 // 原生 tooltip：浮层独立渲染，不受抽屉 overflow_hidden 裁剪；
                 // 只在悬停时构造（294 卷也不会常驻成本）。
                 let tip_title = full.clone();
-                let tip_bg = DRAWER_BG;
-                let tip_edge = EDGE;
-                let tip_ink = INK;
+                let tip_bg = drawer_bg;
+                let tip_edge = edge;
+                let tip_ink = ink;
                 let tip_family = song.clone();
                 col = col.tooltip(move |_window, cx| {
                     cx.new(|_| TocTip {
@@ -2051,7 +2051,7 @@ impl Root {
             .h(px(H))
             .flex()
             .flex_col()
-            .bg(rgba(DRAWER_BG))
+            .bg(rgba(drawer_bg))
             // 悬浮质感：8px 圆角 + 极弱黑色投影，像一张浮在屏底的纸条。
             .rounded(px(8.0))
             .shadow(vec![gpui::BoxShadow {
@@ -2061,7 +2061,7 @@ impl Root {
                 spread_radius: px(0.0),
             }])
             .border_t_1()
-            .border_color(rgba(EDGE))
+            .border_color(rgba(edge))
             .overflow_hidden()
             // 拦住冒泡：点抽屉内不该顺下去触发外层遮罩的「关闭」或翻页。
             .on_mouse_down(
@@ -2103,10 +2103,10 @@ impl Root {
         let vh = self.viewport_h;
         let t = self.theme;
         // 抽屉底：宣纸 + alpha 0xF2（与目录栏同档磨砂半透）。
-        let DRAWER_BG: u32 = (t.paper() << 8) | 0xF2;
-        let EDGE: u32 = (t.rule() << 8) | 0x5A;
-        let INK: u32 = t.ink();
-        let INK_SOFT: u32 = t.ink_soft();
+        let drawer_bg: u32 = (t.paper() << 8) | 0xF2;
+        let edge: u32 = (t.rule() << 8) | 0x5A;
+        let ink: u32 = t.ink();
+        let ink_soft: u32 = t.ink_soft();
         // 朱砂：当前点 / 主动作 / 删除-hover 用。
         const VERMILION: u32 = 0xB23A30;
 
@@ -2114,7 +2114,7 @@ impl Root {
         const HEAD_H: f32 = 34.0;
         let slide = self.bookmarks_slide.clamp(0.0, 1.0);
         let off = -(1.0 - slide) * H;
-        let mask: u32 = (0x000000 << 8) | ((0.42 * slide * 255.0) as u32).min(255);
+        let mask: u32 = ((0.42 * slide * 255.0) as u32).min(255);
 
         let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
         // 当前页锚点只算一次，逐行比对是否「正读到此」这枚书签。
@@ -2140,7 +2140,7 @@ impl Root {
                     .font_family(song.clone())
                     .text_size(px(11.0))
                     .text_color(rgb(VERMILION))
-                    .hover(|s| s.text_color(rgb(INK)))
+                    .hover(|s| s.text_color(rgb(ink)))
                     .child(SharedString::from("＋ 收藏此页"))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2155,7 +2155,7 @@ impl Root {
                 div()
                     .font_family(song.clone())
                     .text_size(px(9.5))
-                    .text_color(rgb(INK_SOFT))
+                    .text_color(rgb(ink_soft))
                     .child(SharedString::from(format!("書籤 {}", self.bookmarks.len()))),
             )
             .child(
@@ -2169,7 +2169,7 @@ impl Root {
                     .cursor_pointer()
                     .font_family(song.clone())
                     .text_size(px(11.0))
-                    .text_color(rgb(INK_SOFT))
+                    .text_color(rgb(ink_soft))
                     .hover(|s| s.text_color(rgb(VERMILION)))
                     .child(SharedString::from("收"))
                     .on_mouse_down(
@@ -2210,7 +2210,7 @@ impl Root {
                     .pt(px(20.0))
                     .font_family(song.clone())
                     .text_size(px(12.0))
-                    .text_color(rgb(INK_SOFT))
+                    .text_color(rgb(ink_soft))
                     .child(SharedString::from(
                         "还没有书签。点「＋ 收藏此页」记下这一页。",
                     )),
@@ -2244,7 +2244,7 @@ impl Root {
             // 当前页书签：章节名转朱砂，一眼可辨「正读到此」。
             let is_cur = cur_anchor.map(|a| (a.0, a.1, a.2))
                 == Some((bm.chapter, bm.para, bm.offset));
-            let ch_fg = if is_cur { VERMILION } else { INK_SOFT };
+            let ch_fg = if is_cur { VERMILION } else { ink_soft };
 
             let mut row = div()
                 .w_full()
@@ -2255,7 +2255,7 @@ impl Root {
                 .px(px(8.0))
                 .py(px(9.0))
                 .border_b_1()
-                .border_color(rgba(EDGE))
+                .border_color(rgba(edge))
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2293,7 +2293,7 @@ impl Root {
                         div()
                             .font_family(song.clone())
                             .text_size(px(13.0))
-                            .text_color(rgb(INK))
+                            .text_color(rgb(ink))
                             .child(SharedString::from(excerpt)),
                     ),
             );
@@ -2310,7 +2310,7 @@ impl Root {
                     .cursor_pointer()
                     .font_family(song.clone())
                     .text_size(px(12.0))
-                    .text_color(rgb(INK_SOFT))
+                    .text_color(rgb(ink_soft))
                     .hover(|s| s.text_color(rgb(VERMILION)))
                     .child(SharedString::from("删"))
                     .on_mouse_down(
@@ -2334,7 +2334,7 @@ impl Root {
             .h(px(H))
             .flex()
             .flex_col()
-            .bg(rgba(DRAWER_BG))
+            .bg(rgba(drawer_bg))
             .rounded(px(8.0))
             .shadow(vec![gpui::BoxShadow {
                 color: gpui::hsla(0.0, 0.0, 0.0, 0.12),
@@ -2343,7 +2343,7 @@ impl Root {
                 spread_radius: px(0.0),
             }])
             .border_t_1()
-            .border_color(rgba(EDGE))
+            .border_color(rgba(edge))
             .overflow_hidden()
             // 拦住冒泡：点抽屉内不该顺下去触发外层遮罩的「关闭」或翻页。
             .on_mouse_down(
@@ -2388,8 +2388,8 @@ impl Root {
         let mut out = String::new();
         for c in raw.chars() {
             match c {
-                '【' | '“' | '“' => out.push('「'),
-                '】' | '”' | '”' => out.push('」'),
+                '【' | '“' => out.push('「'),
+                '】' | '”' => out.push('」'),
                 '《' | '〈' => out.push('︽'),
                 '》' | '〉' => out.push('︾'),
                 '…' | '⋯' => out.push('︙'),
@@ -2414,8 +2414,8 @@ impl Root {
         let mut out = String::new();
         for c in raw.chars() {
             match c {
-                '【' | '“' | '“' => out.push('「'),
-                '】' | '”' | '”' => out.push('」'),
+                '【' | '“' => out.push('「'),
+                '】' | '”' => out.push('」'),
                 '《' | '〈' => out.push('︽'),
                 '》' | '〉' => out.push('︾'),
                 '…' | '⋯' => out.push('︙'),
@@ -3222,7 +3222,7 @@ impl Root {
             .absolute()
             .left(px(x))
             .top(px(0.0))
-            .font_family(&crate::fonts::head_family())
+            .font_family(crate::fonts::head_family())
             .text_size(px(fs))
             .child(crate::ime::InputField::new(
                 Self::head_note_column(&draft, fs, lh, Some(cur), head_ink),
@@ -3413,7 +3413,7 @@ impl Root {
         // 章末统计表：排在正文末列之后的第一片空列里、贴着天头，
         // 仿刻本卷尾的「篇—章—字」小表（版心之左、正文之尾）。
         if !stats.is_empty() {
-            if let Some(empty) = first_empty_column(&columns, text_cols) {
+            if let Some(empty) = first_empty_column(columns, text_cols) {
                 inner = inner.child(self.render_chapter_stats(
                     stats,
                     empty,
@@ -4018,7 +4018,7 @@ impl Root {
         let t = self.theme;
         let is_user = matches!(source, NoteSource::User);
         let chars: Vec<char> = text.chars().collect();
-        let rows = (chars.len() + 1) / 2;
+        let rows = chars.len().div_ceil(2);
         let row_h = cell_h / 2.0;
         // 小字 = 正文一半（0.5）；列数 ≥10 时下限抬到 10（可读性阈值），
         // 但上沿不越过半格高，保证小字始终在格内、不与上一字重叠
@@ -6142,7 +6142,7 @@ impl Root {
             if s.is_empty() {
                 0
             } else {
-                (s.chars().count() + per_line - 1) / per_line
+                s.chars().count().div_ceil(per_line)
             }
         };
         // 段间留白折算成「行」计入行预算，避免段多了把卡撑过上限。
@@ -6153,7 +6153,7 @@ impl Root {
                 .max(48.0)
         };
         // 贪心选段：能整段塞进预算就整段塞，塞不下的最后一段按需截断。
-        let avail = ((body_h_at(max_h) / line_h).floor() as f32).max(3.0);
+        let avail = (body_h_at(max_h) / line_h).floor().max(3.0);
         let mut chosen: Vec<String> = Vec::new();
         let mut lines_total: f32 = 0.0;
         let mut first = true;
@@ -6277,7 +6277,7 @@ impl Root {
                 let rule = if on {
                     rgba((zhu << 8) | 0xDC)
                 } else {
-                    rgba((zhu << 8) | 0x00)
+                    rgba(zhu << 8)
                 };
                 let text = div()
                     .font_family(main_family.clone())
@@ -6689,7 +6689,7 @@ impl Root {
                     this.goto_hit(i, cx);
                 }));
             // 一行：前文（淡墨）+ 命中（朱砂）+ 后文（淡墨）。
-            let mut line = div()
+            let line = div()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -7725,7 +7725,7 @@ impl Root {
         if self.has_selection() {
             if let Some((a, b)) = self.selection_range() {
                 // 全叶扫描：选区可能跨叶，按阅读顺序一路收干净。
-                'scan: for (pi, pg) in pages.iter().enumerate() {
+                for (pi, pg) in pages.iter().enumerate() {
                     for g in pg.iter() {
                         if g.kind != GlyphKind::Char || g.is_indent() {
                             continue;
@@ -8030,7 +8030,7 @@ impl Root {
     fn render_notes_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let vw = self.viewport_w;
-        let vh = self.viewport_h;
+        let _vh = self.viewport_h;
         let slide = self.notes_slide.clamp(0.0, 1.0);
         let panel_w = (vw * 0.36).clamp(300.0, 440.0);
         let off = -(1.0 - slide) * panel_w;

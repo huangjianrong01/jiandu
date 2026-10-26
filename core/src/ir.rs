@@ -929,7 +929,7 @@ mod tests {
         let spans = line_to_spans("漢[拼音:hàn]字");
         assert_eq!(spans_text(&spans), "漢字");
         assert!(matches!(
-            spans.get(0),
+            spans.first(),
             Some(IrSpan::Ruby { base, rt }) if base == "漢" && rt == "hàn"
         ));
     }
@@ -969,7 +969,7 @@ mod tests {
         ir.juans.push(j);
         let md = ir.to_markdown();
         let back = IrBook::from_markdown("莊子", &md);
-        assert!(back.juans.len() >= 1, "导出再导入不该丢卷：\n{md}");
+        assert!(!back.juans.is_empty(), "导出再导入不该丢卷：\n{md}");
         // `body_text` 是去标记的纯字（夹注不占格，故不出现在纯正文里）；
         // 校验保真要看带标记的那一份 `body_lines`。
         let plain: String = back.juans.iter().map(|j| j.body_text()).collect();

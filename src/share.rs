@@ -289,7 +289,7 @@ pub fn cn_small(n: usize) -> String {
         11..=19 => format!("十{}", D[n - 10]),
         20..=99 => {
             let tens = D[n / 10];
-            if n % 10 == 0 {
+            if n.is_multiple_of(10) {
                 format!("{tens}十")
             } else {
                 format!("{tens}十{}", D[n % 10])
@@ -649,7 +649,7 @@ fn horizontal_content(t: &ShareTpl, spec: &CardSpec, avail_w: f32, avail_h: f32)
     let base_fs = ((spec.h / 22.0).clamp(14.0, 28.0)) * t.fs_boost;
     // 每行字数：至少 6 字，最多把可用宽度用满（CJK 字宽≈字号）。
     let mut fs = base_fs;
-    let mut cpl = ((avail_w / (fs * 1.06)).floor() as usize).max(6);
+    let mut cpl;
     loop {
         cpl = ((avail_w / (fs * 1.06)).floor() as usize).max(6);
         // 行数 × 行高 + 落款两行，要放得下卡片高。

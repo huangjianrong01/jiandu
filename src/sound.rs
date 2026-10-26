@@ -199,7 +199,7 @@ mod tests {
         let b = synth();
         assert_eq!(a, b, "同一段纸声每次合成必须一致（才能缓存复用）");
         assert!(!a.is_empty());
-        assert!(a.iter().all(|s| *s >= -32768 && *s <= 32767));
+        assert!(a.iter().all(|s| *s >= -32768));
     }
 
     #[test]

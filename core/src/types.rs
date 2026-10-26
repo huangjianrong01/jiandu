@@ -315,18 +315,15 @@ impl FontPreset {
 /// 取代原先那条七档圆点滑块——档位太多，相邻两档肉眼几乎分不出来，
 /// 反而让人反复试。四档拉开差距，一档一个手感，且档名就是档名，不必数点。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum ZoomLevel {
     Small,
+    #[default]
     Normal,
     Large,
     Huge,
 }
 
-impl Default for ZoomLevel {
-    fn default() -> Self {
-        ZoomLevel::Normal
-    }
-}
 
 impl ZoomLevel {
     pub const ALL: [ZoomLevel; 4] = [
@@ -669,6 +666,7 @@ impl<'de> Deserialize<'de> for Paragraph {
 
 /// 封面信息：书名、副题、印章文字、主色。
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Cover {
     #[serde(default)]
     pub title: String,
@@ -680,16 +678,6 @@ pub struct Cover {
     pub accent: u32,
 }
 
-impl Default for Cover {
-    fn default() -> Self {
-        Self {
-            title: String::new(),
-            subtitle: String::new(),
-            seal: String::new(),
-            accent: 0,
-        }
-    }
-}
 
 impl Cover {
     pub fn seal_or_default(&self) -> String {

@@ -104,8 +104,10 @@ pub fn sat(c: u32) -> f32 {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default)]
 pub enum Theme {
     /// 宣纸：米白偏暖，最像常见的影印本（联动「墨朱」）。
+    #[default]
     Xuan,
     /// 米黄：更黄一些，旧书味重（联动「赭朱」）。
     Mi,
@@ -115,11 +117,6 @@ pub enum Theme {
     Ye,
 }
 
-impl Default for Theme {
-    fn default() -> Self {
-        Theme::Xuan
-    }
-}
 
 impl Theme {
     /// 顺序必须与 [`PAPER_THEMES`] 完全一致——下标即主题编号。
@@ -356,8 +353,10 @@ pub fn mix(a: u32, b: u32, k: f32) -> u32 {
 /// 渲染时正文用 `ink`、夹注 / 句读 / 眉批用 `note`——两者严格分色，
 /// 绝不能正文注文一个色（任务三·生死攸关）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default)]
 pub enum InkPalette {
     /// 墨黑正文 · 朱红批注（默认，最接近常见刻本；浅纸直取纸主题 text/note）
+    #[default]
     Ink,
     /// 墨绿正文 · 砖红批注（联动青简）
     Forest,
@@ -367,11 +366,6 @@ pub enum InkPalette {
     Gold,
 }
 
-impl Default for InkPalette {
-    fn default() -> Self {
-        InkPalette::Ink
-    }
-}
 
 impl InkPalette {
     pub const ALL: [InkPalette; 4] = [

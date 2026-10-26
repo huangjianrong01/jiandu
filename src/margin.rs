@@ -47,8 +47,6 @@ pub struct MarginBox {
     pub w: f32,
     /// 字柱区高 = `每列字数 × 行距`。
     pub h: f32,
-    /// 字宽（= 字号）。
-    pub fs: f32,
     /// 相邻两列的间距（列距）。
     pub pitch: f32,
     /// 每列字数。
@@ -69,7 +67,7 @@ impl MarginBox {
         if n == 0 || self.per_col == 0 {
             return 0;
         }
-        (n + self.per_col - 1) / self.per_col
+        n.div_ceil(self.per_col)
     }
 
     /// 第 `k` 列（**0 = 最右一列**，竖排自右向左读）的字。
@@ -174,8 +172,8 @@ pub fn layout_notes(
             chars[..1].iter().collect()
         };
         let m = text.chars().count();
-        let cols = ((m + per_col_max - 1) / per_col_max).min(max_cols).max(1);
-        let per_col = ((m + cols - 1) / cols).min(per_col_max).max(1);
+        let cols = m.div_ceil(per_col_max).min(max_cols).max(1);
+        let per_col = m.div_ceil(cols).min(per_col_max).max(1);
         let w = (cols as f32 - 1.0) * pitch + fs;
         let h = per_col as f32 * lh;
         // 字柱区居中压在锚定字上；贴边时夹回带内，绝不探出纸缘。
@@ -202,7 +200,6 @@ pub fn layout_notes(
             y: top,
             w,
             h,
-            fs,
             pitch,
             per_col,
             text,
@@ -221,7 +218,7 @@ pub fn layout_notes(
 ///
 /// 控制点取在起点正下方（垂直走 62% 的落差），于是曲线起笔是竖直的——
 /// 视觉上像从批语最后一字笔锋顺势拖下来，再斜着搭到被批的那个字上。
-pub fn leader_ctrl(x0: f32, y0: f32, x1: f32, y1: f32) -> (f32, f32) {
+pub fn leader_ctrl(x0: f32, y0: f32, _x1: f32, y1: f32) -> (f32, f32) {
     let dy = (y1 - y0).max(1.0);
     (x0, y0 + dy * 0.62)
 }

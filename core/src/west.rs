@@ -167,7 +167,7 @@ pub fn width_units<I: IntoIterator<Item = char>>(chars: I) -> usize {
 /// 一串字符占几个汉字格：`ceil(units / 2)`。`1628` → 2 格。
 pub fn run_cells<I: IntoIterator<Item = char>>(chars: I) -> usize {
     let u = width_units(chars);
-    (u + WEST_PER_CELL - 1) / WEST_PER_CELL
+    u.div_ceil(WEST_PER_CELL)
 }
 
 /// 竖排括号字形：`(` → `︵`，`)` → `︶`（全角同理）。

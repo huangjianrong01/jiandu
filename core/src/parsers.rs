@@ -1203,11 +1203,10 @@ pub fn parse_xml(raw: &str) -> Vec<RawChapter> {
                                 stack.push(std::mem::replace(&mut mode, Mode::Note));
                             }
                         }
-                        "p" | "ab" | "lg" | "seg" | "div" | "body" => {
-                            if skip == 0 {
+                        "p" | "ab" | "lg" | "seg" | "div" | "body"
+                            if skip == 0 => {
                                 mode = Mode::Body;
                             }
-                        }
                         _ => {
                             // 其它未知开放标签（hi/q/ref…）：不改语义，文本仍按外层 mode 收。
                         }

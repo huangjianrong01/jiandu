@@ -124,7 +124,7 @@ pub fn decode_bytes(bytes: &[u8]) -> String {
     // UTF-16 LE / BE BOM
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
         let u16s: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| {
                 if bytes[0] == 0xFF {
                     u16::from_le_bytes([c[0], c[1]])
@@ -183,7 +183,7 @@ pub fn fullwidth_punct(s: &str) -> String {
 pub fn classicize(s: &str) -> String {
     // 破折号竖排化与 EPUB 那条链同源（`vclean::dash_to_vertical`）：
     // 横躺的 `——` 在竖排里就是一根拦腰截断行气的横杠。
-    let s = crate::vclean::dash_to_vertical(&s);
+    let s = crate::vclean::dash_to_vertical(s);
     // 现代括号不进正文流（与 `parsers::cleanup_ancient_text` 同源）：EPUB
     // 那条链也走这里，两链一致才不会「时有时无」。
     let s = crate::parsers::purge_bracket_marks(&s);
@@ -965,8 +965,8 @@ fn attr_value(attrs: &str, key: &str) -> String {
         return String::new();
     };
     let rest = &attrs[i + needle.len()..];
-    let rest = rest.trim_start_matches(|c| c == '"' || c == '\'');
-    let end = rest.find(|c| c == '"' || c == '\'').unwrap_or(rest.len());
+    let rest = rest.trim_start_matches(['"', '\'']);
+    let end = rest.find(['"', '\'']).unwrap_or(rest.len());
     rest[..end].to_string()
 }
 

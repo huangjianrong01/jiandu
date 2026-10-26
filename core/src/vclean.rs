@@ -397,7 +397,7 @@ fn noteref_to_note(s: &str, notes: &HashMap<String, String>) -> String {
         let attrs = &low[at + 2..at + g];
         let id = href_id(attrs);
         // 注脚：要么显式 noteref 类，要么 href 指向一条已收集的注文。
-        let is_ref = is_noteref(attrs) || id.as_ref().map_or(false, |i| notes.contains_key(i));
+        let is_ref = is_noteref(attrs) || id.as_ref().is_some_and(|i| notes.contains_key(i));
         if !is_ref {
             cursor = at + g + 1;
             continue;
@@ -928,11 +928,10 @@ fn squeeze_spaces(s: &str) -> String {
             if prev.is_some() && next.is_some() {
                 if ideographic {
                     out.push('\u{3000}');
-                } else if !crate::west::is_cjk(prev.unwrap()) && !crate::west::is_cjk(next.unwrap()) {
-                    if !out.ends_with(' ') {
+                } else if !crate::west::is_cjk(prev.unwrap()) && !crate::west::is_cjk(next.unwrap())
+                    && !out.ends_with(' ') {
                         out.push(' ');
                     }
-                }
             }
             i = j;
             continue;
@@ -1344,14 +1343,14 @@ fn clean_tag(raw: &str) -> String {
     }
     let mut s = raw.to_string();
     if has_style {
-        s = rewrite_attr(&s, "style", |v| strip_style_colors(v));
+        s = rewrite_attr(&s, "style", strip_style_colors);
     }
     if has_color_attr {
         s = rewrite_attr(&s, "color", |_| String::new());
         s = rewrite_attr(&s, "bgcolor", |_| String::new());
     }
     if has_class {
-        s = rewrite_attr(&s, "class", |v| strip_color_classes(v));
+        s = rewrite_attr(&s, "class", strip_color_classes);
     }
     // `<font>` 剥成空壳就没意义了（它唯一的作用就是上色）。
     if s.to_ascii_lowercase().starts_with("<font") && s.trim_end().ends_with('>') {

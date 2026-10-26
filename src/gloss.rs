@@ -90,7 +90,7 @@ impl Filler {
         if chars == 0 {
             return 0;
         }
-        let want = (chars + 1) / 2;
+        let want = chars.div_ceil(2);
         let room = self.room();
         if want <= room {
             self.units += want;
@@ -159,7 +159,7 @@ pub fn piece_units(p: &Piece) -> usize {
         Piece::Main(g) if g.kind == GlyphKind::Attach => 0,
         Piece::Main(_) => 2,
         Piece::Gap => 2,
-        Piece::Gloss(s, ..) => (s.chars().count() + 1) / 2,
+        Piece::Gloss(s, ..) => s.chars().count().div_ceil(2),
     }
 }
 
@@ -728,7 +728,7 @@ pub fn note_boxes_in_column(
                 idx += 1;
             }
             Piece::Gloss(text, src, host) => {
-                let rows = (text.chars().count() + 1) / 2;
+                let rows = text.chars().count().div_ceil(2);
                 let h = rows as f32 * row_h;
                 out.push(NoteBox {
                     x: li as f32 * cell_w + pad + inset,
@@ -963,7 +963,7 @@ pub fn z_layout(text: &str, col_w: f32, row_h: f32, fs: f32) -> Vec<ZCell> {
             }
             Seg::Note(t) => {
                 let chars: Vec<char> = t.chars().collect();
-                let half = (chars.len() + 1) / 2; // 右小列（读在前）的字数
+                let half = chars.len().div_ceil(2); // 右小列（读在前）的字数
                 let anchor = y; // 注块紧跟宿主字之后起排
                 for (i, ch) in chars.iter().enumerate() {
                     let right = i < half; // 竖排右先左后
@@ -1161,7 +1161,7 @@ impl ZFlowBuilder {
                 }
                 Seg::Note(t) => {
                     let all: Vec<char> = t.chars().collect();
-                    let half = (all.len() + 1) / 2; // 右小列（读在前）字数
+                    let half = all.len().div_ceil(2); // 右小列（读在前）字数
                     for k in 0..all.len() {
                         let ch = all[k]; // 当前注文字（主指针内容）
                         self.flush_pending();
@@ -1253,11 +1253,10 @@ impl ZFlowBuilder {
     /// 放一个正文字（占 2 半格）。本列放不下就换列；本面列尽就收面，
     /// 收面后新面首列必空（`cap >= 2`），继续排此字——不丢、不截断。
     fn place_main(&mut self, ch: char) {
-        if self.note_only || self.col_used + 2 > self.cap {
-            if !self.next_col(false) {
+        if (self.note_only || self.col_used + 2 > self.cap)
+            && !self.next_col(false) {
                 self.seal_page();
             }
-        }
         self.col_slots.push(RowSlot::Main(ch));
         self.col_used += 2;
         let y = self.col_y;
@@ -1536,7 +1535,7 @@ mod tests {
         let col = vec![Piece::Gloss("注".into(), NoteSource::Original, ghost())];
         let (cell_w, cell_h) = (50.0, 55.0);
         let text_cols = 4;
-        let rightmost = note_boxes_in_column(&col, text_cols - 1 - 0, cell_w, cell_h, true);
+        let rightmost = note_boxes_in_column(&col, text_cols - 1, cell_w, cell_h, true);
         let leftmost = note_boxes_in_column(&col, text_cols - 1 - 3, cell_w, cell_h, true);
         let pad = cell_w * NOTE_PAD_RATIO + cell_w * NOTE_EDGE_INSET;
         assert!((rightmost[0].x - (3.0 * cell_w + pad)).abs() < 0.01);
@@ -1658,14 +1657,14 @@ mod tests {
 
         // 注文：半格宽高 + 50% 字号；块锚点 = 宿主字之后（3 个正文 = 3*row_h）。
         let anchor = 3.0 * row_h;
-        for (_i, n) in notes.iter().enumerate() {
+        for n in notes.iter() {
             assert!((n.w - sub_w).abs() < 1e-3, "小列宽必须是 colWidth/2");
             assert!((n.h - sub_row).abs() < 1e-3, "小行高必须是 rowHeight/2");
             assert!((n.fs - nfs).abs() < 1e-3, "注文字号必须是正文 50%");
         }
         // 竖排右先左后：块内前 half=ceil(5/2)=3 字进右小列（读序在前），
         // 余下 2 字进左小列；两小列各自自上而下，构成 Z 字型填充。
-        let half = (5 + 1) / 2;
+        let half = 5_usize.div_ceil(2);
         for (i, n) in notes.iter().enumerate() {
             let (want_x, want_row) = if i < half {
                 (sub_w, i) // 右小列第 i 行
@@ -1751,7 +1750,7 @@ mod tests {
         let gloss_first = pages
             .iter()
             .flat_map(|p| p.columns.iter())
-            .any(|c| matches!(c.first(), Some(Piece::Gloss(_, ..))));
+            .any(|c| matches!(c.first(), Some(Piece::Gloss(..))));
         assert!(gloss_first, "长注应跨列流转：下一列列首应是注尾");
     }
 
@@ -1876,7 +1875,7 @@ mod tests {
                     .iter()
                     .map(|c| {
                         c.iter()
-                    .map(|p| piece_units(p))
+                    .map(piece_units)
                             .sum::<usize>()
                     })
                     .sum();
@@ -1915,7 +1914,7 @@ mod tests {
                         for (ci, col) in p.columns.iter().enumerate() {
                             let used: usize = col
                                 .iter()
-                                .map(|x| piece_units(x))
+                                .map(piece_units)
                                 .sum();
                             // 失败时把这列排出来看：正文出字、· 为避头空白、[n] 为 n 字夹注。
                             let brief: String = col
@@ -1961,7 +1960,7 @@ mod tests {
                 for (ci, col) in cols_all.iter().enumerate() {
                     let units: usize = col
                         .iter()
-                        .map(|p| piece_units(p))
+                        .map(piece_units)
                         .sum();
                     // 避头：首片不得是避头类标点（若有让位，首片是 Gap）。
                     if let Some(Piece::Main(g)) = col.first() {
@@ -2275,7 +2274,7 @@ mod tests {
             "同页流转列必须是纯注文列"
         );
         // 后续正文字另起新列（col 2），不挤回流注列。
-        let last_main = flat.iter().filter(|c| !c.note).last().unwrap();
+        let last_main = flat.iter().filter(|c| !c.note).next_back().unwrap();
         assert_eq!(last_main.ch, '乙');
         assert_eq!(last_main.col, 2);
         // 列容量不超：每列已用高度 ≤ cap 半格。
@@ -2323,7 +2322,7 @@ mod tests {
         assert_eq!(first_of_page1.note_idx, 7, "读序跨页连续");
         // 正文字「乙」排在缓存注文全部落完之后（本块 5 个续排字把第 1 面
         // 两列排满，新正文只能落到第 2 面）。
-        let last_main = flat.iter().filter(|c| !c.note).last().unwrap();
+        let last_main = flat.iter().filter(|c| !c.note).next_back().unwrap();
         assert!(
             last_main.page == 2 && last_main.col == 0,
             "新正文应排在缓存注文之后（实际第 {} 面第 {} 列）",

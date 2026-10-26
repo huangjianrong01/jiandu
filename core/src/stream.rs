@@ -14,7 +14,10 @@
 //! 的东西。读完时内存里从来没同时存在过两章正文。
 
 use crate::store;
-use crate::types::{Book, Chapter, Paragraph};
+use crate::types::{Book, Chapter};
+// 只在单测里构造段落（`Paragraph::plain`），正式构建里用不到，故按 cfg 收口。
+#[cfg(test)]
+use crate::types::Paragraph;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
@@ -320,7 +323,7 @@ pub fn unload_all(book: &mut Book) {
 /// 仓库 id：文件路径 + 大小 + 修改时间 的稳定哈希，同一文件重复导入
 /// 落在同一条记录上（覆盖），不会把库撑爆。
 pub fn store_id_for(path: &Path) -> String {
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hash;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.to_string_lossy().hash(&mut h);
     if let Ok(m) = std::fs::metadata(path) {
