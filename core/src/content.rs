@@ -43,6 +43,20 @@ pub fn catalog_book(key: &str) -> Option<Book> {
     catalog().into_iter().find(|c| c.key == key).map(|c| c.book)
 }
 
+/// **首启内置全本《道德經》**（v1.56.0）。
+///
+/// 苹果审核必看：装完第一次打开不能是空书架，得有一本翻得动的真书。
+/// 选它的三条理由：① 公有领域，无版权风险；② 八十一章、五千余言，
+/// 竖排翻几叶就看得出排版的成色；③ 分「道經 / 德經」两篇，目录两级。
+///
+/// 内容不是手搓的：正文由 `jiandu --convert` 走**与用户导入完全相同**的
+/// 清洗链路产出（解析 → IR → 清洗 → 引擎），再编译期 `include_str!` 编进
+/// 二进制，离线可用、不联网、不写沙盒外的任何地方。
+pub fn bundled_dao_de_jing() -> Option<Book> {
+    const JSON: &str = include_str!("../../resources/books/daodejing.json");
+    serde_json::from_str::<Book>(JSON).ok()
+}
+
 pub fn sample_dao_de_jing() -> Book {
     let mut book = Book::new("道德经", "老子");
     book.cover = Cover {
@@ -231,4 +245,42 @@ fn sample_qian_zi_wen() -> Book {
     });
     book.rebuild_toc_from_chapters();
     book
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 首启内置书目：`bundled_dao_de_jing` 必须解得开，且是全本。
+    #[test]
+    fn bundled_dao_de_jing_is_the_full_eighty_one_chapters() {
+        let book = bundled_dao_de_jing().expect("内置《道德經》资源应能解析");
+        assert_eq!(book.title, "道德經");
+        assert_eq!(book.author, "〔周〕李耳");
+        assert_eq!(book.chapters.len(), 81, "八十一章一章不能少");
+        assert_eq!(book.schema_version, crate::types::BOOK_SCHEMA_VERSION);
+        // 正文非空、无 `[注]` 之类未摘净的标签残留。
+        let chars: usize = book
+            .chapters
+            .iter()
+            .flat_map(|c| c.paragraphs.iter())
+            .map(|p| p.text.chars().count())
+            .sum();
+        assert!(chars > 5000, "正文应约五千言，实得 {chars}");
+        for c in &book.chapters {
+            for p in &c.paragraphs {
+                assert!(!p.text.contains("[注]"), "夹注标签没摘净：{}", p.text);
+                assert!(!p.text.contains('\u{200B}'), "零宽字符没清掉：{}", p.text);
+            }
+        }
+        // 两级目录：道經 / 德經 两篇 + 八十一章。
+        let l1: Vec<&str> = book
+            .toc
+            .iter()
+            .filter(|e| e.level == 1)
+            .map(|e| e.title.as_str())
+            .collect();
+        assert_eq!(l1, vec!["道經", "德經"], "上下两篇");
+        assert_eq!(book.toc.iter().filter(|e| e.level == 2).count(), 81);
+    }
 }

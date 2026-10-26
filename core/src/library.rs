@@ -583,15 +583,21 @@ impl Library {
         Ok(self.books.len() - 1)
     }
 
-    /// 首次运行时把内置样张写进书架，让书架不空。
+    /// **首次启动的内置书目**（v1.56.0）：把内置全本《道德經》写进书架。
+    ///
+    /// 只在书架为空时调一次（`Root::new`），之后用户爱删爱换都不再插手。
+    /// 正文来自 `content::bundled_dao_de_jing`（编译期编入的资源），解析
+    /// 不出来才退回旧的手搓样张——资源是 `include_str!` 编进去的，理论上
+    /// 不会发生，但宁可书架有书，也别开天窗。
     pub fn seed_sample(&mut self) -> Result<usize> {
         let dir = Self::books_dir();
         std::fs::create_dir_all(&dir).context("无法创建书架目录")?;
         let path = dir.join("daodejing.json");
-        let book = crate::content::sample_dao_de_jing();
+        let book = crate::content::bundled_dao_de_jing()
+            .unwrap_or_else(crate::content::sample_dao_de_jing);
         if !path.exists() {
             let json = serde_json::to_string_pretty(&book)?;
-            std::fs::write(&path, json).context("写入样张失败")?;
+            std::fs::write(&path, json).context("写入内置书目失败")?;
         }
         self.import_path(&path)
     }
@@ -817,5 +823,30 @@ pub(crate) mod tests {
         e.last_page = 4;
         e.total_pages = 10;
         assert_eq!(e.volume_line(), "卷 5 / 10");
+    }
+
+    /// **首启内置书目**：空书架种下去的是全本《道德經》，目录两级不丢。
+    #[test]
+    fn seed_sample_puts_the_bundled_book_on_the_shelf() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = temp_home("seed");
+        std::env::set_var("JIANDU_HOME", &home);
+        let mut lib = Library::load();
+        assert!(lib.books.is_empty(), "临时书架空");
+        let idx = lib.seed_sample().expect("首启应种上内置书目");
+        assert_eq!(lib.books[idx].title, "道德經");
+        assert_eq!(lib.books[idx].chapters, 81, "八十一章");
+        assert_eq!(lib.books[idx].author, "〔周〕李耳");
+        // 走的是 import_path（即与用户导入同一条清洗链路），目录不能被重建成一摊。
+        let raw = std::fs::read_to_string(&lib.books[idx].path).unwrap();
+        let book: Book = serde_json::from_str(&raw).unwrap();
+        assert_eq!(book.chapters.len(), 81, "清洗后章数不变");
+        assert_eq!(
+            book.toc.iter().filter(|e| e.level == 1).count(),
+            2,
+            "道經 / 德經 两篇应保住"
+        );
+        std::env::remove_var("JIANDU_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
