@@ -29,12 +29,16 @@ pub fn import_from_path(path: &Path) -> Result<Book> {
         "html" | "htm" | "xhtml" | "xml" => import_html(path)?,
         "json" => import_json(path)?,
         "epub" => import_epub(path)?,
+        "docx" => import_docx(path)?,
         other => {
             return Err(anyhow!(
-                "不支持的格式：.{other}（支持 md / txt / html / xml / epub / json）"
+                "不支持的格式：.{other}（支持 md / txt / html / xml / epub / docx / json）"
             ))
         }
     };
+    // **统一清洗**（v1.54.0）：剥壳之后先落 IR，两遍扫完再交回排版引擎——
+    // 从此引擎只见一种数据，新增格式只要写解析器。
+    crate::cleaner::clean_book(&mut book, crate::ir::IrSource::from_ext(&ext));
     // 正文里残留（或旧 JSON 里本就存着）的 `[注]…[/注]` 标签：摘成夹注，
     // 绝不让 `[` `注` `]` 四个字占掉字格。
     book.ingest_inline_notes();
@@ -465,6 +469,29 @@ fn strip_links(s: &str, open: &str, mid: &str) -> String {
 // ---------------------------------------------------------------------------
 // json
 // ---------------------------------------------------------------------------
+/// DOCX 导入：zip 包 → `word/document.xml` → 标准章数组（样式全丢，见
+/// [`crate::pipeline::parse_docx`]）。
+pub fn import_docx(path: &Path) -> Result<Book> {
+    let bytes = std::fs::read(path).with_context(|| format!("读不出 {}", path.display()))?;
+    let chapters = crate::pipeline::parse_docx(&bytes)?;
+    let mut book = crate::pipeline::chapters_to_book(&file_stem(path), "", chapters);
+    let (t, a) = detect_title_author(&book.chapters.first().map(|c| {
+        c.paragraphs
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }).unwrap_or_default());
+    if !t.is_empty() {
+        book.title = t;
+    }
+    if !a.is_empty() {
+        book.author = a;
+    }
+    book.cover.title = book.title.clone();
+    Ok(book)
+}
+
 pub fn import_json(path: &Path) -> Result<Book> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("读取 json 失败: {}", path.display()))?;

@@ -19,6 +19,7 @@
 
 use crate::types::{Book, Chapter, Note, NoteKind, Paragraph};
 use anyhow::{anyhow, Result};
+use std::io::{Cursor, Read};
 
 /// 无章节标识时的强制切分字数。
 pub const CHUNK_CHARS: usize = 3000;
@@ -1372,6 +1373,133 @@ pub fn paragraph_of(line: &str) -> Paragraph {
     p
 }
 
+// ------------------------------------------------------------------
+// 四之二、DOCX：zip 包 + word/document.xml
+// ------------------------------------------------------------------
+
+/// DOCX（Office Open XML）→ 标准章数组。
+///
+/// docx 的「壳」就是一个 zip：正文全躺在 `word/document.xml` 里。剥法：
+///   * **样式全丢**（字体 / 字号 / 颜色 / 行距）——竖排版式由笺读接管；
+///   * 只取两样：`w:p` 段落的文本，与段落的标题级别（`w:outlineLvl` /
+///     `w:pStyle`：Heading1 / 标题1 / 大纲级别）；
+///   * 段落里的 `<w:br/>`（软换行）与 `<w:tab/>` 归一成空格——中文 docx 常
+///     用软换行冒充分段，接起来才是一句完整的话。
+pub fn parse_docx(bytes: &[u8]) -> Result<Vec<RawChapter>> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| anyhow!("这不是一个能打开的 docx（zip 打不开：{e}）"))?;
+    let mut xml = String::new();
+    {
+        let mut f = zip.by_name("word/document.xml").map_err(|_| {
+            anyhow!("包里没有 word/document.xml——是老版 .doc 吧？请另存为 .docx 再导入")
+        })?;
+        f.read_to_string(&mut xml)
+            .map_err(|e| anyhow!("读不出正文：{e}"))?;
+    }
+    Ok(docx_xml_to_chapters(&xml))
+}
+
+/// `w:p` 段落流 → 章数组（标题级 ≤2 开新章，3 级以下当章内小标题段）。
+fn docx_xml_to_chapters(xml: &str) -> Vec<RawChapter> {
+    let lower = xml.to_ascii_lowercase();
+    let mut out: Vec<RawChapter> = Vec::new();
+    let mut title = "正文".to_string();
+    let mut paras: Vec<String> = Vec::new();
+    let mut pos = 0usize;
+    while let Some(rel) = lower[pos..].find("<w:p") {
+        let open = pos + rel;
+        let Some(gt) = lower[open..].find('>') else { break };
+        let head_end = open + gt + 1;
+        let Some(k) = lower[head_end..].find("</w:p>") else { break };
+        let close = head_end + k;
+        let text = docx_para_text(&xml[head_end..close]);
+        if !text.trim().is_empty() {
+            // 标题级别藏在段内 `<w:pPr>` 里（不在 `<w:p …>` 的属性上），
+            // 故把整段都交给判定函数。
+            let level = docx_head_level(&xml[open..close]);
+            match level {
+                Some(l) if l <= 2 => {
+                    push_chapter(&mut out, &title, &mut paras);
+                    title = text;
+                }
+                _ => paras.push(text),
+            }
+        }
+        pos = close + "</w:p>".len();
+    }
+    push_chapter(&mut out, &title, &mut paras);
+    if out.is_empty() {
+        out.push(RawChapter::new("正文", String::new()));
+    }
+    out.iter_mut().for_each(|c| {
+        c.title = classicize(&c.title);
+        c.content = classicize(&c.content);
+    });
+    out
+}
+
+/// 取 `<w:t …>文本</w:t>` 里的文本（其余节点一概不要）。
+fn docx_para_text(inner: &str) -> String {
+    let lower = inner.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut pos = 0usize;
+    while let Some(rel) = lower[pos..].find("<w:t") {
+        let open = pos + rel;
+        let Some(gt) = lower[open..].find('>') else { break };
+        let start = open + gt + 1;
+        let Some(k) = lower[start..].find("</w:t>") else { break };
+        out.push_str(&inner[start..start + k]);
+        pos = start + k + "</w:t>".len();
+    }
+    decode_entities(&out.replace(['\t', '\r', '\n'], " "))
+        .trim()
+        .to_string()
+}
+
+/// 段落的标题级别：`w:outlineLvl`（0 起）优先，其次 `w:pStyle`。
+///
+/// 这两个都是 `<w:pPr>` 里的**子标签**（`<w:pStyle w:val="Heading1"/>`），
+/// 不是 `<w:p>` 的属性，故传进来的是整段。
+fn docx_head_level(seg: &str) -> Option<u8> {
+    let low = seg.to_ascii_lowercase();
+    if let Some(v) = docx_attr(&low, "w:outlinelvl") {
+        if let Ok(n) = v.trim().parse::<u8>() {
+            return Some(n.saturating_add(1));
+        }
+    }
+    if let Some(v) = docx_attr(&low, "w:pstyle") {
+        let v = v.trim().to_ascii_lowercase();
+        let digits: String = v.chars().filter(|c| c.is_ascii_digit()).collect();
+        if v.contains("heading") || v.contains("head") || v.contains("标题") {
+            return match digits.parse::<u8>() {
+                Ok(n) => Some(n.max(1)),
+                Err(_) => Some(1),
+            };
+        }
+        // 光秃秃的「1」「2」也是标题样式（中文 docx 常见）
+        if v.len() <= 2 {
+            if let Ok(n) = digits.parse::<u8>() {
+                if (1..=9).contains(&n) {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 在一段 XML 里取某个子标签的值：`<w:pStyle w:val="Heading1"/>` → `Heading1`。
+fn docx_attr(seg_low: &str, tag: &str) -> Option<String> {
+    let found = seg_low.find(&format!("<{tag}"))?;
+    let rest = &seg_low[found..];
+    let end = rest.find('>')?;
+    let inside = &rest[..end];
+    let open = inside.find('"')?;
+    let after = &inside[open + 1..];
+    let close = after.find('"')?;
+    Some(after[..close].to_string())
+}
+
 /// 标准章数组 → `Book`。
 ///
 /// 首章只有标题没有正文时（markdown 常见：`# 书名` 独占一章），把它提升为书名。
@@ -1468,6 +1596,65 @@ pub fn slice_by_chars(title: &str, paras: Vec<Paragraph>, limit: usize) -> Vec<C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- DOCX（zip + word/document.xml）----
+
+    /// 造一个内存里的 docx（只有正文部件的迷你 zip）。
+    fn zip_of(name: &str, body: &str) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            w.start_file(name, SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut w, body.as_bytes()).unwrap();
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn docx_headings_split_chapters_and_text_is_kept() {
+        let doc = concat!(
+            r#"<w:document xmlns:w="http://x"><w:body>"#,
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>卷一</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>道可道，非常道。</w:t></w:r></w:p>"#,
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>第一章</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>名可名，</w:t></w:r><w:r><w:t>非常名。</w:t></w:r></w:p>"#,
+            r#"</w:body></w:document>"#,
+        );
+        let chapters = parse_docx(&zip_of("word/document.xml", doc)).expect("docx 应当解析成功");
+        assert_eq!(chapters.len(), 2, "{chapters:?}");
+        assert_eq!(chapters[0].title, "卷一");
+        assert_eq!(chapters[1].title, "第一章");
+        // 同一段里的多个 run 要接成一句，不能断成两半。
+        assert_eq!(chapters[1].content, "名可名，非常名。");
+        assert_eq!(chapters[0].content, "道可道，非常道。");
+    }
+
+    #[test]
+    fn docx_outline_level_counts_as_heading() {
+        let doc = concat!(
+            r#"<w:document xmlns:w="http://x"><w:body>"#,
+            r#"<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:r><w:t>自序</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>余少好讀書。</w:t></w:r></w:p>"#,
+            r#"<w:p><w:pPr><w:outlineLvl w:val="1"/></w:pPr><w:r><w:t>卷上</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>學而時習之。</w:t></w:r></w:p>"#,
+            r#"</w:body></w:document>"#,
+        );
+        let chapters = parse_docx(&zip_of("word/document.xml", doc)).expect("应当解析成功");
+        let titles: Vec<&str> = chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, vec!["自序", "卷上"]);
+    }
+
+    #[test]
+    fn non_docx_bytes_fail_with_a_readable_message() {
+        // 不是 zip
+        let err = parse_docx(b"not a zip at all").expect_err("应当报错");
+        assert!(format!("{err}").contains("docx"), "报错要看得出是 docx 的问题：{err}");
+        // 是 zip 但没有正文部件（老版 .doc 转的假 docx）
+        let err = parse_docx(&zip_of("readme.txt", "hello")).expect_err("应当报错");
+        assert!(format!("{err}").contains("document.xml"), "{err}");
+    }
 
     // ---- 标记解析（EPUB 竖排清洗产出的三种标记）----
 

@@ -16,10 +16,15 @@
 #![allow(dead_code)]
 
 pub mod banxin;
+/// **清洗器**（v1.54.0）：两遍扫描——去噪 + 重建语义，产出 IR。
+pub mod cleaner;
 pub mod content;
 pub mod dict;
 pub mod grid;
 pub mod importer;
+/// **统一书稿模型 IR**（v1.54.0）：解析与排版之间的中间表示。
+/// 各格式先「断头」剥壳 → 清洗 → 落进 IR，引擎只认这一份数据。
+pub mod ir;
 pub mod library;
 pub mod numcn;
 pub mod parsers;
