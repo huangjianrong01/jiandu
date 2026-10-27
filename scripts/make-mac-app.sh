@@ -6,6 +6,8 @@
 #   ./scripts/make-mac-app.sh            # 编译 release 并打包（本机架构）
 #   ARCH=universal ./scripts/make-mac-app.sh  # 打通用包（Apple Silicon + Intel）
 #   SKIP_BUILD=1 ./scripts/make-mac-app.sh   # 用已编译好的二进制打包
+#   SANDBOX=1 ./scripts/make-mac-app.sh      # ad-hoc 签名也带上沙盒 entitlements
+#                                            # → 本地即可真跑沙盒，验证导入/导出路径
 #
 # 产出：dist/笺读.app（可直接拖到「应用程序」文件夹）
 #
@@ -19,8 +21,8 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP_NAME="笺读"
 BUNDLE_ID="com.jiandu.app"
-VERSION="1.72.0"
-BUILD_NUM="120"
+VERSION="1.73.0"
+BUILD_NUM="121"
 MIN_MACOS="12.0"
 ARCH="${ARCH:-native}"
 
@@ -360,7 +362,22 @@ if [ "${APPSTORE:-0}" = "1" ]; then
     echo "   下一步：用 Transporter（或 Xcode Organizer）上传 $PKG 到 App Store Connect。"
 else
     # —— 本地 / 直接分发：ad-hoc 签名 ——
-    codesign --force --deep --sign - "$APP" 2>/dev/null && echo "✓ ad-hoc 签名完成" || echo "· 跳过签名（不影响本地运行）"
+    #
+    # SANDBOX=1：ad-hoc 签名时**也**带上 entitlements（v1.73.0）。
+    # 这样打出来的 .app 在本机双击就直接跑在 App Sandbox 里——上传 App Store
+    # 之前，导入 / 导出 / 数据目录这些路径问题可以在本地**真跑一遍**验出来，
+    # 而不是等审核被打回。ad-hoc 身份签的沙盒 App 本机可正常运行。
+    # 沙盒下数据目录会被重定向到
+    # ~/Library/Containers/com.jiandu.app/Data/Library/Application Support/com.jiandu.app，
+    # 书架为空是正常的（旧书在容器外，沙盒读不到）——验收时重新导入一本即可。
+    if [ "${SANDBOX:-0}" = "1" ]; then
+        codesign --force --deep --sign - \
+            --entitlements "$ROOT/jiandu.entitlements" \
+            "$APP" 2>/dev/null && echo "✓ ad-hoc 签名完成（已启用 App Sandbox）" \
+            || echo "· 跳过签名（不影响本地运行）"
+    else
+        codesign --force --deep --sign - "$APP" 2>/dev/null && echo "✓ ad-hoc 签名完成" || echo "· 跳过签名（不影响本地运行）"
+    fi
     if codesign --verify --deep "$APP" 2>/dev/null; then
         echo "✓ 签名校验通过"
     else

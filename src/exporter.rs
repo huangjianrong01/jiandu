@@ -400,20 +400,107 @@ pub fn convert(input: &Path, out: &Path) -> Result<PathBuf> {
 pub fn pick_save_path(title: &str, file_name: &str, filter_name: &str, exts: &[&str]) -> Option<PathBuf> {
     let mut dlg = rfd::FileDialog::new()
         .set_title(title)
-        // 默认文件名：调用方拼好「笺卡_书名_页码.png」这类名字传进来。
+        // 默认文件名：调用方拼好「笺读_书名_第N叶.png」这类名字传进来。
         .set_file_name(file_name)
         .add_filter(filter_name, exts);
-    // 默认目录兜底：定位到用户桌面。NSSavePanel 在没有显式目录时会落到
-    // App 的当前工作目录（从 Finder /  Dock 启动时可能是 `/`，从 dist
-    // 目录旁启动时甚至是 App 包内部）——用户直接点「存储」后根本找不到
-    // 文件，表现为「点了导出但没生成」。
-    if let Some(home) = std::env::var_os("HOME") {
-        let desktop = Path::new(&home).join("Desktop");
-        if desktop.is_dir() {
-            dlg = dlg.set_directory(desktop);
-        }
+    // 起始目录优先级：**上次导出目录 → 桌面 → 交给系统记忆**。
+    //
+    // NSSavePanel 在没有显式目录时会落到 App 的当前工作目录（从 Finder /
+    // Dock 启动时可能是 `/`，从 dist 目录旁启动时甚至是 App 包内部）——
+    // 用户直接点「存储」后根本找不到文件，表现为「点了导出但没生成」。
+    if let Some(dir) = remembered_export_dir() {
+        dlg = dlg.set_directory(dir);
+    } else if let Some(desktop) = desktop_dir() {
+        dlg = dlg.set_directory(desktop);
     }
     dlg.save_file()
+}
+
+/// 桌面目录（保存面板的最后兜底）。
+///
+/// App Sandbox 下 `HOME` 指向**容器**（`~/Library/Containers/<bundle>/Data`），
+/// 容器里的 `Desktop` 是系统建的符号链接，`is_dir()` 跟随链接仍成立；
+/// 万一不存在就返回 `None`，让 `NSSavePanel` 退回它自己记住的位置——
+/// 不设目录不会出错，只是起点变成系统默认。
+fn desktop_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let d = Path::new(&home).join("Desktop");
+    if d.is_dir() {
+        Some(d)
+    } else {
+        None
+    }
+}
+
+// ------------------------------------------------------------------
+// 沙盒合规：导出目录记忆（v1.73.0）
+// ------------------------------------------------------------------
+
+/// 记「上次导出到哪个目录」的那一行字，存在**应用数据目录**下。
+///
+/// 为什么落这里而不是真 `~`：App Sandbox 会把
+/// `~/Library/Application Support/com.jiandu.app` **透明重定向到容器**，
+/// 沙盒内外同一份代码、同一条路径都永远可写、且不需要任何授权；
+/// 而真 `~` 下的自定义文件在沙盒里读不到。
+fn last_dir_file() -> PathBuf {
+    jiandu_core::library::Library::home().join("last_export_dir.txt")
+}
+
+/// 上次导出的**所在目录**；没记过、或那个目录已经不在了（外置盘拔了、
+/// 用户删了、沙盒里无权访问）就返回 `None`。
+///
+/// ⚠️ 它只决定保存面板的**起始位置**，不是访问授权——真正的写权限由
+/// `NSSavePanel` 每次现场授予（entitlement:
+/// `com.apple.security.files.user-selected.read-write`）。所以哪怕这里
+/// 返回一个当前无权访问的目录也**不会崩**：面板自己会退回可用位置。
+pub fn remembered_export_dir() -> Option<PathBuf> {
+    remembered_from(&last_dir_file())
+}
+
+/// 记住导出目录：存的是文件**所在目录**，不是文件名本身。
+///
+/// 失败一律静默——记不住只是下次回到桌面起点，不该打断已经成功的导出。
+pub fn remember_export_dir(path: &Path) {
+    let Some(dir) = path.parent() else { return };
+    remember_to(&last_dir_file(), dir);
+}
+
+/// 从记忆文件里读出目录（**纯 I/O，路径由参数给**，故可单测）。
+///
+/// 抽出来是为了让测试不必去动全局 `JIANDU_HOME`——cargo test 是多线程跑
+/// 同一个二进制里的所有用例，谁改了环境变量，别人的 `Library::home()`
+/// 就跟着错位（数据目录一旦指错，store / library 的用例会随机红）。
+fn remembered_from(file: &Path) -> Option<PathBuf> {
+    let s = std::fs::read_to_string(file).ok()?;
+    let p = PathBuf::from(s.trim());
+    if p.is_dir() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// 把目录写进记忆文件（同样是**纯 I/O**，便于单测）。
+fn remember_to(file: &Path, dir: &Path) {
+    if !dir.is_dir() {
+        return;
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let _ = std::fs::write(file, dir.to_string_lossy().as_bytes());
+}
+
+/// **写盘唯一出口**：补后缀 → 建父目录 → 写字节 → 记住这个目录。
+///
+/// 六条导出链路（PNG / 分享图 / MD / 批注 / 卡片 CSV ×2）都走这里，
+/// 免得各处手写 `std::fs::write` 时漏掉「建父目录」——用户手敲一个
+/// 不存在的子目录就会「导出失败：No such file or directory」。
+pub fn save_bytes(picked: PathBuf, ext: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let path = with_extension(picked, ext);
+    write_bytes(&path, bytes)?;
+    remember_export_dir(&path);
+    Ok(path)
 }
 
 /// 把路径**补上**指定扩展名（用户手打了不带后缀的名字时兜底）。
@@ -714,4 +801,53 @@ mod tests {
         assert_eq!(csv_two_quoted("天", "地"), "\"天\",\"地\"\n");
     }
 
+
+    // ── v1.73.0 沙盒合规：导出目录记忆 ──────────────────────────────
+    #[test]
+    fn export_dir_memory_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("jiandu-dir-mem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let file = dir.join("mem.txt");
+        remember_to(&file, &dir);
+        assert_eq!(remembered_from(&file).as_deref(), Some(dir.as_path()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 记过的目录没了（外置盘拔了 / 用户删了 / 沙盒里无权访问）→ **静默降级
+    /// 为「没记过」**，绝不能把保存面板指到一个死路径上。
+    #[test]
+    fn export_dir_memory_degrades_when_dir_gone() {
+        let base = std::env::temp_dir().join(format!("jiandu-dir-gone-{}", std::process::id()));
+        let file = base.join("mem.txt");
+        std::fs::create_dir_all(&base).ok();
+        std::fs::write(&file, "/nonexistent/jiandu/definitely/not/here").ok();
+        assert!(
+            remembered_from(&file).is_none(),
+            "目录已不在就该当没记过（降级到桌面 / 系统记忆）"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// `save_bytes`：补后缀 + 建父目录——用户手敲一个还不存在的子目录也该成。
+    #[test]
+    fn save_bytes_adds_extension_and_creates_parent() {
+        let orig = remembered_export_dir();
+        let base = std::env::temp_dir().join(format!("jiandu-save-{}", std::process::id()));
+        // 既没有后缀，父目录也还不存在。
+        let dest = base.join("子目录").join("朱批录");
+        let got = save_bytes(dest, "csv", b"a,b\n");
+        assert!(got.is_ok(), "建父目录后应当写成功：{got:?}");
+        let p = got.unwrap();
+        assert_eq!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("csv"),
+            "用户没打后缀时要补上"
+        );
+        assert!(p.is_file());
+        std::fs::remove_dir_all(&base).ok();
+        // 副作用回滚：别把用户真实的「上次导出目录」冲掉。
+        if let Some(d) = orig {
+            remember_to(&last_dir_file(), &d);
+        }
+    }
 }

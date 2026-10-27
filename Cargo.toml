@@ -3,7 +3,7 @@ members = ["core"]
 
 [package]
 name = "jiandu"
-version = "1.72.0"
+version = "1.73.0"
 edition = "2021"
 description = "笺读 · 一个用 Rust + GPUI 写的原生中文阅读器（古文竖笺 / 现代横笺）"
 license = "MIT"
@@ -37,8 +37,8 @@ once_cell = "1"
 regex = "1"
 # 原生文件选择器（导入 md/txt/epub/json）
 rfd = "0.14"
-# 导出分享：PNG 笺卡走 macOS `screencapture` 直截屏幕，无需 image / flate2。
-# （PDF 导出已移除：v1.56.0）
+# 导出分享：PNG 走 CoreGraphics **离屏光栅**（见下方 mac 目标依赖），
+# 既不依赖 image / flate2，也不要屏幕录制权限。（PDF 导出已于 v1.56.0 移除）
 # 离线双引擎字典：《康熙字典》+《說文解字》合并库（见 `scripts/merge_dict.py`）。
 # `bundled` = 自己编译一份 sqlite3 进二进制，不依赖系统库版本；数据文件由
 # `include_bytes!` 嵌入，运行时零 I/O、断网可查。

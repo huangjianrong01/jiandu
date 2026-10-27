@@ -611,6 +611,16 @@ pub struct Root {
     pub search_animating: bool,
 
 
+    /// **导出闸门**（v1.73.0）：任一导出作业（出图 → 弹保存框 → 落盘）进行中
+    /// 为 true，**所有出口**（成功 / 失败 / 取消）都必须复位。
+    ///
+    /// 修的是「连点两次导出 → 弹两个保存框、第二次把第一次的状态冲掉」。
+    /// 保存框是**主线程模态**，但 `cx.spawn` 的 async 体就在同一个主线程上
+    /// 被 poll：面板浮起前那几十毫秒里，第二次点击照样能进事件处理器。
+    /// PNG 那条原本靠 `png_export.is_some()` 挡着，MD / 卡片 ×2 / 批注
+    /// 四条**全裸奔**。统一交给这个闸门管。
+    pub export_busy: bool,
+
     /// PNG 笺卡导出的两段式作业（v1.52.3）：`Some(Warm)` = 面板已收、等一帧
     /// 干净纸面；`Some(Shoot)` = 下一帧截屏 + 弹保存框。`None` = 空闲。
     /// 修的是「开着目录点导出 PNG，图里带着目录」——`screencapture` 截屏幕，
@@ -985,6 +995,7 @@ impl Root {
             search_target: false,
             search_animating: false,
             png_export: None,
+            export_busy: false,
             export_toast: None,
             narrow_hint: false,
             narrow_hint_seen: prefs.narrow_hint_seen,
@@ -2773,9 +2784,25 @@ impl Root {
     ///
     /// 保存顺序**不能反**：先截后弹。保存面板一浮起，再截就截到面板自己了。
     /// 用户取消 = 正常结果：清掉临时文件、提示一句，不 panic、不报错红。
+    /// 导出作业的**统一入口闸门**：已在跑就拒绝并提示一句，否则占位。
+    ///
+    /// 返回 `false` = 已有导出在跑，调用方应当立刻 return。
+    /// 每个对应出口都必须 `export_busy = false`，否则导出会**永久锁死**
+    /// （此后点任何导出都只回一句「已有导出在进行中」）。
+    fn export_begin(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.export_busy {
+            self.notice = "已有导出在进行中，请先完成或取消".to_string();
+            cx.notify();
+            return false;
+        }
+        self.export_busy = true;
+        true
+    }
+
     pub fn export_page_png(&mut self, _window: &Window, cx: &mut Context<Self>) {
         // 导出已在推进中：忽略重复点击（两段式作业会自行收尾）。
-        if self.png_export.is_some() {
+        // `export_begin` 顺手把统一闸门占住——两段式跨帧，Shoot 帧才收摊。
+        if self.png_export.is_some() || !self.export_begin(cx) {
             return;
         }
         // 导出前收起所有面板 / 浮层，纸面只留正文（与 begin_pdf_export 同序）。
@@ -2804,9 +2831,13 @@ impl Root {
     /// 于是既不需要「等一帧干净纸面」，也不再有临时文件要清理。
     /// 用户取消 = 正常结果：提示一句，不 panic、不报错红。
     fn export_page_png_shoot(&mut self, _window: &Window, cx: &mut Context<Self>) {
+        // 两段式作业到这一帧就结束了：**无论成败都先收摊**。不复位的话
+        // `png_export` 会永远停在 Some，此后再点「导出当前页图片」无事发生。
+        self.png_export = None;
         let png = match self.render_leaf_png() {
             Ok(p) => p,
             Err(e) => {
+                self.export_busy = false;
                 self.notice = e.clone();
                 self.export_toast = Some(e);
                 cx.notify();
@@ -2839,21 +2870,19 @@ impl Root {
                         "PNG 图片",
                         &["png"],
                     );
-                    let Some(dest) = picked else {
+                    // 三种结局（用户取消 / 写盘成功 / 写盘失败）**在同一处收口**：
+                    // 提示语先算成值，最后只做一次 update——闸门复位与提示
+                    // 落地绑在一起，杜绝「某个分支忘了复位 → 导出永久锁死」。
+                    let (msg, toast) = match picked {
                         // 用户点了取消：这不是错误。
-                        this.update(&mut cx, |this, cx| {
-                            this.notice = "已取消保存".to_string();
-                            this.export_toast = Some("已取消保存".to_string());
-                            cx.notify();
-                        })
-                        .ok();
-                        return;
-                    };
-                    let dest = crate::exporter::with_extension(dest, "png");
-                    // 直接写字节：不再「先截临时文件再拷一份」，少一次失败点。
-                    let res = std::fs::write(&dest, &png).map(|_| dest).map_err(|e| e.to_string());
-                    this.update(&mut cx, |this, cx| {
-                        let (msg, toast) = match res {
+                        None => (
+                            "已取消保存".to_string(),
+                            "已取消保存".to_string(),
+                        ),
+                        // v1.73.0：走 `save_bytes`——补后缀 + 建父目录 +
+                        // 写字节 + 记住这个目录（下次保存框直接从这里开）。
+                        // 不再「先截临时文件再拷一份」，少一次失败点。
+                        Some(dest) => match crate::exporter::save_bytes(dest, "png", &png) {
                             Ok(p) => {
                                 let kb = png.len() / 1024;
                                 let name = p
@@ -2872,7 +2901,10 @@ impl Root {
                                 let m = format!("保存失败：{e}");
                                 (m.clone(), m)
                             }
-                        };
+                        },
+                    };
+                    this.update(&mut cx, |this, cx| {
+                        this.export_busy = false;
                         this.notice = msg;
                         this.export_toast = Some(toast);
                         cx.notify();
@@ -2904,6 +2936,11 @@ impl Root {
             "{}_朱批录.md",
             crate::exporter::safe_file_stem(&book.title)
         );
+        // v1.73.0：连点两次不该弹两个保存框（async 体在主线程 poll，
+        // 面板浮起前第二次点击照样能进来）。
+        if !self.export_begin(cx) {
+            return;
+        }
         cx.spawn(
             move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 let mut cx = cx.clone();
@@ -2912,6 +2949,7 @@ impl Root {
                     // executor 会被主循环挤掉、静默返回 None）。
                     let res = crate::exporter::export_annotations_picked(&book, &file_name);
                     this.update(&mut cx, |this, cx| {
+                        this.export_busy = false;
                         this.notice = match res {
                             Ok(Some(p)) if n == 0 => {
                                 format!("此书尚无朱批，已导出空稿：{}", p.display())
@@ -2949,6 +2987,11 @@ impl Root {
         if front.is_empty() {
             self.notice = "请先选中要制卡的文字".to_string();
             cx.notify();
+            return;
+        }
+        // v1.73.0：连点两次不该弹两个保存框（async 体在主线程 poll，保存
+        // 面板浮起前那几十毫秒里，第二次点击照样能进事件处理器）。
+        if !self.export_begin(cx) {
             return;
         }
 
@@ -3049,21 +3092,20 @@ impl Root {
                         "CSV 表格",
                         &["csv"],
                     );
-                    let Some(dest) = picked else {
-                        this.update(&mut cx, |this, cx| {
-                            this.notice = "已取消导出".to_string();
-                            cx.notify();
-                        })
-                        .ok();
-                        return;
-                    };
-                    let dest = crate::exporter::with_extension(dest, "csv");
-                    let res = std::fs::write(&dest, csv.as_bytes());
-                    this.update(&mut cx, |this, cx| {
-                        this.notice = match res {
-                            Ok(()) => "已导出 1 张卡片，可在 Anki 中导入 CSV".to_string(),
+                    // v1.73.0：取消 / 成功 / 失败三态在**同一处收口**：提示
+                    // 先算成值，最后只做一次 update——闸门复位与提示落地绑在
+                    // 一起，杜绝「某个分支忘了复位 → 导出永久锁死」。
+                    // 写盘走 `save_bytes`：补后缀 + 建父目录 + 记住该目录。
+                    let msg = match picked {
+                        None => "已取消导出".to_string(),
+                        Some(dest) => match crate::exporter::save_bytes(dest, "csv", csv.as_bytes()) {
+                            Ok(_) => "已导出 1 张卡片，可在 Anki 中导入 CSV".to_string(),
                             Err(e) => format!("写入失败：{e}"),
-                        };
+                        },
+                    };
+                    this.update(&mut cx, |this, cx| {
+                        this.export_busy = false;
+                        this.notice = msg;
                         cx.notify();
                     })
                     .ok();
@@ -3145,6 +3187,10 @@ impl Root {
             cx.notify();
             return;
         }
+        // v1.73.0：连点两次不该弹两个保存框。
+        if !self.export_begin(cx) {
+            return;
+        }
         let stem = crate::exporter::safe_file_stem(&book.title);
         let cstem = crate::exporter::safe_file_stem(&chap);
         let default = if cstem.is_empty() {
@@ -3165,21 +3211,20 @@ impl Root {
                         "CSV 表格",
                         &["csv"],
                     );
-                    let Some(dest) = picked else {
-                        this.update(&mut cx, |this, cx| {
-                            this.notice = "已取消导出".to_string();
-                            cx.notify();
-                        })
-                        .ok();
-                        return;
-                    };
-                    let dest = crate::exporter::with_extension(dest, "csv");
-                    let res = std::fs::write(&dest, csv.as_bytes());
-                    this.update(&mut cx, |this, cx| {
-                        this.notice = match res {
-                            Ok(()) => format!("已导出 {total} 张卡片，请在 Anki 中导入 CSV"),
+                    // v1.73.0：取消 / 成功 / 失败三态在**同一处收口**：提示
+                    // 先算成值，最后只做一次 update——闸门复位与提示落地绑在
+                    // 一起，杜绝「某个分支忘了复位 → 导出永久锁死」。
+                    // 写盘走 `save_bytes`：补后缀 + 建父目录 + 记住该目录。
+                    let msg = match picked {
+                        None => "已取消导出".to_string(),
+                        Some(dest) => match crate::exporter::save_bytes(dest, "csv", csv.as_bytes()) {
+                            Ok(_) => format!("已导出 {total} 张卡片，请在 Anki 中导入 CSV"),
                             Err(e) => format!("写入失败：{e}"),
-                        };
+                        },
+                    };
+                    this.update(&mut cx, |this, cx| {
+                        this.export_busy = false;
+                        this.notice = msg;
                         cx.notify();
                     })
                     .ok();
@@ -3271,6 +3316,10 @@ fn anki_push_card(
             return;
         };
         let file_name = format!("{}.md", crate::exporter::safe_file_stem(&book.title));
+        // v1.73.0：连点两次不该弹两个保存框。
+        if !self.export_begin(cx) {
+            return;
+        }
         cx.spawn(
             |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 let mut cx = cx.clone();
@@ -3286,6 +3335,7 @@ fn anki_push_card(
                         &file_name,
                     );
                     this.update(&mut cx, |this, cx| {
+                        this.export_busy = false;
                         this.notice = match res {
                             Ok(Some(p)) => format!("已导出 Markdown：{}", p.display()),
                             // 取消不是失败：只说一声，不甩错误。

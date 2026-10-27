@@ -9406,8 +9406,11 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
                         .ok();
                         return;
                     };
-                    let msg = match std::fs::write(&dest, &png) {
-                        Ok(_) => format!("已保存分享图：{}", dest.display()),
+                    // v1.73.0：写盘统一走 `save_bytes`——补后缀 + 建父目录
+                    // （用户手敲不存在的子目录也不会「No such file」）+
+                    // 记住这个目录，下次保存框直接从这里开。
+                    let msg = match crate::exporter::save_bytes(dest, "png", &png) {
+                        Ok(p) => format!("已保存分享图：{}", p.display()),
                         Err(e) => format!("保存失败：{e}"),
                     };
                     this.update(&mut cx, |this, cx| {
