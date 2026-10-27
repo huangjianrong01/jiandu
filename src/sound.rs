@@ -10,8 +10,10 @@
 //!   * 包络是**两记峰 + 一条指数尾巴**：第一记是纸页脱离手指，第二记是落下贴合；
 //!   * 再叠几粒随机「爆音」（纤维崩断的那声脆响），密度别高，高了像电流声。
 //!
-//! 播放走 `afplay`（macOS 自带）的子进程，调用方不阻塞；连续翻页有节流，
-//! 不会叠成一团。
+//! 播放走**原生 `NSSound`**（v1.71.0）：不再 fork `afplay` 子进程——沙盒下
+//! `PATH` / `HOME` 都不可靠，子进程随时被拦，且每次翻页起一个进程太贵。
+//! `NSSound` 由 FFI 直调（不加新依赖、不要权限），`play` 本身是异步的，
+//! 调完立刻返回，调用方不阻塞；连续翻页另有节流，不会叠成一团。
 
 use crate::library::Library;
 use std::path::PathBuf;
@@ -165,6 +167,87 @@ fn ensure_wav() -> Option<&'static PathBuf> {
     }
 }
 
+// ----------------------------------------------------------------------
+// 播放：原生 NSSound（v1.71.0，取代 `afplay` 子进程）
+//
+// 三个要点：
+// 1. **不加新依赖**：`objc_getClass` / `sel_registerName` / `objc_msgSend`
+//    三个符号都在 libobjc 里，直接 `extern "C"` 声明即可（gpui 本身也这么
+//    链接 libobjc），不必拖进 `objc` / `cocoa` crate。
+// 2. **一台对象复用**：`[[NSSound alloc] initWithContentsOfFile:…]` 只建一次，
+//    缓存在 `OnceLock` 里（存 `usize` 以免 `*mut c_void` 不是 Send/Sync）。
+//    `init` 出来的对象我们持有一份引用计数，不会被自动释放池收走。
+// 3. **主线程直调**：`play` 立即返回、播放由 AppKit 在后台完成；主线程也
+//    自带自动释放池（`stringWithUTF8String:` 返回的临时 NSString 有池可归）。
+//    失败一律静默——没声音不影响读书。
+// ----------------------------------------------------------------------
+
+/// 缓存的 NSSound 对象（裸指针按 usize 存，跨线程读需要 Send/Sync）。
+static SOUND: OnceLock<usize> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+unsafe fn nssound_play_file(path: &str) -> bool {
+    use std::ffi::CString;
+    use std::os::raw::c_char;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut std::os::raw::c_void;
+        fn sel_registerName(name: *const c_char) -> *mut std::os::raw::c_void;
+        fn objc_msgSend(
+            receiver: *mut std::os::raw::c_void,
+            op: *mut std::os::raw::c_void,
+            ...
+        ) -> *mut std::os::raw::c_void;
+    }
+
+    let sel = |n: &[u8]| -> *mut std::os::raw::c_void {
+        sel_registerName(n.as_ptr() as *const c_char)
+    };
+    // 空指针 / 空类一律当「这台机器没有 NSSound」，静默降级。
+    let cls = objc_getClass(b"NSSound\0".as_ptr() as *const c_char);
+    if cls.is_null() {
+        return false;
+    }
+    let ns_string = objc_getClass(b"NSString\0".as_ptr() as *const c_char);
+    if ns_string.is_null() {
+        return false;
+    }
+    let Ok(cpath) = CString::new(path) else {
+        return false;
+    };
+    let s = objc_msgSend(
+        ns_string,
+        sel(b"stringWithUTF8String:\0"),
+        cpath.as_ptr(),
+    );
+    if s.is_null() {
+        return false;
+    }
+    let alloc = objc_msgSend(cls, sel(b"alloc\0"));
+    if alloc.is_null() {
+        return false;
+    }
+    let snd = objc_msgSend(
+        alloc,
+        sel(b"initWithContentsOfFile:byReference:\0"),
+        s,
+        0i32,
+    );
+    if snd.is_null() {
+        return false;
+    }
+    // BOOL 返回值不关心（失败也只是没声音），故按指针收一下即可。
+    let _ = objc_msgSend(snd, sel(b"play\0"));
+    SOUND.get_or_init(|| snd as usize);
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn nssound_play_file(_path: &str) -> bool {
+    false
+}
+
 /// 放一声翻纸。节流 + 总开关都在这里拦；失败静默（没声音不影响读书）。
 pub fn page_turn() {
     if !ENABLED.load(Ordering::Relaxed) {
@@ -178,15 +261,34 @@ pub fn page_turn() {
     LAST_MS.store(now, Ordering::Relaxed);
 
     let Some(path) = ensure_wav() else { return };
+    // 已建过对象就直接重放（省一次文件解析），否则按路径建一台。
+    if let Some(p) = SOUND.get() {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::raw::c_void;
+            #[link(name = "objc")]
+            extern "C" {
+                fn objc_msgSend(
+                    receiver: *mut c_void,
+                    op: *mut c_void,
+                    ...
+                ) -> *mut c_void;
+                fn sel_registerName(name: *const std::os::raw::c_char) -> *mut c_void;
+            }
+            let snd = *p as *mut c_void;
+            unsafe {
+                let _ = objc_msgSend(
+                    snd,
+                    sel_registerName(b"play\0".as_ptr() as *const std::os::raw::c_char),
+                );
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = p;
+        return;
+    }
     let path = path.clone();
-    // 子进程播放，绝不阻塞 UI 线程。
-    std::thread::spawn(move || {
-        let _ = std::process::Command::new("afplay")
-            .arg(&path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    });
+    let _ = unsafe { nssound_play_file(&path.to_string_lossy()) };
 }
 
 #[cfg(test)]

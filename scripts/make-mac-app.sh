@@ -19,8 +19,8 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP_NAME="笺读"
 BUNDLE_ID="com.jiandu.app"
-VERSION="1.71.0"
-BUILD_NUM="119"
+VERSION="1.72.0"
+BUILD_NUM="120"
 MIN_MACOS="12.0"
 ARCH="${ARCH:-native}"
 
@@ -198,8 +198,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
          App Store Connect 不再索要出口合规文件。 -->
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
-    <key>NSScreenCaptureUsageDescription</key>
-    <string>「印制笺卡」要把当前这一叶保存成图片，需要读取屏幕上的纸面。</string>
+    <!-- v1.71.0：全仓已无 screencapture——「导出当前页图片」改走 CoreGraphics
+         离屏重绘（见 reader::render_leaf_png），不再申请「屏幕录制」权限。 -->
     <key>CFBundleSupportedPlatforms</key>
     <array>
         <string>MacOSX</string>

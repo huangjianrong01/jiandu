@@ -1568,6 +1568,78 @@ impl Root {
             );
         }
 
+        // v1.71.0：**导出收尾提示条（Toast）**——极简一枚纸签，浮在页码条之上。
+        //
+        // 三条例行公事：
+        //   * 只一句话（副行最多带个文件名），绝不堆信息；
+        //   * 退出三选一：点右侧「关」/ 按 Esc / 点纸面任一处；
+        //   * 单字按钮一律用 CJK（「关」）——U+2715 那类拉丁区符号在 GPUI 里
+        //     是零宽，画出来什么都没有（老规矩，见眉批菜单那处注释）。
+        if let Some(toast) = self.export_toast.clone() {
+            let (head, sub) = match toast.split_once('\n') {
+                Some((a, b)) => (a.to_string(), b.to_string()),
+                None => (toast, String::new()),
+            };
+            let mut slip = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .px_3()
+                .py_1p5()
+                .rounded(px(7.0))
+                .bg(rgb(t.chip()))
+                .border_1()
+                .border_color(rgb(t.chrome_line()))
+                .shadow_sm();
+            let words = div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(t.chrome_text()))
+                        .child(SharedString::from(head)),
+                )
+                .child(if sub.is_empty() {
+                    div()
+                } else {
+                    div()
+                        .pt(px(1.0))
+                        .text_size(px(9.5))
+                        .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.5)))
+                        .child(SharedString::from(sub))
+                });
+            slip = slip.child(words).child(
+                div()
+                    .cursor_pointer()
+                    .text_size(px(11.5))
+                    .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.5)))
+                    .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+                    .child(SharedString::from("关"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.export_toast = None;
+                            cx.notify();
+                        }),
+                    ),
+            );
+            root = root.child(
+                div()
+                    .absolute()
+                    .bottom(px(44.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .flex()
+                    .flex_row()
+                    .justify_center()
+                    .child(slip),
+            );
+        }
+
         // 点字查字浮层（右上角常驻面板）。
         // `lookup_at` 有值说明是长按呼出的「字义浮签」（贴着长按点浮起，
         // 由 `render_lookup_card` 画），这里不能再叠一张，否则一屏两张字书。
@@ -1683,6 +1755,18 @@ impl Root {
     pub fn handle_reading_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
                     let k = event.keystroke.key.as_str();
                     let mods = event.keystroke.modifiers;
+
+                    // ⓪ v1.71.0：**Esc 收起导出提示条**（Toast）。
+                    //    排在笔记 / 检索编辑态之前——提示条是最轻的一层，
+                    //    Esc 先收它；正在编辑笔记时不抢键（那时 Esc 是「弃稿」）。
+                    if !self.note_editing
+                        && self.export_toast.is_some()
+                        && (k == "escape" || k == "Escape" || k == "esc")
+                    {
+                        self.export_toast = None;
+                        cx.notify();
+                        return;
+                    }
 
                     // ① 笔记编辑态：键盘全部路由给浮层笔记框。
                     //    Esc 取消 / ⏎ 保存 / 退格删字 / ← → 移光标 /
@@ -5734,15 +5818,10 @@ impl Root {
         // 下一次交互（点纸面 / 翻页）即清。平时这两行都不存在，
         // v1.52.2 的「底部只留页码」不受影响。
         let mut center = div().flex().flex_col().items_center();
-        if let Some(toast) = self.export_toast.clone() {
-            center = center.child(
-                div()
-                    .pb(px(1.5))
-                    .text_size(px(9.5))
-                    .text_color(rgb(sheet_zhu(t)))
-                    .child(SharedString::from(toast)),
-            );
-        } else if self.narrow_hint {
+        // v1.71.0：导出收尾话不再挤在这行 9.5px 的小字里——已升级成独立的
+        // Toast 纸签（见 `render_reading`，可点「关」或按 Esc 收起）。
+        // 底部状态条回到 v1.52.2 的口径：只留页码。
+        if self.narrow_hint {
             // v1.52.3 窄屏首次引导（P3#8）：一句白话，说完就收。
             center = center.child(
                 div()
@@ -5752,7 +5831,7 @@ impl Root {
                     .child(SharedString::from("竖排自右向左，纸面贴右缘")),
             );
         } else if self.png_export.is_some() {
-            let label = "正在印制笺卡…".to_string();
+            let label = "正在印制本叶…".to_string();
             center = center.child(
                 div()
                     .pb(px(1.5))
@@ -8201,7 +8280,7 @@ impl Root {
         list = list.child(help_row("⌘Z", "专注模式（Esc 退出）", t));
         list = list.child(help_row("⌘K", "笔记面板", t));
         list = list.child(help_row("⌘/", "帮助（本面板）", t));
-        list = list.child(help_row("Esc", "退出专注 / 图片·文字分享 / 收起浮层", t));
+        list = list.child(help_row("Esc", "退出专注 / 收起浮层 / 收起导出提示条", t));
 
         list = list.child(help_sec("文字", t));
         // v1.37.0：天头（版框上方那段留白）点一下就能写朱砂小字。
@@ -8220,7 +8299,13 @@ impl Root {
         list = list.child(help_row("点面板外空白", "收起目录 / 朱批 / 帮助 / 导出菜单", t));
 
         list = list.child(help_sec("导出", t));
-        list = list.child(help_row("顶栏「导出」", "当前页图片 · 当前章卡片 · MD", t));
+        list = list.child(help_row("顶栏「导出」", "本叶图片 · 当前章卡片 · MD", t));
+        // v1.71.0：本叶图片改离屏重绘后口径变了，写进帮助里——
+        // 用户最关心「要不要权限」「清晰度由什么定」「提示怎么收」。
+        list = list.child(help_row("导出当前页图片", "存本叶高清 PNG（长边 2160，离屏重绘）", t));
+        list = list.child(help_row("同上 · 清晰度", "与窗口大小无关，不需「屏幕录制」权限", t));
+        list = list.child(help_row("同上 · 文件名", "笺读_书名_第N叶（保存框里可改）", t));
+        list = list.child(help_row("导出提示条", "点「关」· 按 Esc · 点纸面任一处，皆可收起", t));
 
         list = list.child(help_sec("叶与页", t));
         list = list.child(
@@ -9119,6 +9204,130 @@ impl Root {
         }
     }
 
+/// 本叶出图的像素尺存：**长边恒 2160**（2× 高清），短边按比例，且不小于 480。
+///
+/// 抽成自由函数是为了能单测（不牵扯 `Root` 的窗口状态）；纸面矩形取不到时
+/// 由调用方回退到视口尺寸，这里只认一对正数。
+pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
+    let rw = if rw.is_finite() && rw > 1.0 { rw } else { 1080.0 };
+    let rh = if rh.is_finite() && rh > 1.0 { rh } else { 1920.0 };
+    const LONG: f32 = 2160.0;
+    if rw >= rh {
+        (LONG, (LONG * rh / rw).clamp(480.0, LONG))
+    } else {
+        ((LONG * rw / rh).clamp(480.0, LONG), LONG)
+    }
+}
+
+/// 本叶正文（繁简形态与阅读界面一致）+ 逐字「是否划了朱线」。
+    ///
+    /// 直接读**当前叶的排版结果**（`page_at`），与屏幕上看到的是同一批字；
+    /// 只取 `GlyphKind::Char`（句读、缩进占位不进图）。
+    ///
+    /// ⚠️ 只读不写：不碰分页器、不改 `share_*` 快照，导出与阅读互不干扰。
+    fn leaf_body(&mut self) -> (Vec<char>, Vec<bool>) {
+        let mut body: Vec<char> = Vec::new();
+        let mut red: Vec<bool> = Vec::new();
+        let glyphs: Vec<Glyph> = self
+            .page_at(self.page)
+            .map(|p| p.glyphs)
+            .unwrap_or_default();
+        for g in glyphs
+            .iter()
+            .filter(|g| g.kind == GlyphKind::Char && !g.is_indent())
+        {
+            let k = (g.chapter, g.para, g.offset);
+            red.push(self.underlines.contains(&k));
+            body.push(self.shown(g.ch));
+        }
+        // 长短对齐：红标记必须逐字对应正文，短了按「未划线」补齐。
+        if red.len() < body.len() {
+            red.resize(body.len(), false);
+        } else if red.len() > body.len() {
+            red.truncate(body.len());
+        }
+        (body, red)
+    }
+
+    /// 本叶出图的像素尺寸：长边拉到 **2160px**（1080 的两倍，即 2× 高清），
+    /// 短边按纸面**真实比例**换算——图与屏幕上那一叶是同一个长宽比。
+    pub(crate) fn leaf_png_size(&self) -> (f32, f32) {
+        let (rw, rh) = match self.page_rect.get() {
+            Some((_, _, w, h)) if w.is_finite() && h.is_finite() && w > 1.0 && h > 1.0 => (w, h),
+            _ => (self.viewport_w, self.viewport_h),
+        };
+        Self::leaf_png_size_of(rw, rh)
+    }
+
+    /// 本叶出图的纸色 / 栏色：**跟阅读界面走**（不是分享抽屉那套偏好）。
+    ///
+    /// 纸色按亮度分宣纸 / 暗金，栏色看丝栏偏朱还是偏墨——导出的图因此
+    /// 与屏幕上正在读的那一叶同一个调子。
+    fn leaf_bg_frame(&self) -> (crate::share::ShareBg, crate::share::ShareFrame) {
+        let p = self.theme.paper();
+        let lum = ((p >> 16) & 0xFF) + ((p >> 8) & 0xFF) + (p & 0xFF);
+        let bg = if lum > 380 {
+            crate::share::ShareBg::Xuan
+        } else {
+            crate::share::ShareBg::Gold
+        };
+        let r = self.theme.rule();
+        let (rr, gg, bb) = ((r >> 16) & 0xFF, (r >> 8) & 0xFF, r & 0xFF);
+        let frame = if rr > gg.saturating_add(20) && rr > bb.saturating_add(20) {
+            crate::share::ShareFrame::Red
+        } else {
+            crate::share::ShareFrame::Black
+        };
+        (bg, frame)
+    }
+
+    /// **『导出当前页图片』的底层**：把「本叶」离屏重绘成高清 PNG 字节。
+    ///
+    /// v1.71.0 重写（取代旧的 `screencapture` 截屏）：
+    ///   * 走 `share_layout` + `share_paint` 的 **CoreGraphics 离屏光栅**——
+    ///     不读屏幕、**不要「屏幕录制」权限**、锁屏 / 最小化的窗口照样出图；
+    ///   * 分辨率与窗口无关（长边 2160，2× 高清），不再是「屏幕有多大就多
+    ///     大」，也不会把顶栏 / 页码 / 浮层截进去；
+    ///   * 画面只留 **宣纸 + 天头地脚 + 版框界行 + 正文 + 朱印**——落款 /
+    ///     日期 / 批注列一律不画（`show_*` 全 false），这就是「纯净本叶」。
+    ///
+    /// ⚠️ 只消费排版结果，**不碰排版引擎**（分页 / 网格 / 锚点一行未改）。
+    pub(crate) fn render_leaf_png(&mut self) -> Result<Vec<u8>, String> {
+        let (body, red) = self.leaf_body();
+        if body.is_empty() {
+            return Err("这一叶没有可导出的正文".to_string());
+        }
+        let (w, h) = self.leaf_png_size();
+        let (bg, frame) = self.leaf_bg_frame();
+        let seal_text = crate::share::seal_chars(
+            &self
+                .book
+                .as_ref()
+                .map(|b| b.title.clone())
+                .unwrap_or_default(),
+        );
+        let spec = crate::share_layout::LayoutSpec {
+            body: &body,
+            red: &red,
+            note: "",
+            show_notes: false,
+            sign: "",
+            show_sign: false,
+            date: "",
+            show_date: false,
+            columns: self.grid.columns.max(2),
+            bg,
+            frame,
+            seal: crate::share::ShareSeal::Twin,
+            seal_text: &seal_text,
+            font: self.share_font_kind(),
+            w,
+            h,
+        };
+        let l = crate::share_layout::layout(&spec);
+        crate::share_paint::render_png(&l)
+    }
+
     /// 按当前抽屉参数**离屏**渲染 1080×1920 的分享 PNG。
     ///
     /// 走 `share_layout::layout` → `share_paint::render_png`：纯 CoreGraphics
@@ -9700,83 +9909,9 @@ impl Root {
     }
 
 
-    /// 把分享卡截成 PNG：按渲染时记下的卡片矩形裁切，只截卡片本身。
-    ///
-    /// `screencapture -R x,y,w,h` 用屏幕坐标（左上原点）；窗口 frame 含标题栏，
-    /// 内容区从标题栏下沿开始，所以 y 要加 `窗口高 - 视口高`。
-    /// 截分享卡。返回 `Ok(路径)` / `Err(可读原因)`。
-    ///
-    /// 早先只返回 `Option`，失败时界面上一句「需要屏幕录制权限」把所有情况
-    /// 都归到权限头上——坐标算错、桌面目录不存在、临时文件写不进去都长一个样，
-    /// 没法排查。现在把 `screencapture` 的 stderr 一并带出来。
-    pub(crate) fn capture_card_png(&self, window: &Window, prefix: &str) -> Result<String, String> {
-        let b = window.bounds();
-        let unit = px(1.0);
-        let wx = b.origin.x / unit;
-        let wy = b.origin.y / unit;
-        let wh = b.size.height / unit;
-        let title_h = (wh - self.viewport_h).max(0.0);
-        let (rx, ry, rw, rh) = self.share_card_rect.unwrap_or((
-            0.0,
-            0.0,
-            self.viewport_w,
-            self.viewport_h,
-        ));
-        if rw < 40.0 || rh < 40.0 {
-            return Err(format!(
-                "卡片区域过小（{rw:.0}×{rh:.0}），无法截图；请重开分享面板"
-            ));
-        }
-        let x = (wx + rx).max(0.0);
-        let y = (wy + title_h + ry).max(0.0);
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        // 桌面目录不一定存在（沙箱 / 自定义 HOME），落不下去就退回家目录。
-        let dir = {
-            let d = format!("{home}/Desktop");
-            if std::path::Path::new(&d).is_dir() {
-                d
-            } else {
-                home.clone()
-            }
-        };
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let path = format!("{dir}/{prefix}-{secs}.png");
-        let rect = format!("{x:.0},{y:.0},{rw:.0},{rh:.0}");
-        if std::env::var("JIANDU_CAPTURE_DEBUG").is_ok() {
-            eprintln!(
-                "bounds=({wx:.0},{wy:.0},{:.0},{wh:.0}) viewport=({:.0},{:.0}) title={title_h:.0} card=({rx:.0},{ry:.0},{rw:.0},{rh:.0}) -> {rect}",
-                b.size.width / unit, self.viewport_w, self.viewport_h
-            );
-        }
-        let out = std::process::Command::new("screencapture")
-            .args(["-x", "-R", &rect, &path])
-            .output();
-        match out {
-            Ok(o) if o.status.success() && std::path::Path::new(&path).exists() => Ok(path),
-            Ok(o) => {
-                let why = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                let why = if why.is_empty() {
-                    format!("退出码 {:?}", o.status.code())
-                } else {
-                    why
-                };
-                // macOS 上最常见的失败就是没给屏幕录制权限。
-                let hint = if why.to_lowercase().contains("permission")
-                    || why.to_lowercase().contains("not allowed")
-                    || why.to_lowercase().contains("denied")
-                {
-                    "请到「系统设置 → 隐私与安全性 → 屏幕录制」勾选笺读后重试"
-                } else {
-                    "（若提示权限不足：系统设置 → 隐私与安全性 → 屏幕录制）"
-                };
-                Err(format!("截图失败：{why} {hint}"))
-            }
-            Err(e) => Err(format!("无法调用 screencapture：{e}")),
-        }
-    }
+    // v1.71.0：旧的 `capture_card_png`（`screencapture -R` 截分享卡矩形）已删除——
+    // 它要屏幕录制权限、分辨率随窗口、且这条路径早在 v1.57.0 起就没人调用了
+    // （分享卡一律走 `render_share_png` 离屏出图）。全仓再无 `screencapture` 子进程。
 
     /// 版字面板里的一组小选项（标注 / 简繁等开关）。
     /// 一律无底无框：只有字与字下那道线。
@@ -10435,6 +10570,33 @@ mod tests {
             &|c| if c == '甲' { '申' } else { c },
         );
         assert_eq!(chars.iter().collect::<String>(), "申乙");
+    }
+
+    /// 本叶出图：**长边恒 2× 高清 2160**，短边按纸面真实比例。
+    /// 竖长的纸 → 2160×H；宽扁的纸（对开横笺）→ W×2160。
+    #[test]
+    fn leaf_png_long_edge_is_always_2x_hd() {
+        // 竖长纸 1080×1920 → 高是长边：2160 高、1215 宽（比例不变）。
+        let (w, h) = crate::app::Root::leaf_png_size_of(1080.0, 1920.0);
+        assert_eq!(h, 2160.0);
+        assert!((w - 1215.0).abs() < 1.0, "竖长纸 w={w}");
+        // 横宽纸（对开横笺）1920×1080 → 宽是长边：2160 宽、1215 高。
+        let (w2, h2) = crate::app::Root::leaf_png_size_of(1920.0, 1080.0);
+        assert_eq!(w2, 2160.0);
+        assert!((h2 - 1215.0).abs() < 1.0, "横宽纸 h={h2}");
+        // 两边相等（正方形纸）时取长边 2160×2160，不会退化成 0。
+        let (w3, h3) = crate::app::Root::leaf_png_size_of(1000.0, 1000.0);
+        assert_eq!((w3, h3), (2160.0, 2160.0));
+    }
+
+    /// 探针还没写、或窗口尺寸是 0：不能除出 0×0 的空图，退回 1080×1920 基准。
+    #[test]
+    fn leaf_png_size_survives_a_missing_probe() {
+        let (w, h) = crate::app::Root::leaf_png_size_of(0.0, 0.0);
+        // 回退基准 1080×1920（3:2 竖纸）→ 长边 2160，短边 1215。
+        assert_eq!((w, h), (1215.0, 2160.0));
+        let (w2, h2) = crate::app::Root::leaf_png_size_of(f32::NAN, f32::INFINITY);
+        assert!(w2 >= 480.0 && h2 >= 480.0, "非法尺寸也得出图：{w2}×{h2}");
     }
 
     /// 「篇 / 章 / 字」只收在此叶收尾的章：跨叶未完的章不赶它，

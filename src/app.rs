@@ -17,7 +17,7 @@ use gpui::{
     WeakEntity, Window,
 };
 use std::cell::Cell;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 /// **渲染帧 → 事件层的一次性矩形探针**（x, y, w, h）。
@@ -152,7 +152,11 @@ pub enum AppUIState {
     Bookmarks,
 }
 
-/// PNG 笺卡导出的两段式阶段（v1.52.3，见 `Root::png_export`）。
+/// PNG 本叶导出的两段式阶段（v1.52.3 起，见 `Root::png_export`）。
+///
+/// v1.71.0：出图已改**离屏重绘**，不再依赖「屏幕上一帧干净纸面」，但两段式
+/// 保留——Warm 帧先把面板收干净并给用户一句「正在印制本叶…」，下一帧才出图
+/// 弹保存框，节拍与旧版一致（不抢在事件处理器里做重活）。
 ///
 /// `screencapture` 截的是**屏幕**而不是渲染树：事件处理器里当场截，截到的
 /// 还是带着目录 / 浮层的旧帧。故先收面板、登记 `Warm`，等「无面板」纸面
@@ -2753,71 +2757,12 @@ impl Root {
     // 导出：印制笺卡（PNG） / 导出纯文本（MD）
     // ------------------------------------------------------------------
 
-    /// 当前纸面（整幅双叶）在**屏幕坐标**里的矩形 (x, y, w, h)。
-    ///
-    /// `screencapture -R` 吃屏幕坐标；窗口 frame 含标题栏，内容区从标题栏
-    /// 下沿开始，故 y 要加 `窗口高 − 视口高`。`page_rect` 由渲染帧写入
-    /// （内容区坐标），这里只做一次平移，不参与任何排版计算。
-    pub fn page_screen_rect(&self, window: &Window) -> (f32, f32, f32, f32) {
-        let b = window.bounds();
-        let unit = px(1.0);
-        let wx = b.origin.x / unit;
-        let wy = b.origin.y / unit;
-        let wh = b.size.height / unit;
-        let title_h = (wh - self.viewport_h).max(0.0);
-        let (rx, ry, rw, rh) = self
-            .page_rect
-            .get()
-            .unwrap_or((0.0, 0.0, self.viewport_w, self.viewport_h));
-        (
-            (wx + rx).max(0.0),
-            (wy + title_h + ry).max(0.0),
-            rw.max(1.0),
-            rh.max(1.0),
-        )
-    }
-
-    /// 把**当前纸面**截成 PNG 写到 `dest`（macOS `screencapture`，Retina 真
-    /// 分辨率——屏幕上渲染多少像素就存多少像素，不做缩放，即最高画质）。
-    ///
-    /// 失败一律返回 `Err(可读原因)`，绝不 panic：没给屏幕录制权限、坐标算错、
-    /// 目标目录不可写，三种情况在界面上都能看到各自的说法。
-    pub fn capture_page_png(&self, window: &Window, dest: &Path) -> Result<(), String> {
-        let (x, y, w, h) = self.page_screen_rect(window);
-        if w < 40.0 || h < 40.0 {
-            return Err(format!("纸面区域过小（{w:.0}×{h:.0}），无法截图"));
-        }
-        if let Some(dir) = dest.parent() {
-            std::fs::create_dir_all(dir).ok();
-        }
-        let rect = format!("{x:.0},{y:.0},{w:.0},{h:.0}");
-        let out = std::process::Command::new("screencapture")
-            .args(["-x", "-R", &rect])
-            .arg(dest)
-            .output();
-        match out {
-            Ok(o) if o.status.success() && dest.exists() => Ok(()),
-            Ok(o) => {
-                let why = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                let why = if why.is_empty() {
-                    format!("退出码 {:?}", o.status.code())
-                } else {
-                    why
-                };
-                let hint = if why.to_lowercase().contains("permission")
-                    || why.to_lowercase().contains("not allowed")
-                    || why.to_lowercase().contains("denied")
-                {
-                    "请到「系统设置 → 隐私与安全性 → 屏幕录制」勾选笺读后重试"
-                } else {
-                    "（若提示权限不足：系统设置 → 隐私与安全性 → 屏幕录制）"
-                };
-                Err(format!("截图失败：{why} {hint}"))
-            }
-            Err(e) => Err(format!("无法调用 screencapture：{e}")),
-        }
-    }
-
+    // v1.71.0：旧 `page_screen_rect` + `capture_page_png`（走 `screencapture`
+    // 子进程、要屏幕录制权限、会把顶栏与页码一起截进去）已整体删除。
+    // 现在「导出当前页图片」改由 `reader::Root::render_leaf_png` **离屏重绘**
+    // （CoreGraphics 位图，长边 2160 的 2× 高清，画面只有纸与字），
+    // 见 `export_page_png_shoot`。纸面矩形探针 `page_rect` 仍由渲染帧写入，
+    // 只用于取本叶的长宽比（`leaf_png_size`）。
     /// 『印制笺卡（PNG）』按钮：截当前纸面 → 弹系统保存对话框 → 落盘。
     ///
     /// v1.52.3：**先收面板再截**（与 PDF 导出同序）。`screencapture` 截的是
@@ -2852,26 +2797,29 @@ impl Root {
     }
 
     /// PNG 笺卡导出的实段（`PngStage::Shoot` 帧由 `render` 循环调用）：
-    /// 此刻屏幕上正是「无面板」的干净纸面，截下 → 弹系统保存框 → 落盘。
-    fn export_page_png_shoot(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let tmp = std::env::temp_dir().join(format!("jiandu-card-{secs}.png"));
-        if let Err(e) = self.capture_page_png(window, &tmp) {
-            self.notice = e.clone();
-            self.export_toast = Some(e);
-            cx.notify();
-            return;
-        }
+    /// **离屏重绘**本叶 → 弹系统保存框 → 把 PNG 字节直接写到用户选的路径。
+    ///
+    /// v1.71.0：不再 `screencapture`（要屏幕录制权限、分辨率随窗口、会把顶栏
+    /// 与页码截进去），改走 `render_leaf_png()` 的 CoreGraphics 离屏光栅——
+    /// 于是既不需要「等一帧干净纸面」，也不再有临时文件要清理。
+    /// 用户取消 = 正常结果：提示一句，不 panic、不报错红。
+    fn export_page_png_shoot(&mut self, _window: &Window, cx: &mut Context<Self>) {
+        let png = match self.render_leaf_png() {
+            Ok(p) => p,
+            Err(e) => {
+                self.notice = e.clone();
+                self.export_toast = Some(e);
+                cx.notify();
+                return;
+            }
+        };
         let title = self
             .book
             .as_ref()
             .map(|b| b.title.clone())
             .unwrap_or_else(|| "笺读".to_string());
         let default = format!(
-            "笺卡_{}_{}.png",
+            "笺读_{}_第{}叶.png",
             crate::exporter::safe_file_stem(&title),
             self.page + 1
         );
@@ -2886,14 +2834,13 @@ impl Root {
                     // executor 在主线程 poll，is_main_thread() 为 true，
                     // 面板即原生模态显示。详见 exporter::pick_save_path 注释。
                     let picked = crate::exporter::pick_save_path(
-                        "印制笺卡（PNG）",
+                        "印制本叶（高清 PNG）",
                         &default,
                         "PNG 图片",
                         &["png"],
                     );
                     let Some(dest) = picked else {
                         // 用户点了取消：这不是错误。
-                        let _ = std::fs::remove_file(&tmp);
                         this.update(&mut cx, |this, cx| {
                             this.notice = "已取消保存".to_string();
                             this.export_toast = Some("已取消保存".to_string());
@@ -2903,15 +2850,31 @@ impl Root {
                         return;
                     };
                     let dest = crate::exporter::with_extension(dest, "png");
-                    let res = crate::exporter::copy_file(&tmp, &dest);
-                    let _ = std::fs::remove_file(&tmp);
+                    // 直接写字节：不再「先截临时文件再拷一份」，少一次失败点。
+                    let res = std::fs::write(&dest, &png).map(|_| dest).map_err(|e| e.to_string());
                     this.update(&mut cx, |this, cx| {
-                        let msg = match res {
-                            Ok(p) => format!("已印制笺卡：{}", p.display()),
-                            Err(e) => format!("保存失败：{e}"),
+                        let (msg, toast) = match res {
+                            Ok(p) => {
+                                let kb = png.len() / 1024;
+                                let name = p
+                                    .file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "本叶.png".to_string());
+                                // 用户点名要的提示语：一句「本叶已印制」。
+                                // 副行只带文件名（不含目录），保持极简；
+                                // 完整路径放 `notice`，Toast 上不堆信息。
+                                (
+                                    format!("已保存到 {}（{} KB）", p.display(), kb),
+                                    format!("本叶已印制\n{name}"),
+                                )
+                            }
+                            Err(e) => {
+                                let m = format!("保存失败：{e}");
+                                (m.clone(), m)
+                            }
                         };
-                        this.notice = msg.clone();
-                        this.export_toast = Some(msg);
+                        this.notice = msg;
+                        this.export_toast = Some(toast);
                         cx.notify();
                     })
                     .ok();
@@ -5337,9 +5300,10 @@ impl Render for Root {
                 window.request_animation_frame();
             }
         }
-        // PNG 笺卡导出：两段式（先收面板画一帧干净纸面，下一帧才截屏）——v1.52.3。
-        // `screencapture` 截的是屏幕：Warm 帧只画不截，等干净纸面合成上屏，
-        // Shoot 帧才动手，免得图里挂着目录 / 浮层（P2#2）。
+        // PNG 本叶导出：两段式——v1.52.3。
+        // Warm 帧：面板已收、纸上只剩正文，并显示「正在印制本叶…」；
+        // Shoot 帧：离屏重绘出图 + 弹系统保存框。
+        // （v1.71.0 起出图走 CoreGraphics 离屏光栅，不再读屏幕。）
         if let Some(stage) = self.png_export {
             match stage {
                 PngStage::Warm => {
