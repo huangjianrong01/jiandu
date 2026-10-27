@@ -258,6 +258,31 @@ pub struct Root {
     /// 百万字的丛书解析要跑几秒，绝不能堵在主线程上；进度与结果都放在
     /// `Arc<Mutex<…>>` 里，主线程每帧读一次（见 `poll_import`）。
     pub import_job: Option<ImportJob>,
+    /// **批量导入作业**（v1.77.0）：不为空表示「正在一批一批地刻」。
+    ///
+    /// 与单本 `import_job` 互斥——同一时刻只跑一条导入线，免得两条线程
+    /// 同时写 `chapters.db`（SQLite 会撞 `busy_timeout`）。
+    pub batch: Option<crate::batch::BatchJob>,
+    /// 点检出来的**待刻书衣**（书架上的占位卡）。
+    ///
+    /// 点检是毫秒级的：书还没刻，书名已经知道，先让它出现在书架上——
+    /// 用户不用盯着空书架等。刻完一本撤一张（`batch_consumed` 之前锋）。
+    pub batch_cards: Vec<jiandu_core::batch::Candidate>,
+    /// 书衣里已经刻掉几张（占位卡从这里往后才是「待刻」）。
+    pub batch_consumed: usize,
+    /// 本次批量已上架 / 已跳过本数（浮层计数用）。
+    pub batch_done: usize,
+    pub batch_skipped: usize,
+    /// 本次批量已上架的 `store_id`：取消时靠它把「该删的半成品」与
+    /// 「用户已经看见上架的书」区分开——后者一个字都不能删。
+    batch_admitted: Vec<String>,
+    /// **后台慢建索引**的排队（v1.77.0）：导入只管落正文，FTS5 索引交给
+    /// 后台线程一本一本慢慢补，绝不让首屏卡在建索引上。
+    fts_queue: Vec<String>,
+    /// 后台索引线程是否正在跑。
+    fts_busy: bool,
+    /// 后台索引线程跑完没有（每帧探一眼，成了就接着排下一批）。
+    fts_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 目录面板滑入 / 滑出动画进度（0 = 完全收起，1 = 完全展开）。
     pub toc_slide: f32,
     /// 目录动画的目标态（true = 展开）。
@@ -896,6 +921,15 @@ impl Root {
             toc_scroll: ScrollHandle::new(),
             toc_need_scroll: false,
             import_job: None,
+            batch: None,
+            batch_cards: Vec::new(),
+            batch_consumed: 0,
+            batch_done: 0,
+            batch_skipped: 0,
+            batch_admitted: Vec::new(),
+            fts_queue: Vec::new(),
+            fts_busy: false,
+            fts_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             toc_slide: 0.0,
             toc_target: false,
             toc_animating: false,
@@ -2587,12 +2621,188 @@ impl Root {
     /// md / html / json 这些通常不大的格式也走同一条路（流式管线内部对
     /// 它们仍是「整篇解析 + 逐章落盘」），口径统一，不必维护两套入口。
     pub fn add_import(&mut self, path: PathBuf) {
-        if self.import_job.is_some() {
+        if self.import_job.is_some() || self.batch.is_some() {
             self.notice = "还有一部书正在刻印，请稍候".into();
             return;
         }
         self.notice.clear();
         self.import_job = Some(ImportJob::start(path));
+    }
+
+    /// **批量导入**（v1.77.0）：一次喂进一批文件，后台**串行**刻印。
+    ///
+    /// 主线程立刻返回——点检（毫秒级）由后台线程做，点检完书就以真书名
+    /// 出现在书架上（待刻书衣），正文一本一本地刻，刻完一本上架一本。
+    /// 全程不碰主线程：翻书、点书架都是流畅的。
+    pub fn start_batch(&mut self, paths: Vec<std::path::PathBuf>) {
+        if self.import_job.is_some() || self.batch.is_some() {
+            self.notice = "还有书正在刻印，请稍候".into();
+            return;
+        }
+        if paths.is_empty() {
+            return;
+        }
+        self.notice.clear();
+        self.batch_cards.clear();
+        self.batch_consumed = 0;
+        self.batch_done = 0;
+        self.batch_skipped = 0;
+        self.batch_admitted.clear();
+        self.batch = Some(crate::batch::BatchJob::start(paths));
+    }
+
+    /// 用户按下取消：立起标记，等当前这一本刻完就收工。
+    pub fn cancel_batch(&mut self) {
+        if let Some(b) = self.batch.as_mut() {
+            b.request_cancel();
+        }
+    }
+
+    /// 每帧探一眼批量导入：取点检结果 → 上架刻完的 → 收工清场。
+    pub fn poll_batch(&mut self, cx: &mut Context<Self>) {
+        // ① 点检结果（只可能被取到一次）。
+        let cards = self.batch.as_ref().and_then(|j| j.take_cards());
+        if let Some(c) = cards {
+            self.batch_cards = c;
+        }
+        // ② 刻完的：主线程只干「登记入架」这一下轻活。
+        let settled = self
+            .batch
+            .as_ref()
+            .map(|j| j.take_settled())
+            .unwrap_or_default();
+        let canceling = self.batch.as_ref().map(|j| j.canceling).unwrap_or(false);
+        for s in settled {
+            if let Some(i) = s.card_idx {
+                self.batch_consumed = self.batch_consumed.max(i + 1);
+            }
+            let Some((book, sid, src)) = s.payload else {
+                // 跳过（点检就失败的 / 刻印失败的）。
+                self.batch_skipped += 1;
+                continue;
+            };
+            if canceling {
+                // 取消按下之后才刻完的这半本：不上架，直接删库。
+                Self::discard_store(&sid);
+                continue;
+            }
+            let admitted = if sid.is_empty() {
+                self.admit_whole(&src, &book)
+            } else {
+                self.library.admit_streamed(&src, &book, &sid)
+            };
+            match admitted {
+                Ok(_) => {
+                    self.batch_done += 1;
+                    if !sid.is_empty() {
+                        self.batch_admitted.push(sid.clone());
+                        // 索引不在这里建——推给后台慢慢补（见 `enqueue_fts`）。
+                        self.enqueue_fts(sid);
+                    }
+                }
+                Err(e) => {
+                    self.batch_skipped += 1;
+                    eprintln!("[batch] 上架失败：{e}");
+                }
+            }
+        }
+
+        // ③ 收工：清半成品 + 记日志 + 报一句人话。
+        let report = self.batch.as_ref().and_then(|j| j.take_report());
+        if let Some(rep) = report {
+            for sid in &rep.orphans {
+                // 已经上架的书绝不能删——用户看得见它。
+                if !self.batch_admitted.contains(sid) {
+                    Self::discard_store(sid);
+                }
+            }
+            let skipped_any = rep.log.iter().any(|l| l.starts_with("跳过"));
+            Self::write_import_log(&rep.log);
+            self.notice = if skipped_any {
+                format!("{}（跳过的明细已记入 import-log.txt）", rep.summary)
+            } else {
+                rep.summary
+            };
+            self.batch = None;
+            self.batch_cards.clear();
+            self.batch_consumed = 0;
+            cx.notify();
+            return;
+        }
+        if self.batch.is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 删掉一个 `store_id` 的全部痕迹（章 / 书 / 全文索引）。
+    ///
+    /// 取消批量导入时用：正在刻的那一本跑完了但我们不要它，不能留在
+    /// `chapters.db` 里当垃圾（`delete_book` 连 FTS 索引一起清）。
+    fn discard_store(sid: &str) {
+        if sid.is_empty() {
+            return;
+        }
+        if let Ok(c) = jiandu_core::store::connect() {
+            let _ = jiandu_core::store::delete_book(&c, sid);
+        }
+    }
+
+    /// 把这一批的逐本结果追加进日志（App Support 下，沙盒可写）。
+    ///
+    /// 只留最近 200 行——日志是用来「刚才哪几本没导进来」的，不是档案。
+    fn write_import_log(lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        let dir = crate::library::Library::home();
+        let p = dir.join("import-log.txt");
+        let mut all: Vec<String> = std::fs::read_to_string(&p)
+            .map(|s| s.lines().map(|l| l.to_string()).collect())
+            .unwrap_or_default();
+        let keep_from = all.len().saturating_sub(200);
+        all = all.split_off(keep_from);
+        all.extend_from_slice(lines);
+        let _ = std::fs::write(&p, all.join("\n") + "\n");
+    }
+
+    /// 把一本书排进**后台慢建索引**队列（v1.77.0）。
+    ///
+    /// 导入那一刻只落正文。FTS5 的 trigram 索引比正文还大，二十本一起建
+    /// 能把首屏卡住几秒；现在交给后台线程一本一本补，用户第一次搜某本书
+    /// 时若还没轮到它，`run_search` 里的 `search::ensure` 会当场补上——
+    /// 慢一点的是「首次搜索」，不是「导入」。
+    fn enqueue_fts(&mut self, sid: String) {
+        if sid.is_empty() {
+            return;
+        }
+        self.fts_queue.push(sid);
+        self.pump_fts();
+    }
+
+    fn pump_fts(&mut self) {
+        if self.fts_busy || self.fts_queue.is_empty() {
+            return;
+        }
+        self.fts_busy = true;
+        let q = std::mem::take(&mut self.fts_queue);
+        let flag = self.fts_done.clone();
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        std::thread::spawn(move || {
+            if let Ok(c) = jiandu_core::store::connect() {
+                for sid in &q {
+                    let _ = jiandu_core::search::ensure(&c, sid);
+                }
+            }
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    /// 每帧探一眼后台索引线程：跑完了就把剩下的接着排。
+    fn poll_fts(&mut self) {
+        if self.fts_busy && self.fts_done.load(std::sync::atomic::Ordering::Relaxed) {
+            self.fts_busy = false;
+            self.pump_fts();
+        }
     }
 
     /// 漏斗兜底入架（v1.62.0）：整本书写成一个书稿 json，再走旧的非流式入架。
@@ -2671,7 +2881,11 @@ impl Root {
                     self.library.admit_streamed(&src, &book, &sid)
                 };
                 match admitted {
-                    Ok(_) => self.notice = format!("已上架：{title}"),
+                    Ok(_) => {
+                        // 索引不在这里建：推给后台慢慢补，首屏不为它等。
+                        self.enqueue_fts(sid);
+                        self.notice = format!("已上架：{title}");
+                    }
                     Err(e) => self.notice = format!("导入失败：{e}"),
                 }
             }
@@ -2789,13 +3003,52 @@ impl Root {
 
                 if let Some(paths) = picked {
                     this.update(&mut cx, |this, cx| {
-                        for p in paths {
-                            this.add_import(p);
+                        // v1.77.0：**多选即批量**。旧版挨个 `add_import`，
+                        // 而单本通道一次只收一本——选了十本只有第一本进了来，
+                        // 其余九本被「还有一部书正在刻印」静默挡掉（用户以为
+                        // 导进去了，其实没有）。
+                        if paths.len() > 1 {
+                            this.start_batch(paths);
+                        } else {
+                            for p in paths {
+                                this.add_import(p);
+                            }
                         }
                         cx.notify();
                     })
                     .ok();
                 }
+            }
+        })
+        .detach();
+    }
+
+    /// 弹出系统**文件夹**选择器，整批导入一个目录里的书（v1.77.0）。
+    ///
+    /// 选完先点检（毫秒级，书立刻以真书名上架占位），再后台一本一本地刻。
+    /// 子目录也一并收（选「我的电子书」这种大目录是常态）。
+    pub fn import_folder_dialog(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                // 与导出保存框同一条修复：rfd 的同步对话框必须**前台直调**。
+                let picked = rfd::FileDialog::new()
+                    .set_title("整批导入：选一个放书的文件夹")
+                    .pick_folders();
+                let Some(dirs) = picked else { return };
+                let mut paths: Vec<PathBuf> = Vec::new();
+                for d in dirs {
+                    paths.extend(jiandu_core::batch::collect(&d, true));
+                }
+                this.update(&mut cx, |this, cx| {
+                    if paths.is_empty() {
+                        this.notice = "这个文件夹里没有可导入的书".into();
+                    } else {
+                        this.start_batch(paths);
+                    }
+                    cx.notify();
+                })
+                .ok();
             }
         })
         .detach();
@@ -5471,6 +5724,9 @@ impl Render for Root {
         let show_seal = self.screen == Screen::Reading && !self.focus_mode && !self.show_toc;
         // v1.50.0：每帧探一眼后台导入（完成就登记入架，没完成就刷新进度）。
         self.poll_import(cx);
+        // v1.77.0：每帧探一眼批量导入（点检 / 上架 / 收工）与后台建索引。
+        self.poll_batch(cx);
+        self.poll_fts();
         // v1.70.0：**空闲帧渐进铺索引**。开卷后每帧只啃 8 章（≈1ms，60 FPS
         // 纹丝不动），一两秒内把全书的「第几叶在第几章」探明；之后点目录
         // 跳任何一章都是 O(log n) 查表（130µs），根本轮不到「冷跳到末叶」
@@ -5516,6 +5772,19 @@ impl Render for Root {
             .map(|j| (j.name.clone(), j.label(), j.pct()));
         if let Some((name, label, pct)) = import_ui {
             root = root.child(Self::import_overlay(&name, &label, pct));
+        }
+        // 批量导入浮层（v1.77.0）：「正在导入 3/10：庄子」+ 两道进度 + 取消。
+        // 先算成值再 render——`self.batch` 的借用不能与 `&mut self` 并存。
+        let batch_ui = self.batch.as_ref().map(|b| {
+            let (i, n, name, pct, label) = b.progress();
+            (i, n, name, pct, label, b.canceling)
+        });
+        if let Some((i, n, name, pct, label, canceling)) = batch_ui {
+            let done = self.batch_done;
+            let skipped = self.batch_skipped;
+            root = root.child(self.batch_overlay(
+                cx, i, n, &name, pct, &label, done, skipped, canceling,
+            ));
         }
         if show_seal {
             root = root.child(

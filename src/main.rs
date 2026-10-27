@@ -26,6 +26,9 @@
 /// `Root` 里会带着整棵阅读树重绘。落盘（密钥 / 服务商）见 `jiandu_core::ai`。
 mod ai;
 mod app;
+/// **批量导入**（v1.77.0）：后台串行刻印的作业对象 + 进度浮层。
+/// 纯逻辑（点检 / 队列 / 取消语义）在 `jiandu_core::batch`。
+mod batch;
 /// **卡片匣**（v1.74.0）：跨书摘录卡的 UI 层（落盘见 `jiandu_core::cards`）。
 mod cards;
 // v1.71.0：剪贴板唯一入口（原生 NSPasteboard，取代 osascript / pbpaste）。

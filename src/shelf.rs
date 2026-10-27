@@ -788,6 +788,24 @@ impl Root {
                 }),
             );
 
+        // 「整批导入」（v1.77.0）：选一个文件夹，里头的书挨个点检、后台
+        // 一本一本地刻。与「导入」并排——一个是挑几本，一个是整批搬进来。
+        let batch_btn = div()
+            .font_family(song.clone())
+            .text_size(px(12.0))
+            .text_color(rgb(INK_SOFT))
+            .cursor_pointer()
+            .hover(|s| s.text_color(rgb(CINNABAR)))
+            .child(SharedString::from("整批导入"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.import_folder_dialog(cx);
+                    cx.notify();
+                }),
+            );
+
         let mut bar = div()
             .flex()
             .flex_row()
@@ -808,8 +826,9 @@ impl Root {
             bar = bar.child(self.render_shelf_search(cx));
         }
         bar = bar.child(div().flex_1());
-        // 右侧三件：**导入**、**放大镜**、**编辑**（多一枚都是噪音）。
+        // 右侧四件：**导入**、**整批导入**、**放大镜**、**编辑**。
         bar = bar.child(import_btn);
+        bar = bar.child(batch_btn);
         bar = bar.child(self.render_search_icon(searching, cx));
         bar = bar.child(edit);
 
@@ -1162,6 +1181,11 @@ impl Root {
         for (idx, e) in entries {
             grid = grid.child(self.render_slip_card(*idx, e, cx));
         }
+        // v1.77.0：批量导入时，还没刻完的书先以「待刻书衣」占个位——
+        // 点检是毫秒级的，书名早就知道了，不必让用户盯着空书架等。
+        for c in self.batch_pending_cards() {
+            grid = grid.child(self.render_pending_card(&c));
+        }
         div()
             .id(SharedString::from("shelf-grid-scroll"))
             .size_full()
@@ -1350,6 +1374,103 @@ impl Root {
             }
             cx.stop_propagation();
         }))
+    }
+
+    /// 批量导入里**还没刻完**的书（点检已出真书名，正文还在后台刻）。
+    fn batch_pending_cards(&self) -> Vec<jiandu_core::batch::Candidate> {
+        let from = self.batch_consumed.min(self.batch_cards.len());
+        self.batch_cards[from..].to_vec()
+    }
+
+    /// **待刻书衣**（v1.77.0）：与真书衣同形，只是布面褪成一档灰青、
+    /// 右下角盖一枚「待刻」小印，**点不开**——它还没有正文。
+    ///
+    /// 为什么不做成能点开的半本书：半成的书点开是一片白纸，那比「还没
+    /// 出现」更像崩了。占位卡不可点，刻完那一格自然换成真书衣。
+    fn render_pending_card(&mut self, c: &jiandu_core::batch::Candidate) -> Div {
+        const W: f32 = 160.0;
+        const H: f32 = 213.0;
+        const SLIP_W: f32 = 52.0;
+        const SLIP_H: f32 = 96.0;
+        // 褪色的布面：比真书衣（0x2F4858）浅一档、灰一档，一眼看出「未成」。
+        const PENDING_CLOTH: u32 = 0x5C6B72;
+
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::SongTi,
+            crate::types::Script::Ancient,
+        );
+        let title = vertical_block(
+            c.display_name(),
+            SLIP_W - 8.0,
+            SLIP_H - 8.0,
+            15.0,
+            0x241F1A,
+            FontWeight::MEDIUM,
+        );
+
+        let card = div()
+            .relative()
+            .w(px(W))
+            .h(px(H))
+            .rounded(px(8.0))
+            .bg(rgb(PENDING_CLOTH))
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .top(px(10.0))
+                    .left(px(10.0))
+                    .w(px(SLIP_W))
+                    .h(px(SLIP_H))
+                    .p(px(4.0))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0xFFFFFF))
+                    .child(title),
+            )
+            // 右下角「待刻」：朱砂小字，像一枚压在书衣上的印。
+            .child(
+                div()
+                    .absolute()
+                    .right(px(10.0))
+                    .bottom(px(10.0))
+                    .font_family(song.clone())
+                    .text_size(px(10.0))
+                    .text_color(rgb(CINNABAR))
+                    .child(SharedString::from(if c.toc.is_empty() {
+                        "待刻".to_string()
+                    } else {
+                        format!("待刻 · {} 章", c.toc.len())
+                    })),
+            );
+
+        let name_line = div()
+            .w(px(W))
+            .flex()
+            .justify_center()
+            .pt(px(10.0))
+            .child(
+                div()
+                    .font_family(song)
+                    .text_size(px(13.0))
+                    .text_color(rgb(INK_FAINT))
+                    .child(SharedString::from(clip_title_w(c.display_name(), W - 4.0, 13.0))),
+            );
+
+        div()
+            .relative()
+            .w(px(W))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(card)
+            .child(name_line)
+            // 不挂 on_mouse_down：点它要落到网格空白处（撤悬停），
+            // 绝不能当成「翻一本没有正文的书」。
     }
 
     /// 书脊列表：一行一册。

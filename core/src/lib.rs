@@ -20,6 +20,8 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod banxin;
+/// **批量导入**（v1.77.0）：点检 → 串行刻印 → 可取消 → 错误日志。
+pub mod batch;
 /// **问小笺**（v1.76.0 · V2.0 模块二）：AI 伴读的纯逻辑层——服务商预设 /
 /// 提示词组装 / SSE 增量解析。零网络依赖（HTTP 在 UI 层 `src/ai.rs`）。
 pub mod ai;

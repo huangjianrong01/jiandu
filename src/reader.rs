@@ -1781,6 +1781,18 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // v1.77.0：**Esc 取消批量导入**。排在所有屏别之前——批量导入是
+        // 全屏浮层，那时 Esc 唯一的含义就该是「别刻了」。
+        if self.batch.is_some()
+            && matches!(
+                event.keystroke.key.as_str(),
+                "escape" | "Escape" | "esc"
+            )
+        {
+            self.cancel_batch();
+            cx.notify();
+            return;
+        }
         match self.screen {
             Screen::Reading => self.handle_reading_key(event, window, cx),
             _ => self.handle_shelf_key(event, window, cx),
@@ -8374,6 +8386,15 @@ impl Root {
         list = list.child(help_row("栏内「设置」", "选服务商 · 填地址 / 模型 / 密钥", t));
         list = list.child(help_row("同上 · 密钥", "只存本机 ai.json（权限 600），不外传、不进日志", t));
         list = list.child(help_row("同上 · 联网", "问一句就把这句原文发给所选服务商（自己选的服务商）", t));
+
+        // 批量导入（v1.77.0）：一个文件夹几十本，一本一本地刻。
+        list = list.child(help_sec("批量导入", t));
+        list = list.child(help_row("书架「导入」", "可多选：选一本照旧单本导入，选多本自动转批量", t));
+        list = list.child(help_row("书架「整批导入」", "选一个文件夹（含子目录），把里头的书整批搬进来", t));
+        list = list.child(help_row("刻印中", "书先以「待刻」书衣出现在书架，刻完一本换一本真书", t));
+        list = list.child(help_row("进度浮层", "「正在导入 3/10：书名」+ 总进度 / 本本进度", t));
+        list = list.child(help_row("取消", "浮层「取消」或按 Esc（刻完手上这本就停，半成品删净）", t));
+        list = list.child(help_row("坏文件", "自动跳过不中断；明细记在 import-log.txt", t));
 
         // v1.52.3：手势与导出入口、叶页口径补在面板最下方（12 用户模拟报告 P1 / P3#12）。
         list = list.child(help_sec("手势", t));
