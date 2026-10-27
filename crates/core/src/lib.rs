@@ -59,6 +59,10 @@ pub mod pipeline;
 /// `PinyinSource` 三个 trait —— core 说「要什么」，壳子说「怎么画」。
 /// 跨平台时换壳子不换内核，全靠这一层。
 pub mod platform;
+/// **古籍净化漏斗 · 文本层**（v1.80.0）：出版噪声词（ISBN / 丛书 / 译注 /
+/// 版权页）的行级屏蔽、front matter 章节名判据、启发式正文起点定位。
+/// 结构层（DOM / TOC / spine）在 `app::importer::epub_parser`。
+pub mod purge;
 /// **C ABI 出口**（v1.0.0-beta）：给 Tauri / Flutter / Swift / JNI 等
 /// 非 Rust 壳子调 `cdylib` 用。见 `README_cross_platform.md`。
 pub mod ffi;

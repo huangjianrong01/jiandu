@@ -1179,6 +1179,35 @@ fn drop_ascii_brackets(s: &str, open: char, close: char) -> String {
     out
 }
 
+/// **元数据粉碎机·第零步**：把「书名——丛书名」切成「书名」。
+///
+/// 现代出版社的 `dc:title` 几乎总带尾巴：
+/// 「尔雅——中华经典名著全本全注全译丛书」「论语（中华书局版）」
+/// 「史记 : 全本全注全译」。丛书名不是书名——它排进版心书口会把整叶撑爆。
+/// 取第一个分隔符**之前**的那一段（多个分隔符时取最短的那段，最靠前最像书名）；
+/// 切完不足 2 字就原样返回（那说明分隔符在开头，切不得）。
+pub fn main_title_of(raw: &str) -> String {
+    const SEPS: &[&str] = &[
+        "——", "—", "―", "－－", "｜", "|", "／", "/", "：", ":", "（", "(", "【", "[",
+    ];
+    let mut best: Option<&str> = None;
+    for s in SEPS {
+        if let Some((head, _)) = raw.split_once(s) {
+            let h = head.trim();
+            if h.chars().count() >= 2 {
+                best = match best {
+                    Some(b) if b.chars().count() <= h.chars().count() => Some(b),
+                    _ => Some(h),
+                };
+            }
+        }
+    }
+    match best {
+        Some(h) => h.trim().to_string(),
+        None => raw.trim().to_string(),
+    }
+}
+
 /// **元数据粉碎机·第二步**：只留「像书名」的字符，再按 [`META_TITLE_MAX`] 截断。
 ///
 /// 保留：中日韩统一表意文字（含扩展区）、假名、谚文、拉丁字母、数字、
@@ -2186,5 +2215,20 @@ mod tests {
         let broken = "<p>甲</p><table><tr><td>乙";
         let out3 = drop_tag_blocks(broken, &TABLE_TAGS);
         assert!(out3.contains("甲"), "截断文件不该丢正文：{out3}");
+    }
+
+    // ── 元数据粉碎机·第零步 ────────────────────────────────────────
+
+    #[test]
+    fn series_suffix_is_cut_off_the_title() {
+        assert_eq!(
+            main_title_of("尔雅——中华经典名著全本全注全译丛书"),
+            "尔雅"
+        );
+        assert_eq!(main_title_of("史记 : 全本全注全译"), "史记");
+        assert_eq!(main_title_of("论语（中华书局版）"), "论语");
+        assert_eq!(main_title_of("道德经"), "道德经");
+        // 分隔符在开头 → 切不得，原样返回
+        assert_eq!(main_title_of("——尔雅"), "——尔雅");
     }
 }

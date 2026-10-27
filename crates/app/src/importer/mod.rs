@@ -219,11 +219,22 @@ pub fn import_file(path: &Path) -> Result<BookIR, ImportError> {
     } else {
         (None, None)
     };
+    // v1.80.0：EPUB 同理——净化漏斗把题名页整节丢了，正文首行是篇题
+    // （「释诂第一」），从正文猜书名会猜错，只能信 OPF 的 `dc:title`。
+    let epub_title = if fmt == Format::Epub {
+        epub_parser::read_epub_title(path)
+    } else {
+        None
+    };
 
     // ⑤ 标题 / 作者：先从正文首两行认（「书名 · 作者」的排法），认不出用文件名。
-    let (t, a) = jiandu_core::importer::detect_title_author(&text);
-    let t = json_meta.0.unwrap_or(t);
-    let a = json_meta.1.unwrap_or(a);
+    let (t, a0) = jiandu_core::importer::detect_title_author(&text);
+    let t = json_meta.0.or(epub_title).unwrap_or(t);
+    let mut a = json_meta.1.unwrap_or(a0);
+    // 从正文猜出来的「作者」若是出版噪声（「管锡华◎译注」那类），宁可留空。
+    if jiandu_core::purge::is_pub_noise(&a) {
+        a.clear();
+    }
     let title = if t.trim().is_empty() { stem.clone() } else { t };
     // v1.69.0：书名最后再过一遍「元数据粉碎机」。盗版 EPUB 认不出题名时
     // 兜底用的是**文件名**——那一长串 `尔雅……(管锡华 [guanxihua])
