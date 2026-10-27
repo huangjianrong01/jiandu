@@ -2927,14 +2927,19 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jiandu"
-version = "1.75.0"
+version = "1.76.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "core-foundation 0.10.0",
  "core-graphics 0.24.0",
  "core-text",
  "encoding_rs",
  "gpui",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "image",
  "jiandu-core",
  "once_cell",
@@ -2944,6 +2949,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
  "zip",
 ]
 

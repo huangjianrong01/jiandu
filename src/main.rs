@@ -20,6 +20,11 @@
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
+/// **问小笺**（v1.76.0 · V2.0 模块二）：AI 伴读侧栏。
+///
+/// 做成独立 Entity（`AiPanel`）——流式输出每秒 notify 几十次，状态若住在
+/// `Root` 里会带着整棵阅读树重绘。落盘（密钥 / 服务商）见 `jiandu_core::ai`。
+mod ai;
 mod app;
 /// **卡片匣**（v1.74.0）：跨书摘录卡的 UI 层（落盘见 `jiandu_core::cards`）。
 mod cards;

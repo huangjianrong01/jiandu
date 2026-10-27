@@ -219,16 +219,20 @@ impl Root {
 /// 把任意子元素包成「可聚焦、可接 IME」的输入元素。
 ///
 /// prepared 阶段登记焦点句柄（焦点才有落点，IME 才认这块区域），
-/// paint 阶段注册 `handle_input`（平台把组好的字经它送回 `Root`）。
-pub struct InputField {
+/// paint 阶段注册 `handle_input`（平台把组好的字经它送回所属 Entity）。
+///
+/// v1.76.0：`view` 由写死的 `Entity<Root>` 放宽成泛型 `Entity<V>`——
+/// 「问小笺」是**独立 Entity**（流式输出要单独重绘，不能带整棵阅读树），
+/// 它的输入框也得能接中文，故输入框外壳不该只认 Root 一种宿主。
+pub struct InputField<V: EntityInputHandler> {
     child: Option<gpui::AnyElement>,
     focus: FocusHandle,
-    view: Entity<Root>,
+    view: Entity<V>,
 }
 
-impl InputField {
+impl<V: EntityInputHandler> InputField<V> {
     /// `child` 为输入框的视觉内容（草稿 + 光标自绘），`focus` 为该框的焦点句柄。
-    pub fn new(child: impl IntoElement, focus: FocusHandle, view: Entity<Root>) -> Self {
+    pub fn new(child: impl IntoElement, focus: FocusHandle, view: Entity<V>) -> Self {
         Self {
             child: Some(child.into_any_element()),
             focus,
@@ -237,14 +241,14 @@ impl InputField {
     }
 }
 
-impl IntoElement for InputField {
+impl<V: EntityInputHandler> IntoElement for InputField<V> {
     type Element = Self;
     fn into_element(self) -> Self {
         self
     }
 }
 
-impl Element for InputField {
+impl<V: EntityInputHandler> Element for InputField<V> {
     type RequestLayoutState = gpui::AnyElement;
     type PrepaintState = ();
 

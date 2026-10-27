@@ -13,5 +13,11 @@
     <true/>
 
     <!-- 内置 resources/books 位于 App 自身 bundle 内，沙盒默认可读，无需额外授权。 -->
+
+    <!-- 问小笺（v1.76.0）：向用户在设置里自选的服务商发一条 HTTPS 对话请求。
+         不开启则沙盒下所有出站连接被拒（连不上就是一句「网络未通」）。
+         只用出站客户端权限，不监听端口、不申请 server。 -->
+    <key>com.apple.security.network.client</key>
+    <true/>
 </dict>
 </plist>

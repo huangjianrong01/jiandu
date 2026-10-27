@@ -9,11 +9,11 @@ use crate::library::{Bookmark, Library};
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
     Book, Duplex, FontChoice, FontPreset, Glyph, GlyphHit, GlyphKey, GlyphKind,
-    MarkKind, Note, NoteKind, NoteSource, RuleColor, Script,
+    MarkKind, NoteKind, NoteSource, RuleColor, Script,
 };
 use gpui::{
-    div, px, rgb, AsyncApp, Context, Div, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, ScrollHandle, SharedString, Styled,
+    div, px, rgb, AppContext, AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, Render, ScrollHandle, SharedString, Styled,
     WeakEntity, Window,
 };
 use std::cell::Cell;
@@ -152,6 +152,8 @@ pub enum AppUIState {
     Cards,
     /// 书签抽屉。
     Bookmarks,
+    /// 问小笺（v1.76.0 · V2.0 模块二）：AI 伴读侧栏。
+    Ai,
 }
 
 /// PNG 本叶导出的两段式阶段（v1.52.3 起，见 `Root::png_export`）。
@@ -341,6 +343,14 @@ pub struct Root {
     pub show_cards: bool,
     /// 匣中卡片（开栏时从库里读一次，增删后重读；不每帧查询）。
     pub cards: Vec<jiandu_core::cards::Card>,
+    /// **问小笺侧栏**（v1.76.0 · V2.0 模块二）：AI 伴读。
+    ///
+    /// 面板是**独立 Entity**——流式输出每秒要 notify 几十次，若状态住在
+    /// `Root` 里，每次 notify 都会带着整棵阅读树重绘（分页 / 排版 / 版心 /
+    /// 句读），翻页手感会被一个网络请求拖垮。会话状态与流式缓冲都在面板内，
+    /// notify 只重绘这一条侧栏（见 `src/ai.rs` 文件头）。
+    pub show_ai: bool,
+    pub ai_panel: Entity<crate::ai::AiPanel>,
     /// 笔记编辑态：true 时正文区弹出浮层编辑栏，键盘全部路由给编辑。
     pub note_editing: bool,
     /// 编辑栏正在改的是**哪条注文**：`Some((chapter, para, offset))` 表示
@@ -615,6 +625,10 @@ pub struct Root {
     pub cards_slide: f32,
     pub cards_target: bool,
     pub cards_animating: bool,
+    /// 问小笺侧栏滑入 / 滑出动画（v1.76.0，同上）。
+    pub ai_slide: f32,
+    pub ai_target: bool,
+    pub ai_animating: bool,
     /// 检索侧栏滑入 / 滑出动画。
     pub search_slide: f32,
     pub search_target: bool,
@@ -829,7 +843,10 @@ impl ImportJob {
 }
 
 impl Root {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        // 问小笺面板：开局就建（它是常驻 Entity，不开栏也在内存里）。
+        // 做成独立 Entity 是为了把流式 notify 关在面板内——见字段注释。
+        let ai_panel = cx.new(crate::ai::AiPanel::new);
         let mut library = Library::load();
         if library.books.is_empty() {
             let _ = library.seed_sample();
@@ -908,7 +925,7 @@ impl Root {
             note_inject_key: None,
             note_draft: String::new(),
             note_cursor: 0,
-            note_focus: _cx.focus_handle(),
+            note_focus: cx.focus_handle(),
             note_marked: None,
             head_notes: Vec::new(),
             margin_notes: Vec::new(),
@@ -926,8 +943,8 @@ impl Root {
             rename_idx: None,
             rename_draft: String::new(),
             rename_cursor: 0,
-            rename_focus: _cx.focus_handle(),
-            key_focus: _cx.focus_handle(),
+            rename_focus: cx.focus_handle(),
+            key_focus: cx.focus_handle(),
             rename_marked: None,
             delete_confirm: None,
             show_help: false,
@@ -991,7 +1008,7 @@ impl Root {
             ui_state: AppUIState::None,
             search_draft: String::new(),
             search_cursor: 0,
-            search_focus: _cx.focus_handle(),
+            search_focus: cx.focus_handle(),
             search_marked: None,
             search_hits: Vec::new(),
             search_idx: 0,
@@ -1005,6 +1022,11 @@ impl Root {
             cards_target: false,
             cards_animating: false,
             show_cards: false,
+            show_ai: false,
+            ai_panel,
+            ai_slide: 0.0,
+            ai_target: false,
+            ai_animating: false,
             cards: Vec::new(),
             search_slide: 0.0,
             search_target: false,
@@ -1022,7 +1044,7 @@ impl Root {
             shelf_cat: None,
             shelf_query: String::new(),
             shelf_query_cursor: 0,
-            shelf_query_focus: _cx.focus_handle(),
+            shelf_query_focus: cx.focus_handle(),
             shelf_query_marked: None,
             shelf_searching: false,
             shelf_expand: None,
@@ -2821,7 +2843,7 @@ impl Root {
             return;
         }
         // 导出前收起所有面板 / 浮层，纸面只留正文（与 begin_pdf_export 同序）。
-        self.set_ui_state(AppUIState::None);
+        self.set_ui_state(AppUIState::None, cx);
         self.close_transient_ui();
         self.png_export = Some(PngStage::Warm);
         cx.notify();
@@ -3520,7 +3542,7 @@ fn anki_push_card(
     /// 全局 UI 状态机：同一时刻只开一个顶层面板，并强制关闭所有底层瞬态浮层。
     /// 再点同一个已开面板 = 收起（`None`）。所有顶栏按钮 / 快捷键的开合都应
     /// 走这里，保证互斥一致（v1.45.0 交互重构 · 任务一）。
-    pub fn set_ui_state(&mut self, s: AppUIState) {
+    pub fn set_ui_state(&mut self, s: AppUIState, cx: &mut Context<Self>) {
         // 以「当前该面板是否真的开着」决定切换：避免其它路径（点面板内关闭
         // 钮、快捷键等）关掉面板后 `ui_state` 失同步，导致再点同一钮开不了。
         let on = match s {
@@ -3532,6 +3554,7 @@ fn anki_push_card(
             AppUIState::Share => self.show_share_panel,
             AppUIState::Bookmarks => self.show_bookmarks,
             AppUIState::Cards => self.show_cards,
+            AppUIState::Ai => self.show_ai,
             AppUIState::None => false,
         };
         let s = if on { AppUIState::None } else { s };
@@ -3544,6 +3567,7 @@ fn anki_push_card(
         self.show_share_panel = matches!(s, AppUIState::Share);
         self.show_bookmarks = matches!(s, AppUIState::Bookmarks);
         self.show_cards = matches!(s, AppUIState::Cards);
+        self.show_ai = matches!(s, AppUIState::Ai);
         if !self.show_search {
             self.clear_search();
         }
@@ -3557,9 +3581,21 @@ fn anki_push_card(
         self.bookmarks_animating = self.show_bookmarks || self.bookmarks_slide > 0.0;
         self.cards_target = self.show_cards;
         self.cards_animating = self.show_cards || self.cards_slide > 0.0;
+        self.ai_target = self.show_ai;
+        self.ai_animating = self.show_ai || self.ai_slide > 0.0;
         // 开栏那一刻才去库里取一次（侧栏是低频面板，没必要每帧查）。
         if self.show_cards {
             self.reload_cards();
+        }
+        // 问小笺开栏：把当前纸墨与字体递给面板（面板是独立 Entity，
+        // 看不到 `Root` 的主题），换主题 / 换字体时也一样要同步一次。
+        if self.show_ai {
+            let theme = self.theme;
+            let song = self.main_family();
+            self.ai_panel.update(cx, |p, cx| {
+                p.sync_look(theme, song);
+                cx.notify();
+            });
         }
         self.close_transient_ui();
     }
@@ -3575,6 +3611,7 @@ fn anki_push_card(
             || self.show_share_panel
             || self.show_bookmarks
             || self.show_cards
+            || self.show_ai
     }
 
     pub fn open_toc(&mut self) {
@@ -3804,76 +3841,6 @@ fn anki_push_card(
             return false;
         };
         p.emph_at(g.offset)
-    }
-
-    /// 把当前拖选区间标记为人名 / 地名 / 书名：写入书稿段落并回写 JSON，
-    /// 标记即时生效（`mark_kind` 实时读 `self.book`），下次打开仍在。
-    /// 与数据里预置的标记走同一通道——渲染侧 `ancient_cell` 只认 `mark_kind`。
-    pub fn mark_selection(&mut self, kind: NoteKind) {
-        if !matches!(kind, NoteKind::Person | NoteKind::Place | NoteKind::Book) {
-            return;
-        }
-        let Some((a, b)) = self.selection_range() else {
-            self.notice = "请先拖选要标记的文字".to_string();
-            return;
-        };
-        let pages = self.paginate();
-        // 收集区间内与本段同段的字键，并拼出选区文本（兼顾双面对开左右两页）。
-        let mut keys: Vec<(usize, usize, usize)> = Vec::new();
-        let mut text = String::new();
-        for pg in [self.page, self.page + 1] {
-            if let Some(glyphs) = pages.get(pg) {
-                for g in glyphs {
-                    if g.kind != GlyphKind::Char || g.is_indent() {
-                        continue;
-                    }
-                    let k = (g.chapter, g.para, g.offset);
-                    if k >= a && k <= b && k.1 == a.1 {
-                        keys.push(k);
-                        text.push(g.ch);
-                    }
-                }
-            }
-        }
-        if keys.is_empty() {
-            self.notice = "选区内没有可标记的字".to_string();
-            return;
-        }
-        let (c, pa, start) = (a.0, a.1, a.2);
-        let end = keys.iter().map(|k| k.2).max().unwrap_or(start);
-        let len = end - start + 1;
-        // 编辑书稿：在对应段落追加一条跨度标记，并清掉区间内已有的专名标记
-        // （避免新旧叠加错位）。
-        let edited = if let Some(book) = self.book.as_mut() {
-            if let Some(p) = book
-                .chapters
-                .get_mut(c)
-                .and_then(|ch| ch.paragraphs.get_mut(pa))
-            {
-                p.notes.retain(|n| {
-                    !(n.kind.is_mark()
-                        && n.at <= end
-                        && n.at + n.len.saturating_sub(1) >= start)
-                });
-                p.notes.push(Note::span(start, len, kind, text));
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if edited {
-            if let Some(path) = self.library.books.get(self.current).map(|e| e.path.clone()) {
-                let _ = crate::importer::write_book_json(self.book.as_ref().unwrap(), &path);
-            }
-        }
-        self.clear_selection();
-        let label = match kind {
-            NoteKind::Book => "书名",
-            _ => "专名",
-        };
-        self.notice = format!("已标记为{label}");
     }
 
     /// 分页（只保留古籍竖笺）。
@@ -5428,6 +5395,21 @@ impl Render for Root {
                 window.request_animation_frame();
             }
         }
+        // 问小笺侧栏滑入 / 滑出（v1.76.0，同款逐帧推进）。
+        if self.ai_animating {
+            let dir = if self.ai_target { 1.0 } else { -1.0 };
+            let step = 0.12;
+            let next = (self.ai_slide + dir * step).clamp(0.0, 1.0);
+            self.ai_slide = next;
+            if (self.ai_target && next >= 1.0) || (!self.ai_target && next <= 0.0) {
+                self.ai_animating = false;
+                if !self.ai_target {
+                    self.show_ai = false;
+                }
+            } else {
+                window.request_animation_frame();
+            }
+        }
         // 检索侧栏滑入 / 滑出。
         if self.search_animating {
             let dir = if self.search_target { 1.0 } else { -1.0 };
@@ -5519,8 +5501,8 @@ impl Render for Root {
             // 本应用没有任何可聚焦元素（没有输入框），焦点为空时派发路径只有根元素
             // 一个节点——挂在 render_screen 返回的子层上，整组快捷键（含重命名键入、
             // ← → 翻页、笔记输入）会静默失效。
-            .on_key_down(move |event: &KeyDownEvent, _window, app| {
-                let _ = ent.update(app, |this, cx| this.dispatch_key(event, cx));
+            .on_key_down(move |event: &KeyDownEvent, window, app| {
+                let _ = ent.update(app, |this, cx| this.dispatch_key(event, window, cx));
             });
         // 藏印「箋讀」：盖在**纸页左下角外侧**（v1.28.0 由中缝移来）。
         // 必须画在 `screen` **之后**：正文屏是整幅不透明纸面，先画的元素会

@@ -1681,6 +1681,11 @@ impl Root {
         if self.show_cards && !self.focus_mode {
             root = root.child(self.render_cards_panel(cx));
         }
+        // 问小笺（v1.76.0）：AI 伴读侧栏。**独立 Entity**——流式输出每帧只
+        // 重绘这一条侧栏，纸上的书一动不动（见 `src/ai.rs` 文件头）。
+        if self.show_ai && !self.focus_mode {
+            root = root.child(self.render_ai_panel(cx));
+        }
         // 分享卡片浮层（深底竖排，可存为图片）。
         if self.show_share_panel {
             root = root.child(self.render_share_sheet(cx));
@@ -1740,15 +1745,45 @@ impl Root {
     }
 
 
+    /// **问小笺侧栏**（v1.76.0）：右滑宣纸栏，内容与状态都在 `AiPanel` 这个
+    /// 独立 Entity 里。
+    ///
+    /// 这里只做三件事——定宽、按 `ai_slide` 给偏移、拦住冒泡；**不碰**面板
+    /// 内部状态。流式输出时 notify 只重绘 Entity 子树，纸上的书不重排。
+    pub(crate) fn render_ai_panel(&mut self, cx: &mut Context<Self>) -> Div {
+        let slide = self.ai_slide.clamp(0.0, 1.0);
+        let panel_w = (self.viewport_w * 0.42).clamp(320.0, 520.0);
+        let off = -(1.0 - slide) * panel_w;
+        div()
+            .absolute()
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .right(px(off))
+            .w(px(panel_w))
+            .child(self.ai_panel.clone())
+            // 栏内不冒泡：否则一点输入框，根容器的「点纸面收浮层」就把栏收了。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+    }
+
     /// 键盘总入口：由窗口根元素上的监听器调用（见 `app.rs` 的 `Render::render`）。
     ///
     /// GPUI 0.2.2 只把按键派发给「焦点节点 → 根元素」这条路径上的监听器；
     /// `render_screen` 返回的是根元素的子层，且没有任何可聚焦元素，
     /// 挂在它上面的 `on_key_down` 永远收不到键——所以入口必须放在根元素。
-    pub fn dispatch_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    pub fn dispatch_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match self.screen {
-            Screen::Reading => self.handle_reading_key(event, cx),
-            _ => self.handle_shelf_key(event, cx),
+            Screen::Reading => self.handle_reading_key(event, window, cx),
+            _ => self.handle_shelf_key(event, window, cx),
         }
     }
 
@@ -1757,7 +1792,12 @@ impl Root {
     /// 注意：GPUI 0.2.2（macOS）的 keystroke.key 是全小写命名——
     /// 方向键为 "left"/"right"/"up"/"down"，Esc 为 "escape"；
     /// 这里同时兼容旧写法，避免键名拼写差异让整组快捷键静默失效。
-    pub fn handle_reading_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    pub fn handle_reading_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
                     let k = event.keystroke.key.as_str();
                     let mods = event.keystroke.modifiers;
 
@@ -1769,6 +1809,17 @@ impl Root {
                         && (k == "escape" || k == "Escape" || k == "esc")
                     {
                         self.toast = None;
+                        cx.notify();
+                        return;
+                    }
+
+                    // ⓪′ **问小笺**：焦点落在面板输入框上时，键全归面板。
+                    //
+                    //    面板是独立 Entity，自己管草稿与光标（含 IME 回落前的
+                    //    编辑键）。这里只做转发：它说「已消费」就到此为止，
+                    //    说「没消费」（比如输入框里空手按 Esc）就照旧往下走，
+                    //    由 ② 那条 Esc 把面板收掉——绝不两边都吃同一个键。
+                    if self.show_ai && crate::ai::forward_key(&self.ai_panel, event, window, cx) {
                         cx.notify();
                         return;
                     }
@@ -1869,6 +1920,8 @@ impl Root {
                         self.show_style = false;
                         self.show_notes_panel = false;
                         self.show_cards = false;
+                        // 小笺栏：与其余侧栏同款收法（目标态归零，由 render 逐帧滑出）。
+                        self.close_ai();
                         self.show_help = false;
                         self.show_share_panel = false;
                         self.close_lookup();
@@ -1938,7 +1991,7 @@ impl Root {
                             }
                             // 全文检索：⌘F（与顶部「檢索」同款，走状态机开合）。
                             "f" | "F" => {
-                                self.set_ui_state(AppUIState::Search);
+                                self.set_ui_state(AppUIState::Search, cx);
                                 cx.notify();
                             }
                             // 主题切换：⌘P。
@@ -1968,7 +2021,7 @@ impl Root {
                             }
                             // 版字面板：⌘E（走全局状态机：开版字即关其它面板与浮层）。
                             "e" | "E" => {
-                                self.set_ui_state(AppUIState::Style);
+                                self.set_ui_state(AppUIState::Style, cx);
                                 cx.notify();
                             }
                             // 目录：⌘L（同时收起样式 / 帮助）。
@@ -2023,12 +2076,12 @@ impl Root {
                             }
                             // 笔记面板（侧栏）：⌘K（走全局状态机）。
                             "k" | "K" => {
-                                self.set_ui_state(AppUIState::Notes);
+                                self.set_ui_state(AppUIState::Notes, cx);
                                 cx.notify();
                             }
                             // 帮助：⌘/（走全局状态机）。
                             "/" => {
-                                self.set_ui_state(AppUIState::Help);
+                                self.set_ui_state(AppUIState::Help, cx);
                                 cx.notify();
                             }
                             // 划线：⌘U。有选区划选区；无选区划本页第一个正文字。
@@ -2796,7 +2849,7 @@ impl Root {
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.set_ui_state(AppUIState::Style);
+                this.set_ui_state(AppUIState::Style, cx);
                 cx.notify();
             }),
         ));
@@ -2820,7 +2873,7 @@ impl Root {
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 // 走全局状态机：开检索即关其它面板与底层浮层；再点一次收起。
-                this.set_ui_state(AppUIState::Search);
+                this.set_ui_state(AppUIState::Search, cx);
                 if this.show_search {
                     // 焦点交给检索框，否则输入法没有落点、打不进中文。
                     window.focus(&this.search_focus);
@@ -2832,7 +2885,7 @@ impl Root {
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.set_ui_state(AppUIState::Notes);
+                this.set_ui_state(AppUIState::Notes, cx);
                 cx.notify();
             }),
         ));
@@ -2841,15 +2894,23 @@ impl Root {
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.set_ui_state(AppUIState::Cards);
+                this.set_ui_state(AppUIState::Cards, cx);
                 cx.notify();
+            }),
+        ));
+        // 问小笺（v1.76.0 · V2.0 模块二）：框一句原文问他，或在此直接发问。
+        right = right.child(item("问笺", self.show_ai).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.toggle_ai(window, cx);
             }),
         ));
         right = right.child(item("帮助", self.show_help).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.set_ui_state(AppUIState::Help);
+                this.set_ui_state(AppUIState::Help, cx);
                 cx.notify();
             }),
         ));
@@ -7004,7 +7065,7 @@ impl Root {
         let btn_close = self
             .search_link("收", t)
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.set_ui_state(AppUIState::None);
+                this.set_ui_state(AppUIState::None, cx);
                 cx.notify();
             }));
 
@@ -7409,7 +7470,9 @@ impl Root {
         // v1.55.0：加一枚「眉批」——选中文字后直接到天头题批，锚点取全书
         // 扁平字符下标（见 `Root::start_margin_note`）。
         // v1.74.0：再加一枚「存卡」——选中即入卡片匣（见 `Root::save_selection_card`）。
-        let n: f32 = 9.0; // 查典 / 朱批 / 存卡 / 眉批 / 夹注 / 拓印 / 人名 / 地名 / 书名
+        // v1.76.0：撤下「人名 / 地名 / 书名」三枚专名线（有了问小笺，字词来历
+        // 问一句比手划一条线更快，且划线的判据本就全靠人眼），补一枚「问笺」。
+        let n: f32 = 7.0; // 查典 / 朱批 / 存卡 / 眉批 / 夹注 / 拓印 / 问笺
         let w = pad * 2.0 + item_w * n + gap * (n - 1.0) + 2.0;
         let h = pad * 2.0 + item_h + 2.0;
         let place = crate::hit::place_card(
@@ -7444,9 +7507,7 @@ impl Root {
         push_btn("眉批", &mut items);
         push_btn("夹注", &mut items);
         push_btn("拓印", &mut items);
-        push_btn("人名", &mut items);
-        push_btn("地名", &mut items);
-        push_btn("书名", &mut items);
+        push_btn("问笺", &mut items);
 
         // 夹注：先看看这个字上有没有旧注，有就预填（算改写）。
         let existing_note = self
@@ -7549,29 +7610,14 @@ impl Root {
                 cx.notify();
             }),
         );
-        let b_person = items.next().unwrap().on_mouse_down(
+        // 问笺（v1.76.0）：把选中的这句交给小笺，栏开在右侧，答案一字一字吐。
+        // ⚠️ 顺序要紧：面板自己要从 `popup.hit.key` 取「没拖选时那一个字」的
+        // 锚点，故**先**发问、再收工具条；这里也不清选区，让面板拿到完整引文。
+        let b_ask = items.next().unwrap().on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
+            cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.mark_selection(NoteKind::Person);
-                this.popup = None;
-                cx.notify();
-            }),
-        );
-        let b_place = items.next().unwrap().on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.mark_selection(NoteKind::Place);
-                this.popup = None;
-                cx.notify();
-            }),
-        );
-        let b_book = items.next().unwrap().on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.mark_selection(NoteKind::Book);
+                this.ask_ai_selection(window, cx);
                 this.popup = None;
                 cx.notify();
             }),
@@ -7588,7 +7634,7 @@ impl Root {
             .justify_center()
             .gap(px(gap))
             .child(b_query);
-        for b in [b_note, b_card, b_margin, b_gloss, b_copy, b_person, b_place, b_book] {
+        for b in [b_note, b_card, b_margin, b_gloss, b_copy, b_ask] {
             row = row.child(b);
         }
 
@@ -8104,7 +8150,7 @@ impl Root {
             return;
         }
         // 走全局状态机：开分享即收其它顶层面板与瞬态浮层。
-        self.set_ui_state(AppUIState::Share);
+        self.set_ui_state(AppUIState::Share, cx);
         // 快照已落，待分享选区使命完成（`set_ui_state` 可能又补录一次）。
         self.share_sel = None;
         cx.notify();
@@ -8321,6 +8367,13 @@ impl Root {
         // 卡片匣（v1.74.0）：跨书摘录。与朱批不同——朱批长在书里，卡片汇在匣里。
         list = list.child(help_row("浮签「存卡」", "框选正文后入匣（跨书汇集，书删了卡片还在）", t));
         list = list.child(help_row("顶栏「卡片匣」", "查看全部卡片 · 点一条跳回原文 · 右侧「删」", t));
+        // 问小笺（v1.76.0 · V2.0 模块二）：框一句原文问他。
+        list = list.child(help_sec("问小笺", t));
+        list = list.child(help_row("浮签「问笺」", "框选原文即问（自动带上前后文与出处）", t));
+        list = list.child(help_row("顶栏「问笺」", "开栏发问 · ⏎ 送出 · Esc 收栏", t));
+        list = list.child(help_row("栏内「设置」", "选服务商 · 填地址 / 模型 / 密钥", t));
+        list = list.child(help_row("同上 · 密钥", "只存本机 ai.json（权限 600），不外传、不进日志", t));
+        list = list.child(help_row("同上 · 联网", "问一句就把这句原文发给所选服务商（自己选的服务商）", t));
 
         // v1.52.3：手势与导出入口、叶页口径补在面板最下方（12 用户模拟报告 P1 / P3#12）。
         list = list.child(help_sec("手势", t));

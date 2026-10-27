@@ -20,6 +20,9 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod banxin;
+/// **问小笺**（v1.76.0 · V2.0 模块二）：AI 伴读的纯逻辑层——服务商预设 /
+/// 提示词组装 / SSE 增量解析。零网络依赖（HTTP 在 UI 层 `src/ai.rs`）。
+pub mod ai;
 /// **卡片匣**（v1.74.0）：跨书摘录卡的落盘层（`store` 同库的一张表）。
 pub mod cards;
 /// **全文检索索引**（v1.75.0）：SQLite FTS5 按需建索引，毫秒级定位候选章。

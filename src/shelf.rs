@@ -1720,7 +1720,12 @@ impl Root {
     }
 
     /// 书库键盘处理：重命名对话框开着时，键盘全部路由给重命名框。
-    pub(crate) fn handle_shelf_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    pub(crate) fn handle_shelf_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let k = event.keystroke.key.as_str();
         let mods = event.keystroke.modifiers;
         if std::env::var("JIANDU_KEY_DEBUG").is_ok() {

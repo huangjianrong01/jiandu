@@ -3,7 +3,7 @@ members = ["core"]
 
 [package]
 name = "jiandu"
-version = "1.75.0"
+version = "1.76.0"
 edition = "2021"
 description = "笺读 · 一个用 Rust + GPUI 写的原生中文阅读器（古文竖笺 / 现代横笺）"
 license = "MIT"
@@ -54,6 +54,17 @@ core-text = "21"
 core-foundation = "0.10"
 # 只用来把位图编码成 PNG（关掉全部默认 feature，不引解码器 / rayon）。
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# ── 问小笺（AI 伴读，v1.76.0）─────────────────────────────────────
+# 只用来发一条 OpenAI 兼容的流式对话请求（HTTPS + SSE）。全部沿用
+# Cargo.lock 里已有的版本（gpui 依赖树里本就带着 hyper 生态），故离线
+# 也能构建；关掉 default features，只留 ring + 系统根证书，不引 aws-lc。
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "ring"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [profile.release]
 lto = "thin"
