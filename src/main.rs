@@ -26,6 +26,9 @@
 /// `Root` 里会带着整棵阅读树重绘。落盘（密钥 / 服务商）见 `jiandu_core::ai`。
 mod ai;
 mod app;
+/// **内测闸门**（v1.0.0-beta）：启动时那张「箋讀 + 邀請碼」的纸。
+/// 纯逻辑（码表 / 归一 / 凭据）在 `jiandu_core::gate`。
+mod beta;
 /// **批量导入**（v1.77.0）：后台串行刻印的作业对象 + 进度浮层。
 /// 纯逻辑（点检 / 队列 / 取消语义）在 `jiandu_core::batch`。
 mod batch;
@@ -47,6 +50,11 @@ mod note_inject;
 // v1.60.0：惰性分页器（按章分块 + 前缀和索引 + LRU 窗口）。
 // 渲染层只向它要「当前这一叶」，绝不再每帧排全书。
 mod pager;
+// v1.80.0：**PDF 印制**。与 share_paint（PNG）同宗的 CoreGraphics 离屏
+// 后端，只是画布换成 `CGPDFContext`（矢量 + 内嵌字体）。排版仍由
+// `gloss::layout_book_from_opts` 产出，本模块只照着落笔。
+#[cfg(target_os = "macos")]
+mod pdf;
 mod punct;
 mod reader;
 mod share;
@@ -65,8 +73,8 @@ mod zen_kit;
 // 回 crate 根——`crate::grid` / `crate::types` 等既有路径全部继续有效，
 // UI 层（app / reader / shelf）代码零改动。
 pub use jiandu_core::{
-    banxin, content, dict, grid, library, numcn, parsers, pipeline, prefs, ruby, store, stream,
-    trad, theme, types, vclean, west,
+    banxin, content, dict, gate, grid, library, numcn, parsers, pipeline, prefs, ruby, store,
+    stream, trad, theme, types, vclean, west,
 };
 
 use app::Root;

@@ -40,6 +40,16 @@ const FIELD_MAX: usize = 300;
 const REQUEST_TIMEOUT: u64 = 120;
 /// 会话里最多留多少轮（再多只留最近的，免得面板越聊越重）。
 const KEEP_TURNS: usize = 40;
+/// **四枚快捷问法**（v1.80.0）：前项是印上的四个字，后项是真正发出去的那一句。
+///
+/// 为什么是「四个字 + 整句」两截：印上只刻得下四个字，可四个字当问题太短，
+/// 模型容易答成词条释义。故存整句、显示短句——与「目录题名截断」同一路数。
+const SUGGESTS: [(&str, &str); 4] = [
+    ("疏通文意", "疏通這一段的文意，逐句講明白"),
+    ("解釋典故", "這一處用到的典故出自哪裡，原本是何意"),
+    ("梳理脈絡", "梳理這一段的論說脈絡，指出轉折處"),
+    ("續寫下文", "照此文氣與用典，續寫兩句"),
+];
 
 // ── 草稿：与 `ime::InputField` 配套的自绘输入框状态 ──────────────────────
 
@@ -127,6 +137,47 @@ fn max_of(i: usize) -> usize {
     }
 }
 
+/// **问的范围**（v1.80.0「全庫」钮）：材料从哪儿来。
+///
+/// 写匠那枚「全库 / 当前笔记本」是同一个意思：同样是问一句，材料却可以只取
+/// 眼前这一段、翻遍这一本、或翻遍整架书。范围越大越慢（要走全文索引），故
+/// 默认是「本章」——**用户不换，就绝不去翻库**。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AiScope {
+    /// 本章：引文 + 前后文（原来那一套，零检索）。
+    #[default]
+    Chapter,
+    /// 全書：在当前这本书里用全文索引翻几处相关段落。
+    Book,
+    /// 全庫：翻遍书架上所有已入库的书。
+    Library,
+}
+
+impl AiScope {
+    /// 印章上的字（三字，宽度齐整，点一下换下一个范围）。
+    pub fn label(self) -> &'static str {
+        match self {
+            AiScope::Chapter => "本章",
+            AiScope::Book => "全書",
+            AiScope::Library => "全庫",
+        }
+    }
+
+    /// 点一下换下一个（本章 → 全書 → 全庫 → 本章）。
+    pub fn next(self) -> Self {
+        match self {
+            AiScope::Chapter => AiScope::Book,
+            AiScope::Book => AiScope::Library,
+            AiScope::Library => AiScope::Chapter,
+        }
+    }
+
+    /// 这个范围要不要先翻库（要翻库就得让界面层去检索）。
+    pub fn needs_search(self) -> bool {
+        !matches!(self, AiScope::Chapter)
+    }
+}
+
 /// 会话里的一条消息。
 #[derive(Clone)]
 struct Msg {
@@ -159,6 +210,21 @@ pub struct AiPanel {
     focuses: [FocusHandle; 4],
     /// 当前停在设置页（true）还是会话页（false）。
     settings: bool,
+    /// **问的范围**（本章 / 全書 / 全庫，见 [`AiScope`]）。
+    scope: AiScope,
+    /// 正在等界面层翻库取材料（true 时 `send` 不发请求，等 `finish_hunt`）。
+    hunting: bool,
+    /// 这一次翻检是否已经派出去过（防每帧重复派活）。
+    hunt_sent: bool,
+    /// 待翻检的那一问（翻完直接拿它发）。
+    hunt_q: String,
+    /// 上一轮翻检的结果提示（「已翻檢 3 處」）。
+    refs_hint: String,
+    /// `Root` 的实体句柄：**中文输入法统一走 Root 那条通道**（见 `ime::InputField`
+    /// ——平台只认「焦点所在元素登记的 handler」，登记谁，字就送进谁。v1.80.0
+    /// 之前登记的是本面板，四个框一个字也打不进来；现在登记 Root，由 Root
+    /// 转交本面板，与「检索 / 笔记」那两处走的是同一条已验证的通道）。
+    root: Entity<crate::app::Root>,
     /// 待问的**引文上下文**（工具条「问笺」带进来的那一段）。
     ctx: Option<Ask>,
     /// 最近一次出错的人话（ Verbindung / 401 / 模型不存在…）。
@@ -166,7 +232,7 @@ pub struct AiPanel {
 }
 
 impl AiPanel {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>, root: Entity<crate::app::Root>) -> Self {
         let cfg = AiConfig::load();
         // 配好了就直进会话页；没配（缺地址 / 模型 / 密钥）才停在设置页——
         // 否则用户对着一个空输入框不知道要先干什么。
@@ -195,6 +261,12 @@ impl AiPanel {
             // 没配过的小笺先开设置页（不然用户对着空输入框不知道要干什么）；
             // 配好了就直接进会话页。
             settings: !ready,
+            scope: AiScope::Chapter,
+            hunting: false,
+            hunt_sent: false,
+            hunt_q: String::new(),
+            refs_hint: String::new(),
+            root,
             ctx: None,
             error: None,
         }
@@ -225,6 +297,56 @@ impl AiPanel {
     pub fn take_context(&mut self, ask: Ask, cx: &mut Context<Self>) {
         self.ctx = Some(ask);
         self.settings = false;
+        cx.notify();
+    }
+
+    /// **界面层轮询口**：这一问要不要先翻库？要翻且还没派活，就返回它。
+    ///
+    /// 面板自己够不着库（`Root` 才有书架与全文索引），故把「要翻」这件事
+    /// 摊成一个可以被每帧问一句的布尔 + 一句问话：`Root::poll_ai` 每帧问
+    /// 一次，拿到就派一次活（并立刻把 `hunt_sent` 置真，免得每帧重复派）。
+    pub fn take_hunt(&mut self) -> Option<String> {
+        if self.hunting && !self.hunt_sent {
+            self.hunt_sent = true;
+            Some(self.hunt_q.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 当前范围（界面层派活前要认一下：本章不必翻库）。
+    pub fn scope(&self) -> AiScope {
+        self.scope
+    }
+
+    /// 翻库**完成**：材料入 `Ask`，随即把挂起的那一问发出去。
+    ///
+    /// 翻空了也照发——模型还能凭自己的底子答，总比卡在「正在翻檢」强；
+    /// 只是提示一行「未檢得相關段落」，让用户知道材料是空的。
+    pub fn finish_hunt(&mut self, mut ask: Ask, cx: &mut Context<Self>) {
+        self.hunting = false;
+        self.hunt_sent = false;
+        if ask.question.is_empty() {
+            ask.question = self.hunt_q.clone();
+        }
+        self.refs_hint = if ask.refs.is_empty() {
+            "未檢得相關段落，以下只憑所學作答".to_string()
+        } else {
+            format!("已翻檢 {} 處", ask.refs.len())
+        };
+        self.ctx = Some(ask);
+        cx.notify();
+        self.send(cx);
+    }
+
+    /// 换范围（点那枚「本章 / 全書 / 全庫」印章）。
+    pub fn cycle_scope(&mut self, cx: &mut Context<Self>) {
+        self.scope = self.scope.next();
+        // 换了范围，上一轮翻来的材料就作废（新范围要翻的是另一批段落）。
+        if let Some(a) = self.ctx.as_mut() {
+            a.refs.clear();
+        }
+        self.refs_hint.clear();
         cx.notify();
     }
 
@@ -260,10 +382,28 @@ impl AiPanel {
             return;
         }
         let q = self.drafts[F_ASK].text.trim().to_string();
+        if self.hunting {
+            self.error = Some("正在翻檢，稍候".to_string());
+            cx.notify();
+            return;
+        }
         let mut ask = self.ctx.clone().unwrap_or_default();
         ask.question = q.clone();
         if ask.is_empty() {
             self.error = Some("先框选原文，或写一句想问的".to_string());
+            cx.notify();
+            return;
+        }
+        // v1.80.0「全庫」：范围不是「本章」时，材料得先翻库。库在界面层
+        // （`Root` 才有书架与全文索引），面板自己够不着——故在这里挂起：
+        // 记下这一问、置 `hunting`，由 `Root::poll_ai` 派活、翻完回调
+        // `finish_hunt`。命中过一次的材料会留在 `ask.refs` 里，同一范围
+        // 连问两句不会重复翻检。
+        if self.scope.needs_search() && ask.refs.is_empty() {
+            self.hunt_q = q;
+            self.hunting = true;
+            self.hunt_sent = false;
+            self.error = None;
             cx.notify();
             return;
         }
@@ -396,8 +536,68 @@ impl AiPanel {
     }
 
     /// 当前焦点落在第几栏（IME 用）。
-    fn focused_field(&self, window: &Window) -> Option<usize> {
+    pub(crate) fn focused_field(&self, window: &Window) -> Option<usize> {
         self.focuses.iter().position(|f| f.is_focused(window))
+    }
+
+    // ── IME 转交口 ──────────────────────────────────────────────
+    //
+    // 平台把组好的字交给「焦点元素登记的那个 Entity」。v1.80.0 起这个
+    // Entity 是 `Root`（与检索 / 笔记同一条已验证的通道），故 Root 拿到字
+    // 后要**转交**给本面板——下面这六个方法就是转交口，返回 `false` 表示
+    // 焦点不在本面板任何一栏（Root 应退回「没输入目标」）。
+
+    pub(crate) fn ime_text_for_range(&self, range: Range<usize>, window: &Window) -> Option<String> {
+        let i = self.focused_field(window)?;
+        Some(crate::ime::utf16_slice(&self.drafts[i].text, range))
+    }
+
+    pub(crate) fn ime_selected_range(&self, window: &Window) -> Option<UTF16Selection> {
+        let i = self.focused_field(window)?;
+        let at = crate::ime::char_to_utf16(&self.drafts[i].text, self.drafts[i].cursor);
+        Some(UTF16Selection {
+            range: at..at,
+            reversed: false,
+        })
+    }
+
+    pub(crate) fn ime_marked_range(&self, window: &Window) -> Option<Range<usize>> {
+        let i = self.focused_field(window)?;
+        self.drafts[i].marked.clone()
+    }
+
+    pub(crate) fn ime_unmark(&mut self, window: &Window) {
+        if let Some(i) = self.focused_field(window) {
+            self.drafts[i].marked = None;
+        }
+    }
+
+    pub(crate) fn ime_replace(&mut self, range: Option<Range<usize>>, text: &str, window: &Window) {
+        let Some(i) = self.focused_field(window) else {
+            return;
+        };
+        self.drafts[i].marked = None;
+        self.drafts[i].replace_utf16(range, text, max_of(i));
+    }
+
+    pub(crate) fn ime_replace_mark(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        window: &Window,
+    ) {
+        let Some(i) = self.focused_field(window) else {
+            return;
+        };
+        let eff = range.or_else(|| self.drafts[i].marked.clone());
+        let start = self.drafts[i].replace_utf16(eff, new_text, max_of(i));
+        let end = start + crate::ime::utf16_len(new_text);
+        self.drafts[i].marked = Some(start..end);
+        self.drafts[i].cursor = match new_selected_range {
+            Some(sel) => crate::ime::utf16_to_char(&self.drafts[i].text, sel.end),
+            None => crate::ime::utf16_to_char(&self.drafts[i].text, end),
+        };
     }
 
     /// 焦点是否落在本面板的**任一**输入框上。
@@ -652,6 +852,8 @@ impl Render for AiPanel {
         // 半透明宣纸底（GPUI 无 backdrop-filter，用纸色近似磨砂）。
         let veil = ((paper & 0xFFFFFF) << 8) | 0xF2;
         let sept = jiandu_core::theme::mix(paper, ink, 0.16);
+        // 悬停底：纸 + 墨 5%（淡淡的宣纸色，与左侧栏同款）。
+        let hover_bg = jiandu_core::theme::mix(paper, ink, 0.05);
         let song = self.song.clone();
 
         // ⚠️ 先把要用的状态摘成值：下面要给每枚钮挂 `cx.listener`（要
@@ -672,8 +874,11 @@ impl Render for AiPanel {
         let msgs: Vec<Msg> = self.msgs.clone();
         let drafts: [Draft; 4] = self.drafts.clone();
         let focused = self.focused_field(window);
+        let scope = self.scope;
+        let hunting = self.hunting;
+        let refs_hint = self.refs_hint.clone();
 
-        // ── 头：题名 + 两枚小钮 ────────────────────────────────────
+        // ── 头：题名 + 两枚小钮 ────────────────────────────────
         let head_btn = |label: &'static str| -> Div {
             div()
                 .px(px(6.0))
@@ -684,7 +889,7 @@ impl Render for AiPanel {
                 .hover(move |s| s.text_color(rgb(zhu)))
                 .child(SharedString::from(label))
         };
-        let mut header = div()
+        let header = div()
             .flex()
             .flex_row()
             .items_center()
@@ -695,37 +900,50 @@ impl Render for AiPanel {
             .border_color(rgb(sept))
             .child(
                 div()
-                    .font_family(song.clone())
-                    .text_size(px(12.5))
-                    .text_color(rgb(zhu))
-                    .child(SharedString::from(if settings {
-                        "問小箋 · 設".to_string()
-                    } else {
-                        "問小箋".to_string()
-                    })),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .font_family(song.clone())
+                            .text_size(px(13.0))
+                            .text_color(rgb(zhu))
+                            .child(SharedString::from("問小箋")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgb(soft))
+                            .child(SharedString::from(if settings {
+                                "設".to_string()
+                            } else {
+                                String::new()
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(head_btn("設置").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.settings = !this.settings;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(head_btn("清談").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.clear_talk(cx);
+                        }),
+                    )),
             );
-        header = header.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .child(head_btn("設置").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.settings = !this.settings;
-                        cx.notify();
-                    }),
-                ))
-                .child(head_btn("清談").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.clear_talk(cx);
-                    }),
-                )),
-        );
 
-        // ── 中：会话 / 设置，二选一 ────────────────────────────────
+        // ── 中：会话 / 设置，二选一 ────────────────────────────
         let mid = if settings {
             self.render_settings(
                 provider,
@@ -746,7 +964,7 @@ impl Render for AiPanel {
             self.render_talk(&msgs, streaming, has_ctx, &error, zhu, ink, soft, song.clone())
         };
 
-        // ── 尾：引文条 + 提问框 ────────────────────────────────────
+        // ── 尾：引文条 + 提问框 ────────────────────────────────
         let footer = if settings {
             // 设置页不摆提问框（那三栏已经占满，再挤一排反而乱）。
             div().flex().flex_col().px_3().py_2().child(
@@ -756,7 +974,24 @@ impl Render for AiPanel {
                     .child(SharedString::from("密鑰只存本機 ai.json（權限 600），不隨書稿外傳")),
             )
         } else {
-            self.render_ask_bar(&drafts, has_ctx, ctx_quote, zhu, ink, soft, paper, window, cx)
+            self.render_ask_bar(
+                &drafts,
+                has_ctx,
+                ctx_quote,
+                scope,
+                hunting,
+                &refs_hint,
+                msgs.is_empty(),
+                zhu,
+                ink,
+                soft,
+                paper,
+                sept,
+                hover_bg,
+                song.clone(),
+                window,
+                cx,
+            )
         };
 
         div()
@@ -777,7 +1012,10 @@ impl Render for AiPanel {
 }
 
 impl AiPanel {
-    /// 会话区：一问一答两列小字，答的那条尾部带一枚朱砂游标。
+    /// 会话区：空着时是「一位坐在纸边上的先生」的开场；有话则一问一答。
+    ///
+    /// v1.80.0：开场不再是一行干巴巴的灰字提示——给一枚朱砂小印（「箋」）
+    /// 加两句人话，形态上与写匠那类现代知识库对齐，字句仍是古籍的口气。
     fn render_talk(
         &self,
         msgs: &[Msg],
@@ -802,16 +1040,53 @@ impl AiPanel {
 
         if msgs.is_empty() {
             let hint = if has_ctx {
-                "已引一句原文，直接按「問」即可"
+                "已圈一句原文，按「問」即可"
             } else {
-                "框選正文後點「問箋」，或在此直接發問"
+                "圈一句原文問他，或直接在此發問"
             };
-            list = list.child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(rgb(soft))
-                    .child(SharedString::from(hint)),
-            );
+            list = list
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        // 朱砂小印：方框 + 「箋」——面板的落款。
+                        .child(
+                            div()
+                                .w(px(26.0))
+                                .h(px(26.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .border_1()
+                                .border_color(rgb(zhu))
+                                .rounded(px(2.0))
+                                .font_family(song.clone())
+                                .text_size(px(14.0))
+                                .text_color(rgb(zhu))
+                                .child(SharedString::from("箋")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .font_family(song.clone())
+                                        .text_size(px(12.5))
+                                        .text_color(rgb(ink))
+                                        .child(SharedString::from("紙邊坐著一位先生")),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(soft))
+                                        .child(SharedString::from(hint)),
+                                ),
+                        ),
+                );
         }
         for m in msgs {
             let label = if m.mine { "問" } else { "箋" };
@@ -837,7 +1112,7 @@ impl AiPanel {
             if !m.text.is_empty() {
                 let mut line = div()
                     .text_size(px(12.5))
-                    .text_color(rgb(if m.mine { ink } else { ink }))
+                    .text_color(rgb(ink))
                     .child(SharedString::from(m.text.clone()));
                 if m.typing {
                     // 输出中的游标：一枚朱砂小方块（✕ 类拉丁符号在 GPUI 零宽）。
@@ -872,16 +1147,37 @@ impl AiPanel {
         list
     }
 
-    /// 提问条：引文一行 + 输入框一行 + 「問」钮。
+    /// **提问条**（v1.80.0 改版，形制参考写匠「问小文」）：
+    ///
+    /// ```text
+    ///   〔引〕北冥有魚，其名為鯤……        去
+    ///   ┌────────────────────────────┐
+    ///   │ 想問什麼                          │
+    ///   └────────────────────────────┘
+    ///   本章 ⟡  疏通文意 解釋典故 …………   〔問〕
+    /// ```
+    ///
+    /// 三处讲究：① 输入框单独成行、宽度撑满（写得了整句追问，不像挤在
+    /// 一行里只能塞半句）；② 「範圍」是一枚可点的朱砂小印（本章 / 全書 /
+    /// 全庫），点一下换一个范围；③ 空会话时给四枚「快捷问法」小签，省得
+    /// 用户对着空条发愣。
+    #[allow(clippy::too_many_arguments)]
     fn render_ask_bar(
         &self,
         drafts: &[Draft; 4],
         has_ctx: bool,
         ctx_quote: String,
+        scope: AiScope,
+        hunting: bool,
+        refs_hint: &str,
+        fresh: bool,
         zhu: u32,
         ink: u32,
         soft: u32,
         paper: u32,
+        sept: u32,
+        hover_bg: u32,
+        song: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -922,10 +1218,10 @@ impl AiPanel {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .flex_1()
+            .w_full()
             .py_2()
             .border_b_1()
-            .border_color(rgb(zhu))
+            .border_color(rgb(if cursor_on { zhu } else { sept }))
             .child(if hint.is_empty() {
                 box_body
             } else {
@@ -942,20 +1238,56 @@ impl AiPanel {
                     cx.notify();
                 }),
             );
-        let input = InputField::new(field, self.focuses[F_ASK].clone(), cx.entity());
+        // ⚠️ IME 落点登记的是 **Root**：与「检索 / 笔记」同一条已验证的通道，
+        // 见 `root` 字段注释。四个框都归它管。
+        let input = InputField::new(field, self.focuses[F_ASK].clone(), self.root.clone());
 
-        let send = div()
-            .px(px(8.0))
+        // 「範圍」小印：点一下换范围（本章 → 全書 → 全庫）。翻检中不许换。
+        let scope_chip = div()
+            .px(px(7.0))
             .py(px(2.0))
-            .text_size(px(12.0))
-            .text_color(rgb(if self.streaming { soft } else { zhu }))
+            .border_1()
+            .border_color(rgb(if scope.needs_search() { zhu } else { sept }))
+            .rounded(px(2.0))
+            .font_family(song.clone())
+            .text_size(px(10.5))
+            .text_color(rgb(if scope.needs_search() { zhu } else { soft }))
             .cursor_pointer()
-            .hover(move |s| s.text_color(rgb(zhu)))
-            .child(SharedString::from(if self.streaming { "候" } else { "問" }))
+            .hover(move |s| s.bg(rgb(hover_bg)))
+            .child(SharedString::from(scope.label()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
+                    if this.hunting {
+                        return;
+                    }
+                    this.cycle_scope(cx);
+                }),
+            );
+
+        // 「問」：一枚朱砂小印，与范围印同高，落在行尾。
+        let send = div()
+            .px(px(11.0))
+            .py(px(3.0))
+            .rounded(px(2.0))
+            .bg(rgb(if self.streaming || hunting {
+                jiandu_core::theme::mix(paper, zhu, 0.35)
+            } else {
+                zhu
+            }))
+            .font_family(song.clone())
+            .text_size(px(12.0))
+            .text_color(rgb(paper))
+            .cursor_pointer()
+            .child(SharedString::from(if hunting { "檢" } else { "問" }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    if this.hunting {
+                        return;
+                    }
                     this.send(cx);
                 }),
             );
@@ -963,12 +1295,13 @@ impl AiPanel {
         let row = div()
             .flex()
             .flex_row()
-            .items_end()
+            .items_center()
+            .justify_between()
             .gap(px(8.0))
-            .child(input)
+            .child(scope_chip)
             .child(send);
 
-        let mut col = div().flex().flex_col().px_3().py_2().gap(px(6.0));
+        let mut col = div().flex().flex_col().px_3().py_2().gap(px(8.0));
         if has_ctx {
             col = col.child(
                 div()
@@ -985,6 +1318,7 @@ impl AiPanel {
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.0))
                             .text_size(px(11.0))
                             .text_color(rgb(jiandu_core::theme::mix(ink, zhu, 0.35)))
                             .child(SharedString::from(brief(&ctx_quote, 60))),
@@ -1007,7 +1341,67 @@ impl AiPanel {
                     ),
             );
         }
+        col = col.child(input);
         col = col.child(row);
+        // 翻检状态 / 结果：只在「不是本章」时才占这一行。
+        if scope.needs_search() {
+            let note = if hunting {
+                "正在翻檢……".to_string()
+            } else if refs_hint.is_empty() {
+                match scope {
+                    AiScope::Book => "在本書中翻檢相關段落".to_string(),
+                    AiScope::Library => "在全部藏書中翻檢相關段落".to_string(),
+                    AiScope::Chapter => String::new(),
+                }
+            } else {
+                refs_hint.to_string()
+            };
+            if !note.is_empty() {
+                col = col.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(soft))
+                        .child(SharedString::from(note)),
+                );
+            }
+        }
+        // 四枚快捷问法：只在还没开话时给（开话后它们只会挡住对话）。
+        if fresh {
+            let mut chips = div().flex().flex_row().flex_wrap().gap(px(6.0));
+            for (show, full) in SUGGESTS {
+                chips = chips.child(
+                    div()
+                        .px(px(7.0))
+                        .py(px(2.0))
+                        .border_1()
+                        .border_color(rgb(sept))
+                        .rounded(px(2.0))
+                        .font_family(song.clone())
+                        .text_size(px(10.5))
+                        .text_color(rgb(soft))
+                        .cursor_pointer()
+                        .hover(move |s| {
+                            s.text_color(rgb(zhu)).border_color(rgb(zhu)).bg(rgb(hover_bg))
+                        })
+                        .child(SharedString::from(show.to_string()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                if this.hunting {
+                                    return;
+                                }
+                                this.drafts[F_ASK].text = full.to_string();
+                                this.drafts[F_ASK].cursor = full.chars().count();
+                                this.drafts[F_ASK].marked = None;
+                                this.click_field(F_ASK, window);
+                                this.send(cx);
+                            }),
+                        ),
+                );
+            }
+            col = col.child(chips);
+        }
         let _ = paper;
         col
     }
@@ -1204,7 +1598,8 @@ impl AiPanel {
             .flex_col()
             .gap(px(3.0))
             .child(label(label_text, soft))
-            .child(InputField::new(field, self.focuses[which].clone(), cx.entity()))
+            // IME 落点同样登记 Root（与提问框同一条通道，见 `root` 字段注释）。
+            .child(InputField::new(field, self.focuses[which].clone(), self.root.clone()))
     }
 }
 
@@ -1401,6 +1796,7 @@ impl crate::app::Root {
             before,
             after,
             question: String::new(),
+            refs: Vec::new(),
         }
     }
 
@@ -1434,5 +1830,255 @@ impl crate::app::Root {
             ai::clip_tail(&before, 2000),
             ai::clip_head(&after, 2000),
         )
+    }
+
+    // ── IME 转交（v1.80.0）──────────────────────────────────────
+    //
+    // 平台把组好的字送到 `Root`（输入框登记的是 Root，见 `AiPanel::root`），
+    // Root 再转给小笺面板。与「检索 / 笔记」走的是同一条通道。
+
+    pub(crate) fn ai_ime_text_for_range(
+        &self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        self.ai_panel
+            .update(cx, |p, _cx| p.ime_text_for_range(range, window))
+    }
+
+    pub(crate) fn ai_ime_selected_range(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        self.ai_panel
+            .update(cx, |p, _cx| p.ime_selected_range(window))
+    }
+
+    pub(crate) fn ai_ime_marked_range(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.ai_panel
+            .update(cx, |p, _cx| p.ime_marked_range(window))
+    }
+
+    pub(crate) fn ai_ime_unmark(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ai_panel.update(cx, |p, _cx| p.ime_unmark(window));
+    }
+
+    pub(crate) fn ai_ime_replace(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let t = text.to_string();
+        self.ai_panel
+            .update(cx, |p, _cx| p.ime_replace(range, &t, window));
+    }
+
+    pub(crate) fn ai_ime_replace_mark(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        sel: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let t = text.to_string();
+        self.ai_panel
+            .update(cx, |p, _cx| p.ime_replace_mark(range, &t, sel, window));
+    }
+
+    // ── 「全庫」翻检（v1.80.0）──────────────────────────────────
+
+    /// 每帧问一句：小笺这一问要不要先翻库？
+    ///
+    /// 面板自己够不着库（书架与全文索引都在 `Root` 手里），故把「要翻」摊成
+    /// 一个可轮询的口子：`take_hunt` 只吐一次，本函数随即派一次活。
+    /// DB 与 FTS5 全在后台线程跑——主线程一帧都不等。
+    pub fn poll_ai(&mut self, cx: &mut Context<Self>) {
+        if !self.show_ai {
+            return;
+        }
+        let Some(q) = self.ai_panel.update(cx, |p, _cx| p.take_hunt()) else {
+            return;
+        };
+        let scope = self.ai_panel.read(cx).scope();
+        let cur_sid = self.book.as_ref().and_then(|b| b.store_id.clone());
+        let cur_title = self.book.as_ref().map(|b| b.title.clone()).unwrap_or_default();
+        let cur_chapter = self.chapter_title(self.current_chapter);
+        let q2 = q.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let refs = cx
+                    .background_executor()
+                    .spawn(async move { ai_refs(&q2, scope, cur_sid, cur_title, cur_chapter) })
+                    .await;
+                let _ = this.update(&mut cx, |this, cx| {
+                    let book = this
+                        .book
+                        .as_ref()
+                        .map(|b| b.title.clone())
+                        .unwrap_or_default();
+                    let chapter = this.chapter_title(this.current_chapter);
+                    let ask = Ask {
+                        book,
+                        chapter,
+                        quote: String::new(),
+                        before: String::new(),
+                        after: String::new(),
+                        question: q.clone(),
+                        refs,
+                    };
+                    this.ai_panel.update(cx, |p, cx| p.finish_hunt(ask, cx));
+                });
+            }
+        })
+        .detach();
+    }
+}
+
+/// 翻检**一处**能给多少字（片段太长会把提示词撑爆，太短又没了上下文）。
+const REF_SNIPPET: usize = 260;
+/// 一次最多翻几处。
+const MAX_REFS: usize = 6;
+
+/// 按范围翻库，返回「书名·章名：片段」的列表（v1.80.0「全庫」）。
+///
+/// 全程在后台线程跑：**连库、建索引、取章**三样都是重活，绝不能占主线程
+/// （掉一帧用户就看见纸面抖一下）。索引是 trigram，短查询（< 3 字）用不上，
+/// 那一轮就诚实地返回空——面板会提示「未檢得相關段落」。
+fn ai_refs(
+    q: &str,
+    scope: AiScope,
+    cur_sid: Option<String>,
+    cur_title: String,
+    cur_chapter: String,
+) -> Vec<String> {
+    if !scope.needs_search() || q.chars().count() < 3 {
+        return Vec::new();
+    }
+    let Ok(c) = jiandu_core::store::connect() else {
+        return Vec::new();
+    };
+    // 书目清单：全書只翻当前这本，全庫翻遍库里所有书。
+    let books: Vec<(String, String)> = match scope {
+        AiScope::Book => cur_sid
+            .map(|s| vec![(s, cur_title.clone())])
+            .unwrap_or_default(),
+        AiScope::Library => {
+            let mut out = Vec::new();
+            if let Ok(mut st) = c.prepare("SELECT store_id, title FROM books") {
+                if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+                    for r in rows.flatten() {
+                        out.push(r);
+                    }
+                }
+            }
+            out
+        }
+        AiScope::Chapter => Vec::new(),
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    for (sid, title) in books {
+        if out.len() >= MAX_REFS {
+            break;
+        }
+        // 第一次搜这本书才建索引（与「检索」同一策略：`ensure` 内部幂等）。
+        jiandu_core::search::ensure(&c, &sid).ok();
+        let hits = jiandu_core::search::query(&c, &sid, q, 2).unwrap_or_default();
+        for idx in hits {
+            if out.len() >= MAX_REFS {
+                break;
+            }
+            if let Ok(Some(ch)) = jiandu_core::store::load_chapter(&c, &sid, idx) {
+                let mut text = String::new();
+                for p in &ch.paragraphs {
+                    text.push_str(&p.text);
+                }
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let chap = if ch.title.trim().is_empty() {
+                    cur_chapter.clone()
+                } else {
+                    ch.title.clone()
+                };
+                let snip = snippet_around(&text, q, REF_SNIPPET);
+                out.push(format!("{title}·{chap}：{snip}"));
+            }
+        }
+    }
+    out
+}
+
+/// 从 `text` 里抠出 `needle` 周围的一段（找不到就从头取）。
+///
+/// 纯函数、可单测。**窗口居中**而不是从命中处往后取：古文一句的意思常在前
+/// 半句，只取后半句等于把答案切掉一半。
+fn snippet_around(text: &str, needle: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let at = if needle.is_empty() {
+        None
+    } else {
+        let nc: Vec<char> = needle.chars().collect();
+        (0..chars.len().saturating_sub(nc.len())).find(|&i| &chars[i..i + nc.len()] == nc.as_slice())
+    };
+    let start = match at {
+        Some(i) => i.saturating_sub(max / 3),
+        None => 0,
+    };
+    let end = (start + max).min(chars.len());
+    let mut s: String = chars[start..end].iter().collect();
+    if start > 0 {
+        s.insert(0, '…');
+    }
+    if end < chars.len() {
+        s.push('…');
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{snippet_around, AiScope};
+
+    #[test]
+    fn scope_cycles_and_knows_when_to_search() {
+        assert_eq!(AiScope::Chapter.label(), "本章");
+        assert_eq!(AiScope::Book.label(), "全書");
+        assert_eq!(AiScope::Library.label(), "全庫");
+        // 默认是本章：不换范围就绝不去翻库。
+        assert!(!AiScope::default().needs_search());
+        assert!(AiScope::Book.needs_search());
+        assert!(AiScope::Library.needs_search());
+        // 三档循环一圈回到原点。
+        let mut s = AiScope::default();
+        for want in ["全書", "全庫", "本章"] {
+            s = s.next();
+            assert_eq!(s.label(), want);
+        }
+    }
+
+    #[test]
+    fn snippet_centers_on_the_hit() {
+        let text = "甲".repeat(100) + "關鍵句" + &"乙".repeat(100);
+        let s = snippet_around(&text, "關鍵句", 40);
+        assert!(s.contains("關鍵句"), "片段必须含命中处：{s}");
+        // 命中点前面也留了一截（窗口居中，不是从命中处往后取）。
+        let hit = s.find("關鍵句").unwrap();
+        assert!(hit > 0, "前半句被切掉了：{s}");
+        assert!(s.starts_with('…') && s.ends_with('…'), "两端该有省略号：{s}");
+        // 找不到就从头取，且尾部标省略。
+        let s2 = snippet_around(&text, "不存在", 20);
+        assert!(s2.starts_with('甲'), "未命中就从头取：{s2}");
+        assert!(s2.ends_with('…'));
     }
 }

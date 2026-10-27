@@ -3,7 +3,7 @@ members = ["core"]
 
 [package]
 name = "jiandu"
-version = "1.79.0"
+version = "1.0.0-beta"
 edition = "2021"
 description = "笺读 · 一个用 Rust + GPUI 写的原生中文阅读器（古文竖笺 / 现代横笺）"
 license = "MIT"
@@ -52,6 +52,10 @@ rusqlite = { version = "0.32.1", features = ["bundled"] }
 core-graphics = "0.24"
 core-text = "21"
 core-foundation = "0.10"
+# v1.80.0 PDF 印制：CGPDFContextCreateWithURL 返回裸 `CGContextRef`，
+# 要用 `CGContext::from_ptr` 包成 core-graphics 的 `CGContext`（之后全部走
+# 安全方法）。`from_ptr` 是 `ForeignType` 的方法，须显式引入该 crate。
+foreign-types = "0.5"
 # 只用来把位图编码成 PNG（关掉全部默认 feature，不引解码器 / rayon）。
 image = { version = "0.25", default-features = false, features = ["png"] }
 

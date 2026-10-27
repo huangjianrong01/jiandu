@@ -363,6 +363,9 @@ pub struct Ask {
     pub after: String,
     /// 用户的问题（空则用 [`DEFAULT_QUESTION`]）。
     pub question: String,
+    /// **检索来的参考材料**（v1.80.0「全庫」）：每条是「书名·章名 + 片段」的一
+    /// 段纯文本，由界面层用全文索引捞出来后塞进来。空 = 本轮只问眼前这一句。
+    pub refs: Vec<String>,
 }
 
 impl Ask {
@@ -370,6 +373,36 @@ impl Ask {
     pub fn is_empty(&self) -> bool {
         self.book.is_empty() && self.quote.is_empty() && self.question.trim().is_empty()
     }
+}
+
+/// 参考材料的总字数预算（v1.80.0）：够放七八段片段，再多就把提示词撑爆，
+/// 也容易让模型照抄材料而不答所问。
+pub const REF_CHARS: usize = 2400;
+
+/// 把检索来的片段拼成【参考】一节；一条都没有就返回 `None`（不摆空节）。
+///
+/// 每条按 `max_each` 裁，整节按 `budget` 统收——宁可少给几条，也不让提示词
+/// 膨胀成几万字（那是把钱和延迟一起烧掉）。纯函数、可单测。
+pub fn refs_block(refs: &[String], budget: usize) -> Option<String> {
+    let live: Vec<&String> = refs.iter().filter(|r| !r.trim().is_empty()).collect();
+    if live.is_empty() {
+        return None;
+    }
+    let max_each = (budget / live.len().max(1)).max(120);
+    let mut s = String::new();
+    let mut used = 0usize;
+    for (i, r) in live.iter().enumerate() {
+        let one = clip_head(r.trim(), max_each);
+        if used + one.chars().count() > budget {
+            break; // 预算见底：后面的片段整条丢掉，不截断成半句话。
+        }
+        used += one.chars().count();
+        s.push_str(&format!("{}. {}\n", i + 1, one));
+    }
+    if s.is_empty() {
+        return None;
+    }
+    Some(format!("【参考】\n{s}"))
 }
 
 /// 裁尾巴：留**最后** `max` 字（前文要的就是靠近引文的那一段）。
@@ -419,6 +452,11 @@ pub fn user_prompt(a: &Ask, ctx_chars: usize) -> String {
     }
     if !after.is_empty() {
         s.push_str(&format!("【后文】{after}\n"));
+    }
+    // 参考材料排在原文之后、问题之前：先给他原文，再给他「翻检出来的别处」，
+    // 最后才问——模型不会把参考里的句子当成用户在跟他说话。
+    if let Some(block) = refs_block(&a.refs, REF_CHARS) {
+        s.push_str(&block);
     }
     let q = a.question.trim();
     let q = if q.is_empty() {
@@ -794,6 +832,7 @@ mod tests {
             before: "甲".repeat(500),
             after: "乙".repeat(500),
             question: String::new(),
+            refs: Vec::new(),
         };
         let s = user_prompt(&a, 100);
         assert!(s.starts_with("【出处】"), "首行报出处：{s}");
@@ -805,6 +844,42 @@ mod tests {
         let before_line = s.lines().find(|l| l.contains("前文")).unwrap_or("");
         assert!(before_line.chars().count() <= 60, "前文没裁：{before_line}");
         assert!(before_line.contains('…'));
+    }
+
+    /// 「全庫」检索来的片段要独立成节，且不挤掉「问题压最末」这条老规矩。
+    #[test]
+    fn user_prompt_appends_refs_before_question() {
+        let mut a = Ask {
+            book: "莊子".to_string(),
+            question: "寫了什麼".to_string(),
+            ..Ask::default()
+        };
+        let s = user_prompt(&a, 100);
+        assert!(!s.contains("【参考】"), "没有片段就不摆空节：{s}");
+
+        a.refs = vec!["論語·學而：學而時習之".to_string()];
+        let s = user_prompt(&a, 100);
+        assert!(s.contains("【参考】"), "有片段就该成节：{s}");
+        assert!(s.contains("論語·學而"));
+        assert!(s.ends_with("【问题】寫了什麼"), "问题仍压在最末：{s}");
+    }
+
+    #[test]
+    fn refs_block_clips_each_and_keeps_budget() {
+        // 一条都没有 → 不摆空节。
+        assert!(refs_block(&[], 100).is_none());
+        assert!(refs_block(&["  ".to_string()], 100).is_none());
+        // 每条被裁到预算内。
+        let refs = vec!["甲".repeat(500), "乙".repeat(500)];
+        let block = refs_block(&refs, 1000).expect("有片段");
+        assert!(block.chars().count() <= 1000 + 40, "整节超预算：{block}");
+        // 编号从 1 开始，逐条列出。
+        assert!(block.contains("1. "));
+        assert!(block.contains("2. "));
+        // 预算见底时整条丢掉，不留半句话。
+        let many: Vec<String> = (0..50).map(|i| format!("第{i}条").repeat(50)).collect();
+        let block = refs_block(&many, 300).expect("有片段");
+        assert!(block.chars().count() <= 340, "预算兜不住：{}", block.chars().count());
     }
 
     #[test]

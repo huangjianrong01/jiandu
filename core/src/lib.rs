@@ -32,7 +32,12 @@ pub mod search;
 /// **清洗器**（v1.54.0）：两遍扫描——去噪 + 重建语义，产出 IR。
 pub mod cleaner;
 pub mod content;
+/// **常用字白名单**（v1.81.0）：自动注音的判据（GB2312 一级字 + 其繁体形）。
+/// 文件由 `scripts/gen_common_chars.py` 生成，勿手改。
+pub mod common_chars;
 pub mod dict;
+/// **内测邀请码**（v1.0.0-beta）：纯本地闸门，无服务器。
+pub mod gate;
 pub mod grid;
 pub mod importer;
 /// **统一书稿模型 IR**（v1.54.0）：解析与排版之间的中间表示。

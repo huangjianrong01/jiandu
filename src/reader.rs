@@ -422,7 +422,7 @@ const ZHU_BASE: u32 = 0xB23A30;
 /// 刻本里章题只比正文高一头——再大就成了现代书里的「章标题」；但只放大
 /// 一成二又与正文难分，卷首要有一点「尊」。格宽是字号的 1.33 倍，1.2 的
 /// 字仍稳稳落在列内，不会探到邻列。
-const TITLE_COL_SCALE: f32 = 1.2;
+pub(crate) const TITLE_COL_SCALE: f32 = 1.2;
 
 /// **大题（书名）**最多排几字：版心只有一格宽，书名再长也得让位给篇题。
 const BIG_TITLE_MAX: usize = 4;
@@ -1412,6 +1412,20 @@ impl Root {
                             cx.notify();
                             return;
                         }
+                        // ★ 浮层闸门（v1.80.0）：**任何**顶层面板 / 浮层开着
+                        //   时，纸面上这一下抬起一律不翻页。
+                        //
+                        //   为什么还要这一道：`.occlude()` 已经把命中栈截断在
+                        //   浮层处，但「按下」发生在浮层出现之前的那几帧里
+                        //   （动画滑出中 / 浮层刚开），`press_at` 已经记下，
+                        //   抬起时命中栈里就可能既有浮层又有正文。这道闸门是
+                        //   兜底：翻页只属于「纯阅读」这一态。
+                        if this.any_overlay_open() {
+                            this.press_at = None;
+                            this.dragging = false;
+                            cx.notify();
+                            return;
+                        }
                         // 是否翻页：碰过正文 / 拖动中 / 位移过大，一律不翻。
                         let fwd = crate::types::tap_turns_page(
                             this.touched_glyph,
@@ -1684,16 +1698,14 @@ impl Root {
                     .flex()
                     .flex_row()
                     .justify_center()
+                    // 命中栈在此截断：点面板不该漏到纸面上翻页（同左侧栏）。
+                    .occlude()
                     .child(self.render_style_sheet(cx)),
             );
         }
         // （原「版式控制面板」浮层 v1.35.0 已删除：那四枚 8/10/12/14 档位与
         // 版字面板的「列数」是同一件事的两副面孔，现统一并入「版字」页的
         // `COLUMN_OPTS`；留白两行也一并搬过去了。）
-        // 卡片匣浮层（v1.79.0）：朱批录已归左侧栏，右栏只剩跨书摘录卡。
-        if self.show_cards_panel && !self.focus_mode {
-            root = root.child(self.render_cards_panel(cx));
-        }
         // 问小笺（v1.76.0）：AI 伴读侧栏。**独立 Entity**——流式输出每帧只
         // 重绘这一条侧栏，纸上的书一动不动（见 `src/ai.rs` 文件头）。
         if self.show_ai && !self.focus_mode {
@@ -1713,6 +1725,8 @@ impl Root {
         if self.show_help {
             root = root.child(self.render_help_sheet(cx));
         }
+        // 说明：检索 / 帮助 / 字书 / 分享几张浮层的**根**都在各自 render 里
+        // 加了 `.occlude()`（与左侧栏同款），此处不重复。
         // 左上角那枚独立的书名签条（v1.27.0 删除）：它离书页有一段距离，
         // 且与版框上的书耳、顶栏的「目录」重复——书名与卷目入口都不缺，
         // 只剩一块飘在留白里的牌子碍眼。书耳仍在（左半叶左上角）。
@@ -1765,7 +1779,9 @@ impl Root {
     /// 内部状态。流式输出时 notify 只重绘 Entity 子树，纸上的书不重排。
     pub(crate) fn render_ai_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let slide = self.ai_slide.clamp(0.0, 1.0);
-        let panel_w = (self.viewport_w * 0.42).clamp(320.0, 520.0);
+        // v1.80.0：宽度按「问小文」那类现代伴读面板来定——一整行追问写得下，
+        // 又不至于把纸面吃掉一半。380~560 之间跟着窗宽走（0.40）。
+        let panel_w = (self.viewport_w * 0.40).clamp(380.0, 560.0);
         let off = -(1.0 - slide) * panel_w;
         div()
             .absolute()
@@ -1773,6 +1789,12 @@ impl Root {
             .bottom(px(0.0))
             .right(px(off))
             .w(px(panel_w))
+            // ★ 阻断鼠标穿透（v1.80.0，与左侧栏同因同款）：GPUI 的命中测试
+            //   把压在同一点下的**所有** hitbox 都算 hovered，浮层即便自己
+            //   stop_propagation，「抬起」事件仍会漏到正文那层 → 一点面板
+            //   就翻页（用户报的「点设置，正文跳动」就是这么来的）。
+            //   `.occlude()` 让命中栈在此截断。
+            .occlude()
             .child(self.ai_panel.clone())
             // 栏内不冒泡：否则一点输入框，根容器的「点纸面收浮层」就把栏收了。
             .on_mouse_down(
@@ -1943,7 +1965,6 @@ impl Root {
                         self.focus_mode = false;
                         self.close_side();
                         self.show_style = false;
-                        self.show_cards_panel = false;
                         // 小笺栏：与其余侧栏同款收法（目标态归零，由 render 逐帧滑出）。
                         self.close_ai();
                         self.show_help = false;
@@ -2094,9 +2115,12 @@ impl Root {
                                 }
                                 cx.notify();
                             }
-                            // 笔记面板（侧栏）：⌘K（走全局状态机）。
+                            // 卡片匣（⌘K）：v1.80.0 起它与朱批同住左侧栏
+                            // 「批」印那一页——这一键改为**直接开左栏并停在
+                            // 批注页**（不再有独立的右侧栏可开）。
                             "k" | "K" => {
-                                self.set_ui_state(AppUIState::Cards, cx);
+                                self.side_tab = SideTab::Note;
+                                self.open_side();
                                 cx.notify();
                             }
                             // 帮助：⌘/（走全局状态机）。
@@ -2132,8 +2156,8 @@ impl Root {
                     }
     }
 
-    /// **左侧栏**（v1.79.0）：从左侧平滑滑出 260px 的抽屉，顶上三枚小签——
-    /// 目录 / 书签 / 批注。
+    /// **左侧栏**（v1.80.0）：从左侧平滑滑出 260px 的抽屉，右缘竖排三枚朱砂
+    /// 小印——「錄」「籤」「批」。
     ///
     /// 改这里的人先读这四条规矩：
     ///   1. **绝不挤压正文**。整块面板是 `absolute()` 覆盖层，不占 flex 流，
@@ -2146,8 +2170,10 @@ impl Root {
     ///   3. **高亮只在「当前章变了」那一刻动**。`current_chapter` 由翻页维护，
     ///      这里每帧只比对一次整数，绝不挂滚动监听逐像素重算；列表滚动也只在
     ///      章号真的变了时才推一次。
-    ///   4. **取消表格横线**。极简知识库那一套：靠缩进量层级、靠悬停底色指认、
-    ///      靠左侧一道朱线标「在读」，不用一行行墨线把纸切成格子。
+    ///   4. **不用 Tab 条**。v1.80.0 把「目录 / 书签 / 批注」六个字排成一行
+    ///      的现代页签整块撤掉：那六个字自带「网页后台」的气质，一排就把古籍
+    ///      的纸面打回现代界面。改以**竖排朱砂小印**切换——读法是「翻检签牌」
+    ///      而非「切换标签页」，形制上更接近书耳与藏印。
     #[allow(non_snake_case)]
     fn render_side_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let vw = self.viewport_w;
@@ -2160,46 +2186,72 @@ impl Root {
         let ink_soft = t.ink_soft();
         // 抽屉底：宣纸本色 + alpha 0xF6（96%）——见头注第 2 条，不做模糊。
         let drawer_bg: u32 = (t.paper() << 8) | 0xF6;
-        // 分隔界：纸 + 墨 10%，只用于「页签条」与「内容」之间那一道。
+        // 分隔界：纸 + 墨 10%，只用于「栏头」与「内容」之间那一道。
         let sept: u32 = crate::theme::mix(t.paper(), t.ink(), 0.12);
+        let sept_soft: u32 = crate::theme::mix(t.paper(), t.ink(), 0.07);
         let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
-
-        // ── 三枚小签：当前那枚朱砂字 + 淡朱底 ──
         let cur_tab = self.side_tab;
-        let mut tabs = div().flex().flex_row().items_center().gap(px(2.0));
+
+        // ── 右缘三枚朱砂小印（竖排）────────────────────────────────
+        //
+        // 印面 22×22：选中 = 朱砂底反白字（盖章），未选 = 朱砂细框淡字（刻而未
+        // 盖）。单字入印是形制所需——印面只刻得下一个字，也正因如此它读起来
+        // 像藏印而不像按钮。
+        let mut seals = div()
+            .w(px(30.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(7.0))
+            .py(px(10.0))
+            .border_l_1()
+            .border_color(rgba(sept_soft));
         for tab in [SideTab::Toc, SideTab::Bookmark, SideTab::Note] {
             let on = tab == cur_tab;
-            let mut b = div()
-                .px(px(9.0))
-                .py(px(4.0))
-                .cursor_pointer()
+            let seal = div()
+                .w(px(22.0))
+                .h(px(22.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(rgb(if on { zhu } else { sept }))
+                .bg(rgb(if on { zhu } else { 0 }))
                 .font_family(song.clone())
-                .text_size(px(12.5))
-                .text_color(rgb(if on { zhu } else { ink_soft }))
-                .hover(move |s| s.text_color(rgb(zhu)))
-                .child(SharedString::from(tab.label()));
-            if on {
-                b = b.bg(rgb(crate::theme::mix(t.paper(), zhu, 0.10)));
-            }
-            tabs = tabs.child(b.on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    if this.side_tab == tab {
-                        return;
+                .text_size(px(13.0))
+                .text_color(rgb(if on { t.paper() } else { ink_soft }))
+                .cursor_pointer()
+                .hover(move |s| {
+                    if on {
+                        s
+                    } else {
+                        s.border_color(rgb(zhu)).text_color(rgb(zhu))
                     }
-                    // 切页只换内容，**不重播滑入动画**——抽屉本来就开着。
-                    this.side_tab = tab;
-                    // 目录页每次露面都重新对齐到「在读那一章」。
-                    if tab == SideTab::Toc {
-                        this.toc_need_scroll = true;
-                    }
-                    cx.notify();
-                }),
-            ));
+                })
+                .child(SharedString::from(tab.seal()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if this.side_tab == tab {
+                            return;
+                        }
+                        // 换印只换内容，**不重播滑入动画**——抽屉本来就开着。
+                        this.side_tab = tab;
+                        if tab == SideTab::Toc {
+                            this.toc_need_scroll = true;
+                        }
+                        if tab == SideTab::Note {
+                            this.reload_cards();
+                        }
+                        cx.notify();
+                    }),
+                );
+            seals = seals.child(seal);
         }
 
-        // 页签条右侧那枚小动作：每个页签各配一件最常用动作。
+        // ── 栏头：题字 + 一枚小动作 ────────────────────────────────
         let act: Div = match cur_tab {
             SideTab::Toc => div()
                 .font_family(song.clone())
@@ -2248,7 +2300,6 @@ impl Root {
                     }),
                 ),
         };
-
         let head = div()
             .flex()
             .flex_row()
@@ -2259,10 +2310,16 @@ impl Root {
             .px(px(10.0))
             .border_b_1()
             .border_color(rgba(sept))
-            .child(tabs)
+            .child(
+                div()
+                    .font_family(song.clone())
+                    .text_size(px(12.5))
+                    .text_color(rgb(zhu))
+                    .child(SharedString::from(cur_tab.title())),
+            )
             .child(act);
 
-        // ── 内容：三页各一份列表 ──
+        // ── 内容：三印各一片 ──────────────────────────────────────
         let body = match cur_tab {
             SideTab::Toc => self.render_side_toc_list(cx),
             SideTab::Bookmark => self.render_side_bookmark_list(cx),
@@ -2276,7 +2333,7 @@ impl Root {
             .left(px(off))
             .w(px(SIDE_W))
             .flex()
-            .flex_col()
+            .flex_row()
             .bg(rgba(drawer_bg))
             .border_r_1()
             .border_color(rgba(sept))
@@ -2288,6 +2345,12 @@ impl Root {
             }])
             .overflow_hidden()
             .font_family(song)
+            // ★ 阻断鼠标穿透（v1.80.0）：GPUI 的命中测试会把**所有**压在
+            //   这一点下的 hitbox 都算作 hovered，浮层即便自己 stop_propagation，
+            //   抬起事件仍会漏到正文那层去翻页。`.occlude()` 让命中栈在此截断，
+            //   正文那层从此「看不见」落在抽屉上的点击——这才是「浮层」该有的
+            //   样子（详见 `render_ai_panel` 同款注释）。
+            .occlude()
             // 栏内不冒泡：否则一点列表，外层「点纸面收栏」就把栏收了。
             .on_mouse_down(
                 MouseButton::Left,
@@ -2295,8 +2358,16 @@ impl Root {
                     cx.stop_propagation();
                 }),
             )
-            .child(head)
-            .child(body);
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .child(head)
+                    .child(body),
+            )
+            .child(seals);
 
         // 透明捕获层：**只垫在顶栏以下**（顶栏那排钮要留着能点，否则「再点一次
         // 目录收起」就成了空话）。点栏外的纸面即收，且不会穿透到正文去翻页。
@@ -2307,6 +2378,7 @@ impl Root {
             .w(px(vw))
             .h(px((vh - BAR_H).max(0.0)))
             .bg(rgba(0x00000000))
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -2318,11 +2390,60 @@ impl Root {
             .child(drawer)
     }
 
-    /// 左侧栏 · **目录页**：全卷篇目，按层级缩进；当前在读那一章淡朱底 + 左侧朱线。
+    /// 目录里的**两枚标记**：哪些章折过角（有书签）、哪些章批过字（有批注）。
+    ///
+    /// 返回两个与章号同长的布尔表（不是 `HashSet`——列表渲染要按章号顺序取用，
+    /// 数组更快也更省一次分配）。只走**带锚点的数据**：页记那种只记面号的旧批
+    /// 无法反查章号（要反查就得整本重排一次，太贵），宁可不标也不乱标。
+    fn chapter_marks(&self) -> (Vec<bool>, Vec<bool>) {
+        let n = self.book.as_ref().map(|b| b.chapters.len()).unwrap_or(0);
+        let mut bm = vec![false; n];
+        let mut nt = vec![false; n];
+        for b in &self.bookmarks {
+            if b.chapter < n {
+                bm[b.chapter] = true;
+            }
+        }
+        let Some(b) = self.book.as_ref() else {
+            return (bm, nt);
+        };
+        for h in &b.head_notes {
+            if h.key.0 < n {
+                nt[h.key.0] = true;
+            }
+        }
+        for m in &b.margin_notes {
+            if m.content.trim().is_empty() {
+                continue;
+            }
+            if let Some(k) = flat_to_key(b, m.anchor_char_index) {
+                if k.0 < n {
+                    nt[k.0] = true;
+                }
+            }
+        }
+        for (ci, ch) in b.chapters.iter().enumerate() {
+            for p in &ch.paragraphs {
+                if p.notes.iter().any(|x| x.kind != NoteKind::Ruby) {
+                    nt[ci] = true;
+                    break;
+                }
+            }
+        }
+        (bm, nt)
+    }
+
+    /// 左侧栏 · **目录页**（「錄」印）：全卷篇目，按层级缩进；当前在读那一章
+    /// 淡朱底 + 左侧朱线；折过角的章右侧一枚朱「籤」，批过字的章一枚朱点。
+    ///
+    /// 两枚标记是 v1.80.0 的「彻底融合」：不必翻到「籤」印那一页才知道哪一章
+    /// 折过——目录本身就是一张**带批注的书根**，把「我读过 / 我折过 / 我批过」
+    /// 三层信息压进同一行。
     fn render_side_toc_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = self.theme;
         let zhu = sheet_zhu(t);
         let ink = t.ink();
+        let ink_soft = t.ink_soft();
         // 悬停：纸 + 墨 5%（淡淡的宣纸色，不是高亮块）。
         let hover_bg: u32 = crate::theme::mix(t.paper(), t.ink(), 0.05);
         // 在读：纸 + 朱砂 12%（淡朱砂底）。
@@ -2334,6 +2455,7 @@ impl Root {
             None => Vec::new(),
         };
         let cur_chapter = self.current_chapter;
+        let (marked_bm, marked_note) = self.chapter_marks();
 
         // 自动定位：① 每次开栏滚到「在读那一章」；② 读着读着翻章了，也跟一次。
         // 判据是**章号变了**这一个整数比对，不是滚动偏移——故翻页多快都不会
@@ -2385,11 +2507,13 @@ impl Root {
                 _ => 12.0,
             };
             let row_h = if e.level == 1 { 30.0 } else { 27.0 };
-            // 一行装几个字：扣掉缩进与右侧留白后按字号取整。
-            let room = ((SIDE_W - indent - 22.0) / (fs * 0.98)).floor() as usize;
+            // 一行装几个字：扣掉缩进、右侧留白与两枚标记位后按字号取整。
+            let room = ((SIDE_W - indent - 40.0) / (fs * 0.98)).floor() as usize;
             let shown = clip_chars(&Self::toc_label(&e.title, room.max(4)), room.max(4));
             let full = Self::toc_label_full(&e.title);
             let need_tip = full != shown;
+            let has_bm = marked_bm.get(e.chapter).copied().unwrap_or(false);
+            let has_note = marked_note.get(e.chapter).copied().unwrap_or(false);
 
             let mut row = div()
                 .relative()
@@ -2423,6 +2547,30 @@ impl Root {
                     .text_color(rgb(if cur { zhu } else { ink }))
                     .child(SharedString::from(shown.clone())),
             );
+            // 两枚标记：**籤** 字标折角，朱点标批注（都在行尾，各占一格）。
+            if has_bm {
+                row = row.child(
+                    div()
+                        .flex_shrink_0()
+                        .ml(px(4.0))
+                        .font_family(song.clone())
+                        .text_size(px(10.0))
+                        .text_color(rgb(zhu))
+                        .child(SharedString::from("籤")),
+                );
+            }
+            if has_note {
+                row = row.child(
+                    div()
+                        .flex_shrink_0()
+                        .ml(px(5.0))
+                        .w(px(4.0))
+                        .h(px(4.0))
+                        .rounded(px(2.0))
+                        .bg(rgb(zhu)),
+                );
+            }
+            let _ = ink_soft;
 
             // tooltip 只挂在 Stateful 上，故先 `.id()`；题名没截断就不打扰。
             let mut srow = row.id(SharedString::from(format!("side-toc-{}", e.chapter)));
@@ -2456,7 +2604,8 @@ impl Root {
         list
     }
 
-    /// 左侧栏 · **书签页**：折起的那些叶，按阅读顺序；点一行跳回，点「删」移除。
+    /// 左侧栏 · **书签页**（「籤」印）：折起的那些叶，按阅读顺序；点一行跳回，
+    /// 点「删」移除。
     fn render_side_bookmark_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = self.theme;
         let zhu = sheet_zhu(t);
@@ -2495,7 +2644,7 @@ impl Root {
                     .font_family(song.clone())
                     .text_size(px(11.5))
                     .text_color(rgb(ink_soft))
-                    .child(SharedString::from("还没有书签。点右上「＋ 收此葉」。")),
+                    .child(SharedString::from("還未折角。點右側「＋ 收此葉」。")),
             );
         }
 
@@ -2606,16 +2755,27 @@ impl Root {
         list
     }
 
-    /// 左侧栏 · **批注页**（朱批录）：眉批 / 夹注 / 通假 / 着重 / 划线 / 页记，
-    /// 按章节顺序；点一条即收栏、跳到该字并点亮「抵达」高亮。
+    /// 左侧栏 · **批注页**（「批」印）：上截是朱批录（本书的眉批 / 夹注 /
+    /// 通假 / 着重 / 划线 / 页记），下截是卡片匣（跨书摘录）。
+    ///
+    /// v1.80.0 把原先右侧那条独立的「卡片匣」侧栏整条撤掉：卡片与批注本是
+    /// 同一类东西——**我留下来的字**——一个长在书里、一个汇在匣里，分作两个
+    /// 抽屉、两枚顶栏钮，还得互斥，是纯粹的自我折磨。现在同页上下两截，
+    /// 顶栏也因此少一枚。
     fn render_side_note_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = self.theme;
         let zhu = sheet_zhu(t);
         let ink = t.ink();
         let ink_soft = t.ink_soft();
         let hover_bg: u32 = crate::theme::mix(t.paper(), t.ink(), 0.05);
+        let sept: u32 = crate::theme::mix(t.paper(), t.ink(), 0.12);
+        let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
         let entries = self.note_entries();
+        let cards_n = self.cards.len();
 
+        // 一页只挂**一个**滚动容器：上截（朱批）与下截（卡片）同在这一条卷里滚，
+        // 不做两个各自滚动的盒子——那会在 260px 宽的栏里滚出两套滚动条，
+        // 用户根本不知道该滚哪一个。
         let mut list = div()
             .id(SharedString::from("side-note-list"))
             .flex()
@@ -2627,13 +2787,45 @@ impl Root {
             .scrollbar_width(px(3.0))
             .py(px(6.0));
 
+        // 截题：两截各一枚小标题（带条数），不画线、不设底，只把字排淡一档。
+        let section = |label: String, n: usize, song: SharedString, zhu: u32, soft: u32| -> Div {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(12.0))
+                .pt(px(8.0))
+                .pb(px(4.0))
+                .child(
+                    div()
+                        .font_family(song)
+                        .text_size(px(10.0))
+                        .text_color(rgb(zhu))
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(rgb(soft))
+                        .child(SharedString::from(format!("{n}"))),
+                )
+        };
+
+        list = list.child(section(
+            "朱批".to_string(),
+            entries.len(),
+            song.clone(),
+            zhu,
+            ink_soft,
+        ));
+
         if entries.is_empty() {
             list = list.child(
                 div()
                     .w_full()
-                    .flex()
-                    .justify_center()
-                    .pt(px(18.0))
+                    .px(px(12.0))
+                    .pb(px(6.0))
                     .text_size(px(11.5))
                     .text_color(rgb(ink_soft))
                     .child(SharedString::from(
@@ -2712,9 +2904,25 @@ impl Root {
                 }),
             ));
         }
+
+        // 下截：卡片匣（跨书摘录）。`render_cards_list` 只出条目，不带外壳。
+        list = list.child(
+            div()
+                .w_full()
+                .h(px(1.0))
+                .my(px(6.0))
+                .bg(rgb(sept)),
+        );
+        list = list.child(section(
+            "卡片匣".to_string(),
+            cards_n,
+            song.clone(),
+            zhu,
+            ink_soft,
+        ));
+        list = list.child(self.render_cards_list(cx));
         list
     }
-
 
     /// 目录题名的**竖排净化**（v1.49.3）：先剥书名号空壳、砍掉括注，再把
     /// 现代标点换成竖排形（黑括号→直角引号、书名号→︽︾、省略号→︙），
@@ -2786,9 +2994,14 @@ impl Root {
     /// 「触天头才出、读完即退」那套自动隐藏整块撤掉。只有专注模式会在渲染
     /// 层把它整块撤下，把整幅纸面还给正文。
     ///
-    /// 三组纯文字：书阁 · 目录 ｜ 版字 · 专注 ｜ 检索 · 卡片 · 问笺 · 导出
-    /// · 帮助（v1.78.0 由 10 枚减到 9 枚；v1.79.0 再由 9 枚减到 8 枚——
-    /// 「书签」与「朱批」都收进左侧栏，「笔记」因此只剩卡片匣，改名「卡片」）。
+    /// **六枚**（v1.80.0）：书阁 · 目录 ｜ 版字 ｜ 检索 · 问笺 · 更多
+    /// （v1.78.0 由 10 枚减到 9 枚；v1.79.0 减到 8 枚——「书签」「朱批」收进
+    /// 左侧栏；v1.80.0 再减到 6 枚——「专注」并入「版字」那张阅读设置纸，
+    /// 「导出 / 帮助」与卡片匣一并收进「更多」下拉）。
+    ///
+    /// 减到六枚的道理：顶栏每多一枚，天头就多一道视线落点，读古籍时那道落点
+    /// 一直在提醒「你正在用软件」。天天点的只有「翻哪一卷 / 字多大 / 找一句 /
+    /// 问一句」；导出与说明一年点几次，该住进下拉里。
     ///
     /// v1.37.0「UI 瘦身」撤掉了「封面」一枚：书衣看点在书架点书那一刻，
     /// 读着读着没人想回封面，它只是白占天头一条横向空间。
@@ -2809,27 +3022,6 @@ impl Root {
         // GPUI 0.2.2 无 letter-spacing，字距只能靠 12px 的内边距撑开。
         let item = |label: &'static str, on: bool| -> Div {
             let fg = if on { zhu } else { t.ink() };
-            div()
-                .h(px(BAR_H))
-                .flex()
-                .items_center()
-                .px(px(12.0))
-                .cursor_pointer()
-                .text_size(px(13.0))
-                .text_color(rgb(fg))
-                .hover(move |s| s.text_color(rgb(zhu)))
-                .child(SharedString::from(label))
-        };
-        // 一枚**降权**的纯文字钮：给「帮助」这种一年点几次的功能。
-        // 低频动作不该和检索 / 笔记 / 问笺这些天天点的同权重——常态字色比
-        // 其它钮淡一档（墨混纸 35%），鼠标悬上去才转朱砂；开着时仍是朱砂，
-        // 「此门已开」的读法不变。
-        let faint_item = |label: &'static str, on: bool| -> Div {
-            let fg = if on {
-                zhu
-            } else {
-                crate::theme::mix(t.ink(), t.paper(), 0.35)
-            };
             div()
                 .h(px(BAR_H))
                 .flex()
@@ -2888,17 +3080,6 @@ impl Root {
                 cx.notify();
             }),
         ));
-        mid = mid.child(item("专注", false).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.focus_mode = !this.focus_mode;
-                if this.focus_mode {
-                    this.close_transient_ui();
-                }
-                cx.notify();
-            }),
-        ));
         mid = mid.child(sep());
 
         // ---- 右组：检索 / 笔记 / 问笺 / 导出 / 帮助（最右那枚降权）----
@@ -2916,16 +3097,6 @@ impl Root {
                 cx.notify();
             }),
         ));
-        // 卡片（v1.79.0）：朱批录搬进左侧栏「批注」页后，这一枚只剩跨书
-        // 摘录卡——名字与内容对上了，不必再叫含糊的「笔记」。
-        right = right.child(item("卡片", self.show_cards_panel).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.set_ui_state(AppUIState::Cards, cx);
-                cx.notify();
-            }),
-        ));
         // 问小笺（v1.76.0 · V2.0 模块二）：框一句原文问他，或在此直接发问。
         right = right.child(item("问笺", self.show_ai).on_mouse_down(
             MouseButton::Left,
@@ -2934,25 +3105,15 @@ impl Root {
                 this.toggle_ai(window, cx);
             }),
         ));
-        // v1.52.0：**导出**下拉。当前页图片 / 当前章 Anki 卡片 / 导出 MD
-        // 原先散在底部状态栏，天头一收就找不着了；这里收成一枚「导出」，
-        // 菜单里逐条列出，点哪条都直接弹系统保存对话框。
-        right = right.child(item("导出", self.export_menu).on_mouse_down(
+        // v1.80.0：**更多**下拉。原先散在底部状态栏的六条导出、以及一年点
+        // 几次的「帮助」，现在都住在这一枚里——顶栏只需留「天天点的那几件」。
+        // 点哪条都直接弹系统保存对话框；菜单本体与旧的「导出」同形同构，
+        // 只是名字更中性（里头不只有导出）。
+        right = right.child(item("更多", self.more_menu).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.export_menu = !this.export_menu;
-                cx.notify();
-            }),
-        ));
-        // v1.78.0：**帮助挪到最右并降权**。原先它夹在「问笺」与「导出」之间，
-        // 占了右组倒数第二的黄金位——可帮助是一年点几次的东西，检索 / 笔记
-        // 才是天天点的。挪到末尾 + 字色淡一档，既留得住又不抢视线。
-        right = right.child(faint_item("帮助", self.show_help).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.set_ui_state(AppUIState::Help, cx);
+                this.more_menu = !this.more_menu;
                 cx.notify();
             }),
         ));
@@ -2990,7 +3151,7 @@ impl Root {
             .absolute()
             .top(px(BAR_H + 4.0))
             .right(px(12.0))
-            .w(px(128.0))
+            .w(px(136.0))
             .bg(rgba(veil))
             .border_1()
             .border_color(rgba(sep_ink))
@@ -3000,7 +3161,9 @@ impl Root {
             .flex_col()
             .py(px(3.0))
             .text_size(px(12.0))
-            .text_color(rgb(t.ink()));
+            .text_color(rgb(t.ink()))
+            // 同理：命中栈在此截断，点菜单绝不会漏到纸面上翻页。
+            .occlude();
         // ⓪ **分享所选为图片**（v1.64.0）：选中正文 → 就这儿出竖排分享卡。
         //    与「导出当前页图片」（截原屏）不是一回事：这条走 `share_layout`
         //    重排版，1080×1920、带界行边栏、朱批可随正文一起走。
@@ -3010,7 +3173,7 @@ impl Root {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
-                    this.export_menu = false;
+                    this.more_menu = false;
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         this.open_share_panel(cx);
                     }));
@@ -3026,11 +3189,41 @@ impl Root {
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
-                this.export_menu = false;
+                this.more_menu = false;
                 // 外层 `catch_unwind`：事件处理器 panic 会撞上 GPUI↔ObjC 的
                 // FFI 边界被 `panic_cannot_unwind` 强杀，故在此拦一道，降级为提示。
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     this.export_page_png(window, cx);
+                }));
+                if let Err(e) = r {
+                    this.report_export_panic(e, cx);
+                }
+            }),
+        ));
+        // ①·b **导出本叶 PDF**（v1.80.0）：A4 矢量、一叶一页。
+        //     与「导出当前页图片」不是一回事——那条出位图 PNG（发朋友圈），
+        //     这条出**真字**的 PDF（打印 / 转发 / 归档）。双行夹注照排。
+        menu = menu.child(mitem("export-pdf-leaf", "导出本叶PDF").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.more_menu = false;
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    this.export_pdf(crate::app::PdfScope::Leaf, cx);
+                }));
+                if let Err(e) = r {
+                    this.report_export_panic(e, cx);
+                }
+            }),
+        ));
+        // ①·c **导出本章 PDF**（v1.80.0）：整章一册，叶序照旧。
+        menu = menu.child(mitem("export-pdf-chapter", "导出本章PDF").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.more_menu = false;
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    this.export_pdf(crate::app::PdfScope::Chapter, cx);
                 }));
                 if let Err(e) = r {
                     this.report_export_panic(e, cx);
@@ -3042,7 +3235,7 @@ impl Root {
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.export_menu = false;
+                this.more_menu = false;
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     this.export_anki_chapter(cx);
                 }));
@@ -3059,7 +3252,7 @@ impl Root {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
-                    this.export_menu = false;
+                    this.more_menu = false;
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         this.export_anki_selection(cx);
                     }));
@@ -3076,7 +3269,7 @@ impl Root {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
-                    this.export_menu = false;
+                    this.more_menu = false;
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         this.export_margin_notes(cx);
                     }));
@@ -3091,13 +3284,24 @@ impl Root {
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.export_menu = false;
+                this.more_menu = false;
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     this.export_markdown_file(cx);
                 }));
                 if let Err(e) = r {
                     this.report_export_panic(e, cx);
                 }
+            }),
+        ));
+        // ④ **說明**（v1.80.0）：原先顶栏最右那枚「帮助」钮搬进下拉。
+        //    一年点几次的东西不该占天头一格——它在这里，且排在导出之后。
+        menu = menu.child(mitem("more-help", "說明").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.more_menu = false;
+                this.set_ui_state(AppUIState::Help, cx);
+                cx.notify();
             }),
         ));
 
@@ -3153,7 +3357,7 @@ impl Root {
             );
 
         // 导出下拉展开时挂到栏容器最末：绝对定位不占 flex 流，后绘制盖住纸面。
-        if self.export_menu {
+        if self.more_menu {
             bar = bar.child(menu);
         }
 
@@ -5372,16 +5576,18 @@ impl Root {
         }
         let key = (g.chapter, g.para, g.offset);
         let marked = self.underlines.contains(&key);
-        // 注音：**书里的优先，字典兜底**。
-        //   * `NoteKind::Ruby` —— EPUB `<ruby><rt>` 导入时挂在该字上的读音
-        //     （`[拼音:…]` 标记 → 注音注），作者标什么就读什么；
-        //   * 没有则查内置生僻字表（`rare_pinyin`），按「生僻字注音」开关走。
-        let ruby_py: Option<String> = if self.show_rare {
-            self.ruby_pinyin(g)
-                .or_else(|| (!is_punct(g.ch)).then(|| self.rare_pinyin(g.ch)).flatten().map(str::to_string))
-        } else {
-            None
-        };
+        // 注音：**书里的永远显示，字典只补空缺**。
+        //   * `NoteKind::Ruby` —— EPUB `<ruby><rt>` / `[拼音:…]` 导入的读音，
+        //     作者标了什么就读什么（`长[拼音:cháng]` 不会被念成 zhǎng）；
+        //     这一类**不看开关**——它是原书的一部分，书上有就该现出来
+        //     （v1.81.0 改：此前被「生僻字」开关一并关掉，等于篡改原书）。
+        //   * 「生僻字自动注音」开着时，再给「书里没标、字又冷僻」的那一类
+        //     补一条字典音（判据见 `common_chars`：国标一级字表之外算冷僻）。
+        let ruby_py: Option<String> = self.ruby_pinyin(g).or_else(|| {
+            (self.show_rare && !is_punct(g.ch) && !self.inline_ruby_after(g))
+                .then(|| dict::auto_pinyin(g.ch))
+                .flatten()
+        });
         let rare_py = ruby_py;
         // 专名线 / 书名线：人名、地名画实线，书名画波浪线，贴字左侧、逐字连贯。
         // 标点字不画线条——线在标点处自然断开，绝不穿过标点。
@@ -5870,11 +6076,67 @@ impl Root {
         }
     }
 
-    /// 生僻字注音：命中内置生僻字表时返回读音；会尝试该字的简/繁变体以兼容不同书写。
-    fn rare_pinyin(&self, c: char) -> Option<&'static str> {
-        dict::pinyin_of(c)
-            .or_else(|| trad::simplified_of(c).and_then(dict::pinyin_of))
-            .or_else(|| trad::traditional_of(c).and_then(dict::pinyin_of))
+    /// 这个字**后方**是否已有原文自带的读音：`埵（duǒ）` / `般（bō ）` /
+    /// `罣（guà 同挂）`。
+    ///
+    /// 判据：后面 3 个字之内，先遇到「（ / ( / ：」再遇到拉丁字母，就算原文
+    /// 已经注过音。这类书写者自带的注音**必须在原处照排**（尊重原文），
+    /// 而自动注音就该让位——同一处两根拐杖只会打架（`埵（duǒ）duǒ` 很难看）。
+    fn inline_ruby_after(&self, g: Glyph) -> bool {
+        let Some(b) = self.book.as_ref() else {
+            return false;
+        };
+        let Some(p) = b
+            .chapters
+            .get(g.chapter)
+            .and_then(|c| c.paragraphs.get(g.para))
+        else {
+            return false;
+        };
+        let mut opened = false;
+        for c in p.text.chars().skip(g.offset + 1).take(3) {
+            match c {
+                '（' | '(' | '：' | ':' | '［' | '[' => opened = true,
+                c if opened && crate::west::is_west(c) => return true,
+                c if crate::west::is_cjk(c) => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// 本章注音表的**批量版**：键与 `GlyphKey` 同一把尺子
+    /// `(章, 段, 段内偏移)`，值就是那一个字上要竖排的那串字母。
+    ///
+    /// 印制 PDF 用（`app::Root::export_pdf`）：`pdf.rs` 逐格落笔时按键取音，
+    /// 因此纸上每一处注音与屏幕逐字同位——**同一个 `ruby::layout` 度量、
+    /// 同一份判据**，不是两套逻辑各画一遍。
+    ///
+    /// 口径与 `render_ancient_cell` 严格一致：书里标的永远收；
+    /// 「生僻字自动注音」开着时才给空缺补 `dict::auto_pinyin`。
+    /// 标点不注（句读上顶一根拼音只会更乱）。
+    pub fn chapter_ruby(
+        &self,
+        ci: usize,
+        flow: &[Glyph],
+    ) -> std::collections::HashMap<(usize, usize, usize), String> {
+        let mut m: std::collections::HashMap<(usize, usize, usize), String> =
+            std::collections::HashMap::new();
+        for g in flow {
+            if g.chapter != ci {
+                continue;
+            }
+            if let Some(py) = self.ruby_pinyin(*g) {
+                m.insert((g.chapter, g.para, g.offset), py);
+                continue;
+            }
+            if self.show_rare && !is_punct(g.ch) && !self.inline_ruby_after(*g) {
+                if let Some(py) = dict::auto_pinyin(g.ch) {
+                    m.insert((g.chapter, g.para, g.offset), py);
+                }
+            }
+        }
+        m
     }
 
     /// 书里的注音（EPUB `<ruby><rt>` 导入的 `NoteKind::Ruby`）。
@@ -8603,70 +8865,6 @@ impl Root {
         String::new()
     }
 
-    /// **卡片匣侧栏**（v1.79.0）：右滑宣纸栏，逐条列跨书摘录卡。
-    ///
-    /// 朱批录已搬进左侧栏的「批注」页（与目录、书签同居一处），故这一栏只剩
-    /// 卡片匣——不再有两枚页签、两个「我留下的字」入口互相打架：批在书上的
-    /// 走左边，摘出来的走右边。
-    fn render_cards_panel(&mut self, cx: &mut Context<Self>) -> Div {
-        let t = self.theme;
-        let vw = self.viewport_w;
-        let slide = self.notes_slide.clamp(0.0, 1.0);
-        let panel_w = (vw * 0.36).clamp(300.0, 440.0);
-        let off = -(1.0 - slide) * panel_w;
-        let zhu = sheet_zhu(t);
-        let ink_soft = t.ink_soft();
-        // 半透明宣纸底：纸色 94% 不透明（与左侧栏同款，不做模糊）。
-        let paper_veil = ((t.paper() & 0xFFFFFF) << 8) | 0xF0;
-        // 极细墨线（仅用于栏头那一道界）。
-        let sept = crate::theme::mix(t.paper(), t.ink(), 0.16);
-        let song = self.main_family();
-
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .py(px(5.0))
-            .border_b_1()
-            .border_color(rgb(sept))
-            .child(
-                div()
-                    .font_family(song.clone())
-                    .text_size(px(12.5))
-                    .text_color(rgb(zhu))
-                    .child(SharedString::from("卡片匣")),
-            )
-            .child(
-                div()
-                    .font_family(song.clone())
-                    .text_size(px(9.5))
-                    .text_color(rgb(ink_soft))
-                    .child(SharedString::from("點選可躍")),
-            );
-
-        div()
-            .absolute()
-            .top(px(0.0))
-            .bottom(px(0.0))
-            .right(px(off))
-            .w(px(panel_w))
-            .flex()
-            .flex_col()
-            .bg(rgba(paper_veil))
-            .border_l_1()
-            .border_color(rgb(sept))
-            .child(header)
-            .child(self.render_cards_list(cx))
-            // 拦住冒泡：点面板内不触发外层（页面）的翻页 / 关闭。
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, _, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-    }
 
 
     /// **「版字」面板**：列数 · 字级 · 字体 · 批注 · 留白 · 纸边 · 页面 ·
@@ -9207,7 +9405,7 @@ impl Root {
     ///
     /// GPUI 侧的家族名（文津宋体 / 霞鹜文楷…）CoreText 不认，故按「楷 / 宋」
     /// 两类语义落到系统字体上（`ShareFont::postscript_chain` 内再回退）。
-    fn share_font_kind(&self) -> crate::share_layout::ShareFont {
+    pub(crate) fn share_font_kind(&self) -> crate::share_layout::ShareFont {
         use crate::types::FontChoice;
         let choice = self
             .share_font
@@ -9880,35 +10078,40 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
                 .child(seg(format!("每面 {} 行", self.grid_rows), false))
                 .child(seg(format!("天头:地脚 {:.1}:1", ratio), true)),
         );
-        // ---- 底行：唯一一枚**纯文字**动作（分享 / 保存图片）----
-        // 没有灰底方框、没有图标，只有一行字；悬停时字色加深。
-        // v1.57.0：原「分享图片 / 分享文字」两枚按钮随「分享」两字一并删去，
-        // 面板入口只留「保存图片」（打开出图抽屉）。
-        // v1.64.0：文案改成**如实**反映这次要分享什么——手里有选区（哪怕被
-        // 开面板时的 `close_transient_ui` 清掉了，也还剩 `share_sel` 这份定格）
-        // 就说「分享所选」，否则说「分享本叶」。并改调 `open_share_panel`：
-        // 旧代码只置 `show_share_panel = true`，从不抓正文，卡片必然是空的。
+        // ---- v1.0.0-beta：底行那枚「分享所选 / 分享本叶」已撤 ----
         //
-        // 只判有无、不数字数：`flat_index` 是按章按段累加的，本面板每帧都要
-        // 重画，八百章的老书会被算成每帧几毫秒——字数交给下方图注（那儿用的
-        // 是已落定的 `share_body.len()`，不花代价）。
-        let save_label = if self.share_sel.is_some() {
-            "分享所选"
-        } else {
-            "分享本叶"
-        };
-        let save_img = div()
+        // 理由（用户口径）：这张纸只管**排版**（列数 / 留白 / 字体 / 标注），
+        // 出图与分享归「更多 → 导出」一处——那边有本叶 PNG、本叶 / 本章 PDF、
+        // 分享卡、Anki、Markdown、朱批录六个出口，比这里一枚含糊的「分享」
+        // 清楚得多。撤掉后这张纸从上到下只剩「怎么排」，没有「拿去干嘛」。
+        // 分享卡本体与 `open_share_panel` 仍在（更多 → 分享所选为图片、
+        // 选区工具条第九枚），故不是死代码。
+
+        // ---- 專注（v1.80.0）：顶栏那枚「专注」钮搬进这张纸 ----
+        //
+        // 为什么归到「版字」：专注模式撤掉的是**界面**（顶栏、状态栏、留白），
+        // 留下的只有纸面上的字——它本就是「怎么读」这件事的最后一档，与列数 /
+        // 字体 / 留白同属一组。原先它单独占顶栏一格，可那枚钮的语义等于
+        // 「再来一次版字」，两枚并排纯属重复。
+        let zhu = sheet_zhu(t);
+        let focus_label = if self.focus_mode { "退出專注" } else { "專注（淨室讀書）" };
+        let focus_btn = div()
             .cursor_pointer()
             .text_size(px(11.5))
-            .text_color(rgb(t.ink_soft()))
-            .hover(|s| s.text_color(rgb(t.ink())))
-            .child(SharedString::from(save_label))
+            .text_color(rgb(if self.focus_mode { zhu } else { t.ink_soft() }))
+            .hover(|s| s.text_color(rgb(zhu)))
+            .child(SharedString::from(focus_label))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
-                    // 必须走快照函数：它负责抓正文 / 批注 / 红线并开抽屉。
-                    this.open_share_panel(cx);
+                    this.focus_mode = !this.focus_mode;
+                    if this.focus_mode {
+                        // 进专注：先收浮层、再收这张纸（否则纸还摊在屏上）。
+                        this.close_transient_ui();
+                        this.show_style = false;
+                    }
+                    cx.notify();
                 }),
             );
         sheet = sheet.child(
@@ -9918,10 +10121,13 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
                 .items_center()
                 .gap(px(24.0))
                 .pt(px(6.0))
-                // 与上一行之间一道极淡的墨界，像纸上的折痕。
-                .border_t_1()
-                .border_color(rgba(((t.rule() & 0xFFFFFF) << 8) | 0x1F))
-                .child(save_img),
+                .child(focus_btn)
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(t.ink_soft()))
+                        .child(SharedString::from("專注：收去天頭地脚，只留紙上的字")),
+                ),
         );
 
         // 作为正文正下方的行内面板（像照片说明），宽度等于单张页面，不遮挡正文。

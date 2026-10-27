@@ -48,11 +48,24 @@ pub enum SideTab {
 }
 
 impl SideTab {
-    /// 页签上的两个字。
-    pub fn label(self) -> &'static str {
+    /// **印章上的那一个字**（v1.80.0）：竖排三枚朱砂小印，一字一页。
+    ///
+    /// 为什么是单字而不是「目录 / 书签 / 批注」六个字：那六个字排成一排是
+    /// **现代 Tab 条**，一眼就把古籍的纸面气质打散了。单字入印，读法是
+    /// 「翻检签牌」而不是「切换标签页」——形制上它更像书耳与藏印。
+    pub fn seal(self) -> &'static str {
         match self {
-            SideTab::Toc => "目录",
-            SideTab::Bookmark => "书签",
+            SideTab::Toc => "錄",
+            SideTab::Bookmark => "籤",
+            SideTab::Note => "批",
+        }
+    }
+
+    /// 印章的**全名**（栏头题字 / 提示语用）：印章只刻一字，说清还得两个字。
+    pub fn title(self) -> &'static str {
+        match self {
+            SideTab::Toc => "目錄",
+            SideTab::Bookmark => "書籤",
             SideTab::Note => "批注",
         }
     }
@@ -171,8 +184,6 @@ pub enum AppUIState {
     Style,
     /// 全文检索。
     Search,
-    /// 卡片匣（v1.79.0：朱批录搬进左侧栏「批注」页后，这一栏只剩跨书摘录卡）。
-    Cards,
     /// 帮助。
     Help,
     /// 左侧栏（v1.79.0：目录 + 书签 + 批注 三页合一，从左侧滑出）。
@@ -198,6 +209,15 @@ pub enum PngStage {
     Warm,
     /// 干净纸面已上屏：本帧截屏 + 弹系统保存框。
     Shoot,
+}
+
+/// **PDF 印制范围**（v1.80.0）：一叶一页，本章则一章一册。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PdfScope {
+    /// 屏幕上正在读的**那一叶** → 一份一页的 PDF。
+    Leaf,
+    /// 当前**整章** → 一份多页的 PDF。
+    Chapter,
 }
 
 
@@ -401,7 +421,9 @@ pub struct Root {
     pub notes: std::collections::HashMap<usize, String>,
     /// 卡片匣面板是否展开（v1.79.0：朱批录已搬进左侧栏「批注」页，
     /// 右栏只剩跨书摘录卡，故不再有 `notes_tab` 这个状态）。
-    pub show_cards_panel: bool,
+    /// **「更多」下拉**（v1.80.0）：顶栏第六枚。导出六条 + 说明都收在这里；
+    /// 与「导出」那枚旧菜单是同一形态，只是名字更中性——里头不只有导出。
+    pub more_menu: bool,
     /// 匣中卡片（开栏时从库里读一次，增删后重读；不每帧查询）。
     pub cards: Vec<jiandu_core::cards::Card>,
     /// **问小笺侧栏**（v1.76.0 · V2.0 模块二）：AI 伴读。
@@ -654,6 +676,20 @@ pub struct Root {
     /// 开发用：一次性自检标记（见 render_shelf 的 JIANDU_RENAME_KEYS）。
     pub rename_test_done: bool,
 
+    // ---- 内测闸门（v1.0.0-beta）----
+    /// 邀请码已通过 / 本机此前已验过（`gate::redeemed()`）。
+    ///
+    /// 为 false 时 `Render::render` **只画那张纸**（书名 + 输入框 + 一行提示），
+    /// 书架、正文、所有浮层一律不进场——没有「点旁边绕过」这条路。
+    pub beta_ok: bool,
+    /// 邀请码草稿与光标（字符下标）。
+    pub beta_code: String,
+    pub beta_cursor: usize,
+    /// 闸门输入框的焦点句柄。
+    pub beta_focus: FocusHandle,
+    /// 刚敲错：输入框下方浮一行朱砂小字，下一次输入自动清掉。
+    pub beta_err: bool,
+
     // ---- 全文检索 ----
     /// 检索面板是否展开。
     pub show_search: bool,
@@ -679,9 +715,7 @@ pub struct Root {
     /// 口径与 `search_cur` 一致 `(chapter, para, offset, len)`。
     pub note_flash: Option<(usize, usize, usize, usize)>,
     /// 卡片匣侧栏滑入 / 滑出动画（与 `side_slide` 同款逐帧推进）。
-    pub notes_slide: f32,
-    pub notes_target: bool,
-    pub notes_animating: bool,
+
     /// 问小笺侧栏滑入 / 滑出动画（v1.76.0，同上）。
     pub ai_slide: f32,
     pub ai_target: bool,
@@ -903,7 +937,10 @@ impl Root {
     pub fn new(cx: &mut Context<Self>) -> Self {
         // 问小笺面板：开局就建（它是常驻 Entity，不开栏也在内存里）。
         // 做成独立 Entity 是为了把流式 notify 关在面板内——见字段注释。
-        let ai_panel = cx.new(crate::ai::AiPanel::new);
+        // 面板要拿得到 `Root` 的 Entity：中文输入法统一走 Root 那条通道
+        // （见 `ime::InputField`），输入框登记的是 Root 的 handler。
+        let root_ent = cx.entity();
+        let ai_panel = cx.new(|cx| crate::ai::AiPanel::new(cx, root_ent));
         let mut library = Library::load();
         if library.books.is_empty() {
             let _ = library.seed_sample();
@@ -985,7 +1022,7 @@ impl Root {
             hover_card: false,
             dict_tab: DictTab::default(),
             notes: std::collections::HashMap::new(),
-            show_cards_panel: false,
+            more_menu: false,
             note_editing: false,
             note_edit_note: None,
             note_inject_key: None,
@@ -1054,7 +1091,9 @@ impl Root {
             sel_char: None,
             palette: InkPalette::Ink,
             show_punct: true,
-            show_rare: false,
+            // 生僻字注音：默认开（`prefs.rare` 默认 true）——古籍里真有读不出
+            // 的字，一根拐杖比「干净」重要。关掉的意愿会随下一版落盘。
+            show_rare: prefs.rare,
             han_digits: false,
             auto_duplex: true,
             // 列数默认自动：按书的内容与可用宽算，不写死某一档。
@@ -1070,6 +1109,11 @@ impl Root {
             note_menu: None,
             line_modern: 26.0,
             rename_test_done: false,
+            beta_ok: crate::gate::redeemed(),
+            beta_code: String::new(),
+            beta_cursor: 0,
+            beta_focus: cx.focus_handle(),
+            beta_err: false,
             show_search: false,
             ui_state: AppUIState::None,
             search_draft: String::new(),
@@ -1081,9 +1125,7 @@ impl Root {
             search_keys: std::collections::HashSet::new(),
             search_cur: None,
             note_flash: None,
-            notes_slide: 0.0,
-            notes_target: false,
-            notes_animating: false,
+
             show_ai: false,
             ai_panel,
             ai_slide: 0.0,
@@ -1160,8 +1202,13 @@ impl Root {
                     root.open_side();
                     root.side_slide = 1.0;
                 }
-                "notes" | "cards" => root.show_cards_panel = true,
                 "help" => root.show_help = true,
+                // 检索侧栏（v1.81.0）：核对 IME 落点 / 版式，脚本点不到顶栏。
+                "search" => {
+                    root.show_search = true;
+                    root.search_slide = 1.0;
+                    root.search_target = true;
+                }
                 _ => {}
             }
         }
@@ -1218,9 +1265,6 @@ impl Root {
             root.side_slide = 1.0;
             root.side_animating = false;
             root.toc_need_scroll = true;
-        }
-        if std::env::var("JIANDU_NOTES_OPEN").is_ok() {
-            root.show_cards_panel = true;
         }
         // 开发用：直接浮出笔记编辑框，便于截图核对浮层版式。
         if std::env::var("JIANDU_NOTE_EDIT").is_ok() {
@@ -2564,7 +2608,7 @@ impl Root {
                 self.underlines = ul.into_iter().collect();
                 self.bookmarks = entry.bookmarks.clone();
                 self.show_share_panel = false;
-                self.show_cards_panel = false;
+                self.more_menu = false;
                 self.note_editing = false;
                 self.note_draft.clear();
                 self.note_cursor = 0;
@@ -3258,6 +3302,247 @@ impl Root {
         .detach();
     }
 
+    /// **『导出本叶 / 本章 PDF』**（v1.80.0）：把竖排叶面（**含双行夹注**）
+    /// 印成一份 A4 **矢量** PDF——一叶一页，字是真字（内嵌字体子集），
+    /// 任意倍放大不糊、可复制可检索，打印 / 转发都体面。
+    ///
+    /// 关键在于**不另起炉灶**：列 / 片（`Piece::Main` / `Gloss` / `Gap`）仍然
+    /// 由阅读器那一台排版引擎 `gloss::layout_book_from_opts` 产出，几何由
+    /// `grid::calculate_grid` 按 A4 重新试算（行数变了、分页跟着变，这才叫
+    /// 「按纸重排」而不是「把屏幕等比缩放」）。`pdf.rs` 只负责照着落笔。
+    ///
+    /// 落盘仍走 `exporter::save_bytes`：先渲到临时文件读回字节，再交给保存框
+    /// ——复用「补后缀 + 建父目录 + 记住目录」那一条既有链路，不破坏
+    /// 「写盘唯一出口」的铁律。
+    pub fn export_pdf(&mut self, scope: PdfScope, cx: &mut Context<Self>) {
+        let Some(book) = self.book.clone() else {
+            self.notice = "尚未打开书籍，无法印制 PDF".to_string();
+            cx.notify();
+            return;
+        };
+        // 连点两次不该弹两个保存框。
+        if !self.export_begin(cx) {
+            return;
+        }
+        // ① 按 A4 试算一版网格：与屏幕**同一套算式**，只是换了纸。
+        let cfg = self.current_layout();
+        let plan = crate::grid::calculate_grid(crate::grid::GridInput {
+            columns: self.grid.columns,
+            mode: crate::grid::LayoutMode::Single,
+            content_w: crate::pdf::A4_W as f32 - PDF_PAGE_PAD * 2.0,
+            content_h: crate::pdf::A4_H as f32 - PDF_PAGE_PAD * 2.0,
+            zoom: 1.0,
+            edge: PDF_EDGE,
+            head: 0.0,
+            foot: 0.0,
+            margin: 0.0,
+            line_scale: self.grid.line_scale,
+            fs_ratio: cfg.fs_ratio,
+            line_ratio: cfg.line_ratio,
+            banxin_ratio: self.banxin_ratio,
+            dir: self.grid.dir,
+            // 印制不受「大屏别把字撑太大」那条 32px 上限约束——纸上要的就是
+            // A4 满版大字。
+            fs_max: f32::INFINITY,
+        });
+        let m = plan.m;
+        // 纸面一旦超出 A4，整体等比收一号（行数不变，只是字号 / 格缩一点）。
+        let foot = (m.fs * 0.36).max(9.0) + 10.0;
+        let sh = m.rows as f32 * m.row_h + foot + PDF_EDGE + m.margin_top + m.margin_bot;
+        let sw = m.grid_w + PDF_EDGE;
+        let avail_w = crate::pdf::A4_W as f32 - PDF_PAGE_PAD * 2.0;
+        let avail_h = crate::pdf::A4_H as f32 - PDF_PAGE_PAD * 2.0;
+        let k = (avail_w / sw.max(1.0)).min(avail_h / sh.max(1.0)).min(1.0);
+
+        // ② 用**同一台排版引擎**按新行数重排（分页因此随纸而变）。
+        let reserve = crate::gloss::inscription_reserve(self.chapter_inscription_need(), m.rows);
+        let notes_inline = self.notes_inline;
+        let west_mode = !self.han_digits;
+        // 「本叶」要先知道屏幕上这一叶的第一个字落在哪一章、是哪一字；
+        // 「本章」直接按当前章取。
+        let anchor = if scope == PdfScope::Leaf {
+            self.page_at(self.page)
+                .and_then(|p| p.glyphs.first().map(|g| (g.chapter, g.para, g.offset)))
+        } else {
+            None
+        };
+        let ci = match (scope, anchor) {
+            (PdfScope::Leaf, Some(a)) => a.0,
+            _ => self.current_chapter,
+        };
+        let flow: Vec<Glyph> = book
+            .to_flow(self.show_punct)
+            .into_iter()
+            .filter(|g| g.chapter == ci)
+            .collect();
+        if flow.is_empty() {
+            self.export_busy = false;
+            self.notice = "这一章没有可印制的正文".to_string();
+            self.toast = Some("这一章没有可印制的正文".to_string());
+            cx.notify();
+            return;
+        }
+        // 注音表：**书上自带的优先**（EPUB `<ruby>` / `[拼音:]` / `X（bō）`
+        // 导入的 `NoteKind::Ruby`），「生僻字注音」开着时再给空缺的补一条。
+        // 键与 `GlyphKey` 同一把尺子（章, 段, 段内偏移），落笔时按键取音。
+        let ruby = self.chapter_ruby(ci, &flow);
+        let pages = crate::gloss::layout_book_from_opts(
+            &flow,
+            |g| {
+                if notes_inline {
+                    self.note_chars_with_source(*g)
+                        .map(|(s, src)| (s.to_string(), src, *g))
+                } else {
+                    None
+                }
+            },
+            m.columns,
+            m.rows,
+            reserve,
+            true,
+            west_mode,
+        );
+        if pages.is_empty() {
+            self.export_busy = false;
+            self.notice = "排版结果为空，无法印制".to_string();
+            self.toast = Some("排版结果为空".to_string());
+            cx.notify();
+            return;
+        }
+        // ③ 挑页：本章取全部；本叶取「装着那一个字的那一叶」。
+        let picked: Vec<usize> = match scope {
+            PdfScope::Chapter => (0..pages.len()).collect(),
+            PdfScope::Leaf => {
+                let a = anchor.unwrap_or((0, 0, 0));
+                let hit = pages
+                    .iter()
+                    .position(|p| {
+                        p.glyphs
+                            .iter()
+                            .any(|g| (g.chapter, g.para, g.offset) == a)
+                    })
+                    .unwrap_or(0);
+                vec![hit]
+            }
+        };
+        let title = self.chapter_title(ci);
+        let vol = crate::types::chapter_volume(ci, &title);
+        let inscription = format!("{}{}", book.title, vol);
+        let author = if book.author.trim().is_empty() {
+            "佚名".to_string()
+        } else {
+            book.author.clone()
+        };
+        let geo = crate::pdf::PdfGeo {
+            cols: m.columns,
+            cell_w: m.col_w * k,
+            cell_h: m.row_h * k,
+            rows: m.rows,
+            fs: m.fs * k,
+            reserve,
+            edge: PDF_EDGE * k,
+            margin_top: m.margin_top * k,
+            margin_bot: m.margin_bot * k,
+            paper: self.theme.paper(),
+            ink: self.palette.ink(self.theme),
+            rule: self.theme.rule_by(self.rule_color),
+            note_ink: self.palette.note(self.theme),
+            accent: self.theme.accent(),
+            font: self.share_font_kind(),
+            note_font: crate::share_layout::ShareFont::Kai,
+            han_digits: self.han_digits,
+            traditional: self.show_traditional,
+        };
+        let safe = crate::exporter::safe_file_stem(&book.title);
+        let default = format!(
+            "笺读_{}_{}.pdf",
+            safe,
+            crate::exporter::safe_file_stem(&title)
+        );
+        let scope_label = match scope {
+            PdfScope::Leaf => "本叶",
+            PdfScope::Chapter => "本章",
+        };
+        // ④ 渲染：临时文件 → 读回字节（保存框要的是字节，CG 只肯写 URL）。
+        let tmp = std::env::temp_dir().join(format!(
+            "jiandu-pdf-{}-{}-{}.pdf",
+            std::process::id(),
+            scope_label,
+            ci
+        ));
+        let rendered = (|| -> Result<Vec<u8>, String> {
+            let leaves: Vec<crate::pdf::PdfLeaf> = picked
+                .iter()
+                .map(|&i| crate::pdf::PdfLeaf {
+                    page: &pages[i],
+                    title: &title,
+                    chapter: ci,
+                    leaf: i + 1,
+                    inscription: &inscription,
+                    author: &author,
+                    ruby: &ruby,
+                })
+                .collect();
+            crate::pdf::write_pdf(&tmp, &leaves, &geo)?;
+            std::fs::read(&tmp).map_err(|e| format!("读取临时 PDF 失败：{e}"))
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        let bytes = match rendered {
+            Ok(b) => b,
+            Err(e) => {
+                self.export_busy = false;
+                let msg = format!("PDF 印制失败：{e}");
+                self.notice = msg.clone();
+                self.toast = Some(msg);
+                cx.notify();
+                return;
+            }
+        };
+        let n_leaf = picked.len();
+        cx.spawn(
+            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    // rfd 同步保存框必须**前台直调**（见 export_page_png 的注）。
+                    let picked_path = crate::exporter::pick_save_path(
+                        "印制（A4 矢量 PDF）",
+                        &default,
+                        "PDF 文稿",
+                        &["pdf"],
+                    );
+                    let (msg, toast) = match picked_path {
+                        None => ("已取消保存".to_string(), "已取消保存".to_string()),
+                        Some(dest) => match crate::exporter::save_bytes(dest, "pdf", &bytes) {
+                            Ok(p) => {
+                                let kb = (bytes.len() / 1024).max(1);
+                                let name = p
+                                    .file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "本叶.pdf".to_string());
+                                (
+                                    format!("已保存到 {}（{} KB）", p.display(), kb),
+                                    format!("{scope_label}已印制（{n_leaf} 叶）\n{name}"),
+                                )
+                            }
+                            Err(e) => {
+                                let m = format!("保存失败：{e}");
+                                (m.clone(), m)
+                            }
+                        },
+                    };
+                    this.update(&mut cx, |this, cx| {
+                        this.export_busy = false;
+                        this.notice = msg;
+                        this.toast = Some(toast);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
     /// **『导出全书批注』**（v1.63.0）：把全部 `MarginNote`（天头朱批）按章
     /// 节顺序排成一份 Markdown——章节名 + 原文摘录 + 批语，弹保存框落盘。
     ///
@@ -3841,7 +4126,9 @@ fn anki_push_card(
         self.dragging = false;
         self.hover_card = false;
         // v1.52.0：顶栏「导出」下拉也是瞬态的，随其余浮层一起收。
+        // v1.80.0：「更多」下拉同理（导出六条 + 说明都住在里面）。
         self.export_menu = false;
+        self.more_menu = false;
     }
 
     /// 全局 UI 状态机：同一时刻只开一个顶层面板，并强制关闭所有底层瞬态浮层。
@@ -3853,7 +4140,6 @@ fn anki_push_card(
         let on = match s {
             AppUIState::Style => self.show_style,
             AppUIState::Search => self.show_search,
-            AppUIState::Cards => self.show_cards_panel,
             AppUIState::Help => self.show_help,
             AppUIState::Side => self.show_side,
             AppUIState::Share => self.show_share_panel,
@@ -3864,7 +4150,6 @@ fn anki_push_card(
         self.ui_state = s;
         self.show_style = matches!(s, AppUIState::Style);
         self.show_search = matches!(s, AppUIState::Search);
-        self.show_cards_panel = matches!(s, AppUIState::Cards);
         self.show_help = matches!(s, AppUIState::Help);
         self.show_share_panel = matches!(s, AppUIState::Share);
         self.show_ai = matches!(s, AppUIState::Ai);
@@ -3880,14 +4165,13 @@ fn anki_push_card(
         }
         // 侧栏滑入 / 滑出：开 → 目标态拉满并播动画；关 → 目标态归零、
         // 由 `render` 逐帧把 slide 推回 0 后再卸载面板。
-        self.notes_target = self.show_cards_panel;
-        self.notes_animating = self.show_cards_panel || self.notes_slide > 0.0;
         self.search_target = self.show_search;
         self.search_animating = self.show_search || self.search_slide > 0.0;
         self.ai_target = self.show_ai;
         self.ai_animating = self.show_ai || self.ai_slide > 0.0;
-        // 开栏那一刻才去库里取一次（侧栏是低频面板，没必要每帧查）。
-        if self.show_cards_panel {
+        // 左栏「批」页要列跨书摘录卡：开栏（或切到该页）时才去库里取一次。
+        // v1.80.0：卡片匣已从右侧独立栏搬进左栏，取数时机也随之归到一处。
+        if self.show_side && self.side_tab == SideTab::Note {
             self.reload_cards();
         }
         // 问小笺开栏：把当前纸墨与字体递给面板（面板是独立 Entity，
@@ -3909,10 +4193,13 @@ fn anki_push_card(
         self.show_style
             || self.show_side
             || self.show_search
-            || self.show_cards_panel
             || self.show_help
             || self.show_share_panel
             || self.show_ai
+            // v1.80.0：两枚下拉（顶栏「更多」与旧「导出」）也算浮层——
+            // 菜单摊着时，纸面上的单击不该翻页。
+            || self.more_menu
+            || self.export_menu
     }
 
     /// 呼出**左侧栏**（v1.79.0）：从左侧平滑滑出 260px 的抽屉。
@@ -3930,7 +4217,6 @@ fn anki_push_card(
         // 互斥：开左栏前收起其它顶层面板与底层瞬态浮层。
         self.show_style = false;
         self.show_search = false;
-        self.show_cards_panel = false;
         self.show_help = false;
         self.show_share_panel = false;
         self.ui_state = AppUIState::Side;
@@ -4393,7 +4679,6 @@ fn anki_push_card(
         if let Some(pg) = self.page_of_key(key) {
             self.page = pg;
         }
-        self.show_cards_panel = false;
         self.close_side();
         self.show_search = false;
         self.clear_selection();
@@ -4405,7 +4690,6 @@ fn anki_push_card(
     /// 只翻面（页笔记用：没有 charIndex，无法闪高具体字）。
     pub fn jump_to_page(&mut self, page: usize, cx: &mut Context<Self>) {
         self.page = page;
-        self.show_cards_panel = false;
         self.close_side();
         self.popup = None;
         cx.notify();
@@ -5497,6 +5781,11 @@ pub const ANCIENT_NOTES: f32 = 76.0;
 /// 章首页 = (列数-1) 个正文列 + 1 个章题列，整面总宽恒为 列数×col_w。
 pub const ANCIENT_TITLE_COL: f32 = 1.0;
 
+/// **PDF 印制（v1.80.0）**：A4 纸面上纸面四周的留白（pt）。
+pub const PDF_PAGE_PAD: f32 = 26.0;
+/// PDF 版框双边预留（pt）：纸面外缘 → 字格区，刻本「四周双边」就靠它。
+pub const PDF_EDGE: f32 = 34.0;
+
 // 主题色
 pub const PAPER: u32 = 0xF7F1E3;
 pub const PAPER_BACK: u32 = 0xEAE0C9;
@@ -5585,6 +5874,31 @@ fn ensure_assets() {
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // **内测闸门**（v1.0.0-beta）：没验过邀请码就只画那一张纸。
+        //
+        // 为什么是「只画」而不是「盖在上面」：盖一层不透明浮层，底下的书架 /
+        // 正文照样会跑一遍排版（几百毫秒），而且根元素上那组快捷键仍然活着，
+        // 方向键会翻动看不见的纸。直接从 `render` 的第一行岔开，是唯一干净的
+        // 做法——没有可绕过的第二条路。
+        if !self.beta_ok {
+            return self.render_beta_gate(window, cx).into_any_element();
+        }
+        if std::env::var("JIANDU_IME_DEBUG").is_ok() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static PROBED: AtomicBool = AtomicBool::new(false);
+            if !PROBED.swap(true, Ordering::Relaxed) {
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    crate::ime::probe_input_context()
+                };
+            }
+        }
+        // ── 临时探针（验证用，收尾前删）──────────────────────────────
+        // JIANDU_FAKE_IME=1：直接调 InputHandler，模拟「输入法上屏」，
+        // 用来判定「打不进字」到底是应用侧没接到，还是平台侧没送到。
+        // ⚠️ 已实测：`dispatch_keystroke` 内部会调 `self.draw(cx)`，在
+        //   `render()` 里调它就是重入 update → double-lease panic，
+        //   这段探针**只能留在注释里**，别再打开。
         // 记录窗口内容区尺寸，供阅读视图按视口铺满屏计算字号。
         // `Pixels` 字段对外部 crate 私有，借助 `Pixels / Pixels -> f32` 取出数值。
         let vp = window.viewport_size();
@@ -5634,21 +5948,6 @@ impl Render for Root {
                 self.side_anim_start = None;
                 if !self.side_target {
                     self.show_side = false; // 滑出完成，真正卸载侧栏
-                }
-            } else {
-                window.request_animation_frame();
-            }
-        }
-        // 朱批录侧栏滑入 / 滑出（与 toc 同款逐帧推进）。
-        if self.notes_animating {
-            let dir = if self.notes_target { 1.0 } else { -1.0 };
-            let step = 0.12;
-            let next = (self.notes_slide + dir * step).clamp(0.0, 1.0);
-            self.notes_slide = next;
-            if (self.notes_target && next >= 1.0) || (!self.notes_target && next <= 0.0) {
-                self.notes_animating = false;
-                if !self.notes_target {
-                    self.show_cards_panel = false;
                 }
             } else {
                 window.request_animation_frame();
@@ -5740,6 +6039,8 @@ impl Render for Root {
         // v1.77.0：每帧探一眼批量导入（点检 / 上架 / 收工）与后台建索引。
         self.poll_batch(cx);
         self.poll_fts();
+        // v1.80.0：小笺「全庫 / 全書」那一问的翻检派活（DB + FTS5 在后台线程）。
+        self.poll_ai(cx);
         // v1.70.0：**空闲帧渐进铺索引**。开卷后每帧只啃 8 章（≈1ms，60 FPS
         // 纹丝不动），一两秒内把全书的「第几叶在第几章」探明；之后点目录
         // 跳任何一章都是 O(log n) 查表（130µs），根本轮不到「冷跳到末叶」
@@ -5808,7 +6109,7 @@ impl Render for Root {
                     .child(crate::reader::banxin_seal(22.0, 40.0)),
             );
         }
-        root
+        root.into_any_element()
     }
 }
 

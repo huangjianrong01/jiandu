@@ -146,6 +146,10 @@ pub enum InputTarget {
     Note,
     /// 书架的搜索框（只筛书名 / 作者，用的是 `shelf_query`）。
     ShelfSearch,
+    /// **问小笺的四个输入框**（v1.80.0）：草稿住在 `AiPanel` 里，但输入法
+    /// 只认「焦点元素登记的那个 Entity」——登记的是 `Root`，故 Root 收到字
+    /// 后转交给面板（见 `Root::ai_ime_*`）。
+    Ai,
 }
 
 impl Root {
@@ -189,6 +193,11 @@ impl Root {
     /// 此刻哪个输入框该接字：重命名框 → 笔记框 → 书架搜索 → 阅读页检索；
     /// 都没有则 None（IME 接口收到 None 即不接管，键盘走普通 keydown）。
     pub fn input_target(&self) -> Option<InputTarget> {
+        // 闸门没验过时：这张纸上只收 keydown（邀请码是英数，见 `beta.rs`），
+        // **不接输入法**——接了就与 keydown 叠字（实测 `abc123` 得 `ABCABC112233`）。
+        if !self.beta_ok {
+            return None;
+        }
         if self.rename_idx.is_some() {
             Some(InputTarget::Rename)
         } else if self.note_editing {
@@ -197,6 +206,11 @@ impl Root {
             Some(InputTarget::ShelfSearch)
         } else if self.show_search {
             Some(InputTarget::Search)
+        } else if self.show_ai {
+            // 小笺开着：焦点多半落在它的提问框 / 设置三栏上。判据只取
+            // `show_ai` 一个布尔——`input_target` 拿不到 window，好在上面
+            // 四种输入态与「小笺开着」天然互斥（开面板会收掉那些浮层）。
+            Some(InputTarget::Ai)
         } else {
             None
         }
@@ -299,6 +313,13 @@ impl<V: EntityInputHandler> Element for InputField<V> {
     ) {
         // 只有焦点落在本元素上，这个 handler 才会注册到平台——
         // IME 因此能把组好的中文送到 `Root` 的 replace_text_in_range。
+        if std::env::var("JIANDU_IME_DEBUG").is_ok() {
+            eprintln!(
+                "[input-field] paint focused={} bounds={:?}",
+                self.focus.is_focused(window),
+                bounds
+            );
+        }
         window.handle_input(
             &self.focus,
             ElementInputHandler::new(bounds, self.view.clone()),
@@ -327,6 +348,8 @@ impl EntityInputHandler for Root {
             InputTarget::Search => utf16_slice(&self.search_draft, range),
             InputTarget::Note => utf16_slice(&self.note_draft, range),
             InputTarget::ShelfSearch => utf16_slice(&self.shelf_query, range),
+            // 小笺：草稿住在面板里，转交（见 `Root::ai_ime_*`）。
+            InputTarget::Ai => return self.ai_ime_text_for_range(range, _window, _cx),
         })
     }
 
@@ -343,6 +366,7 @@ impl EntityInputHandler for Root {
             InputTarget::Search => char_to_utf16(&self.search_draft, self.search_cursor),
             InputTarget::Note => char_to_utf16(&self.note_draft, self.note_cursor),
             InputTarget::ShelfSearch => char_to_utf16(&self.shelf_query, self.shelf_query_cursor),
+            InputTarget::Ai => return self.ai_ime_selected_range(_window, _cx),
         };
         Some(UTF16Selection {
             range: at..at,
@@ -362,6 +386,7 @@ impl EntityInputHandler for Root {
             InputTarget::Search => self.search_marked.clone(),
             InputTarget::Note => self.note_marked.clone(),
             InputTarget::ShelfSearch => self.shelf_query_marked.clone(),
+            InputTarget::Ai => return self.ai_ime_marked_range(_window, _cx),
         }
     }
 
@@ -372,6 +397,7 @@ impl EntityInputHandler for Root {
             Some(InputTarget::Search) => self.search_marked = None,
             Some(InputTarget::Note) => self.note_marked = None,
             Some(InputTarget::ShelfSearch) => self.shelf_query_marked = None,
+            Some(InputTarget::Ai) => self.ai_ime_unmark(_window, _cx),
             None => {}
         }
     }
@@ -398,6 +424,9 @@ impl EntityInputHandler for Root {
             );
         }
         match target {
+            InputTarget::Ai => {
+                self.ai_ime_replace(range, text, _window, cx);
+            }
             InputTarget::Rename => {
                 let eff = effective_replace_range(range, &self.rename_marked);
                 self.rename_marked = None;
@@ -450,11 +479,16 @@ impl EntityInputHandler for Root {
                     InputTarget::Search => &self.search_marked,
                     InputTarget::Note => &self.note_marked,
                     InputTarget::ShelfSearch => &self.shelf_query_marked,
+                    // 小笺的组字区间在面板里，这里拿不到——只写日志、不借用。
+                    InputTarget::Ai => &None,
                 },
                 new_text
             );
         }
         match target {
+            InputTarget::Ai => {
+                self.ai_ime_replace_mark(range, new_text, new_selected_range, _window, cx);
+            }
             InputTarget::Rename => {
                 let eff = effective_replace_range(range, &self.rename_marked);
                 let start = self.rename_replace_utf16(eff, new_text);
@@ -681,4 +715,75 @@ mod tests {
         replace_utf16_limited(&mut draft, &mut cursor, eff, "世界", NOTE_MAX);
         assert_eq!(draft, "你好世界");
     }
+}
+
+// ── 平台侧探针（v1.81.0，仅 JIANDU_IME_DEBUG=1 时跑一次）───────────────
+//
+// 「打不进中文」有三个可能的断点：① 应用没接到（已由 `replace_text_in_range`
+// 的探针排除）；② GPUI 没把 handler 装到平台；③ 平台（AppKit）压根没把
+// 键送进输入法上下文。这里直接问 AppKit 要答案：视图的 `inputContext`
+// 是不是 nil、它是不是 firstResponder、它认不认 `insertText:`。
+//
+// `-inputContext` 返回 nil 是自定义 NSView 的通病：`[ctx handleEvent:]`
+// 发给 nil 就是静默无事发生——键照收（所以翻页、Esc 都正常），中文却
+// 一个字也上不来。这条探针就是给这种情况定案的。
+#[cfg(target_os = "macos")]
+pub unsafe fn probe_input_context() {
+    use std::os::raw::{c_char, c_void};
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend(receiver: *mut c_void, op: *mut c_void, ...) -> *mut c_void;
+    }
+    let sel = |n: &[u8]| -> *mut c_void { sel_registerName(n.as_ptr() as *const c_char) };
+    let cls = |n: &[u8]| -> *mut c_void { objc_getClass(n.as_ptr() as *const c_char) };
+
+    let app = objc_msgSend(cls(b"NSApplication\0"), sel(b"sharedApplication\0"));
+    let mut win = objc_msgSend(app, sel(b"keyWindow\0"));
+    if win.is_null() {
+        let wins = objc_msgSend(app, sel(b"windows\0"));
+        win = if wins.is_null() {
+            std::ptr::null_mut()
+        } else {
+            objc_msgSend(wins, sel(b"firstObject\0"))
+        };
+    }
+    let view = if win.is_null() {
+        std::ptr::null_mut()
+    } else {
+        objc_msgSend(win, sel(b"contentView\0"))
+    };
+    let ctx = if view.is_null() {
+        std::ptr::null_mut()
+    } else {
+        objc_msgSend(view, sel(b"inputContext\0"))
+    };
+    let cur = objc_msgSend(
+        cls(b"NSTextInputContext\0"),
+        sel(b"currentInputContext\0"),
+    );
+    let fr = if win.is_null() {
+        std::ptr::null_mut()
+    } else {
+        objc_msgSend(win, sel(b"firstResponder\0"))
+    };
+    let is_first = if view.is_null() || fr.is_null() {
+        0
+    } else {
+        objc_msgSend(view, sel(b"isEqual:\0"), fr) as i32
+    };
+    let responds = if view.is_null() {
+        0
+    } else {
+        objc_msgSend(
+            view,
+            sel(b"respondsToSelector:\0"),
+            sel(b"insertText:replacementRange:\0"),
+        ) as i32
+    };
+    eprintln!(
+        "[ime-probe] view={view:?} inputContext={ctx:?} currentInputContext={cur:?} \
+         viewIsFirstResponder={is_first} respondsInsertText={responds}"
+    );
 }

@@ -23,3 +23,4 @@ rusqlite = { version = "0.32.1", features = ["bundled"] }
 # 跨平台标准应用数据目录：macOS → ~/Library/Application Support
 # （App Sandbox 下系统透明重定向到容器，三态通用，避免硬编码 ~/.jiandu）
 dirs = "5"
+pinyin = "0.11.0"

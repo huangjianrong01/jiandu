@@ -21,8 +21,8 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP_NAME="笺读"
 BUNDLE_ID="com.jiandu.app"
-VERSION="1.79.0"
-BUILD_NUM="128"
+VERSION="1.0.0-beta"
+BUILD_NUM="200"
 MIN_MACOS="12.0"
 ARCH="${ARCH:-native}"
 
@@ -383,6 +383,32 @@ else
     else
         echo "· 签名校验未通过（本地运行通常无碍；如报 sealed resource，重新执行本脚本即可）"
     fi
+fi
+
+# ---- 7.5) 可选：DMG 安装镜像（DMG=1）----
+#
+# 为什么还要 dmg：内测同学拿到的应该是一个**能双击挂载、把图标拖进
+# 「应用程序」**的东西，而不是一个 zip——zip 解压出来的 app 少了那层
+# 「用户主动拖拽」的授权语境，Gatekeeper 更容易直接拒绝。
+#
+# 布局：卷里左「笺读.app」右「Applications」软链，经典拖拽式。
+# 用 `ditto` 而不是 `cp -R`：前者保留资源叉、xattr 与符号链接本身，
+# 后者会把签名相关的扩展属性丢掉（装完打不开就是这么来的）。
+if [ "${DMG:-0}" = "1" ]; then
+    DMG_OUT="$DIST/${APP_NAME}-${VERSION}.dmg"
+    STAGE="$(mktemp -d)/dmg"
+    mkdir -p "$STAGE"
+    ditto "$APP" "$STAGE/${APP_NAME}.app"
+    ln -s /Applications "$STAGE/Applications"
+    rm -f "$DMG_OUT"
+    if hdiutil create -volname "${APP_NAME} ${VERSION}" -srcfolder "$STAGE" \
+        -ov -format UDZO -fs HFS+ "$DMG_OUT" >/dev/null; then
+        echo "✓ 已生成 DMG：${DMG_OUT}（$(du -sh "$DMG_OUT" | cut -f1)）"
+    else
+        echo "✗ DMG 生成失败"
+        exit 1
+    fi
+    rm -rf "$(dirname "$STAGE")"
 fi
 
 # ---- 8) 收尾 ----

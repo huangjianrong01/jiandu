@@ -586,6 +586,40 @@ pub fn pinyin_of(c: char) -> Option<&'static str> {
     RARE.get(&c).copied()
 }
 
+/// 「常用字」白名单：**GB 2312-80 一级汉字 3755 字 ∪ 其繁体形**（5148 字）。
+///
+/// 早先的版本拿「本字书收过的字」当常见判据，口径太宽——字典为求全，
+/// 连「埵」「罣」「耨」都收，于是这批真正需要拐杖的字全被漏注。
+/// 换成国标的一级字表：`般 / 涅 / 僧 / 蕴` 在内（不注），
+/// `埵 / 罣 / 槃 / 耨 / 澹 / 隰 / 玦` 在外（注）。**繁体形一并收录**，
+/// 按繁体读时 `薩 / 劍 / 觀` 不会被当成生僻字。
+///
+/// 数据见 [`crate::common_chars`]（脚本生成，勿手改）。
+pub fn is_common_char(c: char) -> bool {
+    crate::common_chars::COMMON.contains(&c)
+}
+
+/// **自动注音**（v1.81.0）：书里没自带读音时，给**生僻字**补一条。
+///
+/// 两层判据，先窄后宽：
+/// 1. `RARE` 精选表里的字**一律注**——那份表是人工挑的「读古籍会卡住」的字
+///    （澹、泠、隰、玦…），既然挑过就别再拿白名单否掉它；
+/// 2. 其余按 [`is_common_char`]：常用字不注（满纸小字反而碍读），
+///    冷僻字由 `pinyin` crate（静态字表，零 I/O、无网络）给**常用读音**。
+///
+/// 多音字可能读错（般 bān / bō）：书里用 `<ruby>` 或 `X[拼音:bō]` 标了音就
+/// **永远以书为准**，这一层只是兜底（见 `reader::ruby_pinyin`）。
+pub fn auto_pinyin(c: char) -> Option<String> {
+    if let Some(p) = pinyin_of(c) {
+        return Some(p.to_string());
+    }
+    if is_common_char(c) {
+        return None;
+    }
+    use pinyin::ToPinyin;
+    c.to_pinyin().map(|p| p.with_tone().to_string())
+}
+
 /// 生僻字表收录字数（用于状态展示）。
 pub fn rare_len() -> usize {
     RARE.len()
@@ -754,6 +788,39 @@ mod tests {
         // 用户点名的两条测试数据必须在。
         assert!(PHRASES.iter().any(|p| p.word == "长安"));
         assert!(PHRASES.iter().any(|p| p.word == "曰"));
+    }
+
+    /// 自动注音只给**生僻字**开口子：常用字若也注，一部《论语》会满纸小字。
+    #[test]
+    fn auto_pinyin_annotates_rare_and_skips_common() {
+        // ① 精选生僻字表里的字，一律按表上的读音注（表是人工挑的）。
+        assert_eq!(auto_pinyin('澹').as_deref(), Some("dàn"));
+        assert_eq!(auto_pinyin('隰').as_deref(), Some("xí"));
+        // ② 表外但确实冷僻的字，交给 `pinyin` crate（带声调）。
+        assert_eq!(auto_pinyin('埵').as_deref(), Some("duǒ"), "「埵」该注 duǒ");
+        // ③ 常用字不注：这些字读者认得，注了反而碍眼。
+        for c in ['天', '地', '人', '之', '乎', '者', '也'] {
+            assert!(auto_pinyin(c).is_none(), "常用字「{c}」不该自动注音");
+        }
+        // ④ 非汉字一律不注（标点 / 空白 / 西文）。
+        for c in ['，', '。', ' ', 'a', '1'] {
+            assert!(auto_pinyin(c).is_none(), "「{c}」不是汉字，不该注音");
+        }
+    }
+
+    /// 白名单是「国标一级字表」的口径：日常字**简繁两侧**都得在里面。
+    #[test]
+    fn common_set_covers_everyday_classical_chars() {
+        for c in ['仁', '義', '禮', '智', '信', '學', '書', '劍', '楚', '秦'] {
+            assert!(is_common_char(c), "「{c}」被判成生僻字了");
+        }
+        // 繁体形也在（`薩 / 觀 / 涅` 按繁体读时不该逐字注音）。
+        for c in ['薩', '觀', '涅', '蘊', '僧'] {
+            assert!(is_common_char(c), "繁体「{c}」不该算生僻字");
+        }
+        assert!(!is_common_char('埵'), "「埵」不该算常用字");
+        assert!(!is_common_char('罣'), "「罣」不该算常用字");
+        assert_eq!(crate::common_chars::COMMON.len(), crate::common_chars::COMMON_LEN);
     }
 
     #[test]

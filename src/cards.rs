@@ -13,9 +13,7 @@
 
 use crate::app::Root;
 use crate::reader::sheet_zhu;
-use gpui::{
-    div, prelude::*, px, rgb, Context, Div, MouseButton, SharedString, Stateful,
-};
+use gpui::{div, prelude::*, px, rgb, Context, Div, MouseButton, SharedString};
 use jiandu_core::cards::{self, Card, CardKind};
 
 /// 列表一次最多取这么多条。
@@ -132,18 +130,16 @@ impl Root {
         cx.notify();
     }
 
-    /// **卡片匣侧栏**：右滑宣纸栏，逐条列卡片；点一条即收栏并跳回原文。
+    /// **卡片匣的条目列表**（v1.80.0）：跨书摘录卡，点一条即收栏并跳回原文。
     ///
-    /// 形态照朱批录（`render_notes_panel`）来，读作同一套东西的两个抽屉：
-    /// 一个装「批在这本书上的字」，一个装「从各本书里摘出来的句」。
-    /// **笔记抽屉 · 卡片匣页**的条目列表（v1.78.0）：跨书摘录卡，点一条即
-    /// 收栏并跳回原文。
+    /// **只有条目，不含外壳、不含滚动容器**——v1.80.0 撤掉了右侧那条独立的
+    /// 「卡片匣」侧栏（它自己的外壳 / 滑入动画 / 顶栏钮一并撤掉），卡片搬进
+    /// 左侧栏「批」印那一页的下半截，与朱批同处一条卷里滚。
     ///
-    /// **只有列表，不含外壳**——外壳与「朱批錄 / 卡片匣」两枚页签在
-    /// `Root::render_notes_panel`。原先卡片匣是一整个独立抽屉（自己的外壳、
-    /// 自己的滑入动画、自己的顶栏钮），与朱批录互斥；现在两页共用一个抽屉，
-    /// 切页签只换这一块内容。
-    pub(crate) fn render_cards_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// 为什么不该两处各滚一次：260px 宽的栏里摆两条独立滚动区，会出现两套
+    /// 滚动条，用户根本不知道该滚哪一个（实测在旧版右栏里就是这么别扭）。
+    /// 故这里只吐条目，滚动交给外层那一页。
+    pub(crate) fn render_cards_list(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let zhu = sheet_zhu(t);
         let ink = t.ink();
@@ -168,11 +164,9 @@ impl Root {
                 .collect();
 
         let mut list = div()
-            .id(SharedString::from("cards-list"))
             .flex()
             .flex_col()
-            .flex_1()
-            .overflow_y_scroll();
+            .w_full();
         if rows.is_empty() {
             list = list.child(
                 div()
@@ -257,7 +251,7 @@ impl Root {
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.show_cards_panel = false;
+                        this.close_side();
                         this.jump_to_key(key, len, cx);
                     }),
                 );
