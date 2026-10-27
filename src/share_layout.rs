@@ -14,10 +14,13 @@
 //! 竖排列款、朱批引线、印章位置。本文件零 GPUI / 零 macOS API，纯函数可单测。
 //!
 //! 排版铁律（与阅读引擎同宗）：
-//! 1. **强制首行对齐**：每一列的第一个字 `y` 恒等于 `y0`，绝不因列长而错动
-//!    （对应阅读侧的 `grid::top_baseline`）。
+//! 1. **强制首行顶格**：每一列的第一个字 `y` 恒等于 `y0`，绝不因列长而错动
+//!    （对应阅读侧的 `grid::top_baseline`）。且 `y0` **紧贴版框内缘**
+//!    （见 [`top_baseline`]）——正文块不再垂直居中，天头不留空档。
 //! 2. **从右向左**：第 0 列在最右，符合古籍行款。
 //! 3. **禁用 `unwrap`**：越界 / 除零一律走默认值。
+//! 4. **边栏 / 界行齐全**（v1.61.0）：版框（外框线）与界行（列间竖线）
+//!    由版式层一次算好，绘制层只管按序落笔——预览与成图同源。
 
 use crate::share::{ShareBg, ShareFrame, ShareSeal, frame_ink, norm_columns, palette};
 
@@ -62,6 +65,9 @@ pub struct PlacedChar {
     pub color: u32,
     /// 标点：竖排里靠字格**右上**安置，不占整格（见 `punct_box`）。
     pub punct: bool,
+    /// 列首句读被**悬挂**到网格右缘之外（禁则·避头尾）：不占列内格位，
+    /// 正文首字因此仍钉在基准线上，绝不被往下挤。
+    pub hung: bool,
 }
 
 /// 一块矩形：填充（`stroke = None`）或描边（`stroke = Some(线宽)`）。
@@ -108,6 +114,9 @@ pub struct CardLayout {
     /// 正文字体语义（离屏渲染据此挑系统 PostScript 字体）。
     pub font: ShareFont,
     pub rects: Vec<PlacedRect>,
+    /// **界行**（列间竖细线，v1.61.0）：绘制序在 `rects` 之后、`chars` 之前
+    /// ——线在下、字在上，绝不让界行压住墨迹。
+    pub rules: Vec<PlacedLine>,
     pub lines: Vec<PlacedLine>,
     pub chars: Vec<PlacedChar>,
     pub seal: Option<PlacedSeal>,
@@ -147,6 +156,25 @@ pub const META_FS_RATIO: f32 = 0.40;
 /// 朱批引线宽（px，按卡片宽缩放后的值）。
 pub const LEAD_W: f32 = 1.0;
 
+// ----------------------------------------------------------------------
+// v1.61.0：版框（边栏）与界行（列间竖线）
+//
+// 古籍版刻的三件套是「边栏 + 界行 + 中缝」：边栏是四周的框线，界行是界在
+// 列与列之间的竖细线。刻本里两者同色、粗细有别——边栏粗（朱丝栏 2px 上下）、
+// 界行细（1px 且更淡），字始终压在最上层。
+// ----------------------------------------------------------------------
+
+/// **版框（边栏）线宽**（px，以 1080 宽为基准，按卡宽缩放）。
+pub const FRAME_W: f32 = 2.0;
+/// **界行（列间竖线）线宽**（px，1080 基准）——比版框细，绝不抢字。
+pub const RULE_W: f32 = 1.0;
+/// 版框墨色不透明度（`0xRRGGBBAA` 的低字节）：实心但不刺眼。
+pub const FRAME_ALPHA: u32 = 0xC8;
+/// 界行墨色不透明度：比版框**淡一档**，只作分列的骨架。
+pub const RULE_ALPHA: u32 = 0x38;
+/// 版框内缘 → 首字顶端的**气口**（px，1080 基准）：字顶不压线，也不留天头。
+pub const TOP_GAP: f32 = 4.0;
+
 /// **列首字的绝对基准线**（v1.59.0）：所有列的第一个字，顶边一律从它起算。
 ///
 /// 取 0 是刻意的——基准线本身不带任何位移，位移只来自版框天头（见
@@ -154,13 +182,21 @@ pub const LEAD_W: f32 = 1.0;
 /// 常量，谁也不许就地加偏移：两处算法一旦分家，顶格就悄悄漂了。
 pub const TOP_BASELINE: f32 = 0.0;
 
-/// 列首基准线的**唯一取用口径**：`TOP_BASELINE + 版框内居中后的天头留白`。
+/// 列首基准线的**唯一取用口径**：`TOP_BASELINE + 版框内缘 + 气口`。
 ///
-/// 正文块在版框内垂直居中，多出来的余量落在天头与地脚各一半；这段留白是
-/// 基准线允许的唯一位移，且只由本函数给出。
-pub fn top_baseline(inner_y: f32, inner_h: f32, block_h: f32) -> f32 {
-    TOP_BASELINE + inner_y + ((inner_h - block_h) * 0.5).max(0.0)
+/// v1.61.0 起**不再垂直居中**：正文块的上沿与版框内缘（框线的下缘）只隔一个
+/// [`TOP_GAP`]——第一个字的最高点正好卡在框线下方的起点上，不压线、不悬空。
+/// 这是「首行顶格」与「版框」的视觉联动，唯一允许的天头位移就是这一段气口。
+pub fn top_baseline(inner_top: f32, scale: f32) -> f32 {
+    TOP_BASELINE + inner_top + TOP_GAP * scale
 }
+
+/// **悬挂沟**：网格右缘外侧留出的一条竖带（字格比例），专供列首句读挂靠。
+///
+/// 有了它，句读被推出列外时**不会画出画布 / 画到版框上**，正文也照旧顶格。
+pub const HANG_GUTTER: f32 = 0.62;
+/// 悬挂句读与网格右缘之间的横向间隙（字格比例）。
+pub const HANG_GAP: f32 = 0.08;
 
 /// **列首标点**（逗号 / 句号等）挂到版框**外侧**（最右列之右）时的横向外探量
 /// （字格比例）。标点被挂出去后**不再占列内格位**，正文首字因此仍钉在
@@ -180,9 +216,16 @@ pub fn is_punct(c: char) -> bool {
 }
 
 /// 标点的落位盒：字格**右上**象限，字号六成。
+///
+/// 被悬挂的句读（[`PlacedChar::hung`]）走另一路：它的 `x` 已经是「网格右缘
+/// 之外」的最终落点，故不再加 `0.42` 格的内偏移，只留 [`HANG_GAP`] 的气口。
 pub fn punct_box(p: &PlacedChar) -> (f32, f32, f32) {
-    // 竖排古籍的句读挂在字的右上方，不占整格——正文仍按整格推进。
-    (p.x + p.cell * 0.42, p.y + p.cell * 0.04, p.fs * 0.62)
+    if p.hung {
+        (p.x + p.cell * 0.02, p.y + p.cell * 0.10, p.fs * 0.62)
+    } else {
+        // 竖排古籍的句读挂在字的右上方，不占整格——正文仍按整格推进。
+        (p.x + p.cell * 0.42, p.y + p.cell * 0.04, p.fs * 0.62)
+    }
 }
 
 /// 排一张卡：底色 → 界框 → 竖排正文（含高亮 / 批注列 / 引线）→ 落款 → 朱印。
@@ -190,7 +233,12 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
     let p = palette(s.bg);
     let w = if s.w.is_finite() { s.w } else { 1080.0 }.max(240.0);
     let h = if s.h.is_finite() { s.h } else { 1920.0 }.max(360.0);
-    let pad = (w * 0.075).clamp(18.0, 46.0);
+    // 缩放：所有线宽 / 气口都以 1080 宽为基准，小卡同步收细，绝不糊成粗杠。
+    let scale = (w / 1080.0).clamp(0.5, 2.0);
+    // 版框外缘留白：左右按宽、上下按高各取一次（竖长卡的天头地脚要更从容）。
+    let pad_x = (w * 0.075).clamp(18.0, 46.0);
+    let pad_y = (h * 0.035).clamp(18.0, 72.0);
+    let fw = FRAME_W * scale;
 
     let mut out = CardLayout {
         w,
@@ -200,33 +248,28 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
         ..Default::default()
     };
 
-    // ---- 界框：双线（外淡内深），刻本「界行」的规矩 ----
-    if let Some(ink) = frame_ink(s.frame, &p) {
-        let o1 = (pad * 0.38).max(5.0);
-        let o2 = (pad * 0.66).max(9.0);
+    // ---- 版框（边栏）：一整圈矩形框线，朱丝栏取朱砂、乌丝栏取墨 ----
+    //
+    // v1.61.0：旧制是「内外两条细线」，框感太弱且不与首行咬合。现在只画一
+    // 圈实心粗线（1080 卡上 2px），且**描边骑在路径上**（线宽一半在内、一半
+    // 在外），故框的「内缘」= `inset + fw/2`——首行基准线就认这条内缘。
+    let border = frame_ink(s.frame, &p);
+    if let Some(ink) = border {
         out.rects.push(PlacedRect {
-            x: o1,
-            y: o1,
-            w: (w - o1 * 2.0).max(20.0),
-            h: (h - o1 * 2.0).max(20.0),
-            color: (ink << 8) | 0x4D,
-            stroke: Some((w / 1080.0).max(0.6)),
-        });
-        out.rects.push(PlacedRect {
-            x: o2,
-            y: o2,
-            w: (w - o2 * 2.0).max(20.0),
-            h: (h - o2 * 2.0).max(20.0),
-            color: (ink << 8) | 0xA6,
-            stroke: Some((w / 1080.0 * 1.6).max(1.0)),
+            x: pad_x,
+            y: pad_y,
+            w: (w - pad_x * 2.0).max(20.0),
+            h: (h - pad_y * 2.0).max(20.0),
+            color: (ink << 8) | FRAME_ALPHA,
+            stroke: Some(fw),
         });
     }
 
-    // ---- 内容区 ----
-    let inner_x = pad;
-    let inner_y = pad;
-    let inner_w = (w - pad * 2.0).max(80.0);
-    let inner_h = (h - pad * 2.0).max(120.0);
+    // ---- 版框内的工作区（版心）----
+    let inner_l = pad_x + fw * 0.5;
+    let inner_r = (w - pad_x - fw * 0.5).max(inner_l + 40.0);
+    let inner_t = pad_y + fw * 0.5;
+    let inner_b = (h - pad_y - fw * 0.5).max(inner_t + 40.0);
 
     let n = s.body.len();
     let cols_max = norm_columns(s.columns).max(1);
@@ -235,14 +278,30 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
     let note_cols = if want_note { 1 } else { 0 };
 
     // 字格：先按「满列铺开」取，装不下就整体缩字号（绝不加列、绝不溢出）。
-    let mut cell = inner_w / (cols_max + note_cols) as f32;
+    //
+    // 分母多算三段：批注列 + 右侧**悬挂沟**（列首句读挂出去的地方）。悬挂沟
+    // 先按字格比例占位，句读因此绝不会画到版框上、更不会出画布。
+    let denom = (cols_max + note_cols) as f32 + HANG_GUTTER;
+    // 左下角落款 / 朱印要占一条竖带，先从版心宽里扣掉（否则满列时字压落款）。
+    let meta_on = (s.show_sign && !s.sign.is_empty()) || (s.show_date && !s.date.is_empty());
+    let meta_cell_of = |cell: f32| -> f32 {
+        ((cell / CELL_RATIO) * META_FS_RATIO).clamp(11.0, 26.0) * CELL_RATIO
+    };
+    let reserve = if meta_on {
+        meta_cell_of((inner_r - inner_l) / denom) * 2.0 + 14.0 * scale
+    } else {
+        0.0
+    };
+    let grid_l = inner_l + reserve; // 正文网格的左界（版心内）
+    let avail_w = (inner_r - grid_l).max(60.0);
+    let mut cell = avail_w / denom;
     let mut fs = (cell / CELL_RATIO).max(8.0);
-    let mut rows = (inner_h / cell).floor().max(3.0);
+    let mut rows = ((inner_b - top_baseline(inner_t, scale)) / cell).floor().max(3.0);
     let mut guard = 0;
     while (cols_max as f32 * rows) < n as f32 && fs > 9.0 && guard < 40 {
         fs = (fs * 0.92).max(9.0);
         cell = fs * CELL_RATIO;
-        rows = (inner_h / cell).floor().max(3.0);
+        rows = ((inner_b - top_baseline(inner_t, scale)) / cell).floor().max(3.0);
         guard += 1;
     }
 
@@ -261,13 +320,34 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
         (shown as f32 / cols_used as f32).ceil() as usize
     };
     let block_w = cols_used as f32 * cell;
-    let block_h = rows_used as f32 * cell;
-    // 居中：批注列留在正文块的左侧，故整体右移一列。
-    let x0 = inner_x + ((inner_w - block_w - note_cols as f32 * cell) * 0.5).max(0.0)
-        + note_cols as f32 * cell;
-    // 铁律 1：列首 y 恒等于 y0 —— 每列都从这里起笔，绝不因列长而错动。
-    // 基准线只由 `top_baseline` 给出（`TOP_BASELINE` 是它的零点）。
-    let y0 = top_baseline(inner_y, inner_h, block_h);
+    // 居中：批注列留在正文块的左侧，右侧再让出悬挂沟，三者一并居中。
+    let span = note_cols as f32 * cell + block_w + HANG_GUTTER * cell;
+    let x0 = grid_l + ((avail_w - span) * 0.5).max(0.0) + note_cols as f32 * cell;
+    // 铁律 1 + 版框联动：列首 y 恒等于 y0 —— 每列都从这里起笔，绝不因列长而
+    // 错动；y0 本身紧贴**版框内缘**（`top_baseline` 是它的唯一口径），故第一
+    // 个字的最高点正好卡在框线下方的起点上：不压线、也不留天头空档。
+    let y0 = top_baseline(inner_t, scale);
+
+    // ---- 界行（列间竖细线）：通版心高，界在列与列之间 ----
+    //
+    // 刻本的界行只画**内部列界**（最左 / 最右由版框自己收口），故条数是
+    // 「总列数 − 1」；线色比版框淡一档、线宽 1px，绝不抢墨迹的视觉焦点。
+    if border.is_some() && cols_used > 0 {
+        let grid_left = x0 - note_cols as f32 * cell; // 最左一列（含批注列）的左缘
+        let total = cols_used + note_cols;
+        let rule_c = ((border.unwrap_or(p.ink)) << 8) | RULE_ALPHA;
+        for k in 1..total {
+            let x = grid_left + k as f32 * cell;
+            out.rules.push(PlacedLine {
+                x1: x,
+                y1: inner_t,
+                x2: x,
+                y2: inner_b,
+                color: rule_c,
+                width: RULE_W * scale,
+            });
+        }
+    }
 
     // ---- 正文：从右向左，逐格落字 ----
     let mut first_marked: Option<usize> = None;
@@ -275,11 +355,12 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
     // 故它不推进游标，正文首字因此仍落在 row 0（＝基准线）。
     let (mut col, mut row, mut hung) = (0usize, 0usize, 0usize);
     for (i, &ch) in s.body.iter().enumerate().take(shown) {
-        // 禁则·列首标点悬挂（v1.59.0）：这一格若落在列首、且是句读，
-        // 就**不占格**，改挂到版框右缘之外（X 轴偏移），正文照旧顶格。
+        // 禁则·列首标点悬挂（v1.59.0 / v1.61.0 收进悬挂沟）：这一格若落在列首
+        // 且是句读，就**不占格**，改挂到网格右缘之外的悬挂沟里（X 轴偏移），
+        // 正文照旧顶格——绝不为让标点而把后面的字往下挤。
         let head_punct = row == 0 && is_punct(ch);
         let x = if head_punct {
-            inner_x + inner_w + cell * HEAD_PUNCT_OUTSET
+            x0 + block_w + cell * HANG_GAP
         } else {
             x0 + (cols_used as f32 - 1.0 - col as f32) * cell
         };
@@ -323,6 +404,7 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
             fs,
             color,
             punct: is_punct(ch),
+            hung: head_punct,
         });
     }
 
@@ -331,7 +413,7 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
         let note_fs = (fs * NOTE_FS_RATIO).max(9.0);
         let note_cell = note_fs * CELL_RATIO;
         let nx = x0 - cell; // 最左一列的左邻
-        let take = ((inner_h * 0.62) / note_cell).floor() as usize;
+        let take = (((inner_b - y0) * 0.62) / note_cell).floor() as usize;
         let mut ny = y0;
         for (i, ch) in s.note.chars().take(take).enumerate() {
             out.chars.push(PlacedChar {
@@ -342,12 +424,19 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
                 fs: note_fs,
                 color: p.accent,
                 punct: is_punct(ch),
+                hung: false,
             });
             ny += note_cell;
             let _ = i;
         }
-        // 引线：被批的第一个字（无划线则取首字）→ 批注首字，极细朱砂横引。
-        let anchor = first_marked.unwrap_or(0);
+        // 引线：被批的第一个字（无划线则取**最贴近批注列的首字**）→ 批注首字。
+        //
+        // 无划线时不能取全篇首字（它在最右一列！）：那根引线会横穿整片正文，
+        // 把字划得乱七八糟。改取最左一列的首字，引线只在批注列与正文之间。
+        let anchor = first_marked.unwrap_or_else(|| {
+            let left_col = cols_used.saturating_sub(1);
+            (left_col * rows_used).min(shown.saturating_sub(1))
+        });
         let acol = anchor / rows_used.max(1);
         let arow = anchor % rows_used.max(1);
         let ax = x0 + (cols_used as f32 - 1.0 - acol as f32) * cell;
@@ -362,9 +451,12 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
         });
     }
 
-    // ---- 落款与朱印：卡片左下角（古籍里「版心外」的题识位）----
+    // ---- 落款与朱印：版心内左下角（古籍里「版框内」的题识位）----
+    //
+    // v1.61.0：整体收进版框内缘，且左侧已预留 `reserve` 竖带，落款与正文
+    // 网格永不叠字。
     let seal_size = (w * 0.085).clamp(28.0, 44.0);
-    let inset = (pad * 0.55).max(8.0);
+    let inset = inner_l + 6.0 * scale;
     let meta_fs = (fs * META_FS_RATIO).clamp(11.0, 26.0);
     let meta_cell = meta_fs * CELL_RATIO;
 
@@ -376,15 +468,16 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
     if s.show_date && !s.date.is_empty() {
         cols_meta.push((0.0, s.date));
     }
-    let base_bottom = h - inset - seal_size - 10.0;
-    // 可用高：从版框天头到印章上沿。落款按它截字，绝不溢出卡片。
-    let avail = (base_bottom - pad).max(meta_cell);
+    // 印章上方留 12px 气口给落款，落款末字与印面不粘。
+    let base_bottom = inner_b - 6.0 * scale - seal_size - 12.0 * scale;
+    // 可用高：从「首行基准线」到落款底——落款按它截字，绝不溢出版框。
+    let avail = (base_bottom - y0).max(meta_cell);
     let take_meta = (avail / meta_cell).floor() as usize;
     for (k, (_x, text)) in cols_meta.iter().enumerate() {
         let cx = inset + (cols_meta.len() as f32 - 1.0 - k as f32) * meta_cell;
         let chars: Vec<char> = text.chars().take(take_meta).collect();
         let block = chars.len() as f32 * meta_cell;
-        let top = (base_bottom - block).max(pad);
+        let top = (base_bottom - block).max(y0);
         for (i, ch) in chars.iter().enumerate() {
             out.chars.push(PlacedChar {
                 ch: *ch,
@@ -394,13 +487,14 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
                 fs: meta_fs,
                 color: p.meta,
                 punct: is_punct(*ch),
+                hung: false,
             });
         }
     }
 
     out.seal = Some(PlacedSeal {
         x: inset,
-        y: h - inset - seal_size,
+        y: (inner_b - 6.0 * scale - seal_size).max(y0),
         size: seal_size,
         kind: s.seal,
         text: s.seal_text.to_string(),
@@ -440,7 +534,10 @@ mod tests {
     /// 铁律 1：每一列的第一个字，y 必须绝对相同（首行顶格）。
     #[test]
     fn every_column_starts_on_the_same_baseline() {
-        let body: Vec<char> = "道可道非常道名可名非常名無名天地之始有名萬物之母".chars().collect();
+        // 字数要能撑出多列（12 列档下每列约 24 字），否则无从比较列首。
+        let body: Vec<char> = "道可道非常道名可名非常名無名天地之始有名萬物之母故常無欲以觀其妙常有欲以觀其徼此兩者同出而異名同謂之玄玄之又玄眾妙之門"
+            .chars()
+            .collect();
         let red = vec![false; body.len()];
         let l = layout(&spec(&body, &red));
         let body_chars: Vec<&PlacedChar> =

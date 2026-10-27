@@ -8,3 +8,8 @@ resources/fonts/*.otf
 resources/fonts/*.ttf
 ios/*/build/
 ios/**/build/
+
+# 构建产物：.app 包与打包输出目录，绝对不进源码仓库
+dist/
+*.app
+

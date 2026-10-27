@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- App Store 强制：应用沙盒。开启后 ~/Library/Application Support/com.jiandu.app
+         会被系统透明重定向到容器，无需改代码。 -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- 允许用户用「打开」对话框导入自己的书（.txt/.epub/.md/.html 等），并写入。
+         不开启则沙盒下读不到用户任意位置的文件。 -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+
+    <!-- 内置 resources/books 位于 App 自身 bundle 内，沙盒默认可读，无需额外授权。 -->
+</dict>
+</plist>

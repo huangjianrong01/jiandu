@@ -719,9 +719,15 @@ impl ImportJob {
                     *g = s;
                 }
             };
-            let r = crate::stream::import_streaming(&p, Some(Box::new(cb)))
-                .map(|(book, id)| (book, id, p.clone()))
-                .map_err(|e| e.to_string());
+            // 主路：core 的流式导入（逐章落 chapters.db，书架只留骨架）。
+            // 兜底：v1.62.0 的多格式漏斗——脏编码 TXT / 畸形 EPUB / 半截 JSON
+            // 这类「主路读不动」的稿子，换漏斗再试一次（整本入库，store_id 留空）。
+            let r = match crate::stream::import_streaming(&p, Some(Box::new(cb))) {
+                Ok((book, id)) => Ok((book, id, p.clone())),
+                Err(main_err) => crate::importer::import_file(&p)
+                    .map(|ir| (ir.to_book(), String::new(), p.clone()))
+                    .map_err(|e| format!("{main_err}；兜底也失败：{e}")),
+            };
             if let Ok(mut g) = done2.lock() {
                 *g = Some(r);
             }
@@ -2468,6 +2474,33 @@ impl Root {
         self.import_job = Some(ImportJob::start(path));
     }
 
+    /// 漏斗兜底入架（v1.62.0）：整本书写成一个书稿 json，再走旧的非流式入架。
+    ///
+    /// 为什么不做流式：流式入库（`admit_streamed`）要求正文已经在 `chapters.db`
+    /// 里、书架只留骨架；漏斗是「一次性解析整本」，没有落库步骤。整本入库对
+    /// 脏文件足够——这类书本来就不大，且是少数派路径，不占用常规导入的性能。
+    fn admit_whole(&mut self, src: &std::path::Path, book: &Book) -> anyhow::Result<usize> {
+        let dir = crate::library::Library::books_dir();
+        std::fs::create_dir_all(&dir)?;
+        let stem = src
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("book")
+            .to_string();
+        let mut dst = dir.join(format!("{stem}.json"));
+        let mut n = 2;
+        while dst.exists() {
+            let cand = dir.join(format!("{stem}-{n}.json"));
+            if !cand.exists() {
+                dst = cand;
+                break;
+            }
+            n += 1;
+        }
+        crate::importer::write_book_json(book, &dst)?;
+        self.library.import_path(&dst)
+    }
+
     /// 每帧看一眼后台导入：**没完**就继续画进度，**完了**就登记入架。
     pub fn poll_import(&mut self, cx: &mut Context<Self>) {
         let Some(job) = self.import_job.take() else {
@@ -2482,7 +2515,13 @@ impl Root {
         match res {
             Ok((book, sid, src)) => {
                 let title = book.title.clone();
-                match self.library.admit_streamed(&src, &book, &sid) {
+                // `sid` 为空 = 走的是漏斗兜底（整本入库），不是流式骨架。
+                let admitted = if sid.is_empty() {
+                    self.admit_whole(&src, &book)
+                } else {
+                    self.library.admit_streamed(&src, &book, &sid)
+                };
+                match admitted {
                     Ok(_) => self.notice = format!("已上架：{title}"),
                     Err(e) => self.notice = format!("导入失败：{e}"),
                 }

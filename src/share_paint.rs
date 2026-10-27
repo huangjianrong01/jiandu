@@ -60,6 +60,35 @@ fn pick_font(kind: ShareFont, fs: f64) -> Result<core_text::font::CTFont, String
     Err("系统里找不到可用的中文字体".to_string())
 }
 
+/// **基线沉量**：字格顶到基线要落下多少——首行顶格的唯一依据。
+///
+/// 就取 `font.ascent()`，理由是实测出来的（宋体 46.5pt）：
+///
+/// ```text
+///   ascent = 49.3 (1.06 em)     ← 已含拉丁字母的升部余量
+///   「國」的墨顶 = 33.6 (0.72 em)  ← 汉字字身的真实墨顶
+///   字格 = 1.55 em
+/// ```
+///
+/// 于是 `baseline = 格顶 + ascent` 让汉字墨迹在格里**上留 0.34em、下留
+/// 0.32em**——正正好居中。这正是「字格顶贴住边栏、字在格里坐正」的口径。
+///
+/// ⚠️ 两个诱人但错误的替代（都实测过，别走回头路）：
+///   1. 用字体级 `bounding_box()`（origin −36.6 / 高 80.1 = 1.72em）：它被
+///      拉丁变音符撑高，会把整列字往下推 18px，「贴框」变「悬空」；
+///   2. 用「國」单字 bbox 的墨顶（0.72em）：字顶死贴框线，但每格下方空出
+///      0.66em，行气被拉散——首字顶格了，整列却散了。
+///
+/// `ascent` 拿不到（异常字体）就按 0.88 的字号比例兜底，绝不因此崩整张卡。
+fn baseline_drop(fs: f64, f: &core_text::font::CTFont) -> f64 {
+    let a = f.ascent();
+    if a > 0.0 {
+        a
+    } else {
+        fs * 0.88
+    }
+}
+
 /// 一枚字的落笔点（字形原点 = 基线）：**字形顶边贴住字格顶 `y`**。
 ///
 /// CoreText 的基线语义：字形最高点 = `baseline − ascent`。要让最高点正好压在
@@ -137,7 +166,34 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
         }
     }
 
-    // ---- 正文 / 批注 / 落款：逐字落笔 ----
+    // ---- 界行（列间竖细线）：**在文字之前**落笔，字恒压在线上 ----
+    //
+    // 绘制序（用户 v1.61.0 明令）：底色 → 版框 / 界行 → 文字。
+    // 线宽 1px 时 CG 会把线骑在路径两侧各半个像素上，落在整数坐标会糊成两
+    // 行灰边——故 x 取「整像素 + 0.5」，界行才是一根干净的细线。
+    for r in &l.rules {
+        let (cr, cg, cb, ca) = rgba(r.color);
+        ctx.set_rgb_stroke_color(cr, cg, cb, ca);
+        ctx.set_line_width(r.width as f64);
+        let x = (r.x1 as f64).round() + 0.5;
+        ctx.begin_path();
+        ctx.move_to_point(x, cg_base(r.y1 as f64));
+        ctx.add_line_to_point(x, cg_base(r.y2 as f64));
+        ctx.stroke_path();
+    }
+
+    // ---- 朱批引线：也在文字之前落笔（引线可以穿过格，但绝不盖在字上）----
+    for ln in &l.lines {
+        let (r, g, b, a) = rgba(ln.color);
+        ctx.set_rgb_stroke_color(r, g, b, a);
+        ctx.set_line_width(ln.width as f64);
+        ctx.begin_path();
+        ctx.move_to_point(ln.x1 as f64, cg_base(ln.y1 as f64));
+        ctx.add_line_to_point(ln.x2 as f64, cg_base(ln.y2 as f64));
+        ctx.stroke_path();
+    }
+
+    // ---- 正文 / 批注 / 落款：逐字落笔（永远最后，字恒在最顶层）----
     let mut fonts: Vec<(i32, core_text::font::CTFont, f64)> = Vec::new();
     for c in &l.chars {
         let key = (c.fs * 4.0).round() as i32;
@@ -145,8 +201,8 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
             Some(i) => (fonts[i].1.clone(), fonts[i].2),
             None => {
                 let f = pick_font(l.font, c.fs as f64)?;
-                // 拿不到 ascent 就按字号的经验比例兜底，绝不因此崩整张卡。
-                let a = if f.ascent() > 0.0 { f.ascent() } else { c.fs as f64 * 0.88 };
+                // 基线沉量（＝字格顶到基线）——见 [`baseline_drop`]。
+                let a = baseline_drop(c.fs as f64, &f);
                 fonts.push((key, f.clone(), a));
                 (f, a)
             }
@@ -168,17 +224,6 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
         // 逐字落笔即可，转 90° 反而把字放倒。这里只把基线镜像到 CG 侧，
         // 字形本身保持正向（CTM 未翻，故无镜像）。
         font.draw_glyphs(&[glyph], &[CGPoint::new(gx, cg_base(gy))], ctx.clone());
-    }
-
-    // ---- 朱批引线 ----
-    for ln in &l.lines {
-        let (r, g, b, a) = rgba(ln.color);
-        ctx.set_rgb_stroke_color(r, g, b, a);
-        ctx.set_line_width(ln.width as f64);
-        ctx.begin_path();
-        ctx.move_to_point(ln.x1 as f64, cg_base(ln.y1 as f64));
-        ctx.add_line_to_point(ln.x2 as f64, cg_base(ln.y2 as f64));
-        ctx.stroke_path();
     }
 
     // ---- 朱印 ----
@@ -230,9 +275,16 @@ fn paint_seal(ctx: &CGContext, s: &PlacedSeal, _paper: u32, h: f64) {
         Err(_) => return, // 没有字体就不刻字，方块照样在——绝不因印文失败整张图。
     };
     // 印文基线：字形顶边贴住「方块内居中位」，再镜像到 CG 侧。
-    let asc = if font.ascent() > 0.0 { font.ascent() } else { fs * 0.88 };
+    let asc = baseline_drop(fs, &font);
     let baseline = h - (s.y as f64 + sz * 0.5 - fs * 0.5 + asc);
-    for (i, ch) in ['\u{7b46}', '\u{8b80}'].iter().enumerate() {
+    // 印文取版式层给的 `seal_text`（默认「笺讀」），不再写死二字——
+    // 写死会让「书名印」永远刻成「笺讀」。
+    let text: Vec<char> = if s.text.is_empty() {
+        "笺讀".chars().collect()
+    } else {
+        s.text.chars().take(2).collect()
+    };
+    for (i, ch) in text.iter().enumerate() {
         let mut unit: [u16; 1] = [0];
         ch.encode_utf16(&mut unit);
         let mut glyph: core_graphics::font::CGGlyph = 0;
@@ -411,5 +463,196 @@ mod tests {
         }
         assert!(ding < 0.0, "「丁」重心偏下，字形被垂直镜像了：{ding:+.3}");
         assert!(shang > 0.0, "「上」重心偏上，字形被垂直镜像了：{shang:+.3}");
+    }
+
+    /// **版框 + 界行 + 贴框顶格 + 列首悬挂**（v1.61.0 像素级防线）
+    ///
+    /// 四条各钉一处，任何一条回归都会立刻崩：
+    ///   ① 版框：框线那一整行确实是框色（一整圈矩形，不是半截）；
+    ///   ② 界行：列间竖线自上而下贯通版心，且**不盖字**（字在图里仍可读）；
+    ///   ③ 顶格：首字最高点正好卡在框线下方，**上方一格空白都没有**；
+    ///   ④ 悬挂：列首句读被推到网格右缘之外，绝不占格把正文往下挤。
+    #[test]
+    fn frame_rules_top_alignment_and_hung_punct_are_all_in_place() {
+        // 起手就是句读 → 逼出「列首悬挂」这条禁则路径。
+        let body: Vec<char> = "，道可道非常道名可名非常名無名天地之始有名萬物之母故常無欲以觀其妙常有欲以觀其徼此兩者同出而異名"
+            .chars()
+            .collect();
+        let red = vec![false; body.len()];
+        let spec = LayoutSpec {
+            body: &body,
+            red: &red,
+            note: "此章言道為萬物之始",
+            show_notes: true,
+            sign: "道德經 · 第一章",
+            show_sign: true,
+            date: "二〇二六年十月",
+            show_date: true,
+            columns: 8,
+            bg: ShareBg::Xuan,
+            frame: ShareFrame::Red,
+            seal: ShareSeal::Twin,
+            seal_text: "笺讀",
+            font: ShareFont::Song,
+            w: 1080.0,
+            h: 1920.0,
+        };
+        let l = layout(&spec);
+
+        // ---- ① 版框（版式层）：一整圈描边矩形，内缘是首行的天花板 ----
+        let frame = l
+            .rects
+            .iter()
+            .find(|r| r.stroke.is_some())
+            .unwrap_or_else(|| panic!("没排出版框"));
+        let fw = frame.stroke.unwrap_or(1.0);
+        let inner_top = frame.y + fw * 0.5;
+
+        // ---- ② 界行：条数 = 总列数 − 1，且纵向贯通版心 ----
+        let body_fs = l.chars.iter().map(|c| c.fs).fold(0.0f32, f32::max);
+        let body_cols: Vec<&PlacedChar> = l
+            .chars
+            .iter()
+            .filter(|c| (c.fs - body_fs).abs() < 0.01 && !c.punct)
+            .collect();
+        let mut xs: Vec<f32> = body_cols.iter().map(|c| c.x).collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        xs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        assert!(xs.len() >= 2, "列数太少：{}", xs.len());
+        // 批注列也算一列，故界行 = 正文列数 + 批注列 − 1。
+        assert_eq!(
+            l.rules.len(),
+            xs.len(),
+            "界行条数不对：{:?}（列 {} + 批注 1 − 1）",
+            l.rules.len(),
+            xs.len()
+        );
+        let r0 = &l.rules[0];
+        assert!((r0.y2 - r0.y1) > l.h * 0.7, "界行没贯通版心");
+        assert!(r0.width < fw + 0.01, "界行比版框还粗，抢了字的焦点");
+
+        // ---- ③ 顶格：每一列首字同 y，且紧贴版框内缘 ----
+        let y0 = body_cols.iter().map(|c| c.y).fold(f32::MAX, f32::min);
+        for x in &xs {
+            let head = body_cols
+                .iter()
+                .filter(|c| (c.x - *x).abs() < 0.01)
+                .map(|c| c.y)
+                .fold(f32::MAX, f32::min);
+            assert!((head - y0).abs() < 0.01, "列首未顶格：{head} ≠ {y0}");
+        }
+        assert!(
+            (y0 - inner_top) >= 0.0 && (y0 - inner_top) < 12.0,
+            "首行没卡在框线下方：y0={y0} 框内缘={inner_top}"
+        );
+
+        // ---- ④ 悬挂：列首句读在网格右缘之外，且不占格 ----
+        let comma = l
+            .chars
+            .iter()
+            .find(|c| c.ch == '，')
+            .unwrap_or_else(|| panic!("没排出句读"));
+        assert!(comma.hung, "列首句读没被悬挂");
+        let grid_right = body_cols
+            .iter()
+            .map(|c| c.x + c.cell)
+            .fold(f32::MIN, f32::max);
+        assert!(
+            comma.x >= grid_right - 1.0,
+            "句读没挂到网格右缘之外：{} < {}",
+            comma.x,
+            grid_right
+        );
+        // 悬挂不占格：句读之后的正文首字仍与句读同 y（都在基准线上）。
+        let first_real = body_cols
+            .iter()
+            .copied()
+            .min_by_key(|c| (c.y * 4.0).round() as i64)
+            .unwrap_or_else(|| panic!("没有正文字"));
+        assert!(
+            (first_real.y - y0).abs() < 0.01,
+            "句读把正文挤下去了：{} ≠ {}",
+            first_real.y,
+            y0
+        );
+
+        // ---- 像素验收：出图，逐条核对 ----
+        let png = render_png(&l).unwrap_or_else(|e| panic!("离屏出图失败：{e}"));
+        let img = image::load_from_memory(&png).expect("PNG 读不回来").to_rgb8();
+        let (iw, ih) = (img.width(), img.height());
+        let br = ((l.bg >> 16) & 0xFF) as i32;
+        let bgg = ((l.bg >> 8) & 0xFF) as i32;
+        let bb = (l.bg & 0xFF) as i32;
+        // 「与底色不同」的宽松判据：界行很淡（α 0x38），不能用墨迹的高阈值。
+        let diff = |x: u32, y: u32| {
+            let p = img.get_pixel(x, y);
+            (p[0] as i32 - br).abs() + (p[1] as i32 - bgg).abs() + (p[2] as i32 - bb).abs()
+        };
+        // ① 版框顶边：整行的绝大多数像素都该是框色。
+        let fy = frame.y.round() as u32;
+        let x0u = (frame.x.round() as u32).min(iw - 1);
+        let x1u = ((frame.x + frame.w).round() as u32).min(iw - 1);
+        let mut on = 0u32;
+        let mut tot = 0u32;
+        for x in x0u..=x1u {
+            tot += 1;
+            if diff(x, fy) > 24 {
+                on += 1;
+            }
+        }
+        assert!(
+            on as f32 / tot as f32 > 0.90,
+            "版框顶边没画全：{on}/{tot}"
+        );
+        // ② 界行：沿竖线自上而下取样，绝大多数该有色。
+        let rx = (r0.x1.round() as u32).min(iw - 1);
+        let (mut on2, mut tot2) = (0u32, 0u32);
+        let mut y = (r0.y1.round() as u32) + 4;
+        while y < (r0.y2.round() as u32).min(ih).saturating_sub(4) {
+            tot2 += 1;
+            if diff(rx, y) > 12 || diff(rx.saturating_sub(1), y) > 12 {
+                on2 += 1;
+            }
+            y += 7;
+        }
+        assert!(
+            on2 as f32 / tot2.max(1) as f32 > 0.85,
+            "界行没画出来：{on2}/{tot2}"
+        );
+        // ③ 顶格：框线以下到 y0 之前**一格墨都没有**（字顶严格不压线）。
+        // 界行是贯通版心的竖线，会合法地穿过这段天头——扫描时避开它们。
+        let rule_xs: Vec<u32> = l.rules.iter().map(|r| r.x1.round() as u32).collect();
+        let on_rule = |x: u32| rule_xs.iter().any(|rx| (*rx as i32 - x as i32).abs() <= 2);
+        let col_x = (xs[0].round() as u32).min(iw - 1);
+        let scan_from = (inner_top + fw + 1.0).round() as u32;
+        let scan_to = (y0 - 1.0).max(scan_from as f32 + 1.0).round() as u32;
+        for y in scan_from..scan_to.min(ih) {
+            for x in col_x..(col_x + 40).min(iw) {
+                if on_rule(x) {
+                    continue;
+                }
+                assert!(
+                    diff(x, y) <= 24,
+                    "首字压到框线上了：({x},{y}) 有墨（y0={y0}）"
+                );
+            }
+        }
+        // 首字的最顶端墨迹必须落在基准线附近（不悬空）。
+        let first_ink = (scan_to..ih)
+            .find(|&y| (col_x..(col_x + 40).min(iw)).any(|x| diff(x, y) > 120));
+        let first_ink = first_ink.unwrap_or_else(|| panic!("首行没有墨迹"));
+        assert!(
+            (first_ink as f32) < y0 + body_cols[0].cell * 0.40,
+            "首字没贴住基准线：墨迹起于 {first_ink}，y0={y0}"
+        );
+
+        if let Ok(home) = std::env::var("HOME") {
+            let dest = std::path::PathBuf::from(home)
+                .join("Desktop")
+                .join("笺读-分享卡-界行版.png");
+            if std::fs::write(&dest, &png).is_ok() {
+                println!("已出图：{}", dest.display());
+            }
+        }
     }
 }

@@ -3,7 +3,7 @@ members = ["core"]
 
 [package]
 name = "jiandu"
-version = "1.60.0"
+version = "1.62.0"
 edition = "2021"
 description = "笺读 · 一个用 Rust + GPUI 写的原生中文阅读器（古文竖笺 / 现代横笺）"
 license = "MIT"
@@ -32,6 +32,9 @@ quick-xml = "0.36"
 encoding_rs = "0.8"
 # 简繁对照表
 once_cell = "1"
+# 导入漏斗（v1.62.0）：Markdown / JSON 的记号剥离与抢救用正则。
+# 只用作「去 #、**、>」这类确定性替换，不处理用户输入的正则（无 ReDoS 面）。
+regex = "1"
 # 原生文件选择器（导入 md/txt/epub/json）
 rfd = "0.14"
 # 导出分享：PNG 笺卡走 macOS `screencapture` 直截屏幕，无需 image / flate2。
