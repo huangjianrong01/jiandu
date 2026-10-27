@@ -98,6 +98,12 @@ pub struct Prefs {
     /// 深底上会发闷，也压过了正文的月白。
     #[serde(default)]
     pub punct_ink: usize,
+    /// **繁简显示档**（v1.81.0）：0 = 原文、1 = 简体、2 = 繁体。
+    ///
+    /// 老存档没有这一项（`None`）→ 由下面那个旧的 `trad` 布尔推：true 当繁体、
+    /// false 当简体，与升级前的观感**完全一致**。新存档一律写这一项。
+    #[serde(default)]
+    pub trad_mode: Option<usize>,
     /// **回锋**（v1.80.0）：读那一撇的出锋末端带不带一小勾。
     #[serde(default)]
     pub punct_hook: bool,
@@ -148,6 +154,7 @@ impl Default for Prefs {
             punct_mode: 0,
             // 朱砂（v1.66.0 用户定）：句读一直是朱笔点的，升级不该悄悄换色。
             punct_ink: 1,
+            trad_mode: None,
             punct_hook: false,
             keys: Vec::new(),
             narrow_hint_seen: false,
@@ -214,9 +221,33 @@ impl Prefs {
     pub fn punct_mode(&self) -> crate::gloss::PunctMode {
         pick(&crate::gloss::PunctMode::ALL, self.punct_mode)
     }
+    /// 繁简显示档（原文 / 简体 / 繁体）。老存档由 `trad` 布尔推。
+    pub fn trad_mode(&self) -> crate::trad::TradMode {
+        match self.trad_mode {
+            Some(i) => pick(&crate::trad::TradMode::ALL, i),
+            None => {
+                if self.trad {
+                    crate::trad::TradMode::Traditional
+                } else {
+                    crate::trad::TradMode::Simplified
+                }
+            }
+        }
+    }
     /// 句读墨色（墨 / 朱砂）。
     pub fn punct_ink(&self) -> crate::gloss::PunctInk {
         pick(&crate::gloss::PunctInk::ALL, self.punct_ink)
+    }
+
+    /// 只把**繁简档**写盘（不动其它字段）。
+    ///
+    /// 全仓没有「界面 → Prefs」的总收口，所以每一处改设置都得自己写这一下；
+    /// 写成静态方法，免得调用方再去拼一遍下标。
+    pub fn save_trad(m: crate::trad::TradMode) {
+        let mut p = Self::load();
+        p.trad_mode = crate::trad::TradMode::ALL.iter().position(|x| *x == m);
+        p.trad = m == crate::trad::TradMode::Traditional;
+        p.save();
     }
 
     /// 留白档 → 版心率（0.60 / 0.75 / 0.90）。下标越界回落默认档，

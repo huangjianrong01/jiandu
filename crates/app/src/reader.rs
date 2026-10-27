@@ -2010,6 +2010,12 @@ impl Root {
                     //    不能被任何 ⌘ 组合抢走。
                     let chord = crate::keys::chord_of(&event.keystroke);
                     if let Some(action) = self.keymap.resolve(&chord) {
+                        // 诊断钩子：JIANDU_KEYLOG=1 时把「按了什么 → 落到哪个
+                        // 动作」打到 stderr。用户报「某键没反应」时，先看这行
+                        // 就知道是键没到、还是到了没绑（同 JIANDU_LOOKUP 一类）。
+                        if std::env::var_os("JIANDU_KEYLOG").is_some() {
+                            eprintln!("[key] {} → {}", chord.display(), action.id());
+                        }
                         self.run_action(action, window, cx);
                         return;
                     }
@@ -2051,7 +2057,12 @@ impl Root {
                 self.save_punct_prefs();
             }
             A::Rare => self.show_rare = !self.show_rare,
-            A::Traditional => self.show_traditional = !self.show_traditional,
+            A::Traditional => {
+                // 三档轮换：原文 → 简体 → 繁体 → 原文。
+                let all = jiandu_core::trad::TradMode::ALL;
+                let i = all.iter().position(|m| *m == self.trad_mode).unwrap_or(0);
+                self.set_trad_mode(all[(i + 1) % all.len()], cx);
+            }
             A::Theme => self.cycle_theme(),
             A::Style => self.set_ui_state(AppUIState::Style, cx),
             A::Side => {
@@ -2230,14 +2241,25 @@ impl Root {
             } else {
                 self.keymap.chord(a).display()
             };
-            let chip_fg = if waiting { t.accent() } else { t.chrome_text() };
-            let chip_bg = if waiting { t.chip_on() } else { t.chip() };
+            // 键帽：**定宽 + 细边**。定宽是为了让「⌘F」「⌘⌥⇧P」右缘对齐成
+            // 一列——宽窄跟着字数走的话，整列会像被狗啃过；细边是因为面板
+            // 底色（chip）与纸色几乎同色，不描边就只剩一串悬空的字。
+            let (chip_fg, chip_bg, chip_line) = if waiting {
+                (t.accent(), t.chip_on(), t.accent())
+            } else {
+                (t.chrome_text(), t.chip(), t.chrome_line())
+            };
             let mut chip = div()
                 .id(("key-chip", a as usize))
-                .px_2()
+                .w(px(72.0))
+                .flex()
+                .items_center()
+                .justify_center()
                 .py_0p5()
                 .rounded(px(5.0))
                 .bg(rgb(chip_bg))
+                .border_1()
+                .border_color(rgb(chip_line))
                 .text_size(px(11.0))
                 .text_color(rgb(chip_fg))
                 .child(SharedString::from(chord_text))
@@ -2279,7 +2301,7 @@ impl Root {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .py_0p5()
+                    .py_1()
                     .child(
                         div()
                             .flex_1()
@@ -3197,7 +3219,7 @@ impl Root {
         let s: String = glyphs
             .iter()
             .filter(|g| !g.is_indent())
-            .map(|g| self.shown(g.ch))
+            .map(|g| self.shown_glyph(*g))
             .collect();
         clip_chars(s.trim(), max)
     }
@@ -6077,7 +6099,7 @@ impl Root {
             );
         } else {
             // 数字转汉字（可选）：`1628` → `一六二八`，保持古籍的纯粹感。
-            let shown = self.shown(g.ch).to_string();
+            let shown = self.shown_glyph(g).to_string();
             let shown = if self.han_digits {
                 crate::west::digits_to_han(&shown, false)
             } else {
@@ -6310,16 +6332,97 @@ impl Root {
         None
     }
 
-    /// 按当前繁简开关把单字转成展示形态：繁体模式转繁，简体模式转简。
-    /// 正文与小字注释据此「全部」统一为繁体或简体。
+    /// 按当前繁简档把**单字**转成展示形态（没有上下文可用的地方用它）。
+    ///
+    /// 有上下文就别用这个——走 [`Root::shown_glyph`]，那里是段落级转换，
+    /// 「皇后 / 以後」这类歧义才判得对。
     fn shown(&self, c: char) -> char {
-        // 【】→「」先做，再按繁简开关转字（竖排古籍里没有方框括号的位置）。
+        // 【】→「」先做，再按繁简档转字（竖排古籍里没有方框括号的位置）。
         let c = crate::types::bracket_to_quote(c);
-        if self.show_traditional {
-            trad::traditional_of(c).unwrap_or(c)
-        } else {
-            trad::simplified_of(c).unwrap_or(c)
+        jiandu_core::trad::convert_char(c, self.trad_mode)
+    }
+
+    /// 按当前繁简档把一个**正文位置上的字**转成展示形态（段落级、带缓存）。
+    ///
+    /// 段落转换失败（书是虚拟化骨架、段落还没取回）就退回逐字——宁可丢词组
+    /// 上下文，也不能把字吞了。
+    fn shown_glyph(&self, g: Glyph) -> char {
+        if let Some(chars) = self.converted_para(g.chapter, g.para) {
+            if let Some(c) = chars.get(g.offset) {
+                return crate::types::bracket_to_quote(*c);
+            }
         }
+        self.shown(g.ch)
+    }
+
+    /// 取某一章的某一段（转换后的逐字）。
+    ///
+    /// 缓存键是 `(章, 段)`，用「代」（书指纹 + 档位）判废：换书或换档就整批
+    /// 清掉，不必在每个 `self.book = …` 的地方记得手动清。
+    fn converted_para(&self, ci: usize, pi: usize) -> Option<std::rc::Rc<Vec<char>>> {
+        use std::hash::{Hash, Hasher};
+        let book = self.book.as_ref()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.trad_mode.id().hash(&mut h);
+        book.store_id.hash(&mut h);
+        book.title.hash(&mut h);
+        book.chapters.len().hash(&mut h);
+        let stamp = h.finish();
+        if self.trad_gen.get() != stamp {
+            self.trad_cache.borrow_mut().clear();
+            self.trad_gen.set(stamp);
+        }
+        if let Some(v) = self.trad_cache.borrow().get(&(ci, pi)) {
+            return Some(v.clone());
+        }
+        let text = book.chapters.get(ci)?.paragraphs.get(pi)?.text.as_str();
+        if text.is_empty() {
+            return None;
+        }
+        let out: Vec<char> = if self.trad_mode.converts() {
+            let conv = jiandu_core::trad::convert(text, self.trad_mode);
+            let cs: Vec<char> = conv.chars().collect();
+            if cs.len() == text.chars().count() {
+                cs
+            } else {
+                // 词组级转换改了长度（极罕见，如「〇」类合并）→ 退回逐字，
+                // 保证下标仍与 offset 一一对应。
+                text.chars()
+                    .map(|c| jiandu_core::trad::convert_char(c, self.trad_mode))
+                    .collect()
+            }
+        } else {
+            text.chars().collect()
+        };
+        let rc = std::rc::Rc::new(out);
+        let mut cache = self.trad_cache.borrow_mut();
+        // 上限 512 段：一页十来段，512 足够覆盖前后翻页；到顶就整批清，
+        // 不做 LRU（这点开销不值得维护一张双向链表）。
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert((ci, pi), rc.clone());
+        Some(rc)
+    }
+
+    /// 是否繁体档（PDF / 分享卡的字体选择仍按这个布尔走）。
+    pub fn traditional(&self) -> bool {
+        self.trad_mode == jiandu_core::trad::TradMode::Traditional
+    }
+
+    /// 换繁简档：清缓存、落盘、重绘。
+    ///
+    /// **不重排**——转换是逐字换形，格数账一个数都不变；分页、进度、注音
+    /// 全部原地不动。这也是「滤镜」与「改写底本」的分界线。
+    pub fn set_trad_mode(&mut self, m: jiandu_core::trad::TradMode, cx: &mut Context<Self>) {
+        if self.trad_mode == m {
+            return;
+        }
+        self.trad_mode = m;
+        self.trad_cache.borrow_mut().clear();
+        // 旧的 `trad` 布尔跟着写一份：万一回退到老版本，观感不跳。
+        crate::prefs::Prefs::save_trad(m);
+        cx.notify();
     }
 
     /// 这个字**后方**是否已有原文自带的读音：`埵（duǒ）` / `般（bō ）` /
@@ -8572,7 +8675,7 @@ impl Root {
                         }
                         let k = (g.chapter, g.para, g.offset);
                         if k >= a && k <= b {
-                            out.push(self.shown(g.ch));
+                            out.push(self.shown_glyph(*g));
                         }
                     }
                 }
@@ -8586,7 +8689,7 @@ impl Root {
             glyphs
                 .iter()
                 .filter(|g| !g.is_indent())
-                .map(|g| self.shown(g.ch))
+                .map(|g| self.shown_glyph(*g))
                 .collect()
         };
         if text.is_empty() {
@@ -8763,7 +8866,7 @@ impl Root {
             {
                 let k = (g.chapter, g.para, g.offset);
                 red.push(self.underlines.contains(&k));
-                body.push(self.shown(g.ch));
+                body.push(self.shown_glyph(*g));
             }
         }
         // 长度对齐：红标记与正文必须逐字对应，短了按「未划线」补齐。
@@ -9728,7 +9831,7 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
         {
             let k = (g.chapter, g.para, g.offset);
             red.push(self.underlines.contains(&k));
-            body.push(self.shown(g.ch));
+            body.push(self.shown_glyph(*g));
         }
         // 长短对齐：红标记必须逐字对应正文，短了按「未划线」补齐。
         if red.len() < body.len() {
@@ -10313,15 +10416,25 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
                 ("生僻字", self.show_rare, StyleAct::Rare),
                 ("数字汉字", self.han_digits, StyleAct::Han),
                 ("注释", self.show_notes, StyleAct::Notes),
-                (
-                    if self.show_traditional { "繁体" } else { "简体" },
-                    self.show_traditional,
-                    StyleAct::Trad,
-                ),
             ],
             cx,
         );
         sheet = sheet.child(style_row("标注", marks, t));
+
+        // ---- 繁简：原文 / 简体 / 繁体（v1.81.0）----
+        //
+        // **滤镜，不是改写**：底本一个字都不动，只在落笔前换显示形。所以它
+        // 与「标注」那排开关不是一类东西——那排管「显示不显示」，这一排管
+        // 「显示成哪一种字」，故单列一行、给了三个明确的档位。
+        let trad_chips = self.style_chips(
+            crate::trad::TradMode::ALL
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (m.label(), self.trad_mode == *m, StyleAct::Trad(i as u8)))
+                .collect(),
+            cx,
+        );
+        sheet = sheet.child(style_row("繁简", trad_chips, t));
 
         // ---- 句读：形制（现代标点 / 古籍句读）+ 点画（墨 / 朱砂 / 回锋）----
         //
@@ -10486,7 +10599,13 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
                             }
                             StyleAct::Inline => this.set_notes_inline(true),
                             StyleAct::Footnote => this.set_notes_inline(false),
-                            StyleAct::Trad => this.show_traditional = !this.show_traditional,
+                            StyleAct::Trad(i) => this.set_trad_mode(
+                                crate::trad::TradMode::ALL
+                                    .get(i as usize)
+                                    .copied()
+                                    .unwrap_or(crate::trad::TradMode::Original),
+                                cx,
+                            ),
                             StyleAct::Tong => this.show_tongjia = !this.show_tongjia,
                             StyleAct::Notes => this.show_notes = !this.show_notes,
                             StyleAct::Punct => this.show_punct = !this.show_punct,
@@ -10757,7 +10876,8 @@ enum StyleAct {
     Facing,
     Inline,
     Footnote,
-    Trad,
+    /// 繁简显示档（0 原文 / 1 简体 / 2 繁体）。
+    Trad(u8),
     Tong,
     Notes,
     Punct,

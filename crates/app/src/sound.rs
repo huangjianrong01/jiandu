@@ -194,11 +194,41 @@ unsafe fn nssound_play_file(path: &str) -> bool {
     extern "C" {
         fn objc_getClass(name: *const c_char) -> *mut std::os::raw::c_void;
         fn sel_registerName(name: *const c_char) -> *mut std::os::raw::c_void;
-        fn objc_msgSend(
-            receiver: *mut std::os::raw::c_void,
-            op: *mut std::os::raw::c_void,
-            ...
-        ) -> *mut std::os::raw::c_void;
+        /// **只当符号地址用，绝不按变参调**（v1.81.0 修正）。
+        ///
+        /// C 头里它是 `id objc_msgSend(id, SEL, ...)`，照着写成 Rust 变参在
+        /// x86_64 上碰巧能跑，在 arm64 上必崩：AAPCS64 把变参实参放到**栈**上，
+        /// 而它按**寄存器**读 x2/x3，拿到的是垃圾指针。所以下面统一 transmute
+        /// 成具体签名再调。
+        fn objc_msgSend();
+    }
+
+    /// `id f(id, SEL)`
+    unsafe fn msg0(r: *mut std::os::raw::c_void, s: *mut std::os::raw::c_void) -> *mut std::os::raw::c_void {
+        let f: extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void) -> *mut std::os::raw::c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(r, s)
+    }
+    /// `id f(id, SEL, const char *)`
+    unsafe fn msg1s(
+        r: *mut std::os::raw::c_void,
+        s: *mut std::os::raw::c_void,
+        a: *const c_char,
+    ) -> *mut std::os::raw::c_void {
+        let f: extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void, *const c_char) -> *mut std::os::raw::c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(r, s, a)
+    }
+    /// `id f(id, SEL, id, BOOL)`
+    unsafe fn msg2i(
+        r: *mut std::os::raw::c_void,
+        s: *mut std::os::raw::c_void,
+        a: *mut std::os::raw::c_void,
+        b: i32,
+    ) -> *mut std::os::raw::c_void {
+        let f: extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void, *mut std::os::raw::c_void, i32) -> *mut std::os::raw::c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(r, s, a, b)
     }
 
     let sel = |n: &[u8]| -> *mut std::os::raw::c_void {
@@ -216,29 +246,20 @@ unsafe fn nssound_play_file(path: &str) -> bool {
     let Ok(cpath) = CString::new(path) else {
         return false;
     };
-    let s = objc_msgSend(
-        ns_string,
-        sel(b"stringWithUTF8String:\0"),
-        cpath.as_ptr(),
-    );
+    let s = msg1s(ns_string, sel(b"stringWithUTF8String:\0"), cpath.as_ptr());
     if s.is_null() {
         return false;
     }
-    let alloc = objc_msgSend(cls, sel(b"alloc\0"));
+    let alloc = msg0(cls, sel(b"alloc\0"));
     if alloc.is_null() {
         return false;
     }
-    let snd = objc_msgSend(
-        alloc,
-        sel(b"initWithContentsOfFile:byReference:\0"),
-        s,
-        0i32,
-    );
+    let snd = msg2i(alloc, sel(b"initWithContentsOfFile:byReference:\0"), s, 0);
     if snd.is_null() {
         return false;
     }
     // BOOL 返回值不关心（失败也只是没声音），故按指针收一下即可。
-    let _ = objc_msgSend(snd, sel(b"play\0"));
+    let _ = msg0(snd, sel(b"play\0"));
     SOUND.get_or_init(|| snd as usize);
     true
 }

@@ -59,36 +59,64 @@ pub fn is_indexed(c: &Connection, store_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 建索引时**一次取几章**。
+///
+/// 旧版把整本书的章节 JSON 全读进一个 `Vec` 再逐条插——三十万字的大书，
+/// 光这一份就在内存里摊出几十 MB，和「正在导入的另一本 EPUB」撞在一起就
+/// 开始换页（用户看到的是翻页卡一下）。分块之后峰值只跟块大小有关，与书
+/// 有多长无关；块与块之间还能顺手过一遍内存护栏（[`crate::mem::breathe`]）。
+const INDEX_CHUNK: i64 = 24;
+
 /// 为一本书建索引：把它的每一章正文灌进 FTS5。
 ///
 /// 返回灌进去的章数。**按需建**——只在第一次搜这本书时调用。
+///
+/// 事务仍是**整本一个**：分块是为了省内存，不是为了分段提交——中途提交会
+/// 让 FTS5 的 b-tree 反复分裂，建完的体积反而更大。
 pub fn build(c: &Connection, store_id: &str) -> Result<usize> {
     // 幂等：先清干净，重复调用不会把索引灌两遍（trigram 索引翻倍很贵）。
     drop_book(c, store_id)?;
-    let sql = "SELECT idx, json FROM chapters WHERE store_id = ?1 ORDER BY idx ASC";
-    let mut st = c.prepare(sql)?;
-    let rows = st.query_map(params![store_id], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-    })?;
-    let mut pairs: Vec<(i64, String)> = Vec::new();
-    for r in rows {
-        pairs.push(r?);
-    }
-    drop(st);
-
     c.execute_batch("BEGIN")?;
     let res = (|| -> Result<usize> {
         let ins = format!("INSERT INTO {FTS}(store_id, cidx, body) VALUES (?1, ?2, ?3)");
+        let sel = "SELECT idx, json FROM chapters WHERE store_id = ?1 ORDER BY idx ASC \
+                   LIMIT ?2 OFFSET ?3";
         let mut st = c.prepare(&ins)?;
         let mut n = 0usize;
-        for (idx, json) in &pairs {
-            let ch: crate::types::Chapter = match serde_json::from_str(json) {
-                Ok(ch) => ch,
-                // 一章坏了不该拖垮整本书的索引：跳过，其余照建。
-                Err(_) => continue,
+        let mut off = 0i64;
+        loop {
+            // 块内先收成小 vec（24 章），再逐条插入——`sel` 与 `st` 是两条
+            // 独立的 statement，借用不会打架。
+            let batch: Vec<(i64, String)> = {
+                let mut q = c.prepare(sel)?;
+                let rows = q.query_map(params![store_id, INDEX_CHUNK, off], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?;
+                let mut v = Vec::with_capacity(INDEX_CHUNK as usize);
+                for r in rows {
+                    v.push(r?);
+                }
+                v
             };
-            st.execute(params![store_id, *idx, plain_text(&ch)])?;
-            n += 1;
+            if batch.is_empty() {
+                break;
+            }
+            let got = batch.len() as i64;
+            for (idx, json) in &batch {
+                let ch: crate::types::Chapter = match serde_json::from_str(json) {
+                    Ok(ch) => ch,
+                    // 一章坏了不该拖垮整本书的索引：跳过，其余照建。
+                    Err(_) => continue,
+                };
+                st.execute(params![store_id, *idx, plain_text(&ch)])?;
+                n += 1;
+            }
+            off += got;
+            if got < INDEX_CHUNK {
+                break;
+            }
+            // 块间护栏：超限就在**本线程**（后台）里歇一会，主线程不受影响。
+            crate::mem::breathe("fts5");
         }
         Ok(n)
     })();

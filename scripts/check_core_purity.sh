@@ -59,7 +59,10 @@ fi
 # ── 3) 平台特判：源码里不该出现 macOS / Windows 的 cfg 分支 ────────────────
 # core 要么跨平台，要么把差异做成 trait；在 core 里写
 # `#[cfg(target_os = "macos")]` 就是把这个决定往后推，早晚要还。
-CFG_HITS="$(grep -rEn '#\[cfg\(target_os' "$CORE/src" --include='*.rs' 2>/dev/null || true)"
+#
+# 只认**行首（可缩进）就是 `#[`** 的那种：文档注释里写「不许出现
+# `#[cfg(target_os)]`」是说明，不是分叉——早先没锚行首，注释把自己误伤了。
+CFG_HITS="$(grep -rEn '^[[:space:]]*#\[cfg\(target_os' "$CORE/src" --include='*.rs' 2>/dev/null || true)"
 if [ -n "$CFG_HITS" ]; then
     report "$CFG_HITS
    → core 里不该按平台分叉：请把差异抽成 trait（见 crates/core/src/platform.rs），

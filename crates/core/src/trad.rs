@@ -197,6 +197,131 @@ pub fn simplified_of(c: char) -> Option<char> {
     T2S.get(&c).copied()
 }
 
+// ── 繁简三档：原文 / 转简体 / 转繁体（v1.81.0）────────────────────────────
+//
+// 「原文」是**默认档**：古籍整理本里的异体字（說 / 説 / 説）、避讳字、古今字
+// 都是版本信息的一部分，擅自归一就是篡改。转换只是**渲染层的一道滤镜**——
+// 底本一个字都不动，网格、分页、注音、检索全都不受影响（同字数替换）。
+//
+// 转换引擎由壳子注入（macOS 走 ICU 的 `Hans-Hant` / `Hant-Hans` 变换，词组级，
+// 能把「皇后」留在「后」而不误转成「後」）。没装引擎时退回内置的逐字表——
+// 质量差一档，但不至于让功能消失。
+
+/// 繁简显示档。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TradMode {
+    /// **原文**：一个字都不转，异体字原汁原味。
+    Original,
+    /// 转简体。
+    Simplified,
+    /// 转繁体。
+    Traditional,
+}
+
+impl TradMode {
+    /// 面板顺序（下标即 `Prefs::trad_mode` 的值）。
+    pub const ALL: [TradMode; 3] = [
+        TradMode::Original,
+        TradMode::Simplified,
+        TradMode::Traditional,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TradMode::Original => "原文",
+            TradMode::Simplified => "简体",
+            TradMode::Traditional => "繁体",
+        }
+    }
+
+    /// 稳定 id（落盘 / 日志用；`label` 可以改，它不行）。
+    pub fn id(self) -> &'static str {
+        match self {
+            TradMode::Original => "original",
+            TradMode::Simplified => "simplified",
+            TradMode::Traditional => "traditional",
+        }
+    }
+
+    /// 要转成繁体吗？（`Original` 两边都 false）
+    pub fn to_trad(self) -> bool {
+        matches!(self, TradMode::Traditional)
+    }
+
+    /// 要转吗？（`Original` 即不转）
+    pub fn converts(self) -> bool {
+        !matches!(self, TradMode::Original)
+    }
+}
+
+/// 壳子注入的转换引擎：把整段文字转成繁体（`to_trad`）或简体。
+///
+/// 为什么整段而不是逐字：繁简不是一一对应（「皇后」的「后」不该转成「後」、
+/// 「头发」要转成「頭髮」），只有拿到上下文才判得对。
+pub trait Convert: Send + Sync {
+    /// 返回 `None` 表示这次转不了（引擎不可用 / 输入有异常）——调用方退回逐字表。
+    fn convert(&self, text: &str, to_trad: bool) -> Option<String>;
+}
+
+static ENGINE: std::sync::OnceLock<Box<dyn Convert>> = std::sync::OnceLock::new();
+
+/// 装引擎（壳子启动时调一次；重复调以第一次为准）。
+pub fn install(engine: Box<dyn Convert>) {
+    let _ = ENGINE.set(engine);
+}
+
+/// 按档位转换一整段文字。
+///
+/// `Original` 原样返回（一个字节都不动）；其余档位先请引擎，引擎不在或失败
+/// 就退回逐字表——**绝不会因为转不了就吐回空串**。
+pub fn convert(text: &str, mode: TradMode) -> String {
+    if !mode.converts() {
+        return text.to_string();
+    }
+    if let Some(e) = ENGINE.get() {
+        if let Some(s) = e.convert(text, mode.to_trad()) {
+            return s;
+        }
+    }
+    // 兜底：逐字表。**歧义字跳过、繁转简放心转**——质量差一档（词组判不了），
+    // 但绝不会把一个字改错方向。
+    text.chars()
+        .map(|c| {
+            if mode.to_trad() {
+                traditional_of(c).unwrap_or(c)
+            } else {
+                simplified_of(c).unwrap_or(c)
+            }
+        })
+        .collect()
+}
+
+/// 单个字的转换（没有上下文可用的地方：注文尾注、提示语、分享卡）。
+///
+/// 走引擎时也只是一字一段——**能不这么用就别这么用**，尽量走 [`convert`]。
+pub fn convert_char(c: char, mode: TradMode) -> char {
+    if !mode.converts() {
+        return c;
+    }
+    if let Some(e) = ENGINE.get() {
+        let mut buf = [0u8; 4];
+        if let Some(s) = e.convert(c.encode_utf8(&mut buf), mode.to_trad()) {
+            if let Some(x) = s.chars().next() {
+                // 词组级引擎可能把一字扩成多字（极少），此时只取第一字并在
+                // 长度对不上时回退——单字格只容得下一个字。
+                if s.chars().count() == 1 {
+                    return x;
+                }
+            }
+        }
+    }
+    if mode.to_trad() {
+        traditional_of(c).unwrap_or(c)
+    } else {
+        simplified_of(c).unwrap_or(c)
+    }
+}
+
 /// 查一个字的通假本字：先查书内自定义表，再查内置表。
 pub fn tongjia_of(c: char, book_table: &BTreeMap<String, String>) -> Option<char> {
     if let Some(v) = book_table.get(&c.to_string()) {
@@ -208,4 +333,48 @@ pub fn tongjia_of(c: char, book_table: &BTreeMap<String, String>) -> Option<char
 /// 某段文本中是否含可标注的简体字（用于 UI 提示）。
 pub fn has_annotatable(text: &str) -> bool {
     text.chars().any(|c| S2T.contains_key(&c))
+}
+
+#[cfg(test)]
+mod trad_mode_tests {
+    use super::*;
+
+    #[test]
+    fn original_mode_never_touches_a_byte() {
+        // 异体字 + 繁体 + 简体混排：原文档必须一模一样。
+        let s = "說曰：學而時習之，不亦說乎？説 説 后 髮";
+        assert_eq!(convert(s, TradMode::Original), s);
+        assert_eq!(convert_char('說', TradMode::Original), '說');
+    }
+
+    #[test]
+    fn fallback_table_converts_only_unambiguous_chars() {
+        // 兜底表**不做歧义字**：一简对多繁（发/干/后/复…）一律保留原字，
+        // 猜错一个字就是改人家的书。这条底线比「转得全」重要。
+        let t = convert("发干后复", TradMode::Traditional);
+        assert_eq!(t, "发干后复", "歧义字被瞎猜了：{t}");
+
+        // 繁 → 简是**多对一**，没有歧义，可以放心转。
+        let s = convert("學而時習之不亦說乎", TradMode::Simplified);
+        assert!(s.contains('学') && s.contains('习'), "该转简却没转：{s}");
+
+        // 兜底也绝不能把内容吞掉：长度必须一致。
+        for src in ["学而时习之", "道可道，非常道。", "abc 123"] {
+            let out = convert(src, TradMode::Traditional);
+            assert_eq!(
+                out.chars().count(),
+                src.chars().count(),
+                "兜底把字吞了：{src} → {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_metadata_is_stable() {
+        assert_eq!(TradMode::ALL.len(), 3);
+        assert!(!TradMode::Original.converts());
+        assert!(TradMode::Simplified.converts());
+        assert!(TradMode::Traditional.to_trad());
+        assert_ne!(TradMode::Original.id(), TradMode::Traditional.id());
+    }
 }

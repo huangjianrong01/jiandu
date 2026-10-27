@@ -282,7 +282,16 @@ pub struct Root {
     /// `set_font_preset`）。字体名本身不在这儿：`fonts::FONT_CONFIGS`
     /// 才是唯一数据源，UI 与渲染都只认角色。
     pub font_preset: FontPreset,
-    pub show_traditional: bool,
+    pub trad_mode: jiandu_core::trad::TradMode,
+    /// **繁简滤镜的段落缓存**：`(章, 段) → 转换后的逐字`。
+    ///
+    /// 为什么要「段落」而不是「单字」：繁简不是一一对应（皇后 / 以後、头发 /
+    /// 頭髮），只有拿到上下文才判得对。而渲染是逐字问的，所以整段先转好、
+    /// 按 offset 取——一页只转十几段，转完就缓存。
+    pub trad_cache:
+        std::cell::RefCell<std::collections::HashMap<(usize, usize), std::rc::Rc<Vec<char>>>>,
+    /// 缓存属于哪一「代」（书换了 / 档位改了 → 整批作废）。
+    pub trad_gen: std::cell::Cell<u64>,
     pub show_tongjia: bool,
     pub show_notes: bool,
     /// 注文是否以「双行小字夹注」排进正文（false 则退为页脚注）。
@@ -996,7 +1005,9 @@ impl Root {
             font_modern: FontChoice::SourceHanSans,
             font_note: FontChoice::XuandongKaishu,
             font_preset: FontPreset::Song,
-            show_traditional: true,
+            trad_mode: prefs.trad_mode(),
+            trad_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            trad_gen: std::cell::Cell::new(0),
             show_tongjia: true,
             show_notes: true,
             notes_inline: true,
@@ -1206,7 +1217,7 @@ impl Root {
                 root.shelf_view = ShelfView::Spine;
             }
         }
-        // 开发用：JIANDU_PANEL=style|banzi|side|toc|cards|help 直接把某个面板摊开，
+        // 开发用：JIANDU_PANEL=style|banzi|side|toc|cards|help|keys 直接把某个面板摊开，
         // 便于逐面板截图核对（顶栏默认隐身，脚本点不到）。
         // v1.35.0：样式与版式已合并为唯一一张「版字」纸，三个档名同义。
         // v1.79.0：目录 / 书签 / 批注 都在左侧栏里，故 `side` 后可用
@@ -1230,6 +1241,8 @@ impl Root {
                     root.side_slide = 1.0;
                 }
                 "help" => root.show_help = true,
+                // 快捷键面板（v1.81.0）：同 `help`，脚本点不到顶栏时用。
+                "keys" => root.show_keys = true,
                 // 检索侧栏（v1.81.0）：核对 IME 落点 / 版式，脚本点不到顶栏。
                 "search" => {
                     root.show_search = true;
@@ -3478,7 +3491,7 @@ impl Root {
             font: crate::pdf::PdfFontKind::from(self.share_font_kind()),
             note_font: crate::pdf::PdfFontKind::Kai,
             han_digits: self.han_digits,
-            traditional: self.show_traditional,
+            traditional: self.traditional(),
             punct_mode: self.punct_mode,
             punct_ink: self.punct_ink.color(self.palette, self.theme),
         };

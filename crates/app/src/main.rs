@@ -36,6 +36,9 @@ mod batch;
 mod cards;
 // v1.71.0：剪贴板唯一入口（原生 NSPasteboard，取代 osascript / pbpaste）。
 mod clipboard;
+/// **繁简转换引擎（macOS · ICU）**（v1.81.0）：`Hans-Hant` / `Hant-Hans` 词组级
+/// 变换。core 只定档位与兜底表，真正转字在这里——core 不许碰 objc。
+mod conv;
 mod exporter;
 mod fonts;
 // `gloss`（双行夹注排版引擎）v1.0.0-beta 起住在 `jiandu-core`，本 crate 只
@@ -51,6 +54,10 @@ mod importer;
 mod keys;
 mod lines;
 mod margin;
+/// **内存探针（macOS）**（v1.81.0）：`task_info(TASK_BASIC_INFO_64)` 读本进程
+/// 常驻内存，交给 `jiandu_core::mem` 的护栏。core 不许 `#[cfg(target_os)]`，
+/// 所以读 RSS 这一层必须留在壳里。
+mod mem;
 mod note_inject;
 // v1.60.0：惰性分页器（按章分块 + 前缀和索引 + LRU 窗口）。
 // 渲染层只向它要「当前这一叶」，绝不再每帧排全书。
@@ -129,6 +136,13 @@ fn main() {
     // 「点一下就整个退出、什么都没留下」却看不到任何报错。此钩子在 abort
     // 之前把确切位置与回溯写进 ~/.jiandu/panic.log，同时前台也打印一份。
     install_panic_logger();
+
+    // 内存护栏的探针（v1.81.0）：越早装越好——批量导入与 FTS5 建索引都在
+    // 后台线程跑，装晚了它们就有一段「裸奔」的路。
+    mem::install();
+
+    // 繁简滤镜的引擎（v1.81.0）：同上，越早越好——首次渲染就要用。
+    conv::install();
 
     // 命令行模式：`jiandu --convert 输入 --out 输出`
     //   epub -> json / txt / md 的批量转换，不开窗口。

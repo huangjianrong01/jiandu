@@ -66,6 +66,10 @@ pub mod purge;
 /// **全局快捷键表**（v1.81.0）：动作 / 键位 / 映射的唯一数据源。
 /// 壳子只做「框架按键 → `Chord`」的翻译与执行，键位本身不许在壳里另写一份。
 pub mod keys;
+/// **内存护栏**（v1.81.0）：后台重活（FTS5 建索引 / 批量导入）在块与块之间
+/// 看一眼常驻内存，超限就在**后台线程**里退让——主线程一帧都不许等。
+/// 读 RSS 由壳子注入探针（core 不许 `#[cfg(target_os)]`）。
+pub mod mem;
 /// **C ABI 出口**（v1.0.0-beta）：给 Tauri / Flutter / Swift / JNI 等
 /// 非 Rust 壳子调 `cdylib` 用。见 `README_cross_platform.md`。
 pub mod ffi;
