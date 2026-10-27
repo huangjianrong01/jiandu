@@ -298,6 +298,10 @@ pub fn cleanup_ancient_text(text: &str) -> String {
     let s = crate::pipeline::strip_digit_marks(&s);
     // 3) 阿拉伯数字 → 汉字（纪年逐字读、一般按数值读，最长 6 位，字母/# 粘连跳过）。
     let s = crate::numcn::normalize_numbers(&s);
+    // 3.5) **表格整块丢弃**（v1.69.0）：`<table>…</table>` 连内容一起删。
+    //     必须在 HTML 残片处理**之前**——否则标签先被剥掉就再也不知道哪
+    //     些字是从表格里来的。见 `vclean::drop_tag_blocks`。
+    let s = crate::vclean::drop_tag_blocks(&s, &crate::vclean::TABLE_TAGS);
     // 4) HTML 残片：`<br>` → 换行、实体还原、去标签。
     let s = strip_html_residue(&s);
     // 4.5) **注疏标签只去壳、留肉身**（v1.68.1）：`[ 注 ]` / `[疏]` / `[/疏]`

@@ -35,11 +35,22 @@ impl FormatParser for JsonParser {
 }
 
 /// 从 JSON 文本里抠出正文（语法坏了也不报错，能救多少救多少）。
+///
+/// v1.69.0：**结构化提取，绝不无脑遍历**。开源古籍 JSON 里 `pinyin`
+/// `book` `volume` `author` 这些字段和 `content` 平级躺着，旧版「认不出
+/// 就递归翻一遍」会把它们连同正文一起收进来——于是拼音被**一个字母一格**
+/// 竖着排成人间惨剧。现在只认键名：正文键收正文，其余一律当元数据丢掉。
 pub fn extract_json(src: &str) -> String {
     match serde_json::from_str::<Value>(src) {
         Ok(v) => {
             let mut paras: Vec<String> = Vec::new();
             collect(&v, &mut paras);
+            // 一个字都没抠到：说明这份 JSON 的正文键我们没认出来（小众
+            // schema）。这时**退回宽松遍历**兜底——有字胜过无字，反正
+            // 下游 `cleaner` 还会把拼音 / 站名再洗一遍。
+            if paras.is_empty() {
+                collect_lenient(&v, &mut paras);
+            }
             paras.join("\n")
         }
         // 整份不成立：正则 Salvage（只认带正文语义的键）。
@@ -47,35 +58,129 @@ pub fn extract_json(src: &str) -> String {
     }
 }
 
+/// **结构化提取元数据**（v1.69.0）：书名 / 作者。
+///
+/// 开源古籍 JSON 的 `book` / `author` / `volume` 是正经元数据，既不该被
+/// 丢掉（那样书名就退化成文件名了），也绝不能混进正文流（旧版就是这么
+/// 干的——「佚名」「卷三」堂而皇之地排在正文里）。这里单独提出来交给
+/// 调用方当书名 / 作者用。
+///
+/// 找不到就返回 `None`，由调用方退回文件名 / 正文识别。
+pub fn extract_json_meta(src: &str) -> (Option<String>, Option<String>) {
+    let Ok(v) = serde_json::from_str::<Value>(src) else {
+        return (None, None);
+    };
+    // 先看顶层，顶层没有再往下翻一层（很多书把元数据包在 `meta` 里）。
+    let mut title: Option<String> = None;
+    let mut author: Option<String> = None;
+    if let Value::Object(m) = &v {
+        scan_meta(m, &mut title, &mut author);
+        if title.is_none() || author.is_none() {
+            if let Some(Value::Object(mm)) = get_ci(m, "meta").or_else(|| get_ci(m, "metadata")) {
+                scan_meta(mm, &mut title, &mut author);
+            }
+        }
+    }
+    (
+        title.map(|t| jiandu_core::vclean::clean_book_title(&t)),
+        author.map(|a| jiandu_core::vclean::tidy_meta_title(&a)),
+    )
+}
+
+/// 从一个对象里认书名 / 作者（**只认键名**，绝不把值当正文收）。
+fn scan_meta(
+    m: &serde_json::Map<String, Value>,
+    title: &mut Option<String>,
+    author: &mut Option<String>,
+) {
+    if title.is_none() {
+        for k in ["book", "title", "name", "书名", "标题"] {
+            if let Some(Value::String(s)) = get_ci(m, k) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    *title = Some(s.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    if author.is_none() {
+        for k in ["author", "authors", "creator", "作者"] {
+            if let Some(x) = get_ci(m, k) {
+                let s = match x {
+                    Value::String(s) => s.trim().to_string(),
+                    Value::Array(a) => a
+                        .iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join("、"),
+                    _ => String::new(),
+                };
+                if !s.is_empty() {
+                    *author = Some(s);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// 正文键（认得出就用这个顺序）。
-const BODY_KEYS: [&str; 5] = ["content", "text", "paragraphs", "body", "chapters"];
+const BODY_KEYS: [&str; 11] = [
+    "content", "text", "paragraphs", "body", "chapters", "paragraph", "sentences", "lines",
+    // 中文 schema 里常见的正文键。
+    "原文", "正文", "内容",
+];
+
+/// 题名键（先出标题再出正文，章名才不会掉到章尾）。
+const TITLE_KEYS: [&str; 6] = ["title", "name", "标题", "篇", "章", "章题"];
 
 fn collect(v: &Value, out: &mut Vec<String>) {
     match v {
+        // 走到这里的 `Value::String` 只可能是**正文键**递下来的（顶层裸串
+        // 同理），元数据键在下面已经被拦掉了。
         Value::String(s) => push_para(out, s),
         Value::Array(a) => a.iter().for_each(|x| collect(x, out)),
         Value::Object(m) => {
-            // ① 有标题 + 正文：标题先出（这是「章名在章末」的根因）。
-            let title = get_ci(m, "title").or_else(|| get_ci(m, "name"));
             let body = find_body(m);
-            if let (Some(t), Some(b)) = (title, body) {
-                if let Value::String(ts) = t {
+            if let Some(b) = body {
+                // ① 有正文键：先出题名（章名不能掉到章尾），再出正文。
+                //    其余键（pinyin / book / volume / author …）**一律不收**。
+                if let Some(Value::String(ts)) = find_title(m) {
                     push_para(out, ts);
                 }
                 collect(b, out);
                 return;
             }
-            // ② 只有正文。
-            if let Some(b) = body {
-                collect(b, out);
-                return;
-            }
-            // ③ 都不认识：把值递归翻一遍，但跳过纯元信息字段。
+            // ② 没有正文键：只往下翻**数组 / 对象**——不认识的键名下的
+            //    字符串一律丢弃（那正是「佚名」「卷三」「lùn yǔ」这类
+            //    元数据混进正文的入口，v1.69.0）。
             for (k, val) in m {
                 if is_meta_key(k) {
                     continue;
                 }
-                collect(val, out);
+                match val {
+                    Value::Array(_) | Value::Object(_) => collect(val, out),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 兜底遍历（只在**严格提取一无所获**时才跑）：认不出键名就把所有字符串
+/// 都捞一遍。宁可脏一点，也不能整本导入成空白。
+fn collect_lenient(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => push_para(out, s),
+        Value::Array(a) => a.iter().for_each(|x| collect_lenient(x, out)),
+        Value::Object(m) => {
+            for (k, val) in m {
+                if is_meta_key(k) {
+                    continue;
+                }
+                collect_lenient(val, out);
             }
         }
         _ => {}
@@ -87,6 +192,10 @@ fn find_body(m: &serde_json::Map<String, Value>) -> Option<&Value> {
     BODY_KEYS.iter().find_map(|k| get_ci(m, k))
 }
 
+fn find_title(m: &serde_json::Map<String, Value>) -> Option<&Value> {
+    TITLE_KEYS.iter().find_map(|k| get_ci(m, k))
+}
+
 fn get_ci<'a>(m: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a Value> {
     if let Some(v) = m.get(key) {
         return Some(v);
@@ -96,13 +205,27 @@ fn get_ci<'a>(m: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a Va
         .map(|(_, v)| v)
 }
 
-/// 元信息字段：不当作正文，避免把 `id`/`uuid` 收进书里。
+/// 元信息字段：**绝不进正文流**。
+///
+/// v1.69.0 大扩军：开源古籍 JSON 的元数据字段多到离谱（`pinyin`、
+/// `book`、`volume`、`author`、`translator`…），旧表只认得 `id`/`author`
+/// 那几个，剩下的全被当正文收进来了——竖排里就是「拼音字母竖着排」、
+/// 「佚名」占一列、「卷三」混在正文中间。
 fn is_meta_key(k: &str) -> bool {
     matches!(
         k.to_ascii_lowercase().as_str(),
         "id" | "uuid" | "isbn" | "author" | "authors" | "meta" | "metadata" | "toc" | "cover"
             | "language" | "lang" | "date" | "publisher" | "version" | "created" | "updated"
             | "url" | "source" | "site" | "tags" | "icon" | "css" | "style"
+            // —— 以下 v1.69.0 新增：古籍 JSON 的元数据四件套 ——
+            | "pinyin" | "py" | "pron" | "pronunciation" | "phonetic" | "zhuyin" | "注音"
+            | "拼音" | "romaji" | "tone" | "tones"
+            | "book" | "books" | "书名" | "volume" | "vol" | "juan" | "卷" | "卷名"
+            | "chapter_no" | "chapter_num" | "num" | "index" | "idx" | "order" | "序号"
+            | "translator" | "dynasty" | "editor" | "annotator" | "series" | "category"
+            | "keywords" | "commentary" | "annotation" | "note" | "notes" | "注释" | "译文"
+            | "translation" | "meaning" | "explain" | "shiyi" | "english" | "en"
+            | "simplified" | "traditional"
     )
 }
 
@@ -182,5 +305,44 @@ mod tests {
     fn paragraphs_array_of_strings() {
         let j = r#"{"paragraphs":["一","二",""],"id":"x"}"#;
         assert_eq!(extract_json(j), "一\n二");
+    }
+
+    /// v1.69.0：开源古籍 JSON 的元数据污染——拼音 / 作者 / 卷名绝不进正文。
+    #[test]
+    fn metadata_fields_never_leak_into_body() {
+        let j = r#"{
+            "book": "論語",
+            "volume": "卷三",
+            "author": "佚名",
+            "pinyin": "lùn yǔ",
+            "chapter_no": 3,
+            "content": "子曰：學而時習之，不亦說乎？"
+        }"#;
+        let t = extract_json(j);
+        assert!(t.contains("子曰：學而時習之，不亦說乎？"), "正文丢了：{t:?}");
+        assert!(!t.contains("lùn"), "拼音漏进正文：{t:?}");
+        assert!(!t.contains("yu"), "拼音漏进正文：{t:?}");
+        assert!(!t.contains("佚名"), "作者漏进正文：{t:?}");
+        assert!(!t.contains("論語"), "书名漏进正文：{t:?}");
+        assert!(!t.contains("卷三"), "卷名漏进正文：{t:?}");
+    }
+
+    /// 嵌套的章数组：每章只收题名 + 正文，元数据照丢。
+    #[test]
+    fn nested_chapters_drop_their_metadata() {
+        let j = r#"{"chapters":[
+            {"title":"學而","pinyin":"xué ér","author":"佚名","content":"子曰：學而時習之。"},
+            {"title":"為政","pinyin":"wéi zhèng","content":"子曰：為政以德。"}
+        ]}"#;
+        let t = extract_json(j);
+        assert_eq!(t, "學而\n子曰：學而時習之。\n為政\n子曰：為政以德。", "实际：{t:?}");
+    }
+
+    /// 认不出正文键时不能整本变空：退回宽松遍历兜底。
+    #[test]
+    fn unknown_schema_falls_back_to_lenient_scan() {
+        let j = r#"{"weird_key":"道可道，非常道。"}"#;
+        let t = extract_json(j);
+        assert!(t.contains("道可道，非常道。"), "兜底遍历没救回正文：{t:?}");
     }
 }

@@ -48,14 +48,14 @@ pub fn import_from_path(path: &Path) -> Result<Book> {
     skip_front_matter(&mut book);
     // 没有目录的格式（txt / md / json）在这里统一按章节标题补齐。
     book.ensure_toc();
-    // 书名统一夹到 12 字以内（自动识别 + 限长，书架 / 封面竖排区域有限）。
-    book.title = clip_chars(&book.title, 12);
-    if book.cover.title.chars().count() > 12 {
-        book.cover.title = clip_chars(&book.cover.title, 12);
-    }
-    if book.author.chars().count() > 12 {
-        book.author = clip_chars(&book.author, 12);
-    }
+    // 书名 / 作者统一过「元数据粉碎机」再限长（v1.69.0）：盗版 EPUB 的题名
+    // 常是那一长串文件名（`…(z-library.sk, 1lib.sk, z-lib.sk)`），里面塞着
+    // 网址、拼音和站名。限长按 `META_TITLE_MAX`（15 字）——书架卡片一行、
+    // 版心书口一格，超长既排不下也说明那不是书名。
+    let max = crate::vclean::META_TITLE_MAX;
+    book.title = tidy_meta(&book.title, max);
+    book.cover.title = tidy_meta(&book.cover.title, max);
+    book.author = tidy_meta(&book.author, max);
     Ok(book)
 }
 
@@ -151,6 +151,18 @@ pub fn file_stem(path: &Path) -> String {
 }
 
 /// 按字数截断：超长缀省略号（书名 / 作者名夹字用）。
+/// 元数据（书名 / 作者）统一收口（v1.69.0）：先粉碎网址 / 拼音 / 站名
+/// / 特殊符号，再按 `max` 字截断。
+///
+/// 与 `vclean::clean_book_title` 同源，但**不做「遇卷册括号即截」**——
+/// 那一步只该在刚拿到 `dc:title` 时做一次；这里跑在收尾处，题名已经
+/// 定下来了，再截一次会把「卷五十一」这类正经题名截没。
+fn tidy_meta(s: &str, max: usize) -> String {
+    let t = crate::vclean::strip_meta_junk(s);
+    let t = crate::vclean::tidy_meta_title(&t);
+    clip_chars(&t, max)
+}
+
 fn clip_chars(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -582,16 +594,32 @@ pub fn adapt_json_book(raw: &str, fallback_title: &str) -> Result<Book> {
                 }
                 return Ok(book);
             }
-            let title = v
-                .get("title")
-                .and_then(|x| x.as_str())
+            // v1.69.0：书名键**按优先级认**——开源古籍 JSON 常把书名放在
+            // `book` 字段（另有 `volume` / `pinyin` 等一堆元数据）。旧版只
+            // 认 `title`，于是书名退化成文件名（`dirty_pinyin`）。
+            // 这些键一律**只当元数据读**，绝不进正文流（正文只认
+            // `content` / `paragraphs` / `text` / `body`，见 `value_to_chapter`）。
+            let title = ["title", "book", "name", "书名", "标题"]
+                .iter()
+                .find_map(|k| v.get(k).and_then(|x| x.as_str()))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
                 .unwrap_or(fallback_title)
                 .to_string();
-            let author = v
-                .get("author")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
+            let author = ["author", "creator", "authors", "作者"]
+                .iter()
+                .find_map(|k| v.get(k).and_then(|x| match x {
+                    serde_json::Value::String(s) => Some(s.trim().to_string()),
+                    serde_json::Value::Array(a) => Some(
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .collect::<Vec<_>>()
+                            .join("、"),
+                    ),
+                    _ => None,
+                }))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default();
             let mut book = Book::new(title.clone(), author);
             book.cover.title = title;
             if let Some(sub) = v.get("subtitle").and_then(|x| x.as_str()) {
@@ -1342,13 +1370,10 @@ pub fn import_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> {
     // 要读正文的（前言判据）都在 `import_*_into` 内部对着 sink 做过了。
     skip_front_matter_skeleton(&mut book, sink);
     book.ensure_toc();
-    book.title = clip_chars(&book.title, 12);
-    if book.cover.title.chars().count() > 12 {
-        book.cover.title = clip_chars(&book.cover.title, 12);
-    }
-    if book.author.chars().count() > 12 {
-        book.author = clip_chars(&book.author, 12);
-    }
+    let max = crate::vclean::META_TITLE_MAX;
+    book.title = tidy_meta(&book.title, max);
+    book.cover.title = tidy_meta(&book.cover.title, max);
+    book.author = tidy_meta(&book.author, max);
     Ok(book)
 }
 

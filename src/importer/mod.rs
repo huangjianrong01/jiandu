@@ -209,10 +209,34 @@ pub fn import_file(path: &Path) -> Result<BookIR, ImportError> {
     // ④ core 既有管线（一字未改）
     let chapters = parse_str(kind, &text).map_err(|e| ImportError::Parse(e.to_string()))?;
 
+    // ④ JSON 的元数据（`book` / `author` 字段）**单独提出来**当书名 / 作者
+    // （v1.69.0）——它们既不该混进正文流，也不该退化成文件名。
+    let json_meta = if fmt == Format::Json {
+        match json_parser::extract_json_meta(&std::fs::read_to_string(path).unwrap_or_default()) {
+            (Some(t), a) => (Some(t), a),
+            (None, a) => (None, a),
+        }
+    } else {
+        (None, None)
+    };
+
     // ⑤ 标题 / 作者：先从正文首两行认（「书名 · 作者」的排法），认不出用文件名。
     let (t, a) = jiandu_core::importer::detect_title_author(&text);
-    let title = if t.trim().is_empty() { stem } else { t };
-    Ok(BookIR::from_chapters(&title, &a, source, &chapters))
+    let t = json_meta.0.unwrap_or(t);
+    let a = json_meta.1.unwrap_or(a);
+    let title = if t.trim().is_empty() { stem.clone() } else { t };
+    // v1.69.0：书名最后再过一遍「元数据粉碎机」。盗版 EPUB 认不出题名时
+    // 兜底用的是**文件名**——那一长串 `尔雅……(管锡华 [guanxihua])
+    // (z-library.sk, 1lib.sk, z-lib.sk)` 会整串变成书名，书架卡片和版心
+    // 书口全被撑爆。网址 / 拼音 / 站名 / 特殊符号一律剥掉，再截到 15 字。
+    let title = jiandu_core::vclean::tidy_meta_title(&jiandu_core::vclean::strip_meta_junk(&title));
+    let title = if title.trim().is_empty() {
+        stem.clone()
+    } else {
+        title
+    };
+    let author = jiandu_core::vclean::tidy_meta_title(&jiandu_core::vclean::strip_meta_junk(&a));
+    Ok(BookIR::from_chapters(&title, &author, source, &chapters))
 }
 
 /// **分块读取**：`BufReader` + 64 KiB 缓冲，绝不 `read_to_string` 一把梭。

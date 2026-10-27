@@ -91,6 +91,120 @@ const NOISE_HINTS: &[&str] = &[
     "推薦票",
 ];
 
+/// **版权页 / 封面废话**（v1.69.0，整段命中即删）。
+///
+/// 中华书局「全本全注全译」这类丛书，每卷卷首都会塞一页
+/// `中华经典名著全本全注全译丛书`、`管锡华译注` 这种废话；盗版 epub
+/// 更狠，连 `z-library`、`1lib` 的站名都印进正文。判据是「**整段包含**
+/// 且够短」——长文里提到丛书名那是正文，不是废话。
+const COLOPHON_HINTS: &[&str] = &[
+    "全本全注全译",
+    "全本全譯全注",
+    "中华经典名著",
+    "中華經典名著",
+    "中华经典藏书",
+    "中華經典藏書",
+    "中国古典名著",
+    "中國古典名著",
+    "国学经典",
+    "國學經典",
+    "国学典藏",
+    "國學典藏",
+    "丛书编委会",
+    "叢書編委會",
+    "图书在版编目",
+    "圖書在版編目",
+    "责任编辑",
+    "責任編輯",
+    "封面设计",
+    "封面設計",
+    "版式设计",
+    "排版制作",
+    "侵权必究",
+    "侵權必究",
+    "版权合同",
+    "著作權",
+    "著作权",
+    "出版社",
+    "出版发行",
+    "出版發行",
+    "印刷",
+    "字数：",
+    "字數：",
+    "开本：",
+    "開本：",
+    "定价：",
+    "定價：",
+    "印张",
+    "印張",
+    "z-library",
+    "z-lib",
+    "1lib",
+    "zlibrary",
+    "libgen",
+];
+
+/// **凡例 / 图例里的并列标签词组**（v1.69.0）：`书名、地名、人名、夹注`。
+///
+/// 古籍 pdf/epub 转出来的本子，卷首常有一页「凡例」：
+/// `书名　地名　人名　夹注　校记`——既无句读也不是正文，排进竖排就是
+/// 一列莫名其妙的词。
+///
+/// ⚠️ **宁可漏判、绝不可误杀**：古籍整理本的正文里也有顿号列举
+/// （`仁、义、礼、智、信`），一刀切会连正文一起吃掉。故判据是五条
+/// **同时**成立，且必须出现「标签味」的词尾 / 关键词：
+///   ① 全长 ≤ 24 字；② 通篇无句读（。，！？；：）；
+///   ③ 按顿号 / 空白切成 **≥3 段**；④ 每段 **1~4 字**；
+///   ⑤ 至少一段以「名 注 记 号 例 文 字 词 符 标 点 线」收尾，
+///      或整行含 `夹注` / `书名` / `括号` 这类明显的标签词。
+pub fn is_tag_list_line(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t.chars().count() > 24 {
+        return false;
+    }
+    // ⑤-a 一眼就是标签词的，直接判（这是用户点名的那一类）。
+    for kw in ["夹注", "夾註", "书名号", "書名號", "着重号", "專名號", "专名号", "校记", "校記"] {
+        if t.contains(kw) {
+            return true;
+        }
+    }
+    // ② 有句读就是正文（哪怕是短句）。
+    if t.chars()
+        .any(|c| matches!(c, '。' | '，' | '！' | '？' | '；' | '：' | '.' | ',' | '!' | '?'))
+    {
+        return false;
+    }
+    // ③ 按顿号 / 空白切段。
+    let parts: Vec<&str> = t
+        .split(|c: char| c == '、' || c == ',' || c.is_whitespace() || c == '　')
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() < 3 {
+        return false;
+    }
+    // ④ 每段都得是短词。
+    if !parts
+        .iter()
+        .all(|p| (1..=4).contains(&p.chars().count()))
+    {
+        return false;
+    }
+    // ⑤-b 至少一段带「标签味」的词尾。
+    parts.iter().any(|p| {
+        p.chars()
+            .next_back()
+            .map(|c| {
+                matches!(
+                    c,
+                    '名' | '注' | '記' | '记' | '號' | '号' | '例'
+                        | '文' | '字' | '詞' | '词' | '語' | '语'
+                        | '符' | '標' | '标' | '點' | '点' | '線' | '线'
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// 翻页 / 导航残留（**整段等于**这些词才删，避免误伤正文里的「目录」二字）。
 const NAV_HINTS: &[&str] = &[
     "上一页",
@@ -158,7 +272,26 @@ pub fn is_noise_para(s: &str) -> bool {
             return true;
         }
     }
-    // ⑤ 汉字叶码（v1.68.1）：「十三」「六」这种漏网的汉字页码，绝不能独占一列。
+    // ⑤ 版权页 / 封面废话（v1.69.0）：「中华经典名著全本全注全译丛书」
+    // 「管锡华译注」这类印在卷首的出版信息，绝不是正文。
+    if n <= 30 {
+        for kw in COLOPHON_HINTS {
+            if t.contains(kw) {
+                return true;
+            }
+        }
+        // 「管锡华译注」「王晓玮 译注」「陈某 著」这种署名行——短、无句读、
+        // 以译注 / 著 / 撰 / 点校收尾。单字的「注」「译」不算（正文里常见）。
+        let tail = ["译注", "譯註", "譯注", "译註", "点校", "點校", "校点", "編譯", "编译", "著", "撰"];
+        if n <= 12 && tail.iter().any(|w| t.ends_with(w)) && !t.contains('。') {
+            return true;
+        }
+    }
+    // ⑥ 并列标签词组（v1.69.0）：「书名、地名、人名、夹注」这种凡例行。
+    if is_tag_list_line(t) {
+        return true;
+    }
+    // ⑦ 汉字叶码（v1.68.1）：「十三」「六」这种漏网的汉字页码，绝不能独占一列。
     is_lone_number_para(t)
 }
 
@@ -175,6 +308,82 @@ pub fn is_noise_para(s: &str) -> bool {
 /// 占位，漏进排版引擎只会吐一串大小不一的系统豆腐块，甚至有触发文本 shaping
 /// 崩溃的险。故一律换成古风占位的「□」（U+25A1，通用字库都有，绝不会再缺字），
 /// 连续多个乱码压成一个方块，**绝对不许 Panic**。
+/// **删掉连续拉丁字母（拼音）与多余英文空格**（v1.69.0）。
+///
+/// 古籍正文里不该出现成串的拼音字母（`dào kě dào`）——竖排引擎会把它们
+/// **一个字母一格**竖着排下去，读者看到的是一列天书。规则：
+///
+/// * **连续 ≥2 个拉丁字母** → 整段删（拼音必然连成串）；
+/// * **单个字母** → 保留（真的西文单词里它是词的一部分，占一格，不会
+///   被拆成单字母竖排）；
+/// * 连续的英文空格 → 折成一个；删完字母留下的空洞空格也一并收干净；
+/// * `[拼音:dào]` / `[注]…` 这类自家标记**整段原样放行**（标记不是正文，
+///   而且注音还得靠它）。
+/// 是不是**拉丁字母**（含带调符号的拼音字母）。
+///
+/// 拼音几乎都带调号（`dào kě`、`lǘ`、`ḿ`），只认 ASCII 字母会漏掉
+/// 整串——`is_ascii_alphabetic()` 对 `à` 返回 false，一串拼音就被拆成
+/// 一个个「单字母」全放过去了。这里把 Latin-1 补充 / Latin 扩展 A·B /
+/// Latin 扩展附加区一并算作字母。
+fn is_latin_letter(c: char) -> bool {
+    c.is_ascii_alphabetic()
+        || ('\u{00C0}'..='\u{024F}').contains(&c)
+        || ('\u{1E00}'..='\u{1EFF}').contains(&c)
+}
+
+pub fn strip_pinyin_runs(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let n = cs.len();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    let mut space = false;
+    while i < n {
+        // 自家标记整段放行（`[…]` 里的内容一个字母不动）。
+        if cs[i] == '[' {
+            if let Some(end) = (i + 1..n).find(|&j| cs[j] == ']') {
+                for &c in &cs[i..=end] {
+                    out.push(c);
+                }
+                i = end + 1;
+                space = false;
+                continue;
+            }
+        }
+        let c = cs[i];
+        if is_latin_letter(c) {
+            // 数一数这串字母有多长。
+            let mut j = i;
+            while j < n && is_latin_letter(cs[j]) {
+                j += 1;
+            }
+            // 只留「单字母」：那是一个词里的一格，不是拼音串。
+            if j - i == 1 {
+                out.push(c);
+                space = false;
+            }
+            // 拼音串（≥2）：整段丢；它前面若留着空格，交给下面的空格折叠。
+            i = j;
+            // 一串拼音后面可能跟着数字（声调 `dào3`）：一并吃掉。
+            while i < n && cs[i].is_ascii_digit() {
+                i += 1;
+            }
+            continue;
+        }
+        if c == ' ' || c == '\u{00A0}' {
+            if !space {
+                out.push(' ');
+                space = true;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        space = false;
+        i += 1;
+    }
+    out.trim().to_string()
+}
+
 pub fn denoise_text(s: &str) -> String {
     let mut s = s.to_string();
     // HTML 残留（清洗漏网的 `<span>`、`&nbsp;`）：先剥标签再解实体。
@@ -184,6 +393,11 @@ pub fn denoise_text(s: &str) -> String {
     if s.contains('&') {
         s = crate::pipeline::decode_entities(&s);
     }
+    // v1.69.0：**拼音（连续拉丁字母）一律删**。开源 JSON 的 `pinyin` 字段
+    // 一旦混进正文，竖排引擎会把它**一个字母一格**竖着排成一串天书。
+    // 单个字母保留（真有西文单词时它是一个完整词，占一格）。
+    // 自家标记 `[拼音:dào]` / `[注]…` 里的内容受保护，一个字母不少。
+    s = strip_pinyin_runs(&s);
     let mut out = String::with_capacity(s.len());
     let mut space = false;
     let mut tile = false; // 上一个输出已是「□」：连续私用/乱码只留一个方块
@@ -1402,5 +1616,50 @@ mod tests {
         assert_eq!(strip_orphan_title_marks("甲》乙"), "甲乙");
         assert_eq!(strip_orphan_title_marks("读《庄子》"), "读《庄子》");
         assert_eq!(strip_orphan_title_marks("读《庄子"), "读庄子");
+    }
+
+    /// v1.69.0：凡例里的并列标签词组判杂质。
+    #[test]
+    fn tag_list_lines_are_noise_but_prose_is_not() {
+        assert!(is_tag_list_line("书名、地名、人名、夹注"), "凡例标签行没判成杂质");
+        assert!(is_tag_list_line("书名 地名 人名 校记"), "空格并排的标签行没判成杂质");
+        assert!(is_tag_list_line("夹注 校记 专名号"), "含「夹注」的短行没判成杂质");
+        // 正文里带顿号的短列举：没有「标签味」词尾，绝不许误杀。
+        assert!(!is_tag_list_line("仁、义、礼、智、信"), "正文列举被误杀");
+        // 有句读的一律是正文。
+        assert!(!is_tag_list_line("道可道，非常道。"), "正文被误杀");
+        // 只有两段不算（太短，容易是正文）。
+        assert!(!is_tag_list_line("道 德"), "过短的并列不算杂质");
+    }
+
+    /// v1.69.0：版权页废话与署名行不进正文流。
+    #[test]
+    fn colophon_boilerplate_is_noise() {
+        assert!(is_noise_para("中华经典名著全本全注全译丛书"), "丛书名没判成杂质");
+        assert!(is_noise_para("管锡华译注"), "署名行没判成杂质");
+        assert!(is_noise_para("王晓玮 译注"), "署名行没判成杂质");
+        assert!(is_noise_para("图书在版编目（CIP）数据"), "版权页没判成杂质");
+        assert!(is_noise_para("z-library.sk"), "盗版站名没判成杂质");
+        // 正文里提到丛书名（长句）不许误杀。
+        assert!(
+            !is_noise_para("本书属中华经典名著全本全注全译丛书之一种，点校细致，注释妥帖，翻译精确，读者可依此入门。"),
+            "长句被误杀"
+        );
+    }
+
+    /// v1.69.0：连续拉丁字母（拼音）删掉，单字母保留；自家标记不受影响。
+    #[test]
+    fn pinyin_runs_are_stripped_but_markers_survive() {
+        assert_eq!(strip_pinyin_runs("道可道 dào kě dào 非常道"), "道可道 非常道");
+        assert_eq!(strip_pinyin_runs("lùn yǔ"), "");
+        assert_eq!(strip_pinyin_runs("子曰"), "子曰");
+        // 单字母是一个词里的一格，不是拼音串，保留。
+        assert_eq!(strip_pinyin_runs("甲 A 乙"), "甲 A 乙");
+        // 声调数字一并吃掉。
+        assert_eq!(strip_pinyin_runs("道 dao3 可"), "道 可");
+        // 自家标记整段放行：`[拼音:]` 里的注音一个字母不少。
+        assert_eq!(strip_pinyin_runs("长[拼音:cháng]江"), "长[拼音:cháng]江");
+        // 多余空格折叠。
+        assert_eq!(strip_pinyin_runs("甲  乙"), "甲 乙");
     }
 }

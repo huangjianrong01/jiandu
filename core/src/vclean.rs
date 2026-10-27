@@ -1051,25 +1051,245 @@ pub fn hyphen_to_dot(s: &str) -> String {
     out
 }
 
+/// 元数据（书名 / 作者）里能留下的**最长字数**（v1.69.0）：15。
+///
+/// 版心书口只有一格宽、书架卡片也只有一行——超长的书名既排不下，
+/// 也说明那段字符串根本不是书名（而是盗版站塞进去的文件名）。
+pub const META_TITLE_MAX: usize = 15;
+
+/// 盗版站 / 下载站的站名与格式词（命中即整词删除，大小不敏感）。
+///
+/// 这些都是**纯 ASCII** 词，中文书名里不可能出现，删掉绝不误伤。
+const SITE_WORDS: [&str; 22] = [
+    "z-library", "zlibrary", "z-lib", "zlib", "1lib", "libgen", "libgen1",
+    "annas-archive", "anna", "archive", "singlelogin", "it-ebooks", "it-ebooks.info",
+    "epub", "mobi", "azw3", "pdf", "txt", "dvd", "torrent", "download", "free",
+];
+
+/// 域名后缀（用于识别 `z-library.sk` 这类**没被 ① 整段吃掉**的残片）。
+const TLD_WORDS: [&str; 14] = [
+    "com", "net", "org", "sk", "io", "cc", "to", "me", "ru", "info", "biz", "co", "uk", "cn",
+];
+
+/// **元数据粉碎机·第一步**：剥网址、站名、拼音括号（v1.69.0）。
+///
+/// 盗版 EPUB 的 `dc:title` 常常就是那一长串文件名：
+/// `尔雅——中华经典名著全本全注全译丛书 (管锡华 [guanxihua]) (z-library.sk, 1lib.sk, z-lib.sk)`
+/// 里面塞着网址、拼音和站名。这里按四道工序把它们剥干净，**其余标点
+/// 一律不动**（「：」「（」还要留给书名截断用，见 [`clean_book_title`]）：
+///
+///   ① 整段剥网址：`http://` / `https://` / `www.` 起手的一律吃到边界；
+///   ② 剥纯 ASCII 的方括号 / 圆括号内容（`[guanxihua]`）——那是拼音或罗马
+///      字，不是书名；**括号里含中文的保留**（`尔雅（全本）`）；
+///   ③ 按词剥站名与格式词（[`SITE_WORDS`]）与域名后缀（[`TLD_WORDS`]）；
+///   ④ 剥「含点的域名残片」（`z-library.sk`、`1lib.sk`、`www.foo.com`）。
+pub fn strip_meta_junk(raw: &str) -> String {
+    let cs: Vec<char> = raw.chars().collect();
+
+    // ① 网址：`http(s)://` / `www.` 起手，一路吃到「不是网址字符」为止。
+    let is_url_char = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '.' | '-' | '_' | '/' | '?' | '=' | '&' | ':' | '%' | '#' | '~' | '+')
+    };
+    let mut s = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    while i < cs.len() {
+        let head: String = cs[i..].iter().take(10).collect();
+        let low = head.to_ascii_lowercase();
+        if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("www.") {
+            while i < cs.len() && is_url_char(cs[i]) {
+                i += 1;
+            }
+            s.push(' ');
+            continue;
+        }
+        s.push(cs[i]);
+        i += 1;
+    }
+
+    // ② 纯 ASCII 的括号内容连壳删（拼音 / 罗马字），含中文的保留。
+    s = drop_ascii_brackets(&s, '[', ']');
+    s = drop_ascii_brackets(&s, '(', ')');
+
+    // ③ 按词剥站名 / 格式词 / 域名后缀。
+    let keep = |w: &str| -> bool {
+        if w.is_empty() || !w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return true; // 含中文或别的符号的词不动（那不是站名）
+        }
+        let low = w.to_ascii_lowercase();
+        if SITE_WORDS.contains(&low.as_str()) {
+            return false;
+        }
+        if TLD_WORDS.contains(&low.as_str()) {
+            return false;
+        }
+        // ④ 含点的域名残片：`z-library.sk`、`1lib.sk`。
+        if w.contains('.') {
+            let parts: Vec<&str> = w.split('.').collect();
+            if parts.len() >= 2 && parts.iter().all(|p| !p.is_empty()) {
+                return false;
+            }
+        }
+        true
+    };
+    // 按分隔符切词重拼（分隔符本身原样保留，交给后面折叠空白）。
+    let mut res = String::with_capacity(s.len());
+    let mut word = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+            word.push(c);
+        } else {
+            if keep(&word) {
+                res.push_str(&word);
+            }
+            word.clear();
+            res.push(c);
+        }
+    }
+    if keep(&word) {
+        res.push_str(&word);
+    }
+    res
+}
+
+/// 删掉 `open…close` 里**纯 ASCII** 的内容（连壳一起删）。
+///
+/// 括号里只要有一个非 ASCII（汉字、假名……）就整段保留——那多半是
+/// 「尔雅（全本）」这种真书名成分，删了就是丢内容。
+fn drop_ascii_brackets(s: &str, open: char, close: char) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < cs.len() {
+        if cs[i] == open {
+            if let Some(end) = (i + 1..cs.len()).find(|&j| cs[j] == close) {
+                let inner: &[char] = &cs[i + 1..end];
+                let ascii_only = inner.iter().all(|c| c.is_ascii());
+                // 括号里要有内容才算（空壳 `[ ]` 也删）。
+                if ascii_only && !inner.is_empty() {
+                    i = end + 1;
+                    out.push(' ');
+                    continue;
+                }
+            }
+        }
+        out.push(cs[i]);
+        i += 1;
+    }
+    out
+}
+
+/// **元数据粉碎机·第二步**：只留「像书名」的字符，再按 [`META_TITLE_MAX`] 截断。
+///
+/// 保留：中日韩统一表意文字（含扩展区）、假名、谚文、拉丁字母、数字、
+/// 空格、中圆点 / 连字符 / 间隔号。其余一切特殊符号（`！＠＃￥％…`、`（）`
+/// `《》` `【】` `「」` `、` `，` `：` `；` `？`）一律切掉——书名里出现
+/// 这些，只可能是盗版站塞的。
+pub fn tidy_meta_title(raw: &str) -> String {
+    let allowed = |c: char| -> bool {
+        c.is_alphanumeric()
+            // CJK 统一表意文字 + 扩展 A/B…  + 康熙部首 + 兼容表意文字
+            || matches!(c,
+                '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}' | '\u{2E80}'..='\u{2EFF}'
+                | '\u{3000}'..='\u{303F}'  // 全角空格与 CJK 标点另判
+                | '\u{3040}'..='\u{30FF}'  // 假名
+                | '\u{AC00}'..='\u{D7AF}'  // 谚文
+                | '\u{20000}'..='\u{3FFFF}')
+            || matches!(c, '·' | '‧' | '-' | '－' | '—' | '_')
+            // 〔〕：古籍署名里标朝代的正规括号（「〔周〕李耳」），不是杂质。
+            || matches!(c, '〔' | '〕')
+    };
+    let mut s: String = raw
+        .chars()
+        .filter(|&c| {
+            if c == '　' || c == ' ' {
+                return true;
+            }
+            // CJK 标点区里只放行全角空格（已在上一条）与〔〕——〔〕是古籍
+            // 署名里标朝代的正规括号（「〔周〕李耳」），不是杂质。
+            if matches!(c, '\u{3000}'..='\u{303F}') && !matches!(c, '〔' | '〕') {
+                return false;
+            }
+            allowed(c)
+        })
+        .collect();
+    // 连续空白折成一个，首尾去白。
+    let mut folded = String::with_capacity(s.len());
+    let mut prev_space = true;
+    for c in s.chars() {
+        if c == ' ' || c == '　' {
+            if !prev_space {
+                folded.push(' ');
+                prev_space = true;
+            }
+        } else {
+            folded.push(c);
+            prev_space = false;
+        }
+    }
+    s = folded.trim().to_string();
+    // 超长直接截断：一段 15 字以上的「书名」绝不是书名，是文件名。
+    if s.chars().count() > META_TITLE_MAX {
+        s = s.chars().take(META_TITLE_MAX).collect();
+    }
+    s.trim().to_string()
+}
+
+/// **书名终极粉碎**：[`strip_meta_junk`] → 旧有的「遇卷册括号即截」→
+/// [`tidy_meta_title`]。三段顺序不可换：
+/// 网址要在截断点之前剥（否则 `…(z-library.sk` 会把整个书名截没），
+/// 截断要在符号清洗之前跑（否则「注音全译老子：附王弼…」粘成一串，
+/// 再被 15 字硬截成断句）。
 pub fn clean_book_title(raw: &str) -> String {
-    // v1.56.0：先做「连字符 → 中圆点」，再做下面的「遇 · 即截」——
+    // ⓪ v1.69.0：先粉碎盗版站的网址 / 拼音 / 站名——否则
+    // `尔雅…(z-library.sk, 1lib.sk, z-lib.sk)` 里的 `(` 会让下面的
+    // 「遇 ( 即截」把书名截成 `尔雅——中华经典名著全本全注全译丛书`，
+    // 又长又脏；`[guanxihua]` 这类拼音也会被当成书名成分留下。
+    let raw = strip_meta_junk(raw);
+    // ① v1.56.0：先做「连字符 → 中圆点」，再做下面的「遇 · 即截」——
     // 「庄子--中华经典名著全…」因此收成「庄子」，而不是留一串 hyphen。
-    let t = hyphen_to_dot(raw);
+    let t = hyphen_to_dot(&raw);
+    let t = squeeze_spaces(&t);
+    // v1.69.0：**先截后滤**。`【】「」《》` 也要算截断点——旧制先把它们
+    // 剥掉再截，于是「诸子百家系列套装【套装全二十册】(孟子…)」剥完变成
+    // 「诸子百家系列套装套装全二十册」，平白多出一个「套装」。
+    // 开头的书名号要先摘掉（《历代名家词集》卷十九 的截断点在 index 0，
+    // 直接截会得到空串）。
+    let t = t
+        .trim_start_matches(|c: char| matches!(c, '《' | '〈' | '【' | '「' | '（' | '('))
+        .to_string();
+    let cut = t
+        .char_indices()
+        .find(|(_, c)| {
+            matches!(
+                c,
+                '卷' | '册' | '冊' | '（' | '(' | '：' | ':' | '·' | '【' | '《' | '「' | '〈'
+                    | '》' | '〉' | '】' | '」'
+            )
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(t.len());
+    let t = t[..cut].trim().to_string();
     let t: String = t
         .chars()
         .filter(|c| !matches!(c, '《' | '》' | '〈' | '〉' | '【' | '】' | '「' | '」'))
         .collect();
     let t = squeeze_spaces(&t);
-    let cut = t
-        .char_indices()
-        .find(|(_, c)| matches!(c, '卷' | '册' | '冊' | '（' | '(' | '：' | ':' | '·'))
-        .map(|(i, _)| i)
-        .unwrap_or(t.len());
-    let head = t[..cut].trim().to_string();
-    if head.chars().count() >= 2 {
-        head
-    } else {
+    let picked = if t.chars().count() >= 2 {
         t.trim().to_string()
+    } else {
+        // 截得太狠（比如开头就是【/卷）→ 退回整段重来。
+        squeeze_spaces(&hyphen_to_dot(&raw)).trim().to_string()
+    };
+    // ② v1.69.0：只留「像书名」的字符，并按 15 字硬截断。走到这一步
+    // 「：」「（」这些截断点已经用过，剩下的符号全是杂质。
+    let out = tidy_meta_title(&picked);
+    if out.chars().count() >= 2 {
+        out
+    } else {
+        // 剥得太狠（比如整段就一个网址）→ 退回文件名由调用方兜底。
+        picked
     }
 }
 
@@ -1198,9 +1418,13 @@ fn is_han_numeral(c: char) -> bool {
 /// 注意第一步不是降噪而是**抽注文**：脚注体装在 `<aside>` 里，降噪会把它们
 /// 一并删掉，注号就只能退回一个光秃秃的数字了。
 pub fn clean_epub(html: &str) -> Vec<RawChapter> {
+    // v1.69.0：**表格整块丢弃**（死命令，见 [`drop_tag_blocks`]）。必须
+    // 排在最前面——晚一步表格里的字就被当成正文收进来了，再也分不出
+    // 哪些是表格里的、哪些是正文。
+    let html = drop_tag_blocks(html, &TABLE_TAGS);
     // `<sup>` 幽灵字先吃掉（见 `parsers::strip_sup_marks`）：导入走的是逐份
     // xhtml 直接调本函数，不经过 `UniversalParser`，这道闸必须装在这里。
-    let html = crate::parsers::strip_sup_marks(html);
+    let html = crate::parsers::strip_sup_marks(&html);
     let notes = collect_footnotes(&html);
     let s = stage1_denoise(&html);
     let s = stage4_marks_with(&s, &notes);
@@ -1211,6 +1435,10 @@ pub fn clean_epub(html: &str) -> Vec<RawChapter> {
             // 独字夹注（`[注]已[/注]` / `[注]商[/注]`）也是上标残渣的一种：
             // 竖排里它是一个人孤零零占半列的杂质，连壳带字吃掉。
             c.content = crate::parsers::scrub_ghost_notes(&c.content);
+            // v1.69.0：无主的注疏壳（`[/注]` / `[注]` 落单的）连壳删。
+            // 真机实测：传习录、Rust 教程这些 epub 里，上标注号被拆得只剩
+            // 一个收标记，方括号就原样印进正文了（用户点名不许有 []）。
+            c.content = crate::types::strip_dangling_note_marks(&c.content);
             c
         })
         .collect();
@@ -1239,6 +1467,63 @@ fn read_tag(s: &str, low: &str) -> (String, String, bool, bool) {
     let self_close = low[..gt].trim_end().ends_with('/');
     (name, attrs, closing, self_close)
 }
+
+/// **整块丢弃指定标签**（连内容一起删，v1.69.0）。
+///
+/// 用户死命令：**只要文本里有 `<table>` 就整块丢弃，绝不许渲染表格**。
+/// 盗版 epub 里的表格多是「篇章字」表、生僻字表、出版信息表——竖排下
+/// 就是一堆错位的方块字。
+///
+/// 按标签名做**深度配对**（`<table><table>…</table></table>` 这种嵌套
+/// 也一并吃掉），自闭合的 `<table/>` 只删自己。找不到 `>` 的残标（文件
+/// 被截断）直接把余下原样保留——宁可留脏字，绝不越界读写。
+pub fn drop_tag_blocks(html: &str, names: &[&str]) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut depth = 0usize;
+    let mut rest = html;
+    loop {
+        let low = rest.to_ascii_lowercase();
+        let Some(lt) = low.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        // 表格**内部**的文字绝不许流出：只有不在表格里（depth == 0）时才
+        // 把标签之间的正文写进输出。
+        if depth == 0 {
+            out.push_str(&rest[..lt]);
+        }
+        let Some(g) = low[lt..].find('>') else {
+            // 半截标签（文件被截断）：余下原样保留（表格外的才留）。
+            if depth == 0 {
+                out.push_str(&rest[lt..]);
+            }
+            break;
+        };
+        let gt = lt + g + 1;
+        let seg = &rest[lt..gt];
+        let after = &rest[gt..];
+        let (tag, _attrs, closing, self_close) = read_tag(seg, &seg.to_ascii_lowercase());
+        if names.contains(&tag.as_str()) {
+            if !closing && !self_close {
+                depth += 1;
+            } else if closing {
+                depth = depth.saturating_sub(1);
+            }
+            rest = after;
+            continue;
+        }
+        if depth == 0 {
+            out.push_str(seg);
+        }
+        rest = after;
+    }
+    out
+}
+
+/// 表格类标签（v1.69.0）：整块丢弃，单元格文字也不留。
+pub const TABLE_TAGS: [&str; 8] = [
+    "table", "tbody", "thead", "tfoot", "tr", "td", "th", "caption",
+];
 
 /// 标签名后面是不是一个「真边界」（`<ruby>` 命中、`<rubyish>` 不命中）。
 fn tag_boundary(after: &str) -> bool {
@@ -1850,4 +2135,56 @@ mod tests {
         assert_eq!(clean_book_title("庄子--中华经典名著全…"), "庄子");
     }
 
+
+    /// v1.69.0：盗版站的超长脏书名必须被彻底粉碎。
+    #[test]
+    fn dirty_z_library_title_is_pulverized() {
+        // 真·文件名（z-library 下载件）：网址 + 拼音 + 站名 + 一坨符号。
+        let raw = "尔雅——中华经典名著全本全注全译丛书 (管锡华 [guanxihua]) (z-library.sk, 1lib.sk, z-lib.sk)";
+        let t = clean_book_title(raw);
+        assert!(!t.contains("z-library"), "网址漏进书名：{t}");
+        assert!(!t.contains("1lib"), "站名漏进书名：{t}");
+        assert!(!t.contains("guanxihua"), "拼音漏进书名：{t}");
+        assert!(!t.contains("http"), "网址漏进书名：{t}");
+        assert!(t.chars().count() <= META_TITLE_MAX, "书名超长：{t}");
+        assert_eq!(t, "尔雅", "应收到「尔雅」，实为 {t}");
+
+        // 纯网址 + 拼音的书名：粉碎后不许留任何 ASCII 渣。
+        let t2 = clean_book_title("https://z-library.sk/book/12345 【某某】 (zhang san)");
+        assert!(!t2.contains("z-library"), "网址漏进书名：{t2}");
+        assert!(!t2.contains("zhang"), "拼音漏进书名：{t2}");
+
+        // 全角括号里的中文是真书名成分，不许连内容一起删。
+        let t3 = clean_book_title("传习录（全本全注全译）");
+        assert!(t3.starts_with("传习录"), "中文括号里的题名丢了：{t3}");
+
+        // 超长书名一律截到 15 字。
+        let long = "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十";
+        assert_eq!(
+            tidy_meta_title(long).chars().count(),
+            META_TITLE_MAX,
+            "超长书名没被截断"
+        );
+    }
+
+    /// v1.69.0：`<table>` 整块丢弃（嵌套也要吃掉）。
+    #[test]
+    fn table_blocks_are_dropped_whole() {
+        let html = "<p>正文一</p><table><tr><td>篇章</td><td>字</td></tr></table><p>正文二</p>";
+        let out = drop_tag_blocks(html, &TABLE_TAGS);
+        assert!(!out.contains("篇章"), "表格文字漏进正文：{out}");
+        assert!(!out.contains("字</td>"), "表格标签没删干净：{out}");
+        assert!(out.contains("正文一") && out.contains("正文二"), "正文被误删：{out}");
+
+        // 嵌套表格：内层也一并吃掉，绝不留半截。
+        let nested = "<p>甲</p><table><table><tr><td>乙</td></tr></table></table><p>丙</p>";
+        let out2 = drop_tag_blocks(nested, &TABLE_TAGS);
+        assert!(!out2.contains("乙"), "嵌套表格没吃干净：{out2}");
+        assert!(out2.contains("甲") && out2.contains("丙"), "正文被误删：{out2}");
+
+        // 半截文件（没有收口 `>`）不许越界读写、不许 panic。
+        let broken = "<p>甲</p><table><tr><td>乙";
+        let out3 = drop_tag_blocks(broken, &TABLE_TAGS);
+        assert!(out3.contains("甲"), "截断文件不该丢正文：{out3}");
+    }
 }

@@ -594,61 +594,46 @@ fn banxin_tail(w: f32, h: f32, top: bool, color: u32) -> Div {
 /// **象鼻**（v1.68.0 照规范图重做）：版框内缘 → 鱼尾上缘的那一根**实心墨条**。
 ///
 /// 刻本版心不只是两枚鱼尾：鱼尾与上下版框之间还各留一段「鼻子」，
-/// 由一根竖直墨条把鱼尾**吊**在版框下面，形似垂下的象鼻，故名。旧版
-/// 这里画成「中线两侧各一根 1px 竖线」的空心鼻梁，远看是一条双线槽，
-/// 与规范图不符——图上量得是一根 **6px 宽的实心短墨条**（约 0.10W）。
+/// 由一根竖直墨线把鱼尾**吊**在版框下面，形似垂下的象鼻，故名。
 ///
-/// 画法：一个覆盖整条内芯（`w × h`）的 Canvas，在上、下两个定位垫里
-/// 各落**一根**竖墨条，x 关于中缝中线**严格对称**，起止正好落在版框
+/// ⚠️ **v1.69.0 死命令**：象鼻就是**一根 1px 单线**（[`crate::banxin::
+/// XIANG_BI_LINE_W`]）。曾一度按「粗细 = 0.10×中缝宽、夹在 2~8px」画成
+/// **实心墨条**，真机上鱼尾上下各竖一根又黑又粗的柱子——用户在真机截图
+/// 上直接点名这两根「极其丑陋的竖柱子」。版心从今往后只准三样东西：
+/// **上鱼尾多边形、下鱼尾多边形、连接版框的象鼻单线**，多一笔都不画。
+///
+/// 画法：一个覆盖整条内芯（`w × h`）的绝对定位盒，在里面落 1~2 根
+/// `1px × len` 的细线，x 取中缝中线（严格对称），起止正好落在版框
 /// 内缘与鱼尾上缘（`len` 由 `render_gutter` 算出，与鱼尾同源）。
 /// `both = false` 只画**上**象鼻——章题列顶端只有一枚鱼尾，底下那根
 /// 无处可落（会凭空吊在列尾），故按需关掉。
 /// 只碰版心装饰：不占正文行格、不影响分页，也不与鱼尾 / 书口字重叠。
-fn gutter_trunk(w: f32, h: f32, len: f32, bar_w: f32, color: u32, both: bool) -> Div {
-    div()
+fn gutter_trunk(w: f32, h: f32, len: f32, color: u32, both: bool) -> Div {
+    let l = len.min(h * 0.5).max(0.0);
+    let lw = crate::banxin::XIANG_BI_LINE_W;
+    let x = ((w - lw) * 0.5).round();
+    let line = |top: f32| {
+        div()
+            .absolute()
+            .top(px(top))
+            .left(px(x))
+            .w(px(lw))
+            .h(px(l))
+            .bg(rgb(color))
+    };
+    let mut d = div()
         .absolute()
         .top(px(0.0))
         .left(px(0.0))
         .w(px(w))
-        .h(px(h))
-        .child(
-            canvas(
-                move |_b, _window, _cx| {},
-                move |b, _s, window: &mut Window, _cx| {
-                    let unit = px(1.0);
-                    let bw = b.size.width / unit;
-                    let bh = b.size.height / unit;
-                    let l = len.min(bh * 0.5).max(0.0);
-                    if bw < 3.0 || l < 1.0 {
-                        return;
-                    }
-                    let x0 = b.origin.x / unit;
-                    let y0 = b.origin.y / unit;
-                    // 一根实心竖条，居中；宽度夹在 [2, 8] px，永远盖得住 1px 折痕。
-                    let bar = bar_w.clamp(2.0, 8.0);
-                    let left = ((bw - bar) * 0.5).round();
-                    // 上象鼻（版框内缘 → 上鱼尾）+ 下象鼻（下鱼尾 → 地脚），严格镜像。
-                    let mut bars = vec![(left, 0.0, l)];
-                    if both {
-                        bars.push((left, bh - l, l));
-                    }
-                    let mut pb = PathBuilder::fill();
-                    for (x, y, ln) in bars {
-                        let (ax, ay) = (x0 + x, y0 + y);
-                        pb.move_to(point(px(ax), px(ay)));
-                        pb.line_to(point(px(ax + bar), px(ay)));
-                        pb.line_to(point(px(ax + bar), px(ay + ln)));
-                        pb.line_to(point(px(ax), px(ay + ln)));
-                        pb.line_to(point(px(ax), px(ay)));
-                    }
-                    if let Ok(path) = pb.build() {
-                        window.paint_path(path, rgb(color));
-                    }
-                },
-            )
-            .w(px(w))
-            .h(px(h)),
-        )
+        .h(px(h));
+    // 上象鼻（版框内缘 → 上鱼尾）。
+    d = d.child(line(0.0));
+    // 下象鼻（下鱼尾 → 地脚），与上象鼻等长、严格镜像。
+    if both {
+        d = d.child(line(h - l));
+    }
+    d
 }
 
 /// 信笺「对鱼尾」：与版心同一条直线多边形路径，比例取**横展**
@@ -4462,14 +4447,7 @@ impl Root {
         // 一根**实心象鼻**。缺了它，鱼尾之上那段空当看着就像凭空加的
         // padding——其实那是象鼻的位置（v1.68.0 补画，只画上端：列尾没有
         // 鱼尾，底下那根无处可落）。
-        col = col.child(gutter_trunk(
-            col_w,
-            col_h,
-            head,
-            (col_w * crate::banxin::XIANG_BI_W_RATIO).clamp(2.0, 8.0),
-            t.frame_ink(),
-            false,
-        ));
+        col = col.child(gutter_trunk(col_w, col_h, head, t.frame_ink(), false));
         col = col.child(div().h(px(head)));
         // 上鱼尾：与版心同一枚黑鱼尾（深灰 `#222222`），形制同式：宽 = 本列宽，
         // 高 = 宽 × 0.4（扁宽），凹口顶点在 `H × 0.7`。
@@ -4686,13 +4664,14 @@ impl Root {
         //   · 鱼尾宽 = W        ——两翼端点正压在左右界栏的线心上；
         //   · 鱼尾高 = 0.40 W   ——**扁宽**梯形，宽明显大于高；
         //   · 象鼻长 = 1.30 W   ——版框内缘 → 鱼尾上缘，比鱼尾本身还长；
-        //   · 象鼻粗 = 0.10 W   ——一根实心短墨条（不是两根细线的空档）。
+        //   · 象鼻 = 1px 单线  ——v1.69.0：绝不再是实心墨条（那会画成鱼尾
+        //     上下两根丑陋的竖柱子）。版心只准有「两枚鱼尾多边形 + 一根象鼻
+        //     单线」，多一笔都不行。
         // 于是纵向次序是：版框内缘 → 象鼻 → 鱼尾 → 书口字 → 鱼尾 → 象鼻 → 地脚，
         // 鱼尾是**吊**在版框下面的，不再浮在内芯高的 1/4、3/4 处。
         let tail_w = gw + crate::banxin::FISHTAIL_OVERLAP;
         let tail_h = crate::banxin::tail_h_for_width(tail_w);
         let xiangbi = crate::banxin::xiangbi_len(tail_h);
-        let trunk_w = (tail_w * crate::banxin::XIANG_BI_W_RATIO).clamp(2.0, 8.0);
         // 书口文字：书名（去括号）、卷次「卷五十一」、叶码「五十」。
         let book = self.book_title();
         let juan = format!("卷{}", han_num(chapter + 1));
@@ -4733,8 +4712,8 @@ impl Root {
             .flex()
             .flex_col()
             .items_center();
-        // 象鼻：一根实心墨条，从版框内缘垂到鱼尾上缘（上下严格镜像）。
-        col = col.child(gutter_trunk(core_w, core_h, xiangbi, trunk_w, t.frame_ink(), true));
+        // 象鼻：一根 1px 单线，从版框内缘垂到鱼尾上缘（上下严格镜像）。
+        col = col.child(gutter_trunk(core_w, core_h, xiangbi, t.frame_ink(), true));
         // 上象鼻那一段的高度（鱼尾的上缘因此落在 `Y_top + H_xiangbi`）。
         col = col.child(div().h(px(xiangbi)));
         // 上鱼尾：平顶贴象鼻下缘、凹口在下缘朝下；宽＝中缝全宽。

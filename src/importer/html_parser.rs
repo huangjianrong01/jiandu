@@ -49,11 +49,33 @@ pub fn extract_html_str(src: &str) -> (String, Option<String>) {
     extract_html_reader(std::io::Cursor::new(src.as_bytes()))
 }
 
-/// 流式抽正文：`BufRead` 进、纯文本出。
+/// 流式抽正文：`BufRead` 进、纯文本出。**默认整块丢弃 `<table>`**（见
+/// [`extract_html_reader_keep_tables`] 取回表格内容的退路）。
 ///
 /// 返回（正文, 解析错误）。**即使出错也返回已读到的部分**：一本 300 节的 EPUB
 /// 里有 1 节畸形，不该让整本书打不开。
 pub fn extract_html_reader<R: BufRead>(reader: R) -> (String, Option<String>) {
+    extract_html_with(reader, true)
+}
+
+/// 同上，但**保留表格文字**（v1.69.0 的退路）。
+///
+/// 少数电子书整本都用 `<table>` 排版（多见于劣质转换件）。全本弃表后会
+/// 一个字都不剩，那时再跑一遍本函数把表格文字当正文救回来——**有字胜过
+/// 无字**，表格排版再丑也比空书强。
+pub fn extract_html_reader_keep_tables<R: BufRead>(reader: R) -> (String, Option<String>) {
+    extract_html_with(reader, false)
+}
+
+/// 单次导入里允许读的**最大 XML 事件数**（v1.69.0）。
+///
+/// 防盗版脏文件把解析器拖进死循环：非标准 XHTML（`<<<<<`、未闭合的
+/// 实体、几 MB 的单行注释）在某些 `quick-xml` 版本上会反复产出事件而不
+/// 推进游标。设了这道闸，最坏情况是**读到上限就停、返回已读到的部分**
+/// 并给出报错——绝不会「进度条卡死在 0%」。
+const MAX_EVENTS: usize = 4_000_000;
+
+fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Option<String>) {
     let mut xml = Reader::from_reader(reader);
     // 不 trim：行内空格是词边界（`<b>道</b> 可道` 里的空格不能丢）。
     xml.config_mut().trim_text(false);
@@ -63,26 +85,44 @@ pub fn extract_html_reader<R: BufRead>(reader: R) -> (String, Option<String>) {
     let mut para = String::new();
     let mut skip = 0usize; // >0 表示正处在丢弃块里（可嵌套）
     let mut err: Option<String> = None;
+    let mut events = 0usize;
 
     // 块级标签：结束时要断段。
     let is_block = |n: &str| -> bool {
         matches!(
             n,
-            "p" | "div" | "section" | "article" | "blockquote" | "li" | "ul" | "ol" | "tr"
-                | "td" | "th" | "table" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre"
+            "p" | "div" | "section" | "article" | "blockquote" | "li" | "ul" | "ol"
+                | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre"
                 | "figure" | "figcaption" | "dl" | "dt" | "dd" | "body" | "html"
-        )
+        ) || (!drop_tables && matches!(n, "tr" | "td" | "th" | "table"))
     };
     // 丢弃块：整块内容都不进正文。
+    //
+    // v1.69.0：**表格整块丢弃**（用户死命令）。盗版 epub 里的表格多是
+    // 「篇章字」表、生僻字表、出版信息表——排进竖排就是一堆错位方块。
+    // `tbody/thead/tfoot/tr/td/th/caption` 一并丢：它们只在表格里出现，
+    // 留着只会剩下散落的单元格文字。
     let is_skip = |n: &str| -> bool {
         matches!(
             n,
             "script" | "style" | "nav" | "header" | "footer" | "aside" | "head" | "noscript"
                 | "svg" | "math" | "template"
-        )
+        ) || (drop_tables
+            && matches!(
+                n,
+                "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "caption"
+                    | "colgroup" | "col"
+            ))
     };
 
     loop {
+        events += 1;
+        if events > MAX_EVENTS {
+            err = Some(format!(
+                "这一节的 XHTML 结构异常（事件数超过 {MAX_EVENTS}），已跳过余下内容"
+            ));
+            break;
+        }
         match xml.read_event_into(&mut buf) {
             Ok(Event::Eof) => break,
             Ok(Event::Start(e)) => {

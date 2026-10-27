@@ -1101,10 +1101,16 @@ impl Book {
                     p.text = crate::parsers::purge_bracket_marks(&p.text);
                 }
                 if !p.text.contains("[注]") {
+                    // v1.69.0：**无主的注疏壳连壳删**。epub 的上标注号常被
+                    // 拆得只剩一个收标记（`[/注]`），方括号就原样印进正文了
+                    // ——用户点名「正文里不许有 []」。成对的一律保留。
+                    if p.text.contains(']') {
+                        p.text = strip_dangling_note_marks(&p.text);
+                    }
                     continue;
                 }
                 let (clean, notes) = crate::pipeline::split_notes(&p.text);
-                p.text = clean;
+                p.text = strip_dangling_note_marks(&clean);
                 for (at, text) in notes {
                     p.notes.push(Note::new(at, NoteKind::Note, text));
                 }
@@ -2291,3 +2297,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+

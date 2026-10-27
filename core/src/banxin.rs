@@ -149,11 +149,16 @@ pub const BANXIN_TAIL_ASPECT: f32 = 0.40;
 /// 象鼻太短，鱼尾像直接贴在框上、看不出是「吊」下来的；太长，中缝上端
 /// 空出一条白肠子。3.25H 正是图上的长相。
 pub const XIANG_BI_RATIO: f32 = 3.25;
-/// 象鼻的**粗细 / 中缝宽**：0.10（量图 6 / 57）。
+/// 象鼻的**线宽**（px）：**1.0 —— 一根单线，不是墨条**（v1.69.0）。
 ///
-/// 图上象鼻是一根**实心短墨条**（不是两根细线夹出来的空档）——旧版画成
-/// 「左右各一根 1px 竖线」的鼻梁，远看像一条双线槽，与图不符。
-pub const XIANG_BI_W_RATIO: f32 = 0.10;
+/// ⚠️ 死命令（用户 v1.69.0）：版心除了上下两枚鱼尾多边形，只准再有一根
+/// 连接版框与鱼尾的**象鼻单线**。
+///
+/// 旧制（v1.68.0）把象鼻画成「粗细 = 中缝宽 × 0.10、夹在 2~8px」的**实心
+/// 墨条**，真机上就是鱼尾上下各竖一根又黑又粗的柱子——远看像两根钉子把
+/// 鱼尾钉在框上，极其丑陋。象鼻在刻本里本就是一条细墨线（鼻梁），
+/// 与内框细线同粗即可。这里锁死 1px，渲染层不许再夹任何下限。
+pub const XIANG_BI_LINE_W: f32 = 1.0;
 /// 象鼻线的最短长度（px）：极窄屏也别画成一个点。
 pub const XIANG_BI_MIN: f32 = 6.0;
 
@@ -391,6 +396,29 @@ pub struct BanxinOpts<'a> {
 /// 「叶码 → 卷次 → 书名 → 篇题」分。分不够就截字；篇题至少两个字
 /// 才肯露面（一个字的篇题不如不写）。
 pub fn layout(o: BanxinOpts) -> BanxinLayout {
+    // ── v1.69.0：书口字先过「题名净化」──────────────────────────────
+    // 开源 JSON / 盗版 epub 的书名、卷名里常混着**拼音字母**（`lùn yǔ`）、
+    // 站名和怪符号。中缝只有一格宽，那些字母会被**一字一格竖排**成一串
+    // 莫名其妙的拉丁字母（用户实测截图里就是那一条竖着的拼音）。
+    // 净化后只剩汉字与中圆点，且至多 [`BANXIN_TEXT_MAX`] 字——超了截断
+    // 加竖排省略号「︙」。
+    //
+    // 中缝的**宽度恒为 `gutter_w`**（界栏宽），与文本长度无关：下面的字号
+    // `small` / `title_fs` 全由 `gutter_w` 与正文字号推出，绝不按文本算，
+    // 鱼尾尺寸也只由 `tail_size` / `banxin_tail_size(gutter_w…)` 定。
+    // 「中缝被拼音撑变形」的根因是**文本进了版心**，不是宽度计算。
+    let book = banxin_text(o.book, BANXIN_TEXT_MAX);
+    let juan = banxin_text(o.juan, BANXIN_TEXT_MAX);
+    let page = banxin_text(o.page, BANXIN_TEXT_MAX);
+    let chapter_title = banxin_text(o.chapter_title, BANXIN_TEXT_MAX);
+    let o = BanxinOpts {
+        book: &book,
+        juan: &juan,
+        page: &page,
+        chapter_title: &chapter_title,
+        ..o
+    };
+
     let (tail_w, mut tail_h) =
         o.tail_size
             .unwrap_or_else(|| banxin_tail_size(o.gutter_w, o.cell_h, o.col_w));
@@ -493,6 +521,36 @@ pub fn layout(o: BanxinOpts) -> BanxinLayout {
     }
 }
 
+/// 版心（中缝）一行书口字的**最大字数**（v1.69.0）：10。
+///
+/// 中缝只有一格宽，题名排长了就压到鱼尾上；刻本书口本来就只用省称
+/// （「论」「語·卷三」）。
+pub const BANXIN_TEXT_MAX: usize = 10;
+
+/// **版心文本净化**（v1.69.0）：只留「像题名」的字，超长截断加省略号。
+///
+/// 丢掉的东西：**一切拉丁字母**（成串的拼音 `lùn yǔ` 首当其冲）、数字、
+/// 网址、以及除中圆点之外的所有符号。古籍的题名里出现字母，只可能是
+/// 数据源塞的拼音或站名——留着就是一列竖排的拉丁字母。
+///
+/// 超长时取 `max − 1` 字再补一个**竖排省略号**「︙」（U+FE19），总宽仍
+/// 不超过 `max` 格。
+pub fn banxin_text(raw: &str, max: usize) -> String {
+    let is_cjk = |c: char| -> bool {
+        ('\u{3400}'..='\u{9FFF}').contains(&c)
+            || ('\u{F900}'..='\u{FAFF}').contains(&c)
+            || ('\u{20000}'..='\u{3FFFF}').contains(&c)
+    };
+    let keep = |c: char| -> bool { is_cjk(c) || c == '·' || c == '·' };
+    let s: String = raw.chars().filter(|&c| keep(c)).collect();
+    let n = s.chars().count();
+    if n > max.max(2) {
+        let head: String = s.chars().take(max.max(2) - 1).collect();
+        return format!("{head}︙");
+    }
+    s
+}
+
 /// 从 `s` 里按预算取字：每取一个字扣一格高，取够 `max` 或预算见底为止。
 fn take(s: &str, budget: &mut f32, lh: f32, max: usize) -> String {
     let mut out = String::new();
@@ -553,7 +611,12 @@ mod tests {
         );
         // 象鼻必须比鱼尾本身长——短了鱼尾就像直接贴在框上。
         assert!(xb > h * 2.0, "象鼻太短，鱼尾贴框：{xb} vs {h}");
-        assert!(XIANG_BI_W_RATIO > 0.04 && XIANG_BI_W_RATIO < 0.20, "象鼻粗细不成比例");
+        // v1.69.0：象鼻是一根 1px 单线，绝不许再画成实心墨条（那正是用户
+        // 痛斥的「鱼尾上下两根丑陋竖柱子」）。
+        assert!(
+            XIANG_BI_LINE_W <= 1.5,
+            "象鼻必须是单线，不许画成墨条：{XIANG_BI_LINE_W}"
+        );
     }
 
     #[test]
@@ -827,6 +890,62 @@ mod tests {
             let cap = if l.soft { 24.0 * 0.46 } else { 24.0 * 0.60 };
             assert!(l.fs <= cap + 0.01, "书口字溢出版心：{}", l.fs);
             assert!(l.fs >= 7.0);
+        }
+    }
+
+    /// v1.69.0：版心题名只留汉字，拼音 / 符号一律丢，超长截断加省略号。
+    #[test]
+    fn banxin_text_rejects_pinyin_and_caps_length() {
+        assert_eq!(banxin_text("論語 lùn yǔ", 10), "論語");
+        assert_eq!(banxin_text("論語·卷三", 10), "論語·卷三");
+        assert_eq!(banxin_text("佚名", 10), "佚名");
+        // 超长：截到 max-1 字 + 竖排省略号「︙」，总宽不超 max 格。
+        let long = "一二三四五六七八九十一二三";
+        let t = banxin_text(long, 10);
+        assert_eq!(t.chars().count(), 10, "版心题名超长：{t:?}");
+        assert!(t.ends_with('︙'), "截断没加省略号：{t:?}");
+        // 纯拼音 → 空（中缝绝不许竖排拉丁字母）。
+        assert_eq!(banxin_text("lùn yǔ", 10), "");
+        assert_eq!(banxin_text("z-library.sk", 10), "");
+    }
+
+    /// 中缝宽度恒等于界栏宽，绝不被文本长度撑变形（v1.69.0）。
+    #[test]
+    fn gutter_width_never_depends_on_text_length() {
+        let base = BanxinOpts {
+            gutter_w: 60.0,
+            band_h: 700.0,
+            cell_h: 40.0,
+            col_w: 40.0,
+            fs: 20.0,
+            book: "論語",
+            juan: "卷三",
+            page: "五十",
+            chapter_title: "學而第一",
+            detailed: true,
+            seal: false,
+            tail_size: None,
+        };
+        let short = layout(BanxinOpts { ..base });
+        let long = layout(BanxinOpts {
+            book: "論語正義二十四卷校勘記補遺續編又續編三續合訂本",
+            chapter_title: "學而第一何晏集解邢昺疏陸德明音義附校勘記",
+            ..base
+        });
+        // 短题名与超长题名：鱼尾尺寸必须一模一样（宽度只由中缝宽定）。
+        assert!(
+            (short.tail_w - long.tail_w).abs() < 0.01 && (short.tail_h - long.tail_h).abs() < 0.01,
+            "鱼尾被文本长度撑变形了：{:?} vs {:?}",
+            (short.tail_w, short.tail_h),
+            (long.tail_w, long.tail_h)
+        );
+        // 书口字一律不超过 BANXIN_TEXT_MAX 格。
+        for line in long.above.iter().chain(long.below.iter()) {
+            assert!(
+                line.text.chars().count() <= BANXIN_TEXT_MAX,
+                "版心一行超长：{:?}",
+                line.text
+            );
         }
     }
 }

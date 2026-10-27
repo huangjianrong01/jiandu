@@ -16,7 +16,7 @@ use std::path::Path;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::html_parser::extract_html_reader;
+use super::html_parser::{extract_html_reader, extract_html_reader_keep_tables};
 use super::traits::FormatParser;
 use super::ImportError;
 
@@ -49,7 +49,7 @@ impl FormatParser for EpubParser {
         let mut used = 0usize;
         for rel in &sections {
             let name = join_zip_path(&opf_dir, rel);
-            if let Some(text) = read_section(&mut zip, &name) {
+            if let Some(text) = read_section(&mut zip, &name, true) {
                 if !text.trim().is_empty() {
                     if !out.is_empty() {
                         out.push('\n');
@@ -60,7 +60,7 @@ impl FormatParser for EpubParser {
             }
         }
 
-        // 一节都没抽到 → 退化成「全部 xhtml 按名排序」
+        // 一节都没抽到 → 退化成「全部 xhtml 按名排序」（仍先弃表）
         if used == 0 {
             let mut names: Vec<String> = (0..zip.len())
                 .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
@@ -68,7 +68,31 @@ impl FormatParser for EpubParser {
                 .collect();
             names.sort();
             for name in names {
-                if let Some(text) = read_section(&mut zip, &name) {
+                if let Some(text) = read_section(&mut zip, &name, true) {
+                    if !text.trim().is_empty() {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str(&text);
+                        used += 1;
+                    }
+                }
+            }
+        }
+
+        // ── v1.69.0 退路：整本都用 `<table>` 排版的劣质转换件 ──────────
+        // 「表格整块丢弃」是死命令，但真有本子把全部正文塞进表格里，
+        // 全本弃表后一个字都不剩。那时**保留表格文字**再抽一遍：排版再丑
+        // 也比空书强，且这一步只在「弃表后真的空了」时才跑，绝不影响
+        // 正常的本子。
+        if used == 0 {
+            let mut names: Vec<String> = (0..zip.len())
+                .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
+                .filter(|n| is_html_name(n))
+                .collect();
+            names.sort();
+            for name in names {
+                if let Some(text) = read_section(&mut zip, &name, false) {
                     if !text.trim().is_empty() {
                         if !out.is_empty() {
                             out.push('\n');
@@ -178,12 +202,23 @@ fn read_opf_spine(zip: &mut zip::ZipArchive<std::fs::File>, opf: &str) -> Vec<St
 }
 
 /// 打开 zip 里的某一节并抽正文（流式：`BufReader` 直接喂给 XML 解析器）。
-fn read_section(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<String> {
+///
+/// `drop_tables = true` 时**整块丢弃 `<table>`**（v1.69.0 死命令）；
+/// `false` 是「弃表后整本空了」的救回退路。
+fn read_section(
+    zip: &mut zip::ZipArchive<std::fs::File>,
+    name: &str,
+    drop_tables: bool,
+) -> Option<String> {
     if !is_html_name(name) {
         return None;
     }
     let f = zip.by_name(name).ok()?;
-    let (text, _err) = extract_html_reader(BufReader::new(f));
+    let (text, _err) = if drop_tables {
+        extract_html_reader(BufReader::new(f))
+    } else {
+        extract_html_reader_keep_tables(BufReader::new(f))
+    };
     Some(text)
 }
 

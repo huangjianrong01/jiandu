@@ -696,7 +696,23 @@ pub struct ImportJob {
     pct: std::sync::Arc<std::sync::Mutex<f32>>,
     label: std::sync::Arc<std::sync::Mutex<String>>,
     done: std::sync::Arc<std::sync::Mutex<Option<ImportOutcome>>>,
+    /// 起刻时刻（v1.69.0 看门狗用）。
+    started: std::time::Instant,
+    /// 上一次**观测到进度有推进**的时刻。
+    moved: std::time::Instant,
+    /// 上一帧看到的进度签名（pct 量化 + 文案）：变了才算「有推进」。
+    sig: String,
 }
+
+/// 看门狗：起刻后**这么久还没任何推进**就判定卡死（v1.69.0）。
+///
+/// 正常的书 3 秒内一定已经解出第一节、进度条会动；卡在 0% 一动不动的，
+/// 只可能是解析器陷在脏文件里出不来。这时必须**报错并收掉浮层**，
+/// 绝不能让用户对着 0% 干等（用户原话：「绝对不能假死」）。
+const IMPORT_STALL_START: std::time::Duration = std::time::Duration::from_secs(3);
+/// 已经动过之后的宽容阈值：大书单节可能真要跑十几秒（尔雅 9.5MB、
+/// 诸子百家 18MB），给足 45 秒，避免误杀。
+const IMPORT_STALL_LATER: std::time::Duration = std::time::Duration::from_secs(45);
 
 impl ImportJob {
     /// 起一条后台线程：流式解析 → 逐章落盘 → 结果塞进 `done`。
@@ -723,25 +739,42 @@ impl ImportJob {
                     *g = s;
                 }
             };
-            // 主路：core 的流式导入（逐章落 chapters.db，书架只留骨架）。
-            // 兜底：v1.62.0 的多格式漏斗——脏编码 TXT / 畸形 EPUB / 半截 JSON
-            // 这类「主路读不动」的稿子，换漏斗再试一次（整本入库，store_id 留空）。
-            let r = match crate::stream::import_streaming(&p, Some(Box::new(cb))) {
-                Ok((book, id)) => Ok((book, id, p.clone())),
-                Err(main_err) => crate::importer::import_file(&p)
-                    .map(|ir| (ir.to_book(), String::new(), p.clone()))
-                    .map_err(|e| format!("{main_err}；兜底也失败：{e}")),
-            };
+            // ── v1.69.0：**导入线程绝不许 panic 到消失** ──────────────
+            // 后台线程一 panic，`done` 永远不会被填上，主线程就一直以为
+            // 「还在刻印」——进度条永远停在 0%，App 看着就是假死，而用户
+            // 连一句报错都看不到。这里用 `catch_unwind` 把 panic 收成一条
+            // 正常的失败结果，交给下面的错误分支去提示。
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // 主路：core 的流式导入（逐章落 chapters.db，书架只留骨架）。
+                // 兜底：v1.62.0 的多格式漏斗——脏编码 TXT / 畸形 EPUB /
+                // 半截 JSON 这类「主路读不动」的稿子，换漏斗再试一次
+                // （整本入库，store_id 留空）。
+                match crate::stream::import_streaming(&p, Some(Box::new(cb))) {
+                    Ok((book, id)) => Ok((book, id, p.clone())),
+                    Err(main_err) => crate::importer::import_file(&p)
+                        .map(|ir| (ir.to_book(), String::new(), p.clone()))
+                        .map_err(|e| format!("{main_err}；兜底也失败：{e}")),
+                }
+            }))
+            .unwrap_or_else(|_| {
+                Err("解析器在这本电子书上崩溃了（多半是文件损坏或非标准结构）".to_string())
+            });
             if let Ok(mut g) = done2.lock() {
                 *g = Some(r);
             }
         });
 
+        let now = std::time::Instant::now();
         Self {
             name,
             pct,
             label,
             done,
+            started: now,
+            moved: now,
+            // 初始签名 = 「0% + 初始文案」：这样第一帧比下来是「没推进」，
+            // 看门狗走 3 秒的严档；一旦真有推进，立刻放宽到 45 秒。
+            sig: "0.0000|雕版刻印中".to_string(),
         }
     }
 
@@ -2536,7 +2569,35 @@ impl Root {
             return;
         };
         let Some(res) = job.take_done() else {
-            // 没完成：任务放回去，请求下一帧继续刷进度条。
+            // 没完成：先看一眼**看门狗**（v1.69.0）——进度一直不动就判定
+            // 卡死，报错并收掉浮层，绝不让用户对着 0% 干等到天亮。
+            let now = std::time::Instant::now();
+            let sig = format!("{:.4}|{}", (job.pct() * 1000.0).round(), job.label());
+            let mut job = job;
+            if sig != job.sig {
+                job.sig = sig;
+                job.moved = now;
+            }
+            let budget = if job.moved == job.started {
+                IMPORT_STALL_START
+            } else {
+                IMPORT_STALL_LATER
+            };
+            if now.duration_since(job.moved) >= budget {
+                // 卡死了：撤掉任务（浮层随之消失）+ 弹一句人话。
+                self.import_job = None;
+                self.notice = if job.moved == job.started {
+                    "解析失败，文件可能损坏或非标准电子书（进度一直没动，已中止）".to_string()
+                } else {
+                    format!(
+                        "解析超时：{} 秒没有任何进展，已中止（文件可能损坏）",
+                        now.duration_since(job.moved).as_secs()
+                    )
+                };
+                cx.notify();
+                return;
+            }
+            // 还在跑（且有推进）：任务放回去，请求下一帧继续刷进度条。
             self.import_job = Some(job);
             cx.notify();
             return;
