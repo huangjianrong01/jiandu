@@ -134,6 +134,157 @@ pub fn to_markdown(book: &Book) -> String {
     out
 }
 
+/// **朱批录**：全书 `MarginNote` 按**章节顺序**排成一份 Markdown（v1.63.0）。
+///
+/// 一条批注 = 章节名 + 原文摘录 + 批语。天头批语本身只记「锚在全书第几个
+/// 字」，脱离书页就只是一句孤零零的话；故每条都回正文取锚点所在的**那一
+/// 句**作摘录——隔几天再看，也知道当时批的是哪句话。
+///
+/// 排序刻意不按数组顺序：`margin_notes` 是追加的，写入序＝当时读到哪儿，
+/// 补批几次就乱了；按 `anchor_char_index` 归章归段升序，才是一份能当读后感
+/// 通读的稿子。
+pub fn to_annotations_md(book: &Book) -> String {
+    // ① 定位并排序；锚点落在书外的（换过书稿、删过章）直接丢，不写孤儿批注。
+    //    收两类**用户亲手写的字**：天头朱批（MarginNote）与夹注/通假
+    //    （Note::Note / Tongjia）。专名线、着重、注音只是标记，不出文字。
+    let mut rows: Vec<(usize, usize, usize, &'static str, String)> = Vec::new();
+    for m in book.margin_notes.iter() {
+        let t = m.content.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some((ci, pi, off)) = locate_char(book, m.anchor_char_index) {
+            rows.push((ci, pi, off, "眉批", t.to_string()));
+        }
+    }
+    for (ci, ch) in book.chapters.iter().enumerate() {
+        for (pi, p) in ch.paragraphs.iter().enumerate() {
+            for n in p.notes.iter() {
+                let label = match n.kind {
+                    NoteKind::Note => "夹注",
+                    NoteKind::Tongjia => "通假",
+                    _ => continue,
+                };
+                let t = n.text.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                rows.push((ci, pi, n.at, label, t.to_string()));
+            }
+        }
+    }
+    rows.sort_by_key(|(ci, pi, off, _, _)| (*ci, *pi, *off));
+
+    let mut out = String::new();
+    out.push_str(&format!("# 《{}》朱批录\n\n", book.title.trim()));
+    if rows.is_empty() {
+        out.push_str("> 此书尚无朱批。\n\n");
+        out.push_str("正文里选中文字 →「眉批」即可写批语，写完再回来导出。\n");
+        return out;
+    }
+    let mut chs = 0usize;
+    let mut prev = usize::MAX;
+    for (ci, _, _, _, _) in rows.iter() {
+        if *ci != prev {
+            prev = *ci;
+            chs += 1;
+        }
+    }
+    out.push_str(&format!(
+        "> 共 {} 条批注 · 分属 {} 章 · 依章节顺序\n",
+        rows.len(),
+        chs
+    ));
+
+    let mut cur = usize::MAX;
+    for (ci, pi, off, label, text) in rows {
+        if ci != cur {
+            cur = ci;
+            let title = book
+                .chapters
+                .get(ci)
+                .map(|c| c.title.trim())
+                .filter(|t| !t.is_empty())
+                .unwrap_or("（无题）");
+            out.push_str(&format!("\n---\n\n## {title}\n\n"));
+        }
+        let para = book
+            .chapters
+            .get(ci)
+            .and_then(|c| c.paragraphs.get(pi))
+            .map(|p| p.text.as_str())
+            .unwrap_or("");
+        let quote = excerpt_at(para, off);
+        if !quote.is_empty() {
+            out.push_str(&format!("> {quote}\n\n"));
+        }
+        out.push_str(&format!("**{label}**：{text}\n\n"));
+    }
+    out
+}
+
+/// 全书扁平字符下标 → `(章, 段, 段内偏移)`。
+///
+/// 口径必须与 `Book::flat_index` 完全一致（章内按 `Paragraph::text` 的字符
+/// 数累加）：一旦两处算法分家，摘录就会指到隔壁段去。
+fn locate_char(book: &Book, mut idx: usize) -> Option<(usize, usize, usize)> {
+    for (ci, ch) in book.chapters.iter().enumerate() {
+        for (pi, p) in ch.paragraphs.iter().enumerate() {
+            let n = p.text.chars().count();
+            if idx < n {
+                return Some((ci, pi, idx));
+            }
+            idx -= n;
+        }
+    }
+    None
+}
+
+/// 取「锚点所在的那一句」作摘录：向左右各找到最近的句读，含句末标点。
+///
+/// 长句按 80 字截断（以锚点为中心），两端补省略号——批注锚的是单字，整段
+/// 几百字全抄进来反而看不出批的是哪儿。
+fn excerpt_at(text: &str, off: usize) -> String {
+    const EXCERPT_MAX: usize = 80;
+    let cs: Vec<char> = text.chars().collect();
+    if cs.is_empty() {
+        return String::new();
+    }
+    let off = off.min(cs.len() - 1);
+    // 竖排正文里句读就是断句处；换行同样是硬边界。
+    let brk = |c: char| matches!(c, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n');
+    let mut s = off;
+    while s > 0 && !brk(cs[s - 1]) {
+        s -= 1;
+    }
+    let mut e = off;
+    while e < cs.len() && !brk(cs[e]) {
+        e += 1;
+    }
+    if e < cs.len() {
+        e += 1;
+    }
+    if s >= e {
+        return String::new();
+    }
+    if e - s <= EXCERPT_MAX {
+        let raw: String = cs[s..e].iter().collect();
+        return raw.trim().to_string();
+    }
+    let half = EXCERPT_MAX / 2;
+    let a = s.max(off.saturating_sub(half));
+    let b = (a + EXCERPT_MAX).min(e);
+    let mut cut = String::new();
+    if a > s {
+        cut.push('…');
+    }
+    cut.push_str(&cs[a..b].iter().collect::<String>());
+    if b < e {
+        cut.push('…');
+    }
+    cut.trim().to_string()
+}
+
 /// 把一段正文里的注释转成行内 `[^n]` 标记，并返回本段用到的脚注定义。
 ///
 /// 仅处理带位置（`at`/`len`）的注释；无位置的（导入缺位）退化为随文
@@ -332,6 +483,23 @@ pub fn export_markdown_picked(book: &Book, title: &str, file_name: &str) -> Resu
     write_bytes(&path, body.as_bytes()).map(Some)
 }
 
+/// **朱批录落盘**：`to_annotations_md` → 系统保存框 → 写 `.md`。
+///
+/// 返回 `Ok(None)` = 用户取消了保存。
+pub fn export_annotations_picked(book: &Book, file_name: &str) -> Result<Option<PathBuf>> {
+    let Some(picked) = pick_save_path(
+        "导出全书批注（Markdown）",
+        file_name,
+        "Markdown",
+        &["md", "markdown"],
+    ) else {
+        return Ok(None);
+    };
+    let path = with_extension(picked, "md");
+    let body = to_annotations_md(book);
+    write_bytes(&path, body.as_bytes()).map(Some)
+}
+
 /// **RFC 4180 字段转义**（v1.56.0 Anki 导出）。
 ///
 /// 古籍正文里逗号、引号极常见（「…，…」「…」），不转义的话 Anki 导入
@@ -357,6 +525,19 @@ pub fn csv_line(cells: &[&str]) -> String {
     }
     out.push('\n');
     out
+}
+
+/// **恒加引号的两列 CSV 行**（v1.63.0 选区制卡）。
+///
+/// 与 [`csv_line`] 唯一的差别：每个字段**无条件**包双引号（内部引号仍双写）。
+/// Anki 两种写法都能吃，但恒加引号能让「正文里逗号成片」的古籍句子在任何
+/// 表格工具里都不错列——这是选区制卡唯一可能踩的坑，索性写死。
+pub fn csv_two_quoted(front: &str, back: &str) -> String {
+    format!(
+        "\"{}\",\"{}\"\n",
+        front.replace('"', "\"\""),
+        back.replace('"', "\"\"")
+    )
 }
 
 #[cfg(test)]
@@ -428,6 +609,73 @@ mod tests {
         assert!(m.contains("**脚注**"), "章末应有脚注区");
     }
 
+    /// 朱批录：按**章节顺序**排（不是批注数组顺序），每条带回原文摘录。
+    #[test]
+    fn annotations_follow_chapter_order_with_quotes() {
+        use crate::types::MarginNote;
+        let mut b = sample();
+        // 故意乱序写入：先第二章，再第一章。
+        b.margin_notes.push(MarginNote::new(1, 4, "此句最妙"));
+        b.margin_notes.push(MarginNote::new(2, 1, "开篇立骨"));
+        let md = to_annotations_md(&b);
+        let i1 = md.find("## 第一章").expect("应有第一章");
+        let i2 = md.find("## 第二章").expect("应有第二章");
+        assert!(i1 < i2, "必须按章节顺序而非写入顺序：\n{md}");
+        assert!(md.contains("> 甲乙丙"), "应回正文摘出锚点所在句：\n{md}");
+        assert!(md.contains("**眉批**：开篇立骨"));
+        assert!(md.contains("**眉批**：此句最妙"));
+        assert!(md.contains("共 2 条批注 · 分属 2 章"));
+    }
+
+    /// 空书 / 孤儿锚点：给一句人话，绝不把错位的批注写到别的句子上。
+    #[test]
+    fn annotations_report_empty_and_skip_orphans() {
+        use crate::types::MarginNote;
+        let mut b = sample();
+        b.margin_notes
+            .push(MarginNote::new(1, 9999, "锚点早已不在书里"));
+        b.margin_notes.push(MarginNote::new(2, 0, "   "));
+        let md = to_annotations_md(&b);
+        assert!(md.contains("尚无朱批"), "{md}");
+        assert!(
+            !md.contains("锚点早已不在书里"),
+            "孤儿批注不该落盘：\n{md}"
+        );
+    }
+
+    /// 夹注/通假也算批语；超长句按 80 字截断，不把下一句带进来。
+    #[test]
+    fn annotations_include_glosses_and_trim_long_sentences() {
+        use crate::types::{MarginNote, Note, NoteKind};
+        let mut b = Book::new("长书", "");
+        let mut c = Chapter {
+            title: "卷上".into(),
+            paragraphs: Vec::new(),
+        };
+        let long = format!("甲乙丙丁。{}。己庚辛。", "戊".repeat(200));
+        let mut p = Paragraph::plain(long);
+        p.notes.push(Note {
+            kind: NoteKind::Note,
+            at: 0,
+            len: 1,
+            text: "甲者始也".into(),
+            source: crate::types::NoteSource::Original,
+            anchor: None,
+        });
+        c.paragraphs.push(p);
+        b.chapters.push(c);
+        b.margin_notes.push(MarginNote::new(1, 10, "长句之批"));
+        let md = to_annotations_md(&b);
+        assert!(md.contains("**夹注**：甲者始也"), "夹注也要进录：\n{md}");
+        assert!(md.contains("**眉批**：长句之批"));
+        assert!(md.contains('…'), "超长句应截断：\n{md}");
+        assert!(
+            !md.contains("己庚辛"),
+            "截断后不该把下一句带进来：\n{md}"
+        );
+        assert!(md.contains("共 2 条批注"));
+    }
+
     #[test]
     fn csv_field_quotes_only_when_needed() {
         // 全角标点（古籍里的「，」是 U+FF0C）不破坏 CSV 的列结构，不必加引号。
@@ -450,6 +698,20 @@ mod tests {
             "含半角逗号的字段必须被双引号包住：{line}"
         );
         assert!(line.ends_with('\n'));
+    }
+
+    /// 选区制卡：两列**无条件**包双引号，内部引号双写，列数恒为 2。
+    #[test]
+    fn csv_two_quoted_always_wraps_both_fields() {
+        let line = csv_two_quoted("道可道, 非常道", "【出处】老子·第一章<br>按：此句为全书纲领");
+        assert_eq!(
+            line,
+            "\"道可道, 非常道\",\"【出处】老子·第一章<br>按：此句为全书纲领\"\n"
+        );
+        // 字段里本来就有双引号：写成两个，外加最外层一对。
+        assert_eq!(csv_two_quoted("a\"b", "c"), "\"a\"\"b\",\"c\"\n");
+        // 不含任何标点的短字段也照样包——这正是与 `csv_line` 的差别。
+        assert_eq!(csv_two_quoted("天", "地"), "\"天\",\"地\"\n");
     }
 
 }

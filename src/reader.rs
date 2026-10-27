@@ -487,7 +487,10 @@ fn panel_close(t: Theme) -> Div {
         .text_size(px(14.0))
         .text_color(rgb(t.ink_soft()))
         .hover(|s| s.text_color(rgb(sheet_zhu(t))))
-        .child(SharedString::from("✕"))
+        // v1.64.0：改用 **ASCII 大写 X**。旧字 ✕（U+2715）落在拉丁区符号段，
+        // 本机字体里没有对应字形时会被画成零宽——按钮在、字不见，等于没有
+        // 关闭入口（用户点名「关闭用X表示」）。ASCII X 任何字体都有。
+        .child(SharedString::from("X"))
 }
 
 /// 面板的**选项文字**：整块面板的基本单位。
@@ -847,6 +850,24 @@ struct NoteEntry {
     quote: String,
     /// 批注内容（眉批 / 夹注正文）。
     content: String,
+}
+
+/// 全书扁平字符下标 → `(章, 段, 段内偏移)`。
+///
+/// 口径与 `Book::flat_index` 严格一致（章内按 `Paragraph::text` 字数累加）：
+/// 眉批的锚点是扁平下标，而朱批录的跳转、摘录都按「章/段/字」走，两套口径
+/// 一旦错位，点一条朱批会跳到隔壁段去。
+fn flat_to_key(book: &Book, mut idx: usize) -> Option<(usize, usize, usize)> {
+    for (ci, ch) in book.chapters.iter().enumerate() {
+        for (pi, p) in ch.paragraphs.iter().enumerate() {
+            let n = p.text.chars().count();
+            if idx < n {
+                return Some((ci, pi, idx));
+            }
+            idx -= n;
+        }
+    }
+    None
 }
 
 fn build_note_index(book: &Book) -> NoteIndex {
@@ -2739,6 +2760,25 @@ impl Root {
             .py(px(3.0))
             .text_size(px(12.0))
             .text_color(rgb(t.ink()));
+        // ⓪ **分享所选为图片**（v1.64.0）：选中正文 → 就这儿出竖排分享卡。
+        //    与「导出当前页图片」（截原屏）不是一回事：这条走 `share_layout`
+        //    重排版，1080×1920、带界行边栏、朱批可随正文一起走。
+        //    没选区时自动退化为本叶——但入口放在选中之后才自然。
+        menu = menu.child(
+            mitem("export-share-sel", "分享所选为图片").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.export_menu = false;
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        this.open_share_panel(cx);
+                    }));
+                    if let Err(e) = r {
+                        this.report_export_panic(e, cx);
+                    }
+                }),
+            ),
+        );
         // ① 导出当前页图片：收菜单 → 直调 `export_page_png`（两段式：先收
         //    面板画一帧干净纸面，再以真实窗口句柄截屏 → 弹保存框落盘 PNG）。
         menu = menu.child(mitem("export-png", "导出当前页图片").on_mouse_down(
@@ -2770,6 +2810,41 @@ impl Root {
                 }
             }),
         ));
+        // ②·b 导出**选中**文字为**一张** Anki 卡片（v1.63.0）：极简 CSV，
+        //      正面 = 选区原文，背面 = 书名·章名 + 朱批 / 眉批。没选区就提示，
+        //      不静默出空卡。
+        menu = menu.child(
+            mitem("export-anki-sel", "导出选中为卡片").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.export_menu = false;
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        this.export_anki_selection(cx);
+                    }));
+                    if let Err(e) = r {
+                        this.report_export_panic(e, cx);
+                    }
+                }),
+            ),
+        );
+        // ③·b 导出**全书批注**（朱批录，v1.63.0）：全部 MarginNote 按章节
+        //      顺序排成 Markdown——章节名 + 原文摘录 + 批语。
+        menu = menu.child(
+            mitem("export-annotations", "导出全书批注").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.export_menu = false;
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        this.export_margin_notes(cx);
+                    }));
+                    if let Err(e) = r {
+                        this.report_export_panic(e, cx);
+                    }
+                }),
+            ),
+        );
         // ③ 导出 MD：直调 `export_markdown_file`（全书正文 + `[^n]` 脚注）。
         menu = menu.child(mitem("export-md", "导出MD").on_mouse_down(
             MouseButton::Left,
@@ -7425,7 +7500,8 @@ impl Root {
             .text_size(px(13.0))
             .text_color(rgb(0xFFFFFFB0))
             .cursor_pointer()
-            .child(SharedString::from("✕"))
+            // v1.64.0：关闭一律 ASCII「X」（✕ U+2715 在回退字体里会零宽消失）。
+            .child(SharedString::from("X"))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -7857,15 +7933,33 @@ impl Root {
     /// 都只改 `share_*` 态：不翻页、不改排版、不碰字体设置，阅读界面
     /// 一动不动。
     pub fn open_share_panel(&mut self, cx: &mut Context<Self>) {
-        if self.book.is_none() {
-            self.notice = "尚未打开书籍，无从分享".to_string();
+        if let Err(e) = self.snapshot_share() {
+            self.notice = e;
             cx.notify();
             return;
         }
-        let pages = self.paginate();
+        // 走全局状态机：开分享即收其它顶层面板与瞬态浮层。
+        self.set_ui_state(AppUIState::Share);
+        // 快照已落，待分享选区使命完成（`set_ui_state` 可能又补录一次）。
+        self.share_sel = None;
+        cx.notify();
+    }
+
+    /// 抓分享快照（正文 / 红线 / 眉批 / 题识），**不改任何 UI 状态**。
+    ///
+    /// 独立成函数有两个理由：① 事件链里「先抓后开」——开面板会清选区，
+    /// 顺序一颠倒就只剩本叶；② 没有 `Context` 的场合（开发钩子）也能跑
+    /// 同一条快照，所见即所得。
+    pub fn snapshot_share(&mut self) -> Result<(), String> {
+        if self.book.is_none() {
+            return Err("尚未打开书籍，无从分享".to_string());
+        }
+        // 正文快照**直接读 Book 正文**，不再 `paginate()` 全书重排：
+        // 三百多万字的老书重排一次是百毫秒级，而分享该是「按下就出」。
+        // 选区键 `(章, 段, 字)` 本就是正文坐标、与排版无关，可直接取。
+        let leaf_no = self.page;
         let mut body: Vec<char> = Vec::new();
         let mut from_sel = false;
-        let mut leaf_no = self.page;
         let mut chap_idx = 0usize;
 
         // 朱批快照：与 `body` 等长的「这个字是否被划了红线」。
@@ -7874,35 +7968,38 @@ impl Root {
         let mut k_first: Option<(usize, usize, usize)> = None;
         let mut k_last: Option<(usize, usize, usize)> = None;
 
-        if self.has_selection() {
-            if let Some((a, b)) = self.selection_range() {
-                // 全叶扫描：选区可能跨叶，按阅读顺序一路收干净。
-                for (pi, pg) in pages.iter().enumerate() {
-                    for g in pg.iter() {
-                        if g.kind != GlyphKind::Char || g.is_indent() {
-                            continue;
-                        }
-                        let k = (g.chapter, g.para, g.offset);
-                        if k >= a && k <= b {
-                            if body.is_empty() {
-                                // 选区首字落在哪叶哪章，元信息就以它为准。
-                                leaf_no = pi;
-                                chap_idx = g.chapter;
-                                k_first = Some(k);
-                            }
-                            k_last = Some(k);
-                            // 朱批：划过红线的字染朱（用户「连同我的红线一起分享」）。
-                            red.push(self.underlines.contains(&k));
-                            body.push(self.shown(g.ch));
-                        }
-                    }
+        // 活选区优先；其次「待分享选区」——后者是开版字 / 目录等顶层面板
+        // 时由 `close_transient_ui` 抢先定格的那一份（v1.64.0）。
+        let range = if self.has_selection() {
+            self.selection_range()
+        } else {
+            self.share_sel
+        };
+        if let Some((a, b)) = range {
+            if let Some(bk) = self.book.as_ref() {
+                chap_idx = a.0;
+                let (chars, reds) = chars_in_keys(
+                    bk,
+                    a,
+                    b,
+                    &|k| self.underlines.contains(&k),
+                    &|c| self.shown(c),
+                );
+                if !chars.is_empty() {
+                    body = chars;
+                    red = reds;
+                    from_sel = true;
+                    k_first = Some(a);
+                    k_last = Some(b);
                 }
-                from_sel = !body.is_empty();
             }
         }
         if !from_sel {
             // 无选区：本叶正文（繁简形态与阅读界面一致）。
-            let glyphs: Vec<Glyph> = pages.get(self.page).cloned().unwrap_or_default();
+            let glyphs: Vec<Glyph> = self
+                .page_at(self.page)
+                .map(|p| p.glyphs)
+                .unwrap_or_default();
             if let Some(first) = glyphs.first() {
                 chap_idx = first.chapter;
                 k_first = Some((first.chapter, first.para, first.offset));
@@ -7910,21 +8007,24 @@ impl Root {
             if let Some(last) = glyphs.last() {
                 k_last = Some((last.chapter, last.para, last.offset));
             }
-            for g in glyphs.iter().filter(|g| !g.is_indent()) {
-                red.push(self.underlines.contains(&(g.chapter, g.para, g.offset)));
-            }
-            body = glyphs
+            for g in glyphs
                 .iter()
-                .filter(|g| !g.is_indent())
-                .map(|g| self.shown(g.ch))
-                .collect();
-            leaf_no = self.page;
+                .filter(|g| g.kind == GlyphKind::Char && !g.is_indent())
+            {
+                let k = (g.chapter, g.para, g.offset);
+                red.push(self.underlines.contains(&k));
+                body.push(self.shown(g.ch));
+            }
         }
         // 长度对齐：红标记与正文必须逐字对应，短了按「未划线」补齐。
         if red.len() < body.len() {
             red.resize(body.len(), false);
         } else if red.len() > body.len() {
             red.truncate(body.len());
+        }
+        if body.is_empty() {
+            self.share_sel = None;
+            return Err("这叶没有可分享的正文".to_string());
         }
 
         self.share_body = body;
@@ -7968,9 +8068,7 @@ impl Root {
         };
         // 印文：书名首二字（书名空则回退「笺讀」）。
         self.share_seal_text = crate::share::seal_chars(&self.share_book);
-        // 走全局状态机：开分享即收其它顶层面板与瞬态浮层。
-        self.set_ui_state(AppUIState::Share);
-        cx.notify();
+        Ok(())
     }
 
     /// 题识文本：章节 · 书名 · 作者，按三个开关取舍（竖排列宽有限，裁短）。
@@ -8136,6 +8234,7 @@ impl Root {
     fn note_entries(&self) -> Vec<NoteEntry> {
         let mut out = Vec::new();
         if let Some(b) = &self.book {
+            // 天头眉批（旧制 HeadNote，只存于早期书目）。
             for h in &b.head_notes {
                 out.push(NoteEntry {
                     key: Some(h.key),
@@ -8144,6 +8243,26 @@ impl Root {
                     kind: "眉批",
                     quote: self.quote_at(h.key, 10),
                     content: h.text.clone(),
+                });
+            }
+            // **朱批（v1.63.0 补）**：现行「眉批」写进的是 `Book::margin_notes`，
+            // 锚点是全书扁平下标。这里必须先换回 (章, 段, 字) 才能进列表、
+            // 才能跳转——漏了这一步，用户写过的朱批在朱批录里一条都看不见。
+            for m in &b.margin_notes {
+                let t = m.content.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let Some(key) = flat_to_key(b, m.anchor_char_index) else {
+                    continue; // 换过书稿的孤儿批注：不显示，也不跳错地方
+                };
+                out.push(NoteEntry {
+                    key: Some(key),
+                    len: 1,
+                    page: None,
+                    kind: "眉批",
+                    quote: self.quote_at(key, 12),
+                    content: t.to_string(),
                 });
             }
             for (ci, ch) in b.chapters.iter().enumerate() {
@@ -8334,11 +8453,37 @@ impl Root {
                     .child(SharedString::from(format!("朱批錄 {count}"))),
             )
             .child(
+                // 右侧：提示 + 匯出。导出入口就放在「正在看批注」的地方——
+                // 顺着这一列批注读下来想存一份，不必回头去顶栏找。
                 div()
-                    .font_family(song.clone())
-                    .text_size(px(9.5))
-                    .text_color(rgb(ink_soft))
-                    .child(SharedString::from("點選可躍")),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .font_family(song.clone())
+                            .text_size(px(9.5))
+                            .text_color(rgb(ink_soft))
+                            .child(SharedString::from("點選可躍")),
+                    )
+                    .child(
+                        div()
+                            .font_family(song.clone())
+                            .text_size(px(10.5))
+                            .text_color(rgb(zhu))
+                            .cursor_pointer()
+                            .hover(move |s| s.text_color(rgb(ink)))
+                            .child(SharedString::from("匯出"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.export_margin_notes(cx);
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
             );
 
         div()
@@ -8382,7 +8527,8 @@ impl Root {
         let vw = self.viewport_w;
         let vh = self.viewport_h;
         let columns = crate::share::norm_columns(self.grid.columns);
-        let card_h = crate::share::card_h_for(vh, self.share_h);
+        // v1.64.0：高度不再有滑杆，一档定值（见 `share::card_h_for`）。
+        let card_h = crate::share::card_h_for(vh);
         let card_w = (card_h * crate::share::card_ratio(columns))
             .clamp(240.0, (vw - 96.0).max(260.0));
 
@@ -8424,7 +8570,8 @@ impl Root {
         let phone_w = card_w + bezel * 2.0;
         let phone_h = card_h + bezel * 2.0;
         let phone_left = ((vw - phone_w) * 0.5).max(8.0);
-        let phone_top = 84.0;
+        // v1.64.0：卡片变高之后整组内容下移一档，仍与按钮留出气口。
+        let phone_top = 74.0;
         let card_left = phone_left + bezel;
         let card_top = phone_top + bezel;
         // 截图矩形 = 卡片本体（写入渲染态，供保存 / 分享图片读取）。
@@ -8455,24 +8602,26 @@ impl Root {
                     .child(SharedString::from("折简相寄，共赏千年墨香")),
             );
 
-        // 右上角「收」：全屏覆盖层必须有个常驻明确出口（Esc 同样收）。
+        // 右上角关闭：**X**（v1.64.0 用户点名）——旧文案「收」不够直白。
+        // 用 ASCII 大写 X：拉丁区符号（✕ U+2715 之类）在部分字体里零宽消失，
+        // 曾有过「按钮在、字不见」的实拍，这里不再冒险。
         let close = div()
             .absolute()
-            .top(px(18.0))
-            .right(px(20.0))
-            .w(px(26.0))
-            .h(px(26.0))
+            .top(px(16.0))
+            .right(px(18.0))
+            .w(px(28.0))
+            .h(px(28.0))
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(13.0))
+            .rounded(px(14.0))
             .cursor_pointer()
             .hover(|s| s.bg(rgba(0xF2EAD614)))
             .child(
                 div()
-                    .text_size(px(11.0))
-                    .text_color(rgba(0xB9AE9CCC))
-                    .child(SharedString::from("收")),
+                    .text_size(px(15.0))
+                    .text_color(rgba(0xC9BEABD9))
+                    .child(SharedString::from("X")),
             )
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
@@ -8821,81 +8970,6 @@ impl Root {
             .w(px(vw))
             .child(controls);
 
-        // ---- 高度滑杆（竖，五档）：点轨道即落位 ----
-        // 绝对定位在右侧一列，坐标确定 → 点击位置可反算档位（无需元素相对坐标）。
-        let slider_h = 46.0f32;
-        let slider_w = 16.0f32;
-        let slider_left = (vw - 44.0).max(20.0);
-        let slider_top = ctrl_top + 6.0;
-        let frac = (self.share_h as f32 / 4.0).clamp(0.0, 1.0);
-        let fill_h = (slider_h * frac).max(3.0);
-        let slider = div()
-            .absolute()
-            .left(px(slider_left))
-            .top(px(slider_top))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(5.0))
-            .child(
-                div()
-                    .text_size(px(9.0))
-                    .text_color(rgba(0x8A8378B0))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .child(SharedString::from("高"))
-                    .child(SharedString::from("度")),
-            )
-            .child(
-                div()
-                    .relative()
-                    .w(px(slider_w))
-                    .h(px(slider_h))
-                    .cursor_pointer()
-                    // 轨道
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(6.0))
-                            .top(px(0.0))
-                            .w(px(3.0))
-                            .h(px(slider_h))
-                            .rounded(px(1.5))
-                            .bg(rgba(0xF2EAD62E)),
-                    )
-                    // 已填充段（自下而上）
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(6.0))
-                            .bottom(px(0.0))
-                            .w(px(3.0))
-                            .h(px(fill_h))
-                            .rounded(px(1.5))
-                            .bg(rgba(0xF2EAD6B0)),
-                    )
-                    // 钮
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(3.0))
-                            .top(px((slider_h - fill_h - 4.0).max(0.0)))
-                            .w(px(9.0))
-                            .h(px(9.0))
-                            .rounded(px(4.5))
-                            .bg(rgb(0xF2EAD6)),
-                    )
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        // 轨道几何已知：按点击 y 反算档位（自下而上，五档）。
-                        let y = event.position.y.to_f64() as f32 - slider_top;
-                        let step = ((1.0 - y / slider_h) * 4.0).round().clamp(0.0, 4.0) as usize;
-                        this.share_h = step;
-                        cx.notify();
-                    })),
-            );
-
         // ---- 两枚动作钮：保存到本地 / 复制到剪贴板 ----
         //
         // 两者都走 `share_paint` 的**离屏渲染**（1080×1920），与预览同源、
@@ -8960,7 +9034,6 @@ impl Root {
             .child(caption)
             .child(tabs)
             .child(controls_box)
-            .child(slider)
             .child(buttons)
             // 点面板空白处不关闭（防误触丢选择）；但拦住冒泡——绝不把这一下
             // 透给阅读界面（用户明令：点模板时阅读界面不变）。
@@ -9537,22 +9610,35 @@ impl Root {
                 .child(seg(format!("每面 {} 行", self.grid_rows), false))
                 .child(seg(format!("天头:地脚 {:.1}:1", ratio), true)),
         );
-        // ---- 底行：唯一一枚**纯文字**动作（保存图片）----
+        // ---- 底行：唯一一枚**纯文字**动作（分享 / 保存图片）----
         // 没有灰底方框、没有图标，只有一行字；悬停时字色加深。
         // v1.57.0：原「分享图片 / 分享文字」两枚按钮随「分享」两字一并删去，
         // 面板入口只留「保存图片」（打开出图抽屉）。
+        // v1.64.0：文案改成**如实**反映这次要分享什么——手里有选区（哪怕被
+        // 开面板时的 `close_transient_ui` 清掉了，也还剩 `share_sel` 这份定格）
+        // 就说「分享所选」，否则说「分享本叶」。并改调 `open_share_panel`：
+        // 旧代码只置 `show_share_panel = true`，从不抓正文，卡片必然是空的。
+        //
+        // 只判有无、不数字数：`flat_index` 是按章按段累加的，本面板每帧都要
+        // 重画，八百章的老书会被算成每帧几毫秒——字数交给下方图注（那儿用的
+        // 是已落定的 `share_body.len()`，不花代价）。
+        let save_label = if self.share_sel.is_some() {
+            "分享所选"
+        } else {
+            "分享本叶"
+        };
         let save_img = div()
             .cursor_pointer()
             .text_size(px(11.5))
             .text_color(rgb(t.ink_soft()))
             .hover(|s| s.text_color(rgb(t.ink())))
-            .child(SharedString::from("保存图片"))
+            .child(SharedString::from(save_label))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
-                    this.show_share_panel = true;
-                    cx.notify();
+                    // 必须走快照函数：它负责抓正文 / 批注 / 红线并开抽屉。
+                    this.open_share_panel(cx);
                 }),
             );
         sheet = sheet.child(
@@ -10189,6 +10275,52 @@ fn note_paper(card_w: f32, card_h: f32, body: &[char], ink: u32, mute: u32) -> D
         .child(text)
 }
 
+/// 把正文坐标区间 `[a, b]` 摊成「字 + 是否划线」——分享快照的纯逻辑。
+///
+/// 分享卡的正文**直接读 `Book` 正文**，不经过排版：`(章, 段, 字)` 本就是
+/// 正文坐标，跨章跨段按阅读顺序单向推进即可。刻意不走 `paginate()`——
+/// 三百多万字的老书重排一次是百毫秒级，而分享该是「按下就出」。
+///
+/// `red_of` 判某字是否划了红线；`map` 做繁简 / 括号形态转换（与阅读界面
+/// 所见一致，由 `Root::shown` 提供）。返回两个等长 vec，逐字对应。
+fn chars_in_keys(
+    book: &crate::types::Book,
+    a: crate::types::GlyphKey,
+    b: crate::types::GlyphKey,
+    red_of: &dyn Fn(crate::types::GlyphKey) -> bool,
+    map: &dyn Fn(char) -> char,
+) -> (Vec<char>, Vec<bool>) {
+    let mut chars: Vec<char> = Vec::new();
+    let mut red: Vec<bool> = Vec::new();
+    if a > b {
+        return (chars, red);
+    }
+    let (ci0, pi0, _) = a;
+    let (ci1, pi1, _) = b;
+    for ci in ci0..=ci1 {
+        let Some(ch) = book.chapters.get(ci) else {
+            continue;
+        };
+        let last_par = ch.paragraphs.len().saturating_sub(1);
+        let p0 = if ci == ci0 { pi0 } else { 0 };
+        let p1 = if ci == ci1 { pi1 } else { last_par };
+        for pi in p0..=p1.min(last_par) {
+            let Some(par) = ch.paragraphs.get(pi) else {
+                continue;
+            };
+            for (off, c) in par.text.chars().enumerate() {
+                let k = (ci, pi, off);
+                if k < a || k > b {
+                    continue;
+                }
+                red.push(red_of(k));
+                chars.push(map(c));
+            }
+        }
+    }
+    (chars, red)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -10207,6 +10339,61 @@ mod tests {
         // 判据本身已不存在，此处钉住「常驻」契约：高度仍是唯一定量，
         // 显隐只剩专注模式在渲染层的一票（单测覆盖不到渲染，故只验常量在）。
         assert_eq!(BAR_H, 44.0);
+    }
+
+    /// 分享正文按**正文坐标**直接取：跨章跨段不能漏字，也不能把区间外的字
+    /// 带进来；红线标记必须与字逐字对齐（分享卡靠它染朱）。
+    #[test]
+    fn share_body_follows_keys_across_chapters() {
+        let mut b = crate::types::Book::new("测试书", "某人");
+        let mut c1 = crate::types::Chapter {
+            title: "第一章".into(),
+            paragraphs: Vec::new(),
+        };
+        c1.paragraphs.push(crate::types::Paragraph::plain("甲乙丙"));
+        c1.paragraphs.push(crate::types::Paragraph::plain("丁戊"));
+        let mut c2 = crate::types::Chapter {
+            title: "第二章".into(),
+            paragraphs: Vec::new(),
+        };
+        c2.paragraphs.push(crate::types::Paragraph::plain("己庚辛"));
+        b.chapters.push(c1);
+        b.chapters.push(c2);
+
+        // 从「戊」（0 章 1 段 1 字）跨到「庚」（1 章 0 段 1 字）。
+        let (chars, red) = super::chars_in_keys(&b, (0, 1, 1), (1, 0, 1), &|k| k == (1, 0, 0), &|c| c);
+        assert_eq!(chars.iter().collect::<String>(), "戊己庚");
+        assert_eq!(red, vec![false, true, false], "红线标记必须逐字对齐");
+    }
+
+    /// 区间写反（反向拖选没归一）绝不 panic，也不吐半个字。
+    #[test]
+    fn share_body_tolerates_reversed_range() {
+        let mut b = crate::types::Book::new("书", "");
+        b.chapters.push(crate::types::Chapter {
+            title: "一".into(),
+            paragraphs: vec![crate::types::Paragraph::plain("甲乙")],
+        });
+        let (chars, red) = super::chars_in_keys(&b, (0, 0, 1), (0, 0, 0), &|_| false, &|c| c);
+        assert!(chars.is_empty() && red.is_empty());
+    }
+
+    /// 字形转换走 `map`——繁简开关对分享卡同样生效（与阅读界面所见一致）。
+    #[test]
+    fn share_body_maps_every_char() {
+        let mut b = crate::types::Book::new("书", "");
+        b.chapters.push(crate::types::Chapter {
+            title: "一".into(),
+            paragraphs: vec![crate::types::Paragraph::plain("甲乙")],
+        });
+        let (chars, _) = super::chars_in_keys(
+            &b,
+            (0, 0, 0),
+            (0, 0, 1),
+            &|_| false,
+            &|c| if c == '甲' { '申' } else { c },
+        );
+        assert_eq!(chars.iter().collect::<String>(), "申乙");
     }
 
     /// 「篇 / 章 / 字」只收在此叶收尾的章：跨叶未完的章不赶它，

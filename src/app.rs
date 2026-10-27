@@ -466,8 +466,6 @@ pub struct Root {
     pub share_dir_touched: bool,
     /// 分享面板页签：样式 / 字体。
     pub share_tab: crate::share::ShareTab,
-    /// 高度滑杆档位（0..=4，见 `crate::share::H_STEPS`）。
-    pub share_h: usize,
     /// 分享卡正文字体：None = 跟随阅读字体（见 `crate::share::SHARE_FONTS`）。
     pub share_font: Option<usize>,
     /// 打开面板时**快照**的正文：有选区取选区，无选区取本叶。
@@ -475,6 +473,12 @@ pub struct Root {
     pub share_body: Vec<char>,
     /// 快照内容是否来自选区（false = 本叶正文）。
     pub share_from_sel: bool,
+    /// **待分享选区**（v1.64.0）：顶层面板（版字 / 目录 / 朱批 …）一开，
+    /// `close_transient_ui` 就要清 `sel_anchor` / `sel_focus`——选区随之蒸发，
+    /// 「选中 → 版字 → 分享」就只能退化成分享本叶。故在清之前把范围定格
+    /// 一份存这里，供分享抽屉继续取用；点纸面 / 翻页 / 换书即作废
+    /// （见 [`Root::clear_selection`]）。
+    pub share_sel: Option<(GlyphKey, GlyphKey)>,
     /// 快照的元信息：书名 / 作者 / 章节 / 叶号 / 中文日期。
     pub share_book: String,
     pub share_author: String,
@@ -880,10 +884,10 @@ impl Root {
             share_dir: crate::share::ShareDir::Vertical,
             share_dir_touched: false,
             share_tab: crate::share::ShareTab::Style,
-            share_h: 2,
             share_font: None,
             share_body: Vec::new(),
             share_from_sel: false,
+            share_sel: None,
             share_book: String::new(),
             share_author: String::new(),
             share_chap: String::new(),
@@ -1067,7 +1071,32 @@ impl Root {
             }
         }
     // 开发用：直接打开分享面板，便于核对版式 / 底色 / 开关。
+    // v1.64.0：改为走**真实快照**（旧版只置 `show_share_panel = true`，
+    // 从没抓过正文，卡片必然是空的——这正是「分享没实现」的现场）。
+    // 再加 `JIANDU_SHARE_SEL=1` 时先伪造一段选区，用于核对「分享所选」。
     if std::env::var("JIANDU_SHARE_OPEN").is_ok() {
+        if std::env::var("JIANDU_SHARE_SEL").is_ok() {
+            // 取「第一处真有正文的段落」——不少书的章首段是空的（只有章题）。
+            let mut pick: Option<(usize, usize, usize)> = None;
+            if let Some(b) = root.book.as_ref() {
+                'outer: for (ci, ch) in b.chapters.iter().enumerate() {
+                    for (pi, p) in ch.paragraphs.iter().enumerate() {
+                        let n = p.text.chars().count();
+                        if n > 4 {
+                            pick = Some((ci, pi, (n - 1).min(24)));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            if let Some((ci, pi, end)) = pick {
+                root.sel_anchor = Some((ci, pi, 1));
+                root.sel_focus = Some((ci, pi, end));
+            }
+        }
+        if let Err(e) = root.snapshot_share() {
+            root.notice = e;
+        }
         root.show_share_panel = true;
     }
     // 开发用：注入两条**纯内存**眉批并唤醒管理菜单（改 / ✕），便于截图
@@ -2824,6 +2853,195 @@ impl Root {
         .detach();
     }
 
+    /// **『导出全书批注』**（v1.63.0）：把全部 `MarginNote`（天头朱批）按章
+    /// 节顺序排成一份 Markdown——章节名 + 原文摘录 + 批语，弹保存框落盘。
+    ///
+    /// 摘录不是整段抄：版式层只记「锚在第几个字」，导出层回正文取那一句
+    /// （`exporter::to_annotations_md`），读稿时才知道当时批的是哪句。
+    pub fn export_margin_notes(&mut self, cx: &mut Context<Self>) {
+        let Some(book) = self.book.clone() else {
+            self.notice = "尚未打开书籍，无法导出批注".to_string();
+            cx.notify();
+            return;
+        };
+        let n = book
+            .margin_notes
+            .iter()
+            .filter(|m| !m.content.trim().is_empty())
+            .count();
+        let file_name = format!(
+            "{}_朱批录.md",
+            crate::exporter::safe_file_stem(&book.title)
+        );
+        cx.spawn(
+            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    // v1.52.4：rfd 同步保存框必须前台直调（走 background
+                    // executor 会被主循环挤掉、静默返回 None）。
+                    let res = crate::exporter::export_annotations_picked(&book, &file_name);
+                    this.update(&mut cx, |this, cx| {
+                        this.notice = match res {
+                            Ok(Some(p)) if n == 0 => {
+                                format!("此书尚无朱批，已导出空稿：{}", p.display())
+                            }
+                            Ok(Some(p)) => format!("已导出 {n} 条批注：{}", p.display()),
+                            Ok(None) => "已取消导出".to_string(),
+                            Err(e) => format!("导出失败：{e}"),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// **『导出选中文字为 Anki 卡片』**（v1.63.0，极简 CSV）。
+    ///
+    /// 与「导出当前章为卡片」（`export_anki_chapter`，整章逐句切句）是两条
+    /// 路：这里**只出一张卡**——正面就是用户拖选的原文，背面是 书名·章名
+    /// 加这段范围内的朱批（`NoteKind::Note`）与眉批（`MarginNote`）。
+    /// 不弹面板、不做预览，算好一行 CSV 直接走系统保存框。
+    ///
+    /// 转义一律交给 `exporter::csv_line`（RFC 4180）：古籍里逗号、引号成片，
+    /// 不转义 Anki 导入会当场错列。
+    pub fn export_anki_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(book) = self.book.clone() else {
+            self.notice = "尚未打开书籍，无法导出卡片".to_string();
+            cx.notify();
+            return;
+        };
+        // 正面：选中即原文（无拖选时 `selected_text` 退回单个 `sel_char`）。
+        let front = self.selected_text().trim().to_string();
+        if front.is_empty() {
+            self.notice = "请先选中要制卡的文字".to_string();
+            cx.notify();
+            return;
+        }
+
+        let ci = self.current_chapter.min(book.chapters.len().saturating_sub(1));
+        let chap = self.chapter_title(ci);
+        let source = if chap.is_empty() {
+            book.title.clone()
+        } else {
+            format!("{}·{}", book.title, chap)
+        };
+
+        // 背面：出处 + 选区范围内的批注。朱批按「章/段/字」比（与选区同一
+        // 把尺子），眉批另按全书扁平下标比（它的锚点就是扁平下标）。
+        let mut back = format!("【出处】{source}");
+        let mut marks: Vec<String> = Vec::new();
+        if let Some((a, b)) = self.selection_range() {
+            for c in a.0..=b.0 {
+                let Some(ch) = book.chapters.get(c) else {
+                    continue;
+                };
+                let lo = if c == a.0 { a.1 } else { 0 };
+                let hi = if c == b.0 {
+                    b.1
+                } else {
+                    ch.paragraphs.len().saturating_sub(1)
+                };
+                for pi in lo..=hi {
+                    let Some(p) = ch.paragraphs.get(pi) else {
+                        continue;
+                    };
+                    let chars: Vec<char> = p.text.chars().collect();
+                    let len = chars.len();
+                    if len == 0 {
+                        continue;
+                    }
+                    let from = if c == a.0 && pi == a.1 { a.2 } else { 0 };
+                    let to = if c == b.0 && pi == b.1 {
+                        b.2.min(len - 1)
+                    } else {
+                        len - 1
+                    };
+                    if from > to {
+                        continue;
+                    }
+                    // 朱批：用户写在这一段字上的批注
+                    for nt in p.notes.iter() {
+                        let is_gloss = matches!(
+                            nt.kind,
+                            crate::types::NoteKind::Note | crate::types::NoteKind::Tongjia
+                        );
+                        if is_gloss && nt.at >= from && nt.at <= to {
+                            let t = nt.text.trim();
+                            if !t.is_empty() {
+                                marks.push(t.to_string());
+                            }
+                        }
+                    }
+                    // 朱批：被划红线的字（拼起来读）
+                    let red: String = (from..=to)
+                        .filter(|o| self.underlines.contains(&(c, pi, *o)))
+                        .filter_map(|o| chars.get(o).copied())
+                        .collect();
+                    if !red.is_empty() {
+                        marks.push(format!("划线：{red}"));
+                    }
+                }
+            }
+            let base = book.flat_index(a);
+            let end = book.flat_index(b);
+            for m in book.margin_notes.iter() {
+                if m.anchor_char_index >= base
+                    && m.anchor_char_index <= end
+                    && !m.content.trim().is_empty()
+                {
+                    marks.push(m.content.trim().to_string());
+                }
+            }
+        }
+        if !marks.is_empty() {
+            // `<br>` 而非裸换行：Anki 导入后直接按 HTML 分行，不必再设样式。
+            back.push_str("<br>");
+            back.push_str(&marks.join("；"));
+        }
+
+        // 两列恒加双引号：古籍句子里逗号、引号成片，包起来才不会错列。
+        let csv = crate::exporter::csv_two_quoted(&front, &back);
+        let stem = crate::exporter::safe_file_stem(&book.title);
+        let default = format!("{stem}_卡片.csv");
+        cx.spawn(
+            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    // rfd 保存框必须前台直调（v1.52.4 铁律）：走 background
+                    // executor 会被 GPUI 主循环挤掉、静默返回 None。
+                    let picked = crate::exporter::pick_save_path(
+                        "导出 Anki 卡片（CSV）",
+                        &default,
+                        "CSV 表格",
+                        &["csv"],
+                    );
+                    let Some(dest) = picked else {
+                        this.update(&mut cx, |this, cx| {
+                            this.notice = "已取消导出".to_string();
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    };
+                    let dest = crate::exporter::with_extension(dest, "csv");
+                    let res = std::fs::write(&dest, csv.as_bytes());
+                    this.update(&mut cx, |this, cx| {
+                        this.notice = match res {
+                            Ok(()) => "已导出 1 张卡片，可在 Anki 中导入 CSV".to_string(),
+                            Err(e) => format!("写入失败：{e}"),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
     /// 『导出纯文本（MD）』按钮：全书正文 + `[^n]` 脚注，弹系统保存对话框落盘。
     /// **导出当前章为 Anki 卡片**（v1.56.0）。
     ///
@@ -3187,6 +3405,12 @@ fn anki_push_card(
         // v1.48.0：眉批管理态随浮层一起收（改写态更甚——草稿不跨面板存活）。
         self.head_edit = None;
         self.head_active = None;
+        // v1.64.0：清选区**之前**先定格一份「待分享选区」。分享抽屉是唯一
+        // 需要跨面板拿到选区的地方——版字面板一开就清选区，否则用户
+        // 「选中 → 版字 → 分享」永远只能分享本叶。
+        if self.share_sel.is_none() && self.has_selection() {
+            self.share_sel = self.selection_range();
+        }
         self.sel_anchor = None;
         self.sel_focus = None;
         self.note_zoom = None;
@@ -4687,6 +4911,9 @@ fn anki_push_card(
     pub fn clear_selection(&mut self) {
         self.sel_anchor = None;
         self.sel_focus = None;
+        // v1.64.0：连「待分享选区」一并作废——点纸面 / 翻页 / 换书都走到这里，
+        // 语义就是「这次选中的东西不要了」，分享入口不该再捞回来。
+        self.share_sel = None;
         self.dragging = false;
         self.touched_glyph = false;
         self.sel_char = None;

@@ -358,28 +358,14 @@ pub fn card_ratio(columns: usize) -> f32 {
     (0.50 + 0.018 * c).clamp(0.55, 0.80)
 }
 
-/// 高度滑杆五档（视口高比例）。
-pub const H_STEPS: [f32; 5] = [0.50, 0.60, 0.70, 0.80, 0.88];
-
-/// 由档位算卡片高（px）：既按视口比例，又给标题 / 页签 / 控件 / 按钮留位。
-pub fn card_h_for(vh: f32, step: usize) -> f32 {
-    let frac = match H_STEPS.get(step) {
-        Some(f) => *f,
-        None => 0.70,
-    };
-    let cap = (vh - 330.0).max(240.0);
-    // 直接按 `vh * frac` 再 clamp 会让上面几档一起撞上 cap、塌成同一个值
-    // （900px 视口下 0.70/0.80/0.88 全被截到 570，滑杆等于失效）。
-    // 故把档位**线性铺开**在 [220, cap] 区间：低档固定 220，高档顶到 cap，
-    // 中间等分——保证每一档都真的比上一档高。
-    let lo = H_STEPS.first().copied().unwrap_or(0.5);
-    let hi = H_STEPS.last().copied().unwrap_or(0.88);
-    let t = if hi > lo {
-        ((frac - lo) / (hi - lo)).clamp(0.0, 1.0)
-    } else {
-        0.5
-    };
-    220.0 + (cap - 220.0).max(0.0) * t
+/// 预览卡片高（px）——**一档定值**，不再有滑杆（v1.64.0 用户点名删）。
+///
+/// 取「视口高减去抬头 / 图注 / 页签 / 控件 / 按钮所占的那一段」，再上下夹住：
+/// 窗口再小也留得住 240px 的卡，再大也不让一张预览卡撑到荒唐（封顶 720）。
+/// 旧制那根竖向滑杆正是为了绕开 cap 才把五档线性铺开的——既然档位没了，
+/// 这套绕法连同 `H_STEPS` 一起删净，只留一个确定值。
+pub fn card_h_for(vh: f32) -> f32 {
+    (vh - 326.0).clamp(240.0, 720.0)
 }
 
 // ----------------------------------------------------------------------
@@ -1180,17 +1166,18 @@ mod tests {
     }
 
     #[test]
-    fn card_h_steps_are_ordered_and_capped() {
-        let vh = 900.0;
-        let mut prev = 0.0;
-        for step in 0..H_STEPS.len() {
-            let h = card_h_for(vh, step);
-            assert!(h > prev, "滑杆档位必须递增");
-            assert!(h <= vh - 330.0 + 0.001, "必须给控件留位");
-            prev = h;
+    fn card_height_leaves_room_for_chrome_and_is_capped() {
+        // 任何视口的卡片高都必须给抬头 / 图注 / 页签 / 控件 / 按钮留位。
+        for vh in [560.0f32, 700.0, 900.0, 1200.0, 1600.0] {
+            let h = card_h_for(vh);
+            assert!(h >= 240.0 && h <= 720.0, "卡片高越界：vh={vh} h={h}");
+            if vh > 566.0 && vh < 1046.0 {
+                assert!(h <= vh - 326.0 + 0.001, "必须给控件留位：vh={vh} h={h}");
+            }
         }
-        // 越界档位回退中档，不 panic。
-        assert!(card_h_for(vh, 99) > 0.0);
+        // 小窗不塌成 0、大屏不无限长。
+        assert_eq!(card_h_for(300.0), 240.0);
+        assert_eq!(card_h_for(4000.0), 720.0);
     }
 
     #[test]
