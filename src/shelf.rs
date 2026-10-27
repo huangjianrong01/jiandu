@@ -1760,8 +1760,8 @@ impl Root {
                 "home" | "Home" => self.rename_cursor = 0,
                 "end" | "End" => self.rename_cursor = self.rename_draft.chars().count(),
                 "v" | "V" if mods.platform || mods.control => {
-                    if let Ok(o) = std::process::Command::new("pbpaste").output() {
-                        let s = String::from_utf8_lossy(&o.stdout).replace(['\n', '\r'], " ");
+                    // 原生剪贴板（NSPasteboard），不再 fork `pbpaste`。
+                    if let Some(s) = crate::clipboard::paste_text(cx) {
                         crate::app::draft_insert_str(
                             &mut self.rename_draft,
                             &mut self.rename_cursor,
@@ -1802,8 +1802,8 @@ impl Root {
                 "home" | "Home" => self.shelf_query_cursor = 0,
                 "end" | "End" => self.shelf_query_cursor = self.shelf_query.chars().count(),
                 "v" | "V" if mods.platform || mods.control => {
-                    if let Ok(o) = std::process::Command::new("pbpaste").output() {
-                        let s = String::from_utf8_lossy(&o.stdout).replace(['\n', '\r'], " ");
+                    // 原生剪贴板（NSPasteboard），不再 fork `pbpaste`。
+                    if let Some(s) = crate::clipboard::paste_text(cx) {
                         if self.shelf_query.chars().count() < crate::ime::SEARCH_MAX {
                             crate::app::draft_insert_str(
                                 &mut self.shelf_query,

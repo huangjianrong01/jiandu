@@ -4724,11 +4724,13 @@ fn anki_push_card(
         draft_backspace(&mut self.note_draft, &mut self.note_cursor);
     }
 
-    /// 编辑栏粘贴：读系统剪贴板（`pbpaste`）插入到光标处——中文笔记的录入方式。
-    pub fn note_paste(&mut self) {
-        if let Ok(o) = std::process::Command::new("pbpaste").output() {
-            let s = String::from_utf8_lossy(&o.stdout).replace(['\n', '\r'], " ");
-            draft_insert_str(&mut self.note_draft, &mut self.note_cursor, &s);
+    /// 编辑栏粘贴：把一段文本插入到光标处——中文笔记的录入方式。
+    ///
+    /// 剪贴板由调用方读（v1.71.0 起走原生 `crate::clipboard`，不再是
+    /// `pbpaste` 子进程）；这里只管落字，保持「草稿串 + 字符光标」的纯粹。
+    pub fn note_paste(&mut self, text: &str) {
+        if !text.is_empty() {
+            draft_insert_str(&mut self.note_draft, &mut self.note_cursor, text);
         }
     }
 
@@ -5081,7 +5083,8 @@ fn clip_to_width(s: &str, fs: f32, max_w: f32) -> String {
 }
 
 // ---- 行内草稿编辑（浮层笔记框 / 重命名框共用：GPUI 无文本输入元素，
-//      以「草稿串 + 字符光标」自绘，键入走 keystroke.key_char，⌘V 走 pbpaste）----
+//      以「草稿串 + 字符光标」自绘，键入走 keystroke.key_char，
+//      ⌘V 走 crate::clipboard 原生粘贴板）----
 //
 // 注：网格的列数 / 行数不再在这里写死——一律来自 `crate::grid::GridConfig`
 // 与 `compute_grid`（8 / 10 / 12 / 14 列可切）。旧的固定常量（ANCIENT_ROWS /

@@ -21,6 +21,8 @@
 #![allow(clippy::too_many_arguments)]
 
 mod app;
+// v1.71.0：剪贴板唯一入口（原生 NSPasteboard，取代 osascript / pbpaste）。
+mod clipboard;
 mod exporter;
 mod fonts;
 mod gloss;

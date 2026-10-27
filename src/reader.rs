@@ -1721,7 +1721,12 @@ impl Root {
                             "end" | "End" => {
                                 self.note_cursor = self.note_draft.chars().count()
                             }
-                            "v" | "V" if mods.platform || mods.control => self.note_paste(),
+                            "v" | "V" if mods.platform || mods.control => {
+                                // 原生剪贴板（NSPasteboard），不再 fork `pbpaste`。
+                                if let Some(s) = crate::clipboard::paste_text(cx) {
+                                    self.note_paste(&s);
+                                }
+                            }
                             // 可打印键：交给输入法（insertText / setMarkedText
                             // 经 InputHandler 回落），此处直插只会叠字。
                             _ => {}
@@ -1796,7 +1801,7 @@ impl Root {
 
                     // ④ ⌘C 复制：有选区复制选区，否则复制整页正文。
                     if (k == "c" || k == "C") && (mods.platform || mods.control) {
-                        self.copy_page_text();
+                        self.copy_page_text(cx);
                         self.popup = None;
                         self.clear_selection();
                         cx.notify();
@@ -6720,7 +6725,7 @@ impl Root {
                     this.sel_anchor = Some(copy_key);
                     this.sel_focus = Some(copy_key);
                 }
-                this.copy_page_text();
+                this.copy_page_text(cx);
                 this.clear_selection();
                 this.bubble = None;
                 this.close_lookup();
@@ -7432,7 +7437,7 @@ impl Root {
                     this.sel_anchor = Some(key);
                     this.sel_focus = Some(key);
                 }
-                this.copy_page_text();
+                this.copy_page_text(cx);
                 this.popup = None;
                 this.clear_selection();
                 cx.notify();
@@ -7859,9 +7864,10 @@ impl Root {
     }
 
     /// 复制当前页正文（或拖选选区的文字）到系统剪贴板。
-    fn copy_page_text(&mut self) {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
+    ///
+    /// v1.71.0：写剪贴板改走原生 `crate::clipboard`（NSPasteboard），
+    /// 不再往 `pbcopy` 的 stdin 里灌字节——沙盒下子进程随时被拦。
+    fn copy_page_text(&mut self, cx: &App) {
         let pages = self.paginate();
         let text: String = if self.has_selection() {
             // 有选区：收集选区内（含双面对开的左右两页）的字。
@@ -7896,16 +7902,8 @@ impl Root {
             self.notice = "没有可复制的内容".to_string();
             return;
         }
-        match Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
-            Ok(mut child) => {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(text.as_bytes());
-                }
-                let _ = child.wait();
-                self.notice = format!("已复制 {} 字", text.chars().count());
-            }
-            Err(_) => self.notice = "复制失败：找不到 pbcopy".to_string(),
-        }
+        crate::clipboard::write_text(cx, text.clone());
+        self.notice = format!("已复制 {} 字", text.chars().count());
     }
 
     /// 对拖选选区划线：区间内全部字未划则全划，已全划则全消（支持双面对开跨页）。
@@ -9214,10 +9212,14 @@ impl Root {
         .detach();
     }
 
-    /// 复制到剪贴板：离屏出图 → 落临时 PNG → `osascript` 以 PNG 数据写粘贴板。
+    /// 复制到剪贴板：离屏出图 → 直接以 PNG 数据写粘贴板。
     ///
-    /// 用 `«class PNGf»` 而不是 TIFF：微信 / 备忘录粘贴回来才是真 PNG，
-    /// 不会被转成 72dpi 的位图。
+    /// v1.71.0：原来是「落临时 PNG → `osascript` 写 `«class PNGf»`」，两颗雷——
+    /// ① `osascript` 走 AppleEvents，沙盒要 entitlement 且会弹权限框；
+    /// ② 临时文件在沙盒容器里，路径每次都变。
+    /// 现在由 `crate::clipboard::write_png` 直写 `public.png` UTI，
+    /// **不落盘、不起子进程**（macOS 下即 `NSPasteboard`）。
+    /// 仍是 PNG 而非 TIFF：微信 / 备忘录粘回来才是真 PNG。
     fn copy_share_png(&mut self, cx: &mut Context<Self>) {
         let png = match self.render_share_png() {
             Ok(p) => p,
@@ -9228,31 +9230,9 @@ impl Root {
             }
         };
         self.show_share_panel = false;
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let tmp = std::env::temp_dir().join(format!("jiandu-share-{stamp}.png"));
-        if let Err(e) = std::fs::write(&tmp, &png) {
-            self.notice = format!("临时文件写入失败：{e}");
-            cx.notify();
-            return;
-        }
-        let script = format!(
-            "set the clipboard to (read (POSIX file \"{}\") as «class PNGf»)",
-            tmp.display()
-        );
-        let ok = std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        let _ = std::fs::remove_file(&tmp);
-        self.notice = if ok {
-            "分享图已复制到剪贴板，可直接粘贴".to_string()
-        } else {
-            "复制失败：剪贴板不可用".to_string()
-        };
+        let kb = png.len() / 1024;
+        crate::clipboard::write_png(cx, png);
+        self.notice = format!("分享图已复制到剪贴板（{kb} KB），可直接粘贴");
         cx.notify();
     }
 

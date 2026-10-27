@@ -3,10 +3,15 @@
 # 笺读 JianDu · macOS App 打包脚本
 #
 # 用法：
-#   ./scripts/make-mac-app.sh            # 编译 release 并打包
+#   ./scripts/make-mac-app.sh            # 编译 release 并打包（本机架构）
+#   ARCH=universal ./scripts/make-mac-app.sh  # 打通用包（Apple Silicon + Intel）
 #   SKIP_BUILD=1 ./scripts/make-mac-app.sh   # 用已编译好的二进制打包
 #
 # 产出：dist/笺读.app（可直接拖到「应用程序」文件夹）
+#
+# v1.71.0：ARCH=universal 会各编一份 aarch64 / x86_64 再用 lipo 合成，
+#          一份 .app 同时支持 Apple Silicon 与 Intel Mac。
+#          前置：rustup target add x86_64-apple-darwin
 # ============================================================
 set -euo pipefail
 
@@ -14,9 +19,10 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP_NAME="笺读"
 BUNDLE_ID="com.jiandu.app"
-VERSION="1.70.0"
-BUILD_NUM="118"
+VERSION="1.71.0"
+BUILD_NUM="119"
 MIN_MACOS="12.0"
+ARCH="${ARCH:-native}"
 
 DIST="$ROOT/dist"
 APP="$DIST/${APP_NAME}.app"
@@ -27,19 +33,55 @@ echo "==============================================="
 
 # ---- 1) 编译 release 二进制 ----
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-    echo "→ 编译 release（首次需要几分钟）..."
-    cargo build --release --bin jiandu
+    if [ "$ARCH" = "universal" ]; then
+        # 本机那份走默认 target 目录（能复用已编好的产物，省一次全量编译）；
+        # 另一份才开独立 target 子目录。
+        echo "→ 编译 release（本机 $(uname -m)，首次需要几分钟）..."
+        cargo build --release --bin jiandu
+        if [ "$(uname -m)" = "arm64" ]; then
+            echo "→ 编译 release（intel x86_64）..."
+            cargo build --release --bin jiandu --target x86_64-apple-darwin
+        else
+            echo "→ 编译 release（apple silicon arm64）..."
+            cargo build --release --bin jiandu --target aarch64-apple-darwin
+        fi
+    else
+        echo "→ 编译 release（首次需要几分钟）..."
+        cargo build --release --bin jiandu
+    fi
 fi
 
 # 定位二进制（尊重 CARGO_TARGET_DIR，默认 ./target）
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-BIN="$TARGET_DIR/release/jiandu"
-if [ ! -f "$BIN" ]; then
-    echo "✗ 找不到二进制：$BIN"
-    echo "  先跑 cargo build --release，或用 SKIP_BUILD=1 配合已有二进制。"
-    exit 1
+if [ "$ARCH" = "universal" ]; then
+    if [ "$(uname -m)" = "arm64" ]; then
+        ARM_BIN="$TARGET_DIR/release/jiandu"
+        X86_BIN="$TARGET_DIR/x86_64-apple-darwin/release/jiandu"
+    else
+        ARM_BIN="$TARGET_DIR/aarch64-apple-darwin/release/jiandu"
+        X86_BIN="$TARGET_DIR/release/jiandu"
+    fi
+    for b in "$ARM_BIN" "$X86_BIN"; do
+        if [ ! -f "$b" ]; then
+            echo "✗ 找不到二进制：$b（先跑 rustup target add x86_64-apple-darwin）"
+            exit 1
+        fi
+    done
+    # 注意：全角括号会被非 UTF-8 locale 的 bash 误认作变量名的一部分
+    # （$BIN（ → 报 unbound variable），所以这里一律用 ${BIN} 显式定界。
+    BIN="$DIST/jiandu-universal"
+    mkdir -p "$DIST"
+    lipo -create -output "${BIN}" "$ARM_BIN" "$X86_BIN"
+    echo "✓ 通用二进制：${BIN}（架构：$(lipo -archs "${BIN}")）"
+else
+    BIN="$TARGET_DIR/release/jiandu"
+    if [ ! -f "$BIN" ]; then
+        echo "✗ 找不到二进制：$BIN"
+        echo "  先跑 cargo build --release，或用 SKIP_BUILD=1 配合已有二进制。"
+        exit 1
+    fi
+    echo "✓ 二进制：$BIN"
 fi
-echo "✓ 二进制：$BIN"
 
 # ---- 2) 清理旧 bundle ----
 rm -rf "$APP"
