@@ -3922,6 +3922,14 @@ fn anki_push_card(
     }
 
     /// 跑一次检索：填命中表、整段匹配跨度入高亮集、跳到第一处。
+    ///
+    /// v1.75.0：三字以上的查询走 **FTS5 倒排索引**——先由 SQL 毫秒级筛出
+    /// 候选章，再只对这几章做精确扫描（`Book::search_in`）。低于三字时
+    /// trigram 用不上索引（SQLite 文档明说），仍走原来的内存扫描。
+    ///
+    /// 建索引是**按需**的（第一次搜某本书才建，见 `core::search`），可能要
+    /// 花几百毫秒——所以整段 DB 活儿丢给 background_executor，主线程只管
+    /// 出结果，绝不卡住翻页。
     pub fn run_search(&mut self, cx: &mut Context<Self>) {
         let q = self.search_draft.trim().to_string();
         if q.is_empty() {
@@ -3930,7 +3938,53 @@ fn anki_push_card(
             cx.notify();
             return;
         }
+        let qlen = q.chars().count();
+        let store = self.book.as_ref().and_then(|b| b.store_id.clone());
+        if qlen >= 3 {
+            if let Some(sid) = store {
+                self.notice = "正在检索…".to_string();
+                cx.notify();
+                let q2 = q.clone();
+                cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        let sid = sid.clone();
+                        let q3 = q2.clone();
+                        let cands = cx
+                            .background_executor()
+                            .spawn(async move {
+                                jiandu_core::store::connect().ok().and_then(|c| {
+                                    // 第一次搜这本书 → 现建索引；失败就当没索引，
+                                    // 回退全扫（绝不因为索引失败而搜不到东西）。
+                                    jiandu_core::search::ensure(&c, &sid).ok();
+                                    jiandu_core::search::query(&c, &sid, &q3, 300).ok()
+                                })
+                            })
+                            .await;
+                        let _ = this.update(&mut cx, |this, cx| {
+                            let hits = match cands {
+                                Some(cs) if !cs.is_empty() => this
+                                    .book
+                                    .as_ref()
+                                    .map(|b| b.search_in(&q2, &cs))
+                                    .unwrap_or_default(),
+                                _ => this.search_all(&q2),
+                            };
+                            this.apply_hits(hits, &q2, cx);
+                        });
+                    }
+                })
+                .detach();
+                return;
+            }
+        }
+        // 短查询 / 没有库 id（未入库的书）：照旧全扫。
         let hits = self.search_all(&q);
+        self.apply_hits(hits, &q, cx);
+    }
+
+    /// 把命中结果落进高亮集并跳到第一处（检索的收尾，两条路共用）。
+    fn apply_hits(&mut self, hits: Vec<(usize, usize, usize)>, q: &str, cx: &mut Context<Self>) {
         let qlen = q.chars().count();
         // 命中跨度整段入集：不只亮首字，「长安」两字一起亮。
         self.search_keys = hits

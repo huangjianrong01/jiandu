@@ -125,6 +125,9 @@ fn init(c: &Connection) -> Result<()> {
     .context("建章节仓库表失败")?;
     // v1.74.0：卡片匣与章节同库（`IF NOT EXISTS`，老库升级自动补表，零迁移）。
     crate::cards::init(c)?;
+    // v1.75.0：全文检索索引。失败**静默降级**——没有 FTS5 只是退回线性扫描，
+    // 不该让 App 起不来（老库、精简编译的 SQLite 都可能没编 FTS5）。
+    crate::search::init(c).ok();
     Ok(())
 }
 
@@ -289,6 +292,9 @@ fn sizes_in(c: &Connection, schema: &str, id: &str) -> Vec<usize> {
 pub fn delete_book(c: &Connection, id: &str) -> Result<()> {
     c.execute("DELETE FROM chapters WHERE store_id=?1", params![id])?;
     c.execute("DELETE FROM books WHERE store_id=?1", params![id])?;
+    // v1.75.0：顺带清掉这本书的全文索引，否则索引里躺着永不命中的垃圾，
+    // 白白占着 trigram 那份不小的体积。
+    crate::search::drop_book(c, id).ok();
     Ok(())
 }
 

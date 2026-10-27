@@ -256,14 +256,18 @@ impl UniversalParser {
             SrcKind::Xml => XmlParser.parse(raw)?,
             SrcKind::Json => JsonParser.parse(raw)?,
         };
-        Ok(chapters
+        let chapters: Vec<RawChapter> = chapters
             .into_iter()
             .map(|mut c| {
                 c.title = cleanup_ancient_text(&c.title);
                 c.content = cleanup_ancient_text(&c.content);
                 c
             })
-            .collect())
+            .collect();
+        // v1.75.0：**一品为一章**。清洗完之后品题已成独立行，但 EPUB / HTML
+        // 只认结构标签，`第X品` 在它们眼里仍是普通段落——这里统一再扫一遍
+        // 行首标题开章，六种格式归于一律（TXT 那条链已切过，幂等）。
+        Ok(crate::pipeline::resplit_by_heads(chapters))
     }
 }
 
@@ -292,6 +296,10 @@ pub fn cleanup_ancient_text(text: &str) -> String {
     // 0) 头部幽灵（BOM / 零宽 / 全角空格 / 连续空行 / YAML 头）：必须在最前面
     //    ——后面的工序都按「行」走，行首那几个看不见的字符一留下来就会占字格。
     let s = crate::cleaner::strip_head_junk(text);
+    // 0.5) **品题行内断行**（v1.75.0）：EPUB / HTML 抽出来的段落同样会把
+    //      「第X品 + 品名 + 正文」糊在一段里。放在页码孤行之前——断出来的
+    //      新行要能参与后面的逐行工序。与 TXT 那条链同一个函数，判据一致。
+    let s = crate::cleaner::split_inline_heads(&s);
     // 1) 页码孤行（在任何数字转汉字之前——否则会被当成数字转成汉字）。
     let s = strip_page_lines(&s);
     // 2) 先卸掉历史 `[数字:…]` 壳，让里面的数字也能被汉字化。

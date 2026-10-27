@@ -22,6 +22,8 @@
 pub mod banxin;
 /// **卡片匣**（v1.74.0）：跨书摘录卡的落盘层（`store` 同库的一张表）。
 pub mod cards;
+/// **全文检索索引**（v1.75.0）：SQLite FTS5 按需建索引，毫秒级定位候选章。
+pub mod search;
 /// **清洗器**（v1.54.0）：两遍扫描——去噪 + 重建语义，产出 IR。
 pub mod cleaner;
 pub mod content;

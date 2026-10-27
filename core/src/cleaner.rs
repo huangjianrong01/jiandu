@@ -1352,6 +1352,143 @@ pub fn clean_line(s: &str) -> String {
     normalize_variants(&paren_to_note(&t))
 }
 
+// ------------------------------------------------------------------
+// 品 / 章 行内断行（v1.75.0）
+// ------------------------------------------------------------------
+
+/// 章节单位字：`第X__`。
+///
+/// 传统六种之外，v1.75.0 补了 **品 / 颂 / 偈 / 门 / 赞**——佛经与子书的分节
+/// 单位。《金刚经》三十二品、《法华经》二十八品此前一个都不认，整段品题连
+/// 着正文挤在同一段里，竖排出来就是「标题正文糊成一团」。
+///
+/// ⚠️ 没敢放「分」「经」「论」「传」：这四个在正文里太常见（「一分为二」
+/// 「论语」），放进来必然误杀。宁可漏判，不可误杀。
+pub const HEAD_UNITS: &[char] = &[
+    '章', '回', '卷', '节', '篇', '折', '出', '品', '颂', '偈', '门', '赞',
+];
+
+/// 品题的收尾字：`法会因由分` / `威仪寂静分` / `序品` / `方便品` / `偈颂`。
+///
+/// 与 [`HEAD_UNITS`] 有交集（「品」既是单位也是品名尾）是**故意的**：
+/// 「序品第一」这类后置序数里，「品」正是品名的一部分。
+const NAME_TAILS: &[char] = &['分', '品', '颂', '赞', '偈', '门', '论', '篇'];
+
+/// 断行前一格不许是这些「收尾的半个」——`《论语》第二十章说…` 是**引用**，
+/// 不是品题，切一刀就把一句话劈成两半。
+fn closes_quote(c: char) -> bool {
+    matches!(c, '》' | '」' | '』' | '）' | '】' | '”' | '’' | '〉')
+}
+
+pub(crate) fn is_han(c: char) -> bool {
+    ('\u{3400}'..='\u{9fff}').contains(&c) || ('\u{f900}'..='\u{faff}').contains(&c)
+}
+
+/// **行内品题断行**：把黏在正文里的「第X品 / 第X章…」连它的品名一起切出来，
+/// 独占一行。
+///
+/// 典型症状（网上下载的《金刚经》_txt 常是一整坨）：
+///
+/// ```text
+/// …是名一合相。第二十九品 威仪寂静分须菩提。若有人言。如来若来若去…
+/// ```
+///
+/// 切完：
+///
+/// ```text
+/// …是名一合相。
+/// 第二十九品 威仪寂静分
+/// 须菩提。若有人言。如来若来若去…
+/// ```
+///
+/// 判据（**三条全中才切**，宁可漏判不可误杀）：
+/// 1. 行内（或行首）出现 `第` + 数字 + 单位字；
+/// 2. 单位字之后 12 字内有品名收尾字（见 [`NAME_TAILS`]），且收尾字后还
+///    粘着 ≥20 字的内容——说明后面是整品正文，而不是「第二十章分析如下」
+///    这种正文里的引用；
+/// 3. 前一格不是收尾引号（挡掉 `《论语》第二十章…`）。
+///
+/// 只切**第一处**命中：一行里连着两个品号的概率极低，两刀叠着切会把行切碎。
+pub fn split_inline_heads(text: &str) -> String {
+    if !text.contains('第') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    for line in text.split('\n') {
+        out.push_str(&split_one_head(line));
+        out.push('\n');
+    }
+    // `split('\n')` 会多补一个换行（原串结尾那个），退回去保持行结构不变。
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn split_one_head(line: &str) -> String {
+    if !line.contains('第') {
+        return line.to_string();
+    }
+    let cs: Vec<char> = line.chars().collect();
+    let n = cs.len();
+    let mut i = 0usize;
+    while i < n {
+        if cs[i] != '第' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && crate::pipeline::is_numeral(cs[j]) {
+            j += 1;
+        }
+        if j == i + 1 || j >= n || !HEAD_UNITS.contains(&cs[j]) {
+            i += 1;
+            continue;
+        }
+        let m = j + 1; // 单位字之后 = 品名起点
+        if let Some(t) = name_tail_at(&cs, m) {
+            // 前一格是收尾引号 → 多半是「《论语》第二十章」这类引用，不切。
+            if i > 0 && closes_quote(cs[i - 1]) {
+                i += 1;
+                continue;
+            }
+            let head: String = cs[i..=t].iter().collect();
+            let tail: String = cs[t + 1..].iter().collect();
+            // 行首本来就是标题行：只补后刀，前面不加空段。
+            return if i == 0 {
+                format!("{head}\n{tail}")
+            } else {
+                let before: String = cs[..i].iter().collect();
+                format!("{before}\n{head}\n{tail}")
+            };
+        }
+        i += 1;
+    }
+    line.to_string()
+}
+
+/// 品名收尾字的下标：单位字后 12 格内、全是汉字 / 空格，遇标点即停。
+fn name_tail_at(cs: &[char], m: usize) -> Option<usize> {
+    let n = cs.len();
+    // 后面得黏着一大段正文才值得切：只跟着三五个字的话，多半是正文里的引用。
+    if n.saturating_sub(m) < 20 {
+        return None;
+    }
+    let end = (m + 12).min(n);
+    for k in m..end {
+        let c = cs[k];
+        if c == ' ' || c == '\u{3000}' || is_han(c) {
+            if NAME_TAILS.contains(&c) && k + 1 < n {
+                return Some(k);
+            }
+            continue;
+        }
+        break; // 标点 / 其它字符：品名到此为止
+    }
+    None
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

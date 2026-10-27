@@ -206,7 +206,15 @@ pub fn cn_ordinal(n: usize) -> String {
 // 三、txt：智能切章
 // ------------------------------------------------------------------
 
-/// 是否章节标题行：`第` + 若干中文数字 / 阿拉伯数字 + `章回卷节篇折出`。
+/// 是否章节标题行：`第` + 若干中文数字 / 阿拉伯数字 + 章节单位字。
+///
+/// 单位字见 [`crate::cleaner::HEAD_UNITS`]——传统六种（章 / 回 / 卷 / 节 /
+/// 篇 / 折 / 出）之外，v1.75.0 补了佛经与子书的分节单位 **品 / 颂 / 偈 /
+/// 门 / 赞**：《金刚经》的三十二品、 《法华经》的二十八品此前一个都不认，
+/// 整段品题连着正文挤在同一段里。
+///
+/// 另支持**后置序数**（佛经常见「法会因由分第一」「威仪寂静分第二十九」），
+/// 见 [`trailing_ordinal`]。
 ///
 /// 用字符扫描而不是正则——`[0-9]` 与全角数字、`两`、`廿` 都得认，
 /// 而且标题后面常跟整句标题名（「第一章 宴桃园豪杰三结义」）。
@@ -215,20 +223,56 @@ pub fn is_chapter_head(line: &str) -> bool {
     if cs.len() < 3 || cs.len() > 40 {
         return false;
     }
-    if cs[0] != '第' {
+    // 标题行不带句读——这一条先挡掉绝大多数正文（「见第二十章，…」）。
+    if cs.iter().any(|c| matches!(c, '。' | '，' | '、' | '；' | '！' | '？')) {
         return false;
     }
-    let mut i = 1usize;
-    while i < cs.len() && is_numeral(cs[i]) {
-        i += 1;
+    // ① 前置序数：「第」+ 数字 + 单位字。
+    //    允许**短前缀**：佛经的品题常把书名写在前面（「金刚经第一品 法会因
+    //    由分」），前缀限 8 个汉字——「见第二十章」这类正文虽然也满足，
+    //    但它通常跟在句读后、进不了短行，配合上面的无句读判据足矣。
+    if let Some(i) = cs.iter().position(|c| *c == '第') {
+        if i <= 8 && cs[..i].iter().all(|c| crate::cleaner::is_han(*c)) {
+            let mut j = i + 1;
+            while j < cs.len() && is_numeral(cs[j]) {
+                j += 1;
+            }
+            // ⚠️ `j` 可能刚好走到末尾（「第二十九」「第108」这种孤零零的序
+            // 数）：先挡越界再取字符——此前直接 `cs[j]` 会 panic，把整次导
+            // 入炸掉。
+            if j > i + 1 && j < cs.len() && crate::cleaner::HEAD_UNITS.contains(&cs[j]) {
+                return true;
+            }
+        }
     }
-    if i == 1 {
-        return false;
-    }
-    matches!(cs[i], '章' | '回' | '卷' | '节' | '篇' | '折' | '出')
+    // ② 后置序数：「法会因由分第一」——数字在末尾。
+    trailing_ordinal(&cs)
 }
 
-fn is_numeral(c: char) -> bool {
+/// 后置序数：以 `第` + 数字**收尾**的短行（佛经品题的常见写法）。
+///
+/// 判据很窄——短行（≤20 字）+ 不含句读 + 末尾是「第」+ 数字 + 「第」前还有
+/// 品名。三条都满足才认，宁可漏判也绝不把正文当标题切走。
+fn trailing_ordinal(cs: &[char]) -> bool {
+    if cs.len() > 20 {
+        return false;
+    }
+    if cs.iter().any(|c| matches!(c, '。' | '！' | '？' | '；' | '，' | '、')) {
+        return false;
+    }
+    let mut k = cs.len();
+    while k > 0 && is_numeral(cs[k - 1]) {
+        k -= 1;
+    }
+    // 没有数字 / 全是数字 / 「第」不在数字前 → 都不是。
+    if k == 0 || k == cs.len() || cs[k - 1] != '第' {
+        return false;
+    }
+    // 「第」之前还得有品名（「第二十九」这种孤序数不算标题）。
+    k >= 2 && cs[k - 2] != '第'
+}
+
+pub(crate) fn is_numeral(c: char) -> bool {
     matches!(
         c,
         '零' | '〇'
@@ -257,9 +301,12 @@ fn is_numeral(c: char) -> bool {
 pub fn parse_txt(text: &str) -> Vec<RawChapter> {
     // 头部幽灵先切一刀（BOM / 零宽 / 全角空格 / YAML 元数据块 / 连续空行）：
     // 它们每一个都占一个正文字格，留着就是第一列顶部的「幽灵空行」。
-    let norm = crate::cleaner::strip_head_junk(
+    // v1.75.0：品题断行必须在**逐行判章之前**——网上的佛经 txt 常是一整坨，
+    // 「第二十九品 威仪寂静分须菩提。…」黏成一行的情况下，行首不是「第」，
+    // `is_chapter_head` 根本没机会认。先切开，品题才成行、才被认作章。
+    let norm = crate::cleaner::split_inline_heads(&crate::cleaner::strip_head_junk(
         &text.replace("\r\n", "\n").replace('\r', "\n"),
-    );
+    ));
     let mut chapters: Vec<RawChapter> = Vec::new();
     let mut title = "正文".to_string();
     let mut paras: Vec<String> = Vec::new();
@@ -308,6 +355,52 @@ pub fn parse_txt(text: &str) -> Vec<RawChapter> {
         c.content = classicize(&c.content);
     });
     chapters
+}
+
+/// **按品 / 章标题行重新切章**（v1.75.0）：一品为一章。
+///
+/// 各格式的解析器切章口径不一——TXT 认 `is_chapter_head`，EPUB / HTML 只认
+/// 结构标签（`h1`~`h6`）。佛经的「第X品」在 EPUB 里往往只是普通段落：断行
+/// 之后它虽然单独成行，却仍赖在上一品的章里。这里统一再扫一遍，**行首是
+/// 章节标题行就开新章**，让六种格式的品 / 章口径归于一律。
+///
+/// 幂等：TXT 那条链已经这么切过，再跑一遍不会多切（切完的章里不再有行首
+/// 标题行）。
+pub fn resplit_by_heads(chapters: Vec<RawChapter>) -> Vec<RawChapter> {
+    if chapters.is_empty() {
+        return chapters;
+    }
+    let mut out: Vec<RawChapter> = Vec::new();
+    for c in chapters {
+        let mut title = c.title;
+        let mut paras: Vec<String> = Vec::new();
+        let mut pushed_any = false;
+        for line in c.content.lines() {
+            let t = line.trim();
+            if !t.is_empty() && is_chapter_head(t) {
+                push_chapter(&mut out, &title, &mut paras);
+                title = t.to_string();
+                pushed_any = true;
+                continue;
+            }
+            paras.push(line.to_string());
+        }
+        push_chapter(&mut out, &title, &mut paras);
+        let _ = pushed_any;
+    }
+    // 扉页孤行：开头那行往往只是书名（「金刚经」三个字），它既不是品也不是
+    // 章。**尊重原文——一个字都不删**：把它从正文挪去当章标题，随后
+    // `chapters_to_book` 的既有约定（首章无正文 → 提升为书名）自然会把它
+    // 收作书名。这样目录不空，「金刚经」三个字也还在。
+    if out.len() > 1 {
+        let n = out[0].content.chars().count();
+        if n > 0 && n <= 8 && !out[0].content.contains('。') {
+            let t = out[0].content.trim().to_string();
+            out[0].title = t;
+            out[0].content.clear();
+        }
+    }
+    out
 }
 
 fn push_chapter(out: &mut Vec<RawChapter>, title: &str, paras: &mut Vec<String>) {
@@ -1826,6 +1919,52 @@ mod tests {
         assert!(!is_chapter_head("天下大势"));
         assert!(!is_chapter_head("第二天")); // 有数字，但后面不是章回卷节
         assert!(is_chapter_head("第一章")); // 最短的章名也认
+    }
+
+    // ── v1.75.0：佛经「品」与行内断行 ─────────────────────────────
+    #[test]
+    fn chapter_head_knows_pin_and_book_prefix() {
+        // 《金刚经》三十二品的真实形态：书名前缀 + 第X品 + 品名。
+        assert!(is_chapter_head("金刚经第一品 法会因由分"));
+        assert!(is_chapter_head("金刚经第三十二品 应化非真分"));
+        assert!(is_chapter_head("第二十九品 威仪寂静分"));
+        // 后置序数（佛经另一路写法）
+        assert!(is_chapter_head("法会因由分第一"));
+        // 传统章回不受影响
+        assert!(is_chapter_head("第十二回"));
+        assert!(is_chapter_head("第一章"));
+        // ⚠️ 越界保护：孤零零一个序数，此前 `cs[i]` 会 panic。
+        assert!(!is_chapter_head("第二十九"));
+        assert!(!is_chapter_head("第108"));
+        // 带句读的一律不是标题（正文里引用章节）
+        assert!(!is_chapter_head("《论语》第二十章，子曰"));
+        assert!(!is_chapter_head("见第二十章。"));
+    }
+
+    /// 尊重原文：品题长什么样，章标题就是什么样——不自作主张剥书名前缀。
+    #[test]
+    fn chapter_title_keeps_original_text() {
+        let raw = "金刚经\n\n金刚经第一品 法会因由分\n\n如是我闻，一时佛在舍卫国祗树给孤独园。\n\n金刚经第二品 善现启请分\n\n时长老须菩提在大众中。";
+        let cs = parse_txt(raw);
+        let titles: Vec<&str> = cs.iter().map(|c| c.title.as_str()).collect();
+        assert!(titles.iter().any(|t| t == &"金刚经第一品 法会因由分"), "{titles:?}");
+        assert!(titles.iter().any(|t| t == &"金刚经第二品 善现启请分"), "{titles:?}");
+    }
+
+    #[test]
+    fn resplit_makes_one_pin_one_chapter() {
+        use crate::pipeline::RawChapter;
+        // 模拟 EPUB 的产出：解析器只认结构标签，整本书就一章，品题只是普通行。
+        let one = RawChapter::new(
+            "金刚经",
+            "金刚经第一品 法会因由分\n如是我闻，一时佛在舍卫国。\n金刚经第二品 善现启请分\n时长老须菩提在大众中。".to_string(),
+        );
+        let out = resplit_by_heads(vec![one]);
+        assert_eq!(out.len(), 2, "一品一章：{:?}", out.iter().map(|c| c.title.clone()).collect::<Vec<_>>());
+        // 尊重原文：标题就是原文那一行，一个字不改。
+        assert_eq!(out[0].title, "金刚经第一品 法会因由分");
+        assert_eq!(out[1].title, "金刚经第二品 善现启请分");
+        assert!(out[0].content.contains("如是我闻"));
     }
 
     #[test]

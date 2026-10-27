@@ -8295,6 +8295,8 @@ impl Root {
         list = list.child(help_row("⌘T", "简体 / 繁体互转", t));
         list = list.child(help_row("⌘1 – ⌘5", "墨色（五套）", t));
         list = list.child(help_row("⌘F", "切换字体", t));
+        // 全文检索（v1.75.0）：三字以上走 FTS5 索引，首次搜某本书会先建索引。
+        list = list.child(help_row("顶栏「检索」", "输词后 ⏎ 开搜 · 三字以上走索引（首次会先建）", t));
         list = list.child(help_row("⌘P", "切换纸色", t));
         list = list.child(help_row("⌘N", "注释显隐", t));
         list = list.child(help_row("⌘J", "通假显隐", t));

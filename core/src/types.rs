@@ -1199,6 +1199,34 @@ impl Book {
         out
     }
 
+    /// 只在**给定章**里找（FTS5 先筛出候选章时用，见 `core::search`）。
+    ///
+    /// 结果按阅读顺序排序——候选章是按相关度 `bm25` 排的，而「下一处命中」
+    /// 必须顺着读，所以这里要重排一次。
+    pub fn search_in(&self, q: &str, chapters: &[usize]) -> Vec<(usize, usize, usize)> {
+        let pat: Vec<char> = q.chars().collect();
+        if pat.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for &ci in chapters {
+            let Some(ch) = self.chapters.get(ci) else { continue };
+            for (pi, p) in ch.paragraphs.iter().enumerate() {
+                let chars: Vec<char> = p.text.chars().collect();
+                if chars.len() < pat.len() {
+                    continue;
+                }
+                for i in 0..=(chars.len() - pat.len()) {
+                    if &chars[i..i + pat.len()] == pat.as_slice() {
+                        out.push((ci, pi, i));
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
     /// **单章**的字形流（v1.60.0 惰性分页的基石）。
     ///
     /// 分页引擎里，**章边界必然收面**（`layout_book_from_opts` 的
