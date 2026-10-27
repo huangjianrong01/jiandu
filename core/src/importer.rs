@@ -1586,14 +1586,21 @@ pub fn import_epub_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
                 }
             }
             // 书眉：同一句短段见到第 4 回起，直接剔掉（见上 `header_seen`）。
+            //
+            // 先按 `&str` 查表（命中就不必给这一句再分配一个 String）：书眉
+            // 是每叶都印的，重复率极高，大书上这一手能省下几十万次堆分配
+            // （v1.67.2）。
             chapter.paragraphs.retain(|p| {
                 let t = p.text.trim();
                 if t.chars().count() > 16 {
                     return true;
                 }
-                let n = header_seen.entry(t.to_string()).or_insert(0);
-                *n += 1;
-                *n <= 3
+                if let Some(n) = header_seen.get_mut(t) {
+                    *n += 1;
+                    return *n <= 3;
+                }
+                header_seen.insert(t.to_string(), 1);
+                true
             });
             if !chapter.paragraphs.is_empty() {
                 if first_idx.is_none() {

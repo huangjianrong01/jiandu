@@ -52,6 +52,17 @@ pub fn connect_in_memory() -> Result<Connection> {
 }
 
 fn init(c: &Connection) -> Result<()> {
+    // **写盘档位**（v1.67.2）：导入一部大书要落上千章，逐章自动提交等于
+    // 上千次 fsync——实测 9.5MB 的《尔雅》光落盘就 825ms，占了整趟导入的
+    // 82%。这里把库调成 WAL + synchronous=NORMAL，配合 `begin_bulk` 的
+    // 「整本一个事务」，fsync 次数从「每章两次」降到「整本一次」。
+    //（WAL 是写进库头的持久设置，只生效一次；另两个是连接级，每次开库都设。）
+    // 顺带：WAL 让「后台导入写」与「主线程读」互不阻塞，锁等待也少。
+    c.pragma_update(None, "journal_mode", &"WAL")?;
+    c.pragma_update(None, "synchronous", &1i64)?; // NORMAL
+    c.pragma_update(None, "temp_store", &2i64)?; // MEMORY
+    // 并发（导入线程写 / 主线程读）撞锁时等 5 秒，别直接抛 SQLITE_BUSY。
+    c.busy_timeout(std::time::Duration::from_secs(5))?;
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS books(
              store_id   TEXT PRIMARY KEY,
@@ -84,7 +95,24 @@ pub fn put_book(c: &Connection, id: &str, title: &str, author: &str, meta_json: 
     Ok(())
 }
 
+/// **开批量写事务**：一整本书只在开头 `BEGIN` 一次，末尾 `COMMIT` 一次。
+///
+/// 不包事务的话，`put_chapter` 每执行一次就是一次自动提交（一次 fsync +
+/// 一次日志文件开销）。千章级的大书会因此多花好几秒，还把磁盘按在地上
+/// 摩擦——这正是「导入卡顿」的主因（v1.67.2 实测）。
+pub fn begin_bulk(c: &Connection) -> Result<()> {
+    c.execute_batch("BEGIN").context("开启批量写事务失败")
+}
+
+/// 提交批量写事务（与 [`begin_bulk`] 配对）。
+pub fn end_bulk(c: &Connection) -> Result<()> {
+    c.execute_batch("COMMIT").context("提交批量写事务失败")
+}
+
 /// 写一章（`idx` 从 0 起、连续）。
+///
+/// 调用方应先 [`begin_bulk`]、写完全书再 [`end_bulk`]；否则每一章都是一次
+/// 独立的自动提交（见那里的注释）。
 pub fn put_chapter(
     c: &Connection,
     id: &str,
@@ -101,12 +129,17 @@ pub fn put_chapter(
     Ok(())
 }
 
-/// 取回一章（没有该章返回 `None`）。
-pub fn load_chapter(c: &Connection, id: &str, idx: usize) -> Result<Option<Chapter>> {
+/// 取回**第 n 章**（按章号排序后的第 n 条，从 0 起；没有返回 `None`）。
+///
+/// **按位置取，不按章号等值取**（v1.67.2）：砍掉前言 / 散页会在章号里留下
+/// 空洞，等值查询就会「读到空」。按 `ORDER BY idx … OFFSET n` 取，空洞自然
+/// 被跳过——于是导入末尾再也不必把全表读回内存重写一遍（那部 17MB 的丛书
+/// 光这一趟要 1.1 秒）。
+pub fn load_chapter(c: &Connection, id: &str, n: usize) -> Result<Option<Chapter>> {
     let mut st = c.prepare(
-        "SELECT json FROM chapters WHERE store_id=?1 AND idx=?2",
+        "SELECT json FROM chapters WHERE store_id=?1 ORDER BY idx ASC LIMIT 1 OFFSET ?2",
     )?;
-    let mut rows = st.query(params![id, idx as i64])?;
+    let mut rows = st.query(params![id, n as i64])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
@@ -178,22 +211,37 @@ pub fn renumber(c: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// 删掉指定章（按**当前**章号），随后调用方自行 `renumber`。
+/// 删掉指定章（按**当前位置**，即章号排序后的第 n 条）。
+///
+/// 与 [`load_chapter`] 同一套口径（v1.67.2）：位置为准，章号里的空洞不算数。
+/// 调用方要**从大到小**删——删掉靠前的一条，后面的位置会整体前移。
 pub fn drop_chapters(c: &Connection, id: &str, doomed: &[usize]) -> Result<()> {
     for i in doomed {
         c.execute(
-            "DELETE FROM chapters WHERE store_id=?1 AND idx=?2",
+            "DELETE FROM chapters WHERE rowid = (
+                 SELECT rowid FROM chapters WHERE store_id=?1
+                 ORDER BY idx ASC LIMIT 1 OFFSET ?2)",
             params![id, *i as i64],
         )?;
     }
     Ok(())
 }
 
-/// 改写章题（目录润色之后才定得下来题名，那时正文早已落盘）。
-pub fn set_title(c: &Connection, id: &str, idx: usize, title: &str) -> Result<()> {
+/// 清掉某本书的全部章（重导同一文件时用，避免残留上一次的旧章）。
+pub fn clear_chapters(c: &Connection, id: &str) -> Result<()> {
+    c.execute("DELETE FROM chapters WHERE store_id=?1", params![id])?;
+    Ok(())
+}
+
+/// 改写**第 n 章**的章题（目录润色之后才定得下来题名，那时正文早已落盘）。
+///
+/// 与 [`load_chapter`] 同一套位置口径（v1.67.2）。
+pub fn set_title(c: &Connection, id: &str, n: usize, title: &str) -> Result<()> {
     c.execute(
-        "UPDATE chapters SET title=?1 WHERE store_id=?2 AND idx=?3",
-        params![title, id, idx as i64],
+        "UPDATE chapters SET title=?1 WHERE rowid = (
+             SELECT rowid FROM chapters WHERE store_id=?2
+             ORDER BY idx ASC LIMIT 1 OFFSET ?3)",
+        params![title, id, n as i64],
     )?;
     Ok(())
 }

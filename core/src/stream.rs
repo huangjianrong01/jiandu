@@ -77,7 +77,7 @@ impl DbSink {
         total_hint: usize,
         on_progress: Option<Box<dyn Fn(f32, String) + Send>>,
     ) -> Self {
-        Self {
+        let s = Self {
             conn,
             id: id.into(),
             sizes: Vec::new(),
@@ -86,7 +86,14 @@ impl DbSink {
             total_hint: total_hint.max(1),
             done_hint: 0,
             chars: 0,
-        }
+        };
+        // 整本一个事务：千章级的书不再「每章一次 fsync」（见 store::begin_bulk）。
+        // 失败也不致命——退回逐章自动提交，只是慢一点。
+        let _ = store::begin_bulk(&s.conn);
+        // 重导同一文件（store_id 相同）时先清旧章，免得留下上一次的残章。
+        // 与整趟写入同一事务：导入中途失败会整体回滚，旧章原样回来。
+        let _ = store::clear_chapters(&s.conn, &s.id);
+        s
     }
 
     /// 推进进度条（`done` 是已完成的工作量单位，与 `total_hint` 同量纲）。
@@ -111,10 +118,22 @@ impl DbSink {
         &self.id
     }
 
-    /// 收尾：把「题名 + 字数 + 样本」交出去之前，先把章号压实（前言被砍后
-    /// 章号会断）。
+    /// 收尾：提交批量写事务（数据在 `finish` 之前都在事务里，未落盘）。
+    ///
+    /// **不再做章号压实**（v1.67.2）：砍掉前言 / 散页留下的空洞，由
+    /// `store::load_chapter` 的「按位置取」天然跳过——原来那一趟
+    /// `renumber` 要把全表读回内存再删光重写，一部 17MB 的丛书白花 1.1 秒。
     pub fn finish(&self) -> Result<()> {
-        store::renumber(&self.conn, &self.id)
+        store::end_bulk(&self.conn)
+    }
+}
+
+impl Drop for DbSink {
+    /// 导入中途失败（`finish` 没走到）就回滚——绝不留下半本书。
+    ///
+    /// 已提交的库上 `ROLLBACK` 只会报「无活动事务」，忽略即可。
+    fn drop(&mut self) {
+        let _ = self.conn.execute_batch("ROLLBACK");
     }
 }
 
@@ -206,8 +225,11 @@ impl ChapterSink for DbSink {
             v.dedup();
             v
         };
-        let _ = store::drop_chapters(&self.conn, &self.id, &sorted);
-        // 章号留着空洞，交给 `finish()` 的 renumber 压实；这里的
+        // **从大到小删**：`drop_chapters` 现在按「位置」删，删掉靠前的一条
+        // 后面会整体前移，倒着删才不会错位（v1.67.2）。章号留下的空洞不必
+        // 压实——读取一律按位置（见 `store::load_chapter`）。
+        let desc: Vec<usize> = sorted.iter().rev().copied().collect();
+        let _ = store::drop_chapters(&self.conn, &self.id, &desc);
         // sizes / samples 必须与库里「剩下的章」重新对齐，故整表重读。
         self.sizes = store::chapter_sizes(&self.conn, &self.id);
         let keep: std::collections::HashSet<usize> =
@@ -432,6 +454,60 @@ mod tests {
     use super::*;
 
     /// 一章超过 5000 字必须被切成多章，且**切完每章都不超上限**。
+    /// 导入各格式的**分档计时**：`JIANDU_BENCH_FILES` 用 `;` 分隔若干真书路径。
+    ///
+    /// 一档跑三趟，把「解析 + 清洗」与「落盘」分开看：
+    ///
+    /// * `import_into(MemSink)` —— 纯解析 + 清洗 + 切片，不碰数据库；
+    /// * `import_streaming(path)` —— 同一趟活 + 逐章落盘（差出来的就是 DB 开销）。
+    ///
+    /// 跑法（HOME 指到临时目录，别污染真仓库）：
+    /// ```sh
+    /// mkdir -p /tmp/benchhome
+    /// JIANDU_BENCH_FILES="~/a.epub;~/b.txt" HOME=/tmp/benchhome \
+    ///   cargo test --release -p jiandu-core bench_import_stages -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn bench_import_stages() {
+        let files = std::env::var("JIANDU_BENCH_FILES").unwrap_or_default();
+        if files.is_empty() {
+            println!("未给 JIANDU_BENCH_FILES，跳过");
+            return;
+        }
+        for f in files.split(';') {
+            let f = f.trim();
+            if f.is_empty() {
+                continue;
+            }
+            let p = std::path::Path::new(f);
+            let mb = std::fs::metadata(p).map(|m| m.len() as f64 / 1_048_576.0).unwrap_or(0.0);
+            // ① 解析 + 清洗（内存 sink，不落盘）
+            let t0 = std::time::Instant::now();
+            let r1 = crate::importer::import_into(p, &mut MemSink::new());
+            let t1 = t0.elapsed();
+            // ② 同一趟活 + 落盘
+            let t2 = std::time::Instant::now();
+            let r2 = crate::stream::import_streaming(p, None);
+            let t2 = t2.elapsed();
+            let (n, chars) = match &r1 {
+                Ok(b) => (b.chapter_chars.len(), b.chapter_chars.iter().sum::<usize>()),
+                Err(_) => (0, 0),
+            };
+            println!(
+                "{:>6.1}MB  章 {:>5}  字 {:>9}  |  解析+清洗 {:>7.1?}  |  +落盘 {:>7.1?}  | DB≈{:>6.1?}  | {}",
+                mb, n, chars, t1, t2, t2.saturating_sub(t1),
+                p.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+            );
+            if let Err(e) = r1 {
+                println!("    ↳ import_into 失败：{e}");
+            }
+            if let Err(e) = r2 {
+                println!("    ↳ import_streaming 失败：{e}");
+            }
+        }
+    }
+
     #[test]
     fn oversized_chapter_is_split_at_paragraph_boundaries() {
         let mut sink = MemSink::new();

@@ -226,7 +226,7 @@ pub fn denoise_text(s: &str) -> String {
 }
 
 /// 第一遍：一巻内的去噪（文本净化 + 丢噪声段 + 合并连续重复段 + 砍导航短段堆）。
-fn pass1_juan(j: &mut IrJuan, titles: &[String]) {
+fn pass1_juan(j: &mut IrJuan, titles: &std::collections::HashSet<String>) {
     for b in j.blocks.iter_mut() {
         match b {
             IrBlock::Para(spans) | IrBlock::Annotation { spans, .. } => {
@@ -289,7 +289,7 @@ fn spans_line(spans: &[IrSpan]) -> String {
 }
 
 /// 一刀砍掉「目录残页」式的短段堆。
-fn drop_nav_runs(blocks: &mut Vec<IrBlock>, titles: &[String]) {
+fn drop_nav_runs(blocks: &mut Vec<IrBlock>, titles: &std::collections::HashSet<String>) {
     if blocks.len() < 3 {
         return;
     }
@@ -744,7 +744,11 @@ pub fn clean_book_with(book: &mut Book, source: IrSource, opts: &CleanOpts) {
     }
     let before = book.chapters.len();
     let mut ir = IrBook::from_book(book, source);
-    let titles: Vec<String> = ir.juans.iter().map(|j| j.title.clone()).collect();
+    // 题名表做成哈希集合：`drop_nav_runs` 对每个「短段」都要问一句
+    // 「这段是不是别处的题名」，用 Vec 是 O(段数 × 章数) 的线性查找——
+    // 《诸子百家》那类大书上，光这一句就要一秒多（v1.67.2 实测）。
+    let titles: std::collections::HashSet<String> =
+        ir.juans.iter().map(|j| j.title.clone()).collect();
 
     // ---- 第一遍：去噪（所有格式都做，减法最安全） ----
     if opts.denoise {
