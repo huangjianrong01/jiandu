@@ -591,6 +591,67 @@ fn banxin_tail(w: f32, h: f32, top: bool, color: u32) -> Div {
     )
 }
 
+/// **象鼻**（v1.65.0）：版心天头 / 地脚那两段「从版框内缘接到鱼尾」的竖线。
+///
+/// 刻本的版心不只是两枚鱼尾：鱼尾与上下版框之间还各留一段**空白竖条**，
+/// 由两根细线夹出来，形似垂下的象鼻，故名。旧版这里是一片干净纸白，
+/// 两枚鱼尾像浮在中缝中央、与版框不接——正是用户「对照规范图」时最先
+/// 看出的缺口。
+///
+/// 画法：一个覆盖整条内芯（`w × h`）的 Canvas，在上下两个定位垫里各落
+/// 一对 1px 竖线，x 关于中缝中线**严格对称**（`± trunk_w/2`），起止正好
+/// 落在鱼尾的上下缘（`pad` 由 `render_gutter` 算出，与鱼尾同源）。
+/// 只碰版心装饰：不占正文行格、不影响分页，也不与鱼尾/书口字重叠。
+fn gutter_trunk(w: f32, h: f32, pad: f32, trunk_w: f32, color: u32) -> Div {
+    div()
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
+        .w(px(w))
+        .h(px(h))
+        .child(
+            canvas(
+                move |_b, _window, _cx| {},
+                move |b, _s, window: &mut Window, _cx| {
+                    let unit = px(1.0);
+                    let bw = b.size.width / unit;
+                    let bh = b.size.height / unit;
+                    let len = pad.min(bh * 0.5).max(0.0);
+                    if bw < 3.0 || len < 1.0 {
+                        return;
+                    }
+                    let x0 = b.origin.x / unit;
+                    let y0 = b.origin.y / unit;
+                    // 中线两侧各一根：`trunk_w` 是两线之间的净距（象鼻的「鼻梁」）。
+                    let half = (trunk_w * 0.5).max(1.5);
+                    let lx = (bw * 0.5 - half).round();
+                    let rx = (bw * 0.5 + half).round() - 1.0;
+                    // 四段：上象鼻左右各一 + 下象鼻左右各一（等比镜像）。
+                    let bars = [
+                        (lx, 0.0, len),
+                        (rx, 0.0, len),
+                        (lx, bh - len, len),
+                        (rx, bh - len, len),
+                    ];
+                    let mut pb = PathBuilder::fill();
+                    for (x, y, l) in bars {
+                        let (ax, ay) = (x0 + x, y0 + y);
+                        pb.move_to(point(px(ax), px(ay)));
+                        pb.line_to(point(px(ax + 1.0), px(ay)));
+                        pb.line_to(point(px(ax + 1.0), px(ay + l)));
+                        pb.line_to(point(px(ax), px(ay + l)));
+                        pb.line_to(point(px(ax), px(ay)));
+                    }
+                    if let Ok(path) = pb.build() {
+                        window.paint_path(path, rgb(color));
+                    }
+                },
+            )
+            .w(px(w))
+            .h(px(h)),
+        )
+}
+
 /// 信笺「对鱼尾」：与版心同一条直线多边形路径，比例取**横展**
 /// （`banxin::LETTER_TAIL_ASPECT`，照用户「信笺」参考图的 47×34 量级）。
 /// 见 app::ensure_assets。
@@ -3601,19 +3662,23 @@ impl Root {
         // **四边一律闭合**（v1.34.0）：左半叶的右缘、右半叶的左缘各立一道
         // 粗竖框，两线分居中缝两侧，把鱼尾、书名、叶码死死夹在中间——
         // 中缝不再是一条悬空的「马路」。
+        // **四边同粗（v1.65.0：3px 一圈闭合矩形）**：旧制横 3px、竖 4px，
+        // 上下一线细、左右一线粗，远看是一圈「粗细不匀的框」；照规范图把
+        // 外框收成**等宽的粗栏线**，四角才咬得住。内框仍是 1px 细线，
+        // 外粗内细的文武边栏层次照旧。**四边一律闭合**：左半叶的右缘、
+        // 右半叶的左缘各立一道粗竖框，两线分居中缝两侧，把鱼尾、书名、
+        // 叶码死死夹在中间——中缝不再是一条悬空的「马路」。
         if sides[0] {
             frame = frame.border_t_3();
         }
-        // **竖线加粗 1px**（v1.56.0：3px → 4px）：左右两道竖边栏正是中缝
-        // 的「墙」，粗一档古籍的庄重感才立得住；横线仍 3px，保持文武层次。
         if sides[1] {
-            frame = frame.border_r_4();
+            frame = frame.border_r_3();
         }
         if sides[2] {
             frame = frame.border_b_3();
         }
         if sides[3] {
-            frame = frame.border_l_4();
+            frame = frame.border_l_3();
         }
 
         // 书耳：贴版框上角的一小片「耳朵」（刻本书脑侧的题签小耳）。
@@ -4390,7 +4455,10 @@ impl Root {
         let head = cell_h * 1.0;
         col = col.child(div().h(px(head)));
         // 上鱼尾：与版心同一枚燕尾（深灰 `#333333`），尺寸同式。
-        let (tw, th) = crate::banxin::banxin_tail_size(col_w, cell_h, col_w);
+        // **铺满整列**（v1.65.0）：章题列在本版式里就当版心用（见 `detailed`），
+        // 若只取 `col_w×0.46` 的参考宽，配上新定的鱼尾高就是一根竖条——不是鱼尾。
+        let (_ref_w, th) = crate::banxin::banxin_tail_size(col_w, cell_h, col_w);
+        let tw = (col_w - 2.0).max(crate::banxin::FISHTAIL_W_MIN);
         col = col.child(banxin_tail(tw, th, true, t.fish_ink()));
         col = col.child(div().h(px(cell_h * 0.18)));
         // 篇题能排几字：总高扣天头、两枚鱼尾、篇题数与几段留白，
@@ -4648,12 +4716,25 @@ impl Root {
         // 纯版心装饰，正文排版与阅读锚点（page_anchor）完全不受影响。
         let gap_yuwei = crate::banxin::yuwei_gap(core_h);
         let pad = (core_h * 0.25 - gap_yuwei * 0.5 - lay.tail_h * 0.5).max(2.0);
+        // v1.65.0：内芯 `relative`——象鼻（绝对定位的 Canvas）以它为定位上下文。
         let mut col = div()
+            .relative()
             .w(px(core_w))
             .h(px(core_h))
             .flex()
             .flex_col()
             .items_center();
+        // ── 象鼻（v1.65.0）：版框内缘 ⇄ 鱼尾 的两段竖线 ──────────────
+        // 上下定位垫 `pad` 正是「鱼尾上缘到内框线」的净距，象鼻就画在
+        // 这两段里：一条鼻梁两根线，与中缝中线严格对称。界行同色，
+        // 比鱼尾淡一档的墨量，只是「骨架」不是「墨块」。
+        col = col.child(gutter_trunk(
+            core_w,
+            core_h,
+            pad,
+            (core_w * 0.42).clamp(6.0, 40.0),
+            t.rule_by(self.rule_color),
+        ));
         // 上定位垫：鱼尾中心因此落在「1/4 再上移半个 gap」处。
         col = col.child(div().h(px(pad)));
         // 上鱼尾：凹口在下缘、开口朝下；渲染宽 `lay.tail_w` = 中缝全宽 + 外探
@@ -5005,7 +5086,7 @@ impl Root {
     }
 
     /// 句读浮层：**绝不用字体字形**，也绝不用 SVG 贴图——一枚 `canvas`
-    /// 上 `paint_path` 纯手绘的朱砂小记号（几何全在 `punct::place`）。
+    /// 上 `paint_path` 纯手绘的句读（瓜子点 / 空心圈，几何全在 `punct::place`）。
     ///
     /// ── Invariant 3：句读永不被边框盖住 / 重置 ──────────────────────
     /// 本浮层是 `cell`（字格）的子元素，而 `cell` ⊂ `ancient_column` ⊂
@@ -5031,8 +5112,9 @@ impl Root {
         back: bool,
         hung: bool,
     ) -> Div {
-        // 几何（纯函数、有单测）：直径 = 正文 × 0.35、中心钉在格内
-        // 70% × 70% 的右下象限，绝不居中、绝不溢出。
+        // 几何（纯函数、有单测）：读类手绘**瓜子点**（高 0.28 倍正文），
+        // 句类画空心圈；中心钉在格内 72% × 28% 的**右上角**，再向左下让
+        // 1.5px 的悬空。绝不居中、绝不溢出。
         // ── v1.59.0：悬挂句读（`hung`）改走 `place_hang` ──────────────
         // 它是被挤进**末字格**的那枚，与末字共格；X 若仍取 70% 就压在末字
         // 字身上，看着像叠字。推到 86% 才「挂」在字旁。它只在本格内取值，
@@ -5068,10 +5150,11 @@ impl Root {
             )
     }
 
-    /// 句读墨色（Invariant 3 的颜色一侧）：**强制用 `palette.note`**——
-    /// 句读标点与夹注、眉批同属「批注语汇」，必须跟正文（`palette.ink`）严格分色，
-    /// 绝不能正文注文一个色（任务三·生死攸关）。`note` 自身已按纸色明暗
-    /// 自动切换（深底提亮、浅纸压深），无需再手算。
+    /// 句读墨色：**朱砂红**（v1.66.0 用户复点：「还是原来的颜色，朱砂红，
+    /// 不用与正文相同」——形状与位置改，颜色不动）。
+    ///
+    /// 取 `palette.note`：与夹注、朱批同源的那支朱砂，按纸色明暗自动切换
+    /// （深底提亮、浅纸压深），无需再手算。
     fn punct_ink(&self, _back: bool) -> u32 {
         self.palette.note(self.theme)
     }

@@ -115,11 +115,28 @@ pub const LETTER_TAIL_W_RATIO: f32 = 0.92;
 pub const FISHTAIL_ASPECT: f32 = 1.30;
 /// 信笺鱼尾的高 / 宽：横展（照用户「信笺」参考图的比例）。
 pub const LETTER_TAIL_ASPECT: f32 = 0.78;
-/// 鱼尾高（以「字高」为单位）：v1.48.0 收到 **0.22 字**——用户收官指令
-/// 「缩小鱼尾尺寸」：v1.31.x 的 0.30 字对中缝仍偏厚，再收三成，整枚更薄
-/// 更锐；底部中央仍是深 V 白口（见 `TAIL_NOTCH_Y`）。实际值还受
-/// `FISHTAIL_ASPECT` 封顶。
+/// 鱼尾高（以「字高」为单位）：v1.48.0 收到 **0.22 字**——用户当时口径
+/// 「缩小鱼尾尺寸」，那是把鱼尾画成 `<rect>` 黑块的年代，缩的是方块。
+/// 此值现在只作用于**信笺**模板（`tail_size`）；版心另有
+/// [`BANXIN_TAIL_H_CHARS`]，见下。
 pub const FISHTAIL_H_CHARS: f32 = 0.22;
+
+/// **版心鱼尾高**（字高倍数，v1.65.0）：1.05 字。
+///
+/// 版心鱼尾的宽是「整道中缝」（`render_gutter` 覆盖 `tail_w`），而中缝在
+/// 12 列下约两列字宽；若高度仍按旧制 0.22 字，画出来是 35×11 的一条黑杠，
+/// 凹口只有 3px，认不出是鱼尾（用户对照规范图一眼看出）。1.05 字 ≈ 中缝
+/// 宽的 0.5 倍，高宽相称，V 口清清楚楚——这才是宋版「黑鱼尾」的样子。
+/// 与信笺的 [`FISHTAIL_H_CHARS`] 分开，互不牵连。
+pub const BANXIN_TAIL_H_CHARS: f32 = 1.05;
+/// 版心鱼尾高的上限（字高倍数）：版心再窄也不许长成两根竖杠。
+pub const BANXIN_TAIL_H_MAX: f32 = 1.05;
+/// **版心鱼尾的高宽比**（高 ÷ 实际绘制宽，v1.65.0）：0.62。
+///
+/// 光按字高定高会两头不讨好——中缝宽（≈两列）时够看，章题列只有一列宽时
+/// 同一高度就成了一根竖条。故再加这道「按宽封顶」：h ≤ 0.62 × 绘制宽，
+/// 版心与章题列因此都是同一枚端正的鱼尾，只是大小随栏宽走。
+pub const BANXIN_TAIL_ASPECT: f32 = 0.62;
 pub const FISHTAIL_H_MAX_CHARS: f32 = 0.80;
 /// **骨架**：底部中央凹口顶点的纵向位置（占鱼尾高 `h` 的比例，0 = 顶边）。
 ///
@@ -131,7 +148,11 @@ pub const FISHTAIL_H_MAX_CHARS: f32 = 0.80;
 /// 整枚被劈成「两片窄鳍」，远看像缩小的倒三角（用户实测）。0.80 时只在
 /// 下缘**浅浅咬一口**（掏进 0.20·h），主体仍是饱满的实心黑梯形——这才是
 /// 宋版黑鱼尾的大气样子。
-pub const TAIL_NOTCH_Y: f32 = 0.80;
+///
+/// **v1.65.0 定为 0.70**：用户给了标准古籍规范图，凹口顶点坐标写作
+/// `Y_top + H*0.7`（掏进 0.30·h）。比 0.80 略深一档，两枚鳍尖因此更
+/// 分明，仍远浅于 0.40 那个「倒三角」——既照图，又不回到旧坑。
+pub const TAIL_NOTCH_Y: f32 = 0.70;
 /// 信笺鱼尾不追求字高比例（那会把横展的鱼尾拉成竖条）。
 pub const LETTER_TAIL_H_CHARS: f32 = 1.2;
 /// 下限：再窄的屏也认得出这是枚鱼尾。
@@ -170,16 +191,23 @@ pub fn tail_size(gutter_w: f32, cell_h: f32, w_ratio: f32, aspect: f32, max_char
 ///
 /// 注意：**鱼尾的渲染宽不再由此函数决定**——v1.52.9 起渲染层把
 /// `BanxinLayout::tail_w` 直接覆盖成「中缝全宽 + 外探」（`FISHTAIL_OVERLAP`），
-/// 让两翼压住版心左右界栏。此函数保留的 `w` 只作**高度**的参考宽（见下方
-/// `h` 的 `min(w × ASPECT)` 封顶），故仍按 `col_w × FISHTAIL_W_RATIO`
-/// 取一个稳定参考值，避免鱼尾高度随列数忽大忽小。
+/// 让两翼压住版心左右界栏。返回的 `w` 仍是「列宽 × 0.46」这个参考值
+/// （章题列直接用它当绘制宽，故不能动）。
+///
+/// **v1.65.0：高度改按「真实绘制宽」定比例。** 旧制拿参考宽（≈8px）去封
+/// 鱼尾高，得到 10px 高、35px 宽的一条黑杠——用户对照规范图一眼看出
+/// 「不是鱼尾」。现按 `gutter_w`（= 版心内宽，渲染时鱼尾真正铺满的宽度）
+/// 封顶，鱼尾因此与中缝同宽同量级，凹口才看得见。
 pub fn banxin_tail_size(gutter_w: f32, cell_h: f32, col_w: f32) -> (f32, f32) {
     let w = (col_w * FISHTAIL_W_RATIO)
         .min((gutter_w - 2.0).max(FISHTAIL_W_MIN))
         .max(FISHTAIL_W_MIN);
-    let h = (cell_h * FISHTAIL_H_CHARS)
-        .min(w * FISHTAIL_ASPECT)
-        .min(cell_h * FISHTAIL_H_MAX_CHARS)
+    // 高度的「宽封顶」按**版心实际宽**算（不是上面的参考宽 w）：
+    // h ≤ 0.62 × 绘制宽，版心与章题列因此同一枚形、只随栏宽缩放。
+    let draw_w = (gutter_w - 2.0).max(FISHTAIL_W_MIN);
+    let h = (cell_h * BANXIN_TAIL_H_CHARS)
+        .min(draw_w * BANXIN_TAIL_ASPECT)
+        .min(cell_h * BANXIN_TAIL_H_MAX)
         .max(FISHTAIL_H_MIN);
     (w, h)
 }
@@ -463,14 +491,14 @@ mod tests {
     fn tail_never_wider_than_the_gutter() {
         let (w, h) = banxin_tail_size(GW, CH, CW);
         assert!(w <= GW, "鱼尾宽 {w} 超过界栏 {GW}");
-        // 高按 0.50 字起算，但封顶在「宽 × 比例」——不会长成两条竖杠。
-        assert!(h <= CH * FISHTAIL_H_MAX_CHARS + 0.01, "鱼尾高 {h} 超过 0.8 字");
-        // 高四成字（v1.28.0「缩小 50%」的修正：旧版 0.95 字太笨重）。
-        assert!(h <= CH * 0.52, "鱼尾仍嫌高（应 ≲ 半字）：{h}");
-        // 也不能瘦成一条线：v1.48.0「缩小鱼尾尺寸」把下限从 1/3 字放到
-        // 1/5 字（H_CHARS 0.30 → 0.22）——再小就只剩一粒墨点了。
+        // 高按「版心实际宽」定比例（v1.65.0）：鱼尾与中缝同宽同量级，凹口才
+        // 看得见。高宽比落在 0.30~0.70 之间——太扁认不出形，太高变竖条。
+        let draw_w = (GW - 2.0).max(FISHTAIL_W_MIN);
+        assert!(h / draw_w >= 0.30, "鱼尾太扁，认不出形：h={h} w={draw_w}");
+        assert!(h / draw_w <= 0.70, "鱼尾太高，成竖向墨条：h={h} w={draw_w}");
+        assert!(h <= CH * BANXIN_TAIL_H_MAX + 0.01, "鱼尾高 {h} 超过上限");
+        // 也不能瘦成一条线。
         assert!(h >= CH * 0.20, "鱼尾太瘦弱：{h}");
-        assert!(h < CH * 0.95 * 0.60, "没缩到位：{h}");
         // v1.30.0：宽改挂**列宽**（`col_w × 0.7`），不再按版心比例——
         // 版心宽随列数变，挂它会让鱼尾忽大忽小（列多 → 鱼尾缩成一粒）。
         assert!(
@@ -501,9 +529,10 @@ mod tests {
         assert_eq!(pts[2].1, 100.0);
         assert_eq!(pts[4].1, 100.0);
         assert_eq!(pts[3].1, TAIL_NOTCH_Y * 100.0);
-        // 浅 V：掏进深度 = (1 − NOTCH)·h，只在下缘一小口（v1.56.0 为 0.2·h）。
+        // 浅 V：掏进深度 = (1 − NOTCH)·h，只在下缘一小口（v1.65.0 = 0.30·h，
+        // 对应规范图里的 `Y_top + H*0.7`）。
         let depth = 100.0 * (1.0 - TAIL_NOTCH_Y);
-        assert!(depth < 30.0, "V 口掏进过深，鱼尾成倒三角：{depth}");
+        assert!(depth <= 30.01, "V 口掏进过深，鱼尾成倒三角：{depth}");
         assert!(depth > 4.0, "V 口太浅，看不出鱼尾：{depth}");
     }
 
