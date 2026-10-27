@@ -591,18 +591,18 @@ fn banxin_tail(w: f32, h: f32, top: bool, color: u32) -> Div {
     )
 }
 
-/// **象鼻**（v1.65.0）：版心天头 / 地脚那两段「从版框内缘接到鱼尾」的竖线。
+/// **象鼻**（v1.68.0 照规范图重做）：版框内缘 → 鱼尾上缘的那一根**实心墨条**。
 ///
-/// 刻本的版心不只是两枚鱼尾：鱼尾与上下版框之间还各留一段**空白竖条**，
-/// 由两根细线夹出来，形似垂下的象鼻，故名。旧版这里是一片干净纸白，
-/// 两枚鱼尾像浮在中缝中央、与版框不接——正是用户「对照规范图」时最先
-/// 看出的缺口。
+/// 刻本版心不只是两枚鱼尾：鱼尾与上下版框之间还各留一段「鼻子」，
+/// 由一根竖直墨条把鱼尾**吊**在版框下面，形似垂下的象鼻，故名。旧版
+/// 这里画成「中线两侧各一根 1px 竖线」的空心鼻梁，远看是一条双线槽，
+/// 与规范图不符——图上量得是一根 **6px 宽的实心短墨条**（约 0.10W）。
 ///
-/// 画法：一个覆盖整条内芯（`w × h`）的 Canvas，在上下两个定位垫里各落
-/// 一对 1px 竖线，x 关于中缝中线**严格对称**（`± trunk_w/2`），起止正好
-/// 落在鱼尾的上下缘（`pad` 由 `render_gutter` 算出，与鱼尾同源）。
-/// 只碰版心装饰：不占正文行格、不影响分页，也不与鱼尾/书口字重叠。
-fn gutter_trunk(w: f32, h: f32, pad: f32, trunk_w: f32, color: u32) -> Div {
+/// 画法：一个覆盖整条内芯（`w × h`）的 Canvas，在上、下两个定位垫里
+/// 各落**一根**竖墨条，x 关于中缝中线**严格对称**，起止正好落在版框
+/// 内缘与鱼尾上缘（`len` 由 `render_gutter` 算出，与鱼尾同源）。
+/// 只碰版心装饰：不占正文行格、不影响分页，也不与鱼尾 / 书口字重叠。
+fn gutter_trunk(w: f32, h: f32, len: f32, bar_w: f32, color: u32) -> Div {
     div()
         .absolute()
         .top(px(0.0))
@@ -616,30 +616,24 @@ fn gutter_trunk(w: f32, h: f32, pad: f32, trunk_w: f32, color: u32) -> Div {
                     let unit = px(1.0);
                     let bw = b.size.width / unit;
                     let bh = b.size.height / unit;
-                    let len = pad.min(bh * 0.5).max(0.0);
-                    if bw < 3.0 || len < 1.0 {
+                    let l = len.min(bh * 0.5).max(0.0);
+                    if bw < 3.0 || l < 1.0 {
                         return;
                     }
                     let x0 = b.origin.x / unit;
                     let y0 = b.origin.y / unit;
-                    // 中线两侧各一根：`trunk_w` 是两线之间的净距（象鼻的「鼻梁」）。
-                    let half = (trunk_w * 0.5).max(1.5);
-                    let lx = (bw * 0.5 - half).round();
-                    let rx = (bw * 0.5 + half).round() - 1.0;
-                    // 四段：上象鼻左右各一 + 下象鼻左右各一（等比镜像）。
-                    let bars = [
-                        (lx, 0.0, len),
-                        (rx, 0.0, len),
-                        (lx, bh - len, len),
-                        (rx, bh - len, len),
-                    ];
+                    // 一根实心竖条，居中；宽度夹在 [2, 8] px，永远盖得住 1px 折痕。
+                    let bar = bar_w.clamp(2.0, 8.0);
+                    let left = ((bw - bar) * 0.5).round();
+                    // 上象鼻（版框内缘 → 上鱼尾）+ 下象鼻（下鱼尾 → 地脚），严格镜像。
+                    let bars = [(left, 0.0, l), (left, bh - l, l)];
                     let mut pb = PathBuilder::fill();
-                    for (x, y, l) in bars {
+                    for (x, y, ln) in bars {
                         let (ax, ay) = (x0 + x, y0 + y);
                         pb.move_to(point(px(ax), px(ay)));
-                        pb.line_to(point(px(ax + 1.0), px(ay)));
-                        pb.line_to(point(px(ax + 1.0), px(ay + l)));
-                        pb.line_to(point(px(ax), px(ay + l)));
+                        pb.line_to(point(px(ax + bar), px(ay)));
+                        pb.line_to(point(px(ax + bar), px(ay + ln)));
+                        pb.line_to(point(px(ax), px(ay + ln)));
                         pb.line_to(point(px(ax), px(ay)));
                     }
                     if let Ok(path) = pb.build() {
@@ -4451,13 +4445,14 @@ impl Root {
             .items_center()
             .border_l_1()
             .border_color(rgb(t.rule_by(self.rule_color)));
-        // 天头：留约一字高的空白，鱼尾才落在版心上部而不是贴框。
-        let head = cell_h * 1.0;
-        col = col.child(div().h(px(head)));
-        // 上鱼尾：与版心同一枚燕尾（深灰 `#333333`），尺寸同式。
-        // **铺满整列**（v1.65.0）：章题列在本版式里就当版心用（见 `detailed`），
-        // 若只取 `col_w×0.46` 的参考宽，配上新定的鱼尾高就是一根竖条——不是鱼尾。
+        // 天头：与版心同制的**象鼻**——鱼尾吊在版框下面，不是贴框。
+        // （v1.68.0：原来这里拍的是 `cell_h × 1.0`，与版心的象鼻长度对不上，
+        //   章首页的鱼尾会与左半叶的鱼尾高低不齐。）
         let (_ref_w, th) = crate::banxin::banxin_tail_size(col_w, cell_h, col_w);
+        let head = crate::banxin::xiangbi_len(th);
+        col = col.child(div().h(px(head)));
+        // 上鱼尾：与版心同一枚黑鱼尾（深灰 `#222222`），形制同式：宽 = 本列宽，
+        // 高 = 宽 × 0.4（扁宽），凹口顶点在 `H × 0.7`。
         let tw = (col_w - 2.0).max(crate::banxin::FISHTAIL_W_MIN);
         col = col.child(banxin_tail(tw, th, true, t.fish_ink()));
         col = col.child(div().h(px(cell_h * 0.18)));
@@ -4666,25 +4661,29 @@ impl Root {
         // 留边 + 1 内细线）。鱼尾、书口字都排在这两条细线之间，
         // 绝不探到框上——中缝因此被两叶的竖框「夹」住。
         let core_w = (gw - 14.0).max(9.0);
-        // v1.57.0：上下**黑口整块删除**（用户口径「不要出现上下两个黑块，
-        // 清理他们以及他们的代码」）。版心现在只有两枚鱼尾 + 书口字，天头
-        // 地脚各留一段干净纸白——鱼尾因此不可能再与墨块叠成一坨方块。
+        // ── 版心几何（v1.68.0，照《古籍的规范》图逐项量出来的）──────────
+        // 图上量得的四个数（全部以中缝全宽 W 为基准，见 `banxin` 模块文档）：
+        //   · 鱼尾宽 = W        ——两翼端点正压在左右界栏的线心上；
+        //   · 鱼尾高 = 0.40 W   ——**扁宽**梯形，宽明显大于高；
+        //   · 象鼻长 = 1.30 W   ——版框内缘 → 鱼尾上缘，比鱼尾本身还长；
+        //   · 象鼻粗 = 0.10 W   ——一根实心短墨条（不是两根细线的空档）。
+        // 于是纵向次序是：版框内缘 → 象鼻 → 鱼尾 → 书口字 → 鱼尾 → 象鼻 → 地脚，
+        // 鱼尾是**吊**在版框下面的，不再浮在内芯高的 1/4、3/4 处。
+        let tail_w = gw + crate::banxin::FISHTAIL_OVERLAP;
+        let tail_h = crate::banxin::tail_h_for_width(tail_w);
+        let xiangbi = crate::banxin::xiangbi_len(tail_h);
+        let trunk_w = (tail_w * crate::banxin::XIANG_BI_W_RATIO).clamp(2.0, 8.0);
         // 书口文字：书名（去括号）、卷次「卷五十一」、叶码「五十」。
         let book = self.book_title();
         let juan = format!("卷{}", han_num(chapter + 1));
         let page = han_num(page_idx + 1);
-        let mut lay = crate::banxin::layout(crate::banxin::BanxinOpts {
-            // 书口字、叶码、鱼尾高度仍按**内芯宽**排（文字不得探出两条细线）。
+        let lay = crate::banxin::layout(crate::banxin::BanxinOpts {
+            // 书口字、叶码仍按**内芯宽**排（文字不得探出两条细线）。
             gutter_w: core_w,
-            // v1.48.0：可用高 = 两枚鱼尾**中心之间**的那段版心（1/4 ↔ 3/4，
-            // 即半幅内芯高 + 一枚鱼尾）——鱼尾挪位后，书口文字的预算跟着
-            // 换成「夹在两枚鱼尾之间」的量，`banxin::layout` 再扣鱼尾与
-            // 段间留白，剩下的才是文字。
-            band_h: (core_h * 0.5 + crate::banxin::banxin_tail_size(core_w, cell_h, self.col_w).1)
-                .max(40.0),
+            // 可用高先扣掉上下两段象鼻；鱼尾由 `tail_size` 显式给定，
+            // `layout` 再扣两枚鱼尾与段间留白，剩下的才是书口字的地盘。
+            band_h: (core_h - 2.0 * xiangbi).max(60.0),
             cell_h,
-            // `col_w × 0.46` 只作鱼尾**高度的参考宽**（见 `banxin_tail_size`）；
-            // 鱼尾的**渲染宽**由下方 `lay.tail_w` 覆盖成中缝全宽，与排版无关。
             col_w: self.col_w,
             fs,
             book: &book,
@@ -4692,31 +4691,21 @@ impl Root {
             page: &page,
             chapter_title: &self.chapter_title(chapter),
             detailed,
-            // v1.28.0：朱印从中缝挪到纸页左下角外侧（见 `render_page_seal`）——
-            // 版心只留「鱼尾 + 书口字 + 叶码」，不再被一枚红印隔着。
+            // 朱印从中缝挪到纸页左下角外侧（见 `render_page_seal`）——
+            // 版心只留「鱼尾 + 书口字 + 叶码」。
             seal: false,
+            // **鱼尾真实尺寸**：宽＝中缝全宽（比内芯宽多 14px 的框层），
+            // 交给 `layout` 做预算，账与笔同源（否则书口字会被挤到叠字）。
+            tail_size: Some((tail_w, tail_h)),
         });
-        // v1.52.9：鱼尾**渲染宽**改为「中缝全宽 + 外探」——两翼端点压在版心
-        // 左右界栏上（甚至略盖住界线），不再悬浮在中缝中央。`gw` 即中缝（版心）
-        // 全宽，等于两道界栏的间距；高度 `tail_h` 与文字预算沿用 `layout` 原值，
-        // 绝不动纵向尺寸与排版。
-        lay.tail_w = gw + crate::banxin::FISHTAIL_OVERLAP;
-        // 书口小字**极小号宋体**：走正文字体（默认文津宋体）的回退链，
+        debug_assert!((lay.tail_w - tail_w).abs() < 0.01);
+        // 书口小字**极小号宋体**：走正文字体的回退链，
         // 横笺里也不会退化成黑体。
         let family = crate::fonts::family_for(self.current_font(), Script::Ancient);
-        // 版心内芯：全部走**流式布局**（旧版用绝对定位钉线，纸一伸缩就漂）。
-        // ── v1.57.0：鱼尾**恢复原位**（1/4 · 3/4）＋对称微调 ─────────
-        // 用户口径：「版心恢复原来的样子，只需要上下对称移动一点点，确保版心
-        // 中间空白的位置足够显示章节回等信息」。于是回到 v1.48 的摆位——
-        // 上鱼尾中心钉在 `0.25·core_h`、下鱼尾中心钉在 `0.75·core_h`；再各
-        // 向外让半个 `yuwei_gap(core_h)`（版心高 2%~5%，夹 2~10px），中段白口
-        // 因此被对称拉开一点点，书名 / 卷次 / 篇题（章节回）排得从容。
-        // 定位垫 = `0.25·core_h − gap/2 − tail_h/2`，上下同值，绝对对称；
-        // 中间两段 `flex_1` 吸收余量，书口字始终落在两鱼尾正中。
-        // 纯版心装饰，正文排版与阅读锚点（page_anchor）完全不受影响。
-        let gap_yuwei = crate::banxin::yuwei_gap(core_h);
-        let pad = (core_h * 0.25 - gap_yuwei * 0.5 - lay.tail_h * 0.5).max(2.0);
-        // v1.65.0：内芯 `relative`——象鼻（绝对定位的 Canvas）以它为定位上下文。
+        // 版心内芯：全部走**流式布局**——上「象鼻 + 鱼尾」，中段书口字，
+        // 下「鱼尾 + 象鼻」。两段 `flex_1` 把书口字撑在正中，鱼尾因此
+        // 永远钉在版框内缘那一端（不是按内芯高等分算出来的位置）。
+        // 纯版心装饰：不占正文行格，阅读锚点（page_anchor）完全不受影响。
         let mut col = div()
             .relative()
             .w(px(core_w))
@@ -4724,21 +4713,11 @@ impl Root {
             .flex()
             .flex_col()
             .items_center();
-        // ── 象鼻（v1.65.0）：版框内缘 ⇄ 鱼尾 的两段竖线 ──────────────
-        // 上下定位垫 `pad` 正是「鱼尾上缘到内框线」的净距，象鼻就画在
-        // 这两段里：一条鼻梁两根线，与中缝中线严格对称。界行同色，
-        // 比鱼尾淡一档的墨量，只是「骨架」不是「墨块」。
-        col = col.child(gutter_trunk(
-            core_w,
-            core_h,
-            pad,
-            (core_w * 0.42).clamp(6.0, 40.0),
-            t.rule_by(self.rule_color),
-        ));
-        // 上定位垫：鱼尾中心因此落在「1/4 再上移半个 gap」处。
-        col = col.child(div().h(px(pad)));
-        // 上鱼尾：凹口在下缘、开口朝下；渲染宽 `lay.tail_w` = 中缝全宽 + 外探
-        // （两翼压住左右界栏），高度 `lay.tail_h` 沿用 `layout` 原值。
+        // 象鼻：一根实心墨条，从版框内缘垂到鱼尾上缘（上下严格镜像）。
+        col = col.child(gutter_trunk(core_w, core_h, xiangbi, trunk_w, t.frame_ink()));
+        // 上象鼻那一段的高度（鱼尾的上缘因此落在 `Y_top + H_xiangbi`）。
+        col = col.child(div().h(px(xiangbi)));
+        // 上鱼尾：平顶贴象鼻下缘、凹口在下缘朝下；宽＝中缝全宽。
         col = col.child(banxin_tail(lay.tail_w, lay.tail_h, true, t.fish_ink()));
         // 上鱼尾之下的余量：书名 / 卷次 / 篇题因此**垂直居中**于两鱼尾之间。
         col = col.child(div().flex_1());
@@ -4757,10 +4736,10 @@ impl Root {
             col = col.child(banxin_vtext(line, core_w, &family, t));
         }
         col = col.child(div().h(px(lay.gap)));
-        // 下鱼尾：凹口在上缘、开口朝下，与上鱼尾相对。
+        // 下鱼尾：上鱼尾的**严格垂直镜像**（底边贴象鼻上缘、凹口朝上）。
         col = col.child(banxin_tail(lay.tail_w, lay.tail_h, false, t.fish_ink()));
-        // 下定位垫：与上定位垫同值 → 鱼尾中心落「3/4 再下移半个 gap」，绝对对称。
-        col = col.child(div().h(px(pad)));
+        // 下象鼻：与上象鼻同长，落到地脚（版框内缘）。
+        col = col.child(div().h(px(xiangbi)));
 
         // ── 纸面 / 版框 / 内框：与 `render_ancient` 的 sheet 逐层同构 ──
         // `relative`：折痕用绝对定位锚在本栏内（GPUI 的 absolute 子元素

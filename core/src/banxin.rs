@@ -26,6 +26,23 @@
 //!   下鱼尾  同上，整体上下镜像（底边平齐、凹口朝上）
 //! ```
 //!
+//! ### 一之一、v1.68.0：按《古籍的规范》图**逐项量**出来的四个数
+//!
+//! 规范图（中缝 57px 宽）上量得：
+//!
+//! | 构件 | 图上的量 | 相对中缝宽 W |
+//! |---|---|---|
+//! | 鱼尾宽 | 57px（两端顶到左右界栏的线心） | 1.00 W |
+//! | 鱼尾高 | 21px | **0.40 W** |
+//! | 象鼻长 | 74px（版框内缘 → 鱼尾上缘） | 1.30 W |
+//! | 象鼻粗 | 6px（一根**实心短墨条**） | 0.10 W |
+//!
+//! 于是版心的纵向次序是：**版框内缘 → 象鼻（1.3W）→ 鱼尾（0.4W）→
+//! 书口文字 → 鱼尾 → 象鼻 → 版框内缘**。鱼尾是**吊**在版框下面的，
+//! 不是浮在中缝中央——旧版把两枚鱼尾钉在内芯高的 1/4 与 3/4 处，图上
+//! 对不上号（用户「对照规范图一眼看出」）。宽高各只有一个自变量（W），
+//! 形制由 [`tail_h_for_width`] / [`xiangbi_len`] 一处给出。
+//!
 //! 折点（上鱼尾，`cx` 中缝中线、`cy` 顶边、`w` 宽、`h` 高）——**照宋版
 //! 刻本直线刀法**：平顶实心条 + 底部中央一道深 V 白口，两枚实心鳍尖
 //! 朝下、凹口朝上：
@@ -38,16 +55,16 @@
 //! * 顶边贴版框、一刀平直满宽；两侧外缘**竖直**下垂到底——刀刻的行刀，
 //!   不是手绘的弧；
 //! * 中央凹口（白口）的顶点落在中轴上、比两侧鳍尖**高**一截（`(cx,
-//!   cy+h·NOTCH)`，`NOTCH<0.5`），于是底部被掏出一道朝下的**锐角 V**
+//!   cy+h·NOTCH)`，`NOTCH<1`），于是底部被掏出一道朝下的**V**
 //!   （深过半幅），两枚实心鳍因此锐利如鱼尾；
 //! * 两枚上下相对（上鱼尾凹口在下缘、下鱼尾凹口在上缘），中间那块空当
 //!   正是书口文字（书名 / 卷次 / 叶码「二十三」）的地盘——**白口**，
 //!   不画中央墨线；
 //! * **不加抖点**：毛边加在直线上只会看成锯齿，锐利才是刻本的味道。
 //!
-//! > 形体（宽 0.46 列宽、高 0.22 字）与摆位（中心钉在版心 1/4、3/4）由
-//! > 渲染层负责；本文件只管尺寸与「形」。`NOTCH` 是唯一的形参，调它即
-//! > 调鱼尾的锐利度。
+//! > 摆位在渲染层：`reader::render_gutter` 把「象鼻 + 鱼尾」上下各一组
+//! > 钉在版框内缘与地脚，本文件只管尺寸与「形」。`NOTCH` 是唯一的形参，
+//! > 调它即调鱼尾的锐利度。
 //!
 //! > v1.48.0 收官再收：用户指令「缩小鱼尾尺寸，线条更锐利」+「鱼尾不要
 //! > 死贴上下边框，中心点移至版心高度的 1/4 和 3/4 处」。宽 0.60→0.46
@@ -90,25 +107,6 @@ pub const FISHTAIL_W_RATIO: f32 = 0.46;
 /// 界栏线」交界处可能露出的 1px 白缝。高度与文字预算不受影响（`tail_w`
 /// 才是唯一改动的量，`tail_h` 仍由 `banxin_tail_size` 原值决定）。
 pub const FISHTAIL_OVERLAP: f32 = 2.0;
-/// 对鱼尾的**纵向间距**（px）：上鱼尾整体上移「半个 gap」、下鱼尾整体下移
-/// 「半个 gap」，把两枚鱼尾之间（中段书口白口）拉开——纯版心装饰微调，
-/// 不动正文排版与锚点（`render_gutter` 的 flex 列里用 `flex_1` 吸收空量）。
-///
-/// `yuwei_gap(core_h)` 返回**两枚鱼尾中心之间的额外间距总量**（版心内芯高的
-/// 比例），上下各取一半（`yuwei_gap / 2`）对称外移，绝对对称。默认取版心高的
-/// `YUWEI_GAP_RATIO`（落在 2%~5% 区间、中值 4%），再夹在 `YUWEI_GAP_MIN`～
-/// `YUWEI_GAP_MAX` 之间——版心高时多让、矮时少让，但有 `2px` 硬保底绝不
-/// 让鱼尾贴回黑口。
-pub const YUWEI_GAP_RATIO: f32 = 0.04;
-/// 间距下限（px）：版心再矮也至少让出这么多。
-pub const YUWEI_GAP_MIN: f32 = 2.0;
-/// 间距上限（px）：版心再高也不多让（让太多书口文字区反而被压缩观感）。
-pub const YUWEI_GAP_MAX: f32 = 10.0;
-
-/// 版心内芯高 → 对鱼尾中心之间的**额外间距总量**（px）。上下各取一半对称外移。
-pub fn yuwei_gap(core_h: f32) -> f32 {
-    (core_h * YUWEI_GAP_RATIO).clamp(YUWEI_GAP_MIN, YUWEI_GAP_MAX)
-}
 /// 信笺（14 列）的鱼尾更宽：它独占一列，照参考图几乎顶满。
 pub const LETTER_TAIL_W_RATIO: f32 = 0.92;
 /// 版心鱼尾的**高 / 宽**：略竖长的黑鱼尾（太瘦长就成两条竖杠）。
@@ -131,12 +129,46 @@ pub const FISHTAIL_H_CHARS: f32 = 0.22;
 pub const BANXIN_TAIL_H_CHARS: f32 = 1.05;
 /// 版心鱼尾高的上限（字高倍数）：版心再窄也不许长成两根竖杠。
 pub const BANXIN_TAIL_H_MAX: f32 = 1.05;
-/// **版心鱼尾的高宽比**（高 ÷ 实际绘制宽，v1.65.0）：0.62。
+/// **版心鱼尾的高宽比**（高 ÷ 绘制宽）：**0.40**（v1.68.0）。
 ///
-/// 光按字高定高会两头不讨好——中缝宽（≈两列）时够看，章题列只有一列宽时
-/// 同一高度就成了一根竖条。故再加这道「按宽封顶」：h ≤ 0.62 × 绘制宽，
-/// 版心与章题列因此都是同一枚端正的鱼尾，只是大小随栏宽走。
-pub const BANXIN_TAIL_ASPECT: f32 = 0.62;
+/// 这是《古籍的规范》图里给死的数：鱼尾高 `H = W × 0.4`——**扁宽**的
+/// 一横条，宽明显大于高。旧制 0.62 是从「按字高定高再按宽封顶」那套
+/// 折中里长出来的（0.62 是封顶系数，不是形制），画出来偏高，像竖着的
+/// 小盾牌；照图改成 0.4 之后，两翼横展、V 口只在中央浅浅一咬，
+/// 才是宋版黑鱼尾的横阔相。
+///
+/// 宽不再由 `col_w × 0.46` 推算——那个参考宽是为「高按字高定」服务的，
+/// 现在宽**就是**中缝全宽（`render_gutter` 传 `gw + FISHTAIL_OVERLAP`），
+/// 高由这一个比例从宽反算，形制只有「宽」一个自变量。
+pub const BANXIN_TAIL_ASPECT: f32 = 0.40;
+
+/// **象鼻长度 / 鱼尾高**：3.25（v1.68.0）。
+///
+/// 量《古籍的规范》图：中缝宽 57px、鱼尾高 21px、象鼻长 74px
+/// （版框内缘 → 鱼尾上缘）——象鼻 = 1.30 × 中缝宽 = 3.25 × 鱼尾高。
+/// 象鼻太短，鱼尾像直接贴在框上、看不出是「吊」下来的；太长，中缝上端
+/// 空出一条白肠子。3.25H 正是图上的长相。
+pub const XIANG_BI_RATIO: f32 = 3.25;
+/// 象鼻的**粗细 / 中缝宽**：0.10（量图 6 / 57）。
+///
+/// 图上象鼻是一根**实心短墨条**（不是两根细线夹出来的空档）——旧版画成
+/// 「左右各一根 1px 竖线」的鼻梁，远看像一条双线槽，与图不符。
+pub const XIANG_BI_W_RATIO: f32 = 0.10;
+/// 象鼻线的最短长度（px）：极窄屏也别画成一个点。
+pub const XIANG_BI_MIN: f32 = 6.0;
+
+/// 给定鱼尾**绘制宽**，返回鱼尾高（= 宽 × [`BANXIN_TAIL_ASPECT`]）。
+///
+/// 形制只有一个自变量（宽）：宽由中缝定，高由比例定。渲染层与
+/// [`layout`] 的预算账都走这一个函数，绝不再各算一套。
+pub fn tail_h_for_width(w: f32) -> f32 {
+    (w.max(1.0) * BANXIN_TAIL_ASPECT).max(FISHTAIL_H_MIN)
+}
+
+/// 象鼻（版框内缘 → 鱼尾上缘那段竖线）的长度。
+pub fn xiangbi_len(tail_h: f32) -> f32 {
+    (tail_h * XIANG_BI_RATIO).max(XIANG_BI_MIN)
+}
 pub const FISHTAIL_H_MAX_CHARS: f32 = 0.80;
 /// **骨架**：底部中央凹口顶点的纵向位置（占鱼尾高 `h` 的比例，0 = 顶边）。
 ///
@@ -187,29 +219,18 @@ pub fn tail_size(gutter_w: f32, cell_h: f32, w_ratio: f32, aspect: f32, max_char
     (w, h)
 }
 
-/// 版心（中缝）对鱼尾的**高度**尺寸。
+/// 版心（中缝）对鱼尾的尺寸：**宽 = 中缝宽，高 = 宽 × [`BANXIN_TAIL_ASPECT`]**。
 ///
-/// 注意：**鱼尾的渲染宽不再由此函数决定**——v1.52.9 起渲染层把
-/// `BanxinLayout::tail_w` 直接覆盖成「中缝全宽 + 外探」（`FISHTAIL_OVERLAP`），
-/// 让两翼压住版心左右界栏。返回的 `w` 仍是「列宽 × 0.46」这个参考值
-/// （章题列直接用它当绘制宽，故不能动）。
+/// v1.68.0 起形制只剩一个自变量：**宽**。旧制两条路（宽按列宽 ×0.46、
+/// 高按字高再按宽封顶）互相打架，画出来的鱼尾既不够宽、高又不合比例；
+/// 规范图给的是「宽 = 中缝全宽、高 = 0.4 × 宽」，故这里直接由宽反算高，
+/// 与渲染层 `reader::render_gutter` 用的是同一组数（`tail_h_for_width`）。
 ///
-/// **v1.65.0：高度改按「真实绘制宽」定比例。** 旧制拿参考宽（≈8px）去封
-/// 鱼尾高，得到 10px 高、35px 宽的一条黑杠——用户对照规范图一眼看出
-/// 「不是鱼尾」。现按 `gutter_w`（= 版心内宽，渲染时鱼尾真正铺满的宽度）
-/// 封顶，鱼尾因此与中缝同宽同量级，凹口才看得见。
-pub fn banxin_tail_size(gutter_w: f32, cell_h: f32, col_w: f32) -> (f32, f32) {
-    let w = (col_w * FISHTAIL_W_RATIO)
-        .min((gutter_w - 2.0).max(FISHTAIL_W_MIN))
-        .max(FISHTAIL_W_MIN);
-    // 高度的「宽封顶」按**版心实际宽**算（不是上面的参考宽 w）：
-    // h ≤ 0.62 × 绘制宽，版心与章题列因此同一枚形、只随栏宽缩放。
-    let draw_w = (gutter_w - 2.0).max(FISHTAIL_W_MIN);
-    let h = (cell_h * BANXIN_TAIL_H_CHARS)
-        .min(draw_w * BANXIN_TAIL_ASPECT)
-        .min(cell_h * BANXIN_TAIL_H_MAX)
-        .max(FISHTAIL_H_MIN);
-    (w, h)
+/// `col_w` 保留在签名里只为兼容章题列的调用（它传的就是本列宽，等于
+/// 绘制宽），不再参与计算。
+pub fn banxin_tail_size(gutter_w: f32, _cell_h: f32, _col_w: f32) -> (f32, f32) {
+    let w = gutter_w.max(FISHTAIL_W_MIN);
+    (w, tail_h_for_width(w))
 }
 
 /// 信笺中缝对鱼尾的尺寸（更宽、更横展）。
@@ -354,6 +375,14 @@ pub struct BanxinOpts<'a> {
     pub detailed: bool,
     /// 是否在下鱼尾之下落朱印。
     pub seal: bool,
+    /// **鱼尾尺寸由渲染层指定**（v1.68.0）：`Some((宽, 高))` 时用这一组，
+    /// `None` 时按 [`banxin_tail_size`] 从 `gutter_w` 反算。
+    ///
+    /// 为什么要有这个口子：中缝的鱼尾宽是「中缝**全**宽 + 外探」（两翼要
+    /// 压住左右界栏），而书口字要排在内芯宽（`gutter_w`）以内——两者不是
+    /// 同一个数。预算账若还拿内芯宽去算鱼尾高，画出来的鱼尾就会比预算
+    /// 高出一截，把书口字挤到叠字。渲染层把真实尺寸传进来，账与笔同源。
+    pub tail_size: Option<(f32, f32)>,
 }
 
 /// 排一版版心：`上鱼尾 → 书名 / 卷次 / 篇题 → 叶码 → 下鱼尾 → 朱印`。
@@ -362,7 +391,9 @@ pub struct BanxinOpts<'a> {
 /// 「叶码 → 卷次 → 书名 → 篇题」分。分不够就截字；篇题至少两个字
 /// 才肯露面（一个字的篇题不如不写）。
 pub fn layout(o: BanxinOpts) -> BanxinLayout {
-    let (tail_w, mut tail_h) = banxin_tail_size(o.gutter_w, o.cell_h, o.col_w);
+    let (tail_w, mut tail_h) =
+        o.tail_size
+            .unwrap_or_else(|| banxin_tail_size(o.gutter_w, o.cell_h, o.col_w));
     // 书口小字：极小号宋体——收在版心宽的一半以内，且不超过正文字号
     // 的三分之一（刻本书口字远小于正文）。
     let small = (o.gutter_w * 0.46).min(o.fs * 0.34).max(7.0);
@@ -490,25 +521,39 @@ mod tests {
     #[test]
     fn tail_never_wider_than_the_gutter() {
         let (w, h) = banxin_tail_size(GW, CH, CW);
-        assert!(w <= GW, "鱼尾宽 {w} 超过界栏 {GW}");
-        // 高按「版心实际宽」定比例（v1.65.0）：鱼尾与中缝同宽同量级，凹口才
-        // 看得见。高宽比落在 0.30~0.70 之间——太扁认不出形，太高变竖条。
-        let draw_w = (GW - 2.0).max(FISHTAIL_W_MIN);
-        assert!(h / draw_w >= 0.30, "鱼尾太扁，认不出形：h={h} w={draw_w}");
-        assert!(h / draw_w <= 0.70, "鱼尾太高，成竖向墨条：h={h} w={draw_w}");
-        assert!(h <= CH * BANXIN_TAIL_H_MAX + 0.01, "鱼尾高 {h} 超过上限");
-        // 也不能瘦成一条线。
-        assert!(h >= CH * 0.20, "鱼尾太瘦弱：{h}");
-        // v1.30.0：宽改挂**列宽**（`col_w × 0.7`），不再按版心比例——
-        // 版心宽随列数变，挂它会让鱼尾忽大忽小（列多 → 鱼尾缩成一粒）。
+        // v1.68.0：宽**就是**中缝宽（鱼尾两翼压在左右界栏上），不再由
+        // 列宽推算——规范图上量的正是「鱼尾宽 = 中缝全宽」。
+        assert!((w - GW).abs() < 0.01, "鱼尾宽应等于中缝宽 {GW}，实为 {w}");
+        assert!(w <= GW + 0.01, "鱼尾宽 {w} 超过界栏 {GW}");
+        // 高 = 宽 × 0.4：**扁宽**（宽明显大于高），这是规范图给死的形制。
         assert!(
-            (w - CW * FISHTAIL_W_RATIO).abs() < 0.01,
-            "鱼尾宽应为列宽 × {FISHTAIL_W_RATIO} = {:.1}，实为 {w}",
-            CW * FISHTAIL_W_RATIO
+            (h / w - BANXIN_TAIL_ASPECT).abs() < 0.01,
+            "鱼尾高宽比应为 {}，实为 {}",
+            BANXIN_TAIL_ASPECT,
+            h / w
         );
-        // 窄版心时按版心宽封顶，绝不溢出中缝（尖角因此仍在垂直中心线上）。
-        let (wn, _hn) = banxin_tail_size(20.0, CH, 44.0);
-        assert!(wn <= 20.0 - 2.0 + 0.01, "窄版心时鱼尾 {wn} 溢出中缝 20");
+        assert!(h < w, "鱼尾必须宽大于高（扁宽梯形）：w={w} h={h}");
+        // 极窄中缝时高有下限，比例会略胖，但仍必须是扁的。
+        let (wn, hn) = banxin_tail_size(20.0, CH, 44.0);
+        assert!((wn - 20.0).abs() < 0.01, "窄中缝时鱼尾宽应为 20，实为 {wn}");
+        assert!(hn < wn, "窄中缝时也不能竖起来：w={wn} h={hn}");
+    }
+
+    /// 象鼻与「鱼尾吊在版框下」的形制（v1.68.0，照规范图量出来的）。
+    #[test]
+    fn xiangbi_hangs_the_tail_below_the_frame() {
+        // 量图：中缝 57、鱼尾高 21（0.37·W）、象鼻长 74（1.30·W）、象鼻粗 6（0.10·W）。
+        let w = 57.0;
+        let h = tail_h_for_width(w);
+        let xb = xiangbi_len(h);
+        assert!((h / w - 0.40).abs() < 0.02, "鱼尾高应约为宽的 0.4：{h}/{w}");
+        assert!(
+            (xb / w - 1.30).abs() < 0.10,
+            "象鼻长应约为中缝宽的 1.3 倍：{xb}/{w}"
+        );
+        // 象鼻必须比鱼尾本身长——短了鱼尾就像直接贴在框上。
+        assert!(xb > h * 2.0, "象鼻太短，鱼尾贴框：{xb} vs {h}");
+        assert!(XIANG_BI_W_RATIO > 0.04 && XIANG_BI_W_RATIO < 0.20, "象鼻粗细不成比例");
     }
 
     #[test]
@@ -695,6 +740,7 @@ mod tests {
             chapter_title: "菩萨蛮",
             detailed: true,
             seal: true,
+            tail_size: None,
         });
         // 两枚鱼尾之间：上段书名 → 卷次 → 篇题，下段叶码。
         assert_eq!(lay.above.len(), 3, "{:?}", lay.above);
@@ -726,6 +772,7 @@ mod tests {
             chapter_title: "菩萨蛮",
             detailed: true,
             seal: true,
+            tail_size: None,
         });
         let used = lay.tail_h * 2.0
             + lay.seal_h
@@ -753,6 +800,7 @@ mod tests {
             chapter_title: "菩萨蛮",
             detailed: false,
             seal: true,
+            tail_size: None,
         });
         assert!(lay.above.is_empty() && lay.below.is_empty());
         assert!(lay.tail_h > 0.0);
@@ -772,6 +820,7 @@ mod tests {
             chapter_title: "菩萨蛮",
             detailed: true,
             seal: false,
+            tail_size: None,
         });
         for l in lay.above.iter().chain(lay.below.iter()) {
             // 书口字（书名 / 卷次 / 叶码）收在版心宽的 46%，篇题大一档 60%。
