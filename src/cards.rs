@@ -257,7 +257,7 @@ impl Root {
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.show_notes_panel = false;
+                        this.show_cards_panel = false;
                         this.jump_to_key(key, len, cx);
                     }),
                 );

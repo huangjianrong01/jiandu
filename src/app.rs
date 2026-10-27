@@ -27,29 +27,33 @@ use std::rc::Rc;
 /// 里往这枚 `Cell` 回填一次。渲染是输出、事件是输入，中间靠它过河。
 pub type RectProbe = Rc<Cell<Option<(f32, f32, f32, f32)>>>;
 
-/// **笔记抽屉的页签**（v1.78.0）：朱批录 / 卡片匣。
+/// **左侧栏的三枚页签**（v1.79.0）：目录 / 书签 / 批注。
 ///
-/// 原先是顶栏两枚钮、两个抽屉、两套滑入动画，还得靠 `set_ui_state` 互斥
-/// （同时只准开一个）——可它们装的是同一类东西：**我留下的字**。一个装
-/// 「批在这本书上的」，一个装「从各本书里摘出来的」。合并成一个抽屉两页
-/// 之后：顶栏少一枚，用户也不必先想清楚「这条算批注还是算摘录卡」。
+/// 原先这三样各占一处：目录是「从底部升起的竖排卷帘」、书签是「从底部滑出的
+/// 抽屉」、朱批录是「从右侧滑出的笔记栏」——三套外壳、三套滑入动画、三枚顶栏
+/// 钮，还得靠 `set_ui_state` 互斥。可它们本是一件事的三种问法：**我读到哪了 /
+/// 我折了哪一叶 / 我在这一页写了什么**。合成左侧一枚带页签的抽屉之后，顶栏只
+/// 剩「目录」一枚入口，书签与批注都住进去。
 ///
 /// 切页只换内容、**不重播滑入动画**（抽屉本身就开着，滑它干什么）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum NotesTab {
-    /// 朱批录：本书内的批注 / 眉批 / 夹注，按章节顺序。
+pub enum SideTab {
+    /// 目录：全卷篇目，按层级缩进；当前在读那一章朱砂标红。
     #[default]
-    Zhu,
-    /// 卡片匣：跨书摘录卡（书删了卡片还在）。
-    Card,
+    Toc,
+    /// 书签：我折起的那些叶。
+    Bookmark,
+    /// 批注：朱批录——眉批 / 夹注 / 通假 / 着重 / 划线 / 页记。
+    Note,
 }
 
-impl NotesTab {
-    /// 页签上的三个字（繁体，与朱批录一致）。
+impl SideTab {
+    /// 页签上的两个字。
     pub fn label(self) -> &'static str {
         match self {
-            NotesTab::Zhu => "朱批錄",
-            NotesTab::Card => "卡片匣",
+            SideTab::Toc => "目录",
+            SideTab::Bookmark => "书签",
+            SideTab::Note => "批注",
         }
     }
 }
@@ -167,16 +171,14 @@ pub enum AppUIState {
     Style,
     /// 全文检索。
     Search,
-    /// 笔记侧栏（v1.78.0：朱批录 + 卡片匣合成一个抽屉，页签在 `notes_tab`）。
-    Notes,
+    /// 卡片匣（v1.79.0：朱批录搬进左侧栏「批注」页后，这一栏只剩跨书摘录卡）。
+    Cards,
     /// 帮助。
     Help,
-    /// 目录（卷目）侧栏。
-    Toc,
+    /// 左侧栏（v1.79.0：目录 + 书签 + 批注 三页合一，从左侧滑出）。
+    Side,
     /// 分享卡片浮层。
     Share,
-    /// 书签抽屉。
-    Bookmarks,
     /// 问小笺（v1.76.0 · V2.0 模块二）：AI 伴读侧栏。
     Ai,
 }
@@ -272,12 +274,22 @@ pub struct Root {
     pub page: usize,
     /// 当前页首字所属的章（翻页 / 跳章 / 恢复进度时悄悄对齐，供目录朱砂红标当前卷）。
     pub current_chapter: usize,
-    /// 目录面板是否展开（true = 该渲染目录层）。
-    pub show_toc: bool,
-    /// 底部竖排目录的滚动柄：开目录时用它滚到当前在读的那一卷。
+    /// **左侧栏**是否展开（v1.79.0：目录 / 书签 / 批注 三页合一）。
+    ///
+    /// 它是**浮在纸面之上的覆盖层**（`absolute()` 定位），滑出时不占 flex 流、
+    /// 不改 `viewport_w`，故正文版式一行不动——见 `reader::render_side_panel`。
+    pub show_side: bool,
+    /// 左侧栏当前翻到哪一页（目录 / 书签 / 批注）。
+    pub side_tab: SideTab,
+    /// 目录页的滚动柄：开栏时用它滚到当前在读的那一卷。
     pub toc_scroll: ScrollHandle,
-    /// 是否需要「滚到当前卷」（每次开目录置一次，滚完即清）。
+    /// 是否需要「滚到当前卷」（每次开栏置一次，滚完即清）。
     pub toc_need_scroll: bool,
+    /// 目录高亮**已经对齐过的章**（跟随阅读进度用）。
+    ///
+    /// 只在「当前章变了」这一刻才推一次滚动，绝不每帧 / 每像素滚动都推——
+    /// 否则翻页快时列表会一路乱滚、还会把用户手动滚的位置抢回去。
+    pub side_follow: Option<usize>,
     /// **后台导入任务**（v1.50.0）：不为空表示「正在刻印」。
     ///
     /// 百万字的丛书解析要跑几秒，绝不能堵在主线程上；进度与结果都放在
@@ -308,23 +320,23 @@ pub struct Root {
     fts_busy: bool,
     /// 后台索引线程跑完没有（每帧探一眼，成了就接着排下一批）。
     fts_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// 目录面板滑入 / 滑出动画进度（0 = 完全收起，1 = 完全展开）。
-    pub toc_slide: f32,
-    /// 目录动画的目标态（true = 展开）。
-    pub toc_target: bool,
-    /// 是否正在播放目录滑入 / 滑出动画。
-    pub toc_animating: bool,
-    /// 书签抽屉是否展开（true = 该渲染书签层）。
-    pub show_bookmarks: bool,
+    /// 左侧栏滑入 / 滑出动画进度（0 = 完全收起，1 = 完全展开）。
+    ///
+    /// v1.79.0：**按时间推进**（200ms · ease-out cubic），不是旧的「每帧 +12%」——
+    /// 后者在掉帧时会拖成 400ms、在 120Hz 屏上又只有 130ms，同一份代码两种手感。
+    pub side_slide: f32,
+    /// 左侧栏动画的目标态（true = 展开）。
+    pub side_target: bool,
+    /// 是否正在播放左侧栏滑入 / 滑出动画。
+    pub side_animating: bool,
+    /// 本次动画**出发时**的进度：中途反向（滑到一半又点收）从这里接着走，
+    /// 不会跳回 0 再重来。
+    pub side_anim_from: f32,
+    /// 本次动画**出发的时刻**：与上面的 `from` 一起构成时间轴。
+    pub side_anim_start: Option<std::time::Instant>,
     /// 当前这本书的书签（插入 / 跳转 / 删除，落档 `library.json`）。
     pub bookmarks: Vec<Bookmark>,
-    /// 书签抽屉滑入 / 滑出动画进度（0 = 完全收起，1 = 完全展开）。
-    pub bookmarks_slide: f32,
-    /// 书签动画的目标态（true = 展开）。
-    pub bookmarks_target: bool,
-    /// 是否正在播放书签滑入 / 滑出动画。
-    pub bookmarks_animating: bool,
-    /// 书签列表滚动柄。
+    /// 书签列表滚动柄（v1.79.0：书签搬进左侧栏，抽屉那套滑入状态已撤）。
     pub bookmarks_scroll: ScrollHandle,
     /// 「版字」面板是否展开（v1.35.0：样式与版式两页合并为一页，
     /// 面板只剩一张纸，故不再有「当前页签」这个状态）。
@@ -387,13 +399,9 @@ pub struct Root {
     pub dict_tab: DictTab,
     /// 当前书的笔记：页序号 -> 正文。
     pub notes: std::collections::HashMap<usize, String>,
-    /// 笔记面板是否展开。
-    ///
-    /// v1.78.0：**朱批录与卡片匣合成一个抽屉**（顶栏只剩一枚「笔记」），
-    /// 这一枚就表示「笔记抽屉是否开着」；里面翻到哪一页由 `notes_tab` 定。
-    pub show_notes_panel: bool,
-    /// 笔记抽屉当前翻到哪一页（v1.78.0）。
-    pub notes_tab: NotesTab,
+    /// 卡片匣面板是否展开（v1.79.0：朱批录已搬进左侧栏「批注」页，
+    /// 右栏只剩跨书摘录卡，故不再有 `notes_tab` 这个状态）。
+    pub show_cards_panel: bool,
     /// 匣中卡片（开栏时从库里读一次，增删后重读；不每帧查询）。
     pub cards: Vec<jiandu_core::cards::Card>,
     /// **问小笺侧栏**（v1.76.0 · V2.0 模块二）：AI 伴读。
@@ -670,7 +678,7 @@ pub struct Root {
     /// 朱批录 / 搜索跳转后的「抵达」高亮：短暂朱砂衬底，提示用户已跳到该处。
     /// 口径与 `search_cur` 一致 `(chapter, para, offset, len)`。
     pub note_flash: Option<(usize, usize, usize, usize)>,
-    /// 朱批录侧栏滑入 / 滑出动画（与 `toc_slide` 同理）。
+    /// 卡片匣侧栏滑入 / 滑出动画（与 `side_slide` 同款逐帧推进）。
     pub notes_slide: f32,
     pub notes_target: bool,
     pub notes_animating: bool,
@@ -941,9 +949,11 @@ impl Root {
             size_modern: 18.0,
             page: 0,
             current_chapter: 0,
-            show_toc: false,
+            show_side: false,
+            side_tab: SideTab::default(),
             toc_scroll: ScrollHandle::new(),
             toc_need_scroll: false,
+            side_follow: None,
             import_job: None,
             batch: None,
             batch_cards: Vec::new(),
@@ -954,14 +964,12 @@ impl Root {
             fts_queue: Vec::new(),
             fts_busy: false,
             fts_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            toc_slide: 0.0,
-            toc_target: false,
-            toc_animating: false,
-            show_bookmarks: false,
+            side_slide: 0.0,
+            side_target: false,
+            side_animating: false,
+            side_anim_from: 0.0,
+            side_anim_start: None,
             bookmarks: Vec::new(),
-            bookmarks_slide: 0.0,
-            bookmarks_target: false,
-            bookmarks_animating: false,
             bookmarks_scroll: ScrollHandle::new(),
             show_style: false,
             focus_mode: false,
@@ -977,7 +985,7 @@ impl Root {
             hover_card: false,
             dict_tab: DictTab::default(),
             notes: std::collections::HashMap::new(),
-            show_notes_panel: false,
+            show_cards_panel: false,
             note_editing: false,
             note_edit_note: None,
             note_inject_key: None,
@@ -1076,7 +1084,6 @@ impl Root {
             notes_slide: 0.0,
             notes_target: false,
             notes_animating: false,
-            notes_tab: NotesTab::default(),
             show_ai: false,
             ai_panel,
             ai_slide: 0.0,
@@ -1130,17 +1137,40 @@ impl Root {
                 root.shelf_view = ShelfView::Spine;
             }
         }
-        // 开发用：JIANDU_PANEL=style|banzi|toc|notes|help 直接把某个面板摊开，
+        // 开发用：JIANDU_PANEL=style|banzi|side|toc|cards|help 直接把某个面板摊开，
         // 便于逐面板截图核对（顶栏默认隐身，脚本点不到）。
         // v1.35.0：样式与版式已合并为唯一一张「版字」纸，三个档名同义。
+        // v1.79.0：目录 / 书签 / 批注 都在左侧栏里，故 `side` 后可用
+        // `JIANDU_SIDE_TAB=toc|bookmark|note` 指定开在哪一页。
         if let Ok(v) = std::env::var("JIANDU_PANEL") {
             match v.as_str() {
                 "grid" | "banzi" | "style" => root.show_style = true,
-                "toc" => root.open_toc(),
-                "notes" => root.show_notes_panel = true,
+                "toc" | "side" => {
+                    root.side_tab = SideTab::Toc;
+                    root.open_side();
+                    root.side_slide = 1.0;
+                }
+                "bookmark" => {
+                    root.side_tab = SideTab::Bookmark;
+                    root.open_side();
+                    root.side_slide = 1.0;
+                }
+                "note" => {
+                    root.side_tab = SideTab::Note;
+                    root.open_side();
+                    root.side_slide = 1.0;
+                }
+                "notes" | "cards" => root.show_cards_panel = true,
                 "help" => root.show_help = true,
                 _ => {}
             }
+        }
+        if let Ok(v) = std::env::var("JIANDU_SIDE_TAB") {
+            root.side_tab = match v.as_str() {
+                "bookmark" => SideTab::Bookmark,
+                "note" => SideTab::Note,
+                _ => SideTab::Toc,
+            };
         }
         if let Ok(v) = std::env::var("JIANDU_SHELF_Q") {
             root.shelf_query = v;
@@ -1183,13 +1213,14 @@ impl Root {
         }
         // 开发用：默认展开浮层，便于截图核对（不影响正常逻辑）。
         if std::env::var("JIANDU_TOC_OPEN").is_ok() {
-            root.show_toc = true;
-            root.toc_target = true;
-            root.toc_slide = 1.0;
+            root.show_side = true;
+            root.side_target = true;
+            root.side_slide = 1.0;
+            root.side_animating = false;
             root.toc_need_scroll = true;
         }
         if std::env::var("JIANDU_NOTES_OPEN").is_ok() {
-            root.show_notes_panel = true;
+            root.show_cards_panel = true;
         }
         // 开发用：直接浮出笔记编辑框，便于截图核对浮层版式。
         if std::env::var("JIANDU_NOTE_EDIT").is_ok() {
@@ -1468,7 +1499,7 @@ impl Root {
         if self.note_editing
             || self.dragging
             || self.focus_mode
-            || self.show_toc
+            || self.show_side
             || self.show_style
             || self.book.is_none()
         {
@@ -2533,7 +2564,7 @@ impl Root {
                 self.underlines = ul.into_iter().collect();
                 self.bookmarks = entry.bookmarks.clone();
                 self.show_share_panel = false;
-                self.show_notes_panel = false;
+                self.show_cards_panel = false;
                 self.note_editing = false;
                 self.note_draft.clear();
                 self.note_cursor = 0;
@@ -3822,11 +3853,10 @@ fn anki_push_card(
         let on = match s {
             AppUIState::Style => self.show_style,
             AppUIState::Search => self.show_search,
-            AppUIState::Notes => self.show_notes_panel,
+            AppUIState::Cards => self.show_cards_panel,
             AppUIState::Help => self.show_help,
-            AppUIState::Toc => self.show_toc,
+            AppUIState::Side => self.show_side,
             AppUIState::Share => self.show_share_panel,
-            AppUIState::Bookmarks => self.show_bookmarks,
             AppUIState::Ai => self.show_ai,
             AppUIState::None => false,
         };
@@ -3834,28 +3864,30 @@ fn anki_push_card(
         self.ui_state = s;
         self.show_style = matches!(s, AppUIState::Style);
         self.show_search = matches!(s, AppUIState::Search);
-        self.show_notes_panel = matches!(s, AppUIState::Notes);
+        self.show_cards_panel = matches!(s, AppUIState::Cards);
         self.show_help = matches!(s, AppUIState::Help);
-        self.show_toc = matches!(s, AppUIState::Toc);
         self.show_share_panel = matches!(s, AppUIState::Share);
-        self.show_bookmarks = matches!(s, AppUIState::Bookmarks);
         self.show_ai = matches!(s, AppUIState::Ai);
+        // 左侧栏走它自己的开合（有时间轴动画，见 `open_side` / `close_side`），
+        // 不在这里直接置 `show_side`——否则会把动画的起始进度冲掉。
+        if matches!(s, AppUIState::Side) {
+            self.open_side();
+        } else {
+            self.close_side();
+        }
         if !self.show_search {
             self.clear_search();
         }
         // 侧栏滑入 / 滑出：开 → 目标态拉满并播动画；关 → 目标态归零、
-        // 由 `render` 逐帧把 slide 推回 0 后再卸载面板（与 `toc_slide` 同款）。
-        self.notes_target = self.show_notes_panel;
-        self.notes_animating = self.show_notes_panel || self.notes_slide > 0.0;
+        // 由 `render` 逐帧把 slide 推回 0 后再卸载面板。
+        self.notes_target = self.show_cards_panel;
+        self.notes_animating = self.show_cards_panel || self.notes_slide > 0.0;
         self.search_target = self.show_search;
         self.search_animating = self.show_search || self.search_slide > 0.0;
-        self.bookmarks_target = self.show_bookmarks;
-        self.bookmarks_animating = self.show_bookmarks || self.bookmarks_slide > 0.0;
         self.ai_target = self.show_ai;
         self.ai_animating = self.show_ai || self.ai_slide > 0.0;
         // 开栏那一刻才去库里取一次（侧栏是低频面板，没必要每帧查）。
-        // v1.78.0：卡片页的内容也是开栏时才读，切到卡片页同样要读一次。
-        if self.show_notes_panel && self.notes_tab == NotesTab::Card {
+        if self.show_cards_panel {
             self.reload_cards();
         }
         // 问小笺开栏：把当前纸墨与字体递给面板（面板是独立 Entity，
@@ -3875,105 +3907,75 @@ fn anki_push_card(
     /// （打开『版字』/『目录』等顶部面板时，强制收起选词工具条，防事件穿透误触）。
     pub fn any_overlay_open(&self) -> bool {
         self.show_style
-            || self.show_toc
+            || self.show_side
             || self.show_search
-            || self.show_notes_panel
+            || self.show_cards_panel
             || self.show_help
             || self.show_share_panel
-            || self.show_bookmarks
             || self.show_ai
     }
 
-    pub fn open_toc(&mut self) {
-        if self.show_toc && self.toc_target {
+    /// 呼出**左侧栏**（v1.79.0）：从左侧平滑滑出 260px 的抽屉。
+    ///
+    /// 它是一层**绝对定位的覆盖层**，浮在纸面之上、不占 flex 流——正文的版心
+    /// 宽度、列数、字号一概不变，排版引擎一行都不重排（见 `render_side_panel`）。
+    ///
+    /// 动画按**时间**推进（200ms · ease-out cubic）：记下出发时刻与出发进度，
+    /// 由 `render` 每帧按真实经过的时间算进度。旧的「每帧 +12%」在掉帧时会拖
+    /// 成 400ms、在 120Hz 屏上又只剩 130ms，同一份代码两种手感。
+    pub fn open_side(&mut self) {
+        if self.show_side && self.side_target {
             return;
         }
-        // 互斥：开目录前收起其它顶层面板与底层瞬态浮层。
+        // 互斥：开左栏前收起其它顶层面板与底层瞬态浮层。
         self.show_style = false;
         self.show_search = false;
-        self.show_notes_panel = false;
+        self.show_cards_panel = false;
         self.show_help = false;
         self.show_share_panel = false;
-        self.ui_state = AppUIState::Toc;
+        self.ui_state = AppUIState::Side;
         self.close_transient_ui();
-        self.show_toc = true;
-        self.toc_target = true;
-        self.toc_animating = true;
-        // v1.49.3：每次开目录都重新定位——滚到当前在读的那一卷，
+        self.show_side = true;
+        self.side_target = true;
+        self.side_animating = true;
+        self.side_anim_from = self.side_slide;
+        self.side_anim_start = Some(std::time::Instant::now());
+        // v1.49.3：每次开栏都重新定位——滚到当前在读的那一卷，
         // 而不是永远从第一卷起手。
         self.toc_need_scroll = true;
-        if self.toc_slide <= 0.0 {
-            self.toc_slide = 0.0;
-        }
+        self.side_follow = None;
     }
 
-    /// 收起目录侧栏（向右侧滑出）。
+    /// 收起左侧栏（向左侧滑出）。
     ///
-    /// 若侧栏已经完全收起则原地返回；否则把目标态翻成「收起」，
-    /// 由 `render` 的逐帧循环把 `toc_slide` 推回 0 后再真正卸载。
-    pub fn close_toc(&mut self) {
-        if !self.show_toc && !self.toc_animating {
+    /// 若侧栏已经完全收起则原地返回；否则把目标态翻成「收起」，由 `render`
+    /// 的逐帧循环把 `side_slide` 推回 0 后再真正卸载。
+    pub fn close_side(&mut self) {
+        if !self.show_side && !self.side_animating {
             return;
         }
-        if !self.show_toc {
+        if !self.show_side {
             return;
         }
-        self.toc_target = false;
-        self.toc_animating = true;
+        self.side_target = false;
+        self.side_animating = true;
+        self.side_anim_from = self.side_slide;
+        self.side_anim_start = Some(std::time::Instant::now());
         self.ui_state = AppUIState::None;
         // 极端情况：侧栏可见但 slide 已为 0（不应发生），直接收。
-        if self.toc_slide <= 0.0 {
-            self.show_toc = false;
-            self.toc_animating = false;
+        if self.side_slide <= 0.0 {
+            self.show_side = false;
+            self.side_animating = false;
         }
     }
 
-    /// 呼出书签抽屉（从底部滑入）；与目录栏互斥（同一时刻只开一个顶层）。
-    pub fn open_bookmarks(&mut self) {
-        if self.show_bookmarks && self.bookmarks_target {
-            return;
-        }
-        self.show_style = false;
-        self.show_search = false;
-        self.show_notes_panel = false;
-        self.show_help = false;
-        self.show_toc = false;
-        self.show_share_panel = false;
-        self.ui_state = AppUIState::Bookmarks;
-        self.close_transient_ui();
-        self.show_bookmarks = true;
-        self.bookmarks_target = true;
-        self.bookmarks_animating = true;
-    }
-
-    /// 收起书签抽屉（向底部滑出）。
-    pub fn close_bookmarks(&mut self) {
-        if !self.show_bookmarks && !self.bookmarks_animating {
-            return;
-        }
-        if !self.show_bookmarks {
-            return;
-        }
-        self.bookmarks_target = false;
-        self.bookmarks_animating = true;
-        self.ui_state = AppUIState::None;
-        if self.bookmarks_slide <= 0.0 {
-            self.show_bookmarks = false;
-            self.bookmarks_animating = false;
-        }
-    }
-
-    /// 顶栏「书签」钮：抽屉开着就收起；没开则先收藏当前页（去重）再展开。
-    /// 开合书签抽屉（v1.78.0：**纯开关，不再夹带「顺手加一条」**）。
-    ///
-    /// 原先开抽屉 = 「先收藏当前叶 + 再滑出」。这一枚既是动作又是开关，用户
-    /// 想翻书签就必定被加一条新的，翻过页再点又加一条——开关里夹副作用，没
-    /// 法只「看」不「加」。加书签的动作现在在抽屉头上那枚「＋ 收此葉」。
-    pub fn toggle_bookmarks(&mut self) {
-        if self.show_bookmarks {
-            self.close_bookmarks();
+    /// 顶栏「目录」钮：左栏开着（且停在目录页）就收起；否则开到目录页。
+    pub fn toggle_side(&mut self) {
+        if self.show_side && self.side_target {
+            self.close_side();
         } else {
-            self.open_bookmarks();
+            self.side_tab = SideTab::Toc;
+            self.open_side();
         }
     }
 
@@ -4391,7 +4393,8 @@ fn anki_push_card(
         if let Some(pg) = self.page_of_key(key) {
             self.page = pg;
         }
-        self.show_notes_panel = false;
+        self.show_cards_panel = false;
+        self.close_side();
         self.show_search = false;
         self.clear_selection();
         self.popup = None;
@@ -4402,7 +4405,8 @@ fn anki_push_card(
     /// 只翻面（页笔记用：没有 charIndex，无法闪高具体字）。
     pub fn jump_to_page(&mut self, page: usize, cx: &mut Context<Self>) {
         self.page = page;
-        self.show_notes_panel = false;
+        self.show_cards_panel = false;
+        self.close_side();
         self.popup = None;
         cx.notify();
     }
@@ -5606,19 +5610,30 @@ impl Render for Root {
                 true
             });
         }
-        // 目录侧栏滑入 / 滑出：逐帧推进 toc_slide 直到到位，到位后
-        // 若是「收起」则卸载侧栏。这里只改状态、不读窗口输入，
-        // 真正的「下一帧」由 request_animation_frame 驱动，形成动画循环。
-        if self.toc_animating {
-            let dir = if self.toc_target { 1.0 } else { -1.0 };
-            // 每帧约 12%：260ms 量级滑完，手感顺而不拖。
-            let step = 0.12;
-            let next = (self.toc_slide + dir * step).clamp(0.0, 1.0);
-            self.toc_slide = next;
-            if (self.toc_target && next >= 1.0) || (!self.toc_target && next <= 0.0) {
-                self.toc_animating = false;
-                if !self.toc_target {
-                    self.show_toc = false; // 滑出完成，真正卸载侧栏
+        // 左侧栏滑入 / 滑出（v1.79.0）：**按时间推进**，200ms · ease-out cubic。
+        //
+        // 旧写法是「每帧 +12%」：60Hz 屏上约 260ms、120Hz 屏上约 130ms、掉帧时
+        // 拖到 400ms 以上——同一份代码三种手感。现在记出发时刻与出发进度，每帧
+        // 用真实经过的时间算进度，掉帧只是少画几帧，时长仍是 200ms。
+        //
+        // 只改 `side_slide` 这一个 f32，不碰分页 / 排版：面板是 `absolute()`
+        // 覆盖层，正文版心连一个像素都不动。
+        if self.side_animating {
+            const MS: f32 = 200.0;
+            let from = self.side_anim_from;
+            let to = if self.side_target { 1.0 } else { 0.0 };
+            let p = self
+                .side_anim_start
+                .map(|t| (t.elapsed().as_secs_f32() * 1000.0 / MS).clamp(0.0, 1.0))
+                .unwrap_or(1.0);
+            // ease-out cubic：起步快、收尾柔，落位那一下不会「撞墙」。
+            let e = crate::reader::side_ease_out(p);
+            self.side_slide = (from + (to - from) * e).clamp(0.0, 1.0);
+            if p >= 1.0 {
+                self.side_animating = false;
+                self.side_anim_start = None;
+                if !self.side_target {
+                    self.show_side = false; // 滑出完成，真正卸载侧栏
                 }
             } else {
                 window.request_animation_frame();
@@ -5633,22 +5648,7 @@ impl Render for Root {
             if (self.notes_target && next >= 1.0) || (!self.notes_target && next <= 0.0) {
                 self.notes_animating = false;
                 if !self.notes_target {
-                    self.show_notes_panel = false;
-                }
-            } else {
-                window.request_animation_frame();
-            }
-        }
-        // 书签抽屉滑入 / 滑出（与 toc 同款逐帧推进）。
-        if self.bookmarks_animating {
-            let dir = if self.bookmarks_target { 1.0 } else { -1.0 };
-            let step = 0.12;
-            let next = (self.bookmarks_slide + dir * step).clamp(0.0, 1.0);
-            self.bookmarks_slide = next;
-            if (self.bookmarks_target && next >= 1.0) || (!self.bookmarks_target && next <= 0.0) {
-                self.bookmarks_animating = false;
-                if !self.bookmarks_target {
-                    self.show_bookmarks = false;
+                    self.show_cards_panel = false;
                 }
             } else {
                 window.request_animation_frame();
@@ -5734,7 +5734,7 @@ impl Render for Root {
         // 把整幅纸面还给正文（一枚红印也嫌吵）。
         // 目录抽屉展开时收起纸角那枚朱印：印是画在 screen **之后**的，
         // 若不收，它会盖在抽屉左首列的末字上（看起来像脏点）。
-        let show_seal = self.screen == Screen::Reading && !self.focus_mode && !self.show_toc;
+        let show_seal = self.screen == Screen::Reading && !self.focus_mode && !self.show_side;
         // v1.50.0：每帧探一眼后台导入（完成就登记入架，没完成就刷新进度）。
         self.poll_import(cx);
         // v1.77.0：每帧探一眼批量导入（点检 / 上架 / 收工）与后台建索引。
