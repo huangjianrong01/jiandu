@@ -307,7 +307,12 @@ impl AiPanel {
 
         // 收流：一段一段贴进最后那条答案的尾部。**只 notify 本面板**——
         // 这正是把它做成独立 Entity 的全部意义（见文件头）。
-        let _task = cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+        // ⚠️ v1.77.1：这里必须 `.detach()`。上一版写成 `let _task = cx.spawn(...)`，
+        // Task 绑定到局部变量后**在 `send()` 返回时就被析构**——GPUI 里 Task
+        // 一析构即取消，于是收流循环一帧都没跑到，回包全丢：界面只留一个永远
+        // 空着的答案气泡（实测 JIANDU_AI_SMOKE 打本地假服务端，服务端收到了
+        // 请求、面板却一个字没贴进来）。`detach()` 把任务交给执行器托管。
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             // AsyncApp 是 Clone：换成 owned 句柄才能安全跨 await（见 app.rs 同款）。
             let mut cx = cx.clone();
             async move {
@@ -321,7 +326,8 @@ impl AiPanel {
                     });
                 }
             }
-        });
+        })
+        .detach();
         cx.notify();
     }
 
