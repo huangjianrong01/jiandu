@@ -601,8 +601,10 @@ fn banxin_tail(w: f32, h: f32, top: bool, color: u32) -> Div {
 /// 画法：一个覆盖整条内芯（`w × h`）的 Canvas，在上、下两个定位垫里
 /// 各落**一根**竖墨条，x 关于中缝中线**严格对称**，起止正好落在版框
 /// 内缘与鱼尾上缘（`len` 由 `render_gutter` 算出，与鱼尾同源）。
+/// `both = false` 只画**上**象鼻——章题列顶端只有一枚鱼尾，底下那根
+/// 无处可落（会凭空吊在列尾），故按需关掉。
 /// 只碰版心装饰：不占正文行格、不影响分页，也不与鱼尾 / 书口字重叠。
-fn gutter_trunk(w: f32, h: f32, len: f32, bar_w: f32, color: u32) -> Div {
+fn gutter_trunk(w: f32, h: f32, len: f32, bar_w: f32, color: u32, both: bool) -> Div {
     div()
         .absolute()
         .top(px(0.0))
@@ -626,7 +628,10 @@ fn gutter_trunk(w: f32, h: f32, len: f32, bar_w: f32, color: u32) -> Div {
                     let bar = bar_w.clamp(2.0, 8.0);
                     let left = ((bw - bar) * 0.5).round();
                     // 上象鼻（版框内缘 → 上鱼尾）+ 下象鼻（下鱼尾 → 地脚），严格镜像。
-                    let bars = [(left, 0.0, l), (left, bh - l, l)];
+                    let mut bars = vec![(left, 0.0, l)];
+                    if both {
+                        bars.push((left, bh - l, l));
+                    }
                     let mut pb = PathBuilder::fill();
                     for (x, y, ln) in bars {
                         let (ax, ay) = (x0 + x, y0 + y);
@@ -4437,9 +4442,12 @@ impl Root {
         let tfs = fs * TITLE_COL_SCALE;
         let tcell = cell_h * TITLE_COL_SCALE;
         // 丝栏：列间界行按版字面板所选（乌 / 金 / 朱）取色。
+        let col_h = cell_h * rows as f32 + foot_h;
         let mut col = div()
+            // `relative`：象鼻（绝对定位的 Canvas）以本列为定位上下文。
+            .relative()
             .w(px(col_w))
-            .h(px(cell_h * rows as f32 + foot_h))
+            .h(px(col_h))
             .flex()
             .flex_col()
             .items_center()
@@ -4450,6 +4458,18 @@ impl Root {
         //   章首页的鱼尾会与左半叶的鱼尾高低不齐。）
         let (_ref_w, th) = crate::banxin::banxin_tail_size(col_w, cell_h, col_w);
         let head = crate::banxin::xiangbi_len(th);
+        // 章题列在本版式里就是那一叶的版心（见 `detailed`）：顶端同样要吊
+        // 一根**实心象鼻**。缺了它，鱼尾之上那段空当看着就像凭空加的
+        // padding——其实那是象鼻的位置（v1.68.0 补画，只画上端：列尾没有
+        // 鱼尾，底下那根无处可落）。
+        col = col.child(gutter_trunk(
+            col_w,
+            col_h,
+            head,
+            (col_w * crate::banxin::XIANG_BI_W_RATIO).clamp(2.0, 8.0),
+            t.frame_ink(),
+            false,
+        ));
         col = col.child(div().h(px(head)));
         // 上鱼尾：与版心同一枚黑鱼尾（深灰 `#222222`），形制同式：宽 = 本列宽，
         // 高 = 宽 × 0.4（扁宽），凹口顶点在 `H × 0.7`。
@@ -4714,7 +4734,7 @@ impl Root {
             .flex_col()
             .items_center();
         // 象鼻：一根实心墨条，从版框内缘垂到鱼尾上缘（上下严格镜像）。
-        col = col.child(gutter_trunk(core_w, core_h, xiangbi, trunk_w, t.frame_ink()));
+        col = col.child(gutter_trunk(core_w, core_h, xiangbi, trunk_w, t.frame_ink(), true));
         // 上象鼻那一段的高度（鱼尾的上缘因此落在 `Y_top + H_xiangbi`）。
         col = col.child(div().h(px(xiangbi)));
         // 上鱼尾：平顶贴象鼻下缘、凹口在下缘朝下；宽＝中缝全宽。

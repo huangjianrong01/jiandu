@@ -158,7 +158,8 @@ pub fn is_noise_para(s: &str) -> bool {
             return true;
         }
     }
-    false
+    // ⑤ 汉字叶码（v1.68.1）：「十三」「六」这种漏网的汉字页码，绝不能独占一列。
+    is_lone_number_para(t)
 }
 
 /// 单段文本去噪：零宽字符、HTML 残留、实体、空白压缩，以及
@@ -225,8 +226,328 @@ pub fn denoise_text(s: &str) -> String {
     out.trim().to_string()
 }
 
-/// 第一遍：一巻内的去噪（文本净化 + 丢噪声段 + 合并连续重复段 + 砍导航短段堆）。
-fn pass1_juan(j: &mut IrJuan, titles: &std::collections::HashSet<String>) {
+// ── 终极头部清洗（v1.68.1）────────────────────────────────────────────
+/// **段首缩进清零**：把一段开头的所有「看不见 / 占位」字符全部剔除——
+/// 全角空格 `　`、半角空格、制表符、不换行空格、零宽字符、BOM。
+///
+/// 竖排排版里这些字符**每一个都占一个正文字格**（`　` 尤其，它是全角，
+/// 会画成一整格的空白），于是「段首缩进两格」在版面上就是第一列顶部凭空
+/// 多出两格空当——正是用户实测到的「幽灵空行」。段首一律清零，第一个字
+/// 直接贴住版框上沿。
+pub fn trim_para_head(s: &str) -> String {
+    let invisible = |c: char| {
+        matches!(c, '\u{3000}' | '\u{00A0}' | '\t')
+            || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}' | '\u{FEFF}')
+    };
+    // 头部一路吃掉（可能是一串 `　　` 或 `　 ` 混排）。
+    let t = s.trim_start_matches(|c: char| invisible(c) || c == '\r' || c == '\n');
+    // **半角空格只在「一眼就是缩进」时才吃**（连续 ≥4 个）。
+    //
+    // 行首一两个半角空格多半不是缩进，而是西文 / 数字的**换行续行**
+    // （`1.003␣004` 折成两行时第二行带一个空格）——吃掉它就是把两个词黏成
+    // 一个，那是**在改内容**，绝不能干。何况真正的段首空白在下游本来就会被
+    // `line.trim()` 吃掉（txt / epub 两条链都是按行 trim 的），这里再狠一点
+    // 只会伤到「续行中间的那个空格」。
+    let sp = t.chars().take_while(|&c| c == ' ').count();
+    let t = if sp >= 4 { &t[sp..] } else { t };
+    // 尾部只清空白与不可见，不动标点。
+    t.trim_end_matches(|c: char| invisible(c) || c == ' ' || c == '\r' || c == '\n')
+        .to_string()
+}
+
+/// **折叠幽灵空行**：连续 3 个以上换行（中间夹着空格 / 全角空格 / 制表符
+/// 也算）一律折成 2 个——也就是「至多一个空行」。
+///
+/// 排版侧绝不会因此看到空段：空段在 [`pass1_juan`] 里就被 `retain` 掉了，
+/// 更不可能被当成一列排在最前面。
+fn collapse_blank_runs(s: &str) -> String {
+    // 按行走，只裁决「空行」：**行内容一个字都不动**——
+    // 续行前导的那个空格是内容（`1.003␣004` 折行时第二行的空格），
+    // 顺手吃掉就把两个词黏成一个了。
+    let mut out = String::with_capacity(s.len());
+    let mut blank = 0usize; // 当前连续空行数
+    for line in s.split('\n') {
+        if line.trim().is_empty() {
+            blank += 1;
+            // 至多留一个空行（= 至多两个换行）。
+            if blank == 1 {
+                out.push('\n');
+            }
+            continue;
+        }
+        blank = 0;
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// **剥离 YAML / TOML 式元数据头**（v1.68.1）。
+///
+///  notion / Obsidian / Jekyll 导出的 md / txt 常以
+/// ```text
+/// ---
+/// title: 庄子
+/// author: 某人
+/// ---
+/// ```
+/// 开头。这整块一旦流进正文，第一列顶部就是一串 `title:` `author:`，
+/// 更是把真正的首字挤下去。这里整块连壳剥掉，一个字都不留。
+///
+/// 判据保守：开头（略过不可见字符后）必须是 `---`，且在随后的
+/// [`YAML_SCAN_LINES`] 行内找得到收口的 `---` / `...`；找不到就**不动**
+/// （免得把正文里的分隔线当元数据）。
+const YAML_SCAN_LINES: usize = 60;
+pub fn strip_yaml_front_matter(s: &str) -> String {
+    let head = s.trim_start_matches(|c: char| {
+        matches!(c, '\u{FEFF}' | '\u{200B}'..='\u{200F}' | '\u{2060}') || c.is_whitespace()
+    });
+    if !head.starts_with("---") {
+        return s.to_string();
+    }
+    let mut lines = head.lines();
+    lines.next(); // 开闸那一行
+    let mut seen = 0usize;
+    for l in lines {
+        seen += 1;
+        let t = l.trim();
+        if t == "---" || t == "..." {
+            // 收口：整块（含收口行）剥掉，返回其后内容。
+            let rest = &head[..];
+            // 用「行号」定位开销大，这里按字节数直接切：head 里从第
+            // (seen+1) 行起就是正文。
+            return rest
+                .lines()
+                .skip(seen + 1)
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        if seen >= YAML_SCAN_LINES {
+            break;
+        }
+    }
+    s.to_string()
+}
+
+/// **终极头部清洗**：原文进解析器之前的一刀（v1.68.1，用户四条红线）。
+///
+/// 1. 剥 YAML / TOML 元数据头；
+/// 2. 折叠连续 3+ 空行为至多 1 个空行；
+/// 3. 逐行做 **段首缩进清零**（全角空格 / 空格 / 零宽 / BOM 全剔）；
+/// 4. 全文再强力 `trim()`——开头的 BOM、零宽、全角空格、多余换行一律
+///    滚蛋，保证交给排版引擎的第一个字符就是**真字**。
+///
+/// 只碰「文本 → 章」这一段：不改分页、不改锚点、不改字格账。
+pub fn strip_head_junk(text: &str) -> String {
+    let s = strip_yaml_front_matter(text);
+    let s = collapse_blank_runs(&s);
+    let s: String = s.lines().map(trim_para_head).collect::<Vec<_>>().join("\n");
+    s.trim_start_matches(|c: char| {
+        matches!(c, '\u{FEFF}' | '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{3000}' | '\u{00A0}')
+            || c == '\n'
+            || c == '\r'
+            || c == ' '
+            || c == '\t'
+    })
+    .to_string()
+}
+
+// ── 注疏标签：只去壳，留肉身（v1.68.1）─────────────────────────────────
+/// **只去壳、留肉身**：把形态各异的注疏标签**规范化**成笺读自己的
+/// `[注] … [/注]` 夹注壳，**注疏正文一个字都不删**。
+///
+/// 处理的形态（大小写 / 空格 / 全角一律认）：
+///   * `[注]` `[ 注 ]` `[　注　]` `[注 ]` → `[注]`
+///   * `[/注]` `[ /注 ]` `[／注]` → `[/注]`
+///   * `[疏]` `[ 疏 ]` → `[注]`；`[/疏]` → `[/注]`（疏也是注）
+///   * `[高亮]` `[ 高亮 ]` → `[高亮]`（着重号同理）
+///   * **空壳**（`[注][/注]`、只有壳没有肉）→ 连壳删掉，不留空标记
+///   * **不认识的方括号**（`[12]`、`[一]`、网页残渣）→ **只削掉方括号**，
+///     里头的字原样留下（这就是「只去壳」的边界：绝不连内容一起吞）
+///   * 落单的 `[` / `]` → 直接删
+///
+/// 反过来，**合法壳之间的内容 100% 保留**：
+/// `正文[注]注疏内容[/注]正文` → `正文[注]注疏内容[/注]正文`（原样），
+/// 交给排版层落成 `InlineNote`（双行小字夹注），正文里不出现方括号。
+pub fn normalize_note_shells(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '[' {
+            if chars[i] != ']' {
+                out.push(chars[i]);
+            }
+            i += 1;
+            continue;
+        }
+        // 找收口的 `]`（最多向前看 40 字：标签不会更长）。
+        let close = (i + 1..chars.len().min(i + 41)).find(|&j| chars[j] == ']');
+        let Some(c) = close else {
+            i += 1; // 没有收口：这个 `[` 是垃圾，丢掉（内容照常往后走）
+            continue;
+        };
+        let inner: String = chars[i + 1..c].iter().collect();
+        // 归一化：去空格 / 全角空格 / 全角斜杠 → 半角，再判是不是我们的壳。
+        let key: String = inner
+            .chars()
+            .filter(|ch| !matches!(ch, ' ' | '\t' | '\u{3000}' | '\u{00A0}'))
+            .map(|ch| if ch == '／' { '/' } else { ch })
+            .collect();
+        let low = key.to_lowercase();
+        match low.as_str() {
+            "注" | "疏" => out.push_str("[注]"),
+            "/注" | "/疏" => out.push_str("[/注]"),
+            "高亮" => out.push_str("[高亮]"),
+            "/高亮" => out.push_str("[/高亮]"),
+            // 带参数的自家标记（`[拼音:xxx]` / `[数字:xxx]`）连壳原样放行：
+            // 它们的内部是**语法**（冒号是分隔符），下游 `paragraph_of` /
+            // `strip_digit_marks` 还要靠这对壳认出它，削了壳就断成正文了。
+            _ if low.starts_with("拼音:") || low.starts_with("拼音：") => {
+                out.push_str(&format!("[{}]", key));
+            }
+            _ if low.starts_with("数字:") || low.starts_with("数字：") => {
+                out.push_str(&format!("[{}]", key));
+            }
+            _ => {
+                // 不认识的壳：**只削括号，留肉身**。
+                out.push_str(inner.trim());
+            }
+        }
+        i = c + 1;
+    }
+    // 空壳连壳删：`[注][/注]` 这种没有肉身的直接消失。
+    let out = out.replace("[注][/注]", "");
+    out.replace("[高亮][/高亮]", "")
+}
+
+/// **取「纯正文」**：把所有注疏 / 着重 / 注音壳连同方括号一起抹掉，
+/// **壳里的字一个不少地留下**。
+///
+/// 用途：导出纯文本、以及单元测试钉「只去壳不留壳、肉身 100% 在」这条边界。
+/// 导入管线本身**不**调用它——管线要保留 `[注]…[/注]` 好让排版层落成
+/// `InlineNote`（双行小字夹注），抹了就没有夹注了。
+pub fn note_content_only(s: &str) -> String {
+    let mut cur = normalize_note_shells(s);
+    // 反复抹壳（抹掉一对之后可能又挨上一对）。
+    for tag in ["[注]", "[/注]", "[高亮]", "[/高亮]"] {
+        loop {
+            match cur.find(tag) {
+                Some(at) => cur = format!("{}{}", &cur[..at], &cur[at + tag.len()..]),
+                None => break,
+            }
+        }
+    }
+    // `[拼音:xxx]`：壳删、拼音留。
+    loop {
+        let Some(at) = cur.find("[拼音") else { break };
+        let Some(end) = cur[at..].find(']') else { break };
+        let inner = cur[at + "[拼音".len()..at + end]
+            .trim_start_matches(|c| c == ':' || c == '：')
+            .to_string();
+        cur = format!("{}{}{}", &cur[..at], inner, &cur[at + end + 1..]);
+    }
+    cur.replace(['[', ']'], "")
+}
+
+/// **剥离落单的书名号**（v1.68.1）：跨行 / 跨段被截断的《》直接删掉。
+///
+/// 正常成对出现的《…》不动（它们会被 [`crate::vclean`] 转成竖排的 ︽︾，
+/// 渲染时作悬挂标点，不占字格中轴）；只有**找不到另一半**的才删——
+/// 段首落单的 `》`、段尾落单的 `《`，以及全段里多出来的那半个。
+pub fn strip_orphan_title_marks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut open = 0i32;
+    for c in s.chars() {
+        match c {
+            '《' => {
+                open += 1;
+                out.push(c);
+            }
+            '》' => {
+                if open > 0 {
+                    open -= 1;
+                    out.push(c);
+                }
+                // 没有待闭的《：这是个落单的 》，丢掉。
+            }
+            _ => out.push(c),
+        }
+    }
+    if open > 0 {
+        // 段尾有多余的《：从后往前删掉多出来的那几个。
+        let mut extra = open;
+        let mut keep: Vec<char> = Vec::with_capacity(out.len());
+        for c in out.chars().rev() {
+            if c == '《' && extra > 0 {
+                extra -= 1;
+                continue;
+            }
+            keep.push(c);
+        }
+        out = keep.into_iter().rev().collect();
+    }
+    out
+}
+
+/// **孤立的页码 / 页眉残留**（v1.68.1）：整段只由「汉字数字 / 阿拉伯数字 /
+/// 〇零廿卅」构成、且不带任何句读 → 这是漏网的叶码，绝不能独占一列。
+///
+/// 例：`十三`、`六`、`四十二`、`１２`。带上下文的（「卷十三」「十三年」）
+/// 有其它汉字，不会被判成页码，安全。
+pub fn is_lone_number_para(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t.chars().count() > 8 {
+        return false;
+    }
+    let is_num = |c: char| {
+        c.is_ascii_digit()
+            || ('０'..='９').contains(&c)
+            || matches!(
+                c,
+                '〇' | '零' | '一' | '二' | '三' | '四' | '五'
+                    | '六' | '七' | '八' | '九' | '十' | '百' | '千' | '廿' | '卅' | '两'
+            )
+    };
+    t.chars().all(is_num)
+}
+
+/// **页眉式章节元数据**（v1.68.1）：`尔雅 [ 注 ] 二`、`庄子 卷三` 这种
+/// 原书页眉——短、无句读、且带着书名或「注 / 疏」字样。
+///
+/// 判据三条同时成立才算：**≤ 16 字** + **通篇无句读** + **含书名，或含
+/// 「注 / 疏」标记**。识别出来就从正文流里摘掉（它是 TOC 用的元数据，不是
+/// 正文），免得「尔雅 注 二」这种串混进第一列。
+///
+/// ⚠️ **宁可漏判，不可误杀**：`卷 / 篇 / 章 / 回` 这几枚**不算**证据——
+/// 正文里「卷三」「篇上」的短行太多了，凭它们删段是真删内容。只有「书名
+/// 出现在无句读的短行里」（`庄子 卷三`）或「带着注疏标记」（`尔雅[注]二`）
+/// 才动手——这两种要么本来就是页眉，要么注疏内容已由 `[注]` 壳保住了。
+pub fn is_running_header(s: &str, book_title: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t.chars().count() > 16 {
+        return false;
+    }
+    if t.chars().any(|c| matches!(c, '。' | '，' | '！' | '？' | '；' | '：' | '、')) {
+        return false;
+    }
+    let has_mark = t.chars().any(|c| matches!(c, '注' | '疏'));
+    let has_book = !book_title.is_empty()
+        && t.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .contains(book_title.trim());
+    has_mark || has_book
+}
+
+/// 第一遍：一巻内的去噪（文本净化 + 丢噪声段 + 丢页眉 / 叶码 + 合并连续重复段
+/// + 砍导航短段堆）。
+///
+/// `book_title` 用来认页眉（`庄子 卷三`）：书名出现在无句读短行里，那行就是
+/// 元数据不是正文。传空串即关闭这条判据（只留「注 / 疏」那条）。
+fn pass1_juan(j: &mut IrJuan, titles: &std::collections::HashSet<String>, book_title: &str) {
     for b in j.blocks.iter_mut() {
         match b {
             IrBlock::Para(spans) | IrBlock::Annotation { spans, .. } => {
@@ -245,11 +566,11 @@ fn pass1_juan(j: &mut IrJuan, titles: &std::collections::HashSet<String>) {
             IrBlock::SubHead { text, .. } => *text = denoise_text(text),
         }
     }
-    // 丢噪声段（含净化后变空的段）
+    // 丢噪声段（含净化后变空的段）+ 丢页眉 / 汉字叶码（v1.68.1）
     j.blocks.retain(|b| match b {
         IrBlock::Para(spans) | IrBlock::Annotation { spans, .. } => {
             let t = spans_line(spans);
-            !t.trim().is_empty() && !is_noise_para(&t)
+            !t.trim().is_empty() && !is_noise_para(&t) && !is_running_header(&t, book_title)
         }
         IrBlock::HeadNote(t) => !t.trim().is_empty(),
         IrBlock::SubHead { text, .. } => !text.trim().is_empty(),
@@ -752,8 +1073,11 @@ pub fn clean_book_with(book: &mut Book, source: IrSource, opts: &CleanOpts) {
 
     // ---- 第一遍：去噪（所有格式都做，减法最安全） ----
     if opts.denoise {
+        // 页眉认「书名出现在无句读短行里」，书名在 `clean_book_with` 之后可能
+        // 被截短（12 字），故这里取当前书名即可——长书名也只会让判据更严。
+        let book_title = book.title.clone();
         for j in ir.juans.iter_mut() {
-            pass1_juan(j, &titles);
+            pass1_juan(j, &titles, &book_title);
         }
         ir.juans.retain(|j| !j.is_empty() || !j.title.trim().is_empty());
     }
@@ -960,5 +1284,123 @@ mod tests {
         let once = clean_line("道（本原）可道");
         let twice = clean_line(&once);
         assert_eq!(once, twice, "清洗不幂等：{once} -> {twice}");
+    }
+
+    // ── v1.68.1：注疏「只去壳、留肉身」的防误杀边界 ──────────────────
+
+    /// **头号红线**：`正文[注]注疏内容[/注]正文` 洗完必须**注疏内容一字不少**，
+    /// 且正文里**一个方括号都不留**。这是用户亲手指定的防误杀用例。
+    #[test]
+    fn note_shells_lose_only_the_shell_never_the_meat() {
+        let raw = "正文[注]注疏内容[/注]正文";
+        let kept = note_content_only(raw);
+        assert_eq!(kept, "正文注疏内容正文", "注疏肉身被动了：{kept}");
+        assert!(kept.contains("注疏内容"), "注疏内容丢了：{kept}");
+        assert!(!kept.contains("[注]"), "壳没去干净：{kept}");
+        assert!(!kept.contains('[') && !kept.contains(']'), "方括号进正文了：{kept}");
+        // 规范化那一道同样只换壳、不动肉身：壳必须成对留着，好让排版层落成夹注。
+        let norm = normalize_note_shells(raw);
+        assert_eq!(norm, raw, "规范化的壳不该改变合法输入：{norm}");
+        assert!(norm.contains("[注]注疏内容[/注]"), "夹注壳被破坏：{norm}");
+    }
+
+    /// 带空格 / 全角空格 / 疏体 / 全角斜杠的壳，一律归一成 `[注]…[/注]`，
+    /// **肉身照旧**。
+    #[test]
+    fn spaced_and_shu_shells_are_normalized_not_deleted() {
+        let s = normalize_note_shells("正文[ 注 ]某某曰：某，某也。[/注]正文");
+        assert!(s.contains("[注]某某曰：某，某也。[/注]"), "疏/空格壳没归一：{s}");
+        assert!(s.contains("某某曰"), "注疏肉身丢了：{s}");
+
+        let s = normalize_note_shells("甲[疏]某某曰：某也。[/疏]乙");
+        assert!(s.contains("[注]某某曰：某也。[/注]"), "疏体壳没转注：{s}");
+        assert!(!s.contains("[疏]"), "疏体壳残留：{s}");
+
+        // 全角斜杠 `／` 的收口壳（`[／注]`）同样归一成 `[/注]`。
+        assert_eq!(normalize_note_shells("甲[注]某某[／注]乙"), "甲[注]某某[/注]乙");
+        assert_eq!(normalize_note_shells("甲[　注　]乙[/注]丙"), "甲[注]乙[/注]丙");
+
+        // 空壳（只有壳没有肉）：连壳消失，不许在版心留一枚孤零零的标记。
+        assert_eq!(normalize_note_shells("甲[注][/注]乙"), "甲乙");
+        // 不认识的方括号：只削括号，**里头的字一个不少**（[12] → 12）。
+        assert_eq!(normalize_note_shells("甲[12]乙"), "甲12乙");
+        assert_eq!(normalize_note_shells("甲[一]乙"), "甲一乙");
+        // 落单的半截括号直接删。
+        assert_eq!(normalize_note_shells("甲[乙"), "甲乙");
+        assert_eq!(normalize_note_shells("甲]乙"), "甲乙");
+        // 带参数的自家标记：连壳原样放行（下游还要靠它认注音 / 数字）。
+        assert_eq!(normalize_note_shells("长[拼音:cháng]江"), "长[拼音:cháng]江");
+        assert_eq!(normalize_note_shells("号[数字:978-7]"), "号[数字:978-7]");
+    }
+
+    /// HTML 同理：`<span class="note">注疏内容</span>` **只剥标签，留内容**。
+    #[test]
+    fn html_note_span_keeps_its_text() {
+        let s = denoise_text("<span class=\"note\">注疏内容</span>");
+        assert_eq!(s, "注疏内容", "标签没剥 / 内容被吞：{s}");
+        assert!(!s.contains('<') && !s.contains('>'), "尖括号漏进正文：{s}");
+        // 混在正文里的同样只去壳：前后正文 + 注疏内容一个字都不能少。
+        let s = denoise_text("正文<span class=\"note\">某某曰</span>正文");
+        assert_eq!(s, "正文某某曰正文", "内容被动了：{s}");
+        // 走完整清洗链（`clean_line`）也是同一个结论。
+        assert_eq!(clean_line("正文<span class=\"note\">某某曰</span>正文"), "正文某某曰正文");
+    }
+
+    /// 头部幽灵（BOM / YAML 元数据 / 全角空格 / 连续空行）：第一列第一个字
+    /// 必须是**真字**，不许有任何前导空白。
+    #[test]
+    fn head_junk_never_reaches_the_first_column() {
+        let raw = "\u{FEFF}---\ntitle: 庄子\nauthor: 某人\n---\n\u{3000}\u{3000}　道可道，非常道。\n\n\n\n\n名可名，非常名。";
+        let s = strip_head_junk(raw);
+        assert!(s.starts_with("道可道"), "首字没顶格：{s:?}");
+        assert!(!s.contains("title:"), "YAML 头没剥：{s:?}");
+        assert!(!s.contains('\u{FEFF}'), "BOM 残留：{s:?}");
+        assert!(!s.starts_with('\u{3000}') && !s.starts_with(' '), "段首缩进没清零：{s:?}");
+        // 连续 3 个以上空行折成至多一个空行：段与段之间不会插进幽灵空段。
+        assert!(!s.contains("\n\n\n"), "幽灵空行没折叠：{s:?}");
+        // 全文也没被洗没。
+        assert!(s.contains("名可名，非常名。"), "正文被误删：{s:?}");
+    }
+
+    /// 汉字叶码（`十三` / `六`）与页眉（`尔雅 [ 注 ] 二`）不进正文流；
+    /// 带上下文的（`十三年`）绝不误杀。
+    #[test]
+    fn lone_numbers_and_running_headers_are_filtered() {
+        assert!(is_lone_number_para("十三"));
+        assert!(is_lone_number_para("六"));
+        assert!(is_lone_number_para("四十二"));
+        assert!(is_lone_number_para("１２"));
+        assert!(!is_lone_number_para("十三年"), "带上下文的数字被误判：");
+        assert!(!is_lone_number_para("卷十三"));
+
+        assert!(is_running_header("尔雅 [ 注 ] 二", "尔雅"), "页眉没认出来");
+        assert!(is_running_header("庄子 卷三", "庄子"), "带书名的页眉没认出来");
+        assert!(!is_running_header("道可道，非常道。", "尔雅"), "正文被当页眉：");
+        assert!(!is_running_header("卷三", "尔雅"), "无书名的短行不许凭『卷』删：");
+
+        // 端到端：这两段都得从正文流里消失。
+        let mut b = book_of(vec![(
+            "卷一",
+            vec!["道可道，非常道。", "十三", "尔雅 [ 注 ] 二", "名可名，非常名。"],
+        )]);
+        b.title = "尔雅".to_string();
+        clean_book(&mut b, crate::ir::IrSource::Txt);
+        let body: String = b
+            .chapters
+            .iter()
+            .flat_map(|c| c.paragraphs.iter())
+            .map(|p| p.text.as_str())
+            .collect();
+        assert!(!body.contains("十三"), "汉字叶码没滤掉：{body}");
+        assert!(!body.contains("尔雅"), "页眉没滤掉：{body}");
+        assert!(body.contains("道可道，非常道。"), "正文被误杀：{body}");
+    }
+
+    /// 落单的书名号删掉，成对的原样留着（下游转 ︽︾ 作悬挂标点）。
+    #[test]
+    fn orphan_title_marks_stripped_but_pairs_kept() {
+        assert_eq!(strip_orphan_title_marks("甲》乙"), "甲乙");
+        assert_eq!(strip_orphan_title_marks("读《庄子》"), "读《庄子》");
+        assert_eq!(strip_orphan_title_marks("读《庄子"), "读庄子");
     }
 }

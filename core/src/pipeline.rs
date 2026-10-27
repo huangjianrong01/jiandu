@@ -184,6 +184,13 @@ pub fn classicize(s: &str) -> String {
     // 破折号竖排化与 EPUB 那条链同源（`vclean::dash_to_vertical`）：
     // 横躺的 `——` 在竖排里就是一根拦腰截断行气的横杠。
     let s = crate::vclean::dash_to_vertical(s);
+    // **注疏壳先归一、只去壳留肉身**（v1.68.1）：`[ 注 ]` / `[疏]` / `[/疏]`
+    // → `[注]` / `[/注]`。必须在 `purge_bracket_marks` **之前**——那一位只认
+    // 自家的定长壳，认不出的 `[ 注 ]` 会被当杂质连括号削掉、把「注」当成
+    // 正文印在版心（注疏正文虽留着，却再也不成夹注了）。
+    let s = crate::cleaner::normalize_note_shells(&s);
+    // 落单的书名号（跨段截断的半个《》）删掉，成对的留给下游转 ︽︾。
+    let s = crate::cleaner::strip_orphan_title_marks(&s);
     // 现代括号不进正文流（与 `parsers::cleanup_ancient_text` 同源）：EPUB
     // 那条链也走这里，两链一致才不会「时有时无」。
     let s = crate::parsers::purge_bracket_marks(&s);
@@ -248,7 +255,11 @@ fn is_numeral(c: char) -> bool {
 
 /// txt → 标准章数组。
 pub fn parse_txt(text: &str) -> Vec<RawChapter> {
-    let norm = text.replace("\r\n", "\n").replace('\r', "\n");
+    // 头部幽灵先切一刀（BOM / 零宽 / 全角空格 / YAML 元数据块 / 连续空行）：
+    // 它们每一个都占一个正文字格，留着就是第一列顶部的「幽灵空行」。
+    let norm = crate::cleaner::strip_head_junk(
+        &text.replace("\r\n", "\n").replace('\r', "\n"),
+    );
     let mut chapters: Vec<RawChapter> = Vec::new();
     let mut title = "正文".to_string();
     let mut paras: Vec<String> = Vec::new();
@@ -1198,7 +1209,13 @@ pub fn split_notes(s: &str) -> (String, Vec<(usize, String)>) {
                 None => (tail, ""),
             };
             // 宿主 = 标记前那个已输出的正文字（段首无字则锚在首字上）。
-            let at = out.chars().count().saturating_sub(1);
+            // 先 `trim_end()` 再数：`尔雅 [注] 二…` 这种带尾空格的，按下标算到
+            // 空格之后会在下游 trim 时越界，整条注文连肉身一起被丢（真丢内容）。
+            // 宿主下标取「**去掉尾部空白后**的最后一个字」：`[注]` 前面带着
+            // 空格时（`尔雅 [注] 二…`），按未去尾空白算的下标会落在空格之后，
+            // 下游 `denoise_text` 一 trim 就越界 → 整条夹注连同注疏正文一起
+            // 被当无宿主丢掉。绝不能让「去壳」变成「丢肉身」。
+            let at = out.trim_end().chars().count().saturating_sub(1);
             let text = body.trim();
             if !text.is_empty() {
                 notes.push((at, text.to_string()));
@@ -1342,7 +1359,11 @@ pub fn split_body_marks(s: &str) -> (String, Vec<EmphSpan>, Vec<GlossMark>) {
                 Some(i) => (&tail[..i], &tail[i + "[/注]".len()..]),
                 None => (tail, ""),
             };
-            let at = out.chars().count().saturating_sub(1);
+            // 宿主下标取「**去掉尾部空白后**的最后一个字」：`[注]` 前面带着
+            // 空格时（`尔雅 [注] 二…`），按未去尾空白算的下标会落在空格之后，
+            // 下游 `denoise_text` 一 trim 就越界 → 整条夹注连同注疏正文一起
+            // 被当无宿主丢掉。绝不能让「去壳」变成「丢肉身」。
+            let at = out.trim_end().chars().count().saturating_sub(1);
             let text = body.trim();
             if !text.is_empty() {
                 notes.push((at, text.to_string()));
@@ -1358,6 +1379,15 @@ pub fn split_body_marks(s: &str) -> (String, Vec<EmphSpan>, Vec<GlossMark>) {
 }
 
 pub fn paragraph_of(line: &str) -> Paragraph {
+    // 注疏壳先规范化（`[ 注 ]` / `[疏]` / `[/疏]` → `[注]` / `[/注]`）。
+    // 只去壳、留肉身：注疏正文一个字都不动，方括号一个都不留。
+    // 没有 `[` 时整段借走，一个字节都不多分配（大书导入的热路径）。
+    let line = if line.contains('[') {
+        std::borrow::Cow::Owned(crate::cleaner::normalize_note_shells(line))
+    } else {
+        std::borrow::Cow::Borrowed(line)
+    };
+    let line = line.as_ref();
     let line = strip_digit_marks(line);
     // 一趟摘净着重与夹注（下标同源，见 `split_body_marks`），再摘注音。
     let (clean, spans, notes) = split_body_marks(&line);
@@ -1685,6 +1715,47 @@ mod tests {
         assert_eq!(ruby.at, 0);
         assert_eq!(ruby.text, "xuán");
         assert_eq!(ruby.len, 1);
+    }
+
+    /// v1.68.1 防误杀：带空格的 `[ 注 ]` / 疏体 `[疏]` 必须**连同注疏正文**
+    /// 落成夹注，绝不能把「注疏内容」当正文印、更不能留方括号在版心。
+    #[test]
+    fn spaced_note_shell_becomes_inline_note_meat_intact() {
+        use crate::types::NoteKind;
+        let p = paragraph_of("正文[ 注 ]注疏内容[/注]正文");
+        assert_eq!(p.text, "正文正文", "标记不得进正文：{:?}", p.text);
+        assert!(!p.text.contains('[') && !p.text.contains(']'), "方括号漏进正文：{:?}", p.text);
+        let note = p
+            .notes
+            .iter()
+            .find(|n| n.kind == NoteKind::Note)
+            .expect("应落成一条夹注");
+        assert_eq!(note.text, "注疏内容", "注疏肉身丢了 / 被动过：{:?}", note.text);
+
+        // 疏体壳同理（疏也是注）。
+        let p = paragraph_of("甲[疏]某某曰：某也。[/疏]乙");
+        assert!(!p.text.contains('['), "疏体壳漏进正文：{:?}", p.text);
+        let note = p.notes.iter().find(|n| n.kind == NoteKind::Note).unwrap();
+        assert_eq!(note.text, "某某曰：某也。", "疏文丢了：{:?}", note.text);
+    }
+
+    /// v1.68.1 真·内容丢失回归：`[注]` 前面带尾空格时，宿主下标按未去尾空白
+    /// 算会越界，整条夹注（**连同注疏正文**）被静默丢掉。去壳绝不能丢肉身。
+    #[test]
+    fn note_after_trailing_space_keeps_its_body() {
+        use crate::types::NoteKind;
+        let p = paragraph_of("尔雅 [注] 二落单书名号一段话。");
+        assert_eq!(p.text.trim(), "尔雅", "正文被动了：{:?}", p.text);
+        let note = p
+            .notes
+            .iter()
+            .find(|n| n.kind == NoteKind::Note)
+            .expect("注文被丢了——注疏正文跟着一起没了");
+        assert_eq!(note.text, "二落单书名号一段话。", "注疏肉身不全：{:?}", note.text);
+        // 没尾空格时下标本来就对，别改坏。
+        let p = paragraph_of("甲乙[注]丙丁");
+        assert_eq!(p.text, "甲乙");
+        assert!(p.notes.iter().any(|n| n.text == "丙丁"));
     }
 
     #[test]

@@ -349,8 +349,12 @@ fn is_heading(l: &str) -> bool {
 /// 切章与清洗统一交给 [`crate::pipeline::parse_txt`]：认「第 X 章/回/卷/节」，
 /// 通篇无标题且超长按 3000 字切卷，标点转全角、数字转汉字。
 pub fn book_from_plaintext(fallback_title: &str, text: &str) -> Book {
-    let (detected, author) = detect_title_author(text);
-    let chapters = crate::pipeline::parse_txt(text);
+    // 头部幽灵先切一刀（BOM / 零宽 / 全角空格 / YAML 元数据块 / 连续空行）：
+    // 书名自动识别看的是「第一行」，不先洗就会把 `---` / `title:` 认成书名。
+    // 切章（`parse_txt`）内部还会再洗一次，两次结果一致（幂等）。
+    let clean = crate::cleaner::strip_head_junk(text);
+    let (detected, author) = detect_title_author(&clean);
+    let chapters = crate::pipeline::parse_txt(&clean);
     let mut book = crate::pipeline::chapters_to_book(fallback_title, &author, chapters);
     // 书名：正文首行识别出来的优先，其次文件名。
     let title = if detected.is_empty() {
@@ -364,7 +368,7 @@ pub fn book_from_plaintext(fallback_title: &str, text: &str) -> Book {
     if book.chapters.is_empty() {
         book.chapters.push(Chapter {
             title: "正文".into(),
-            paragraphs: vec![para_of(text)],
+            paragraphs: vec![para_of(&clean)],
         });
     }
     book
@@ -1394,6 +1398,10 @@ pub fn import_txt_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> 
     let mut buf: Vec<u8> = Vec::new();
     let mut done: usize = 0;
     let mut head: Vec<String> = Vec::new(); // 前几行留着认书名 / 作者
+    // YAML / TOML 式元数据块（`---` … `---`）：notion / Obsidian / Jekyll 导出的
+    // txt 常见。整块跳过——否则 `title:` `author:` 会变成第一章的第一段，
+    // 第一列顶上凭空多出几行洋文。
+    let mut front: u8 = 0; // 0=还没定 1=块内 2=已剥完
 
     loop {
         buf.clear();
@@ -1411,9 +1419,24 @@ pub fn import_txt_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> 
         } else {
             encoding_rs::GBK.decode(&buf).0.into_owned()
         };
-        let l = line.trim();
+        let l = line.trim().trim_start_matches('\u{FEFF}').trim();
         if l.is_empty() {
             continue;
+        }
+        // 元数据块：只判开头那一段，块一收口就再也不问（`front == 2`）。
+        if front != 2 {
+            if front == 0 {
+                if l == "---" {
+                    front = 1;
+                    continue;
+                }
+                front = 2; // 第一行不是 `---` → 压根没有元数据块
+            } else {
+                if l == "---" || l == "..." {
+                    front = 2;
+                }
+                continue; // 块内一律丢
+            }
         }
         if head.len() < 6 {
             head.push(l.to_string());

@@ -273,8 +273,10 @@ impl UniversalParser {
 
 /// **古籍化后处理**：所有格式解析出的文本最终都必须流经此函数。
 ///
-/// 四道工序，顺序有讲究：
+/// 七道工序，顺序有讲究：
 ///
+/// 0. **头部幽灵**（v1.68.1）：BOM / 零宽 / 全角空格 / 多余空行 / YAML 元数据
+///    块一律切除——它们是「第一列顶部幽灵空行」的元凶；
 /// 1. **页码孤行**：纯数字（≥4 位）独占一行的，按漏网 EPUB 页码整行删掉
 ///    （绝不混入正文）；
 /// 2. **数字强制汉字化**：所有连续阿拉伯数字（含全角）转汉字——竖排里
@@ -287,14 +289,24 @@ impl UniversalParser {
 /// 保护——它们的内部绝不被标点 / 实体清洗碰到，否则 `[拼音:hàn]` 的冒号
 /// 会被转全角、断掉注音解析。
 pub fn cleanup_ancient_text(text: &str) -> String {
+    // 0) 头部幽灵（BOM / 零宽 / 全角空格 / 连续空行 / YAML 头）：必须在最前面
+    //    ——后面的工序都按「行」走，行首那几个看不见的字符一留下来就会占字格。
+    let s = crate::cleaner::strip_head_junk(text);
     // 1) 页码孤行（在任何数字转汉字之前——否则会被当成数字转成汉字）。
-    let s = strip_page_lines(text);
+    let s = strip_page_lines(&s);
     // 2) 先卸掉历史 `[数字:…]` 壳，让里面的数字也能被汉字化。
     let s = crate::pipeline::strip_digit_marks(&s);
     // 3) 阿拉伯数字 → 汉字（纪年逐字读、一般按数值读，最长 6 位，字母/# 粘连跳过）。
     let s = crate::numcn::normalize_numbers(&s);
     // 4) HTML 残片：`<br>` → 换行、实体还原、去标签。
     let s = strip_html_residue(&s);
+    // 4.5) **注疏标签只去壳、留肉身**（v1.68.1）：`[ 注 ]` / `[疏]` / `[/疏]`
+    //    一律规范化成自家的 `[注]` / `[/注]`；不认识的方括号**只削括号**，
+    //    里头的字一个不少地留下。放在标点化之前——规范好壳，下一步的
+    //    「标记保护」才认得出它们，注疏正文才不会被当正文标点化。
+    let s = crate::cleaner::normalize_note_shells(&s);
+    // 4.6) 落单的书名号：跨段截断的《》删掉（成对的转 ︽︾，见工序 5）。
+    let s = crate::cleaner::strip_orphan_title_marks(&s);
     // 5) 标点竖排化 + 书名号 / 省略号：只对标记之外的文本跑（标记保护）。
     let s = crate::vclean::map_outside_markers(&s, cleanup_punct_inner);
     // 5.5) 现代括号（`〔…〕` / `【…】` / `[…]`）一律不许进正文流：短的转
@@ -1537,3 +1549,4 @@ mod tests {
         assert!(!dirty, "真实网页清洗不干净");
     }
 }
+

@@ -3,7 +3,7 @@ members = ["core"]
 
 [package]
 name = "jiandu"
-version = "1.68.0"
+version = "1.68.1"
 edition = "2021"
 description = "笺读 · 一个用 Rust + GPUI 写的原生中文阅读器（古文竖笺 / 现代横笺）"
 license = "MIT"
