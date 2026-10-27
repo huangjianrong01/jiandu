@@ -21,6 +21,8 @@
 #![allow(clippy::too_many_arguments)]
 
 mod app;
+/// **卡片匣**（v1.74.0）：跨书摘录卡的 UI 层（落盘见 `jiandu_core::cards`）。
+mod cards;
 // v1.71.0：剪贴板唯一入口（原生 NSPasteboard，取代 osascript / pbpaste）。
 mod clipboard;
 mod exporter;

@@ -7,7 +7,8 @@
 //! 落盘的是**清洗之后的纯文本**（`Chapter` 的段落与夹注），不是原始 EPUB
 //! 字节，所以取回即可直接排版，不必再跑一遍清洗管线。
 //!
-//! 表结构极简：`books`（书目元数据）+ `chapters`（一章一行，正文 JSON）。
+//! 表结构极简：`books`（书目元数据）+ `chapters`（一章一行，正文 JSON）+
+//! `cards`（卡片匣，v1.74.0）。
 //! 一章上限 5000 字（见 [`MAX_CHAPTER_CHARS`]），故单行 JSON 约 10KB，
 //! 单行读取飞快——这正是「翻到章末才去取下一章」能丝滑的前提。
 
@@ -122,6 +123,8 @@ fn init(c: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_chapters_book ON chapters(store_id);",
     )
     .context("建章节仓库表失败")?;
+    // v1.74.0：卡片匣与章节同库（`IF NOT EXISTS`，老库升级自动补表，零迁移）。
+    crate::cards::init(c)?;
     Ok(())
 }
 

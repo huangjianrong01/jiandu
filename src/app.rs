@@ -148,6 +148,8 @@ pub enum AppUIState {
     Toc,
     /// 分享卡片浮层。
     Share,
+    /// 卡片匣（v1.74.0）：跨书摘录卡。
+    Cards,
     /// 书签抽屉。
     Bookmarks,
 }
@@ -335,6 +337,10 @@ pub struct Root {
     pub notes: std::collections::HashMap<usize, String>,
     /// 笔记面板是否展开。
     pub show_notes_panel: bool,
+    /// 卡片匣侧栏（v1.74.0）：跨书摘录卡的汇集处，与朱批录同为右滑侧栏。
+    pub show_cards: bool,
+    /// 匣中卡片（开栏时从库里读一次，增删后重读；不每帧查询）。
+    pub cards: Vec<jiandu_core::cards::Card>,
     /// 笔记编辑态：true 时正文区弹出浮层编辑栏，键盘全部路由给编辑。
     pub note_editing: bool,
     /// 编辑栏正在改的是**哪条注文**：`Some((chapter, para, offset))` 表示
@@ -605,6 +611,10 @@ pub struct Root {
     pub notes_slide: f32,
     pub notes_target: bool,
     pub notes_animating: bool,
+    /// 卡片匣侧栏滑入 / 滑出动画（v1.74.0，与朱批录同款逐帧推进）。
+    pub cards_slide: f32,
+    pub cards_target: bool,
+    pub cards_animating: bool,
     /// 检索侧栏滑入 / 滑出动画。
     pub search_slide: f32,
     pub search_target: bool,
@@ -627,11 +637,11 @@ pub struct Root {
     /// 不等合成器翻页就会把浮层一起截进去（12 用户模拟报告 P2#2）。
     pub png_export: Option<PngStage>,
 
-    /// 导出收尾的临时提示（v1.52.3）：成功路径 / 失败原因 / 用户取消，都送到
-    /// 底部正中间那行（与导出进度同一个槽位）——`notice` 只在书架底栏渲染，
-    /// 阅读视图里看不到，导出完用户不知道文件去了哪（P2#3）。
-    /// 下一次交互（点纸面 / 翻页）即清，不常驻。
-    pub export_toast: Option<String>,
+    /// **瞬时提示条**（v1.52.3 起，v1.74.0 由「导出专用」泛化为通用）：
+    /// 导出成功路径 / 失败原因 / 用户取消、入匣回执……都送到底部正中间那行
+    /// 宣纸纸签——`notice` 只在书架底栏渲染，**阅读视图里看不到**（P2#3）。
+    /// 收起三选一：点「关」/ Esc / 点纸面；下一次交互即清，不常驻。
+    pub toast: Option<String>,
 
     /// 窄屏首次提示的显示态（v1.52.3，P3#8）：窄屏（手机竖持 / 窗口拉窄）
     /// 单叶阅读时，纸面贴右缘、竖排自右向左——冷启动用户完全找不到正文，
@@ -991,12 +1001,17 @@ impl Root {
             notes_slide: 0.0,
             notes_target: false,
             notes_animating: false,
+            cards_slide: 0.0,
+            cards_target: false,
+            cards_animating: false,
+            show_cards: false,
+            cards: Vec::new(),
             search_slide: 0.0,
             search_target: false,
             search_animating: false,
             png_export: None,
             export_busy: false,
-            export_toast: None,
+            toast: None,
             narrow_hint: false,
             narrow_hint_seen: prefs.narrow_hint_seen,
             book_stat: (0, 0),
@@ -2465,7 +2480,7 @@ impl Root {
                 self.screen = Screen::Reading;
                 self.notice.clear();
                 // 换书即换场景：上一本的导出收尾话不留（v1.52.3）。
-                self.export_toast = None;
+                self.toast = None;
                 // 恢复进度后立刻对齐当前章，目录朱砂红点才不会错位。
                 self.sync_current_chapter();
             }
@@ -2839,7 +2854,7 @@ impl Root {
             Err(e) => {
                 self.export_busy = false;
                 self.notice = e.clone();
-                self.export_toast = Some(e);
+                self.toast = Some(e);
                 cx.notify();
                 return;
             }
@@ -2906,7 +2921,7 @@ impl Root {
                     this.update(&mut cx, |this, cx| {
                         this.export_busy = false;
                         this.notice = msg;
-                        this.export_toast = Some(toast);
+                        this.toast = Some(toast);
                         cx.notify();
                     })
                     .ok();
@@ -3516,6 +3531,7 @@ fn anki_push_card(
             AppUIState::Toc => self.show_toc,
             AppUIState::Share => self.show_share_panel,
             AppUIState::Bookmarks => self.show_bookmarks,
+            AppUIState::Cards => self.show_cards,
             AppUIState::None => false,
         };
         let s = if on { AppUIState::None } else { s };
@@ -3527,6 +3543,7 @@ fn anki_push_card(
         self.show_toc = matches!(s, AppUIState::Toc);
         self.show_share_panel = matches!(s, AppUIState::Share);
         self.show_bookmarks = matches!(s, AppUIState::Bookmarks);
+        self.show_cards = matches!(s, AppUIState::Cards);
         if !self.show_search {
             self.clear_search();
         }
@@ -3538,6 +3555,12 @@ fn anki_push_card(
         self.search_animating = self.show_search || self.search_slide > 0.0;
         self.bookmarks_target = self.show_bookmarks;
         self.bookmarks_animating = self.show_bookmarks || self.bookmarks_slide > 0.0;
+        self.cards_target = self.show_cards;
+        self.cards_animating = self.show_cards || self.cards_slide > 0.0;
+        // 开栏那一刻才去库里取一次（侧栏是低频面板，没必要每帧查）。
+        if self.show_cards {
+            self.reload_cards();
+        }
         self.close_transient_ui();
     }
 
@@ -3551,6 +3574,7 @@ fn anki_push_card(
             || self.show_help
             || self.show_share_panel
             || self.show_bookmarks
+            || self.show_cards
     }
 
     pub fn open_toc(&mut self) {
@@ -4348,7 +4372,7 @@ fn anki_push_card(
         self.clear_selection();
         self.popup = None;
         // 翻页也是「下一次交互」：导出收尾话随翻页清掉（v1.52.3）。
-        self.export_toast = None;
+        self.toast = None;
         // 窄屏引导也跟着走：用户已经在读书了，不用再教（v1.52.3）。
         self.narrow_hint = false;
         self.persist();
@@ -5330,6 +5354,21 @@ impl Render for Root {
                 self.bookmarks_animating = false;
                 if !self.bookmarks_target {
                     self.show_bookmarks = false;
+                }
+            } else {
+                window.request_animation_frame();
+            }
+        }
+        // 卡片匣侧栏滑入 / 滑出（v1.74.0，与书签同款逐帧推进）。
+        if self.cards_animating {
+            let dir = if self.cards_target { 1.0 } else { -1.0 };
+            let step = 0.12;
+            let next = (self.cards_slide + dir * step).clamp(0.0, 1.0);
+            self.cards_slide = next;
+            if (self.cards_target && next >= 1.0) || (!self.cards_target && next <= 0.0) {
+                self.cards_animating = false;
+                if !self.cards_target {
+                    self.show_cards = false;
                 }
             } else {
                 window.request_animation_frame();

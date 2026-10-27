@@ -448,7 +448,7 @@ pub(crate) const BAR_H: f32 = 44.0;
 
 /// 面板选中色的**实际取值**：深底主题（夜读）上这枚朱砂会沉进深纸看不见，
 /// 故向宣纸白提亮一档——界面色与纸面永远反色，不会出现「暗纸上的暗朱」。
-fn sheet_zhu(t: Theme) -> u32 {
+pub(crate) fn sheet_zhu(t: Theme) -> u32 {
     if t.is_dark() {
         crate::theme::mix(ZHU_BASE, 0xF2EAD6, 0.38)
     } else {
@@ -1504,7 +1504,7 @@ impl Root {
                 //  菜单项自身 stop_propagation，不受影响。）
                 this.export_menu = false;
                 // 导出收尾话看完即走：下一次点纸面就清（v1.52.3）。
-                this.export_toast = None;
+                this.toast = None;
                 // 窄屏引导同理：点一下纸面即收（v1.52.3）。
                 this.narrow_hint = false;
                 cx.notify();
@@ -1575,7 +1575,7 @@ impl Root {
         //   * 退出三选一：点右侧「关」/ 按 Esc / 点纸面任一处；
         //   * 单字按钮一律用 CJK（「关」）——U+2715 那类拉丁区符号在 GPUI 里
         //     是零宽，画出来什么都没有（老规矩，见眉批菜单那处注释）。
-        if let Some(toast) = self.export_toast.clone() {
+        if let Some(toast) = self.toast.clone() {
             let (head, sub) = match toast.split_once('\n') {
                 Some((a, b)) => (a.to_string(), b.to_string()),
                 None => (toast, String::new()),
@@ -1622,7 +1622,7 @@ impl Root {
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
-                            this.export_toast = None;
+                            this.toast = None;
                             cx.notify();
                         }),
                     ),
@@ -1675,6 +1675,11 @@ impl Root {
         // 笔记 / 批注浮层。
         if self.show_notes_panel && !self.focus_mode {
             root = root.child(self.render_notes_panel(cx));
+        }
+        // 卡片匣：跨书摘录卡（v1.74.0）。与朱批录同为右滑侧栏，同一时刻只开一个
+        // （`set_ui_state` 互斥保证）。
+        if self.show_cards && !self.focus_mode {
+            root = root.child(self.render_cards_panel(cx));
         }
         // 分享卡片浮层（深底竖排，可存为图片）。
         if self.show_share_panel {
@@ -1760,10 +1765,10 @@ impl Root {
                     //    排在笔记 / 检索编辑态之前——提示条是最轻的一层，
                     //    Esc 先收它；正在编辑笔记时不抢键（那时 Esc 是「弃稿」）。
                     if !self.note_editing
-                        && self.export_toast.is_some()
+                        && self.toast.is_some()
                         && (k == "escape" || k == "Escape" || k == "esc")
                     {
-                        self.export_toast = None;
+                        self.toast = None;
                         cx.notify();
                         return;
                     }
@@ -1863,6 +1868,7 @@ impl Root {
                         self.close_toc();
                         self.show_style = false;
                         self.show_notes_panel = false;
+                        self.show_cards = false;
                         self.show_help = false;
                         self.show_share_panel = false;
                         self.close_lookup();
@@ -2807,7 +2813,7 @@ impl Root {
         ));
         mid = mid.child(sep());
 
-        // ---- 右组：检索 / 朱批（笔记） / 帮助 ----
+        // ---- 右组：检索 / 朱批（笔记） / 卡片匣 / 帮助 / 导出 ----
         let mut right = div().h(px(BAR_H)).flex().items_center().pr(px(26.0));
         right = right.child(item("检索", self.show_search).on_mouse_down(
             MouseButton::Left,
@@ -2827,6 +2833,15 @@ impl Root {
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.set_ui_state(AppUIState::Notes);
+                cx.notify();
+            }),
+        ));
+        // 卡片匣（v1.74.0）：跨书摘录卡的汇集处。
+        right = right.child(item("卡片匣", self.show_cards).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.set_ui_state(AppUIState::Cards);
                 cx.notify();
             }),
         ));
@@ -3068,7 +3083,7 @@ impl Root {
         let msg = crate::app::panic_payload_to_string(e);
         let text = format!("导出出错：{msg}");
         self.notice = text.clone();
-        self.export_toast = Some(text);
+        self.toast = Some(text);
         // 清掉半途残留的导出作业，避免渲染继续翻面 / 截屏死循环。
         self.png_export = None;
         self.export_menu = false;
@@ -5814,7 +5829,7 @@ impl Root {
             );
         // v1.52.3：PDF / PNG 导出期间，底部正中浮一行极淡的进度读数（P2#3）——
         // 全书导出要翻遍每一面（一万多叶就是一万多帧），没有读数用户以为卡死。
-        // 导出收尾话（成功路径 / 失败 / 取消）经 `export_toast` 送到同一个槽位，
+        // 导出收尾话（成功路径 / 失败 / 取消）经 `toast` 送到同一个槽位，
         // 下一次交互（点纸面 / 翻页）即清。平时这两行都不存在，
         // v1.52.2 的「底部只留页码」不受影响。
         let mut center = div().flex().flex_col().items_center();
@@ -7393,7 +7408,8 @@ impl Root {
         let pad = 6.0;
         // v1.55.0：加一枚「眉批」——选中文字后直接到天头题批，锚点取全书
         // 扁平字符下标（见 `Root::start_margin_note`）。
-        let n: f32 = 8.0; // 查典 / 朱批 / 眉批 / 夹注 / 拓印 / 人名 / 地名 / 书名
+        // v1.74.0：再加一枚「存卡」——选中即入卡片匣（见 `Root::save_selection_card`）。
+        let n: f32 = 9.0; // 查典 / 朱批 / 存卡 / 眉批 / 夹注 / 拓印 / 人名 / 地名 / 书名
         let w = pad * 2.0 + item_w * n + gap * (n - 1.0) + 2.0;
         let h = pad * 2.0 + item_h + 2.0;
         let place = crate::hit::place_card(
@@ -7424,6 +7440,7 @@ impl Root {
         };
         push_btn("查典", &mut items);
         push_btn("朱批", &mut items);
+        push_btn("存卡", &mut items);
         push_btn("眉批", &mut items);
         push_btn("夹注", &mut items);
         push_btn("拓印", &mut items);
@@ -7485,6 +7502,16 @@ impl Root {
                 this.start_note_edit_at(Some(hit_xy));
                 this.popup = None;
                 cx.notify();
+            }),
+        );
+        // 存卡（v1.74.0）：选中即入匣。
+        // ⚠️ 不在这里清 `popup`——没拖选时 `save_selection_card` 要靠
+        // `popup.hit.key` 才知道摘的是哪个字，清早了就取不到锚点。
+        let b_card = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.save_selection_card(cx);
             }),
         );
         let b_margin = items.next().unwrap().on_mouse_down(
@@ -7561,7 +7588,7 @@ impl Root {
             .justify_center()
             .gap(px(gap))
             .child(b_query);
-        for b in [b_note, b_margin, b_gloss, b_copy, b_person, b_place, b_book] {
+        for b in [b_note, b_card, b_margin, b_gloss, b_copy, b_person, b_place, b_book] {
             row = row.child(b);
         }
 
@@ -8289,6 +8316,9 @@ impl Root {
         list = list.child(help_row("拖选文字", "连续划线（竖排同样支持）", t));
         list = list.child(help_row("⌘C", "复制（有选区复制选区，否则整页）", t));
         list = list.child(help_row("笔记框", "⏎ 保存 · Esc 取消 · ← → 移光标 · ⌘V 粘贴", t));
+        // 卡片匣（v1.74.0）：跨书摘录。与朱批不同——朱批长在书里，卡片汇在匣里。
+        list = list.child(help_row("浮签「存卡」", "框选正文后入匣（跨书汇集，书删了卡片还在）", t));
+        list = list.child(help_row("顶栏「卡片匣」", "查看全部卡片 · 点一条跳回原文 · 右侧「删」", t));
 
         // v1.52.3：手势与导出入口、叶页口径补在面板最下方（12 用户模拟报告 P1 / P3#12）。
         list = list.child(help_sec("手势", t));
