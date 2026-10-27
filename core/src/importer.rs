@@ -1539,9 +1539,18 @@ pub fn import_epub_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
     let mut header_seen: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
+    // ── v1.60.0：进度量纲修正（「卡死在 0%」的根因）──────────────────
+    // 旧代码 `sink.advance(fi * 1_000_000 / total, …)` 传的是**千分比**，
+    // 而 `DbSink::advance` 的分母是 `total_hint`（文件字节数，动辄几千万）→
+    // 两者量纲不同，算出来的 pct 恒在 2% 以内，进度条纹丝不动。
+    // 这里改用 `tick` 直报 0~1 的比率（EPUB 只能按「spine 文件数」推进，
+    // 总字数要等解开才知道），并把**已解析字数**写进文案——用户看到的
+    // 是「雕版 37 万字 / 第 120/860 篇」，不是一根死掉的进度条。
+    let mut carved_chars = 0usize;
     for (fi, raw_href) in ordered.iter().enumerate() {
         let file_key = normalize_href(raw_href);
-        sink.advance(fi * 1_000_000 / total, "雕版");
+        let label = format!("雕版 {} 万字 · {}/{}", carved_chars / 10_000, fi, total);
+        sink.tick(fi as f32 / total.max(1) as f32, &label);
         let Ok(html) = read_zip_text(&mut zip, &file_key) else {
             continue;
         };
@@ -1588,6 +1597,8 @@ pub fn import_epub_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
                 if first_idx.is_none() {
                     first_idx = Some(sink.len());
                 }
+                // v1.60.0：进度按**已解析字数**报（下一轮的标签就带它）。
+                carved_chars += chapter.char_count();
                 // **交出去**：切片 + 落盘 + 释放，这一章的正文到此为止。
                 sink.push(chapter);
             }

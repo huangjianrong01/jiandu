@@ -29,6 +29,9 @@ mod ime;
 mod lines;
 mod margin;
 mod note_inject;
+// v1.60.0：惰性分页器（按章分块 + 前缀和索引 + LRU 窗口）。
+// 渲染层只向它要「当前这一叶」，绝不再每帧排全书。
+mod pager;
 mod punct;
 mod reader;
 mod share;

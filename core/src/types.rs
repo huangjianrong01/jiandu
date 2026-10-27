@@ -1193,6 +1193,42 @@ impl Book {
         out
     }
 
+    /// **单章**的字形流（v1.60.0 惰性分页的基石）。
+    ///
+    /// 分页引擎里，**章边界必然收面**（`layout_book_from_opts` 的
+    /// `chapter_start` 分支无条件 `seal!()`），所以「逐章排完再串起来」与
+    /// 「全书一次排完」在数学上等价。由此可以把百万字的排版拆成若干块，
+    /// 只在需要时排其中一块——`to_flow` 的章内实现与全书版逐字一致
+    /// （同一套标点显隐、同一套书名号替换），故两种排法的字序也相同。
+    ///
+    /// 返回的 `Glyph.chapter` 仍是**全书章号** `ci`（不是 0），这样分页引擎
+    /// 判章边界、渲染层反查章节的行为都与全书流一致。
+    pub fn flow_of_chapter(&self, ci: usize, show_punct: bool) -> Vec<Glyph> {
+        let mut out = Vec::new();
+        let Some(ch) = self.chapters.get(ci) else {
+            return out;
+        };
+        for (pi, p) in ch.paragraphs.iter().enumerate() {
+            for (oi, c) in p.text.chars().enumerate() {
+                if !show_punct && is_punct(c) {
+                    continue;
+                }
+                out.push(Glyph {
+                    chapter: ci,
+                    para: pi,
+                    offset: oi,
+                    ch: title_mark(c),
+                    kind: if is_title_mark(c) {
+                        GlyphKind::Attach
+                    } else {
+                        GlyphKind::Char
+                    },
+                });
+            }
+        }
+        out
+    }
+
     /// 把全书拍平成字形流（供分页使用）。
     /// **绝对顶格**：每段之前不再插入任何段首缩进占位——古籍竖排本就
     /// 顶格起排，现代「首行缩进两个字」在此为刻意剔除（v1.52.0 起）。

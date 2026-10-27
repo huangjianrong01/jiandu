@@ -760,6 +760,25 @@ fn first_empty_column(columns: &[Vec<Piece>], text_cols: usize) -> Option<usize>
 /// 这一叶上「收尾」的章号：本章正文到此为止（下一叶是新章首，或已是全书末叶）。
 /// 通常只有一章；短章恰好同叶收尾时，统计表就一行一篇并排列出——正是影印本
 /// 卷尾那条「篇 / 章 / 字」小表的样子。
+/// **惰性版** `chapters_ended_at`（v1.60.0）：只看当前叶与下一叶。
+///
+/// 旧版要 `&[Page]` 全量切片（从而逼着渲染层每帧排全书）；渲染层现在手里
+/// 只有当前叶 + 下一叶，故另开这一版——旧函数与它的测试原样留着。
+fn chapters_ended_at_pair(cur: &Page, next: Option<&Page>, is_last: bool) -> Vec<usize> {
+    // 下一叶仍出现的章：正文还没收完，统计表不赶它。
+    let carries_on: std::collections::HashSet<usize> = next
+        .map(|p| p.glyphs.iter().map(|g| g.chapter).collect())
+        .unwrap_or_default();
+    let mut seen: Vec<usize> = Vec::new();
+    for g in &cur.glyphs {
+        if !seen.contains(&g.chapter) {
+            seen.push(g.chapter);
+        }
+    }
+    seen.retain(|&c| is_last || !carries_on.contains(&c));
+    seen
+}
+
 fn chapters_ended_at(pages: &[Page], idx: usize) -> Vec<usize> {
     let Some(cur) = pages.get(idx) else {
         return Vec::new();
@@ -907,6 +926,13 @@ impl Root {
     }
 
     pub fn render_reading(&mut self, cx: &mut Context<Self>) -> Div {
+        // v1.60.0 **帧率探针**：`JIANDU_FPS=1` 时把每帧耗时打到 stderr。
+        // 验收就靠它——旧架构 308 万字的书是 107ms/帧，现在应当是个位数
+        // 毫秒（60 FPS 的预算是 16.7ms）。从终端跑二进制才看得到：
+        //   JIANDU_FPS=1 dist/笺读.app/Contents/MacOS/jiandu
+        let t_frame = std::env::var("JIANDU_FPS")
+            .ok()
+            .map(|_| std::time::Instant::now());
         if self.book.is_none() {
             return self.render_shelf(cx);
         }
@@ -940,21 +966,27 @@ impl Root {
             // 拉宽窗口 / 转横屏：引导当场收起（不留一句白话在宽屏上）。
             self.narrow_hint = false;
         }
-        // 「面 → 列 → 片」一次排好：分页与切列同源（gloss::layout_book），
-        // 双行夹注的跨列流转也在这里定型，渲染侧不再重算。
-        let pages = self.layout_pages_timed();
-        let total = pages.len();
+        // ── v1.60.0：分页**惰性化** ────────────────────────────────
+        // 旧代码在这里调 `layout_pages_timed()`：每帧 `to_flow`(13ms) +
+        // 全书排版(94ms) ≈ 107ms/帧，还要每帧分配 308 万个 Glyph——308 万字的
+        // 《资治通鉴》因此只有个位数帧率（「导入完卡死」的真凶）。
+        // 现在只向分页器要**当前叶与下一叶**：命中缓存是一次 O(log n) 查表，
+        // 没排过才排那一章（最慢一章 0.8ms）。
+        let total = self.total_pages_lazy();
         if self.page >= total {
             self.page = total.saturating_sub(1);
         }
+        let facing = self.duplex == Duplex::Facing;
+        let cur_page = self.page_at(self.page);
+        let next_page = if facing { self.page_at(self.page + 1) } else { None };
         // 每帧重算可见面的注文包围盒（Canvas 命中测试 / 卡片定位用）。
-        self.refresh_note_boxes(&pages);
+        self.refresh_note_boxes(cur_page.as_ref(), next_page.as_ref());
 
         // 双面对开 / 单页由**屏幕方向**驱动（见 fit_sizes）：
         //   · 横屏（宽 > 高，平板 / iPad 横持）→ 双面对开：两叶竖排并排；
         //   · 竖屏（高 ≥ 宽，手机竖持）      → 单页：一叶居中。
         // 两叶均为古籍竖排，读序自右向左。
-        let stage = if self.duplex == Duplex::Facing {
+        let stage = if facing {
             let cur = self.page; // 当前面（右半叶）
             let next = self.page + 1; // 下一面（左半叶）
             // 古籍对开自右向左读：当前面（cur）在右、下一面（next）在左，读序 N → N+1。
@@ -964,12 +996,20 @@ impl Root {
             // 内侧也不留白，两半在纸心直接相接；纸心再立一道「中缝」（版心）。
             // 这样摊开的就是一整张印张，而不是两片孤立的书叶。
             let mut row = div().flex().flex_row().items_start();
-            let left_is_head = pages.get(next).map(|p| p.start_chapter).unwrap_or(false);
-            let cur_is_head = pages.get(cur).map(|p| p.start_chapter).unwrap_or(false);
-            if next < total {
-                row = row.child(self.render_leaf(&pages, next, false, LeafHalf::Left, cx));
-                let ch = pages
-                    .get(cur)
+            let left_is_head = next_page.as_ref().map(|p| p.start_chapter).unwrap_or(false);
+            let cur_is_head = cur_page.as_ref().map(|p| p.start_chapter).unwrap_or(false);
+            if next < total && next_page.is_some() {
+                row = row.child(self.render_leaf(
+                    next_page.as_ref(),
+                    None,
+                    next,
+                    next + 1 >= total,
+                    false,
+                    LeafHalf::Left,
+                    cx,
+                ));
+                let ch = cur_page
+                    .as_ref()
                     .and_then(|p| p.glyphs.first())
                     .map(|g| g.chapter)
                     .unwrap_or(0);
@@ -979,9 +1019,17 @@ impl Root {
                 let detailed = !left_is_head && !cur_is_head;
                 row = row.child(self.render_gutter(ch, cur, detailed));
             }
-            if cur < total {
+            if cur < total && cur_page.is_some() {
                 let edge = if next < total { LeafHalf::Right } else { LeafHalf::Alone };
-                row = row.child(self.render_leaf(&pages, cur, false, edge, cx));
+                row = row.child(self.render_leaf(
+                    cur_page.as_ref(),
+                    next_page.as_ref(),
+                    cur,
+                    cur + 1 >= total,
+                    false,
+                    edge,
+                    cx,
+                ));
             }
             row
         } else {
@@ -994,8 +1042,27 @@ impl Root {
                 .flex_row()
                 .when(narrow, |d| d.justify_end())
                 .when(!narrow, |d| d.justify_center())
-                .child(self.render_leaf(&pages, self.page, false, LeafHalf::Alone, cx))
+                .child(self.render_leaf(
+                    cur_page.as_ref(),
+                    None,
+                    self.page,
+                    self.page + 1 >= total,
+                    false,
+                    LeafHalf::Alone,
+                    cx,
+                ))
         };
+
+        // v1.60.0 帧率探针打点：此刻「分页 + 取当前两叶」这两件最贵的活已
+        // 干完（旧架构正是这里每帧吃掉 107ms），剩下的只是组装元素。
+        if let Some(t0) = t_frame {
+            eprintln!(
+                "[frame] 分页+取叶 {:?}　第 {} 葉 / 共 {} 葉",
+                t0.elapsed(),
+                self.page + 1,
+                total
+            );
+        }
 
         let toolbar = self.render_reading_toolbar(total, cx);
 
@@ -2840,22 +2907,26 @@ impl Root {
     }
 
     /// 渲染一面（一篇叶子）。
+    /// 画一叶。`page` / `next` 由分页器**按需**取来（不再传全量切片），
+    /// `idx` 仍是全局叶号（中缝叶码、注文定位都靠它），`is_last` 代替旧的
+    /// `idx + 1 >= pages.len()` 判定。
     fn render_leaf(
         &self,
-        pages: &[Page],
+        page: Option<&Page>,
+        next: Option<&Page>,
         idx: usize,
+        is_last: bool,
         back: bool,
         edge: LeafHalf,
         cx: &mut Context<Self>,
     ) -> Div {
-        let page = pages.get(idx);
         let glyphs: Vec<Glyph> = page.map(|p| p.glyphs.clone()).unwrap_or_default();
         let start = page.map(|p| p.start_chapter).unwrap_or(false);
         let columns: Vec<Vec<Piece>> = page.map(|p| p.columns.clone()).unwrap_or_default();
         // 章末统计：本章在此收尾（下一葉即新章首，或已是全书末葉）时，
         // 把「篇 / 章 / 字」小表排在正文之后的第一片空列里。
         let stats: Vec<ChapStat> = self
-            .chapters_ended_here(pages, idx)
+            .chapters_ended_pair(page, next, is_last)
             .iter()
             .filter_map(|&c| self.chapter_stat(c))
             .collect();
@@ -2918,7 +2989,9 @@ impl Root {
         // 只在末叶**留白够多**时落印：正文排满时硬盖上去会遮字。
         let used_cols = columns.iter().filter(|c| !c.is_empty()).count();
         let sparse_tail = used_cols * 3 <= columns.len().max(1);
-        if idx + 1 >= pages.len() && !pages.is_empty() && sparse_tail {
+        // v1.60.0：`is_last` 就是旧的「idx+1 >= pages.len()」（渲染层已不再
+        // 持有全量切片），语义完全一致：末叶且尾部留白够多才落牌记。
+        if is_last && page.is_some() && sparse_tail {
             let paper = if back {
                 self.theme.paper_back()
             } else {
@@ -4634,6 +4707,19 @@ impl Root {
     /// ——正是影印本卷尾那条「篇 / 章 / 字」小表的样子。
     fn chapters_ended_here(&self, pages: &[Page], idx: usize) -> Vec<usize> {
         chapters_ended_at(pages, idx)
+    }
+
+    /// 惰性版：当前叶 + 下一叶 + 是否末叶（不再需要全量切片）。
+    fn chapters_ended_pair(
+        &self,
+        cur: Option<&Page>,
+        next: Option<&Page>,
+        is_last: bool,
+    ) -> Vec<usize> {
+        match cur {
+            Some(c) => chapters_ended_at_pair(c, next, is_last),
+            None => Vec::new(),
+        }
     }
 
     /// 章末统计表：照用户给的影印本样式——三列「篇 / 章 / 字」，一行一篇，

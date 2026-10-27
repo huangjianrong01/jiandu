@@ -626,6 +626,14 @@ pub struct Root {
     /// 全书统计（章数, 字数）：开卷时算一次，供章末「篇·章·字」小表的
     /// 「全書」一行使用（逐帧扫全书太贵）。
     pub book_stat: (usize, usize),
+    /// v1.60.0 **惰性分页器**：按章分块 + 前缀和索引 + LRU 窗口。
+    ///
+    /// 渲染循环只向它要「当前这一叶」，**绝不再每帧排全书**——旧架构每帧
+    /// `to_flow`(13ms) + `layout_book`(94ms) ≈ 107ms/帧，是「导入完卡死」的
+    /// 真凶。换书 / 换版式时它会整体作废重来。
+    pub pager: Option<crate::pager::Pager>,
+    /// 卷首题署预留行数的缓存：算它要遍历全书章题，别每帧来一遍。
+    pub inscription_need: Option<usize>,
 
     // ---- 书架（题签网格 / 书脊列表 / 分类 / 搜索 / 排序）----
     /// 书架视图：题签网格（默认）或书脊列表。
@@ -927,6 +935,8 @@ impl Root {
             narrow_hint: false,
             narrow_hint_seen: prefs.narrow_hint_seen,
             book_stat: (0, 0),
+            pager: None,
+            inscription_need: None,
             shelf_view: ShelfView::TitleSlip,
             shelf_sort: ShelfSort::Recent,
             shelf_cat: None,
@@ -2333,6 +2343,10 @@ impl Root {
                 // `render_head_notes` 里，因为此刻才有页锚点（开卷那一刻
                 // 版面还没排，`page_anchor()` 是 None）。只动内存，不写 JSON。
                 self.book = Some(book);
+                // v1.60.0：换书必须作废分页器与题署缓存——两本章数恰好
+                // 相同时若不清，会拿上一本的面数索引去查这一本。
+                self.pager = None;
+                self.inscription_need = None;
                 self.notes = nt;
                 self.underlines = ul.into_iter().collect();
                 self.bookmarks = entry.bookmarks.clone();
@@ -3730,6 +3744,81 @@ fn anki_push_card(
         cx.notify();
     }
 
+    /// 当前版式指纹：它变了的任何一项都会改变面数，故整份分页缓存作废。
+    fn pager_key(&mut self) -> crate::pager::LayoutKey {
+        // 卷首题署预留行数要遍历全书章题，缓存住（换书时清）。
+        let need = match self.inscription_need {
+            Some(v) => v,
+            None => {
+                let v = self.chapter_inscription_need();
+                self.inscription_need = Some(v);
+                v
+            }
+        };
+        crate::pager::LayoutKey {
+            cols: self.grid.columns,
+            rows: self.grid_rows,
+            reserve: crate::gloss::inscription_reserve(need, self.grid_rows),
+            show_punct: self.show_punct,
+            inline_notes: self.notes_inline && self.show_notes,
+            west_mode: !self.han_digits,
+        }
+    }
+
+    /// 让分页器与「当前这本书 + 当前这套版式」对齐。
+    ///
+    /// 换书（章数不同）→ 重建；换列数 / 留白 / 标点显隐 / 夹注开关 → 作废
+    /// 重排（`rekey`）。两者都不变时是空操作，故每帧调它也零成本。
+    fn sync_pager(&mut self) {
+        let n = match &self.book {
+            Some(b) => b.chapters.len(),
+            None => {
+                self.pager = None;
+                return;
+            }
+        };
+        let key = self.pager_key();
+        let store = self.book.as_ref().and_then(|b| b.store_id.clone());
+        let rebuild = match self.pager.as_ref() {
+            Some(p) => p.chapters() != n,
+            None => true,
+        };
+        if rebuild {
+            self.pager = Some(crate::pager::Pager::new(n, key, store));
+        } else if let Some(p) = self.pager.as_mut() {
+            p.rekey(key);
+            p.set_store(store);
+        }
+    }
+
+    /// **取第 `i` 叶**（渲染 / 命中用）：命中缓存就是 O(log n) 的一次查表，
+    /// 没排过才排它所在的那一章。
+    ///
+    /// 旧架构在这里排的是**全书**——现在只排一章（实测最慢一章 0.8ms）。
+    pub fn page_at(&mut self, i: usize) -> Option<crate::gloss::Page> {
+        self.sync_pager();
+        let book = self.book.as_mut()?;
+        let pg = self.pager.as_mut()?;
+        pg.page(book, i)
+    }
+
+    /// 总叶数。第一次调用会把索引探明（hydrate 沿途各章 + 排各章取面数），
+    /// 之后纯查表。开卷首帧一次性付出（308 万字约 0.36s），换来之后每帧
+    /// 60 FPS。
+    pub fn total_pages_lazy(&mut self) -> usize {
+        self.sync_pager();
+        let Some(book) = self.book.as_mut() else {
+            return 0;
+        };
+        let Some(pg) = self.pager.as_mut() else {
+            return 0;
+        };
+        if !pg.is_complete() {
+            pg.scan_all(book);
+        }
+        pg.known_total()
+    }
+
     /// 一列 `rows` 字 = `rows×2` 格、一面 `cols` 列；注文过长会跨列流转，
     /// 排版结果与阅读器里的列布局完全一致（两边同走 `gloss::layout_book`）。
     /// `cols` / `rows` 全部来自网格引擎——同一套分页逻辑适配任意列数。
@@ -3818,24 +3907,29 @@ fn anki_push_card(
     /// 与 `render_reading` 的舞台排布一致。坐标是**版框内纸面坐标**，
     /// 换算窗口坐标走 `gloss::leaf_origin`（见 `note_box_at`）。
     /// 脚注模式（`notes_inline=false`）注文在页脚，不在行内，没有包围盒。
-    pub fn refresh_note_boxes(&mut self, pages: &[crate::gloss::Page]) {
+    /// v1.60.0：只吃**当前叶 + 下一叶**（由分页器按需取来），不再要全量切片
+    /// ——旧签名逼着调用方每帧排全书。
+    pub fn refresh_note_boxes(
+        &mut self,
+        cur: Option<&crate::gloss::Page>,
+        next: Option<&crate::gloss::Page>,
+    ) {
         self.note_boxes.clear();
         if !self.notes_inline || !self.show_notes {
             return;
         }
-        let mut leaves: Vec<(usize, bool)> = Vec::new();
+        let mut leaves: Vec<(usize, bool, &crate::gloss::Page)> = Vec::new();
         if self.duplex == Duplex::Facing {
-            if self.page + 1 < pages.len() {
-                leaves.push((self.page + 1, true));
+            if let Some(p) = next {
+                leaves.push((self.page + 1, true, p));
             }
-            if self.page < pages.len() {
-                leaves.push((self.page, false));
+            if let Some(p) = cur {
+                leaves.push((self.page, false, p));
             }
-        } else if self.page < pages.len() {
-            leaves.push((self.page, false));
+        } else if let Some(p) = cur {
+            leaves.push((self.page, false, p));
         }
-        for (idx, back) in leaves {
-            let Some(pg) = pages.get(idx) else { continue };
+        for (idx, back, pg) in leaves {
             let tc = if pg.start_chapter {
                 self.grid.columns.saturating_sub(1)
             } else {
@@ -5354,5 +5448,248 @@ mod tests {
             draft_move(&d, &mut c, false);
         }
         assert_eq!(c, d.chars().count());
+    }
+
+    /// **排版耗时实测 + 「按章分页 ≡ 全书分页」等价性验证**（v1.60.0）。
+    ///
+    /// 平时 `#[ignore]`（要读真书稿、跑满全书），只在架构决策时手动跑：
+    /// `cargo test --release -- --ignored --nocapture bench_layout`
+    ///
+    /// 它回答两个问题：① 百万字全书排版到底多贵（决定要不要惰性化）；
+    /// ② 逐章排完串起来，与全书一次排是否逐字同面（决定能不能惰性化）。
+    #[test]
+    #[ignore]
+    fn bench_layout_and_chapterwise_equivalence() {
+        use std::time::Instant;
+        let home = std::env::var("HOME").unwrap_or_default();
+        let p = std::path::PathBuf::from(&home).join(".jiandu/books/船山遗书.json");
+        if !p.exists() {
+            eprintln!("[bench] 书稿不在，跳过");
+            return;
+        }
+        let t0 = Instant::now();
+        let book = crate::importer::import_json(&p).expect("读稿失败");
+        let chars: usize = book
+            .chapters
+            .iter()
+            .flat_map(|c| c.paragraphs.iter())
+            .map(|q| q.text.chars().count())
+            .sum();
+        println!(
+            "[bench] import {:?}　章 {}　字 {}",
+            t0.elapsed(),
+            book.chapters.len(),
+            chars
+        );
+
+        let cols = 12usize;
+        let rows = 22usize;
+
+        let t1 = Instant::now();
+        let flow = book.to_flow(true);
+        println!("[bench] to_flow {} 字　{:?}", flow.len(), t1.elapsed());
+
+        let t2 = Instant::now();
+        let pages =
+            crate::gloss::layout_book_from_opts(&flow, |_| None, cols, rows, 0, true, false);
+        println!(
+            "[bench] 全书排版 {} 面　{:?}",
+            pages.len(),
+            t2.elapsed()
+        );
+
+        // ---- 按章排：等价性 + 单块耗时 ----
+        let t3 = Instant::now();
+        let mut total2 = 0usize;
+        let mut flat2: Vec<(usize, usize, usize)> = Vec::new();
+        let mut worst = std::time::Duration::ZERO;
+        for ci in 0..book.chapters.len() {
+            let f = book.flow_of_chapter(ci, true);
+            let tc = Instant::now();
+            let ps =
+                crate::gloss::layout_book_from_opts(&f, |_| None, cols, rows, 0, true, false);
+            let el = tc.elapsed();
+            if el > worst {
+                worst = el;
+            }
+            for pg in &ps {
+                for g in &pg.glyphs {
+                    flat2.push((g.chapter, g.para, g.offset));
+                }
+            }
+            total2 += ps.len();
+        }
+        println!(
+            "[bench] 按章排 {} 面　{:?}　最慢一章 {:?}",
+            total2,
+            t3.elapsed(),
+            worst
+        );
+
+        // 只排 3 章（秒开场景：当前章 + 前后各一章）的耗时。
+        let t4 = Instant::now();
+        for ci in 0..book.chapters.len().min(3) {
+            let f = book.flow_of_chapter(ci, true);
+            let _ = crate::gloss::layout_book_from_opts(&f, |_| None, cols, rows, 0, true, false);
+        }
+        println!("[bench] 只排 3 章　{:?}", t4.elapsed());
+
+        let flat1: Vec<(usize, usize, usize)> = pages
+            .iter()
+            .flat_map(|pg| pg.glyphs.iter().map(|g| (g.chapter, g.para, g.offset)))
+            .collect();
+        println!(
+            "[bench] 面数 {} vs {}　字序逐字一致：{}",
+            pages.len(),
+            total2,
+            flat1 == flat2
+        );
+        assert_eq!(pages.len(), total2, "按章排与全书排的面数不一致");
+        assert!(flat1 == flat2, "按章排与全书排的字序不一致");
+    }
+
+    /// **开卷代价实测**（v1.60.0）：`hydrate_all`（从 SQLite 把全书正文读回
+    /// 内存）与全书排版的耗时对比，外加「只 hydrate 当前章」的秒开耗时。
+    ///
+    /// 用**真实的《资治通鉴》**（799 章 / 12072 叶）跑，平时 `#[ignore]`。
+    #[test]
+    #[ignore]
+    fn bench_open_cost_on_real_book() {
+        use std::time::Instant;
+        let home = std::env::var("HOME").unwrap_or_default();
+        let db = std::path::PathBuf::from(&home).join(".jiandu/chapters.db");
+        if !db.exists() {
+            eprintln!("[bench] 没有 chapters.db，跳过");
+            return;
+        }
+        let Ok(conn) = crate::store::connect() else {
+            eprintln!("[bench] 连不上库");
+            return;
+        };
+        // 库里第一本书（真机上是《资治通鉴》）。
+        let Ok(id) = conn.query_row("select store_id from books limit 1", [], |r| r.get::<_, String>(0)) else {
+            eprintln!("[bench] 库里没书");
+            return;
+        };
+        let Ok(meta) = conn.query_row("select meta_json from books where store_id=?1", [&id], |r| r.get::<_, String>(0)) else {
+            eprintln!("[bench] 取不到 meta");
+            return;
+        };
+        let mut book: crate::types::Book = match serde_json::from_str(&meta) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[bench] meta 解析失败：{e}");
+                return;
+            }
+        };
+        let n = crate::store::chapter_count(&conn, &id);
+        book.store_id = Some(id.clone());
+        book.chapters = (0..n)
+            .map(|_| crate::types::Chapter {
+                title: String::new(),
+                paragraphs: Vec::new(),
+            })
+            .collect();
+
+        println!("[bench] 书：{}　章 {}", book.title, n);
+
+        // ① 单章 hydrate（秒开场景：只取当前章）
+        let t0 = Instant::now();
+        let one = crate::stream::hydrate_chapter(&id, n / 2);
+        println!(
+            "[bench] 单章 hydrate {:?}　{} 字",
+            t0.elapsed(),
+            one.as_ref().map(|c| c.char_count()).unwrap_or(0)
+        );
+
+        // ② 全书 hydrate
+        let t1 = Instant::now();
+        crate::stream::hydrate_all(&mut book);
+        let chars: usize = book
+            .chapters
+            .iter()
+            .flat_map(|c| c.paragraphs.iter())
+            .map(|q| q.text.chars().count())
+            .sum();
+        println!("[bench] 全书 hydrate {:?}　{} 字", t1.elapsed(), chars);
+
+        // ③ 全书排版
+        let t2 = Instant::now();
+        let flow = book.to_flow(true);
+        println!("[bench] to_flow {:?}", t2.elapsed());
+        let t3 = Instant::now();
+        let pages =
+            crate::gloss::layout_book_from_opts(&flow, |_| None, 12, 22, 0, true, false);
+        println!("[bench] 全书排版 {} 面　{:?}", pages.len(), t3.elapsed());
+    }
+
+    /// **狂滚实测**（v1.60.0）：用真实的《资治通鉴》模拟「连翻 300 叶」，
+    /// 量每一叶的取页成本（首帧建索引另计）。
+    #[test]
+    #[ignore]
+    fn bench_pager_scroll_300_leaves() {
+        use std::time::Instant;
+        let home = std::env::var("HOME").unwrap_or_default();
+        let db = std::path::PathBuf::from(&home).join(".jiandu/chapters.db");
+        if !db.exists() {
+            eprintln!("[bench] 没有 chapters.db，跳过");
+            return;
+        }
+        let Ok(conn) = crate::store::connect() else { return };
+        let Ok(id) = conn.query_row("select store_id from books limit 1", [], |r| r.get::<_, String>(0)) else { return };
+        let Ok(meta) = conn.query_row("select meta_json from books where store_id=?1", [&id], |r| r.get::<_, String>(0)) else { return };
+        let mut book: crate::types::Book = match serde_json::from_str(&meta) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let n = crate::store::chapter_count(&conn, &id);
+        book.store_id = Some(id.clone());
+        book.chapters = (0..n)
+            .map(|_| crate::types::Chapter { title: String::new(), paragraphs: Vec::new() })
+            .collect();
+
+        let key = crate::pager::LayoutKey {
+            cols: 12,
+            rows: 22,
+            reserve: 0,
+            show_punct: true,
+            inline_notes: false,
+            west_mode: false,
+        };
+        let mut pg = crate::pager::Pager::new(n, key, Some(id));
+
+        // ① 开卷首帧：建索引（hydrate 沿途各章 + 逐章取面数）
+        let t0 = Instant::now();
+        let total = {
+            crate::stream::hydrate_all(&mut book);
+            pg.scan_all(&mut book);
+            pg.known_total()
+        };
+        println!("[bench] 首帧建索引 {:?}　共 {} 叶", t0.elapsed(), total);
+
+        // ② 狂滚 300 叶（每叶都要真的取出来：模拟连续翻页 / 惯性滚动）
+        let t1 = Instant::now();
+        let mut worst = std::time::Duration::ZERO;
+        let mut got = 0usize;
+        for k in 0..300 {
+            let i = (k * 37) % total.max(1); // 跳着取，逼 LRU 换章
+            let t = Instant::now();
+            if pg.page(&mut book, i).is_some() {
+                got += 1;
+            }
+            let el = t.elapsed();
+            if el > worst {
+                worst = el;
+            }
+        }
+        let per = t1.elapsed();
+        println!(
+            "[bench] 连取 300 叶 {:?}（平均 {:?} / 叶，最慢 {:?}）　取到 {} 叶",
+            per,
+            per / 300,
+            worst,
+            got
+        );
+        println!("[bench] LRU 窗口内常驻章数：{}", pg.cache_len());
     }
 }
