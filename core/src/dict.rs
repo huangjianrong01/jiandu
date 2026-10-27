@@ -382,14 +382,19 @@ impl Zishu {
     }
 }
 
-/// 字书缓存落盘路径：`~/.jiandu/zishu.db`（拿不到 HOME 就退回临时目录）。
+/// 字书缓存落盘路径：`Library::home()/zishu.db`。
+///
+/// v1.70.0：与 `store::db_path` 同理，必须跟书架同源，否则沙盒下字书缓存
+/// 会写进容器外的 `~/.jiandu`（沙盒里根本不可写），查词直接降级失效。
+/// 拿不到数据目录就退回临时目录（宁可每次重解，也不崩）。
 fn zishu_cache_path() -> std::path::PathBuf {
-    let dir = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .map(|h| h.join(".jiandu"))
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
-    dir.join("zishu.db")
+    let dir = crate::library::Library::home();
+    if dir.is_dir() {
+        dir
+    } else {
+        std::env::temp_dir()
+    }
+    .join("zishu.db")
 }
 
 /// 落盘并打开只读连接；任何一步失败都返回 `None`（查词降级，绝不崩）。

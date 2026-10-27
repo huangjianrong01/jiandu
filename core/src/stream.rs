@@ -305,8 +305,10 @@ pub fn import_streaming(
 
 /// 取回一章的正文（虚拟化读路径）。
 pub fn hydrate_chapter(store_id: &str, idx: usize) -> Option<Chapter> {
-    let c = store::connect().ok()?;
-    store::load_chapter(&c, store_id, idx).ok().flatten()
+    // v1.70.0：走**缓存的读连接**。旧制每章开一次库（开库 + PRAGMA +
+    // ATTACH 旧库），扫一部 799 章的书冷跳到末叶要 244ms，其中绝大部分是
+    // 重复开库而不是读数据——缓存后整趟只开一次。
+    store::with_read_conn(|c| store::load_chapter(c, store_id, idx).ok().flatten()).flatten()
 }
 
 /// 把骨架 `Book` 的**所有章**取回内存（开卷时用一次）。

@@ -456,15 +456,35 @@ pub fn cn_date_from_str(ymd: &str) -> String {
 }
 
 /// 取系统当前日期的中文形式；失败返回空串（调用方按「不显示」处理）。
+///
+/// v1.70.0：**不再 fork 一个 `date` 子进程**（App Store 沙盒下外部进程
+/// 随时可能被拦，且为了拿一个本地日期去起进程纯属浪费）。改用 Rust 标准
+/// 库自己把 epoch 秒转成日历年月日——闰年规则写死在下面，无第三方依赖，
+/// 2038 年之前都不会错。
 pub fn cn_date_today() -> String {
-    let ymd = match std::process::Command::new("date").arg("+%Y-%m-%d").output() {
-        Ok(o) => match String::from_utf8(o.stdout) {
-            Ok(s) => s.trim().to_string(),
-            Err(_) => return String::new(),
-        },
+    let secs = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
         Err(_) => return String::new(),
     };
-    cn_date_from_str(&ymd)
+    let days = (secs / 86_400) as i64;
+    let (y, m, d) = civil_from_days(days);
+    cn_date_from_str(&format!("{y:04}-{m:02}-{d:02}"))
+}
+
+/// epoch 天 → (年, 月, 日)。Howard Hinnant 的 civil_from_days 算法：
+/// 先按 400 年一循环把日子挪进 [0, 400年) 区间，再逐月减法。纯整数、
+/// 无查表、无依赖。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 // ----------------------------------------------------------------------
@@ -1206,5 +1226,33 @@ mod tests {
         let picked = card_family(Some(0), reader.clone());
         assert!(!picked.is_empty());
         let _ = card_family(Some(99), reader);
+    }
+
+    /// v1.70.0：本地日期换算（换掉 `date` 子进程后必须自证正确）。
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        // 已知锚点：1970-01-01 = day 0。
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // 闰年 2 月 29 日必须存在（2000 / 2024 是闰年，1900 / 2100 不是）。
+        assert_eq!(civil_from_days(days_of(2000, 2, 29)), (2000, 2, 29));
+        assert_eq!(civil_from_days(days_of(2024, 2, 29)), (2024, 2, 29));
+        assert_eq!(civil_from_days(days_of(2024, 3, 1)), (2024, 3, 1));
+        assert_eq!(civil_from_days(days_of(2023, 3, 1)), (2023, 3, 1));
+        // 年末 / 年初跨界。
+        assert_eq!(civil_from_days(days_of(2025, 12, 31)), (2025, 12, 31));
+        assert_eq!(civil_from_days(days_of(2026, 1, 1)), (2026, 1, 1));
+        // 中文渲染。
+        assert_eq!(cn_date_from_str("2026-10-27"), "二〇二六年十月二十七日");
+        assert_eq!(cn_date_from_str("2024-02-29"), "二〇二四年二月二十九日");
+    }
+
+    /// 公历年月日 → epoch 天（与 `civil_from_days` 互逆，单测专用）。
+    fn days_of(y: i64, m: u32, d: u32) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m as i64 - 3 } else { m as i64 + 9 }) + 2) / 5 + d as i64 - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
     }
 }

@@ -714,6 +714,13 @@ const IMPORT_STALL_START: std::time::Duration = std::time::Duration::from_secs(3
 /// 诸子百家 18MB），给足 45 秒，避免误杀。
 const IMPORT_STALL_LATER: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// **渐进铺索引**每帧啃几章（v1.70.0）。
+///
+/// 一章的成本是「SQLite 读一章 + 排一章」≈ 0.14ms，8 章 ≈ 1.1ms——塞进
+/// 一帧里 60 FPS 毫无感觉；799 章的书约 100 帧（1.7 秒）铺满。给太大
+/// 会在铺索引的那几帧掉帧（正是要避免的），给太小则铺得太慢。
+const INDEX_WARM_CHAPTERS: usize = 8;
+
 impl ImportJob {
     /// 起一条后台线程：流式解析 → 逐章落盘 → 结果塞进 `done`。
     pub fn start(path: PathBuf) -> Self {
@@ -5372,6 +5379,21 @@ impl Render for Root {
         let show_seal = self.screen == Screen::Reading && !self.focus_mode && !self.show_toc;
         // v1.50.0：每帧探一眼后台导入（完成就登记入架，没完成就刷新进度）。
         self.poll_import(cx);
+        // v1.70.0：**空闲帧渐进铺索引**。开卷后每帧只啃 8 章（≈1ms，60 FPS
+        // 纹丝不动），一两秒内把全书的「第几叶在第几章」探明；之后点目录
+        // 跳任何一章都是 O(log n) 查表（130µs），根本轮不到「冷跳到末叶」
+        // 那一百多毫秒的卡顿。只在阅读屏做，导入中不去抢它的时间。
+        if self.screen == Screen::Reading && self.import_job.is_none() {
+            let more = match (self.pager.as_mut(), self.book.as_mut()) {
+                (Some(pg), Some(book)) if !pg.is_complete() => {
+                    pg.scan_more(book, INDEX_WARM_CHAPTERS)
+                }
+                _ => false,
+            };
+            if more {
+                cx.notify();
+            }
+        }
         let screen = self.render_screen(cx);
         let key_focus = self.key_focus.clone();
         let mut root = div()
@@ -5788,8 +5810,7 @@ mod tests {
     #[ignore]
     fn bench_layout_and_chapterwise_equivalence() {
         use std::time::Instant;
-        let home = std::env::var("HOME").unwrap_or_default();
-        let p = std::path::PathBuf::from(&home).join(".jiandu/books/船山遗书.json");
+        let p = jiandu_core::library::Library::home().join("books/船山遗书.json");
         if !p.exists() {
             eprintln!("[bench] 书稿不在，跳过");
             return;
@@ -5883,8 +5904,7 @@ mod tests {
     #[ignore]
     fn bench_open_cost_on_real_book() {
         use std::time::Instant;
-        let home = std::env::var("HOME").unwrap_or_default();
-        let db = std::path::PathBuf::from(&home).join(".jiandu/chapters.db");
+        let db = jiandu_core::store::db_path();
         if !db.exists() {
             eprintln!("[bench] 没有 chapters.db，跳过");
             return;
@@ -5956,8 +5976,7 @@ mod tests {
     #[ignore]
     fn bench_pager_scroll_300_leaves() {
         use std::time::Instant;
-        let home = std::env::var("HOME").unwrap_or_default();
-        let db = std::path::PathBuf::from(&home).join(".jiandu/chapters.db");
+        let db = jiandu_core::store::db_path();
         if !db.exists() {
             eprintln!("[bench] 没有 chapters.db，跳过");
             return;
@@ -5983,7 +6002,7 @@ mod tests {
             inline_notes: false,
             west_mode: false,
         };
-        let mut pg = crate::pager::Pager::new(n, key, Some(id));
+        let mut pg = crate::pager::Pager::new(n, key, Some(id.clone()));
 
         // ① 开卷首帧：建索引（hydrate 沿途各章 + 逐章取面数）
         let t0 = Instant::now();
@@ -6018,5 +6037,37 @@ mod tests {
             got
         );
         println!("[bench] LRU 窗口内常驻章数：{}", pg.cache_len());
+
+        // ③ 冷启动跳到最后一叶：模拟「从目录点最后一章 / 恢复书签」。
+        //    索引是空的（`scanned == 0`），`page()` 必须一路扫到末章才拿得到
+        //    那一叶——这一趟全是同步的 SQLite 读 + 逐章排版，若不限流就会
+        //    整帧卡在这里（v1.70.0 要修的正是它）。
+        let fresh_book = || crate::types::Book {
+            store_id: Some(id.clone()),
+            chapters: (0..n)
+                .map(|_| crate::types::Chapter { title: String::new(), paragraphs: Vec::new() })
+                .collect(),
+            ..book.clone()
+        };
+        let mut b2 = fresh_book();
+        let mut pg2 = crate::pager::Pager::new(n, key, Some(id.clone()));
+        let t2 = Instant::now();
+        let target = total.saturating_sub(1);
+        let hit = pg2.page(&mut b2, target).is_some();
+        let el = t2.elapsed();
+        println!(
+            "[bench] 冷跳到末叶 #{} {:?}　命中={}　（>16ms 即掉帧，>100ms 就是用户能感觉到的卡）",
+            target, el, hit
+        );
+        // 半程跳：只扫一半，成本应当约为全程的一半（线性 = 没有隐藏的 O(n²)）。
+        let mut b3 = fresh_book();
+        let mut pg3 = crate::pager::Pager::new(n, key, Some(id.clone()));
+        let t3 = Instant::now();
+        let half = total / 2;
+        let hit3 = pg3.page(&mut b3, half).is_some();
+        println!(
+            "[bench] 冷跳到半程 #{} {:?}　命中={}",
+            half, t3.elapsed(), hit3
+        );
     }
 }

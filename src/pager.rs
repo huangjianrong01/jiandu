@@ -206,9 +206,28 @@ impl Pager {
             let len = self.layout_chapter(book, k).len();
             self.lens[k] = Some(len);
         }
-        // 前缀和：从头累加（799 章 × 每帧几次，比二分还便宜）。
-        let mut acc = 0usize;
-        for k in 0..end {
+        // 前缀和：**只从 `scanned` 续着累加**。`[0, scanned)` 那一段早就
+        // 算过且永不改变，其总和就是 `starts[scanned-1] + lens[scanned-1]`。
+        //
+        // 旧制是 `for k in 0..end` 每推进一章就把全表重加一遍——冷跳到末叶
+        // 要推进 799 次，于是 O(n²) 地白算了 32 万次。改成续加后是 O(n)，
+        // 结果与逐章重算**逐位相同**（前缀和的定义没变）。
+        let mut acc = if self.scanned == 0 {
+            0usize
+        } else {
+            self.starts
+                .get(self.scanned - 1)
+                .copied()
+                .flatten()
+                .unwrap_or(0)
+                + self
+                    .lens
+                    .get(self.scanned - 1)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(0)
+        };
+        for k in self.scanned..end {
             let len = self.lens.get(k).copied().flatten().unwrap_or(0);
             if let Some(slot) = self.starts.get_mut(k) {
                 *slot = Some(acc);
@@ -216,6 +235,24 @@ impl Pager {
             acc += len;
         }
         self.scanned = end;
+    }
+
+    /// **渐进探明**（v1.70.0）：再往前扫 `budget` 章，返回「还有活没干完」。
+    ///
+    /// 为什么要有这个：冷跳到末叶要一路 hydrate + 排 799 章，同步干完就是
+    /// 一帧 115ms 的实打实卡顿。改成开卷后在**空闲帧**里每次只啃几章
+    /// （8 章 ≈ 1ms，60 FPS 纹丝不动），一两秒内把全书索引铺满；之后用户
+    /// 点目录跳任何一章都是 O(log n) 查表（130µs），根本轮不到冷跳。
+    ///
+    /// 扫完了返回 `false`，调用方据此停止请求下一帧。
+    pub fn scan_more(&mut self, book: &mut Book, budget: usize) -> bool {
+        let n = self.lens.len();
+        if n == 0 || self.scanned >= n {
+            return false;
+        }
+        let end = (self.scanned + budget.max(1)).min(n);
+        self.scan_to(book, end - 1);
+        self.scanned < n
     }
 
     /// 探明全书（后台线程干这个）。

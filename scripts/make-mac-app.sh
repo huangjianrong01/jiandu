@@ -14,8 +14,8 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP_NAME="笺读"
 BUNDLE_ID="com.jiandu.app"
-VERSION="1.69.0"
-BUILD_NUM="117"
+VERSION="1.70.0"
+BUILD_NUM="118"
 MIN_MACOS="12.0"
 
 DIST="$ROOT/dist"
@@ -100,6 +100,28 @@ fi
 rm -rf "$ICONSET"
 echo "✓ 图标已就绪"
 
+# ---- 5.5) App Store 上传用的 1024 图标 ----
+# bundle 里的 icns 允许带圆角与透明（Dock / 启动台看着才对）；
+# 但 App Store Connect 另要单独上传一张 1024×1024 的 PNG，**不许有 alpha**——
+# 有透明通道会被直接拒收。做法：把圆角外的空白用图标**自己的主色**填满
+# （合成到白底会露出四个白角，很明显）。
+python3 - "$ICON_SRC" "$DIST/appstore-icon-1024.png" <<'ICONPY'
+from PIL import Image
+import sys, collections
+
+src = Image.open(sys.argv[1]).convert("RGBA").resize((1024, 1024), Image.LANCZOS)
+# 底色 = 非透明像素里的主流颜色（图标自身的纸色），方角填它，天衣无缝。
+cnt = collections.Counter()
+for px in src.resize((64, 64), Image.LANCZOS).getdata():
+    if px[3] > 200:
+        cnt[px[:3]] += 1
+base = cnt.most_common(1)[0][0] if cnt else (255, 255, 255)
+bg = Image.new("RGBA", src.size, base + (255,))
+bg.alpha_composite(src)
+bg.convert("RGB").save(sys.argv[2])
+ICONPY
+echo "✓ App Store 上传用图标：dist/appstore-icon-1024.png（1024×1024，无 alpha）"
+
 # ---- 6) Info.plist ----
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -126,6 +148,16 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>${VERSION}</string>
     <key>CFBundleVersion</key>
     <string>${BUILD_NUM}</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright \u00a9 2026 Jiandu. All rights reserved.</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.books</string>
+    <!-- 不用任何非豁免加密（无网络、无 HTTPS、无加密存档）：声明后
+         App Store Connect 不再索要出口合规文件。 -->
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>「印制笺卡」要把当前这一叶保存成图片，需要读取屏幕上的纸面。</string>
     <key>CFBundleSupportedPlatforms</key>
     <array>
         <string>MacOSX</string>
@@ -146,6 +178,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
                 <string>md</string>
                 <string>markdown</string>
             </array>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>net.daringfireball.markdown</string>
+            </array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
             <key>LSHandlerRank</key>
@@ -157,6 +193,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
             <key>CFBundleTypeExtensions</key>
             <array>
                 <string>txt</string>
+            </array>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.plain-text</string>
             </array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
@@ -170,6 +210,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
             <array>
                 <string>epub</string>
             </array>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>org.idpf.epub-container</string>
+            </array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
             <key>LSHandlerRank</key>
@@ -182,10 +226,56 @@ cat > "$APP/Contents/Info.plist" <<PLIST
             <array>
                 <string>json</string>
             </array>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.json</string>
+            </array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
             <key>LSHandlerRank</key>
             <string>Alternate</string>
+        </dict>
+    </array>
+    <!-- md / epub 不是系统内置 UTI，要在包内自行声明才能被 LaunchServices 认。 -->
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>net.daringfireball.markdown</string>
+            <key>UTTypeDescription</key>
+            <string>Markdown 书籍</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.plain-text</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>md</string>
+                    <string>markdown</string>
+                </array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.idpf.epub-container</string>
+            <key>UTTypeDescription</key>
+            <string>EPUB 电子书</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+                <string>public.composite-content</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>epub</string>
+                </array>
+                <key>public.mime-type</key>
+                <string>application/epub+zip</string>
+            </dict>
         </dict>
     </array>
 </dict>

@@ -14,6 +14,7 @@
 use crate::types::Chapter;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 /// **单章字数的硬上限**（导入时强制）。
@@ -23,12 +24,15 @@ use std::path::PathBuf;
 /// 5000 字对古籍是「一卷」的量级，切在句读处，读起来仍是完整的段落。
 pub const MAX_CHAPTER_CHARS: usize = 5000;
 
-/// 仓库文件：`~/.jiandu/chapters.db`（与书架索引 `~/.jiandu/` 同一处）。
+/// 仓库文件：`Library::home()/chapters.db`（与书架索引**同一处**）。
+///
+/// v1.70.0 起**必须与书架同源**：旧制这里硬拼 `~/.jiandu`，而书架走
+/// `Library::home()`（`~/Library/Application Support/com.jiandu.app`）。
+/// Mac App Store 强制沙盒后 `HOME` 被重定向到容器，两条路径会**分裂成
+/// 两份**：书架索引落在容器里、章节库落在容器外的 `~/.jiandu`，于是「书
+/// 架有这本书、点开却是空白」（反之亦然）。上架必炸，故统一走同一入口。
 pub fn db_path() -> PathBuf {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    home.join(".jiandu").join("chapters.db")
+    crate::library::Library::home().join("chapters.db")
 }
 
 /// 打开仓库（没有就建库建表）。每次操作各开一条连接：导入在后台线程、
@@ -41,7 +45,44 @@ pub fn connect() -> Result<Connection> {
     }
     let c = Connection::open(&p).with_context(|| format!("打开章节仓库失败：{}", p.display()))?;
     init(&c)?;
+    // 老用户的书还在旧库里（见 [`legacy_db_path`]）：只读挂上，查询 miss 时回退。
+    attach_legacy(&c);
     Ok(c)
+}
+
+/// v1.69 及更早的章节库位置：`~/.jiandu/chapters.db`。
+///
+/// v1.70.0 把库统一到 `Library::home()`（书架索引所在处）之后，**老用户
+/// 的书全在旧库里**——只换路径不改回退，书架上的书会集体变空白（骨架在
+/// 新库、正文在旧库，hydrate 取不到任何一章）。实测本机就是：旧库 7 部
+/// 3385 章、新库 1 部 799 章，六本书直接读不出来。
+///
+/// 这里**只读挂载**旧库（`ATTACH … AS legacy`），读 miss 时回退：
+///   · **零写入**：绝不改、绝不删旧库，用户原数据原样留着；
+///   · **沙盒下自动失效**：容器里没有 `~/.jiandu`，挂载失败即跳过，
+///     所以 App Store 版不会因此多要任何权限；
+///   · 之后导入的书一律进新库，旧库自然退役。
+fn legacy_db_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let p = PathBuf::from(home).join(".jiandu").join("chapters.db");
+    // 同一个文件（`JIANDU_HOME` 被指到旧目录时）不必挂两次。
+    if !p.is_file() || p == db_path() {
+        return None;
+    }
+    Some(p)
+}
+
+/// 把旧库以 `legacy` 只读挂到这条连接上；失败一律忽略（旧库损坏 / 沙盒
+/// 里读不到都不该影响新库工作）。
+fn attach_legacy(c: &Connection) {
+    let Some(p) = legacy_db_path() else {
+        return;
+    };
+    // 路径里理论上不会有单引号，仍然转义一次（防御性，成本为零）。
+    let esc = p.display().to_string().replace('\'', "''");
+    if let Err(e) = c.execute_batch(&format!("ATTACH DATABASE '{esc}' AS legacy")) {
+        eprintln!("[jiandu] 旧章节库挂载失败，已忽略：{e}");
+    }
 }
 
 /// 内存库（单测用）：与落盘库同一套表结构，但不碰 `~/.jiandu` 里的真数据。
@@ -135,23 +176,83 @@ pub fn put_chapter(
 /// 空洞，等值查询就会「读到空」。按 `ORDER BY idx … OFFSET n` 取，空洞自然
 /// 被跳过——于是导入末尾再也不必把全表读回内存重写一遍（那部 17MB 的丛书
 /// 光这一趟要 1.1 秒）。
+///
+/// v1.70.0：新库 miss 就回退旧库（见 [`legacy_db_path`]）。
 pub fn load_chapter(c: &Connection, id: &str, n: usize) -> Result<Option<Chapter>> {
-    let mut st = c.prepare(
-        "SELECT json FROM chapters WHERE store_id=?1 ORDER BY idx ASC LIMIT 1 OFFSET ?2",
-    )?;
+    let sql = "SELECT json FROM chapters WHERE store_id=?1 ORDER BY idx ASC LIMIT 1 OFFSET ?2";
+    let mut st = c.prepare(sql)?;
     let mut rows = st.query(params![id, n as i64])?;
-    let Some(row) = rows.next()? else {
-        return Ok(None);
-    };
-    let json: String = row.get(0)?;
-    let ch: Chapter = serde_json::from_str(&json).context("章节 JSON 损坏")?;
-    Ok(Some(ch))
+    if let Some(row) = rows.next()? {
+        let json: String = row.get(0)?;
+        let ch: Chapter = serde_json::from_str(&json).context("章节 JSON 损坏")?;
+        return Ok(Some(ch));
+    }
+    Ok(legacy_chapter(c, id, n))
 }
 
-/// 该书有几章。
+/// 读路径的**线程本地连接缓存**（v1.70.0）。
+///
+/// `hydrate_chapter` 在扫索引时会被调上千次：一部 799 章的书「冷跳到末
+/// 叶」就要 hydrate 799 次。旧制**每章都 `connect()` 一次**——开库 + 三条
+/// PRAGMA + ATTACH 旧库，实测整趟 244ms，里面绝大部分是重复开库，不是读
+/// 数据。缓存后整趟只开一次库。
+///
+/// 为什么是 `thread_local` 而不是全局 `static`：`rusqlite::Connection` 是
+/// `Send` 而非 `Sync`，全局拿不到；而取页 / 渲染全在主线程，线程本地缓存
+/// 既安全又无需加锁。
+thread_local! {
+    static READ_CONN: RefCell<Option<Connection>> = RefCell::new(None);
+}
+
+/// 借一条读库连接干活（`with` 闭包，免得把 `&Connection` 借出 `RefCell`）。
+/// 库打不开就返回 `None`，调用方按「没读到」处理，绝不崩。
+pub fn with_read_conn<T>(f: impl FnOnce(&Connection) -> T) -> Option<T> {
+    READ_CONN.with(|slot| {
+        let mut b = slot.borrow_mut();
+        if b.is_none() {
+            *b = connect().ok();
+        }
+        b.as_ref().map(f)
+    })
+}
+
+/// 丢弃缓存的读连接（下次用时重开）。
+///
+/// 导入跑在后台线程、写的是**另一条**连接，提交后主线程的读连接本就能看
+/// 到（WAL + 每条查询各自开隐式事务）；这里留个显式重置口子，给「库文件
+/// 被换掉 / 修过」这类场景兜底。
+pub fn reset_read_conn() {
+    READ_CONN.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+/// 旧库回退取章。**任何一步失败都当没查到**（旧库没挂载 / 损坏 / 沙盒
+/// 读不到，都不该影响新库那条主路）。
+fn legacy_chapter(c: &Connection, id: &str, n: usize) -> Option<Chapter> {
+    let sql = "SELECT json FROM legacy.chapters WHERE store_id=?1 ORDER BY idx ASC LIMIT 1 OFFSET ?2";
+    let mut st = c.prepare(sql).ok()?;
+    let mut rows = st.query(params![id, n as i64]).ok()?;
+    let row = rows.next().ok()??;
+    let json: String = row.get(0).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// 该书有几章（新库为 0 时回退旧库——老书整本都在旧库里，count 为 0 会
+/// 让书架上的书「点开是空」）。
 pub fn chapter_count(c: &Connection, id: &str) -> usize {
+    let n = c
+        .query_row(
+            "SELECT COUNT(*) FROM chapters WHERE store_id=?1",
+            params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+    if n > 0 {
+        return n;
+    }
     c.query_row(
-        "SELECT COUNT(*) FROM chapters WHERE store_id=?1",
+        "SELECT COUNT(*) FROM legacy.chapters WHERE store_id=?1",
         params![id],
         |r| r.get::<_, i64>(0),
     )
@@ -159,11 +260,18 @@ pub fn chapter_count(c: &Connection, id: &str) -> usize {
 }
 
 /// 该书的「章号 → 字数」表（按章号升序）——骨架层用来算进度与跳章偏移，
-/// 不必把正文拉回内存。
+/// 不必把正文拉回内存。新库为空时回退旧库。
 pub fn chapter_sizes(c: &Connection, id: &str) -> Vec<usize> {
-    let mut st = match c.prepare(
-        "SELECT chars FROM chapters WHERE store_id=?1 ORDER BY idx ASC",
-    ) {
+    let v = sizes_in(c, "main", id);
+    if !v.is_empty() {
+        return v;
+    }
+    sizes_in(c, "legacy", id)
+}
+
+fn sizes_in(c: &Connection, schema: &str, id: &str) -> Vec<usize> {
+    let sql = format!("SELECT chars FROM {schema}.chapters WHERE store_id=?1 ORDER BY idx ASC");
+    let mut st = match c.prepare(&sql) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -244,4 +352,34 @@ pub fn set_title(c: &Connection, id: &str, n: usize, title: &str) -> Result<()> 
         params![title, id, n as i64],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v1.70.0：旧库**没挂载时**（沙盒 / 旧库不存在 / 内存库），回退查询
+    /// 必须静默降级成「没查到」，绝不能把 `no such table: legacy.chapters`
+    /// 当错误抛出去——那会让所有老书一打开就报错。
+    #[test]
+    fn legacy_fallback_degrades_silently_when_absent() {
+        let c = connect_in_memory().expect("内存库");
+        put_book(&c, "b1", "书", "", "{}").expect("建书");
+        let ch = Chapter {
+            title: "第一章".to_string(),
+            paragraphs: vec![crate::types::Paragraph::plain("道可道，非常道。")],
+        };
+        let json = serde_json::to_string(&ch).expect("序列化");
+        put_chapter(&c, "b1", 0, "第一章", 8, &json).expect("落章");
+
+        // 主库查得到：照旧返回。
+        assert!(load_chapter(&c, "b1", 0).unwrap().is_some());
+        assert_eq!(chapter_count(&c, "b1"), 1);
+        assert_eq!(chapter_sizes(&c, "b1").len(), 1);
+
+        // 主库查不到 + 没有 legacy：全部降级为「空」，且不返回 Err。
+        assert!(load_chapter(&c, "nope", 0).unwrap().is_none());
+        assert_eq!(chapter_count(&c, "nope"), 0);
+        assert!(chapter_sizes(&c, "nope").is_empty());
+    }
 }
