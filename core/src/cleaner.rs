@@ -161,10 +161,19 @@ pub fn is_noise_para(s: &str) -> bool {
     false
 }
 
-/// 单段文本去噪：零宽字符、HTML 残留、实体、空白压缩。
+/// 单段文本去噪：零宽字符、HTML 残留、实体、空白压缩，以及
+/// **PUA 私用区 / 增补私用区 → 「□」空心方块**的防崩溃兜底。
 ///
 /// **不动** 笺读自己的 `[注]` / `[拼音:]` 记号——它们不含 `<`，不会被
-/// 剥标签那一步碰到。
+/// 剥标签那一步碰到。也**不替换**生僻但可渲染的字（CJK 扩展 A/B、康熙部首等）：
+/// 那些交给字体回退（主字缺字时系统大字库 / 用户沙盒字库兜底），且只进
+/// `rare_chars` 的扫描清单提醒配字典——改一个字就等于篡改古籍，绝不越界。
+///
+/// 唯独 **PUA 私用区**（BMP `E000–F8FF` + 增补私用区 `F0000+` / `100000+`）
+/// 任何字库都不会有字形、也无从安装字体补齐：它们几乎全是坏转换留下的私造
+/// 占位，漏进排版引擎只会吐一串大小不一的系统豆腐块，甚至有触发文本 shaping
+/// 崩溃的险。故一律换成古风占位的「□」（U+25A1，通用字库都有，绝不会再缺字），
+/// 连续多个乱码压成一个方块，**绝对不许 Panic**。
 pub fn denoise_text(s: &str) -> String {
     let mut s = s.to_string();
     // HTML 残留（清洗漏网的 `<span>`、`&nbsp;`）：先剥标签再解实体。
@@ -176,6 +185,7 @@ pub fn denoise_text(s: &str) -> String {
     }
     let mut out = String::with_capacity(s.len());
     let mut space = false;
+    let mut tile = false; // 上一个输出已是「□」：连续私用/乱码只留一个方块
     for c in s.chars() {
         match c {
             // 零宽 / BOM / 软连字符 / 方向控制符：一律删（竖排里全是空白格）。
@@ -186,16 +196,29 @@ pub fn denoise_text(s: &str) -> String {
             | '\u{00AD}'
             | '\u{0000}'..='\u{0008}'
             | '\u{000E}'..='\u{001F}' => {}
+            // PUA 私用区（BMP + 增补 A/B）：任何字库都无此字形 → 「□」占位，
+            // 连续多个压成一个，绝不把无法渲染的私造字漏进排版引擎。
+            '\u{E000}'..='\u{F8FF}'
+            | '\u{F0000}'..='\u{FFFFD}'
+            | '\u{100000}'..='\u{10FFFD}' => {
+                if !tile {
+                    out.push('\u{25A1}');
+                    tile = true;
+                }
+                space = false;
+            }
             // 各种空白统一成一个半角空格（段内换行先并成空格）。
             '\u{00A0}' | '\u{3000}' | '\t' | '\r' | '\n' | ' ' => {
                 if !space {
                     out.push(' ');
                     space = true;
                 }
+                tile = false;
             }
             _ => {
                 out.push(c);
                 space = false;
+                tile = false;
             }
         }
     }
@@ -907,6 +930,25 @@ mod tests {
             rare.iter().any(|(c, _)| *c == '\u{E000}'),
             "PUA 私造字没扫出来：{rare:?}"
         );
+    }
+
+    #[test]
+    fn pua_becomes_a_single_tile_but_rare_renderable_chars_survive() {
+        // 单个私用区字 → 一个「□」古风占位，绝不漏进排版引擎。
+        assert_eq!(denoise_text("\u{E000}"), "\u{25A1}");
+        assert_eq!(denoise_text("道\u{E000}可道"), "道\u{25A1}可道");
+        // 连续多个私用/乱码字压成一个方块，别在版心吐「□□□□」。
+        assert_eq!(denoise_text("\u{E000}\u{E001}\u{E002}"), "\u{25A1}");
+        assert_eq!(denoise_text("甲\u{E000}\u{E000}乙"), "甲\u{25A1}乙");
+        // 增补私用区 A/B 同样兜底（Rust char 覆盖到 U+10FFFF）。
+        assert_eq!(denoise_text("\u{F0000}"), "\u{25A1}");
+        assert_eq!(denoise_text("\u{100000}"), "\u{25A1}");
+        // 关键分界：生僻但**可渲染**的字（CJK 扩展 B、康熙部首）绝不替换——
+        // 交给字体回退去显示真字形，改了就是篡改古籍。
+        assert_eq!(denoise_text("道\u{20000}可道"), "道\u{20000}可道");
+        assert_eq!(denoise_text("\u{2F00}"), "\u{2F00}"); // 康熙部首
+        // 占位方块本身不是空白：段首段尾的 trim 不该吃掉它。
+        assert_eq!(denoise_text("  \u{E000}  "), "\u{25A1}");
     }
 
     #[test]

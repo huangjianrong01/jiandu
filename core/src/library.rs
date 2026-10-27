@@ -358,6 +358,15 @@ impl Library {
         Self::home().join("books")
     }
 
+    /// 用户自备字库的**沙盒拖拽入口**：`com.jiandu.app/fonts/`。
+    ///
+    /// 把整部大字符集字体（覆盖 CJK 扩展 B 的花园明朝 / 思源宋体等，几十 MB 一部）
+    /// 拖进这里即被 `src/fonts.rs::font_dirs` 扫到并注册，补主字体缺字的系统兜底。
+    /// 默认**不**随安装包分发大字符集字库（会撑爆体积），用户按需自行下载放入。
+    pub fn fonts_dir() -> PathBuf {
+        Self::home().join("fonts")
+    }
+
     pub fn index_path() -> PathBuf {
         Self::home().join("library.json")
     }

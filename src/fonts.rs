@@ -242,7 +242,7 @@ const BUNDLED: &[&str] = &[
 /// 系统可用字体族名（启动时缓存一次）。
 static AVAILABLE: OnceLock<Vec<String>> = OnceLock::new();
 
-/// 字体文件可能所在的目录（源码树运行 / .app bundle / 免安装包）。
+/// 字体文件可能所在的目录（源码树运行 / .app bundle / 免安装包 / 沙盒拖拽入口）。
 fn font_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = vec![PathBuf::from("resources/fonts")];
     if let Ok(exe) = std::env::current_exe() {
@@ -251,6 +251,11 @@ fn font_dirs() -> Vec<PathBuf> {
             dirs.push(dir.join("resources/fonts"));
         }
     }
+    // 用户自备字库的**沙盒拖拽入口**：`com.jiandu.app/fonts/`。把整部大字符集
+    // 字体（覆盖 CJK 扩展 B 的花园明朝 / 思源宋体等）拖进来即自动注册，补主
+    // 字体缺字的**系统兜底**——默认不随安装包分发大字符集字库（一部几十 MB，
+    // 撑爆体积），用户按需自行下载放入。放最后：同名族以用户后放的为准。
+    dirs.push(jiandu_core::library::Library::fonts_dir());
     dirs
 }
 
@@ -295,11 +300,12 @@ pub fn register_bundled_fonts(cx: &mut App) {
                 cx.text_system().add_fonts(vec![bytes.into()]).ok();
             }
         }
-        // 目录不存在就继续找下一个候选目录。
-        if !seen.is_empty() {
-            break;
-        }
+        // 不再「首个有字体的目录就停」：沙盒拖拽入口必须总能被扫到，哪怕 bundle /
+        // 源码树目录里已经有字体。同名文件靠上面的 `seen` 去重，重复注册无害。
     }
+    // 确保沙盒拖拽入口存在（首次启动建好空目录，用户才好把字体拖进去）。
+    // 失败（只读卷等）静默忽略——没有用户字库时系统兜底照常工作。
+    let _ = std::fs::create_dir_all(jiandu_core::library::Library::fonts_dir());
     // 白名单里的字体即使放在别处（例如手放到 Resources 根目录）也尽力注册。
     for name in BUNDLED {
         for dir in font_dirs() {
@@ -574,6 +580,17 @@ mod tests {
     fn chain_falls_back_to_first_when_unknown() {
         let chain = modern_chain(FontChoice::SourceHanSans);
         assert_eq!(pick_font(&chain, &[]), SharedString::new("Source Han Sans SC"));
+    }
+
+    #[test]
+    fn sandbox_font_drop_dir_is_scanned() {
+        // 用户自备字库的沙盒拖拽入口必须出现在扫描目录里：默认不随包分发大字符集
+        // 字库，靠用户拖一部覆盖 CJK 扩展 B 的字库进 `com.jiandu.app/fonts/` 补系统兜底。
+        let dirs = font_dirs();
+        assert!(
+            dirs.iter().any(|d| d == &jiandu_core::library::Library::fonts_dir()),
+            "沙盒 fonts/ 拖拽入口没进 font_dirs：{dirs:?}"
+        );
     }
 
     #[test]
