@@ -215,8 +215,14 @@ pub fn detect_title_author(text: &str) -> (String, String) {
                 }
             }
         }
-        // ---- 书名：第一个短行（无句读、非章回标题）----
-        if title.is_empty() && !is_heading(line) && line.chars().count() <= 16 {
+        // ---- 书名：第一个短行（无句读、非章回标题、非叶码）----
+        // 扫描本 / 分页 txt 的第一行常常就是个叶码（「十三」「６」），它短且
+        // 无句读，最容易被当书名——认出来跳过（v1.68.1）。
+        if title.is_empty()
+            && !is_heading(line)
+            && line.chars().count() <= 16
+            && !crate::cleaner::is_lone_number_para(line)
+        {
             let t = line
                 .split_whitespace()
                 .next()
@@ -1963,6 +1969,9 @@ mod tests {
         // 「文 / X」作者式样。
         let t = "水浒传\n文 / 施耐庵\n\n第一回 张天师祈禳瘟疫";
         let b = book_from_plaintext("x", t);
+        // 首行是叶码（扫描本常态）→ 绝不能当成书名（v1.68.1）。
+        let (title, _) = detect_title_author("十三\n道德经\n作者：老子");
+        assert_eq!(title, "道德经", "叶码被当成书名了：{title}");
         assert_eq!(b.title, "水浒传");
         assert_eq!(b.author, "施耐庵");
     }
