@@ -101,6 +101,13 @@ pub struct Prefs {
     /// **回锋**（v1.80.0）：读那一撇的出锋末端带不带一小勾。
     #[serde(default)]
     pub punct_hook: bool,
+    /// **改过的快捷键**（v1.81.0）：`(动作 id, 键位串)`，只存改过的那些。
+    ///
+    /// 出厂键位在 [`crate::keys::Action::default_chord`] 里，这里留空即「全按
+    /// 出厂」。落 `Vec` 而不是 map，是为了让 JSON 保持数组形态、老版本读到时
+    /// 也不会因为多出一个对象字段而整份作废。
+    #[serde(default)]
+    pub keys: Vec<(String, String)>,
     /// 窄屏（手机竖持 / 窗口拉窄）首次提示已看过（v1.52.3）：
     /// 「竖排自右向左，纸面贴右缘」只说一次，跨会话不再唠叨。
     /// 老存档没有这一项 → false（升级后第一次进窄屏会看到）。
@@ -142,6 +149,7 @@ impl Default for Prefs {
             // 朱砂（v1.66.0 用户定）：句读一直是朱笔点的，升级不该悄悄换色。
             punct_ink: 1,
             punct_hook: false,
+            keys: Vec::new(),
             narrow_hint_seen: false,
         }
     }

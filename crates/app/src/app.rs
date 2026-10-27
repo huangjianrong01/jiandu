@@ -630,6 +630,16 @@ pub struct Root {
     pub punct_ink: crate::gloss::PunctInk,
     /// **回锋**：读那一撇的出锋末端带不带一小勾。
     pub punct_hook: bool,
+    /// **快捷键映射**（v1.81.0）：出厂键位 + 用户改写过的那几条。
+    ///
+    /// 键位表本身在 `jiandu_core::keys`——这里只装「这一份」，不定义任何键位。
+    pub keymap: jiandu_core::keys::KeyMap,
+    /// 快捷键面板开着没（帮助面板里的「改键」进来）。
+    pub show_keys: bool,
+    /// 正在等新键位的动作：`Some` 时下一次按键被吃掉当新键位。
+    pub key_capture: Option<jiandu_core::keys::Action>,
+    /// 改键失败的一句话（冲突 / 不可用），显示到下次改键为止。
+    pub key_hint: Option<String>,
     /// 生僻字显示：true 时给生僻字标注读音。
     pub show_rare: bool,
     /// 数字转汉字：true 时阿拉伯数字在竖排里显示为汉字（一六二八），
@@ -1103,6 +1113,11 @@ impl Root {
             punct_mode: prefs.punct_mode(),
             punct_ink: prefs.punct_ink(),
             punct_hook: prefs.punct_hook,
+            // 改键记录：只装用户动过的那些，出厂值仍在 core 的表里。
+            keymap: jiandu_core::keys::KeyMap::from_pairs(&prefs.keys),
+            show_keys: false,
+            key_capture: None,
+            key_hint: None,
             // 生僻字注音：默认开（`prefs.rare` 默认 true）——古籍里真有读不出
             // 的字，一根拐杖比「干净」重要。关掉的意愿会随下一版落盘。
             show_rare: prefs.rare,

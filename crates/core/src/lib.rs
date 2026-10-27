@@ -63,6 +63,9 @@ pub mod platform;
 /// 版权页）的行级屏蔽、front matter 章节名判据、启发式正文起点定位。
 /// 结构层（DOM / TOC / spine）在 `app::importer::epub_parser`。
 pub mod purge;
+/// **全局快捷键表**（v1.81.0）：动作 / 键位 / 映射的唯一数据源。
+/// 壳子只做「框架按键 → `Chord`」的翻译与执行，键位本身不许在壳里另写一份。
+pub mod keys;
 /// **C ABI 出口**（v1.0.0-beta）：给 Tauri / Flutter / Swift / JNI 等
 /// 非 Rust 壳子调 `cdylib` 用。见 `README_cross_platform.md`。
 pub mod ffi;

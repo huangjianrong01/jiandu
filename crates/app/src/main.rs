@@ -45,6 +45,10 @@ mod ime;
 // v1.62.0：多格式导入的**漏斗**（各格式只出纯文本 → cleaner 唯一出口 →
 // core 管线 → BookIR）。旧 `importer::*` API 在本模块内原样透传。
 mod importer;
+// v1.81.0：**快捷键壳**。键位表在 `jiandu_core::keys`（core 不碰 gpui），
+// 这里只做「GPUI 按键 → Chord」的翻译——按住 Shift 时 GPUI 给大写键名，
+// 归一化漏一处，整条 ⌘⇧A 就静默失效。
+mod keys;
 mod lines;
 mod margin;
 mod note_inject;

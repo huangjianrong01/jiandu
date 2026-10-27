@@ -1725,6 +1725,10 @@ impl Root {
         if self.show_help {
             root = root.child(self.render_help_sheet(cx));
         }
+        // 快捷键面板（v1.81.0）：改键。叠在帮助之上——从帮助里点进来。
+        if self.show_keys {
+            root = root.child(self.render_keys_sheet(cx));
+        }
         // 说明：检索 / 帮助 / 字书 / 分享几张浮层的**根**都在各自 render 里
         // 加了 `.occlude()`（与左侧栏同款），此处不重复。
         // 左上角那枚独立的书名签条（v1.27.0 删除）：它离书页有一段距离，
@@ -1816,6 +1820,12 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // ⓪ **改键态最先截获**（v1.81.0）：此刻用户按的是一个「键位样本」，
+        //    不是命令——排在最前，才不会被 Esc 收浮层 / 方向键翻页抢走。
+        if self.key_capture.is_some() {
+            self.capture_chord(event, cx);
+            return;
+        }
         // v1.77.0：**Esc 取消批量导入**。排在所有屏别之前——批量导入是
         // 全屏浮层，那时 Esc 唯一的含义就该是「别刻了」。
         if self.batch.is_some()
@@ -1968,6 +1978,11 @@ impl Root {
                         // 小笺栏：与其余侧栏同款收法（目标态归零，由 render 逐帧滑出）。
                         self.close_ai();
                         self.show_help = false;
+                        // 快捷键面板跟着收起（改键态也一并清掉，免得下次
+                        // 开面板还停在「按下新键…」）。
+                        self.show_keys = false;
+                        self.key_capture = None;
+                        self.key_hint = None;
                         self.show_share_panel = false;
                         self.close_lookup();
                         self.clear_selection();
@@ -1987,173 +2002,375 @@ impl Root {
                         return;
                     }
 
-                    // ④ ⌘C 复制：有选区复制选区，否则复制整页正文。
-                    if (k == "c" || k == "C") && (mods.platform || mods.control) {
-                        self.copy_page_text(cx);
-                        self.popup = None;
-                        self.clear_selection();
-                        cx.notify();
+                    // ④ **全局快捷键表**（v1.81.0）：键位只有 core 那一份
+                    //    （`jiandu_core::keys`），面板照同一张表渲染，改键即时
+                    //    生效——这里绝不另写一串 `if k == "f"`。
+                    //
+                    //    排在翻页与编辑态之后：正在写字时键归输入框，这条规矩
+                    //    不能被任何 ⌘ 组合抢走。
+                    let chord = crate::keys::chord_of(&event.keystroke);
+                    if let Some(action) = self.keymap.resolve(&chord) {
+                        self.run_action(action, window, cx);
                         return;
                     }
+    }
 
-                    // ⑤ ⌘ 组合快捷键：⌘+数字 选调色板，⌘+字母 调功能。
-                    //    翻页：← / → （及 ⌘+← / ⌘+→）左右翻页。
-                    //    复制：⌘C（见上方 ④）。
-                    //    为避免与 macOS 系统保留键冲突，刻意避开了 ⌘H（隐藏）、
-                    //    ⌘M（最小化）、⌘S（保存）、⌘Q（退出）。
-                    if mods.platform && !mods.control && !mods.alt {
-                        match k {
-                            // 调色板：⌘1–⌘5（朱、墨、纸…… 五套）。
-                            "1" => {
-                                self.set_palette(0);
+    // ── 快捷键：执行 / 改键 / 面板（v1.81.0）─────────────────────────────
+
+    /// 执行一个快捷键动作。
+    ///
+    /// 每个分支只调**既有方法**——快捷键是一条入口，不是第二套实现。唯一的
+    /// 例外是「问小笺」：有选区就带原文问、没选区只开栏，这个二选一本就是
+    /// 快捷键该有的语义（用户按 ⌘⇧A 时心里想的是「问这一句」）。
+    pub fn run_action(
+        &mut self,
+        a: jiandu_core::keys::Action,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use jiandu_core::keys::Action as A;
+        match a {
+            A::Search => self.set_ui_state(AppUIState::Search, cx),
+            A::Lookup => self.act_lookup(cx),
+            A::Copy => {
+                self.copy_page_text(cx);
+                self.popup = None;
+                self.clear_selection();
+            }
+            A::Underline => self.act_underline(),
+            A::Notes => self.show_notes = !self.show_notes,
+            A::Tongjia => self.show_tongjia = !self.show_tongjia,
+            A::Punct => {
+                // 显隐与形制是两件事：⌘B 只管「画不画」，⌘J 只管「怎么画」。
+                self.show_punct = !self.show_punct;
+            }
+            A::PunctMode => {
+                let all = crate::gloss::PunctMode::ALL;
+                let i = all.iter().position(|m| *m == self.punct_mode).unwrap_or(0);
+                self.punct_mode = all[(i + 1) % all.len()];
+                self.save_punct_prefs();
+            }
+            A::Rare => self.show_rare = !self.show_rare,
+            A::Traditional => self.show_traditional = !self.show_traditional,
+            A::Theme => self.cycle_theme(),
+            A::Style => self.set_ui_state(AppUIState::Style, cx),
+            A::Side => {
+                self.show_help = false;
+                self.toggle_side();
+            }
+            A::Focus => {
+                self.focus_mode = !self.focus_mode;
+                self.show_style = false;
+                self.close_side();
+                self.show_help = false;
+                if self.focus_mode {
+                    self.close_transient_ui();
+                }
+            }
+            A::Cards => {
+                self.side_tab = SideTab::Note;
+                self.open_side();
+            }
+            A::Help => self.set_ui_state(AppUIState::Help, cx),
+            A::Palette1 => self.set_palette(0),
+            A::Palette2 => self.set_palette(1),
+            A::Palette3 => self.set_palette(2),
+            A::Palette4 => self.set_palette(3),
+            A::Palette5 => self.set_palette(4),
+            A::Palette6 => self.set_palette(5),
+            A::AskAi => {
+                if self.has_selection() {
+                    self.ask_ai_selection(window, cx);
+                } else {
+                    self.toggle_ai(window, cx);
+                }
+            }
+            A::ExportLeaf => self.export_pdf(crate::app::PdfScope::Leaf, cx),
+            A::ExportChapter => self.export_pdf(crate::app::PdfScope::Chapter, cx),
+        }
+        cx.notify();
+    }
+
+    /// 查字（原 ⌘G 的肉体，从 match 里搬出来给快捷键表调用）。
+    fn act_lookup(&mut self, cx: &mut Context<Self>) {
+        let c = self
+            .sel_char
+            .or_else(|| self.popup.as_ref().map(|h| h.ch))
+            .or_else(|| {
+                self.paginate()
+                    .get(self.page)
+                    .and_then(|p| p.iter().find(|g| !g.is_indent()).map(|g| g.ch))
+            });
+        if let Some(c) = c {
+            // 连同 charIndex / 选中文本一起记下：查字面板上也要显示「第几章
+            // 第几段第几字」。
+            let key = self
+                .sel_focus
+                .or(self.sel_anchor)
+                .or_else(|| self.popup.as_ref().map(|h| h.key))
+                .unwrap_or((self.current_chapter, 0, 0));
+            let text = if self.has_selection() {
+                self.selected_text()
+            } else {
+                c.to_string()
+            };
+            self.open_lookup(key, c, text, None, None);
+        }
+        self.clear_selection();
+        self.popup = None;
+        cx.notify();
+    }
+
+    /// 划线（原 ⌘U 的肉体）。
+    fn act_underline(&mut self) {
+        if self.has_selection() {
+            self.underline_selection();
+        } else {
+            let first = self
+                .paginate()
+                .get(self.page)
+                .and_then(|p| p.iter().find(|g| !g.is_indent()).map(|g| (g.chapter, g.para, g.offset)));
+            if let Some(key) = first {
+                if !self.underlines.remove(&key) {
+                    self.underlines.insert(key);
+                }
+                self.save_annotations();
+            }
+        }
+        self.popup = None;
+    }
+
+    /// **改键态**：把这一次按键当成「键位样本」收下。
+    ///
+    /// 三条规矩（都是实测踩出来的）：
+    ///   1. 单独按下的修饰键不算数——按 ⌘⇧A 时 ⌘ 与 ⇧ 会先到，收下就绑歪了；
+    ///   2. Esc 退出改键，**不**把它绑成某个动作的键位；
+    ///   3. 裸键（无 ⌘⌃⌥）拒收：绑成裸键会让正文打字触发命令。
+    pub fn capture_chord(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if crate::keys::is_modifier_only(&event.keystroke) {
+            return;
+        }
+        if matches!(event.keystroke.key.as_str(), "escape" | "Escape" | "esc") {
+            self.key_capture = None;
+            self.key_hint = None;
+            cx.notify();
+            return;
+        }
+        let chord = crate::keys::chord_of(&event.keystroke);
+        if !chord.has_modifier() {
+            self.key_hint = Some("快捷键至少要带 ⌘ / ⌃ / ⌥ 之一".to_string());
+            cx.notify();
+            return;
+        }
+        let Some(a) = self.key_capture else {
+            return;
+        };
+        match self.keymap.bind(a, chord) {
+            Ok(()) => {
+                self.save_keys();
+                self.key_capture = None;
+                self.key_hint = None;
+            }
+            // 撞车：**不改**，把占用者名字摆给用户看，等他再按一个。
+            Err(e) => self.key_hint = Some(e),
+        }
+        cx.notify();
+    }
+
+    /// 改键落盘。与 `save_punct_prefs` 同款单点写：全仓没有「界面 → Prefs」
+    /// 的总收口，改完不写这一下，关窗就回出厂键位。
+    fn save_keys(&self) {
+        let mut prefs = crate::prefs::Prefs::load();
+        prefs.keys = self.keymap.to_pairs();
+        prefs.save();
+    }
+
+    /// **快捷键面板**（帮助 → 「改键」进来）：点键位、按下新键，即刻生效。
+    ///
+    /// 面板本身照 [`jiandu_core::keys::Action::ALL`] 渲染——**没有任何一份
+    /// 手写的键位清单**。这就是「说明与实际永不脱节」的原因。
+    fn render_keys_sheet(&mut self, cx: &mut Context<Self>) -> Div {
+        use jiandu_core::keys::Action;
+        let t = self.theme;
+        let vw = self.viewport_w;
+        let vh = self.viewport_h;
+
+        let mut list = div()
+            .id("keys-sheet-list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .px_4()
+            .pb_3()
+            .overflow_y_scroll()
+            .scrollbar_width(px(0.0));
+
+        // 提示行（冲突 / 裸键）常驻在顶部，免得用户按完不知道发生了什么。
+        if let Some(h) = &self.key_hint {
+            list = list.child(
+                div()
+                    .pt_1()
+                    .text_size(px(11.0))
+                    .text_color(rgb(t.accent()))
+                    .child(SharedString::from(h.clone())),
+            );
+        }
+
+        let mut last_sec = "";
+        for a in Action::ALL {
+            if a.section() != last_sec {
+                last_sec = a.section();
+                list = list.child(help_sec(last_sec, t));
+            }
+            let waiting = self.key_capture == Some(a);
+            let custom = self.keymap.is_custom(a);
+            let chord_text = if waiting {
+                "按下新键…".to_string()
+            } else {
+                self.keymap.chord(a).display()
+            };
+            let chip_fg = if waiting { t.accent() } else { t.chrome_text() };
+            let chip_bg = if waiting { t.chip_on() } else { t.chip() };
+            let mut chip = div()
+                .id(("key-chip", a as usize))
+                .px_2()
+                .py_0p5()
+                .rounded(px(5.0))
+                .bg(rgb(chip_bg))
+                .text_size(px(11.0))
+                .text_color(rgb(chip_fg))
+                .child(SharedString::from(chord_text))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.key_capture = Some(a);
+                        this.key_hint = None;
+                        cx.notify();
+                    }),
+                );
+            if custom && !waiting {
+                // 改过的键位挂一枚「复位」，点一下回出厂。
+                chip = chip.child(
+                    div()
+                        .id(("key-reset", a as usize))
+                        .ml_1()
+                        .text_size(px(10.0))
+                        .text_color(rgb(t.ink_soft()))
+                        .child(SharedString::from("↺"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.keymap.reset(a);
+                                this.key_capture = None;
+                                this.key_hint = None;
+                                this.save_keys();
                                 cx.notify();
-                            }
-                            "2" => {
-                                self.set_palette(1);
-                                cx.notify();
-                            }
-                            "3" => {
-                                self.set_palette(2);
-                                cx.notify();
-                            }
-                            "4" => {
-                                self.set_palette(3);
-                                cx.notify();
-                            }
-                            "5" => {
-                                self.set_palette(4);
-                                cx.notify();
-                            }
-                            // 新增第六套：暗金（⌘6）——金墨正文 + 米白夹注。
-                            "6" => {
-                                self.set_palette(5);
-                                cx.notify();
-                            }
-                            // 繁简切换：⌘T。
-                            "t" | "T" => {
-                                self.show_traditional = !self.show_traditional;
-                                cx.notify();
-                            }
-                            // 全文检索：⌘F（与顶部「檢索」同款，走状态机开合）。
-                            "f" | "F" => {
-                                self.set_ui_state(AppUIState::Search, cx);
-                                cx.notify();
-                            }
-                            // 主题切换：⌘P。
-                            "p" | "P" => {
-                                self.cycle_theme();
-                                cx.notify();
-                            }
-                            // 笔记（行间注）显隐：⌘N。
-                            "n" | "N" => {
-                                self.show_notes = !self.show_notes;
-                                cx.notify();
-                            }
-                            // 通假显隐：⌘J。
-                            "j" | "J" => {
-                                self.show_tongjia = !self.show_tongjia;
-                                cx.notify();
-                            }
-                            // 标点显隐：⌘B。
-                            "b" | "B" => {
-                                self.show_punct = !self.show_punct;
-                                cx.notify();
-                            }
-                            // 生僻注音显隐：⌘R。
-                            "r" | "R" => {
-                                self.show_rare = !self.show_rare;
-                                cx.notify();
-                            }
-                            // 版字面板：⌘E（走全局状态机：开版字即关其它面板与浮层）。
-                            "e" | "E" => {
-                                self.set_ui_state(AppUIState::Style, cx);
-                                cx.notify();
-                            }
-                            // 目录：⌘L（同时收起样式 / 帮助）。
-                            "l" | "L" => {
-                                self.show_help = false;
-                                self.toggle_side();
-                                cx.notify();
-                            }
-                            // 查字：⌘G（查选区 / 最近碰过的字，没有则查本页首字）。
-                            "g" | "G" => {
-                                let c = self
-                                    .sel_char
-                                    .or_else(|| self.popup.as_ref().map(|h| h.ch))
-                                    .or_else(|| {
-                                        self.paginate().get(self.page).and_then(|p| {
-                                            p.iter().find(|g| !g.is_indent()).map(|g| g.ch)
-                                        })
-                                    });
-                                if let Some(c) = c {
-                                    // 连同 charIndex / 选中文本一起记下：查字面
-                                    // 板上也要显示「第几章第几段第几字」。
-                                    let key = self
-                                        .sel_focus
-                                        .or(self.sel_anchor)
-                                        .or_else(|| self.popup.as_ref().map(|h| h.key))
-                                        .unwrap_or((self.current_chapter, 0, 0));
-                                    let text = if self.has_selection() {
-                                        self.selected_text()
-                                    } else {
-                                        c.to_string()
-                                    };
-                                    self.open_lookup(key, c, text, None, None);
-                                }
-                                self.clear_selection();
-                                self.popup = None;
-                                cx.notify();
-                            }
-                            // 专注模式：⌘Z（收起样式 / 目录 / 帮助，进入时清底层浮层）。
-                            "z" | "Z" => {
-                                self.focus_mode = !self.focus_mode;
-                                self.show_style = false;
-                                self.close_side();
-                                self.show_help = false;
-                                if self.focus_mode {
-                                    self.close_transient_ui();
-                                }
-                                cx.notify();
-                            }
-                            // 卡片匣（⌘K）：v1.80.0 起它与朱批同住左侧栏
-                            // 「批」印那一页——这一键改为**直接开左栏并停在
-                            // 批注页**（不再有独立的右侧栏可开）。
-                            "k" | "K" => {
-                                self.side_tab = SideTab::Note;
-                                self.open_side();
-                                cx.notify();
-                            }
-                            // 帮助：⌘/（走全局状态机）。
-                            "/" => {
-                                self.set_ui_state(AppUIState::Help, cx);
-                                cx.notify();
-                            }
-                            // 划线：⌘U。有选区划选区；无选区划本页第一个正文字。
-                            "u" | "U" => {
-                                if self.has_selection() {
-                                    self.underline_selection();
-                                } else {
-                                    let first = self
-                                        .paginate()
-                                        .get(self.page)
-                                        .and_then(|p| {
-                                            p.iter().find(|g| !g.is_indent()).map(|g| {
-                                                (g.chapter, g.para, g.offset)
-                                            })
-                                        });
-                                    if let Some(key) = first {
-                                        if !self.underlines.remove(&key) {
-                                            self.underlines.insert(key);
-                                        }
-                                        self.save_annotations();
-                                    }
-                                }
-                                self.popup = None;
-                                cx.notify();
-                            }
-                            _ => {}
-                        }
-                    }
+                            }),
+                        ),
+                );
+            }
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .py_0p5()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(11.5))
+                            .text_color(rgb(t.ink()))
+                            .child(SharedString::from(a.label())),
+                    )
+                    .child(chip),
+            );
+        }
+
+        let sheet = div()
+            .w(px((vw * 0.46).clamp(360.0, 520.0)))
+            .max_h(px(vh * 0.82))
+            .flex()
+            .flex_col()
+            // 命中栈在面板上截断：点面板里的空白不该被外层「点外面收面板」吃掉。
+            .occlude()
+            .bg(rgb(t.paper()))
+            .border_1()
+            .border_color(rgb(t.frame()))
+            .rounded(px(8.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(t.chrome_line()))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(t.accent()))
+                            .child(SharedString::from("快捷键")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                small_button("全部复位", false, t).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.keymap.reset_all();
+                                        this.key_capture = None;
+                                        this.key_hint = None;
+                                        this.save_keys();
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(small_button("关闭", false, t).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.show_keys = false;
+                                    this.key_capture = None;
+                                    this.key_hint = None;
+                                    cx.notify();
+                                }),
+                            )),
+                    ),
+            )
+            .child(list);
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w(px(vw))
+            .h(px(vh))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x14100ACC))
+            .child(sheet)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.show_keys = false;
+                    this.key_capture = None;
+                    this.key_hint = None;
+                    cx.notify();
+                }),
+            )
     }
 
     /// **左侧栏**（v1.80.0）：从左侧平滑滑出 260px 的抽屉，右缘竖排三枚朱砂
@@ -8661,15 +8878,20 @@ impl Root {
 
         list = list.child(help_sec("阅读", t));
         list = list.child(help_row("⌘T", "简体 / 繁体互转", t));
-        list = list.child(help_row("⌘1 – ⌘5", "墨色（五套）", t));
-        list = list.child(help_row("⌘F", "切换字体", t));
+        list = list.child(help_row("⌘1 – ⌘6", "墨色（朱 / 墨 / 纸 / 青 / 黛 / 暗金）", t));
+        // v1.75.0 把 ⌘F 从「切字体」改到「全库检索」——帮助面板一直没跟上，
+        // 这次连带修掉（说明与代码两处不一致，比没说明更糟）。
+        list = list.child(help_row("⌘F", "全库检索", t));
         // 全文检索（v1.75.0）：三字以上走 FTS5 索引，首次搜某本书会先建索引。
         list = list.child(help_row("顶栏「检索」", "输词后 ⏎ 开搜 · 三字以上走索引（首次会先建）", t));
         list = list.child(help_row("⌘P", "切换纸色", t));
         list = list.child(help_row("⌘N", "注释显隐", t));
-        list = list.child(help_row("⌘J", "通假显隐", t));
-        list = list.child(help_row("⌘B", "标点显隐", t));
+        // v1.81.0：⌘J 让给「现代标点 / 古籍句读」，通假挪到 ⌘Y。
+        list = list.child(help_row("⌘J", "现代标点 / 古籍句读", t));
+        list = list.child(help_row("⌘Y", "通假显隐", t));
+        list = list.child(help_row("⌘B", "句读显隐", t));
         list = list.child(help_row("⌘R", "生僻字显隐", t));
+        list = list.child(help_row("⌘⇧A", "问小笺（有选区带原文问）", t));
 
         list = list.child(help_sec("视图", t));
         list = list.child(help_row("⌘E", "版字面板", t));
@@ -8717,6 +8939,9 @@ impl Root {
 
         list = list.child(help_sec("导出", t));
         list = list.child(help_row("顶栏「导出」", "本叶图片 · 当前章卡片 · MD", t));
+        // v1.81.0：印制成了一等公民，给了两个键。
+        list = list.child(help_row("⌘⌥P", "印制：本叶 PDF", t));
+        list = list.child(help_row("⌘⌥⇧P", "印制：本章 PDF", t));
         // v1.71.0：本叶图片改离屏重绘后口径变了，写进帮助里——
         // 用户最关心「要不要权限」「清晰度由什么定」「提示怎么收」。
         list = list.child(help_row("导出当前页图片", "存本叶高清 PNG（长边 2160，离屏重绘）", t));
@@ -8760,14 +8985,35 @@ impl Root {
                             .text_color(rgb(t.accent()))
                             .child(SharedString::from("帮 助")),
                     )
-                    .child(small_button("关闭", false, t).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.show_help = false;
-                            cx.notify();
-                        }),
-                    )),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            // v1.81.0：改键入口。面板把 `Action::ALL` 整张表
+                            // 摆出来，点键位、按新键，即刻生效并落盘。
+                            .child(
+                                small_button("改键", false, t).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.show_keys = true;
+                                        this.key_capture = None;
+                                        this.key_hint = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(small_button("关闭", false, t).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.show_help = false;
+                                    cx.notify();
+                                }),
+                            )),
+                    ),
             )
             .child(list);
 
