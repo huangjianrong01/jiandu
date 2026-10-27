@@ -1399,10 +1399,10 @@ mod tests {
         let dot = note * NOTE_PUNCT_RATIO;
         assert!(dot < note, "注文标点没有比注文字小");
         assert!(
-            (dot / body - crate::punct::FS_RATIO).abs() < 0.12,
+            (dot / body - crate::types::PUNCT_FS_RATIO).abs() < 0.12,
             "注文标点 {:.3}×正文，与正文句读 {:.2} 差太远",
             dot / body,
-            crate::punct::FS_RATIO
+            crate::types::PUNCT_FS_RATIO
         );
         // 只收「点状」句读；引号 / 书名号 / 括号要括住东西，不收。
         for c in ['，', '。', '、', '；', '：', '？', '！', '…', '—'] {

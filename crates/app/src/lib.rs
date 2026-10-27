@@ -13,6 +13,6 @@
 
 pub use jiandu_core::*;
 
-pub mod gloss;
-pub mod hit;
+// `gloss`（双行夹注排版引擎）已于 v1.0.0-beta 迁入 `jiandu-core`，
+// 上面那句 `pub use jiandu_core::*` 已把它带出来，`crate::gloss` 照旧可用。
 pub mod punct;

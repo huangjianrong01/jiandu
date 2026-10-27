@@ -66,7 +66,8 @@ pub const BUNDLED_BOOKS: &[&str] = &["daodejing", "tangshi"];
 /// 1. `.app/Contents/Resources/books/<name>.json` —— 打包后正式运行；
 /// 2. 沿可执行文件向上回溯 `resources/books/<name>.json` —— 开发 / 测试态
 ///    （`target/{debug,release}/jiandu` 一路回溯到仓库根 `resources`）；
-/// 3. `CARGO_MANIFEST_DIR/../resources/books` —— core crate 编译期目录兜底。
+/// 3. `CARGO_MANIFEST_DIR/resources/books` —— core crate 编译期目录兜底
+///    （workspace 化后资源随 core 走：`crates/core/resources/books`）。
 pub fn bundled_book(name: &str) -> Option<Book> {
     let file = format!("{name}.json");
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -78,12 +79,14 @@ pub fn bundled_book(name: &str) -> Option<Book> {
             let mut d = Some(p.to_path_buf());
             while let Some(dir) = d {
                 candidates.push(dir.join("resources/books").join(&file));
+                // workspace 化后的新位置（仓库根往上是找不到的）
+                candidates.push(dir.join("crates/core/resources/books").join(&file));
                 d = dir.parent().map(|x| x.to_path_buf());
             }
         }
     }
     if let Ok(man) = std::env::var("CARGO_MANIFEST_DIR") {
-        candidates.push(PathBuf::from(&man).join("../resources/books").join(&file));
+        candidates.push(PathBuf::from(&man).join("resources/books").join(&file));
     }
     for p in &candidates {
         if let Ok(txt) = std::fs::read_to_string(p) {

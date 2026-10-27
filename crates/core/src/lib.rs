@@ -1,7 +1,8 @@
 //! 笺读 JianDu · 纯逻辑核心库（v1.47.0 起独立成 crate）。
 //!
 //! **零 GPUI 依赖**：
-//!   * 网格排版引擎（`grid`：天宽地窄、文武边栏、鱼尾黑口的全部几何演算）；
+//!   * 网格排版引擎（`grid`：天宽地窄、文武边栏、鱼尾黑口的全部几何演算）
+//!     与双行夹注排版（`gloss`：面 → 列 → 片）；
 //!   * 双行夹注之外的版面数据模型（`types` / `content` / `ruby`）；
 //!   * EPUB / TXT / MD / HTML 解析与清洗（`parsers` / `vclean` / `pipeline` /
 //!     `importer` / `library`：通假、脚注、前言智能跳过、上标幽灵字清剿）；
@@ -39,6 +40,13 @@ pub mod dict;
 /// **内测邀请码**（v1.0.0-beta）：纯本地闸门，无服务器。
 pub mod gate;
 pub mod grid;
+/// **命中测试**（v1.0.0-beta 自 app 迁入）：`Page` → 字/片包围盒，
+/// 供画布点选、卡片定位、注音落点复用。纯几何，零 UI。
+pub mod hit;
+/// **双行夹注排版引擎**（v1.0.0-beta 自 app 迁入）：一次排出「面 → 列 → 片」
+/// 整棵树，分页与渲染同源。只依赖 `types`，零 UI——跨平台壳子拿到的是
+/// 同一份 `Page`，画法可以完全不同。
+pub mod gloss;
 pub mod importer;
 /// **统一书稿模型 IR**（v1.54.0）：解析与排版之间的中间表示。
 /// 各格式先「断头」剥壳 → 清洗 → 落进 IR，引擎只认这一份数据。
@@ -47,6 +55,13 @@ pub mod library;
 pub mod numcn;
 pub mod parsers;
 pub mod pipeline;
+/// **平台能力抽象层**（v1.0.0-beta）：`PdfExporter` / `InputSink` /
+/// `PinyinSource` 三个 trait —— core 说「要什么」，壳子说「怎么画」。
+/// 跨平台时换壳子不换内核，全靠这一层。
+pub mod platform;
+/// **C ABI 出口**（v1.0.0-beta）：给 Tauri / Flutter / Swift / JNI 等
+/// 非 Rust 壳子调 `cdylib` 用。见 `README_cross_platform.md`。
+pub mod ffi;
 pub mod prefs;
 pub mod ruby;
 /// 章节仓库（`store`）与流式导入（`stream`）：v1.50.0 为百万字丛书加的

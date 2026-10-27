@@ -1,0 +1,38 @@
+[package]
+name = "jiandu-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "笺读 · 纯 Rust 内核：排版几何 / EPUB 解析 / SQLite(FTS5) 检索 / AI(RAG) / 注音判据。零 UI 依赖，可被任意壳子复用"
+
+# 三种产物（注意：crate-type 归 `[lib]`，写在 `[package]` 下会被 Cargo 忽略）：
+#   lib       —— Rust 壳子（现在的 crates/app、将来的 Tauri Rust 端）直接依赖；
+#   cdylib    —— 跨平台壳子的 FFI 入口（.dylib / .so / .dll），见 `src/ffi.rs`；
+#   staticlib —— iOS / Android 静态链接进宿主 App。
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+# ── 文本与结构 ──
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# EPUB 导入（zip + opf 解析）
+zip = { workspace = true }
+# 编码探测：老书 txt 多为 GBK
+encoding_rs = { workspace = true }
+# 简繁对照表 / 惰性静态表
+once_cell = { workspace = true }
+# 离线双引擎字典：《康熙字典》+《說文解字》合并库（bundled = 自编译 sqlite3）
+rusqlite = { workspace = true }
+# 生僻字自动注音判据所需：`pinyin` crate 兜底（白名单 `common_chars.rs` 脚本生成）
+pinyin = { workspace = true }
+# 跨平台标准应用数据目录：macOS → ~/Library/Application Support
+# （App Sandbox 下系统透明重定向到容器，三态通用，避免硬编码 ~/.jiandu）
+dirs = "5"
+
+# ⚠️ 本 crate 的**纯洁性**由 `scripts/check_core_purity.sh` 守卫：
+# 不许出现 gpui / cocoa / objc / core-graphics / core-text / rfd 等任何
+# 与「画」或「某一台机器」有关的依赖。要平台能力请定义 trait（见
+# `src/platform.rs`），由壳子注入实现。

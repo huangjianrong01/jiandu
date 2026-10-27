@@ -36,7 +36,7 @@ def main() -> None:
     l1 = gb2312_level1()
     assert len(l1) == 3755, len(l1)
 
-    db = sqlite3.connect(ROOT / "resources/dict/dict.db")
+    db = sqlite3.connect(ROOT / "crates/core/resources/dict/dict.db")
     s2t: dict[str, str] = {}
     for w, t in db.execute("select word, trad from variant"):
         if len(w) == 1 and len(t) == 1:
@@ -82,7 +82,7 @@ const SOURCE: &str = concat!(
 pub static COMMON: Lazy<HashSet<char>> = Lazy::new(|| SOURCE.chars().collect());
 '''
 
-    out = ROOT / "core/src/common_chars.rs"
+    out = ROOT / "crates/core/src/common_chars.rs"
     out.write_text(src, encoding="utf-8")
     print(f"wrote {out} ({len(chars)} chars, {len(src)} bytes)")
 

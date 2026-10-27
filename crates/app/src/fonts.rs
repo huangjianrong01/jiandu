@@ -244,7 +244,11 @@ static AVAILABLE: OnceLock<Vec<String>> = OnceLock::new();
 
 /// 字体文件可能所在的目录（源码树运行 / .app bundle / 免安装包 / 沙盒拖拽入口）。
 fn font_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = vec![PathBuf::from("resources/fonts")];
+    let mut dirs: Vec<PathBuf> = vec![
+        // 开发态 cwd = 仓库根：资源目录随 core crate 走（workspace 化后）
+        PathBuf::from("resources/fonts"),
+        PathBuf::from("crates/core/resources/fonts"),
+    ];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             dirs.push(dir.join("../Resources/fonts"));

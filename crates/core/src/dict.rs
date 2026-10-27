@@ -9,14 +9,14 @@ use std::sync::Mutex;
 
 const RAW: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../resources/dict/guhanyu.json"
+    "/resources/dict/guhanyu.json"
 ));
 
 /// 「简明」页签的 JSON（v1.52.10 起：王力《古汉语常用字字典》首义，
 /// 由 `scripts/mdx2concise.py` 从 .mdx 产出）。格式同 `guhanyu.json`。
 const RAW_CONCISE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../resources/dict/concise.json"
+    "/resources/dict/concise.json"
 ));
 
 /// 词库：`《古漢語常用字字典》` 的 JSON 结构是「记录数组」——
@@ -207,7 +207,7 @@ struct RawPhrase {
 
 const PHRASE_RAW: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../resources/dict/phrases.json"
+    "/resources/dict/phrases.json"
 ));
 
 /// 词组表（编译期嵌入，运行时零 I/O）。
@@ -353,7 +353,7 @@ pub fn zdic_url(ch: &str) -> String {
 /// 合并后的字书库（康熙 + 說文）。
 const ZISHU_DB: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../resources/dict/dict.db"
+    "/resources/dict/dict.db"
 ));
 
 /// **一条字书记录**：康熙释义与說文原文分开存，浮签分栏各列一列。

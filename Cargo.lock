@@ -2956,7 +2956,7 @@ dependencies = [
 
 [[package]]
 name = "jiandu-core"
-version = "1.47.0"
+version = "1.0.0-beta"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",

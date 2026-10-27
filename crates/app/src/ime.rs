@@ -226,6 +226,101 @@ impl Root {
             SEARCH_MAX,
         )
     }
+
+    // ── `jiandu_core::platform::InputSink`（v1.0.0-beta）─────────────────
+    //
+    // core 只认「上屏 / 组字 / 收工」三句话，平台差异（macOS 的
+    // NSTextInputClient、Windows 的 IMM32/TSF、安卓的 InputConnection）
+    // 全挡在这一层外面。跨平台壳子照这个 trait 实现一遍，core 侧的检索 /
+    // 批注逻辑一个字都不用改。
+
+    /// 往**当前**输入框写一段**已上屏**的文本（IME 上屏 / 粘贴的统一入口）。
+    pub fn ime_insert(&mut self, text: &str) {
+        match self.input_target() {
+            Some(InputTarget::Rename) => {
+                self.rename_replace_utf16(None, text);
+            }
+            Some(InputTarget::Note) => {
+                self.note_replace_utf16(None, text);
+            }
+            Some(InputTarget::ShelfSearch) => {
+                self.shelf_query_replace_utf16(None, text);
+            }
+            Some(InputTarget::Search) => {
+                self.search_replace_utf16(None, text);
+            }
+            // 问小笺的草稿住在另一个 Entity 里，动它要 `Window`/`Context`
+            // ——那条路仍走 `EntityInputHandler`（见本文件下方）。这里不
+            // 硬塞一个静默的空实现：宁可显式留白，也别让人以为字打进去了。
+            Some(InputTarget::Ai) | None => {}
+        }
+    }
+
+    /// 组字中：把 `text` 写进光标处并标成「未上屏」；传空串等于收工。
+    pub fn ime_set_marked(&mut self, text: &str) {
+        if text.is_empty() {
+            self.ime_clear_marked();
+            return;
+        }
+        match self.input_target() {
+            Some(InputTarget::Rename) => {
+                let eff = effective_replace_range(None, &self.rename_marked);
+                let start = self.rename_replace_utf16(eff, text);
+                let end = start + utf16_len(text);
+                self.rename_marked = Some(start..end);
+                self.rename_cursor = utf16_to_char(&self.rename_draft, end);
+            }
+            Some(InputTarget::Note) => {
+                let eff = effective_replace_range(None, &self.note_marked);
+                let start = self.note_replace_utf16(eff, text);
+                let end = start + utf16_len(text);
+                self.note_marked = Some(start..end);
+                self.note_cursor = utf16_to_char(&self.note_draft, end);
+            }
+            Some(InputTarget::ShelfSearch) => {
+                let eff = effective_replace_range(None, &self.shelf_query_marked);
+                let start = self.shelf_query_replace_utf16(eff, text);
+                let end = start + utf16_len(text);
+                self.shelf_query_marked = Some(start..end);
+                self.shelf_query_cursor = utf16_to_char(&self.shelf_query, end);
+            }
+            Some(InputTarget::Search) => {
+                let eff = effective_replace_range(None, &self.search_marked);
+                let start = self.search_replace_utf16(eff, text);
+                let end = start + utf16_len(text);
+                self.search_marked = Some(start..end);
+                self.search_cursor = utf16_to_char(&self.search_draft, end);
+            }
+            Some(InputTarget::Ai) | None => {}
+        }
+    }
+
+    /// 结束组字（丢掉未上屏的那部分）。
+    pub fn ime_clear_marked(&mut self) {
+        match self.input_target() {
+            Some(InputTarget::Rename) => self.rename_marked = None,
+            Some(InputTarget::Note) => self.note_marked = None,
+            Some(InputTarget::ShelfSearch) => self.shelf_query_marked = None,
+            Some(InputTarget::Search) => self.search_marked = None,
+            Some(InputTarget::Ai) | None => {}
+        }
+    }
+}
+
+/// **壳子侧对「输入法」这条平台能力的回答**（见 `jiandu_core::platform`）。
+///
+/// 有了它，core 与将来的跨平台壳子就能用同一套话收中文，不必知道
+/// `inputContext` / `IMM32` / `InputConnection` 是什么。
+impl jiandu_core::platform::InputSink for Root {
+    fn insert_text(&mut self, text: &str) {
+        self.ime_insert(text)
+    }
+    fn set_marked(&mut self, text: &str) {
+        self.ime_set_marked(text)
+    }
+    fn clear_marked(&mut self) {
+        self.ime_clear_marked()
+    }
 }
 
 // ---- 自绘输入框外壳 ----

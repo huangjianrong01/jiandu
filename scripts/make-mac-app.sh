@@ -39,17 +39,17 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
         # 本机那份走默认 target 目录（能复用已编好的产物，省一次全量编译）；
         # 另一份才开独立 target 子目录。
         echo "→ 编译 release（本机 $(uname -m)，首次需要几分钟）..."
-        cargo build --release --bin jiandu
+        cargo build --release -p jiandu --bin jiandu
         if [ "$(uname -m)" = "arm64" ]; then
             echo "→ 编译 release（intel x86_64）..."
-            cargo build --release --bin jiandu --target x86_64-apple-darwin
+            cargo build --release -p jiandu --bin jiandu --target x86_64-apple-darwin
         else
             echo "→ 编译 release（apple silicon arm64）..."
-            cargo build --release --bin jiandu --target aarch64-apple-darwin
+            cargo build --release -p jiandu --bin jiandu --target aarch64-apple-darwin
         fi
     else
         echo "→ 编译 release（首次需要几分钟）..."
-        cargo build --release --bin jiandu
+        cargo build --release -p jiandu --bin jiandu
     fi
 fi
 
@@ -94,21 +94,21 @@ cp "$BIN" "$APP/Contents/MacOS/jiandu"
 chmod +x "$APP/Contents/MacOS/jiandu"
 
 # ---- 4) 随包资源：字体（可选） ----
-if [ -d "$ROOT/resources/fonts" ] && ls "$ROOT/resources/fonts"/*.otf "$ROOT/resources/fonts"/*.ttf "$ROOT/resources/fonts"/*.ttc >/dev/null 2>&1; then
+if [ -d "$ROOT/crates/core/resources/fonts" ] && ls "$ROOT/crates/core/resources/fonts"/*.otf "$ROOT/crates/core/resources/fonts"/*.ttf "$ROOT/crates/core/resources/fonts"/*.ttc >/dev/null 2>&1; then
     mkdir -p "$APP/Contents/Resources/fonts"
-    cp "$ROOT/resources/fonts"/*.otf "$ROOT/resources/fonts"/*.ttf "$ROOT/resources/fonts"/*.ttc "$APP/Contents/Resources/fonts/" 2>/dev/null || true
+    cp "$ROOT/crates/core/resources/fonts"/*.otf "$ROOT/crates/core/resources/fonts"/*.ttf "$ROOT/crates/core/resources/fonts"/*.ttc "$APP/Contents/Resources/fonts/" 2>/dev/null || true
     echo "✓ 已打包随包字体：$(ls "$APP/Contents/Resources/fonts" | tr '\n' ' ')"
 else
-    echo "· 无随包字体（将回退到系统宋体 / 思源，可在 resources/fonts/ 放入 .otf 后重新打包）"
+    echo "· 无随包字体（将回退到系统宋体 / 思源，可在 crates/core/resources/fonts/ 放入 .otf 后重新打包）"
 fi
 
 # ---- 4.5) 随包资源：内置书目（运行时读 Resources/books，方便热更新） ----
-if [ -d "$ROOT/resources/books" ] && ls "$ROOT/resources/books"/*.json >/dev/null 2>&1; then
+if [ -d "$ROOT/crates/core/resources/books" ] && ls "$ROOT/crates/core/resources/books"/*.json >/dev/null 2>&1; then
     mkdir -p "$APP/Contents/Resources/books"
-    cp "$ROOT/resources/books"/*.json "$APP/Contents/Resources/books/" 2>/dev/null || true
+    cp "$ROOT/crates/core/resources/books"/*.json "$APP/Contents/Resources/books/" 2>/dev/null || true
     echo "✓ 已打包内置书目：$(ls "$APP/Contents/Resources/books" | tr '\n' ' ')"
 else
-    echo "· 无 resources/books/（内置书目将缺失，首启书架会空）"
+    echo "· 无 crates/core/resources/books/（内置书目将缺失，首启书架会空）"
 fi
 
 # ---- 5) App 图标：PNG → icns ----

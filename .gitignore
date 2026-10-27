@@ -4,8 +4,8 @@ nohup.out
 **/*.rs.bk
 Cargo.lock.bak
 .DS_Store
-resources/fonts/*.otf
-resources/fonts/*.ttf
+crates/core/resources/fonts/*.otf
+crates/core/resources/fonts/*.ttf
 ios/*/build/
 ios/**/build/
 

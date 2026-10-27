@@ -38,8 +38,9 @@ mod cards;
 mod clipboard;
 mod exporter;
 mod fonts;
-mod gloss;
-mod hit;
+// `gloss`（双行夹注排版引擎）v1.0.0-beta 起住在 `jiandu-core`，本 crate 只
+// 再导出（见下方 `pub use jiandu_core::{… gloss …}`）——跨平台壳子要的是
+// 同一份 `Page`，不该被 GPUI 壳子绑架。
 mod ime;
 // v1.62.0：多格式导入的**漏斗**（各格式只出纯文本 → cleaner 唯一出口 →
 // core 管线 → BookIR）。旧 `importer::*` API 在本模块内原样透传。
@@ -73,8 +74,8 @@ mod zen_kit;
 // 回 crate 根——`crate::grid` / `crate::types` 等既有路径全部继续有效，
 // UI 层（app / reader / shelf）代码零改动。
 pub use jiandu_core::{
-    banxin, content, dict, gate, grid, library, numcn, parsers, pipeline, prefs, ruby, store,
-    stream, trad, theme, types, vclean, west,
+    banxin, content, dict, gate, gloss, grid, hit, library, numcn, parsers, pipeline, prefs,
+    ruby, store, stream, trad, theme, types, vclean, west,
 };
 
 use app::Root;

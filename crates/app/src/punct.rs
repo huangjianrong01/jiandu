@@ -41,7 +41,7 @@ use gpui::{PathBuilder, Pixels, Point, Rgba, Window, point, px, rgb};
 ///
 /// 现在只作用于「句」类的空心圈（[`PunctKind::Dot`]）；读点走
 /// [`SEED_H_RATIO`]（瓜子点，另有一组比例）。
-pub const FS_RATIO: f32 = 0.35;
+pub const FS_RATIO: f32 = crate::types::PUNCT_FS_RATIO;
 /// **瓜子点的长 / 正文字号**（v1.67.2）：0.50。
 ///
 /// 一路改上来的：0.28 → 0.32 → 0.40 → 0.42 都还嫌小。实测 12 列行款下

@@ -3448,8 +3448,8 @@ impl Root {
             rule: self.theme.rule_by(self.rule_color),
             note_ink: self.palette.note(self.theme),
             accent: self.theme.accent(),
-            font: self.share_font_kind(),
-            note_font: crate::share_layout::ShareFont::Kai,
+            font: crate::pdf::PdfFontKind::from(self.share_font_kind()),
+            note_font: crate::pdf::PdfFontKind::Kai,
             han_digits: self.han_digits,
             traditional: self.show_traditional,
         };
@@ -3463,30 +3463,27 @@ impl Root {
             PdfScope::Leaf => "本叶",
             PdfScope::Chapter => "本章",
         };
-        // ④ 渲染：临时文件 → 读回字节（保存框要的是字节，CG 只肯写 URL）。
-        let tmp = std::env::temp_dir().join(format!(
-            "jiandu-pdf-{}-{}-{}.pdf",
-            std::process::id(),
-            scope_label,
-            ci
-        ));
-        let rendered = (|| -> Result<Vec<u8>, String> {
-            let leaves: Vec<crate::pdf::PdfLeaf> = picked
-                .iter()
-                .map(|&i| crate::pdf::PdfLeaf {
-                    page: &pages[i],
-                    title: &title,
-                    chapter: ci,
-                    leaf: i + 1,
-                    inscription: &inscription,
-                    author: &author,
-                    ruby: &ruby,
-                })
-                .collect();
-            crate::pdf::write_pdf(&tmp, &leaves, &geo)?;
-            std::fs::read(&tmp).map_err(|e| format!("读取临时 PDF 失败：{e}"))
-        })();
-        let _ = std::fs::remove_file(&tmp);
+        // ④ 渲染：**走 core 定义的 `PdfExporter` 接口**。
+        //
+        // 本平台拿到的实现是 CoreGraphics 矢量后端（字是真字、内嵌子集，
+        // 可复制可检索）；跨平台壳子只要换一个实现了同一个 trait 的东西，
+        // `pages`（`gloss::Page`）与 `geo` 一行都不用改——**排版的活早在
+        // core 里做完了**，落到纸上只是换个落笔的人。
+        let leaves: Vec<crate::pdf::PdfLeaf> = picked
+            .iter()
+            .map(|&i| crate::pdf::PdfLeaf {
+                page: &pages[i],
+                title: &title,
+                chapter: ci,
+                leaf: i + 1,
+                inscription: &inscription,
+                author: &author,
+                ruby: &ruby,
+            })
+            .collect();
+        let rendered = crate::pdf::exporter()
+            .render_leaves(&leaves, &geo)
+            .map_err(|e| e.to_string());
         let bytes = match rendered {
             Ok(b) => b,
             Err(e) => {

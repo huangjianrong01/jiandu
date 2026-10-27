@@ -1,75 +1,46 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 笺读 JianDu · Cargo Workspace（v1.0.0-beta 起）
+#
+# 为什么要拆成 workspace：
+#   未来要上 Windows / iOS / Android，而现在的壳子是 GPUI（macOS 原生）。
+#   把「书是什么、怎么排」与「用谁画」分开，跨平台时只换壳子、不动内核。
+#
+#   crates/core —— **纯 Rust 内核**，零 UI 依赖。EPUB 解析 / SQLite(FTS5)
+#                  检索 / AI(RAG) / 数据模型 / 排版几何 / 注音判据全在这里。
+#                  可被 Tauri 壳、iOS 壳、命令行工具直接复用，甚至编成 cdylib。
+#   crates/app  —— 当前的 macOS 原生壳子（GPUI）。平台相关的一切（CoreGraphics
+#                  PDF、NSPasteboard、NSSound、IME）只准出现在这里。
+#
+# 铁律：**core 里绝不能出现 `use gpui` / `use cocoa` / `use objc`**。
+# 有 CI 级的 grep 校验（`scripts/check_core_purity.sh`）。
+# ─────────────────────────────────────────────────────────────────────────────
 [workspace]
-members = ["core"]
+members = ["crates/core", "crates/app"]
+resolver = "2"
 
-[package]
-name = "jiandu"
+# 版本 / 元数据统一在一处，两个 crate 用 `version.workspace = true` 继承，
+# 免得出现「core 1.47、app 1.0」这种对不上账的版本号。
+[workspace.package]
 version = "1.0.0-beta"
 edition = "2021"
-description = "笺读 · 一个用 Rust + GPUI 写的原生中文阅读器（古文竖笺 / 现代横笺）"
 license = "MIT"
 authors = ["you"]
 
-[[bin]]
-name = "jiandu"
-path = "src/main.rs"
-
-[dependencies]
-# GPUI：Zed 的 GPU 加速 UI 框架。
-# 固定 crates.io 稳定版（0.2.2）——zed 的 main 分支 API 每天都在变，
-# 跟随它会导致「昨天还能编译、今天报一堆错」；固定版本保证可复现构建。
-gpui = "0.2.2"
-# 纯逻辑核心（v1.47.0 解耦）：网格排版 / 解析器 / 字典查询在此，
-# 零 GPUI 依赖，为移植 iOS 做准备。
-jiandu-core = { path = "core" }
-# 文本与结构
+# 两个 crate 共用的依赖也统一版本。Cargo 的 workspace 继承只认**版本号**，
+# 不认 feature，所以 feature 仍在各 crate 里写——这里负责「别出现两份
+# rusqlite 各自编一份 bundled sqlite3」这种又慢又大的事故。
+[workspace.dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# EPUB 导入（zip + opf 解析）
 zip = "2"
-quick-xml = "0.36"
-# 编码探测：老书 txt 多为 GBK，读错码会整页方块（与浏览器同一套码表）
 encoding_rs = "0.8"
-# 简繁对照表
 once_cell = "1"
-# 导入漏斗（v1.62.0）：Markdown / JSON 的记号剥离与抢救用正则。
-# 只用作「去 #、**、>」这类确定性替换，不处理用户输入的正则（无 ReDoS 面）。
 regex = "1"
-# 原生文件选择器（导入 md/txt/epub/json）
-rfd = "0.14"
-# 导出分享：PNG 走 CoreGraphics **离屏光栅**（见下方 mac 目标依赖），
-# 既不依赖 image / flate2，也不要屏幕录制权限。（PDF 导出已于 v1.56.0 移除）
-# 离线双引擎字典：《康熙字典》+《說文解字》合并库（见 `scripts/merge_dict.py`）。
-# `bundled` = 自己编译一份 sqlite3 进二进制，不依赖系统库版本；数据文件由
-# `include_bytes!` 嵌入，运行时零 I/O、断网可查。
 rusqlite = { version = "0.32.1", features = ["bundled"] }
+pinyin = "0.11.0"
 
-# ── 离屏出图（v1.57.0 分享重构）───────────────────────────────────
-# 旧制用 `screencapture` 截屏：依赖屏幕录制权限、分辨率随窗口、锁屏即失败。
-# 现在走 CoreGraphics 位图上下文 + CoreText 逐字落笔，**真正离屏**渲染
-# 1080×1920 高清 PNG，再交给系统保存框 / 剪贴板。仅 macOS 目标编译。
-[target.'cfg(target_os = "macos")'.dependencies]
-core-graphics = "0.24"
-core-text = "21"
-core-foundation = "0.10"
-# v1.80.0 PDF 印制：CGPDFContextCreateWithURL 返回裸 `CGContextRef`，
-# 要用 `CGContext::from_ptr` 包成 core-graphics 的 `CGContext`（之后全部走
-# 安全方法）。`from_ptr` 是 `ForeignType` 的方法，须显式引入该 crate。
-foreign-types = "0.5"
-# 只用来把位图编码成 PNG（关掉全部默认 feature，不引解码器 / rayon）。
-image = { version = "0.25", default-features = false, features = ["png"] }
-
-# ── 问小笺（AI 伴读，v1.76.0）─────────────────────────────────────
-# 只用来发一条 OpenAI 兼容的流式对话请求（HTTPS + SSE）。全部沿用
-# Cargo.lock 里已有的版本（gpui 依赖树里本就带着 hyper 生态），故离线
-# 也能构建；关掉 default features，只留 ring + 系统根证书，不引 aws-lc。
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "ring"] }
-http-body-util = "0.1"
-bytes = "1"
-
+# 只有 workspace 根的 profile 生效（member 里写会被忽略并告警）。
 [profile.release]
 lto = "thin"
 opt-level = 3

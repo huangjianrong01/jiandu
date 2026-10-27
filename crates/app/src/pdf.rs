@@ -25,7 +25,8 @@
 //! 2. **CFRelease**：`CGContext` / `CFURL` 都是 `TCFType` 包装，`Drop` 自动
 //!    release；字体按 (字形类, 字号) 缓存复用，一叶只建两三台字体对象。
 
-use crate::gloss::{Page, Piece};
+use crate::gloss::Piece;
+use jiandu_core::platform::{LeafSpec, PdfExporter, PdfGeometry};
 use crate::share_layout::ShareFont;
 use crate::types::GlyphKind;
 use core_foundation::base::TCFType;
@@ -56,76 +57,32 @@ extern "C" {
 pub const A4_W: f64 = 595.276;
 pub const A4_H: f64 = 841.89;
 
-/// 一叶要印的一页。
-pub struct PdfLeaf<'a> {
-    /// 排版引擎产出的那一叶（**只读**，本模块绝不改分页）。
-    pub page: &'a Page,
-    /// 章题（章首页的篇题列用）。
-    pub title: &'a str,
-    /// 第几章（0 起，篇题数用）。
-    pub chapter: usize,
-    /// 第几叶（1 起，地脚叶码用）。
-    pub leaf: usize,
-    /// 卷首题署第一行：**书名 + 卷次**（章首页开卷列顶端，顶格）。
-    pub inscription: &'a str,
-    /// 卷首题署第二行：**署名**（低几格、字略小，落款意味）。
-    pub author: &'a str,
-    /// 本叶的注音表：`(章, 段, 段内偏移) → 拼音`。
-    ///
-    /// 汉字的读音（EPUB `<ruby>` / `X（bō）` / `[拼音:bō]` 导入的
-    /// `NoteKind::Ruby`，以及「生僻字注音」自动补的那一层）**不住在
-    /// `Page` 里**——`Page` 只有正文与夹注。故由调用方按章备好一张表，
-    /// 落笔时按键取音。空表＝本叶不注音。
-    pub ruby: &'a std::collections::HashMap<(usize, usize, usize), String>,
+/// 一叶要印的一页 / 整份 PDF 的版式与配色：
+/// **定义住在 `jiandu_core::platform`**（壳子无关），本模块只是拿来用。
+///
+/// 为什么搬走：跨平台壳子（Windows / 移动端）也要印同样的叶，它们不该
+/// 为了拿这两个结构体去依赖一个 GPUI + CoreGraphics 的壳子。
+pub use jiandu_core::platform::{LeafSpec as PdfLeaf, PdfFontKind, PdfGeometry as PdfGeo};
+
+/// 壳子的字体语义（`ShareFont`，带 PostScript 回退链）↔ core 的中立语义
+/// （`PdfFontKind`）。**两边各说各的方言，只在这里翻译一次**。
+impl From<PdfFontKind> for ShareFont {
+    fn from(k: PdfFontKind) -> Self {
+        match k {
+            PdfFontKind::Song => ShareFont::Song,
+            PdfFontKind::Kai => ShareFont::Kai,
+            PdfFontKind::Hei => ShareFont::Hei,
+        }
+    }
 }
 
-/// 一整份 PDF 共用的版式与配色（**纯数据**，零 GPUI）。
-#[derive(Clone, Debug)]
-pub struct PdfGeo {
-    /// 列数（8 / 10 / 12 / 14）。
-    pub cols: usize,
-    /// 字格宽（= 列宽）。
-    pub cell_w: f32,
-    /// 字格高。
-    pub cell_h: f32,
-    /// 每列行数。
-    pub rows: usize,
-    /// 正文字号。
-    pub fs: f32,
-    /// 章首页开卷列顶部预留给卷首题署的行数。
-    pub reserve: usize,
-    /// 版框双边预留（纸面外缘 → 字格区）。
-    pub edge: f32,
-    /// 天头（字格区之上，地脚 = 天头 ÷ 1.5，铁律 3∶2）。
-    pub margin_top: f32,
-    /// 地脚（含叶码条）。
-    pub margin_bot: f32,
-    /// 纸色 / 墨色 / 界行色 / 注文色 / 朱砂。
-    pub paper: u32,
-    pub ink: u32,
-    pub rule: u32,
-    pub note_ink: u32,
-    pub accent: u32,
-    /// 正文 / 注文字体（离屏渲染按 PostScript 名挑系统字）。
-    pub font: ShareFont,
-    pub note_font: ShareFont,
-    /// 「数字转汉字」：开了则每个数字独立一格（与分页同一开关）。
-    pub han_digits: bool,
-    /// 繁体显示（与阅读器的繁简开关同源）。
-    pub traditional: bool,
-}
-
-impl PdfGeo {
-    /// 一叶的纸面尺寸（字格区 + 版框 + 天头地脚）。
-    pub fn sheet_w(&self) -> f32 {
-        self.cols as f32 * self.cell_w + self.edge
-    }
-    pub fn sheet_h(&self) -> f32 {
-        self.rows as f32 * self.cell_h + self.foot_h() + self.edge + self.margin_top + self.margin_bot
-    }
-    /// 地脚条高（叶码）：与阅读器 `render_ancient` 同一算法。
-    pub fn foot_h(&self) -> f32 {
-        (self.fs * 0.36).max(9.0) + 10.0
+impl From<ShareFont> for PdfFontKind {
+    fn from(k: ShareFont) -> Self {
+        match k {
+            ShareFont::Song => PdfFontKind::Song,
+            ShareFont::Kai => PdfFontKind::Kai,
+            ShareFont::Hei => PdfFontKind::Hei,
+        }
     }
 }
 
@@ -349,7 +306,7 @@ fn draw_ruby(
             lh,
             rl.fs as f64,
             g.note_ink,
-            g.note_font,
+            ShareFont::from(g.note_font),
         );
         ty += lh;
     }
@@ -449,7 +406,7 @@ fn draw_leaf(b: &mut Brush, leaf: &PdfLeaf, g: &PdfGeo, p: &Place) {
                 if used as f64 >= res - 1.0 {
                     break;
                 }
-                b.glyph_in(ch, cx, y0 + used as f64 * cell_h, cell_w, cell_h, fs, g.ink, g.font);
+                b.glyph_in(ch, cx, y0 + used as f64 * cell_h, cell_w, cell_h, fs, g.ink, ShareFont::from(g.font));
                 used += 1;
             }
             if (used as f64) < res - 1.0 {
@@ -467,7 +424,7 @@ fn draw_leaf(b: &mut Brush, leaf: &PdfLeaf, g: &PdfGeo, p: &Place) {
                     cell_h,
                     fs * 0.86,
                     g.ink,
-                    g.font,
+                    ShareFont::from(g.font),
                 );
                 used += 1;
             }
@@ -487,7 +444,7 @@ fn draw_leaf(b: &mut Brush, leaf: &PdfLeaf, g: &PdfGeo, p: &Place) {
     let chars: Vec<char> = num.chars().collect();
     let mut ty = y0 + g.rows as f64 * cell_h + (foot - nfs) * 0.5;
     for ch in chars {
-        b.glyph_at(ch, x0 + fw * 0.5, ty, nfs * 1.25, nfs, g.ink, g.font);
+        b.glyph_at(ch, x0 + fw * 0.5, ty, nfs * 1.25, nfs, g.ink, ShareFont::from(g.font));
         ty += nfs * 1.15;
     }
 
@@ -553,13 +510,13 @@ fn draw_title_column(
         title.len()
     };
     for ch in title.iter().take(max_chars) {
-        b.glyph_in(*ch, x, ty, cell_w, tcell, tfs.min(tcell), g.ink, g.font);
+        b.glyph_in(*ch, x, ty, cell_w, tcell, tfs.min(tcell), g.ink, ShareFont::from(g.font));
         ty += tcell;
     }
     // 篇题数：篇题下方，小字。
     ty += cell_h * 0.12;
     for ch in num.chars() {
-        b.glyph_in(ch, x, ty, cell_w, nfs * 1.2, nfs, g.ink, g.font);
+        b.glyph_in(ch, x, ty, cell_w, nfs * 1.2, nfs, g.ink, ShareFont::from(g.font));
         ty += nfs * 1.15;
     }
     // 下鱼尾：贴正文块下沿（V 口朝上）。
@@ -670,7 +627,7 @@ fn walk_column(
                         cell_h * 0.5,
                         mfs,
                         g.ink,
-                        g.font,
+                        ShareFont::from(g.font),
                     );
                 }
                 if let Some(c) = close_mk {
@@ -682,7 +639,7 @@ fn walk_column(
                         cell_h * 0.5,
                         mfs,
                         g.ink,
-                        g.font,
+                        ShareFont::from(g.font),
                     );
                 }
                 if let Some(h) = hang {
@@ -743,7 +700,7 @@ fn draw_run(b: &mut Brush, items: &[Piece], from: usize, to: usize, x: f64, y: &
                 gd.ch
             };
             let ch = crate::west::vertical_glyph(ch);
-            b.glyph_in(ch, x, *y + (k - from) as f64 * half, cell_w, half, dfs.min(half), g.ink, g.font);
+            b.glyph_in(ch, x, *y + (k - from) as f64 * half, cell_w, half, dfs.min(half), g.ink, ShareFont::from(g.font));
         }
     }
     *y += (to - from) as f64 * half;
@@ -760,20 +717,20 @@ fn draw_cell(b: &mut Brush, ch: char, x: f64, y: f64, cell_w: f64, cell_h: f64, 
     }
     if let Some(vp) = crate::west::vertical_paren(c) {
         let pf = (fs * 0.88).max(8.0).min(cell_h);
-        b.glyph_in(vp, x, y, cell_w, cell_h, pf, g.ink, g.font);
+        b.glyph_in(vp, x, y, cell_w, cell_h, pf, g.ink, ShareFont::from(g.font));
         return;
     }
     if crate::types::is_title_mark(c) {
         let tf = (fs * crate::punct::TITLE_FS_RATIO as f64).max(9.0).min(cell_h);
-        b.glyph_in(crate::types::title_mark(c), x, y, cell_w, cell_h, tf, g.ink, g.font);
+        b.glyph_in(crate::types::title_mark(c), x, y, cell_w, cell_h, tf, g.ink, ShareFont::from(g.font));
         return;
     }
     if crate::types::is_quote_mark(c) {
-        b.glyph_in(crate::types::vertical_quote(c), x, y, cell_w, cell_h, fs.min(cell_h), g.ink, g.font);
+        b.glyph_in(crate::types::vertical_quote(c), x, y, cell_w, cell_h, fs.min(cell_h), g.ink, ShareFont::from(g.font));
         return;
     }
     if crate::west::is_west_hyphen(c) {
-        b.glyph_in('丨', x, y, cell_w, cell_h, (fs * 0.92).min(cell_h), g.ink, g.font);
+        b.glyph_in('丨', x, y, cell_w, cell_h, (fs * 0.92).min(cell_h), g.ink, ShareFont::from(g.font));
         return;
     }
     let shown = if g.han_digits && c.is_ascii_digit() {
@@ -786,7 +743,7 @@ fn draw_cell(b: &mut Brush, ch: char, x: f64, y: f64, cell_w: f64, cell_h: f64, 
     } else {
         crate::trad::simplified_of(shown).unwrap_or(shown)
     };
-    b.glyph_in(shown, x, y, cell_w, cell_h, fs.min(cell_h), g.ink, g.font);
+    b.glyph_in(shown, x, y, cell_w, cell_h, fs.min(cell_h), g.ink, ShareFont::from(g.font));
 }
 
 /// 一枚**手绘句读**：落位与尺寸全读 `punct::place`（阅读器同一函数），
@@ -864,7 +821,7 @@ fn draw_gloss(b: &mut Brush, txt: &str, x: f64, y: f64, g: &PdfGeo, head: bool) 
                 row_h,
                 size.min(row_h),
                 g.note_ink,
-                g.note_font,
+                ShareFont::from(g.note_font),
             );
         }
     }
@@ -924,6 +881,7 @@ pub fn write_pdf(path: &Path, leaves: &[PdfLeaf], g: &PdfGeo) -> Result<usize, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gloss::Page;
     use crate::types::{Glyph, NoteSource};
 
     /// 造一叶「正文 + 双行夹注」，验证 **PDF 是矢量**：有 `%PDF-` 头、
@@ -976,8 +934,8 @@ mod tests {
             rule: 0x8A7A5C,
             note_ink: 0xC3272D,
             accent: 0xC3272D,
-            font: ShareFont::Song,
-            note_font: ShareFont::Kai,
+            font: PdfFontKind::Song,
+            note_font: PdfFontKind::Kai,
             han_digits: false,
             traditional: false,
         };
@@ -1028,12 +986,61 @@ mod tests {
             rule: 0x000000,
             note_ink: 0x000000,
             accent: 0xC3272D,
-            font: ShareFont::Song,
-            note_font: ShareFont::Kai,
+            font: PdfFontKind::Song,
+            note_font: PdfFontKind::Kai,
             han_digits: false,
             traditional: false,
         };
         assert!(g.sheet_w() as f64 <= A4_W, "纸宽超出 A4");
         assert!(g.sheet_h() as f64 <= A4_H, "纸高超出 A4");
+    }
+}
+
+// ── 平台后端注册（v1.0.0-beta）──────────────────────────────────────────────
+//
+// core 只定义 `PdfExporter` 这个「要说的话」，这里是 macOS 的「说话方式」。
+// 将来 Windows / 移动端各写一个 `impl PdfExporter`，`exporter()` 里按
+// `#[cfg]` 分派即可——`LeafSpec` 与 `PdfGeometry` 一份都不用改。
+
+/// macOS：**矢量**后端（CGPDFContext）。字是真字、内嵌字体子集，
+/// 任意倍放大不糊、可复制可检索，一叶几十 KB。
+#[cfg(target_os = "macos")]
+pub struct CoreGraphicsPdfExporter;
+
+#[cfg(target_os = "macos")]
+impl PdfExporter for CoreGraphicsPdfExporter {
+    fn name(&self) -> &'static str {
+        "coregraphics"
+    }
+
+    fn render_leaves(&self, leaves: &[LeafSpec<'_>], geo: &PdfGeometry) -> anyhow::Result<Vec<u8>> {
+        if leaves.is_empty() {
+            anyhow::bail!("没有可印制的叶面");
+        }
+        // CG 只肯写 URL，而保存框要的是字节 → 先落临时文件再读回。
+        // （与 `exporter::save_bytes` 的「唯一写盘出口」不冲突：那个管的是
+        //  **用户最终选中的路径**，这里是渲染过程的中间产物。）
+        let dir = std::env::temp_dir().join("jiandu-pdf");
+        std::fs::create_dir_all(&dir)?;
+        let tmp = dir.join(format!("leaf-{}-{}.pdf", std::process::id(), leaves[0].leaf));
+        write_pdf(&tmp, leaves, geo).map_err(|e| anyhow::anyhow!(e))?;
+        let bytes = std::fs::read(&tmp)?;
+        let _ = std::fs::remove_file(&tmp);
+        Ok(bytes)
+    }
+}
+
+/// 本平台该用哪个 PDF 后端。
+///
+/// 非 macOS 时退回 core 的 `UnavailablePdfExporter`——**明确报错**，
+/// 而不是给用户一张能打开、但一片空白的 PDF 让他怀疑自己的书坏了。
+pub fn exporter() -> Box<dyn PdfExporter> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(CoreGraphicsPdfExporter)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Box::new(jiandu_core::platform::UnavailablePdfExporter)
     }
 }
