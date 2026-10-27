@@ -1,25 +1,31 @@
 //! 专名线与书名线（古籍竖排）。
 //!
-//! 标记为人名 / 地名的词组：在其所在列的左侧画一条**实线**（专名线）；
+//! 标记为人名 / 地名的词组：在其所在列的**右侧**画一条**实线**（专名线）；
 //! 标记为书名的词组：画**波浪线**（书名线）。
 //!
-//! 两条线都贴在字面左侧的同一线位上，逐字首尾相接：
+//! 两条线都贴在字面右侧的同一线位上，逐字首尾相接：
 //!   * 实线按字格通高画，相邻字格的线段在格界处正好接上，跨字、跨列连贯；
 //!   * 波浪线是一串圆点连成的竖波，每个字格取**整数个周期**、首末相位归零，
 //!     相邻字格以同一相位起收，点链跨格无缝；
 //!   * 线位 / 波幅 / 波长都按字格宽与字号伸缩，列数（8~14）切换后依然贴合。
+//!
+//! # 为什么在右（v1.81.0 用户定）
+//!
+//! GB/T 15834 给直行文稿定的位置是**左侧**；这份实现照用户口径改到**右侧**，
+//! 与朱批、着重号分成两边（那条「划线」的朱线才走左侧），一眼能分清
+//! 「书里印的」与「读者加的」。改回左侧只需把 [`line_x`] 的镜像换回去。
 
 use gpui::{div, prelude::*, px, rgb, Div};
 
 use crate::types::MarkKind;
 
-/// 线位：离字格左缘的比例（竖排文字居于格中央，线贴在字左侧）。
+/// 线位：离字格**右缘**的比例（竖排文字居于格中央，线贴在字右侧）。
 pub const LINE_INSET_FRAC: f32 = 0.10;
-/// 线道：字格左侧留给专名线 / 书名线的留白带（占字格宽的比例）。
+/// 线道：字格右侧留给专名线 / 书名线的留白带（占字格宽的比例）。
 ///
-/// 竖排每字占满一个字格，字面墨迹大致落在格的 5%~95%。线道取左缘 20%，
+/// 竖排每字占满一个字格，字面墨迹大致落在格的 5%~95%。线道取右缘 20%，
 /// 线的任何一部分（含波峰与点径）都被夹在这条带子里 —— 这是
-/// 「不遮挡文字」的硬约束：线永远走字面左侧的空白，不压进墨迹。
+/// 「不遮挡文字」的硬约束：线永远走字面右侧的空白，不压进墨迹。
 pub const LINE_LANE_FRAC: f32 = 0.20;
 /// 专名线粗细 = 字号比例（随字号伸缩；另有上下限，见 `name_line_w`）。
 pub const NAME_LINE_W_FRAC: f32 = 0.045;
@@ -40,12 +46,12 @@ const WAVE_DOT_FRAC: f32 = 0.075;
 const WAVE_DOT_MIN: f32 = 1.6;
 const WAVE_DOT_MAX: f32 = 6.0;
 
-/// 线道宽度（px）：字格左缘留给线画的那条带子。
+/// 线道宽度（px）：字格右缘留给线画的那条带子。
 pub fn line_lane(cell_w: f32) -> f32 {
     cell_w * LINE_LANE_FRAC
 }
 
-/// 线位（px）：线道中线，线以此为中心左右摆动。
+/// 线位（px）：**距字格右缘**的距离，线以此为中心左右摆动。
 pub fn line_x(cell_w: f32) -> f32 {
     cell_w * LINE_INSET_FRAC
 }
@@ -101,7 +107,8 @@ pub fn name_line(cell_w: f32, cell_h: f32, fs: f32, color: u32) -> Div {
     // 与书名线共用同一条轴线（线位）：实线以线位为中心左右均分，
     // 换到波浪线时位置不跳。粗细随字号自适应。
     let w = name_line_w(fs, cell_w);
-    let x = (line_x(cell_w) - w / 2.0).max(0.0);
+    // 从右缘反算 left：线心距右缘 `line_x`，故左缘是 `cell_w − line_x − w/2`。
+    let x = (cell_w - line_x(cell_w) - w / 2.0).max(0.0);
     div()
         .absolute()
         .left(px(x))
@@ -111,7 +118,7 @@ pub fn name_line(cell_w: f32, cell_h: f32, fs: f32, color: u32) -> Div {
         .bg(rgb(color))
 }
 
-/// 书名线（书名）：一串圆点连成的竖波，与专名线同一线位。
+/// 书名线（书名）：一串圆点连成的竖波，与专名线同一线位（帖字右侧）。
 pub fn book_wave(cell_w: f32, cell_h: f32, fs: f32, color: u32) -> Div {
     let x = line_x(cell_w);
     let geo = wave_geometry(cell_w, cell_h, fs);
@@ -126,7 +133,8 @@ pub fn book_wave(cell_w: f32, cell_h: f32, fs: f32, color: u32) -> Div {
         line = line.child(
             div()
                 .absolute()
-                .left(px(x + dx - d / 2.0))
+                // 镜像：中心距右缘 `x + dx`，左缘 = 格宽 − 该距离 − 半径。
+                .left(px((cell_w - (x + dx) - d / 2.0).max(0.0)))
                 .top(px(y - d / 2.0))
                 .w(px(d))
                 .h(px(d))
@@ -174,9 +182,10 @@ mod tests {
             let lane = line_lane(cw);
             let x = line_x(cw);
             for (_, dx) in &geo.dots {
+                // 距**右缘**的距离：线心 `x + dx`，再各让半个点径。
                 let lo = x + dx - geo.dot / 2.0;
                 let hi = x + dx + geo.dot / 2.0;
-                assert!(lo >= -0.01, "波点探出字格左缘：{lo}");
+                assert!(lo >= -0.01, "波点探出字格右缘：{lo}");
                 assert!(
                     hi <= lane + 0.01,
                     "波点探进字面（越出线道）：{hi} > {lane}"

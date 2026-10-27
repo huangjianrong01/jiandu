@@ -759,7 +759,10 @@ fn draw_punct(
     g: &PdfGeo,
     hung: bool,
 ) {
-    let kind = crate::punct::kind_of(ch);
+    // 形制读**当前句读模式**（`PdfGeo::punct_mode`）——筛选口径与屏幕完全
+    // 同源（`gloss::jodu_of`），纸上那枚「〇」才与屏幕上逐字同位。
+    let kind = crate::punct::kind_for(ch, g.punct_mode)
+        .unwrap_or(crate::punct::PunctKind::Dot);
     let m = if hung {
         crate::punct::place_hang(fs as f32, cell_w as f32, cell_h as f32, kind)
     } else {
@@ -768,11 +771,25 @@ fn draw_punct(
     let cx = x + m.cx as f64;
     let cy = y + m.cy as f64;
     let d = m.d as f64;
+    let ink = g.punct_ink;
     match m.kind {
-        // 句类：空心小圈（细线描边）。
-        crate::punct::PunctKind::Dot => b.ellipse(cx, cy, d, d, g.note_ink, Some(m.stroke as f64)),
-        // 读类：实心瓜子点（竖长椭圆，宽 = 0.55 × 高）。
-        crate::punct::PunctKind::Seed => b.ellipse(cx, cy, d * 0.55, d, g.note_ink, None),
+        // 现代句：空心小圈（细线描边）。
+        crate::punct::PunctKind::Dot => b.ellipse(cx, cy, d, d, ink, Some(m.stroke as f64)),
+        // 古籍「〇」：略呈椭圆、笔画厚一档（毛笔写的圈不是正圆）。
+        crate::punct::PunctKind::Ring => b.ellipse(
+            cx,
+            cy,
+            d * (1.0 + crate::punct::RING_OVAL as f64),
+            d,
+            ink,
+            Some(m.stroke as f64),
+        ),
+        // 读 / 疑叹：实心瓜子点（竖长椭圆，宽 = `SEED_W_OF_H` × 高）。
+        // PDF 这头只落「一枚斜点的墨团」——矢量的一次近似；屏幕那头的
+        // 出锋与回锋是手绘曲线的细节，落到纸上仍是同一位置、同一大小。
+        crate::punct::PunctKind::Seed | crate::punct::PunctKind::BigSeed => {
+            b.ellipse(cx, cy, d * crate::punct::SEED_W_OF_H as f64, d, ink, None)
+        }
     }
 }
 
@@ -938,6 +955,8 @@ mod tests {
             note_font: PdfFontKind::Kai,
             han_digits: false,
             traditional: false,
+            punct_mode: crate::gloss::PunctMode::Modern,
+            punct_ink: 0xC3272D,
         };
         // 注音表：给首个字挂一条，验证「注音也进 PDF」这条链路不被优化掉。
         let mut ruby_map: std::collections::HashMap<(usize, usize, usize), String> =
@@ -990,6 +1009,8 @@ mod tests {
             note_font: PdfFontKind::Kai,
             han_digits: false,
             traditional: false,
+            punct_mode: crate::gloss::PunctMode::Modern,
+            punct_ink: 0xC3272D,
         };
         assert!(g.sheet_w() as f64 <= A4_W, "纸宽超出 A4");
         assert!(g.sheet_h() as f64 <= A4_H, "纸高超出 A4");

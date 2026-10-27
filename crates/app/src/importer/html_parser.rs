@@ -75,6 +75,44 @@ pub fn extract_html_reader_keep_tables<R: BufRead>(reader: R) -> (String, Option
 /// 并给出报错——绝不会「进度条卡死在 0%」。
 const MAX_EVENTS: usize = 4_000_000;
 
+/// 专名号 / 书名号的**最大跨度**（字）：超过就当它是排版用的强调，不标。
+///
+/// 古籍里一个专名至多四五个字，书名长些也就十字上下；一段几十字被 `<u>`
+/// 包住，多半是「整句下划线」这种现代排版习惯，标成专名线反而是错的。
+const MARK_MAX_CHARS: usize = 12;
+
+/// 标签 + `class` → 该画哪种线：`"书"` 波浪线，`"人"` 实线；`None` 不标。
+///
+/// 判据顺序：**先看书名类**（`class` 里带 book / title 的一律是书名），
+/// 再认 `<u>`：中文 EPUB 里 `<u>` 几乎就是**专名号**（竖排的专名线在
+/// HTML 里只能靠下划线表达），故直接归「人」。
+fn mark_kind_for(name: &str, class: &str) -> Option<&'static str> {
+    let c = class.to_ascii_lowercase();
+    if ["book", "title", "shuming", "shu-ming"].iter().any(|k| c.contains(k)) {
+        return Some("书");
+    }
+    if name == "u" {
+        return Some("人");
+    }
+    if ["proper", "person", "people", "zhuanming", "zhuan-ming"]
+        .iter()
+        .any(|k| c.contains(k))
+    {
+        return Some("人");
+    }
+    None
+}
+
+/// 取 `class` 属性的值（没有就是空串）。
+fn class_of(e: &quick_xml::events::BytesStart) -> String {
+    for a in e.attributes().flatten() {
+        if a.key.as_ref() == b"class" {
+            return String::from_utf8_lossy(a.value.as_ref()).to_string();
+        }
+    }
+    String::new()
+}
+
 fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Option<String>) {
     let mut xml = Reader::from_reader(reader);
     // 不 trim：行内空格是词边界（`<b>道</b> 可道` 里的空格不能丢）。
@@ -86,6 +124,13 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
     let mut skip = 0usize; // >0 表示正处在丢弃块里（可嵌套）
     let mut err: Option<String> = None;
     let mut events = 0usize;
+    // 正在采集的**划线标记**：`(标签名, 线种, 已收文本)`。
+    //
+    // 三层漏斗的第一层就在这里：`<u>孔子</u>` 不剥成一串没头没尾的字，
+    // 而是转成 core 认识的 `〔人:孔子〕孔子`——那条注会变成字侧的
+    // **专名线**，而不是正文里多出来的几个字。只采一层（嵌套不叠），
+    // 因为古籍里的专名不会套着书名再套着专名。
+    let mut mark_cap: Option<(String, &'static str, String)> = None;
 
     // 块级标签：结束时要断段。
     let is_block = |n: &str| -> bool {
@@ -129,8 +174,20 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
                 let name = local_name(e.name().as_ref());
                 if is_skip(&name) {
                     skip += 1;
-                } else if skip == 0 && is_block(&name) {
-                    push_break(&mut para, &mut out);
+                } else if skip == 0 {
+                    // 划线标记开壳：只认一层，且块级标签先断段（`<u>` 不会
+                    // 是块，但 `<span class=book>` 里可能有）——标记绝不跨段。
+                    if mark_cap.is_none() {
+                        if let Some(kind) = mark_kind_for(&name, &class_of(&e)) {
+                            push_break(&mut para, &mut out);
+                            mark_cap = Some((name, kind, String::new()));
+                            buf.clear();
+                            continue;
+                        }
+                    }
+                    if is_block(&name) {
+                        push_break(&mut para, &mut out);
+                    }
                 }
             }
             Ok(Event::Empty(e)) => {
@@ -143,14 +200,32 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
                 let name = local_name(e.name().as_ref());
                 if is_skip(&name) {
                     skip = skip.saturating_sub(1);
-                } else if skip == 0 && is_block(&name) {
-                    push_break(&mut para, &mut out);
+                } else if skip == 0 {
+                    // 收壳：跨度合法就转成 core 的划线标记，否则原样留字
+                    // （宁可少画一条线，也不能把「整句下划线」标成人名）。
+                    let closing = matches!(&mark_cap, Some((t, _, _)) if *t == name);
+                    if closing {
+                        let (_, kind, text) = mark_cap.take().unwrap();
+                        let t = collapse_inline_space(&text);
+                        let n = t.chars().count();
+                        if n > 0 && n <= MARK_MAX_CHARS && !t.chars().any(crate::types::is_punct) {
+                            para.push_str(&format!("〔{kind}:{t}〕{t}"));
+                        } else if !t.is_empty() {
+                            para.push_str(&t);
+                        }
+                    } else if is_block(&name) {
+                        push_break(&mut para, &mut out);
+                    }
                 }
             }
             Ok(Event::Text(t)) => {
                 if skip == 0 {
                     let raw = String::from_utf8_lossy(t.as_ref());
-                    para.push_str(&unescape_html(&raw));
+                    let txt = unescape_html(&raw);
+                    match mark_cap.as_mut() {
+                        Some((_, _, cap)) => cap.push_str(&txt),
+                        None => para.push_str(&txt),
+                    }
                 }
             }
             Ok(Event::CData(c)) => {
@@ -326,6 +401,29 @@ mod tests {
         // `<br/>` 按规矩转成换行（诗行由此分行），故第 2 段被切成两行。
         assert_eq!(t.lines().count(), 4, "段落/换行数不对：{t:?}");
         assert!(t.contains("非常名 也。"), "&nbsp; 没还原成空格：{t:?}");
+    }
+
+    /// 专名号：`<u>` / `class` 带 book 的 span 转成 core 的划线标记，
+    /// **不**在正文里留下划线标签本身，也不把长句硬标成人名。
+    #[test]
+    fn underline_becomes_a_proper_name_mark() {
+        let src = r#"<html><body>
+            <p><u>孔子</u>曰：<span class="book-name">春秋</span>者，天子之事也。</p>
+            <p><u>这一整句都被画了下划线的现代排版句子不该被标成专名</u></p>
+            <p><span class="quiet">普通 span 不动</span></p>
+            </body></html>"#;
+        let (t, e) = extract_html_str(src);
+        assert!(e.is_none(), "不该报错：{e:?}");
+        assert!(t.contains("〔人:孔子〕孔子"), "`<u>` 没转成专名：{t}");
+        assert!(t.contains("〔书:春秋〕春秋"), "书名 span 没转成书名线：{t}");
+        // 超过跨度上限的（现代「整句下划线」）不标，但字一个都不许丢。
+        assert!(!t.contains("〔人:这一整句"), "长跨度不该标成专名：{t}");
+        assert!(t.contains("这一整句"), "长跨度的字被吞了：{t}");
+        // 普通 span 不带线。
+        assert!(!t.contains("〔人:普通"), "{t}");
+        assert!(t.contains("普通 span 不动"), "{t}");
+        // 标记壳不能残留成正文。
+        assert!(!t.contains("<u>") && !t.contains("class="), "{t}");
     }
 
     #[test]

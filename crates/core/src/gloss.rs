@@ -684,6 +684,170 @@ pub fn is_dot_punct(c: char) -> bool {
     )
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// 古籍句读符号库（v1.81.0）
+// ─────────────────────────────────────────────────────────────────────
+//
+// 刻本不用现代标点：一句之末是一枚「。」般的小圆圈，句中断处是一枚
+// 侧锋写出的斜点，疑问 / 感叹更罕见——真遇上，古人也只点一枚**大一点**
+// 的点，而不是画「？」那个弯钩。这套库就是把「字符 → 画什么形」这件
+// 事从渲染层收回到排版引擎里，让**屏幕与 PDF 读同一张表**（`pdf.rs` 与
+// `reader.rs` 各自判一次必然走偏）。
+//
+// 库只管**分类与口径**（哪枚字画哪种形、多大），不碰笔画——手绘在
+// `crate::punct`（macOS 壳），几何两边共用。
+
+/// **句读模式**：现代标点 / 古籍句读。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PunctMode {
+    /// 现代标点：句画细线小空心圆，读画侧点，疑叹仍是「？」那套圈的形。
+    #[default]
+    Modern,
+    /// 古籍句读：句画古风小圆圈「〇」，读画圆头斜点，疑叹画**大一号**斜点。
+    Classic,
+}
+
+impl PunctMode {
+    /// 面板上的顺序（下标即 `Prefs::punct_mode` 的值）。
+    pub const ALL: [PunctMode; 2] = [PunctMode::Modern, PunctMode::Classic];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PunctMode::Modern => "现代标点",
+            PunctMode::Classic => "古籍句读",
+        }
+    }
+}
+
+/// **句读墨色**：墨 / 朱砂。
+///
+/// 只在**浅纸**上由读者挑：暗金那套（深底的夜读、或墨色组选了「暗金」）
+/// 一律走**淡金**——朱砂压在深底上发闷，也压过了正文的月白。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PunctInk {
+    /// 墨：与正文同一支墨，句读退到「只是点了断」的本分。
+    Mo,
+    /// 朱砂（默认）：与夹注、朱印同源的那支朱。
+    Zhu,
+}
+
+impl PunctInk {
+    pub const ALL: [PunctInk; 2] = [PunctInk::Mo, PunctInk::Zhu];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PunctInk::Mo => "墨色",
+            PunctInk::Zhu => "朱砂",
+        }
+    }
+
+    /// 取色：**暗金 → 淡金**，浅纸 → 墨 / 朱砂。
+    ///
+    /// 淡金两档：深底取「秋香提亮」（看得见又不刺），浅纸取「金兑墨一档」
+    /// （比暗金正文略淡，是句读不是正文）。
+    pub fn color(self, palette: crate::theme::InkPalette, theme: crate::theme::Theme) -> u32 {
+        let gold = matches!(palette, crate::theme::InkPalette::Gold);
+        if gold {
+            return if theme.is_dark() {
+                0xC2A468 // 暗金·淡金（深底）
+            } else {
+                crate::theme::mix(0x7A5C1E, theme.paper(), 0.18) // 暗金·淡金（浅纸）
+            };
+        }
+        match self {
+            PunctInk::Mo => palette.ink(theme),
+            // 朱砂走 `accent`：与朱印同源，深底自动提亮一档。
+            PunctInk::Zhu => theme.accent(),
+        }
+    }
+}
+
+/// 符号库里的**一枚形制**。
+///
+/// 命名跟着刻本的叫法走，不跟着现代标点走——`Seed` 是「读」那一撇，
+/// `Ring` 是「句」那个圈；`Dot` 是**现代**句号才有的细线空心圆。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Jodu {
+    /// **读**（，、；：—…）：圆头斜点——小圆头在右上、出锋扫向左下，
+    /// 灵飞经小楷「侧锋按下即提」那一笔。
+    Seed,
+    /// **句**（。．）：古风小圆圈「〇」——比现代空心圆大一圈、笔画厚，
+    /// 起笔处略顿，是毛笔写出来的圈，不是几何圆。
+    Ring,
+    /// **疑叹**（？！）：**大一号**的斜点。古人极少用，遇上了也不画
+    /// 弯钩，只把「读」那一点写重、写大。
+    BigSeed,
+    /// **现代句**（。）：细线小空心圆（`Modern` 模式专用）。
+    Dot,
+}
+
+impl Jodu {
+    /// 记号直径 = 正文字号 × 此比例（渲染与 PDF 共用的唯一口径）。
+    ///
+    /// 读（0.54）< 疑叹（0.62）< 句（0.42）？不——**句比读小**是刻本的
+    /// 规矩：句末那一圈只作收束，读处那一点要撑住行气故更重。疑叹最重，
+    /// 因为它是「读」的加强。
+    pub fn fs_ratio(self) -> f32 {
+        match self {
+            Jodu::Seed => 0.54,
+            Jodu::Ring => 0.42,
+            Jodu::BigSeed => 0.62,
+            Jodu::Dot => 0.35,
+        }
+    }
+
+    /// 是不是「实心笔画」的形（斜点类填实，圈类描边）。
+    pub fn is_solid(self) -> bool {
+        matches!(self, Jodu::Seed | Jodu::BigSeed)
+    }
+}
+
+/// **查表**：一个标点字符 + 当前模式 → 该画哪一枚。
+///
+/// `None` = 这一枚不归符号库管（引号 / 括号 / 书名号等，仍按原字形排）。
+/// 分类口径与 `types::is_stop_punct` 同源：**句类是「。．」，疑叹是
+/// 「？！」，余下算读**。
+pub fn jodu_of(c: char, mode: PunctMode) -> Option<Jodu> {
+    // **句**（含全角句点 `．` 与竖排句点 `︒`）。
+    //
+    // 这三个不在 `types::is_punct` 那套「排版集合」里（那集合列的是需要
+    // 挤压 / 避头的字），但语义上就是句号，故在这里先认下来——符号库认的
+    // 是**语义**，不是排版集合的成员资格。
+    if matches!(c, '。' | '．' | '︒') {
+        return Some(match mode {
+            PunctMode::Modern => Jodu::Dot,
+            PunctMode::Classic => Jodu::Ring,
+        });
+    }
+    // **疑 / 叹**：古人没有「？」这个符号，弯钩是西式标点的形；古籍模式下
+    // 一律降级成一枚写重、写大的斜点。
+    if matches!(c, '？' | '！' | '︖' | '︕' | '?' | '!') {
+        return Some(match mode {
+            PunctMode::Modern => Jodu::Dot,
+            PunctMode::Classic => Jodu::BigSeed,
+        });
+    }
+    // **省略号**：话没说完，不是一句已了。现代那套照旧画细圈（与旧版
+    // `kind_of` 的行为逐字一致，升级不改观感），古籍里归「读」那一撇。
+    if matches!(c, '…' | '‥') {
+        return Some(match mode {
+            PunctMode::Modern => Jodu::Dot,
+            PunctMode::Classic => Jodu::Seed,
+        });
+    }
+    // 其余句读（逗号 / 顿号 / 分号 / 冒号 / 破折号 / 间隔号）都算「读」。
+    // 引号 / 括号 / 书名号虽然也在 `is_punct` 里，但它们要「括住」东西、
+    // 有自己的一对字形，绝不换成点子——故一并排掉。
+    if crate::types::is_punct(c)
+        && !crate::types::is_title_mark(c)
+        && !crate::types::is_quote_mark(c)
+        && !matches!(c, '（' | '）' | '(' | ')')
+    {
+        return Some(Jodu::Seed);
+    }
+    None
+}
+
 /// 一列内所有夹注块的纸面坐标。
 ///
 /// `li` 是该列在 flex_row 里**从左数**的位置（左缘 `li*cell_w`）：
@@ -1388,8 +1552,69 @@ mod tests {
         book.to_flow(true)
     }
 
+    /// 符号库：现代模式下句与疑叹都收成一枚细线空心圆。
     #[test]
-    #[allow(clippy::assertions_on_constants)] // 钉的是注文标点比例常量（0 < r < 1）
+    fn jodu_lib_modern_draws_one_ring_for_every_stop() {
+        for c in ['。', '！', '？', '．'] {
+            assert_eq!(
+                jodu_of(c, PunctMode::Modern),
+                Some(Jodu::Dot),
+                "{c} 现代模式应画空心圆"
+            );
+        }
+        for c in ['，', '、', '；', '：'] {
+            assert_eq!(
+                jodu_of(c, PunctMode::Modern),
+                Some(Jodu::Seed),
+                "{c} 现代模式应画斜点"
+            );
+        }
+    }
+
+    /// 符号库：古籍模式下句画「〇」、疑叹画**大一号**斜点、读画斜点。
+    #[test]
+    fn jodu_lib_classic_splits_the_stop_into_ring_and_big_seed() {
+        assert_eq!(jodu_of('。', PunctMode::Classic), Some(Jodu::Ring));
+        assert_eq!(jodu_of('．', PunctMode::Classic), Some(Jodu::Ring));
+        // 疑叹：不是弯钩，是一枚更重的斜点。
+        for c in ['？', '！', '︖', '︕'] {
+            assert_eq!(
+                jodu_of(c, PunctMode::Classic),
+                Some(Jodu::BigSeed),
+                "{c} 古籍模式应画大斜点"
+            );
+        }
+        for c in ['，', '、', '；'] {
+            assert_eq!(jodu_of(c, PunctMode::Classic), Some(Jodu::Seed));
+        }
+        // 省略号是「话没说完」，仍归读。
+        assert_eq!(jodu_of('…', PunctMode::Classic), Some(Jodu::Seed));
+        // 引号 / 书名号不归符号库管（仍走原字形）。
+        assert_eq!(jodu_of('《', PunctMode::Classic), None);
+        assert_eq!(jodu_of('「', PunctMode::Modern), None);
+        // 正文汉字当然不是句读。
+        assert_eq!(jodu_of('道', PunctMode::Classic), None);
+    }
+
+    /// 字号口径：疑叹 > 读 > 句（刻本的轻重次序），且全都小于正文字。
+    #[test]
+    fn jodu_lib_sizes_follow_the_carved_book_order() {
+        assert!(Jodu::BigSeed.fs_ratio() > Jodu::Seed.fs_ratio());
+        assert!(Jodu::Seed.fs_ratio() > Jodu::Ring.fs_ratio());
+        for j in [Jodu::Seed, Jodu::Ring, Jodu::BigSeed, Jodu::Dot] {
+            assert!(
+                j.fs_ratio() < 1.0 && j.fs_ratio() > 0.2,
+                "{j:?} 字号比 {:?} 离谱",
+                j.fs_ratio()
+            );
+        }
+        // 斜点类是实心笔画，圈类不是。
+        assert!(Jodu::Seed.is_solid());
+        assert!(Jodu::BigSeed.is_solid());
+        assert!(!Jodu::Ring.is_solid());
+        assert!(!Jodu::Dot.is_solid());
+    }
+
     fn note_punct_is_a_size_smaller_than_the_note_text() {
         // 注文本身就是正文的一半；注里的句读再收一档（0.62），
         // 合起来约正文的 0.31——略小于正文句读（0.4×），小字里只剩一粒轻点。

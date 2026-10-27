@@ -73,6 +73,16 @@ pub struct PdfGeometry {
     pub han_digits: bool,
     /// 繁体显示（与阅读器的繁简开关同源）。
     pub traditional: bool,
+    /// **句读模式**（现代标点 / 古籍句读，v1.81.0）。
+    ///
+    /// 纸上与屏幕必须同一个口径：`gloss::jodu_of` 是唯一数据源，壳子只照
+    /// 它挑画法（同尺寸同位置），故 PDF 里的「〇」与屏幕上逐字同位。
+    pub punct_mode: crate::gloss::PunctMode,
+    /// **句读墨色**（已解析成 `0xRRGGBB`）。
+    ///
+    /// 由壳子按 `PunctInk::color(palette, theme)` 算好传进来——core 不认识
+    /// 主题 / 墨色组，也不该认识。
+    pub punct_ink: u32,
 }
 
 impl PdfGeometry {
@@ -219,6 +229,8 @@ mod tests {
             note_font: PdfFontKind::Kai,
             han_digits: false,
             traditional: false,
+            punct_mode: crate::gloss::PunctMode::Modern,
+            punct_ink: 0xC3272D,
         };
         assert!((g.sheet_w() - (12.0 * 30.0 + 34.0)).abs() < 1e-6);
         assert!(g.sheet_h() > g.sheet_w(), "A4 竖放：高必须大于宽");
@@ -264,6 +276,8 @@ mod tests {
             note_font: PdfFontKind::Kai,
             han_digits: false,
             traditional: false,
+            punct_mode: crate::gloss::PunctMode::Modern,
+            punct_ink: 0xC3272D,
         };
         assert!(e.render_leaves(std::slice::from_ref(&leaf), &g).is_err());
     }

@@ -5497,11 +5497,16 @@ impl Root {
         // 它是被挤进**末字格**的那枚，与末字共格；X 若仍取 70% 就压在末字
         // 字身上，看着像叠字。推到 86% 才「挂」在字旁。它只在本格内取值，
         // 绝不占列首格位——列首顶格（top_baseline）因此不受影响。
+        // 形制读**当前句读模式**（现代 / 古籍）：分类归排版引擎，
+        // 这里只查表（`kind_for` → `gloss::jodu_of`）。
+        let kind = crate::punct::kind_for(ch, self.punct_mode).unwrap_or(crate::punct::PunctKind::Dot);
         let m = if hung {
-            crate::punct::place_hang(fs, cell_w, cell_h, crate::punct::kind_of(ch))
+            crate::punct::place_hang(fs, cell_w, cell_h, kind)
         } else {
-            crate::punct::place(fs, cell_w, cell_h, crate::punct::kind_of(ch))
+            crate::punct::place(fs, cell_w, cell_h, kind)
         };
+        // 回锋开关（只对斜点有意义，圈类不看它）。
+        let m = crate::punct::with_hook(m, self.punct_hook);
         let ink = self.punct_ink(back);
         // 浮层铺满字格：canvas 的 paint 闭包收到的是**窗口坐标**的
         // bounds，把字格原点（ox/oy）加回记号中心即可。
@@ -5533,8 +5538,32 @@ impl Root {
     ///
     /// 取 `palette.note`：与夹注、朱批同源的那支朱砂，按纸色明暗自动切换
     /// （深底提亮、浅纸压深），无需再手算。
+    ///
+    /// v1.81.0 起由 [`crate::gloss::PunctInk::color`] 统管三档：
+    /// **暗金 → 淡金**（深底朱砂发闷，会压过正文月白）、浅纸 → 墨 / 朱砂
+    /// 由读者挑（默认朱砂，与 v1.66 定下的那支朱一致）。
     fn punct_ink(&self, _back: bool) -> u32 {
-        self.palette.note(self.theme)
+        self.punct_ink.color(self.palette, self.theme)
+    }
+
+    /// 把句读三项（模式 / 墨色 / 回锋）单独写回 `prefs.json`。
+    ///
+    /// 为什么单点保存：全仓并没有一处「把整个界面状态 capture 成 Prefs」的
+    /// 收口（`Prefs::capture` 只在单测里用过），故新加的三项若不自己落盘，
+    /// 一关窗口就退回默认。改一次存一次，代价是一次几百字节的写。
+    fn save_punct_prefs(&self) {
+        use crate::gloss::{PunctInk, PunctMode};
+        let mut prefs = crate::prefs::Prefs::load();
+        prefs.punct_mode = PunctMode::ALL
+            .iter()
+            .position(|m| *m == self.punct_mode)
+            .unwrap_or(0);
+        prefs.punct_ink = PunctInk::ALL
+            .iter()
+            .position(|i| *i == self.punct_ink)
+            .unwrap_or(1);
+        prefs.punct_hook = self.punct_hook;
+        prefs.save();
     }
 
     /// 正文单字格：主字 + 旁注（繁体/通假）+ 句读朱点。
@@ -5600,10 +5629,10 @@ impl Root {
                     cell_w,
                     cell_h,
                     fs,
-                    match mk {
-                        MarkKind::Name => if back { t.ink_soft() } else { t.ink() },
-                        MarkKind::Book => t.accent(),
-                    },
+                    // **朱砂**（v1.81.0 用户口径）：专名线与书名线都是「书里
+                    // 印的标号」，用同一支朱笔；不再一支取墨、一支取朱——
+                    // 两种颜色并排会让人以为是两种不同的标记。
+                    t.accent(),
                 )
             })
         };
@@ -10048,6 +10077,53 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
         );
         sheet = sheet.child(style_row("标注", marks, t));
 
+        // ---- 句读：形制（现代标点 / 古籍句读）+ 点画（墨 / 朱砂 / 回锋）----
+        //
+        // v1.81.0：古籍句读不是「换一套标点字体」，而是**换一套记号**——
+        // 句号画「〇」、疑叹画大斜点、读画圆头侧点。这一行只管形制，
+        // 是否显示句读仍归上一行的「标点」开关（两件事，别混）。
+        use crate::gloss::{PunctInk, PunctMode};
+        let mode_chips = self.style_chips(
+            vec![
+                (
+                    PunctMode::Modern.label(),
+                    self.punct_mode == PunctMode::Modern,
+                    StyleAct::PunctModern,
+                ),
+                (
+                    PunctMode::Classic.label(),
+                    self.punct_mode == PunctMode::Classic,
+                    StyleAct::PunctClassic,
+                ),
+            ],
+            cx,
+        );
+        sheet = sheet.child(style_row("句读", mode_chips, t));
+
+        // 点画只在**古籍句读**下有意义（现代标点那套是「印刷体」的形，
+        // 没有回锋这回事），故跟着模式显隐——省一行高度，也不误导。
+        if self.punct_mode == PunctMode::Classic {
+            // 暗金那套一律**淡金**（判定在 `PunctInk::color` 里），故此时
+            // 墨 / 朱砂两枚都不点亮——点了也不会立刻变色，索性不假装选中；
+            // 换回浅纸那套墨色，选择立刻生效。
+            let gold = matches!(self.palette, InkPalette::Gold);
+            let items = vec![
+                (
+                    PunctInk::Mo.label(),
+                    !gold && self.punct_ink == PunctInk::Mo,
+                    StyleAct::InkMo,
+                ),
+                (
+                    PunctInk::Zhu.label(),
+                    !gold && self.punct_ink == PunctInk::Zhu,
+                    StyleAct::InkZhu,
+                ),
+                ("回锋", self.punct_hook, StyleAct::Hook),
+            ];
+            let ink_chips = self.style_chips(items, cx);
+            sheet = sheet.child(style_row("点画", ink_chips, t));
+        }
+
         // ---- 实时反馈：引擎当下算出的列数 / 版心 / 列宽 / 字号 / 每面行款 ----
         // 自动档每帧换挡，这一行是「当前到底排成什么样」的唯一凭据。
         // 层次化：**版心% 与 天头:地脚** 用半透明朱砂微微高亮（核心参数），
@@ -10180,6 +10256,28 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
                             StyleAct::AutoDuplex => {
                                 this.auto_duplex = !this.auto_duplex;
                                 this.fit_sizes();
+                            }
+                            // 句读：只换形制 / 颜色，不动格数账，**不重排**
+                            // （形制变了但每枚句读仍占半格账 0，列不会挪）。
+                            StyleAct::PunctModern => {
+                                this.punct_mode = crate::gloss::PunctMode::Modern;
+                                this.save_punct_prefs();
+                            }
+                            StyleAct::PunctClassic => {
+                                this.punct_mode = crate::gloss::PunctMode::Classic;
+                                this.save_punct_prefs();
+                            }
+                            StyleAct::InkMo => {
+                                this.punct_ink = crate::gloss::PunctInk::Mo;
+                                this.save_punct_prefs();
+                            }
+                            StyleAct::InkZhu => {
+                                this.punct_ink = crate::gloss::PunctInk::Zhu;
+                                this.save_punct_prefs();
+                            }
+                            StyleAct::Hook => {
+                                this.punct_hook = !this.punct_hook;
+                                this.save_punct_prefs();
                             }
                         }
                         cx.notify();
@@ -10422,6 +10520,16 @@ enum StyleAct {
     Han,
     /// 响应式单 / 双叶：按屏幕宽高比自动决定对开 / 单叶。
     AutoDuplex,
+    /// 句读模式：现代标点。
+    PunctModern,
+    /// 句读模式：古籍句读（「〇」+ 侧点 + 大斜点）。
+    PunctClassic,
+    /// 句读墨色：墨。
+    InkMo,
+    /// 句读墨色：朱砂。
+    InkZhu,
+    /// 读点的回锋（出锋末端带一小勾）。
+    Hook,
 }
 
 /// 版字面板的一行：左侧极小号标签（像书页边的批字），右侧一组控件。

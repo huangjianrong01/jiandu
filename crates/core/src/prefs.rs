@@ -86,6 +86,21 @@ pub struct Prefs {
     pub notes: bool,
     /// 翻页音效。
     pub sound: bool,
+    /// **句读模式**下标（[`crate::gloss::PunctMode::ALL`]）：
+    /// 0 = 现代标点、1 = 古籍句读（句画「〇」、疑叹画大斜点）。
+    ///
+    /// 老存档没有这一项 → 0（现代），升级后读者自己切，不擅自改人家的版。
+    #[serde(default)]
+    pub punct_mode: usize,
+    /// **句读墨色**下标（[`crate::gloss::PunctInk::ALL`]）：0 = 墨、1 = 朱砂。
+    ///
+    /// 只在**浅纸**上分这两档：深底（暗金 / 夜读）一律走淡金，朱砂压在
+    /// 深底上会发闷，也压过了正文的月白。
+    #[serde(default)]
+    pub punct_ink: usize,
+    /// **回锋**（v1.80.0）：读那一撇的出锋末端带不带一小勾。
+    #[serde(default)]
+    pub punct_hook: bool,
     /// 窄屏（手机竖持 / 窗口拉窄）首次提示已看过（v1.52.3）：
     /// 「竖排自右向左，纸面贴右缘」只说一次，跨会话不再唠叨。
     /// 老存档没有这一项 → false（升级后第一次进窄屏会看到）。
@@ -123,6 +138,10 @@ impl Default for Prefs {
             layout_mode: 0,
             notes: true,
             sound: true,
+            punct_mode: 0,
+            // 朱砂（v1.66.0 用户定）：句读一直是朱笔点的，升级不该悄悄换色。
+            punct_ink: 1,
+            punct_hook: false,
             narrow_hint_seen: false,
         }
     }
@@ -182,6 +201,14 @@ impl Prefs {
     /// 排版字体（刻本宋体 / 手写楷体）。
     pub fn font_preset(&self) -> FontPreset {
         pick(&FontPreset::ALL, self.font_preset)
+    }
+    /// 句读模式（现代标点 / 古籍句读）。
+    pub fn punct_mode(&self) -> crate::gloss::PunctMode {
+        pick(&crate::gloss::PunctMode::ALL, self.punct_mode)
+    }
+    /// 句读墨色（墨 / 朱砂）。
+    pub fn punct_ink(&self) -> crate::gloss::PunctInk {
+        pick(&crate::gloss::PunctInk::ALL, self.punct_ink)
     }
 
     /// 留白档 → 版心率（0.60 / 0.75 / 0.90）。下标越界回落默认档，

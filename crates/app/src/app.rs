@@ -621,6 +621,15 @@ pub struct Root {
     pub palette: InkPalette,
     /// 标点显隐：true 显示句读（朱色小字），false 隐藏（同时影响分页）。
     pub show_punct: bool,
+    /// **句读模式**（v1.81.0）：现代标点 / 古籍句读。
+    ///
+    /// 古籍模式下句用「〇」、疑叹用大斜点、读用侧点（见 `gloss::jodu_of`）。
+    /// 它只改**形制**，不改是否显示句读（那是 `show_punct`）。
+    pub punct_mode: crate::gloss::PunctMode,
+    /// **句读墨色**：墨 / 朱砂；暗金那套一律淡金（见 `gloss::PunctInk::color`）。
+    pub punct_ink: crate::gloss::PunctInk,
+    /// **回锋**：读那一撇的出锋末端带不带一小勾。
+    pub punct_hook: bool,
     /// 生僻字显示：true 时给生僻字标注读音。
     pub show_rare: bool,
     /// 数字转汉字：true 时阿拉伯数字在竖排里显示为汉字（一六二八），
@@ -1091,6 +1100,9 @@ impl Root {
             sel_char: None,
             palette: InkPalette::Ink,
             show_punct: true,
+            punct_mode: prefs.punct_mode(),
+            punct_ink: prefs.punct_ink(),
+            punct_hook: prefs.punct_hook,
             // 生僻字注音：默认开（`prefs.rare` 默认 true）——古籍里真有读不出
             // 的字，一根拐杖比「干净」重要。关掉的意愿会随下一版落盘。
             show_rare: prefs.rare,
@@ -3452,6 +3464,8 @@ impl Root {
             note_font: crate::pdf::PdfFontKind::Kai,
             han_digits: self.han_digits,
             traditional: self.show_traditional,
+            punct_mode: self.punct_mode,
+            punct_ink: self.punct_ink.color(self.palette, self.theme),
         };
         let safe = crate::exporter::safe_file_stem(&book.title);
         let default = format!(

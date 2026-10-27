@@ -48,6 +48,8 @@ fn geo() -> PdfGeometry {
         note_font: PdfFontKind::Kai,
         han_digits: true,
         traditional: false,
+        punct_mode: jiandu_core::gloss::PunctMode::Modern,
+        punct_ink: 0xC3272D,
     }
 }
 
