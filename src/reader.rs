@@ -7,7 +7,7 @@
 //!   * 段落分隔 —— 段首空两格（首行缩进），不再放置任何段落标记符。
 
 use crate::app::{
-    AppUIState, Root, Screen, ANCIENT_EDGE, ANCIENT_TITLE_COL,
+    AppUIState, NotesTab, Root, Screen, ANCIENT_EDGE, ANCIENT_TITLE_COL,
 };
 use crate::dict;
 use crate::gloss::{Page, Piece};
@@ -1672,14 +1672,12 @@ impl Root {
         // （原「版式控制面板」浮层 v1.35.0 已删除：那四枚 8/10/12/14 档位与
         // 版字面板的「列数」是同一件事的两副面孔，现统一并入「版字」页的
         // `COLUMN_OPTS`；留白两行也一并搬过去了。）
-        // 笔记 / 批注浮层。
+        // 笔记浮层（v1.78.0）：**一个抽屉两页**——朱批录（本书内的批）与
+        // 卡片匣（跨书的摘录）合成一枚「笔记」，页签在抽屉头上切。原先是两枚
+        // 顶栏钮、两个抽屉、两套滑入动画，还得靠 `set_ui_state` 互斥，而它们
+        // 装的本是同一类东西：我留下的字。
         if self.show_notes_panel && !self.focus_mode {
             root = root.child(self.render_notes_panel(cx));
-        }
-        // 卡片匣：跨书摘录卡（v1.74.0）。与朱批录同为右滑侧栏，同一时刻只开一个
-        // （`set_ui_state` 互斥保证）。
-        if self.show_cards && !self.focus_mode {
-            root = root.child(self.render_cards_panel(cx));
         }
         // 问小笺（v1.76.0）：AI 伴读侧栏。**独立 Entity**——流式输出每帧只
         // 重绘这一条侧栏，纸上的书一动不动（见 `src/ai.rs` 文件头）。
@@ -1931,7 +1929,6 @@ impl Root {
                         self.close_toc();
                         self.show_style = false;
                         self.show_notes_panel = false;
-                        self.show_cards = false;
                         // 小笺栏：与其余侧栏同款收法（目标态归零，由 render 逐帧滑出）。
                         self.close_ai();
                         self.show_help = false;
@@ -2774,7 +2771,9 @@ impl Root {
     /// 「触天头才出、读完即退」那套自动隐藏整块撤掉。只有专注模式会在渲染
     /// 层把它整块撤下，把整幅纸面还给正文。
     ///
-    /// 三组纯文字：书阁 · 目录 ｜ 版字 · 专注 ｜ 检索 · 朱批 · 帮助。
+    /// 三组纯文字：书阁 · 目录 · 书签 ｜ 版字 · 专注 ｜ 检索 · 笔记 · 问笺
+    /// · 导出 · 帮助（v1.78.0 由 10 枚减到 9 枚：「朱批」+「卡片匣」合成
+    /// 一枚「笔记」，两个抽屉也并成一个带页签的）。
     ///
     /// v1.37.0「UI 瘦身」撤掉了「封面」一枚：书衣看点在书架点书那一刻，
     /// 读着读着没人想回封面，它只是白占天头一条横向空间。
@@ -2795,6 +2794,27 @@ impl Root {
         // GPUI 0.2.2 无 letter-spacing，字距只能靠 12px 的内边距撑开。
         let item = |label: &'static str, on: bool| -> Div {
             let fg = if on { zhu } else { t.ink() };
+            div()
+                .h(px(BAR_H))
+                .flex()
+                .items_center()
+                .px(px(12.0))
+                .cursor_pointer()
+                .text_size(px(13.0))
+                .text_color(rgb(fg))
+                .hover(move |s| s.text_color(rgb(zhu)))
+                .child(SharedString::from(label))
+        };
+        // 一枚**降权**的纯文字钮：给「帮助」这种一年点几次的功能。
+        // 低频动作不该和检索 / 笔记 / 问笺这些天天点的同权重——常态字色比
+        // 其它钮淡一档（墨混纸 35%），鼠标悬上去才转朱砂；开着时仍是朱砂，
+        // 「此门已开」的读法不变。
+        let faint_item = |label: &'static str, on: bool| -> Div {
+            let fg = if on {
+                zhu
+            } else {
+                crate::theme::mix(t.ink(), t.paper(), 0.35)
+            };
             div()
                 .h(px(BAR_H))
                 .flex()
@@ -2839,7 +2859,11 @@ impl Root {
                 cx.notify();
             }),
         ));
-        // 书签：顶栏一枚入口，点一下收藏当前页并滑出书签抽屉（再点收起）。
+        // 书签（v1.78.0）：**只开合抽屉，不再顺手加一条**。
+        // 原先 `toggle_bookmarks` 是「开抽屉 = 先收藏当前叶 + 再滑出」，一枚钮
+        // 同时是动作和开关：想翻书签，点一下就先给你加了条新的；翻过页再点又
+        // 加一条。开关里夹副作用，用户没法只「看」不「加」。现在加书签的动作
+        // 挪进抽屉头上那枚「＋ 收此葉」，语义各归各位。
         left = left.child(item("书签", self.show_bookmarks).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
@@ -2878,7 +2902,7 @@ impl Root {
         ));
         mid = mid.child(sep());
 
-        // ---- 右组：检索 / 朱批（笔记） / 卡片匣 / 帮助 / 导出 ----
+        // ---- 右组：检索 / 笔记 / 问笺 / 导出 / 帮助（最右那枚降权）----
         let mut right = div().h(px(BAR_H)).flex().items_center().pr(px(26.0));
         right = right.child(item("检索", self.show_search).on_mouse_down(
             MouseButton::Left,
@@ -2893,20 +2917,14 @@ impl Root {
                 cx.notify();
             }),
         ));
-        right = right.child(item("朱批", self.show_notes_panel).on_mouse_down(
+        // 笔记（v1.78.0）：朱批录 + 卡片匣合成**一个抽屉两页**——原先这两样
+        // 是两枚钮、两个抽屉、两套滑入动画，还得互斥，可它们装的是同一类
+        // 东西：我留下的字。顶栏因此少一枚，右组也不再撑到 340px。
+        right = right.child(item("笔记", self.show_notes_panel).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.set_ui_state(AppUIState::Notes, cx);
-                cx.notify();
-            }),
-        ));
-        // 卡片匣（v1.74.0）：跨书摘录卡的汇集处。
-        right = right.child(item("卡片匣", self.show_cards).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.set_ui_state(AppUIState::Cards, cx);
                 cx.notify();
             }),
         ));
@@ -2918,14 +2936,6 @@ impl Root {
                 this.toggle_ai(window, cx);
             }),
         ));
-        right = right.child(item("帮助", self.show_help).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.set_ui_state(AppUIState::Help, cx);
-                cx.notify();
-            }),
-        ));
         // v1.52.0：**导出**下拉。当前页图片 / 当前章 Anki 卡片 / 导出 MD
         // 原先散在底部状态栏，天头一收就找不着了；这里收成一枚「导出」，
         // 菜单里逐条列出，点哪条都直接弹系统保存对话框。
@@ -2934,6 +2944,17 @@ impl Root {
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.export_menu = !this.export_menu;
+                cx.notify();
+            }),
+        ));
+        // v1.78.0：**帮助挪到最右并降权**。原先它夹在「问笺」与「导出」之间，
+        // 占了右组倒数第二的黄金位——可帮助是一年点几次的东西，检索 / 笔记
+        // 才是天天点的。挪到末尾 + 字色淡一档，既留得住又不抢视线。
+        right = right.child(faint_item("帮助", self.show_help).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.set_ui_state(AppUIState::Help, cx);
                 cx.notify();
             }),
         ));
@@ -8378,7 +8399,7 @@ impl Root {
         list = list.child(help_row("笔记框", "⏎ 保存 · Esc 取消 · ← → 移光标 · ⌘V 粘贴", t));
         // 卡片匣（v1.74.0）：跨书摘录。与朱批不同——朱批长在书里，卡片汇在匣里。
         list = list.child(help_row("浮签「存卡」", "框选正文后入匣（跨书汇集，书删了卡片还在）", t));
-        list = list.child(help_row("顶栏「卡片匣」", "查看全部卡片 · 点一条跳回原文 · 右侧「删」", t));
+        list = list.child(help_row("顶栏「笔记」", "一个抽屉两页：朱批錄（本书批注）/ 卡片匣（跨书摘录）", t));
         // 问小笺（v1.76.0 · V2.0 模块二）：框一句原文问他。
         list = list.child(help_sec("问小笺", t));
         list = list.child(help_row("浮签「问笺」", "框选原文即问（自动带上前后文与出处）", t));
@@ -8402,7 +8423,7 @@ impl Root {
         list = list.child(help_row("悬停文字约半秒", "字书浮签（本 → 繁 → 简 三级兜底）", t));
         list = list.child(help_row("双击页码", "一键回到卷首", t));
         list = list.child(help_row("按住天头拖拽", "题「眉批」（同列位置自动避让）", t));
-        list = list.child(help_row("点面板外空白", "收起目录 / 朱批 / 帮助 / 导出菜单", t));
+        list = list.child(help_row("点面板外空白", "收起目录 / 笔记 / 帮助 / 导出菜单", t));
 
         list = list.child(help_sec("导出", t));
         list = list.child(help_row("顶栏「导出」", "本叶图片 · 当前章卡片 · MD", t));
@@ -8585,10 +8606,18 @@ impl Root {
 
     /// **朱批录**：右滑侧栏，半透明宣纸底，朱砂细线列出全部批注；点一条即
     /// 收栏、瞬跳到该 charIndex 并点亮「抵达」高亮。
+    /// **笔记抽屉**（v1.78.0）：右滑侧栏，**一个抽屉两页**——朱批录（批在
+    /// 这本书上的字）与卡片匣（从各本书里摘出来的句）合成顶栏一枚「笔记」，
+    /// 抽屉头上两枚页签切换。
+    ///
+    /// 为什么合：它们装的是同一类东西——**我留下的字**。原先两枚顶栏钮、两个
+    /// 抽屉、两套滑入动画，还得靠 `set_ui_state` 互斥（同时只准开一个），用户
+    /// 却得先想清楚「这条算批注还是算摘录卡」。
+    ///
+    /// 切页签**只换内容、不重播滑入动画**：抽屉本来就开着，滑它干什么。
     fn render_notes_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let vw = self.viewport_w;
-        let _vh = self.viewport_h;
         let slide = self.notes_slide.clamp(0.0, 1.0);
         let panel_w = (vw * 0.36).clamp(300.0, 440.0);
         let off = -(1.0 - slide) * panel_w;
@@ -8600,9 +8629,125 @@ impl Root {
         // 极细墨线（条目分隔）：纸 + 墨 16%。
         let sept = crate::theme::mix(t.paper(), t.ink(), 0.16);
         let song = self.main_family();
+        let cur = self.notes_tab;
+        // 条数写在页签上，不必另起一行标题。
+        let n_zhu = self.note_entries().len();
+        let n_card = self.cards.len();
 
+        // ── 两枚页签：当前那枚朱砂字 + 淡朱底（不用下划线，纸面上更静）──
+        let mut tabs = div().flex().flex_row().items_center().gap(px(2.0));
+        for (tab, n) in [(NotesTab::Zhu, n_zhu), (NotesTab::Card, n_card)] {
+            let on = tab == cur;
+            let mut b = div()
+                .px(px(10.0))
+                .py(px(4.0))
+                .cursor_pointer()
+                .font_family(song.clone())
+                .text_size(px(12.5))
+                .text_color(rgb(if on { zhu } else { ink_soft }))
+                .hover(move |s| s.text_color(rgb(zhu)))
+                .child(SharedString::from(format!("{} {}", tab.label(), n)));
+            if on {
+                b = b.bg(rgb(crate::theme::mix(t.paper(), zhu, 0.10)));
+            }
+            tabs = tabs.child(b.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if this.notes_tab == tab {
+                        return;
+                    }
+                    this.notes_tab = tab;
+                    // 卡片页的内容开栏 / 切页时才去库里读一次（低频面板，不每帧查）。
+                    if tab == NotesTab::Card {
+                        this.reload_cards();
+                    }
+                    cx.notify();
+                }),
+            ));
+        }
+
+        // 右侧：一句极小提示；朱批页再加一枚「匯出」（想存一份时不必回头找顶栏）。
+        let mut right_side = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .font_family(song.clone())
+                    .text_size(px(9.5))
+                    .text_color(rgb(ink_soft))
+                    .child(SharedString::from("點選可躍")),
+            );
+        if cur == NotesTab::Zhu {
+            right_side = right_side.child(
+                div()
+                    .font_family(song.clone())
+                    .text_size(px(10.5))
+                    .text_color(rgb(zhu))
+                    .cursor_pointer()
+                    .hover(move |s| s.text_color(rgb(ink)))
+                    .child(SharedString::from("匯出"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.export_margin_notes(cx);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .py(px(5.0))
+            .border_b_1()
+            .border_color(rgb(sept))
+            .child(tabs)
+            .child(right_side);
+
+        let body = match cur {
+            NotesTab::Zhu => self.render_notes_list(cx),
+            NotesTab::Card => self.render_cards_list(cx),
+        };
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .right(px(off))
+            .w(px(panel_w))
+            .flex()
+            .flex_col()
+            .bg(rgba(paper_veil))
+            .border_l_1()
+            .border_color(rgb(sept))
+            .child(header)
+            .child(body)
+            // 拦住冒泡：点面板内不触发外层（页面）的翻页 / 关闭。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+    }
+
+    /// 笔记抽屉 · **朱批录页**的条目列表：本书内的批注 / 眉批 / 夹注，
+    /// 按章节顺序；点一条即收栏、跳到该字并点亮「抵达」高亮。
+    fn render_notes_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let t = self.theme;
+        let zhu = sheet_zhu(t);
+        let ink = t.ink();
+        let ink_soft = t.ink_soft();
+        let sept = crate::theme::mix(t.paper(), t.ink(), 0.16);
         let entries = self.note_entries();
-        let count = entries.len();
 
         let mut list = div()
             .id(SharedString::from("notes-list"))
@@ -8684,79 +8829,9 @@ impl Root {
             }
             list = list.child(row);
         }
-
-        // 表头：朱批录 + 条数（朱砂宋体），另一侧一句极小提示「點選可躍」。
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(rgb(sept))
-            .child(
-                div()
-                    .font_family(song.clone())
-                    .text_size(px(12.5))
-                    .text_color(rgb(zhu))
-                    .child(SharedString::from(format!("朱批錄 {count}"))),
-            )
-            .child(
-                // 右侧：提示 + 匯出。导出入口就放在「正在看批注」的地方——
-                // 顺着这一列批注读下来想存一份，不必回头去顶栏找。
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .child(
-                        div()
-                            .font_family(song.clone())
-                            .text_size(px(9.5))
-                            .text_color(rgb(ink_soft))
-                            .child(SharedString::from("點選可躍")),
-                    )
-                    .child(
-                        div()
-                            .font_family(song.clone())
-                            .text_size(px(10.5))
-                            .text_color(rgb(zhu))
-                            .cursor_pointer()
-                            .hover(move |s| s.text_color(rgb(ink)))
-                            .child(SharedString::from("匯出"))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.export_margin_notes(cx);
-                                    cx.notify();
-                                }),
-                            ),
-                    ),
-            );
-
-        div()
-            .absolute()
-            .top(px(0.0))
-            .bottom(px(0.0))
-            .right(px(off))
-            .w(px(panel_w))
-            .flex()
-            .flex_col()
-            .bg(rgba(paper_veil))
-            .border_l_1()
-            .border_color(rgb(sept))
-            .child(header)
-            .child(list)
-            // 拦住冒泡：点面板内不触发外层（页面）的翻页 / 关闭。
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, _, cx| {
-                    cx.stop_propagation();
-                }),
-            )
+        list
     }
+
 
     /// **「版字」面板**：列数 · 字级 · 字体 · 批注 · 留白 · 纸边 · 页面 ·
     /// 纸色 · 墨色 · 丝栏 · 标注——**一张纸、一页**，没有第二处入口。

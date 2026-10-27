@@ -196,16 +196,19 @@ pub fn load_chapter(c: &Connection, id: &str, n: usize) -> Result<Option<Chapter
     Ok(legacy_chapter(c, id, n))
 }
 
-/// 读路径的**线程本地连接缓存**（v1.70.0）。
-///
-/// `hydrate_chapter` 在扫索引时会被调上千次：一部 799 章的书「冷跳到末
-/// 叶」就要 hydrate 799 次。旧制**每章都 `connect()` 一次**——开库 + 三条
-/// PRAGMA + ATTACH 旧库，实测整趟 244ms，里面绝大部分是重复开库，不是读
-/// 数据。缓存后整趟只开一次库。
-///
-/// 为什么是 `thread_local` 而不是全局 `static`：`rusqlite::Connection` 是
-/// `Send` 而非 `Sync`，全局拿不到；而取页 / 渲染全在主线程，线程本地缓存
-/// 既安全又无需加锁。
+// 读路径的**线程本地连接缓存**（v1.70.0）。
+//
+// `hydrate_chapter` 在扫索引时会被调上千次：一部 799 章的书「冷跳到末
+// 叶」就要 hydrate 799 次。旧制**每章都 `connect()` 一次**——开库 + 三条
+// PRAGMA + ATTACH 旧库，实测整趟 244ms，里面绝大部分是重复开库，不是读
+// 数据。缓存后整趟只开一次库。
+//
+// 为什么是 `thread_local` 而不是全局 `static`：`rusqlite::Connection` 是
+// `Send` 而非 `Sync`，全局拿不到；而取页 / 渲染全在主线程，线程本地缓存
+// 既安全又无需加锁。
+//
+// ⚠️ 必须是 `//` 而不是 `///`：`thread_local!` 展开后不是单一 item，挂在
+// 它上面的文档注释会被丢弃并报「unused doc comment」。
 thread_local! {
     static READ_CONN: RefCell<Option<Connection>> = RefCell::new(None);
 }

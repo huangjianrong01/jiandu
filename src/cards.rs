@@ -13,7 +13,9 @@
 
 use crate::app::Root;
 use crate::reader::sheet_zhu;
-use gpui::{div, prelude::*, px, rgb, rgba, Context, Div, MouseButton, SharedString};
+use gpui::{
+    div, prelude::*, px, rgb, Context, Div, MouseButton, SharedString, Stateful,
+};
 use jiandu_core::cards::{self, Card, CardKind};
 
 /// 列表一次最多取这么多条。
@@ -134,24 +136,21 @@ impl Root {
     ///
     /// 形态照朱批录（`render_notes_panel`）来，读作同一套东西的两个抽屉：
     /// 一个装「批在这本书上的字」，一个装「从各本书里摘出来的句」。
-    pub(crate) fn render_cards_panel(&mut self, cx: &mut Context<Self>) -> Div {
+    /// **笔记抽屉 · 卡片匣页**的条目列表（v1.78.0）：跨书摘录卡，点一条即
+    /// 收栏并跳回原文。
+    ///
+    /// **只有列表，不含外壳**——外壳与「朱批錄 / 卡片匣」两枚页签在
+    /// `Root::render_notes_panel`。原先卡片匣是一整个独立抽屉（自己的外壳、
+    /// 自己的滑入动画、自己的顶栏钮），与朱批录互斥；现在两页共用一个抽屉，
+    /// 切页签只换这一块内容。
+    pub(crate) fn render_cards_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = self.theme;
-        let vw = self.viewport_w;
-        let slide = self.cards_slide.clamp(0.0, 1.0);
-        let panel_w = (vw * 0.36).clamp(300.0, 440.0);
-        let off = -(1.0 - slide) * panel_w;
         let zhu = sheet_zhu(t);
         let ink = t.ink();
         let ink_soft = t.ink_soft();
-        // 半透明宣纸底：纸色 94% 不透明（GPUI 无 backdrop-filter，用纸色近似磨砂）。
-        let paper_veil = ((t.paper() & 0xFFFFFF) << 8) | 0xF0;
+        // 极细墨线（条目分隔）：纸 + 墨 16%。
         let sept = crate::theme::mix(t.paper(), t.ink(), 0.16);
-        let song = self.main_family();
-        let count = self.cards.len();
 
-        // ⚠️ 先摘成**值**再进循环：下面要给每枚条目挂 `cx.listener`（要
-        // `&mut self`），迭代期间不能还借着 `self.cards`。
-        #[allow(clippy::type_complexity)]
         let rows: Vec<(i64, String, String, (usize, usize, usize), usize, CardKind, String)> =
             self.cards
                 .iter()
@@ -258,57 +257,14 @@ impl Root {
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.show_cards = false;
+                        this.show_notes_panel = false;
                         this.jump_to_key(key, len, cx);
                     }),
                 );
             list = list.child(row);
         }
 
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(rgb(sept))
-            .child(
-                div()
-                    .font_family(song.clone())
-                    .text_size(px(12.5))
-                    .text_color(rgb(zhu))
-                    .child(SharedString::from(format!("卡片匣 {count}"))),
-            )
-            .child(
-                div()
-                    .font_family(song)
-                    .text_size(px(9.5))
-                    .text_color(rgb(ink_soft))
-                    .child(SharedString::from("點選可躍")),
-            );
-
-        div()
-            .absolute()
-            .top(px(0.0))
-            .bottom(px(0.0))
-            .right(px(off))
-            .w(px(panel_w))
-            .flex()
-            .flex_col()
-            .bg(rgba(paper_veil))
-            .border_l_1()
-            .border_color(rgb(sept))
-            .child(header)
-            .child(list)
-            // 拦住冒泡：点面板内不触发外层（页面）的翻页 / 关闭。
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, _, cx| {
-                    cx.stop_propagation();
-                }),
-            )
+        list
     }
 }
 

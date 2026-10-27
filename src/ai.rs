@@ -400,6 +400,19 @@ impl AiPanel {
         self.focuses.iter().position(|f| f.is_focused(window))
     }
 
+    /// 焦点是否落在本面板的**任一**输入框上。
+    ///
+    /// `Root::render` 每帧都要裁决焦点归谁，最后一支是「焦点不在根句柄上就
+    /// 抢回 `key_focus`」。本面板是**独立 Entity**，四个输入框的句柄都不属于
+    /// `Root`——只要焦点落进来，`key_focus` 就立刻失焦，那一支每帧都会把焦点
+    /// 抢回去。后果：中文输入法刚要送字，落点已被夺走，一个汉字也打不进来
+    /// （ASCII 还能进，因为它走 keydown 转发而非 IME）。v1.78.1 修的就是这个。
+    ///
+    /// Root 侧据此放手：焦点在面板内就不抢。
+    pub fn holds_focus(&self, window: &Window) -> bool {
+        self.focuses.iter().any(|f| f.is_focused(window))
+    }
+
     /// 把焦点交给第 i 栏。
     fn focus_field(&self, i: usize, window: &mut Window) {
         if let Some(f) = self.focuses.get(i) {

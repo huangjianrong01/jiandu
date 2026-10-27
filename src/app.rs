@@ -27,6 +27,33 @@ use std::rc::Rc;
 /// 里往这枚 `Cell` 回填一次。渲染是输出、事件是输入，中间靠它过河。
 pub type RectProbe = Rc<Cell<Option<(f32, f32, f32, f32)>>>;
 
+/// **笔记抽屉的页签**（v1.78.0）：朱批录 / 卡片匣。
+///
+/// 原先是顶栏两枚钮、两个抽屉、两套滑入动画，还得靠 `set_ui_state` 互斥
+/// （同时只准开一个）——可它们装的是同一类东西：**我留下的字**。一个装
+/// 「批在这本书上的」，一个装「从各本书里摘出来的」。合并成一个抽屉两页
+/// 之后：顶栏少一枚，用户也不必先想清楚「这条算批注还是算摘录卡」。
+///
+/// 切页只换内容、**不重播滑入动画**（抽屉本身就开着，滑它干什么）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum NotesTab {
+    /// 朱批录：本书内的批注 / 眉批 / 夹注，按章节顺序。
+    #[default]
+    Zhu,
+    /// 卡片匣：跨书摘录卡（书删了卡片还在）。
+    Card,
+}
+
+impl NotesTab {
+    /// 页签上的三个字（繁体，与朱批录一致）。
+    pub fn label(self) -> &'static str {
+        match self {
+            NotesTab::Zhu => "朱批錄",
+            NotesTab::Card => "卡片匣",
+        }
+    }
+}
+
 /// 字书浮签的**来源页签**（v1.42.0）：康熙 / 說文，一次只摊一部。
 ///
 /// 浮签里不再两段并列——一次全摊会占掉半屏正文，且康熙动辄数百字，
@@ -140,7 +167,7 @@ pub enum AppUIState {
     Style,
     /// 全文检索。
     Search,
-    /// 朱批（笔记侧栏）。
+    /// 笔记侧栏（v1.78.0：朱批录 + 卡片匣合成一个抽屉，页签在 `notes_tab`）。
     Notes,
     /// 帮助。
     Help,
@@ -148,8 +175,6 @@ pub enum AppUIState {
     Toc,
     /// 分享卡片浮层。
     Share,
-    /// 卡片匣（v1.74.0）：跨书摘录卡。
-    Cards,
     /// 书签抽屉。
     Bookmarks,
     /// 问小笺（v1.76.0 · V2.0 模块二）：AI 伴读侧栏。
@@ -363,9 +388,12 @@ pub struct Root {
     /// 当前书的笔记：页序号 -> 正文。
     pub notes: std::collections::HashMap<usize, String>,
     /// 笔记面板是否展开。
+    ///
+    /// v1.78.0：**朱批录与卡片匣合成一个抽屉**（顶栏只剩一枚「笔记」），
+    /// 这一枚就表示「笔记抽屉是否开着」；里面翻到哪一页由 `notes_tab` 定。
     pub show_notes_panel: bool,
-    /// 卡片匣侧栏（v1.74.0）：跨书摘录卡的汇集处，与朱批录同为右滑侧栏。
-    pub show_cards: bool,
+    /// 笔记抽屉当前翻到哪一页（v1.78.0）。
+    pub notes_tab: NotesTab,
     /// 匣中卡片（开栏时从库里读一次，增删后重读；不每帧查询）。
     pub cards: Vec<jiandu_core::cards::Card>,
     /// **问小笺侧栏**（v1.76.0 · V2.0 模块二）：AI 伴读。
@@ -646,10 +674,6 @@ pub struct Root {
     pub notes_slide: f32,
     pub notes_target: bool,
     pub notes_animating: bool,
-    /// 卡片匣侧栏滑入 / 滑出动画（v1.74.0，与朱批录同款逐帧推进）。
-    pub cards_slide: f32,
-    pub cards_target: bool,
-    pub cards_animating: bool,
     /// 问小笺侧栏滑入 / 滑出动画（v1.76.0，同上）。
     pub ai_slide: f32,
     pub ai_target: bool,
@@ -1052,10 +1076,7 @@ impl Root {
             notes_slide: 0.0,
             notes_target: false,
             notes_animating: false,
-            cards_slide: 0.0,
-            cards_target: false,
-            cards_animating: false,
-            show_cards: false,
+            notes_tab: NotesTab::default(),
             show_ai: false,
             ai_panel,
             ai_slide: 0.0,
@@ -3806,7 +3827,6 @@ fn anki_push_card(
             AppUIState::Toc => self.show_toc,
             AppUIState::Share => self.show_share_panel,
             AppUIState::Bookmarks => self.show_bookmarks,
-            AppUIState::Cards => self.show_cards,
             AppUIState::Ai => self.show_ai,
             AppUIState::None => false,
         };
@@ -3819,7 +3839,6 @@ fn anki_push_card(
         self.show_toc = matches!(s, AppUIState::Toc);
         self.show_share_panel = matches!(s, AppUIState::Share);
         self.show_bookmarks = matches!(s, AppUIState::Bookmarks);
-        self.show_cards = matches!(s, AppUIState::Cards);
         self.show_ai = matches!(s, AppUIState::Ai);
         if !self.show_search {
             self.clear_search();
@@ -3832,12 +3851,11 @@ fn anki_push_card(
         self.search_animating = self.show_search || self.search_slide > 0.0;
         self.bookmarks_target = self.show_bookmarks;
         self.bookmarks_animating = self.show_bookmarks || self.bookmarks_slide > 0.0;
-        self.cards_target = self.show_cards;
-        self.cards_animating = self.show_cards || self.cards_slide > 0.0;
         self.ai_target = self.show_ai;
         self.ai_animating = self.show_ai || self.ai_slide > 0.0;
         // 开栏那一刻才去库里取一次（侧栏是低频面板，没必要每帧查）。
-        if self.show_cards {
+        // v1.78.0：卡片页的内容也是开栏时才读，切到卡片页同样要读一次。
+        if self.show_notes_panel && self.notes_tab == NotesTab::Card {
             self.reload_cards();
         }
         // 问小笺开栏：把当前纸墨与字体递给面板（面板是独立 Entity，
@@ -3863,7 +3881,6 @@ fn anki_push_card(
             || self.show_help
             || self.show_share_panel
             || self.show_bookmarks
-            || self.show_cards
             || self.show_ai
     }
 
@@ -3947,11 +3964,15 @@ fn anki_push_card(
     }
 
     /// 顶栏「书签」钮：抽屉开着就收起；没开则先收藏当前页（去重）再展开。
+    /// 开合书签抽屉（v1.78.0：**纯开关，不再夹带「顺手加一条」**）。
+    ///
+    /// 原先开抽屉 = 「先收藏当前叶 + 再滑出」。这一枚既是动作又是开关，用户
+    /// 想翻书签就必定被加一条新的，翻过页再点又加一条——开关里夹副作用，没
+    /// 法只「看」不「加」。加书签的动作现在在抽屉头上那枚「＋ 收此葉」。
     pub fn toggle_bookmarks(&mut self) {
         if self.show_bookmarks {
             self.close_bookmarks();
         } else {
-            self.add_bookmark_current();
             self.open_bookmarks();
         }
     }
@@ -5633,21 +5654,6 @@ impl Render for Root {
                 window.request_animation_frame();
             }
         }
-        // 卡片匣侧栏滑入 / 滑出（v1.74.0，与书签同款逐帧推进）。
-        if self.cards_animating {
-            let dir = if self.cards_target { 1.0 } else { -1.0 };
-            let step = 0.12;
-            let next = (self.cards_slide + dir * step).clamp(0.0, 1.0);
-            self.cards_slide = next;
-            if (self.cards_target && next >= 1.0) || (!self.cards_target && next <= 0.0) {
-                self.cards_animating = false;
-                if !self.cards_target {
-                    self.show_cards = false;
-                }
-            } else {
-                window.request_animation_frame();
-            }
-        }
         // 问小笺侧栏滑入 / 滑出（v1.76.0，同款逐帧推进）。
         if self.ai_animating {
             let dir = if self.ai_target { 1.0 } else { -1.0 };
@@ -5714,6 +5720,13 @@ impl Render for Root {
         } else if self.note_editing {
             // 笔记框要接中文：焦点必须落在它自己的句柄上，IME 才认这块区域。
             window.focus(&self.note_focus);
+        } else if self.show_ai && self.ai_panel.read(cx).holds_focus(window) {
+            // 问小笺（v1.78.1）：**这里必须放手**。
+            // 面板是独立 Entity，四个输入框的句柄都不在 `Root` 名下——焦点一
+            // 落进去，`key_focus` 就失焦，若照旧走下面那支「抢回 key_focus」，
+            // 就会每帧夺走一次焦点：中文输入法刚要送字，落点没了，一个汉字也
+            // 打不进来（ASCII 仍进得来，因为它走 keydown 转发而不是 IME）。
+            // 焦点既已在面板内，什么都不做就是对的。
         } else if !self.key_focus.is_focused(window) {
             window.focus(&self.key_focus);
         }
