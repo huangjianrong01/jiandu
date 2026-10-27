@@ -371,14 +371,52 @@ impl Library {
         Self::home().join("library.json")
     }
 
-    /// 读取索引（过滤掉已被删除的文件）。
+    /// 读取索引（过滤掉已被删除的文件，再把旧索引里的老书**并入**）。
     pub fn load() -> Self {
         let mut lib: Self = std::fs::read_to_string(Self::index_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         lib.books.retain(|b| b.path.exists());
+        lib.absorb_legacy_index();
         lib
+    }
+
+    /// 把旧书架索引（`~/.jiandu/library.json`）里**还在、且当前索引里没有**
+    /// 的书并入内存列表。
+    ///
+    /// 为什么需要：书架索引一直在 `Library::home()`（Application Support），
+    /// 但 v1.69 及更早的版本用过 `~/.jiandu`。换过数据目录的用户，书架会
+    /// 「凭空少掉一批书」——本机实测就是 8 本老书在新索引里一本不剩。
+    ///
+    /// **只读**：只往内存里的列表追加，一个文件都不写。落盘等用户下次正常
+    /// 操作（导入 / 删书 / 翻页写进度）时自然发生——绝不擅自动用户的存档。
+    /// 沙盒下容器里根本没有 `~/.jiandu`，读不到就直接返回，也不多要权限。
+    fn absorb_legacy_index(&mut self) {
+        let legacy = match std::env::var("HOME") {
+            Ok(h) => PathBuf::from(h).join(".jiandu").join("library.json"),
+            Err(_) => return,
+        };
+        if legacy == Self::index_path() {
+            return; // 同一个文件（`JIANDU_HOME` 指过去时），别自己并自己。
+        }
+        let Ok(s) = std::fs::read_to_string(&legacy) else {
+            return;
+        };
+        let Ok(old): Result<Self, _> = serde_json::from_str(&s) else {
+            return;
+        };
+        let have: std::collections::HashSet<String> = self
+            .books
+            .iter()
+            .map(|b| b.path.to_string_lossy().to_string())
+            .collect();
+        for b in old.books {
+            // 只收「书稿文件还在」且「当前索引里没有」的——重复的一概不收。
+            if b.path.exists() && !have.contains(&b.path.to_string_lossy().to_string()) {
+                self.books.push(b);
+            }
+        }
     }
 
     /// 保存索引（失败不影响使用）。

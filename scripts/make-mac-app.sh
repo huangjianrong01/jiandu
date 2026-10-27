@@ -149,7 +149,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key>
     <string>${BUILD_NUM}</string>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright \u00a9 2026 Jiandu. All rights reserved.</string>
+    <string>Copyright © 2026 Jiandu. All rights reserved.</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.books</string>
     <!-- 不用任何非豁免加密（无网络、无 HTTPS、无加密存档）：声明后
@@ -342,4 +342,6 @@ echo "    2) 或拖到「应用程序」文件夹；"
 echo "    3) 之后就能像普通 App 一样从启动台 / Dock 打开。"
 echo ""
 echo "  卸载：把「笺读.app」拖进废纸篓即可；"
-echo "  用户数据在 ~/.jiandu/（书架索引与阅读进度），可留可删。"
+echo "  用户数据在 ~/Library/Application Support/com.jiandu.app/"
+echo "  （书架索引、章节库、阅读进度、自备字库都在里，卸载后可留可删）；"
+echo "  v1.69 及更早版本的 ~/.jiandu/ 旧库会被**只读**挂载取回，不会删除。"
