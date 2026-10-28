@@ -36,7 +36,7 @@
 //! 弯引号 → 直角引号的替换在 [`crate::types::bracket_to_quote`]，
 //! 悬挂 / 挤压在 [`crate::gloss::layout_book_from_opts`]。
 
-use gpui::{PathBuilder, Pixels, Point, Rgba, Window, point, px, rgb};
+use gpui::{PathBuilder, Rgba, Window, point, px, rgb};
 
 /// 句读直径 / 正文字号：**0.35**（v1.34.0 用户定「极小，像个手点的小记号」）。
 ///
@@ -61,19 +61,53 @@ pub const SEED_H_RATIO: f32 = 0.54;
 ///
 /// 0.58 那档配上外扩的肚部控制点，真机上活脱脱一条**红锦鲤**：中段鼓出
 /// 一个胖身子、尾根两侧切线一撑开就成了分叉的尾鳍——用户原话「分叉的
-/// 尾巴和胖胖的身体」。收窄只是一个方面，真正的刀口在**控制点贴弦**
-/// （见 `paint_seed`）。
-pub const SEED_W_OF_H: f32 = 0.46;
+/// 尾巴和胖胖的身体」。收窄只是一个方面，真正的刀口在**控制点贴弦**。
+///
+/// **0.37（v1.84.0）** 是照用户给的精刻本照片反推的：照片里那枚朱砂读点
+/// 沿笔势长 95px、最宽 34px，长宽比 **2.8**；宽度剖面（从细端起八等分）
+/// `0.32 / 0.54 / 0.67 / 0.83 / 0.91 / 0.96 / 1.00 / 0.87`——**重的一头压在
+/// 下右、细尾拖向左上**，正是毛笔按下后自然拖曳出的那道水痕。这一档的
+/// 剖面与照片逐段相差不到 0.04。
+pub const SEED_W_OF_H: f32 = 0.37;
+
+/// 墨滴**最宽处（顿笔）**的纵向位置（局部坐标，单位为 `hh`；+1 是底端、
+/// −1 是尾尖）。两档都做过 A/B，几何上**都合法**（各有单测钉着）：
+///
+/// | 档位 | 值 | 宽度峰值落在（从细尾起算） | 出处 |
+/// |---|---|---|---|
+/// | [`SEED_BELLY_GOLDEN`] | `0.20` | **0.618** | 黄金分割：峰落在全长 61.8% 处 |
+/// | [`SEED_BELLY_BRUSH`]  | `0.47` | **0.75**  | 毛笔古意：照片里那枚读点正是 6/8 |
+///
+/// 峰位往**下**挪，重的一头更沉、更像「按下去」；往上挪则更瘦长、更
+/// 数理。
+///
+/// **v1.84.0 定稿：用户 2026-10-28 在 3x 真机放大对比图上亲自选了
+/// B 版（0.75 / 毛笔古意）**——理由是要「书卷气」而非秩序感，且与参考
+/// 照片（峰在 6/8）同源。换档仍只改 [`SEED_BELLY_AT`] 一行，形制与全部
+/// 单测两档都能过。
+pub const SEED_BELLY_GOLDEN: f32 = 0.20;
+/// 见 [`SEED_BELLY_GOLDEN`]：峰落在 0.75（照片的 6/8）。
+pub const SEED_BELLY_BRUSH: f32 = 0.47;
+/// **出货档**：`0.47`（B 版 · 峰 0.75），见上文定稿说明。
+pub const SEED_BELLY_AT: f32 = SEED_BELLY_BRUSH;
 /// 瓜子点的最小长（px）：行款兜底锁到 12px 正文时，它仍得是一粒看得见的墨点。
 pub const SEED_MIN: f32 = 3.2;
-/// 瓜子点的**笔势倾角**（度，顺时针）：17°（v1.80.0，20° → 10° → 17°）。
+/// 墨滴的**笔势倾角**（度，顺时针）：**42°**（v1.84.0；沿革 20° → 10° →
+/// 17° → 23° → 42°）。
 ///
-/// 20° 那档把整枚点转得太斜，真机上头尾挤成一坨、尾锋被头压住；10° 又
-/// 立得太正，看着像一枚竖着的水滴，不是侧锋写下的那一「点」。17° 是
-/// 灵飞经小楷里侧点的斜度：头抬向右上、尾扫向左下，斜得自然、又不抢形。
-/// 形制本身已按小楷「，」的解剖画好（见 [`seed_anchors`]），倾角只做定向上
-/// 的最后一手。
-pub const SEED_TILT_DEG: f32 = 23.0;
+/// 23° 那几档是灵飞经小楷的侧势，写在屏幕上偏「立」——用户拿精刻本照片
+/// 一比：「倾斜度似乎比我们定的还要大」。照片实测主轴**相对竖直 41.4°**
+/// （PCA 量出来），故定 42°：整枚顺势倒向**右下**，细尾拖向**左上**，
+/// 与照片里那枚读点同一走向。
+///
+/// 斜到这里会不会躺平？不会——记号整体只占 0.37d 宽，42° 下它在字格里
+/// 仍是一枚斜置的墨点，不是一横。
+///
+/// ⚠️ **这个角只许乘一次**（v1.84.0 修的第二个坑）：`seed_anchors_for` /
+/// `seed_controls_for` 里已经转过，`paint_seed` 只做平移。v1.83.1 两处都转，
+/// 屏幕上因此是 2×23° = 46°——用户拿照片一比说「比我们定的还大」，正是这
+/// 一刀造成的。区间由 `seed_axis_is_tilted_like_a_woodblock_comma` 钉着。
+pub const SEED_TILT_DEG: f32 = 42.0;
 /// 瓜子点的**悬空微调**（px）：落在格右上后再**向左、向下**各让这么多——
 /// 竖排里上一字在上方，向下即离开它；向左即离开版心右缘。1px 的错位
 /// 足以让记号「浮」在字外，又不会看着像跑偏。
@@ -446,15 +480,18 @@ const RING_OVERLAP_DEG: f32 = 18.0;
 fn paint_seed(window: &mut Window, cx: f32, cy: f32, m: PunctMark, color: Rgba) {
     // 几何全部来自 `seed_anchors_for` / `seed_controls_for`（纯函数、有单测），
     // 这里只负责串路径——「画出什么形」不在这里定。
-    let a = seed_anchors_for(m.d, m.hook); // 7 点（首尾同点，闭合）
-    let k = seed_controls_for(m.d, m.hook); // 6 个控制点
-    let (s, c) = SEED_TILT_DEG.to_radians().sin_cos();
+    let a = seed_anchors_for(m.d, m.hook); // 7 个锚点（第 8 个即回到 a[0]）
+    let k = seed_controls_for(m.d, m.hook); // 7 个控制点
+    // ⚠️ **倾角只许转一次**：锚点与控制点从 `seed_*_for` 出来时**已经含倾角**
+    // （屏幕坐标下的偏移），这里只做平移。v1.83.1 在这里又转了一次，屏幕上
+    // 于是成了 2×23° = 46°——用户一看「比我们定的还要大」，就是这一刀。
     let mut b = PathBuilder::fill();
-    b.move_to(rotated(cx, cy, s, c, a[0].0, a[0].1));
-    for i in 0..6 {
+    b.move_to(point(px(cx + a[0].0), px(cy + a[0].1)));
+    for i in 0..7 {
+        let n = (i + 1) % 7;
         b.curve_to(
-            rotated(cx, cy, s, c, k[i].0, k[i].1),
-            rotated(cx, cy, s, c, a[i + 1].0, a[i + 1].1),
+            point(px(cx + k[i].0), px(cy + k[i].1)),
+            point(px(cx + a[n].0), px(cy + a[n].1)),
         );
     }
     b.close();
@@ -463,96 +500,171 @@ fn paint_seed(window: &mut Window, cx: f32, cy: f32, m: PunctMark, color: Rgba) 
     }
 }
 
-/// 六段曲线的**控制点**（窗口坐标，已含倾角）：`[c0..c5]`。
+/// 七段曲线的**控制点**（窗口坐标，已含倾角）：`[c0..c6]`。
 ///
 /// 与 [`seed_anchors`] 同尺（都是绕记号中心转 [`SEED_TILT_DEG`] 之后的
 /// 绝对坐标），绘制与单测看的是同一份数，不会走偏：
 ///
-/// * **c0 / c5** —— 头帽两侧：把顶点撑成一小段圆弧；
-/// * **c1** —— 右外缘：贴着「最右 → 尾根」那条弦走，腰身一路收细、不鼓肚；
-/// * **c2 / c3** —— 尾根到**尾口**：尾口是一段小圆弧（两个锚点之间），
-///   c3 略微外凸，让末端圆钝而不收成针尖。
+/// * **c0 / c6** —— 细尾那一段的两侧：c0 微微外鼓，让尾巴**贴着弦一路
+///   收细**（不鼓出第二个肚子）；c6 是尾口的小圆帽，把末端收钝；
+/// * **c1 / c2** —— 右外缘下行到最宽处：c2 落在 (1.02hw, 0.78hh)，把「顿
+///   笔」那一下推到**下半**，重的一头才压得住；
+/// * **c3 / c4** —— 底部圆弧：两个控制点都落在 y ≈ 1.05hh 之外，底端是
+///   一个圆转的收口，不是切平的方底；
+/// * **c5** —— 左外缘上行：贴弦回到细尾，与右侧构成一路收细的拖曳。
 ///
-/// 这三个约束各有单测钉着（`seed_body_does_not_bulge_into_a_belly` /
-/// `seed_tail_is_blunt_not_pinched` / `seed_head_cap_is_a_short_round_arc`）。
-pub fn seed_controls(d: f32) -> [(f32, f32); 6] {
+/// 三个约束各有单测钉着：`seed_tail_is_blunt_not_pinched`（尾口不尖）、
+/// `seed_taper_is_monotonic_from_tip_to_belly`（一路收细、不鼓第二只肚）、
+/// `seed_belly_sits_at_the_lower_right`（最宽处压在下半）。
+pub fn seed_controls(d: f32) -> [(f32, f32); 7] {
     seed_controls_for(d, false)
 }
 
-/// 回锋档的控制点：只把尾口收小一档，其余同常档。
-pub fn seed_controls_hook(d: f32) -> [(f32, f32); 6] {
+/// 指定**最宽处**的那一版（A/B 用）：见 [`SEED_BELLY_AT`]。
+pub fn seed_controls_belly(d: f32, hook: bool, belly: f32) -> [(f32, f32); 7] {
+    seed_controls_at(d, hook, belly)
+}
+
+/// 回锋档的控制点：只把尾口那一段收短，其余同常档。
+pub fn seed_controls_hook(d: f32) -> [(f32, f32); 7] {
     seed_controls_for(d, true)
 }
 
-fn seed_controls_for(d: f32, hook: bool) -> [(f32, f32); 6] {
+fn seed_controls_for(d: f32, hook: bool) -> [(f32, f32); 7] {
+    seed_controls_at(d, hook, SEED_BELLY_AT)
+}
+
+/// 控制点的真身：`belly` 是**最宽处**的纵向位置（见 [`SEED_BELLY_AT`]）。
+fn seed_controls_at(d: f32, hook: bool, belly: f32) -> [(f32, f32); 7] {
     let hh = d * 0.5;
     let hw = hh * SEED_W_OF_H;
     let (s, c) = SEED_TILT_DEG.to_radians().sin_cos();
-    let rot = |x: f32, y: f32| (x * c - y * s, x * s + y * c);
+    // 屏幕 y 向下。锚点的局部 **+y 是重的一头**，要让它落到**右下**
+    // （照片里正是如此），旋转取 `(x·c + y·s, −x·s + y·c)`——即屏幕上的
+    // 逆时针 42°：局部的「下」被甩向「右下」。
+    let rot = |x: f32, y: f32| (x * c + y * s, -x * s + y * c);
     if hook {
-        // 回锋档：尾口向内收一档（更含蓄），其余与常档同一条外缘。
+        // 回锋档：尾短一截（两个控制点跟着往里收），其余与常档同一条外缘。
         [
-            rot(hw * 0.60, -hh * 0.97),
-            rot(hw * 0.90, hh * 0.00),
-            rot(hw * 0.42, hh * 0.78),
-            rot(hw * 0.06, hh * 0.90),
-            rot(-hw * 0.60, hh * 0.58),
-            rot(-hw * 0.70, -hh * 0.74),
+            rot(hw * 0.52, -hh * 0.62), // 尾段右缘
+            rot(hw * 0.80, -hh * 0.04), // 右外缘下行
+            rot(hw * 1.02, hh * 0.78),  // 顿笔：最宽处
+            rot(hw * 0.24, hh * 1.08),  // 底部圆弧
+            rot(-hw * 0.74, hh * 1.02), // 底部回收
+            rot(-hw * 1.02, hh * 0.02), // 左外缘上行
+            rot(hw * 0.16, -hh * 0.86), // 尾口小圆帽（收短）
         ]
     } else {
         [
-            rot(hw * 0.60, -hh * 0.97), // 头帽：把顶点撑成一小段圆弧
-            rot(hw * 0.90, hh * 0.00),  // 右外缘：贴弦下行，几乎不鼓
-            rot(hw * 0.42, hh * 0.84),  // 尾根外缘
-            rot(hw * 0.03, hh * 0.98),  // 尾口：略微外凸，末端圆钝
-            rot(-hw * 0.64, hh * 0.62), // 尾口回收
-            rot(-hw * 0.70, -hh * 0.74),// 左外缘：上行接回头顶
+            rot(hw * 0.41, -hh * 0.69), // 尾段右缘：贴弦，一路收细
+            rot(hw * 0.82, hh * belly * 0.05),   // 右外缘下行
+            rot(hw * 1.03, hh * (belly + 0.34)), // 顿笔：最宽处压在下半
+            rot(hw * 0.22, hh * 1.09),           // 底部圆弧
+            rot(-hw * 0.75, hh * 1.04),          // 底部回收
+            rot(-hw * 1.03, hh * belly * 0.40),  // 左外缘上行
+            rot(hw * 0.00, -hh * 1.04), // 尾口小圆帽：钝口，抗锯齿吃不掉
         ]
     }
 }
 
-/// 墨滴的**六个锚点** + 闭合点（相对记号中心的局部坐标，**已含倾角**）：
-/// `[头顶, 右肩, 右腰, 尾外, 尾内, 左腰, 头顶]`。
+/// **采样成折线**（相对记号中心，**已含倾角**）：PDF 那一头与单测共用。
 ///
-/// v1.83.1 把「单顶点尾尖」拆成**尾外 / 尾内**两点——这是治「双截棍」的手术：
-/// 单顶点拓扑下尾端宽度恒为 0，真机 d≈9.3px 时尾巴只剩不到 1 个设备像素，
-/// 抗锯齿一淡，视觉上与主块**断开**（用户原话「骨折了，像断开的双截棍」）。
-/// 现在尾口是一段约 1.6 设备像素的小圆弧，永远连得住。
+/// 屏幕走 `paint_path`（GPUI 自己光栅化贝塞尔）；PDF 那头是 CG，只能吃
+/// 折线。两边看的是同一份 `seed_anchors_for` / `seed_controls_for`，故
+/// 纸上与屏幕上**逐字同位、同形**——`STEPS` 取 12，一段 12 根折线在
+/// d≈9px 下与真曲线的偏差远小于 0.1px（肉眼与印刷都看不出）。
+pub fn seed_outline(d: f32, hook: bool) -> Vec<(f32, f32)> {
+    seed_outline_belly(d, hook, SEED_BELLY_AT)
+}
+
+/// 指定**最宽处**的那一版（A/B 用）：见 [`SEED_BELLY_AT`]。
+pub fn seed_outline_belly(d: f32, hook: bool, belly: f32) -> Vec<(f32, f32)> {
+    const STEPS: usize = 12;
+    let a = seed_anchors_at(d, hook, belly);
+    let k = seed_controls_at(d, hook, belly);
+    let mut out = Vec::with_capacity(7 * STEPS);
+    for i in 0..7 {
+        let (p0, p1, kp) = (a[i], a[(i + 1) % 7], k[i]);
+        for s in 0..STEPS {
+            let t = s as f32 / STEPS as f32;
+            let mt = 1.0 - t;
+            out.push((
+                mt * mt * p0.0 + 2.0 * mt * t * kp.0 + t * t * p1.0,
+                mt * mt * p0.1 + 2.0 * mt * t * kp.1 + t * t * p1.1,
+            ));
+        }
+    }
+    out
+}
+
+/// 墨滴的**六个锚点**（相对记号中心的局部坐标，**已含倾角**）：
+/// `[尾外, 右腰, 右顿, 右底, 底内, 左顿, 尾内]`，第 7 段回到 `尾外` 闭合。
+///
+/// v1.84.0 照用户给的精刻本照片重画的**走向**（此前是「重头在上」，照片里
+/// 恰恰相反）：**重的一头压在下右、细尾拖向左上**——毛笔按下、顺势拖出
+/// 的那一道水痕，收笔处钝而不尖。
 ///
 /// ```text
-///           ╭──╮           头顶：正轴顶点，小圆弧
-///          ╱    ╲
-///         │      ╲         右肩：紧跟头顶（只低 0.26hh），头帽才圆
-///         │       ╲
-///          ╲       ╲       右腰 / 左腰：贴弦收细，中段不鼓
-///           ╲       ╲
-///            ╰─╮ ╭─╯       尾口：一小段圆弧，**不尖、不断**
+///        ╱╲                 ← 尾口：一小段圆帽（钝，抗锯齿吃不掉）
+///       ╱  ╲
+///      ╱    ╲               ← 细尾：贴弦一路收细，绝不鼓第二只肚
+///     ╱      ╲
+///    │        ╲
+///    │         │            ← 最宽处：压在**下半**（照片量出来在 0.8 处）
+///    │         │
+///     ╲       ╱
+///      ╰─────╯              ← 底部：圆转的收口，不是切平的方底
 /// ```
+///
+/// 两个拓扑细节各有单测钉着：
+///
+/// * **尾口是两个锚点之间的一小段圆弧**（不是单顶点）。单顶点拓扑下末端
+///   宽度恒为 0，真机 d≈9.3px 时尾巴不到半个设备像素，2× 光栅化后与主块
+///   **断开**——用户原话「骨折了，像断开的双截棍」（v1.83.1）；
+/// * **最宽处在下半**（[`seed_belly_sits_at_the_lower_right`]）——照片的
+///   宽度剖面在 7/8 处才到顶，重的一头明显偏下。
 pub fn seed_anchors(d: f32) -> [(f32, f32); 7] {
     seed_anchors_for(d, false)
 }
 
-/// 墨滴的**六个锚点**（回锋档）：只尾口收一档，见 [`seed_anchors`]。
+/// 指定**最宽处**的那一版（A/B 用）：见 [`SEED_BELLY_AT`]。
+pub fn seed_anchors_belly(d: f32, hook: bool, belly: f32) -> [(f32, f32); 7] {
+    seed_anchors_at(d, hook, belly)
+}
+
+/// 墨滴的**六个锚点**（回锋档）：只尾口收短一截，见 [`seed_anchors`]。
 pub fn seed_anchors_hook(d: f32) -> [(f32, f32); 7] {
     seed_anchors_for(d, true)
 }
 
 /// 两档共用的锚点计算：`hook` 只改尾口两点（其余四点完全一样）。
 fn seed_anchors_for(d: f32, hook: bool) -> [(f32, f32); 7] {
+    seed_anchors_at(d, hook, SEED_BELLY_AT)
+}
+
+/// 锚点的真身：`belly` 是**最宽处**的纵向位置（见 [`SEED_BELLY_AT`]）。
+fn seed_anchors_at(d: f32, hook: bool, belly: f32) -> [(f32, f32); 7] {
     let hh = d * 0.5;
     let hw = hh * SEED_W_OF_H;
     let (s, c) = SEED_TILT_DEG.to_radians().sin_cos();
-    let rot = |x: f32, y: f32| (x * c - y * s, x * s + y * c);
-    let entry = rot(hw * 0.00, -hh * 0.98); // 头顶：正轴顶点
-    let right = rot(hw * 1.00, -hh * 0.72); // 右肩：撑出半圆帽
-    let waist = rot(hw * 0.54, hh * 0.54); // 右腰
-    let (tail_out, tail_in) = if hook {
-        (rot(hw * 0.30, hh * 0.80), rot(-hw * 0.10, hh * 0.76))
+    // 屏幕 y 向下。锚点的局部 **+y 是重的一头**，要让它落到**右下**
+    // （照片里正是如此），旋转取 `(x·c + y·s, −x·s + y·c)`——即屏幕上的
+    // 逆时针 42°：局部的「下」被甩向「右下」。
+    let rot = |x: f32, y: f32| (x * c + y * s, -x * s + y * c);
+    let (tip_out, tip_in) = if hook {
+        (rot(hw * 0.30, -hh * 0.84), rot(hw * 0.02, -hh * 0.76)) // 回锋：尾短一截
     } else {
-        (rot(hw * 0.22, hh * 0.88), rot(-hw * 0.16, hh * 0.82))
+        (rot(hw * 0.18, -hh * 1.00), rot(-hw * 0.16, -hh * 0.92)) // 尾口：钝口
     };
-    let left = rot(-hw * 1.00, -hh * 0.26); // 左腰
-    [entry, right, waist, tail_out, tail_in, left, entry]
+    [
+        tip_out,
+        rot(hw * 0.48, -hh * 0.24), // 右腰：细尾与顿笔之间的转折
+        rot(hw * 1.00, hh * belly),      // 右顿：最宽处
+        rot(hw * 0.60, hh * 0.95),       // 右底
+        rot(-hw * 0.35, hh * 0.91),      // 底内：与右底之间是底部圆弧
+        rot(-hw * 0.94, hh * (belly + 0.06)), // 左顿（跟着 belly 走）
+        tip_in,
+    ]
 }
 
 /// **回锋开关**（默认关）：出锋末端是不是带一小勾。
@@ -563,14 +675,6 @@ fn seed_anchors_for(d: f32, hook: bool) -> [(f32, f32); 7] {
 /// 只改**尾尖一点**（[`seed_anchors_hook`]）与它的两个控制点，头的圆润
 /// 与整体斜度不受影响。
 pub const SEED_HOOK: bool = false;
-
-/// 把局部坐标绕记号中心旋转后落到窗口坐标。
-///
-/// `s` / `c` 是 [`SEED_TILT_DEG`] 的 sin / cos；屏幕坐标 y 向下，故
-/// 顺时针旋转即 `x' = x·c − y·s`、`y' = x·s + y·c`。
-fn rotated(cx: f32, cy: f32, s: f32, c: f32, x: f32, y: f32) -> Point<Pixels> {
-    point(px(cx + x * c - y * s), px(cy + x * s + y * c))
-}
 
 #[cfg(test)]
 mod tests {
@@ -685,73 +789,189 @@ mod tests {
         }
     }
 
-    /// **笔势**：露锋必须在右上、出锋必须在左下（灵飞经那一「点」的走向）。
+    /// A/B 两档（v1.84.0）：`(最宽处, 宽度峰值应落在)`。
     ///
-    /// 这是「瓜子」与「小菱形」的分野——v1.66.0 忘了倾角，画出来是左右
-    /// 对称的两头尖，真机上就是一颗红色碎屑。此测钉死倾角方向：
-    /// 尾尖 x < 0 < 起笔 x，尾尖 y > 起笔 y（屏幕 y 向下）。
+    /// 用户要的正是这两版：**0.618（黄金分割）** 与 **0.75（照片的 6/8）**。
+    /// 两档都在下面的每一条形制测试里跑一遍——**不许画鱼 / 不许断**这条
+    /// 底线，换哪一档都得过；将来再调峰位，只需往这里加一行。
+    const BELLY_VARIANTS: [(f32, f32); 2] = [
+        (SEED_BELLY_GOLDEN, 0.618),
+        (SEED_BELLY_BRUSH, 0.75),
+    ];
+
+    /// **笔势**（v1.84.0）：**重的一头压在右下、细尾拖向左上**。
+    ///
+    /// 这是照用户给的精刻本照片改的走向——照片里那枚朱砂读点，顿笔那一头在
+    /// 下右、细尾顺着笔势拖向左上（PCA 量得主轴相对竖直 41.4°）。此前的版本
+    /// 恰恰是反的（重头在上），用户一眼看出「不像」。
     #[test]
-    fn seed_head_is_up_right_and_the_tail_hooks_down_left() {
-        for d in [4.0f32, 8.0, 9.6, 13.6] {
-            let a = seed_anchors(d);
-            // 六锚点口径：0 头顶 / 1 右肩 / 2 右腰 / 3 尾外 / 4 尾内 / 5 左腰
-            let (entry, right, tail, left) = (a[0], a[1], a[3], a[5]);
-            assert!(tail.0 < 0.0, "出锋没扫向左：{tail:?}");
-            assert!(entry.0 > 0.0, "露锋没落在右上：{entry:?}");
-            assert!(tail.1 > entry.1, "出锋应在露锋下方：{tail:?} / {entry:?}");
-            // 头尾的**沿笔势距离**要有一枚瓜子的「长」：≥ 0.85 倍 d。
-            // （v1.80.0：斜到 23° 以后，纵向投影天然被 cos 吃掉一截——
-            // 量「长度」该顺着笔势量，不该竖着量，否则会把斜置误判成太短。）
-            let span = ((tail.0 - entry.0).powi(2) + (tail.1 - entry.1).powi(2)).sqrt();
-            assert!(
-                span >= d * 0.85,
-                "瓜子太短，看着是块碎屑：{span} / d={d}"
-            );
-            // 起笔与收笔同一点（闭合路径，不留缺口）。
-            assert_eq!(a[0], a[6], "墨滴没闭合");
-            // **不镜像**：右腹（肥头）比左腹明显更靠右——一笔写下来的点，
-            // 两侧绝不相等。旋转后两侧在 X 上拉开（胖的一侧探出更多）。
-            assert!(
-                right.0 - left.0 > d * 0.10,
-                "左右对称回去了，没有偏侧肥头：左 {left:?} / 右 {right:?}"
-            );
-            // 肚子在上半：出锋那一截明显比入笔那一截长（才有「一撇」的爽利）。
-            assert!(
-                tail.1 - right.1 > (right.1 - entry.1) * 2.0,
-                "出锋太短，肚子沉到下面去了：{a:?}"
-            );
+    fn seed_points_down_right_with_the_tail_dragging_up_left() {
+        for (belly, _) in BELLY_VARIANTS {
+            for d in [4.0f32, 8.0, 9.27, 13.6] {
+                let a = seed_anchors_belly(d, false, belly);
+                // 七锚点口径：0 尾外 / 1 右腰 / 2 右顿（最宽）/ 3 右底 /
+                //             4 底内 / 5 左顿 / 6 尾内
+                let (tip_out, belly_p, tip_in, bottom) = (a[0], a[2], a[6], a[3]);
+                // 顿笔在细尾的**下右**：屏幕 y 向下，故 y 与 x 都明显更大。
+                // 纵向拉开 0.30d 起：A 版峰位偏高（0.618）实测 0.34d，
+                // B 版（0.75）实测 0.44d——两版都要过得去，故取 0.30。
+                assert!(
+                    belly_p.1 - tip_out.1 > d * 0.30,
+                    "顿笔没压到下半：{belly_p:?} / 尾 {tip_out:?}"
+                );
+                assert!(
+                    belly_p.0 - tip_out.0 > d * 0.30,
+                    "顿笔没探向右：{belly_p:?} / 尾 {tip_out:?}"
+                );
+                // 尾口那两个锚点都落在**上左**（离顿笔至少 0.3d）。
+                // 同上：A 版实测 0.27d、B 版 0.37d，取 0.25。
+                assert!(belly_p.1 - tip_in.1 > d * 0.25, "尾口没拖向左上：{tip_in:?}");
+                assert!(belly_p.0 - tip_in.0 > d * 0.25, "尾口没拖向左上：{tip_in:?}");
+                // 沿笔势的长要有一枚墨滴的「长」：尾口 → 底部 ≥ 0.85 倍 d。
+                let span =
+                    ((bottom.0 - tip_out.0).powi(2) + (bottom.1 - tip_out.1).powi(2)).sqrt();
+                assert!(span >= d * 0.85, "墨滴太短，看着是块碎屑：{span} / d={d}");
+                // **不镜像**：顿笔一侧明显比另一侧探出更多。
+                let left = a[5];
+                assert!(
+                    belly_p.0 - left.0 > d * 0.10,
+                    "左右对称回去了，没有偏侧重头：左 {left:?} / 右 {belly_p:?}"
+                );
+            }
         }
     }
 
-    /// 点到直线的距离（全部用「相对 d」量，与字号无关）。
-    fn dist_to_line(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
-        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-        let len = (dx * dx + dy * dy).sqrt();
-        ((p.0 - a.0) * dy - (p.1 - a.1) * dx).abs() / len
+    /// 沿笔势轴的**宽度剖面**：`(按 `nb` 等分的宽度, 轴长, 相对竖直的角度)`。
+    ///
+    /// 轴 = 「细尾中点 → 底部中点」，分段从细尾起算。测形不看锚点下标，
+    /// 直接量成品轮廓（[`seed_outline_belly`]），与真机画出来的是同一条曲线。
+    fn width_profile(d: f32, hook: bool, belly: f32, nb: usize) -> (Vec<f32>, f32, f32) {
+        let a = seed_anchors_at(d, hook, belly);
+        let pts = seed_outline_belly(d, hook, belly);
+        let mid = |p: (f32, f32), q: (f32, f32)| ((p.0 + q.0) * 0.5, (p.1 + q.1) * 0.5);
+        let (tip, bot) = (mid(a[0], a[6]), mid(a[3], a[4]));
+        let (ax, ay) = (bot.0 - tip.0, bot.1 - tip.1);
+        let len = (ax * ax + ay * ay).sqrt();
+        let (ux, uy) = (ax / len, ay / len); // 轴向（细尾 → 顿笔）
+        let (vx, vy) = (-uy, ux);            // 垂直方向
+        let mut tmin = f32::MAX;
+        let mut tmax = f32::MIN;
+        let proj: Vec<(f32, f32)> = pts
+            .iter()
+            .map(|&(x, y)| {
+                let t = x * ux + y * uy;
+                tmin = tmin.min(t);
+                tmax = tmax.max(t);
+                (t, x * vx + y * vy)
+            })
+            .collect();
+        let mut lo = vec![f32::MAX; nb];
+        let mut hi = vec![f32::MIN; nb];
+        for &(t, u) in &proj {
+            let k = (((t - tmin) / (tmax - tmin + 1e-9)) * nb as f32) as usize;
+            let k = k.min(nb - 1);
+            lo[k] = lo[k].min(u);
+            hi[k] = hi[k].max(u);
+        }
+        let w: Vec<f32> = (0..nb)
+            .map(|k| if hi[k] >= lo[k] { hi[k] - lo[k] } else { 0.0 })
+            .collect();
+        // 相对竖直的角度：轴与「正下方」的夹角。
+        (w, len, ux.atan2(uy).to_degrees().abs())
     }
 
-    /// **腰身不许鼓肚**（v1.83.0「放生锦鲤」）：右外缘的控制点 c2 必须
-    /// 贴着「最宽处 → 尾尖」那条弦走。
+    /// **倾角**：主轴相对竖直 **42°**（照片实测 41.4°）。
     ///
-    /// v1.80.0 把 c2 推到弦外 0.37hw（≈ 弦长的 21%），中段于是鼓出一个
-    /// 胖身子——真机上就是那条锦鲤的鱼腹。这条测试把「外凸量」钉在弦长
-    /// 的 8% 以内：小到看不出来，却足以让曲线保持凸（不是一条死直线）。
+    /// 这条同时钉住「**倾角只许转一次**」：v1.83.1 在 `seed_anchors_at` 与
+    /// `paint_seed` 里各转了一次，屏幕上实际是 2×23° = 46°，用户拿照片一比
+    /// 「比我们定的还要大」——再犯就是 84°，这里立刻红。
     #[test]
-    fn seed_body_does_not_bulge_into_a_belly() {
-        for d in [4.0f32, 8.0, 9.6, 13.6, 24.0] {
-            let a = seed_anchors(d);
-            let k = seed_controls(d);
-            let chord = ((a[3].0 - a[1].0).powi(2) + (a[3].1 - a[1].1).powi(2)).sqrt();
-            let bulge = dist_to_line(k[1], a[1], a[3]);
-            assert!(
-                bulge <= chord * 0.08,
-                "腰身鼓了（锦鲤回来了？）：外凸 {bulge:.2}px / 弦长 {chord:.2}px"
-            );
+    fn seed_axis_is_tilted_like_a_woodblock_comma() {
+        for (belly, _) in BELLY_VARIANTS {
+            for (d, hook) in [(4.0f32, false), (9.27, false), (13.6, false), (24.0, false), (9.27, true)] {
+                let (_, _, deg) = width_profile(d, hook, belly, 8);
+                assert!(
+                    (36.0..=48.0).contains(&deg),
+                    "主轴 {deg:.1}°：照片是 41.4°——<36° 又立回去了，>48° 是倾角被乘了两次"
+                );
+            }
         }
     }
 
-    /// **尾口必须钝到不断**（v1.83.1「双截棍」）：尾口两个锚点之间的
-    /// 距离就是末端的**实际宽度**，它必须宽到抗锯齿吃不掉。
+    /// **一路收细**（v1.84.0）：从细尾到最宽处，宽度**单调不减**。
+    ///
+    /// v1.80.0 的「红锦鲤」就是中段鼓出第二只肚子——宽度剖面在腰上先鼓一个
+    /// 包再收，真机上活脱脱一条鱼。这条只查**细尾 → 峰**那一段（峰在底部圆
+    /// 弧之前），底部收口那一段本就该变窄，不在查的范围内。
+    #[test]
+    fn seed_taper_is_monotonic_from_tip_to_belly() {
+        for (belly, _) in BELLY_VARIANTS {
+            for (d, hook) in [(4.0f32, false), (9.27, false), (13.6, false), (24.0, false), (9.27, true)] {
+                let (w, len, _) = width_profile(d, hook, belly, 8);
+                let max = w.iter().cloned().fold(0.0, f32::max);
+                let peak = w
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .unwrap()
+                    .0;
+                // 细尾足够细（照片里是 0.32）：不许胖成一枚方块。
+                assert!(
+                    w[0] <= max * 0.45,
+                    "细尾太胖（{:.0}%）：像方块不像墨点",
+                    w[0] / max * 100.0
+                );
+                // 细尾又不能细到没有（那是 v1.83.1 的「双截棍」）。
+                assert!(w[0] >= d * 0.05, "细尾太虚（{:.2}px），真机会断", w[0]);
+                // 单调（留 3% 的容差给折线采样）。
+                for k in 1..=peak {
+                    assert!(
+                        w[k] >= w[k - 1] - max * 0.03,
+                        "第 {k} 段收细回去了（{:.2} < {:.2}）：中段又鼓出一只肚子——画鱼了",
+                        w[k],
+                        w[k - 1]
+                    );
+                }
+                // 长宽比：照片是 2.8，不许胖过 3.6 也不许瘦成一根针。
+                assert!(
+                    len / max > 2.2 && len / max < 3.6,
+                    "长宽比 {:.2}：照片是 2.8",
+                    len / max
+                );
+            }
+        }
+    }
+
+    /// **最宽处落在它该在的位置**（v1.84.0）：A 版 0.618、B 版 0.75。
+    ///
+    /// 这条是 A/B 两档的**定盘星**——峰位即「重的一头沉在哪」。峰若跑到上半，
+    /// 就又变回那枚「头重脚轻」的斜刀片；两档都必须在下半，且各自命中
+    /// 自己的目标（容差 0.05，两档相差 0.13，分得开）。
+    #[test]
+    fn seed_belly_sits_where_its_variant_says() {
+        for (belly, target) in BELLY_VARIANTS {
+            for (d, hook) in [(4.0f32, false), (9.27, false), (13.6, false), (24.0, false), (9.27, true)] {
+                // 32 段精测（8 段太粗，分不出 0.618 与 0.75）。
+                let (w, _, _) = width_profile(d, hook, belly, 32);
+                let peak = w
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .unwrap()
+                    .0;
+                let frac = (peak as f32 + 0.5) / 32.0;
+                assert!(
+                    (frac - target).abs() <= 0.05,
+                    "最宽处落在 {frac:.3}（应 {target:.3}）：belly={belly} d={d} hook={hook}"
+                );
+                // 两版都必须在下半（≥ 0.5）——重的一头不许跑上去。
+                assert!(frac >= 0.5, "重的一头跑到上半去了：{frac:.3}");
+            }
+        }
+    }
+
+    /// **尾口必须钝到不断**（v1.83.1「双截棍」，v1.84.0 沿用）：尾口两个锚点
+    /// 之间的距离就是末端的**实际宽度**，它必须宽到抗锯齿吃不掉。
     ///
     /// 病根：v1.83.0 用**单顶点**收尾（尾宽恒为 0）。真机 d≈9.27px 时，
     /// 尾巴末端只剩不到半个设备像素，2× 光栅化后与主块之间被淡成纸色——
@@ -762,59 +982,52 @@ mod tests {
     /// 上限 16% 防止它胖成方头（那就不是「轻轻提起」了）。
     #[test]
     fn seed_tail_is_blunt_not_pinched() {
-        for (d, hook) in [(4.0f32, false), (8.0, false), (9.27, false), (9.6, false), (24.0, false), (9.6, true)] {
-            let a = seed_anchors_for(d, hook);
-            let w = ((a[4].0 - a[3].0).powi(2) + (a[4].1 - a[3].1).powi(2)).sqrt();
-            let ratio = w / d;
-            assert!(
-                (0.06..=0.16).contains(&ratio),
-                "尾口宽 {w:.2}px（d 的 {:.1}%）：< 6% 会被抗锯齿淡成断口，> 16% 是方头",
-                ratio * 100.0
-            );
+        for (belly, _) in BELLY_VARIANTS {
+            for (d, hook) in [(4.0f32, false), (8.0, false), (9.27, false), (9.6, false), (24.0, false), (9.6, true)] {
+                let a = seed_anchors_at(d, hook, belly);
+                let w = ((a[6].0 - a[0].0).powi(2) + (a[6].1 - a[0].1).powi(2)).sqrt();
+                let ratio = w / d;
+                assert!(
+                    (0.06..=0.16).contains(&ratio),
+                    "尾口宽 {w:.2}px（d 的 {:.1}%）：< 6% 会被抗锯齿淡成断口，> 16% 是方头",
+                    ratio * 100.0
+                );
+            }
         }
     }
 
-    /// **头帽必须短**：最宽处紧贴头顶（≤ 全长的 30%），头顶才收得成一个半圆。
-    ///
-    /// v1.80.0 的最宽处落在 −0.29hh（头顶在 −0.70），头帽占了全长的 23%，
-    /// 却又被两条近乎直线的外缘夹住——放大看就是个尖尖的鱼吻。
-    #[test]
-    fn seed_head_cap_is_a_short_round_arc() {
-        for d in [4.0f32, 9.6, 24.0] {
-            let a = seed_anchors(d);
-            let cap = ((a[1].0 - a[0].0).powi(2) + (a[1].1 - a[0].1).powi(2)).sqrt();
-            let full = ((a[3].0 - a[0].0).powi(2) + (a[3].1 - a[0].1).powi(2)).sqrt();
-            assert!(
-                cap <= full * 0.30,
-                "头帽太长（{:.0}%）：头顶被拉成一条斜边，不是半圆",
-                cap / full * 100.0
-            );
-        }
-    }
-
-    /// **回锋档**：只收尾口那一小段——其余四点不动，整枚仍闭合、仍在左下。
+    /// **回锋档**：只把尾口那一小段收短——其余五点不动，整枚仍闭合、仍在左上。
     #[test]
     fn hook_pulls_the_tip_back_without_breaking_the_shape() {
-        for d in [4.0f32, 8.0, 9.6, 13.6] {
-            let plain = seed_anchors(d);
-            let hooked = seed_anchors_hook(d);
-            // 头 / 右肩 / 右腰 / 左腰 四点完全不动（回锋只碰尾口）。
-            for i in [0, 1, 2, 5] {
-                assert_eq!(plain[i], hooked[i], "回锋动了第 {i} 个锚点");
+        for (belly, _) in BELLY_VARIANTS {
+            for d in [4.0f32, 8.0, 9.6, 13.6] {
+                let plain = seed_anchors_belly(d, false, belly);
+                let hooked = seed_anchors_belly(d, true, belly);
+                // 右腰 / 右顿 / 右底 / 底内 / 左顿 五点完全不动（回锋只碰尾口）。
+                for i in [1, 2, 3, 4, 5] {
+                    assert_eq!(plain[i], hooked[i], "回锋动了第 {i} 个锚点");
+                }
+                // 尾口回收：回锋档的尾更短（沿笔势往顿笔那头缩）。
+                let tip_mid =
+                    |a: [(f32, f32); 7]| ((a[0].0 + a[6].0) * 0.5, (a[0].1 + a[6].1) * 0.5);
+                let (tp, th) = (tip_mid(plain), tip_mid(hooked));
+                let dist = |p: (f32, f32), q: (f32, f32)| {
+                    ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2)).sqrt()
+                };
+                assert!(
+                    dist(th, plain[2]) < dist(tp, plain[2]),
+                    "回锋没收锋：尾中点 {th:?} 应比 {tp:?} 更靠近顿笔",
+                );
+                // 仍闭合、尾口仍在**左上**（不能因为回锋就翻到右下去了）。
+                assert!(
+                    th.0 < plain[2].0 && th.1 < plain[2].1,
+                    "回锋把尾口甩到右下：{th:?}"
+                );
+                // 回锋档同样不许被捏成针尖。
+                let w =
+                    ((hooked[6].0 - hooked[0].0).powi(2) + (hooked[6].1 - hooked[0].1).powi(2)).sqrt();
+                assert!(w / d >= 0.06, "回锋档尾口太尖（{:.1}%），会断", w / d * 100.0);
             }
-            // 尾口回收：回锋档的尾外点更靠右（横向收回来一点）。
-            assert!(
-                hooked[3].0 > plain[3].0,
-                "回锋没收锋：{:?} vs {:?}",
-                hooked[3],
-                plain[3]
-            );
-            // 仍闭合、仍在左下（不能因为回锋就翻到右边去）。
-            assert_eq!(hooked[0], hooked[6], "回锋档没闭合");
-            assert!(hooked[4].0 < 0.0, "回锋把尾口甩到右边了：{:?}", hooked[4]);
-            // 回锋档同样不许被捏成针尖。
-            let w = ((hooked[4].0 - hooked[3].0).powi(2) + (hooked[4].1 - hooked[3].1).powi(2)).sqrt();
-            assert!(w / d >= 0.06, "回锋档尾口太尖（{:.1}%），会断", w / d * 100.0);
         }
     }
 }

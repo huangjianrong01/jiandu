@@ -26,6 +26,14 @@ pub struct PaperTheme {
     pub note: u32,
     /// 界栏 / 版框色（乌丝栏）。
     pub border: u32,
+    /// **句读朱砂**（v1.84.0）：句读专用的一档朱——比 [`Self::note`]
+    /// （朱印 / 夹注）**更鲜**。
+    ///
+    /// 为什么另开一档：用户拿精刻本照片比过——照片里那枚朱砂句读是
+    /// `#B3262F` 那一路的**活朱**，压在冷米白纸上是跳出来的；`note` 那档
+    /// 是「沉朱」（`#8C2B22`），用来盖印、写夹注很稳，用来点句读就读成
+    /// 一枚暗红的墨点，毫无书卷气。两档各归各的，谁也不迁就谁。
+    pub zhu: u32,
 }
 
 /// 主题配置表：顺序即面板按钮顺序，下标即 `Theme` 的编号。
@@ -41,6 +49,7 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         paper: 0xF5F0E6,
         text: 0x2F3535,  // 墨朱·正文
         note: 0xB23A30,  // 墨朱·批注（朱砂红）
+        zhu: 0xB2382E,   // 墨朱·句读
         border: 0x2F3535, // 乌丝栏
     },
     PaperTheme {
@@ -49,6 +58,7 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         paper: 0xF2E6D0,
         text: 0x3D352F,  // 赭朱·正文
         note: 0xA63F2E,  // 赭朱·批注
+        zhu: 0xA8412F,   // 赭朱·句读
         border: 0x4A6B5D, // 绿丝栏
     },
     PaperTheme {
@@ -57,6 +67,7 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         paper: 0xD8E2DB,
         text: 0x222B2D,  // 松墨·正文
         note: 0x8C3A3A,  // 松墨·批注
+        zhu: 0x9A3C36,   // 松墨·句读
         border: 0x222B2D,
     },
     PaperTheme {
@@ -65,6 +76,7 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         paper: 0x1A1C1D,
         text: 0xDCD6CD, // 暗金·正文（月白）
         note: 0xA68E5C, // 暗金·批注（秋香）
+        zhu: 0xC0A26A,  // 暗金·句读（秋香，深底上不刺眼）
         border: 0x4A4D4F, // 灰丝栏
     },
     // ── v1.83.0 · 仿古籍精刻本 ──────────────────────────────────────
@@ -81,6 +93,7 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         paper: 0xF7F6F1,
         text: 0x1E1B18,   // 焦墨（刻本的字比宋体屏显字更黑一档）
         note: 0x8C2B22,   // 朱（比墨朱稍沉，压在冷米白上不刺）
+        zhu: 0xB0342C,   // 句读朱砂：照精刻本照片取（照片实测 #B3262F）
         border: 0x2E2823, // 版框：比正文更深，外框才立得住
     },
 ];
@@ -326,6 +339,20 @@ impl Theme {
         }
     }
 
+    /// **句读朱砂**（v1.84.0）：句读专走这一档，见 [`PaperTheme::zhu`]。
+    ///
+    /// 深底上同样向纸色兑淡一档（与 [`Self::accent`] 同口径），免得朱砂压在
+    /// 夜读底上发闷；浅纸上就是表里那一只活朱，不作任何兑淡——**句读要跳
+    /// 出来才对**，那是朱笔，不是正文。
+    pub fn zhu(self) -> u32 {
+        let p = self.paper_theme();
+        if p.is_dark() {
+            mix(p.zhu, p.paper, 0.20)
+        } else {
+            p.zhu
+        }
+    }
+
     /// 靛色：通假标注。
     pub fn indigo(self) -> u32 {
         if self.is_dark() {
@@ -520,6 +547,33 @@ mod tests {
         let g = ((c >> 8) & 0xFF) as f32;
         let b = (c & 0xFF) as f32;
         0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    /// **句读朱砂必须是「活朱」**（v1.84.0）：用户拿精刻本照片比过——照片里
+    /// 那枚朱砂读点是 `#B3262F` 那一路的鲜红，压在冷米白上跳出来；而朱印那
+    /// 档（`accent`）是沉朱，用来点句读就读成一枚暗红的墨点，没有书卷气。
+    /// 故句读另开 `zhu` 一档，且它必须**明显偏红**（R 高出 G/B 一大截）。
+    #[test]
+    fn z_zhu_is_a_livelier_cinnabar_than_the_seal_ink() {
+        for t in [Theme::Xuan, Theme::Mi, Theme::Qing, Theme::Ke] {
+            let zhu = t.zhu();
+            let (r, g, b) = (
+                ((zhu >> 16) & 0xFF) as i32,
+                ((zhu >> 8) & 0xFF) as i32,
+                (zhu & 0xFF) as i32,
+            );
+            assert!(
+                r - g.max(b) > 90,
+                "{t:?} 句读朱不够朱（#{zhu:06X}）：压差只有 {}，读起来是枚暗红墨点",
+                r - g.max(b)
+            );
+            // 与朱印那档是两只不同的朱（各归各的档，谁也别盖过谁）。
+            assert_ne!(zhu, t.accent(), "{t:?} 句读朱与朱印同色，白分一档");
+        }
+        // 仿刻本那一档照照片取色（照片实测 #B3262F，压一档沉度得 #B0342C）。
+        assert_eq!(Theme::Ke.zhu(), 0xB0342C);
+        // 夜读深底：朱砂向纸色兑淡一档，别在深底上发闷。
+        assert!(lum(Theme::Ye.zhu()) < lum(Theme::Ye.paper()) + 130.0);
     }
 
     #[test]

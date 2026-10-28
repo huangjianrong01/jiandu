@@ -787,11 +787,18 @@ fn draw_punct(
             ink,
             Some(m.stroke as f64),
         ),
-        // 读 / 疑叹：实心瓜子点（竖长椭圆，宽 = `SEED_W_OF_H` × 高）。
-        // PDF 这头只落「一枚斜点的墨团」——矢量的一次近似；屏幕那头的
-        // 出锋与回锋是手绘曲线的细节，落到纸上仍是同一位置、同一大小。
+        // 读 / 疑叹：**与屏幕同一枚墨滴**（v1.84.0）。
+        //
+        // 旧版在这里偷懒画了个「宽 = SEED_W_OF_H × 高的竖长椭圆」——倾角
+        // 完全丢了，纸上是一枚躺着的橄榄，与屏幕上那枚拖尾的墨滴根本不是
+        // 同一个东西。现在读 `punct::seed_outline`（屏幕也是这两个函数出的
+        // 几何），折线填实：纸上的走向、钝口、拖尾与屏幕逐字同位。
         crate::punct::PunctKind::Seed | crate::punct::PunctKind::BigSeed => {
-            b.ellipse(cx, cy, d * crate::punct::SEED_W_OF_H as f64, d, ink, None)
+            let pts: Vec<(f64, f64)> = crate::punct::seed_outline(m.d, m.hook)
+                .into_iter()
+                .map(|(px_, py_)| (cx + px_ as f64, cy + py_ as f64))
+                .collect();
+            b.poly(&pts, ink);
         }
     }
 }

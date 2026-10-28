@@ -756,8 +756,10 @@ impl PunctInk {
         }
         match self {
             PunctInk::Mo => palette.ink(theme),
-            // 朱砂走 `accent`：与朱印同源，深底自动提亮一档。
-            PunctInk::Zhu => theme.accent(),
+            // 朱砂走**句读专档** `theme.zhu()`（v1.84.0）：比朱印那档更鲜，
+            // 照片里那枚朱砂读点就是这一路的活朱。空心圈「〇」与现代细圈
+            // `Dot` 都吃这一个色——**句读不论形制，一律朱笔**。
+            PunctInk::Zhu => theme.zhu(),
         }
     }
 }
@@ -1567,6 +1569,7 @@ impl ZFlowBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{InkPalette, Theme};
     use crate::types::{Book, Chapter, Glyph, GlyphKind, NoteSource, Paragraph};
 
     fn flow_of(book: &Book) -> Vec<Glyph> {
@@ -1590,6 +1593,31 @@ mod tests {
                 "{c} 现代模式应画斜点"
             );
         }
+    }
+
+    /// **空心圈「〇」也吃朱砂**（v1.84.0）：用户点名——照片里那枚句号是
+    /// **红色**的空心圆圈。取色与形制无关（`PunctInk::color` 不看 `Jodu`），
+    /// 故「〇」（`Ring`）与现代细圈（`Dot`）在朱砂档下必须与墨滴同一个色，
+    /// 且那色是活朱、与墨色明显两分。
+    #[test]
+    fn cinnabar_paints_the_hollow_ring_too_not_just_the_dot() {
+        let t = Theme::Ke;
+        let zhu = PunctInk::Zhu.color(InkPalette::Ink, t);
+        let mo = PunctInk::Mo.color(InkPalette::Ink, t);
+        // 四种形制同一个色（取色不看形制，将来谁加「按形制取色」这里就红）。
+        for j in [Jodu::Seed, Jodu::Ring, Jodu::BigSeed, Jodu::Dot] {
+            assert_eq!(zhu, PunctInk::Zhu.color(InkPalette::Ink, t), "{j:?} 走了别的色");
+        }
+        assert_eq!(zhu, t.zhu(), "朱砂没走句读专档");
+        // 是活朱：R 高出 G/B 一大截。
+        let (r, g, b) = (
+            ((zhu >> 16) & 0xFF) as i32,
+            ((zhu >> 8) & 0xFF) as i32,
+            (zhu & 0xFF) as i32,
+        );
+        assert!(r - g.max(b) > 90, "空心圈不够红：#{zhu:06X}");
+        // 与墨色两分（差得一眼看得出）。
+        assert_ne!(zhu, mo, "朱砂与墨同色，等于没得选");
     }
 
     /// **EPUB 标点扫雷**（v1.83.1）：凡是在电子书里真会出现的句读，
