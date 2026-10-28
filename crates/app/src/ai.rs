@@ -121,6 +121,18 @@ impl Draft {
         self.cursor = 0;
         self.marked = None;
     }
+
+    /// 在光标处插入一个换行（⇧⏎ 用：多行追问，绝不发送）。
+    fn insert_newline(&mut self) {
+        let at = self.cursor.min(self.text.chars().count());
+        if at >= max_of(F_ASK) {
+            return;
+        }
+        let head: String = self.text.chars().take(at).collect();
+        let tail: String = self.text.chars().skip(at).collect();
+        self.text = format!("{head}\n{tail}");
+        self.cursor = at + 1;
+    }
 }
 
 /// 四个输入框的编号（数组下标）。
@@ -229,6 +241,8 @@ pub struct AiPanel {
     ctx: Option<Ask>,
     /// 最近一次出错的人话（ Verbindung / 401 / 模型不存在…）。
     error: Option<String>,
+    /// 左历史抽屉是否展开（v1.84.1 写匠式侧栏）。
+    drawer_open: bool,
 }
 
 impl AiPanel {
@@ -269,6 +283,7 @@ impl AiPanel {
             root,
             ctx: None,
             error: None,
+            drawer_open: true,
         }
     }
 
@@ -363,6 +378,22 @@ impl AiPanel {
         self.seq = self.seq.wrapping_add(1); // 让在途的旧回包作废
         self.streaming = false;
         self.error = None;
+        cx.notify();
+    }
+
+    /// 收 / 展左历史抽屉（写匠式侧栏）。
+    pub fn toggle_drawer(&mut self, cx: &mut Context<Self>) {
+        self.drawer_open = !self.drawer_open;
+        cx.notify();
+    }
+
+    /// 点历史里的一句，把它填回提问框并交还焦点（不自动发送，免得误发）。
+    pub fn load_history(&mut self, q: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings = false;
+        self.drafts[F_ASK].text = q;
+        self.drafts[F_ASK].cursor = self.drafts[F_ASK].text.chars().count();
+        self.drafts[F_ASK].marked = None;
+        self.click_field(F_ASK, window);
         cx.notify();
     }
 
@@ -640,6 +671,19 @@ impl AiPanel {
             // ⏎ 发送（⌘⏎ 亦发送，给全键盘用户一个不与输入法打架的键）。
             "enter" | "Enter" => {
                 if f == F_ASK {
+                    // IME 组字态（正在拼词 / 选字）：回车只交给输入法把字
+                    // 上屏，绝不发送——否则「拼音选字回车」会把半句误发。
+                    // 本代码库用 `marked`（组字区间）存活与否判定 composing，
+                    // 与全文 / 笔记框的 `note_marked` 守卫同一路数。
+                    if self.drafts[F_ASK].marked.is_some() {
+                        return true;
+                    }
+                    // ⇧⏎ 换行：多行追问，绝不发送。
+                    if mods.shift {
+                        self.drafts[F_ASK].insert_newline();
+                        cx.notify();
+                        return true;
+                    }
                     self.send(cx);
                 } else {
                     self.save_settings(cx);
@@ -877,6 +921,17 @@ impl Render for AiPanel {
         let scope = self.scope;
         let hunting = self.hunting;
         let refs_hint = self.refs_hint.clone();
+        let drawer_open = self.drawer_open;
+        // 历史：本会话里问过的句子（去重，最新在底部），点一下回填提问框。
+        let mut history: Vec<String> = Vec::new();
+        for m in &msgs {
+            if m.mine {
+                let t = m.text.trim().to_string();
+                if !t.is_empty() && !history.contains(&t) {
+                    history.push(t);
+                }
+            }
+        }
 
         // ── 头：题名 + 两枚小钮 ────────────────────────────────
         let head_btn = |label: &'static str| -> Div {
@@ -994,14 +1049,111 @@ impl Render for AiPanel {
             )
         };
 
-        div()
+        // ── 左：历史抽屉（写匠式，可收起）────────────────────────
+        let drawer_veil = ((paper & 0xFFFFFF) << 8) | 0xE8;
+        let mut drawer = div()
             .flex()
             .flex_col()
-            .size_full()
-            .bg(rgba(veil))
+            .w(px(168.0))
+            .h_full()
+            .bg(rgba(drawer_veil))
+            .border_r_1()
+            .border_color(rgb(sept));
+        drawer = drawer.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .px_2()
+                .py_2()
+                .border_b_1()
+                .border_color(rgb(sept))
+                .child(
+                    div()
+                        .font_family(song.clone())
+                        .text_size(px(12.0))
+                        .text_color(rgb(zhu))
+                        .child(SharedString::from("歷史")),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(soft))
+                        .cursor_pointer()
+                        .hover(move |s| s.text_color(rgb(zhu)))
+                        .child(SharedString::from("收起"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_drawer(cx);
+                            }),
+                        ),
+                ),
+        );
+        if history.is_empty() {
+            drawer = drawer.child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(10.0))
+                    .text_color(rgb(soft))
+                    .child(SharedString::from("還沒問過。問一句，便留下一筆。")),
+            );
+        } else {
+            let mut list = div()
+                .id(SharedString::from("ai-history-list"))
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .px_1()
+                .py_1()
+                .gap(px(2.0));
+            for q in &history {
+                let qc = q.clone();
+                let short: String = brief(&qc, 16);
+                list = list.child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(5.0))
+                        .rounded(px(4.0))
+                        .text_size(px(10.5))
+                        .text_color(rgb(ink))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(hover_bg)))
+                        .child(SharedString::from(short))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.load_history(qc.clone(), window, cx);
+                            }),
+                        ),
+                );
+            }
+            drawer = drawer.child(list);
+        }
+
+        // ── 右：主栏（头 + 会话 + 提问条）──────────────────────
+        let main = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
             .child(header)
             .child(mid)
-            .child(footer)
+            .child(footer);
+
+        div()
+            .flex()
+            .flex_row()
+            .size_full()
+            .bg(rgba(veil))
+            .when(drawer_open, |s| s.child(drawer))
+            .child(main)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _, _, cx| {
@@ -1147,20 +1299,20 @@ impl AiPanel {
         list
     }
 
-    /// **提问条**（v1.80.0 改版，形制参考写匠「问小文」）：
+    /// **提问条**（v1.84.1 写匠式重构）：
     ///
     /// ```text
-    ///   〔引〕北冥有魚，其名為鯤……        去
-    ///   ┌────────────────────────────┐
-    ///   │ 想問什麼                          │
-    ///   └────────────────────────────┘
-    ///   本章 ⟡  疏通文意 解釋典故 …………   〔問〕
+    ///   〔引〕北冥有魚，其名為鯤……        去      ← 引文条（居中）
+    ///   ┌──────────────────────────────────┐
+    ///   │ 〔本章〕   想問什麼……        〔問〕 │      ← 居中大输入框（毛玻璃）
+    ///   └──────────────────────────────────┘         框内置范围选择器 + 发送钮
+    ///      疏通文意  解釋典故  梳理脈絡  續寫下文       ← 底部胶囊（极简细边框）
     /// ```
     ///
-    /// 三处讲究：① 输入框单独成行、宽度撑满（写得了整句追问，不像挤在
-    /// 一行里只能塞半句）；② 「範圍」是一枚可点的朱砂小印（本章 / 全書 /
-    /// 全庫），点一下换一个范围；③ 空会话时给四枚「快捷问法」小签，省得
-    /// 用户对着空条发愣。
+    /// 三处讲究：① 输入框是**居中大框**（毛玻璃 / 宣纸质感，圆角无硬边），
+    /// 写得了整句追问；② 「範圍」是一枚可点的朱砂小印（本章 / 全書 / 全庫），
+    /// 嵌在输入框**左侧**、与发送钮同框；③ 空会话时给四枚「快捷问法」胶囊，
+    /// 极简细边框、居中排布，省得用户对着空条发愣。
     #[allow(clippy::too_many_arguments)]
     fn render_ask_bar(
         &self,
@@ -1218,10 +1370,8 @@ impl AiPanel {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .w_full()
-            .py_2()
-            .border_b_1()
-            .border_color(rgb(if cursor_on { zhu } else { sept }))
+            .flex_1()
+            .min_w(px(0.0))
             .child(if hint.is_empty() {
                 box_body
             } else {
@@ -1248,7 +1398,7 @@ impl AiPanel {
             .py(px(2.0))
             .border_1()
             .border_color(rgb(if scope.needs_search() { zhu } else { sept }))
-            .rounded(px(2.0))
+            .rounded(px(999.0))
             .font_family(song.clone())
             .text_size(px(10.5))
             .text_color(rgb(if scope.needs_search() { zhu } else { soft }))
@@ -1270,7 +1420,7 @@ impl AiPanel {
         let send = div()
             .px(px(11.0))
             .py(px(3.0))
-            .rounded(px(2.0))
+            .rounded(px(999.0))
             .bg(rgb(if self.streaming || hunting {
                 jiandu_core::theme::mix(paper, zhu, 0.35)
             } else {
@@ -1292,16 +1442,33 @@ impl AiPanel {
                 }),
             );
 
-        let row = div()
+        // 居中大输入框（宣纸 / 毛玻璃质感）：框内置范围选择器 + 发送钮。
+        let glass = ((paper & 0xFFFFFF) << 8) | 0xD8;
+        let input_box = div()
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
             .gap(px(8.0))
+            .w_full()
+            .px(px(14.0))
+            .py(px(11.0))
+            .rounded(px(16.0))
+            .bg(rgba(glass))
+            .border_1()
+            .border_color(rgb(if cursor_on { zhu } else { sept }))
+            .when(scope.needs_search(), |s| s.border_color(rgb(zhu)))
             .child(scope_chip)
+            .child(input)
             .child(send);
 
-        let mut col = div().flex().flex_col().px_3().py_2().gap(px(8.0));
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap(px(8.0));
         if has_ctx {
             col = col.child(
                 div()
@@ -1309,6 +1476,7 @@ impl AiPanel {
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
+                    .w_full()
                     .child(
                         div()
                             .text_size(px(10.0))
@@ -1341,8 +1509,11 @@ impl AiPanel {
                     ),
             );
         }
-        col = col.child(input);
-        col = col.child(row);
+        // 空输入时上方留白把输入框压低、显得居中；一旦有字 / 聚焦便上移贴住对话区。
+        if d.text.is_empty() && !cursor_on {
+            col = col.child(div().h(px(46.0)));
+        }
+        col = col.child(input_box);
         // 翻检状态 / 结果：只在「不是本章」时才占这一行。
         if scope.needs_search() {
             let note = if hunting {
@@ -1367,15 +1538,20 @@ impl AiPanel {
         }
         // 四枚快捷问法：只在还没开话时给（开话后它们只会挡住对话）。
         if fresh {
-            let mut chips = div().flex().flex_row().flex_wrap().gap(px(6.0));
+            let mut chips = div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .justify_center()
+                .gap(px(6.0));
             for (show, full) in SUGGESTS {
                 chips = chips.child(
                     div()
-                        .px(px(7.0))
-                        .py(px(2.0))
+                        .px(px(9.0))
+                        .py(px(3.0))
                         .border_1()
                         .border_color(rgb(sept))
-                        .rounded(px(2.0))
+                        .rounded(px(999.0))
                         .font_family(song.clone())
                         .text_size(px(10.5))
                         .text_color(rgb(soft))
