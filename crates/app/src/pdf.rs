@@ -18,12 +18,20 @@
 //! 几何（列宽 / 行高 / 行数 / 字号）同样由 `grid::calculate_grid` 按 A4 试算，
 //! 与屏幕同一套算式，只是换了纸。
 //!
-//! ── 两条防雷（与 `share_paint` 同一口径）────────────────────────
+//! ── 三条防雷（与 `share_paint` 同一口径）────────────────────────
 //! 1. **不翻 CTM**：`CGPDFContext` 与位图上下文同是 CG 坐标（原点左下、
 //!    y 向上），版式数据是屏幕坐标（原点左上）。只把每个元素的 y 做一次
 //!    镜像（[`Brush::cy`]），**绝不动 CTM**——一动字形就被垂直镜像。
 //! 2. **CFRelease**：`CGContext` / `CFURL` 都是 `TCFType` 包装，`Drop` 自动
 //!    release；字体按 (字形类, 字号) 缓存复用，一叶只建两三台字体对象。
+//! 3. **整本导出的两条底线（v1.85.3，商业化印刷代排）**：
+//!    - **UTF-16 绝不越界**：码元缓冲按 `char::len_utf16()` 精确开
+//!      （[`utf16_units`]）。扩展 B 区的字（如 `U+27B82`）要两枚码元，
+//!      旧代码写死 `[u16; 1]` 会 **panic**，整本《离骚》一碰生僻字就崩。
+//!    - **逐页流式落盘**：[`PdfStream`] 一叶一 `EndPage` + `flush`，
+//!      写完即交 CG，本模块**不持有任何一页的产物**——内存与书的厚薄无关。
+//!    - **字体三级回退**：本字体 → 楷/黑/宋 → 系统兜底链（宋体 / 苹方 /
+//!      LastResort），缺字一路往下换，绝不画空格也绝不崩。
 
 use crate::gloss::Piece;
 use jiandu_core::platform::{LeafSpec, PdfExporter, PdfGeometry};
@@ -86,6 +94,55 @@ impl From<ShareFont> for PdfFontKind {
     }
 }
 
+// ── 生僻字安全：UTF-16 码元 ────────────────────────────────────────────
+/// 一个 `char` 折成 UTF-16 码元，连同**实际枚数**（BMP = 1，扩展区 = 2）。
+///
+/// ⚠️ v1.85.3 修的正是这里 —— 旧代码：
+/// ```ignore
+/// let mut unit: [u16; 1] = [0];
+/// ch.encode_utf16(&mut unit);   // ← 缓冲不够时 **panic**，不是返回错误
+/// ```
+/// `U+27B82`（扩展 B 区）要**两枚**码元（代理对），塞进一枚的缓冲直接
+/// `need 2 bytes to encode U+27B82 but buffer has just 1` 把进程带走——
+/// 整本《离骚》《资治通鉴》一碰生僻字就崩，商业印刷代排绝不能这样。
+///
+/// 容量**只由 `len_utf16()` 精确得出**（等价于 `encode_utf16().count()`）：
+/// 绝不用 `text.len()`（那是 UTF-8 字节数）也绝不用 `chars().count()`
+/// （那是码点数）——这两个在「一个汉字 ≠ 一个码元」的地方永远猜错。
+fn utf16_units(ch: char) -> ([u16; 2], usize) {
+    let n = ch.len_utf16(); // 精确：1（BMP）或 2（代理对）
+    let mut buf = [0u16; 2]; // 上限恒为 2，`n` 绝不会超出
+    ch.encode_utf16(&mut buf[..n]);
+    (buf, n)
+}
+
+/// **系统兜底字体链**：自备字体 / 刻本字体缺的异体字、扩展区生僻字靠它们收尾。
+///
+/// 印刷代排的底线是「纸上一枚字都不能少，也绝不能崩」：字形查不到就一路
+/// 往下换字体，直到系统里一定在的宋 / 黑。顺序按「最像刻本」排——先宋后黑，
+/// 最后 `LastResort`（macOS 的系统兜底字体，覆盖全 Unicode，样子是带码位的
+/// 方框：**有框能被看见，也比空白 / 崩溃强一百倍**）。
+const SYS_FALLBACK: &[&str] = &[
+    "Songti SC",
+    "SongtiSC",
+    "STSong",
+    "SimSun",
+    "Songti TC",
+    "PingFang SC",
+    "PingFangSC",
+    "Hiragino Sans GB",
+    "HiraginoSansGB",
+    "Heiti SC",
+    "STHeiti",
+    "Arial Unicode MS",
+    "LastResort",
+];
+
+/// 字体缓存上限：键是 `(字体, 字号)`，正常一本只会有十来个组合；
+/// 设个上限只为防「字号被算成几百种」的意外把缓存撑大。**流式导出时
+/// 缓存不清空**（清空会让每页重建字体，反而更慢更费），只在上限处兜底。
+const FONT_CACHE_MAX: usize = 64;
+
 // ── 画笔 ──────────────────────────────────────────────────────────────
 /// 一支笔：持一个 CG 上下文（**PDF**），把「屏幕坐标」翻成 CG 坐标落笔。
 struct Brush {
@@ -94,6 +151,10 @@ struct Brush {
     h: f64,
     /// 字体缓存：`(字形类, 字号×4 取整) → (字体, ascent, descent)`。
     fonts: Vec<(ShareFont, i32, CTFont, f64, f64)>,
+    /// 系统兜底字体缓存：`(PostScript 名, 字号×4) → (字体, ascent, descent)`。
+    sys: Vec<(&'static str, i32, CTFont, f64, f64)>,
+    /// **缺字计数**：连系统兜底都查不到字形的字（只记数，绝不崩、绝不静默）。
+    missing: usize,
 }
 
 /// `0xRRGGBB` → 三分量（0~1）。
@@ -111,6 +172,8 @@ impl Brush {
             ctx,
             h,
             fonts: Vec::new(),
+            sys: Vec::new(),
+            missing: 0,
         }
     }
 
@@ -143,8 +206,34 @@ impl Brush {
             fs * 0.88
         };
         let desc = font.descent().abs();
+        if self.fonts.len() >= FONT_CACHE_MAX {
+            self.fonts.clear();
+        }
         self.fonts.push((kind, key, font.clone(), asc, desc));
         Ok((font, asc, desc))
+    }
+
+    /// 取（并缓存）一台**系统兜底**字体（按 PostScript / 家族名）。
+    /// 系统里没有这个名字就返回 `None`（换下一个），绝不 panic。
+    fn sys_font(&mut self, name: &'static str, fs: f64) -> Option<(CTFont, f64, f64)> {
+        let key = (fs * 4.0).round() as i32;
+        for (n, k, f, a, d) in self.sys.iter() {
+            if *n == name && *k == key {
+                return Some((f.clone(), *a, *d));
+            }
+        }
+        let font = core_text::font::new_from_name(name, fs).ok()?;
+        let asc = if font.ascent() > 0.0 {
+            font.ascent()
+        } else {
+            fs * 0.88
+        };
+        let desc = font.descent().abs();
+        if self.sys.len() >= FONT_CACHE_MAX {
+            self.sys.clear();
+        }
+        self.sys.push((name, key, font.clone(), asc, desc));
+        Some((font, asc, desc))
     }
 
     /// 存 / 取图形状态（配合 [`Brush::clip_top_rect`] 用）。
@@ -235,7 +324,61 @@ impl Brush {
         self.glyph_at(ch, x + w * 0.5, y, h, fs, color, kind);
     }
 
-    /// 落一枚字：横向按 `cx` 居中、纵向按行盒居中。
+    /// 在一台字体里查 `unit` 的字形；**查不到（或缺字）返回 `None`**。
+    ///
+    /// 判定「缺字」用 `!ok || glyph == 0`：字形序号 0 是 `.notdef`，
+    /// 画出来是个空格 / 方框，**等于白印一个字**——必须当缺字处理，
+    /// 交给下一级字体（这是回退机制真正生效的关键一判）。
+    fn lookup(
+        &mut self,
+        k: ShareFont,
+        fs: f64,
+        unit: &[u16],
+    ) -> Option<(CTFont, f64, f64, core_graphics::font::CGGlyph)> {
+        let (font, asc, desc) = self.font(k, fs).ok()?;
+        let mut glyphs: [core_graphics::font::CGGlyph; 2] = [0; 2];
+        let ok = unsafe {
+            font.get_glyphs_for_characters(unit.as_ptr(), glyphs.as_mut_ptr(), unit.len() as isize)
+        };
+        if !ok || glyphs[0] == 0 {
+            return None;
+        }
+        Some((font, asc, desc, glyphs[0]))
+    }
+
+    /// 把一枚字形落到纸上（拿到的 `asc/desc` 决定行盒居中）。
+    fn put(
+        &self,
+        font: &CTFont,
+        glyph: core_graphics::font::CGGlyph,
+        cx: f64,
+        y: f64,
+        h: f64,
+        fs: f64,
+        asc: f64,
+        desc: f64,
+        color: u32,
+    ) {
+        let baseline = y + (h - (asc + desc)) * 0.5 + asc;
+        let (r, g, b) = rgb(color);
+        self.ctx.set_rgb_fill_color(r, g, b, 1.0);
+        font.draw_glyphs(
+            &[glyph],
+            &[CGPoint::new(cx - fs * 0.5, self.cy(baseline))],
+            self.ctx.clone(),
+        );
+    }
+
+    /// 落一枚字：横向按 `cx` 居中、纵向按行盒居中。返回**有没有真落上**。
+    ///
+    /// ── 三级字体回退（v1.85.3，商业化印刷代排底线）─────────────────
+    ///   ① 本字体（刻本 / 楷 / 黑，含用户自备字库）
+    ///   ② 楷 → 黑 → 宋（老规矩：宋体缺 `ō ǎ ě` 这类带调元音时靠这层补）
+    ///   ③ **系统兜底链**（Songti SC / PingFang SC / … / LastResort）
+    ///
+    /// 三级都查不到才放弃这一枚（只 `missing += 1`），**绝不 panic、绝不画
+    /// 空格**。扩展 B 区的字（如 `U+27B82`）在自备刻本字体里多半没有，
+    /// 但系统宋体 / LastResort 里一定有——所以生僻字照样安安全全落在纸上。
     fn glyph_at(
         &mut self,
         ch: char,
@@ -245,42 +388,47 @@ impl Brush {
         fs: f64,
         color: u32,
         kind: ShareFont,
-    ) {
-        // 字形回退：宋体缺 `ō ǎ ě` 这类带调元音时（拼音注音的老毛病），
-        // 依次试楷 / 黑——只要有一个字体有这枚字就落笔，绝不静默丢字
-        // （PDF 里「少一个 ī」比「字形风格不统一」难看得多）。
-        let mut unit: [u16; 1] = [0];
-        ch.encode_utf16(&mut unit);
+    ) -> bool {
+        // ① UTF-16 码元：**按 `len_utf16()` 精确开缓冲**，扩展区两枚也不越界。
+        let (buf, n) = utf16_units(ch);
+        let unit = &buf[..n];
+
+        // ② 本字体 → 楷 / 黑 / 宋
         let chain = [kind, ShareFont::Kai, ShareFont::Hei, ShareFont::Song];
         for k in chain {
-            let (font, asc, desc) = match self.font(k, fs) {
-                Ok(v) => v,
-                Err(_) => continue,
+            if let Some((font, asc, desc, glyph)) = self.lookup(k, fs, unit) {
+                self.put(&font, glyph, cx, y, h, fs, asc, desc, color);
+                return true;
+            }
+        }
+        // ③ 系统兜底：自备字体缺的异体字 / 扩展区字靠这一层收尾。
+        for name in SYS_FALLBACK {
+            let Some((font, asc, desc)) = self.sys_font(name, fs) else {
+                continue;
             };
-            let mut glyph: core_graphics::font::CGGlyph = 0;
-            let ok = unsafe { font.get_glyphs_for_characters(unit.as_ptr(), &mut glyph, 1) };
-            if !ok {
+            let mut glyphs: [core_graphics::font::CGGlyph; 2] = [0; 2];
+            let ok = unsafe {
+                font.get_glyphs_for_characters(unit.as_ptr(), glyphs.as_mut_ptr(), unit.len() as isize)
+            };
+            if !ok || glyphs[0] == 0 {
                 continue;
             }
-            let baseline = y + (h - (asc + desc)) * 0.5 + asc;
-            let (r, g, b) = rgb(color);
-            self.ctx.set_rgb_fill_color(r, g, b, 1.0);
-            font.draw_glyphs(
-                &[glyph],
-                &[CGPoint::new(cx - fs * 0.5, self.cy(baseline))],
-                self.ctx.clone(),
-            );
-            return;
+            self.put(&font, glyphs[0], cx, y, h, fs, asc, desc, color);
+            return true;
         }
+        // 全系统都没有这枚字：记一笔，**绝不崩、绝不画空格**。
+        self.missing += 1;
+        false
     }
 }
 
-/// 竖排注音：**紧凑竖叠**、贴字格右侧（与屏幕 `ruby::layout` 同一套几何）。
+/// 注音：**横排、正立、从左到右**，落在汉字右侧的列间空白里
+/// （与屏幕 `ruby::layout` 同一套几何）。
 ///
-/// 屏幕那侧是 GPUI 里一串竖排小 div；这里是 CG 逐字母落笔。两者共用
-/// `jiandu_core::ruby::layout` 的度量（字号 40%、步进 0.82、长拼音收敛下限
-/// 22%、右侧留呼吸间距），所以 PDF 里的 `bō rě` 与屏幕逐字同位——
-/// **绝不横向排**（横向会撑破一格宽、压到邻列），纵向也绝不溢出格高。
+/// 屏幕那侧是一张 CoreGraphics 离屏位图；这里是 CG 逐字落笔。两者共用
+/// `jiandu_core::ruby::layout` 的度量（字号 40%、按可用宽收敛到 22%、
+/// 左缘从汉字右缘让开），所以 PDF 里的 `měng` 与屏幕逐字同位——
+/// 绝不歪着排、绝不被转 90°，也绝不碰到下一列的字形。
 fn draw_ruby(
     b: &mut Brush,
     py: &str,
@@ -292,26 +440,21 @@ fn draw_ruby(
     g: &PdfGeo,
 ) {
     let rl = crate::ruby::layout(py, fs as f32, cell_w as f32, cell_h as f32);
-    // 右上角落点（屏幕坐标）：右缘内缩一个 `rl.gutter`（与屏幕同一套度量）。
-    let right = x + cell_w - rl.gutter as f64;
+    let left = x + rl.left as f64;
     let top = y + rl.top as f64;
-    if draw_ruby_rotated(b, py, right, top, &rl, g.note_ink, ShareFont::from(g.note_font)).is_err() {
-        // 退化：逐字母竖叠（步进取字母全高，绝不叠墨）。
-        let bw = rl.block_w as f64;
-        let step = rl.fs as f64 * 1.02;
-        let mut ty = top;
-        for c in py.chars() {
-            b.glyph_at(
-                c,
-                right - bw + bw * 0.5,
-                ty,
-                step,
-                rl.fs as f64,
-                g.note_ink,
-                ShareFont::from(g.note_font),
-            );
-            ty += step;
-        }
+    // 等距分格落笔：格宽由 `ruby::layout` 定死，字距均匀，绝不会把串画长。
+    let n = py.chars().count().max(1) as f64;
+    let step = rl.block_w as f64 / n;
+    for (i, c) in py.chars().enumerate() {
+        b.glyph_at(
+            c,
+            left + (i as f64 + 0.5) * step,
+            top,
+            rl.block_h as f64,
+            rl.fs as f64,
+            g.note_ink,
+            ShareFont::from(g.note_font),
+        );
     }
     // 三点提示（与屏幕同款）：贴字格下缘右侧，三道极细短横——只作
     // 「此字有音」的暗示，不抢正文。宽高都随格缩，A4 上是一道灰线。
@@ -325,72 +468,9 @@ fn draw_ruby(
     }
 }
 
-/// 整串**顺时针旋转 90°** 落笔（与屏幕 `ruby_glyph` 同一套度量）。
-///
-/// 纸面上 CoreGraphics 的 CTM **能真转**（不像 GPUI 把变换矩阵写死），
-/// 所以这里直接 `translate → rotate(-90°) → 逐字落笔`：
-/// 局部 `+x`（读序）→ 全局向下；局部 `+y`（字母的上）→ 全局向右。
-fn draw_ruby_rotated(
-    b: &mut Brush,
-    py: &str,
-    right_x: f64,
-    top_y: f64,
-    rl: &crate::ruby::RubyLayout,
-    color: u32,
-    kind: ShareFont,
-) -> Result<(), String> {
-    use core_graphics::font::CGGlyph;
-    use core_graphics::geometry::{CGPoint, CGSize};
-    use core_text::font_descriptor::kCTFontOrientationHorizontal;
-
-    let fs = rl.fs as f64;
-    let (font, asc, _desc) = b.font(kind, fs)?;
-    let mut glyphs: Vec<CGGlyph> = Vec::new();
-    let mut advs: Vec<f64> = Vec::new();
-    for c in py.chars() {
-        let mut unit: [u16; 1] = [0];
-        c.encode_utf16(&mut unit);
-        let mut gl: CGGlyph = 0;
-        let ok = unsafe { font.get_glyphs_for_characters(unit.as_ptr(), &mut gl, 1) };
-        if !ok {
-            return Err(format!("字体缺字形 {c:?}"));
-        }
-        let mut sz = CGSize::new(0.0, 0.0);
-        unsafe {
-            font.get_advances_for_glyphs(kCTFontOrientationHorizontal, &gl, &mut sz, 1)
-        };
-        glyphs.push(gl);
-        advs.push(sz.width);
-    }
-    let run_w: f64 = advs.iter().sum();
-    if run_w <= 0.0 {
-        return Err("串宽为零".to_string());
-    }
-    // 真实串宽比 core 预留的长时整体缩一档——绝不溢出到同列下一个字。
-    let k = (rl.block_h as f64 / run_w).min(1.0);
-
-    let (r, gg, bb) = rgb(color);
-    b.ctx.save();
-    // **顺时针 90°**（与屏幕 `ruby_glyph` 同向）：字母顶部朝 +x，故最右一列
-    // 是**升部**，基线落在 `right_x - asc`；串自上而下读，起点（局部 x=0）
-    // 在整条的顶端 `top_y`。
-    b.ctx.translate(right_x - asc, b.cy(top_y));
-    b.ctx.rotate(-std::f64::consts::FRAC_PI_2);
-    if k < 1.0 {
-        b.ctx.scale(k, k);
-    }
-    b.ctx.set_rgb_fill_color(r, gg, bb, 1.0);
-    let mut ax = 0.0f64;
-    for i in 0..glyphs.len() {
-        font.draw_glyphs(&[glyphs[i]], &[CGPoint::new(ax, 0.0)], b.ctx.clone());
-        ax += advs[i];
-    }
-    b.ctx.restore();
-    Ok(())
-}
-
 // ── 画一叶 ────────────────────────────────────────────────────────────
 /// 单叶在纸面上的落位（由 [`PdfGeo`] + A4 算出，**所有叶共用**）。
+#[derive(Clone, Copy)]
 struct Place {
     /// 字格区左上（PDF 页坐标）。
     gx: f64,
@@ -921,55 +1001,164 @@ fn draw_gloss(b: &mut Brush, txt: &str, x: f64, y: f64, g: &PdfGeo, head: bool) 
     }
 }
 
+// ── 流式写手 ──────────────────────────────────────────────────────────
+/// **一页一页写的 PDF 写手**（v1.85.3，整本导出的内存底线）。
+///
+/// 五千页的《资治通鉴》绝不能先把五千页的绘制结果攒在内存里。这里是：
+///
+/// ```text
+///   begin(path) ──► push(叶1) ──► push(叶2) ──► … ──► finish()
+///                     │
+///                     └─ BeginPage → 铺纸 → 落笔 → EndPage
+///                        → flush（催 CG 把这一页写下去）
+///                        → 本页临时全丢（不持有任何一页的产物）
+/// ```
+///
+/// `CGPDFContext` 本身是**数据消费者**：`EndPage` 一过，这一页的内容流就
+/// 交给它往下写；本模块只留一支笔（字体缓存是十来个对象，与页数无关）。
+/// 因此内存占用**与书有多厚无关**，只与「一页有多大」有关。
+///
+/// `Drop` 会兜底 `CGPDFContextClose`——哪怕中途出错提前 return，也不会
+/// 落一个没写交叉引用表的坏 PDF 在磁盘上。
+pub struct PdfStream {
+    /// 裸指针：`BeginPage` / `EndPage` / `Close` 这三个入口 core-graphics
+    /// 没包，只能自己声明（见文件头 `extern "C"`）。
+    raw: sys::CGContextRef,
+    /// 同一对象的 Rust 包装（持所有权，Drop 时 release）。
+    ///
+    /// ⚠️ `raw` 与 `ctx` **指向同一个对象**：`raw` 只用来调那三个 C 入口，
+    /// 生命周期交给 `ctx`。绝不能再 `from_ptr` 一次（会双 release）。
+    ctx: CGContext,
+    brush: Brush,
+    /// 已写页数。
+    pages: usize,
+    /// 落位（各叶共用，算一次存着）。
+    place: Option<Place>,
+    /// 是否已经 `Close`（`Drop` 里防重复关）。
+    closed: bool,
+}
+
+impl PdfStream {
+    /// 开一份新的 PDF（**先建文件，再一页页喂**）。
+    pub fn begin(path: &Path) -> Result<Self, String> {
+        let url = CFURL::from_path(path, false)
+            .ok_or_else(|| format!("路径无法转成文件 URL：{}", path.display()))?;
+        let media = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(A4_W, A4_H));
+        let raw = unsafe { CGPDFContextCreateWithURL(url.as_concrete_TypeRef(), &media, std::ptr::null()) };
+        if raw.is_null() {
+            return Err("无法创建 PDF 画布（CoreGraphics 返回空）".to_string());
+        }
+        // `from_ptr` 接管所有权：Drop 时 `CGContextRelease`，与
+        // `CGPDFContextClose` 一前一后，绝不泄漏。
+        let ctx = unsafe { CGContext::from_ptr(raw) };
+        ctx.set_allows_antialiasing(true);
+        ctx.set_should_antialias(true);
+        // ⚠️ 先 `clone` 再 move：`Brush` 要的是同一台上下文的另一份引用
+        // （`CGContext` 的 `Clone` 是 retain，`Drop` 各 release 一次，配平）。
+        let brush = Brush::new(ctx.clone(), A4_H);
+        Ok(Self {
+            raw,
+            ctx,
+            brush,
+            pages: 0,
+            place: None,
+            closed: false,
+        })
+    }
+
+    /// 写一叶：开页 → 铺纸 → 落笔 → 收页 → **flush**。
+    ///
+    /// 这一页画完，本模块**不留下任何属于这一页的东西**（`Page` / `Piece`
+    /// 都是调用方持有的借用，`draw_leaf` 只是照着读一遍），所以内存不会
+    /// 随页数累积。
+    pub fn push(&mut self, leaf: &PdfLeaf<'_>, g: &PdfGeo) {
+        // ⚠️ **必须先开页再落笔**：CG 的 PDF 上下文在 `BeginPage` 之前
+        // 收到的绘制会被丢掉，页面只剩一个空的内容流（控制台会报
+        // “No content stream…”）。整页底色因此也在开页之后铺。
+        unsafe { CGPDFContextBeginPage(self.raw, std::ptr::null()) };
+        // 纸色铺满 A4（纸面之外也是纸，印出来才不会有白边感）。
+        let (pr, pg, pb) = rgb(g.paper);
+        self.brush.ctx.set_rgb_fill_color(pr, pg, pb, 1.0);
+        self.brush.ctx.fill_rect(CGRect::new(
+            &CGPoint::new(0.0, 0.0),
+            &CGSize::new(A4_W, A4_H),
+        ));
+        let place = *self.place.get_or_insert_with(|| place_of(g));
+        draw_leaf(&mut self.brush, leaf, g, &place);
+        unsafe { CGPDFContextEndPage(self.raw) };
+        // 催 CG 把刚收的这一页写下去（不等 `Close` 时才一次性吐）。
+        self.brush.ctx.flush();
+        self.pages += 1;
+    }
+
+    /// 关文件（写交叉引用表）。返回写出的**页数**。
+    pub fn finish(mut self) -> Result<usize, String> {
+        self.close();
+        let n = self.pages;
+        if self.brush.missing > 0 {
+            // 绝不静默：印厂拿到纸才发现少了字就晚了。
+            eprintln!(
+                "[笺读] PDF 印制完成 {n} 叶，其中 {} 枚字在所有字体中都查不到字形（已跳过，未印）",
+                self.brush.missing
+            );
+        }
+        Ok(n)
+    }
+
+    /// 已写页数（中途看进度用）。
+    pub fn pages(&self) -> usize {
+        self.pages
+    }
+
+    fn close(&mut self) {
+        if !self.closed {
+            unsafe { CGPDFContextClose(self.raw) };
+            self.closed = true;
+        }
+    }
+}
+
+impl Drop for PdfStream {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 // ── 对外入口 ──────────────────────────────────────────────────────────
-/// 把若干叶写成一份 **A4 矢量 PDF**（一叶一页）。返回写出的页数。
+/// 把若干叶写成一份 **A4 矢量 PDF**（一叶一页，**逐页流式落盘**）。
+/// 返回写出的页数。
 ///
 /// 失败一律返回可读原因，绝不 panic（导出路径最怕「崩在半路」）。
 pub fn write_pdf(path: &Path, leaves: &[PdfLeaf], g: &PdfGeo) -> Result<usize, String> {
     if leaves.is_empty() {
         return Err("没有可印制的叶面".to_string());
     }
-    let url = CFURL::from_path(path, false).ok_or_else(|| {
-        format!("路径无法转成文件 URL：{}", path.display())
-    })?;
-    let media = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(A4_W, A4_H));
-    let raw = unsafe {
-        CGPDFContextCreateWithURL(
-            url.as_concrete_TypeRef(),
-            &media,
-            std::ptr::null(),
-        )
-    };
-    if raw.is_null() {
-        return Err("无法创建 PDF 画布（CoreGraphics 返回空）".to_string());
-    }
-    // `from_ptr` 接管所有权：Drop 时 `CGContextRelease`，与 CGPDFContextClose
-    // 一前一后，绝不泄漏。
-    let ctx = unsafe { CGContext::from_ptr(raw) };
-    ctx.set_allows_antialiasing(true);
-    ctx.set_should_antialias(true);
-    let mut b = Brush::new(ctx, A4_H);
-    let place = place_of(g);
+    let mut s = PdfStream::begin(path)?;
+    // 逐叶喂给写手：**写完一叶就落盘**，绝不攒一个「整本的绘制结果」。
     for leaf in leaves {
-        // ⚠️ **必须先开页再落笔**：CG 的 PDF 上下文在 `BeginPage` 之前
-        // 收到的绘制会被丢掉，页面只剩一个空的内容流（控制台会报
-        // “No content stream…”）。整页底色因此也在开页之后铺。
-        unsafe { CGPDFContextBeginPage(raw, std::ptr::null()) };
-        // 纸色铺满 A4（纸面之外也是纸，印出来才不会有白边感）。
-        let (pr, pg, pb) = rgb(g.paper);
-        b.ctx.set_rgb_fill_color(pr, pg, pb, 1.0);
-        b.ctx.fill_rect(CGRect::new(
-            &CGPoint::new(0.0, 0.0),
-            &CGSize::new(A4_W, A4_H),
-        ));
-        draw_leaf(&mut b, leaf, g, &place);
-        unsafe { CGPDFContextEndPage(raw) };
+        s.push(leaf, g);
     }
-    // 收笔：写完所有页再 close（它把交叉引用表落盘）。
-    let n = leaves.len();
-    unsafe { CGPDFContextClose(raw) };
-    drop(b);
-    Ok(n)
+    s.finish()
+}
+
+/// **迭代器版**入口：调用方可以边排版边喂（一叶一叶来），
+/// 本模块始终只持有一叶的量——《资治通鉴》那种体量靠这条入口才真流式。
+pub fn write_pdf_streaming<'a, I>(
+    path: &Path,
+    g: &PdfGeo,
+    leaves: I,
+) -> Result<usize, String>
+where
+    I: IntoIterator<Item = PdfLeaf<'a>>,
+{
+    let mut s = PdfStream::begin(path)?;
+    for leaf in leaves {
+        s.push(&leaf, g);
+    }
+    match s.finish() {
+        Ok(0) => Err("没有可印制的叶面".to_string()),
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -1093,6 +1282,205 @@ mod tests {
         };
         assert!(g.sheet_w() as f64 <= A4_W, "纸宽超出 A4");
         assert!(g.sheet_h() as f64 <= A4_H, "纸高超出 A4");
+    }
+
+    /// 测试用的版式（与上一个用例同制，抽出来给下面几条共用）。
+    fn test_geo() -> PdfGeo {
+        PdfGeo {
+            cols: 8,
+            cell_w: 46.0,
+            cell_h: 66.0,
+            rows: 10,
+            fs: 36.0,
+            reserve: 0,
+            edge: 40.0,
+            margin_top: 40.0,
+            margin_bot: 26.0,
+            paper: 0xF5EFE2,
+            ink: 0x1A1A1A,
+            rule: 0x8A7A5C,
+            rule_soft: 0x8A7A5C,
+            note_ink: 0xC3272D,
+            accent: 0xC3272D,
+            font: PdfFontKind::Song,
+            note_font: PdfFontKind::Kai,
+            han_digits: false,
+            traditional: false,
+            punct_mode: crate::gloss::PunctMode::Modern,
+            punct_ink: 0xC3272D,
+        }
+    }
+
+    /// 由一串字造一叶（正文单列，无夹注）。
+    fn page_of(s: &str) -> Page {
+        let glyphs: Vec<Glyph> = s
+            .chars()
+            .enumerate()
+            .map(|(i, c)| Glyph {
+                chapter: 0,
+                para: 0,
+                offset: i,
+                ch: c,
+                kind: GlyphKind::Char,
+            })
+            .collect();
+        let columns = vec![glyphs
+            .iter()
+            .map(|g| Piece::Main(*g))
+            .collect::<Vec<Piece>>()];
+        Page {
+            glyphs,
+            start_chapter: false,
+            columns,
+        }
+    }
+
+    fn tmp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("jiandu-pdf-test");
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    /// **UTF-16 缓冲必须精确**：BMP 一枚、扩展区两枚（代理对）。
+    ///
+    /// 钉的是 v1.85.3 那个真崩溃：`[u16; 1]` 装不下 `U+27B82`，
+    /// `encode_utf16` panic，整本《离骚》《资治通鉴》导出当场死。
+    #[test]
+    fn utf16_units_are_exact_for_bmp_and_astral() {
+        let (u, n) = utf16_units('a');
+        assert_eq!(n, 1, "BMP 只要一枚码元");
+        assert_eq!(u[0], 0x0061);
+
+        let (u, n) = utf16_units('\u{27B82}');
+        assert_eq!(n, 2, "扩展 B 区必须是两枚码元（代理对）");
+        assert!((0xD800..0xDC00).contains(&u[0]), "首枚应是高位代理");
+        assert!((0xDC00..0xE000).contains(&u[1]), "次枚应是低位代理");
+        // 反解回来：一枚字都没丢。
+        let back = String::from_utf16(&u[..n]).expect("反解失败");
+        assert_eq!(back.chars().next().unwrap(), '\u{27B82}');
+
+        // 最容易写错的那两个口径，这里一并钉死它们**不该**被拿来定缓冲：
+        let s = "\u{27B82}";
+        assert_eq!(s.len(), 4, "UTF-8 是 4 字节 ≠ 码元数");
+        assert_eq!(s.chars().count(), 1, "码点数 ≠ 码元数");
+        assert_eq!(s.encode_utf16().count(), 2, "真正要的是这个：2");
+    }
+
+    /// **生僻字不崩、且真落进 PDF**（扩展 B 区 + 扩展 B 区外的另一枚）。
+    #[test]
+    fn astral_rare_chars_do_not_crash_and_land_in_the_pdf() {
+        // `\u{27B82}` 就是线上把导出打崩的那一枚；`\u{20000}` 是扩展 B 区首字。
+        let body = "扈江離與辟芷兮\u{27B82}紉秋蘭以為佩\u{20000}汨余若將不及兮恐年歲之不吾與";
+        let page = page_of(body);
+        let ruby = std::collections::HashMap::new();
+        let g = test_geo();
+        let out = tmp_dir().join("astral.pdf");
+        let leaf = PdfLeaf {
+            page: &page,
+            title: "離騷",
+            chapter: 0,
+            leaf: 1,
+            inscription: "",
+            author: "",
+            ruby: &ruby,
+        };
+        // 旧实现在这里 panic（encode_utf16 越界）——能走到下一行就算过。
+        // 但「没崩」还不够：还要**真印上去**（走字体回退找到字形），
+        // 所以直接用写手，收工时看缺字计数必须是 0。
+        let mut s = PdfStream::begin(&out).expect("开 PDF 失败");
+        s.push(&leaf, &g);
+        assert_eq!(
+            s.brush.missing, 0,
+            "扩展区生僻字一枚都没印上——字体回退没生效"
+        );
+        let n = s.finish().expect("写 PDF 失败");
+        assert_eq!(n, 1);
+        let bytes = std::fs::read(&out).expect("读回 PDF 失败");
+        assert!(bytes.starts_with(b"%PDF-"));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/Font"), "字体未内嵌");
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// **逐页流式**：写一叶就落一叶，`pages()` 随时可读，收笔页数对得上。
+    #[test]
+    fn streaming_writer_writes_and_releases_one_page_at_a_time() {
+        let page = page_of("帝曰咨汝羲暨和朞三百有六旬有六日以閏月定四時成歲");
+        let ruby = std::collections::HashMap::new();
+        let g = test_geo();
+        let out = tmp_dir().join("stream.pdf");
+        let mut s = PdfStream::begin(&out).expect("开 PDF 失败");
+        for i in 0..40usize {
+            let leaf = PdfLeaf {
+                page: &page,
+                title: "堯典",
+                chapter: 0,
+                leaf: i + 1,
+                inscription: "",
+                author: "",
+                ruby: &ruby,
+            };
+            s.push(&leaf, &g);
+            assert_eq!(s.pages(), i + 1, "每推一叶，页数就该加一");
+        }
+        let n = s.finish().expect("收笔失败");
+        assert_eq!(n, 40);
+        let bytes = std::fs::read(&out).expect("读回 PDF 失败");
+        assert!(bytes.starts_with(b"%PDF-"));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("/Type /Page") || text.contains("/Type/Page"),
+            "没有页面对象"
+        );
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// **整本压力**（冒烟）：三百叶一气写完，页数不丢、不崩、不超内存预期。
+    ///
+    /// 这里断言的是「页数相等 + 真有 300 个页面对象」——内存是否真的不随
+    /// 页数涨，靠的是 `PdfStream` 不持有任何一页产物（见该类型的文档），
+    /// 单测测不到 RSS，但这条能保证「写得完、写得对」。
+    #[test]
+    fn three_hundred_leaves_stream_out_in_one_pass() {
+        let page = page_of("資治通鑑卷第一周紀一起著雍攝提格盡玄黓困敦凡三十五年");
+        let ruby = std::collections::HashMap::new();
+        let g = test_geo();
+        let out = tmp_dir().join("bulk.pdf");
+        // 想压测就自己加量：`JIANDU_PDF_STRESS=5000 cargo test -p jiandu three_hundred`。
+        let total: usize = std::env::var("JIANDU_PDF_STRESS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+        let leaves: Vec<PdfLeaf> = (0..total)
+            .map(|i| PdfLeaf {
+                page: &page,
+                title: "資治通鑑",
+                chapter: 0,
+                leaf: i + 1,
+                inscription: "",
+                author: "",
+                ruby: &ruby,
+            })
+            .collect();
+        let n = write_pdf(&out, &leaves, &g).expect("整本写失败");
+        assert_eq!(n, total);
+        // 压测模式（`JIANDU_PDF_STRESS` 已设）两件事：
+        //   · 文件**留着**不删，方便你去看体积 / 用预览器翻；
+        //   · 设 `JIANDU_PDF_STRESS_NOREAD=1` 可跳过「读回整份文件」这步——
+        //     那一步是**测试自己**的开销（整份 PDF 进内存再转 String 扫页面数），
+        //     不是写手的开销。想量「光写要多少内存」，就把它设上。
+        let stress = std::env::var("JIANDU_PDF_STRESS").is_ok();
+        if !std::env::var("JIANDU_PDF_STRESS_NOREAD").is_ok() {
+            let bytes = std::fs::read(&out).expect("读回 PDF 失败");
+            assert!(bytes.starts_with(b"%PDF-"));
+            let text = String::from_utf8_lossy(&bytes);
+            let n_page =
+                text.matches("/Type /Page").count() + text.matches("/Type/Page").count();
+            assert!(n_page >= total, "页面对象只有 {n_page} 个，少于 {total} 叶");
+        }
+        if !stress {
+            std::fs::remove_file(&out).ok();
+        }
     }
 }
 
