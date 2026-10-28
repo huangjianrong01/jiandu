@@ -672,6 +672,22 @@ impl AiPanel {
         self.focuses.iter().any(|f| f.is_focused(window))
     }
 
+    /// **把焦点收回面板**（v1.85.1）。
+    ///
+    /// 面板开着却不持焦点，是「输入法打不进字」最隐蔽的一种死法：IME 只把
+    /// 组好的字交给**当前焦点元素登记的 Entity**，焦点一旦被根元素抢回
+    /// `key_focus`，`InputField::paint` 里的 `handle_input` 就不再登记这个
+    /// 输入框，字于是被静默丢弃——界面上看不出任何异样。
+    ///
+    /// 所以 `Root::render` 每帧做的是「把焦点**留在面板里**」，而不是
+    /// 「抢回根」。设置页优先落在第一栏（那页是要填地址 / 模型 / 密钥的）。
+    pub fn refocus(&self, window: &mut Window) {
+        if self.holds_focus(window) {
+            return;
+        }
+        self.focus_field(if self.settings { F_URL } else { F_ASK }, window);
+    }
+
     /// 把焦点交给第 i 栏。
     fn focus_field(&self, i: usize, window: &mut Window) {
         if let Some(f) = self.focuses.get(i) {

@@ -371,7 +371,9 @@ fn draw_ruby_rotated(
 
     let (r, gg, bb) = rgb(color);
     b.ctx.save();
-    // CG 坐标（原点左下、y 向上）：字母顶部朝 +x，故基线在 `right_x - asc`。
+    // **顺时针 90°**（与屏幕 `ruby_glyph` 同向）：字母顶部朝 +x，故最右一列
+    // 是**升部**，基线落在 `right_x - asc`；串自上而下读，起点（局部 x=0）
+    // 在整条的顶端 `top_y`。
     b.ctx.translate(right_x - asc, b.cy(top_y));
     b.ctx.rotate(-std::f64::consts::FRAC_PI_2);
     if k < 1.0 {

@@ -168,7 +168,13 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
     ctx.set_should_antialias(true);
     // 新建的位图上下文内容全零 —— 即透明底，注音因此只叠在纸面上，不糊白块。
 
-    // ④ 顺时针 90°：放大到超采样网格 → 原点挪到「顶行、基线」→ 转 −90°。
+    // ④ **顺时针 90°**（竖排注音的标准朝向，用户 v1.85.0 定稿）：
+    //    放大到超采样网格 → 原点挪到「基线 / 顶行」→ 转 −90°。
+    //
+    //    转 −90° 后：局部 `+x`（读序）→ 全局向下；局部 `+y`（字母的上）
+    //    → 全局向右。即「字头朝右、自上而下读」——与竖排正文的行气同向。
+    //    平移量随之反算：基线放在 `x = pad + desc`（降部向左伸到 `pad`，
+    //    升部向右伸到 `w - pad`）；串起点放在 `y = h - pad`（顶行）。
     ctx.scale(SS, SS);
     ctx.translate(pad + desc, h - pad);
     ctx.rotate(-std::f64::consts::FRAC_PI_2);
@@ -223,6 +229,36 @@ mod tests {
         assert!(
             h > w * 1.6,
             "四个字母转 90° 后应是竖长条，实得 {w:.1}×{h:.1}"
+        );
+    }
+
+    /// **朝向钉死**：字母 `T` 转 **顺时针** 90° 后，T 顶部那条横杠（字母
+    /// 的「上」）落在位图**右侧**，竖杠变成横向。断言「墨最重的那一列在
+    /// 右半边」——若哪天把旋转方向改回逆时针，这条会立刻红。
+    ///
+    /// 之所以需要这条：屏幕侧位图的行序与 CG 的 y 轴方向正是当初判错朝向
+    /// 的地方，靠肉眼看截图定不了案。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ruby_is_rotated_clockwise() {
+        let (bw, bh, buf) = raster("T", 40.0, 0xFF0000).expect("位图");
+        let mut col_ink = vec![0u32; bw];
+        for y in 0..bh {
+            for x in 0..bw {
+                if buf[(y * bw + x) * 4 + 3] > 128 {
+                    col_ink[x] += 1;
+                }
+            }
+        }
+        let heaviest = col_ink
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, n)| *n)
+            .map(|(i, _)| i)
+            .expect("字形应有墨");
+        assert!(
+            heaviest > bw / 2,
+            "T 的横杠落在左半边（列 {heaviest}/{bw}）——旋转方向成了逆时针"
         );
     }
 

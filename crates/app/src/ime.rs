@@ -834,51 +834,55 @@ pub unsafe fn probe_input_context() {
     let sel = |n: &[u8]| -> *mut c_void { sel_registerName(n.as_ptr() as *const c_char) };
     let cls = |n: &[u8]| -> *mut c_void { objc_getClass(n.as_ptr() as *const c_char) };
 
+    /// `[obj className]` → Rust 串。
+    unsafe fn cls_name(obj: *mut c_void) -> String {
+        if obj.is_null() {
+            return "<nil>".to_string();
+        }
+        let s = objc_msgSend(obj, sel_registerName(b"className\0".as_ptr() as *const c_char));
+        if s.is_null() {
+            return "<noname>".to_string();
+        }
+        let p = objc_msgSend(s, sel_registerName(b"UTF8String\0".as_ptr() as *const c_char));
+        if p.is_null() {
+            return "<nochars>".to_string();
+        }
+        std::ffi::CStr::from_ptr(p as *const c_char)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     let app = objc_msgSend(cls(b"NSApplication\0"), sel(b"sharedApplication\0"));
     let mut win = objc_msgSend(app, sel(b"keyWindow\0"));
     if win.is_null() {
-        let wins = objc_msgSend(app, sel(b"windows\0"));
-        win = if wins.is_null() {
-            std::ptr::null_mut()
-        } else {
-            objc_msgSend(wins, sel(b"firstObject\0"))
-        };
+        win = objc_msgSend(app, sel(b"mainWindow\0"));
     }
-    let view = if win.is_null() {
-        std::ptr::null_mut()
-    } else {
-        objc_msgSend(win, sel(b"contentView\0"))
-    };
-    let ctx = if view.is_null() {
-        std::ptr::null_mut()
-    } else {
-        objc_msgSend(view, sel(b"inputContext\0"))
-    };
-    let cur = objc_msgSend(
-        cls(b"NSTextInputContext\0"),
-        sel(b"currentInputContext\0"),
-    );
+    // ⚠️ 只问 firstResponder 一件事，绝不遍历视图树——遍历会在 gpui 的
+    //    `Lease` 栈上踩出「Leases must be ended」直接 abort（实测）。
     let fr = if win.is_null() {
         std::ptr::null_mut()
     } else {
         objc_msgSend(win, sel(b"firstResponder\0"))
     };
-    let is_first = if view.is_null() || fr.is_null() {
-        0
+    let ctx = if fr.is_null() {
+        std::ptr::null_mut()
     } else {
-        objc_msgSend(view, sel(b"isEqual:\0"), fr) as i32
+        objc_msgSend(fr, sel(b"inputContext\0"))
     };
-    let responds = if view.is_null() {
+    let cur = objc_msgSend(cls(b"NSTextInputContext\0"), sel(b"currentInputContext\0"));
+    let resp = if fr.is_null() {
         0
     } else {
-        objc_msgSend(
-            view,
-            sel(b"respondsToSelector:\0"),
-            sel(b"insertText:replacementRange:\0"),
-        ) as i32
+        objc_msgSend(fr, sel(b"respondsToSelector:\0"), sel(b"insertText:replacementRange:\0")) as i32
+    };
+    let acc = if fr.is_null() {
+        0
+    } else {
+        objc_msgSend(fr, sel(b"respondsToSelector:\0"), sel(b"acceptsFirstResponder\0")) as i32
     };
     eprintln!(
-        "[ime-probe] view={view:?} inputContext={ctx:?} currentInputContext={cur:?} \
-         viewIsFirstResponder={is_first} respondsInsertText={responds}"
+        "[ime-probe] window={win:?} firstResponder={} fr.inputContext={ctx:?} \
+         currentInputContext={cur:?} respondsInsertText={resp} respondsAcceptsFirst={acc}",
+        cls_name(fr)
     );
 }

@@ -6391,13 +6391,20 @@ impl Render for Root {
             // 落在纸张自己的句柄上——否则挂在 sheet 上的 `on_key_down`
             // 收不到键，敲半天一个字也进不去。
             window.focus(&self.license_focus);
-        } else if self.show_ai && self.ai_panel.read(cx).holds_focus(window) {
-            // 问小笺（v1.78.1）：**这里必须放手**。
-            // 面板是独立 Entity，四个输入框的句柄都不在 `Root` 名下——焦点一
-            // 落进去，`key_focus` 就失焦，若照旧走下面那支「抢回 key_focus」，
-            // 就会每帧夺走一次焦点：中文输入法刚要送字，落点没了，一个汉字也
-            // 打不进来（ASCII 仍进得来，因为它走 keydown 转发而不是 IME）。
-            // 焦点既已在面板内，什么都不做就是对的。
+        } else if self.show_ai {
+            // 问小笺（v1.78.1 / v1.85.1）：**焦点必须留在面板里**。
+            //
+            // 面板是独立 Entity，四个输入框的句柄都不在 `Root` 名下。旧版只在
+            // 「面板恰好持焦点」时放手，一旦焦点被抢回 `key_focus`（开栏那一
+            // 帧、点过发送钮、面板重绘…），`InputField::paint` 就再也不为输入
+            // 框登记 `handle_input`，IME 组好的字**静默丢弃**——界面上完全看
+            // 不出异样，正是「输入法打不进字」。
+            //
+            // 现在反过来：不持焦点就把焦点**送回面板**（设置页落第一栏，
+            // 其余落提问框），绝不让它掉到根上。
+            if !self.ai_panel.read(cx).holds_focus(window) {
+                self.ai_panel.update(cx, |p, _| p.refocus(window));
+            }
         } else if !self.key_focus.is_focused(window) {
             window.focus(&self.key_focus);
         }
