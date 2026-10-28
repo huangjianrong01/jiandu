@@ -217,16 +217,20 @@ pub enum ShareBg {
     Gold,
     /// 极简纯白：现代极简，无一丝杂色。
     Plain,
+    /// **仿刻本纸**（v1.83.0）：`#F7F6F1`，比宣纸黄冷、比纯白暖——
+    /// 与阅读界面「仿刻本」主题同一只色号（`theme::Theme::Ke.paper()`）。
+    Keben,
 }
 
 impl ShareBg {
-    pub const ALL: [ShareBg; 3] = [ShareBg::Xuan, ShareBg::Gold, ShareBg::Plain];
+    pub const ALL: [ShareBg; 4] = [ShareBg::Xuan, ShareBg::Gold, ShareBg::Plain, ShareBg::Keben];
 
     pub fn label(self) -> &'static str {
         match self {
             ShareBg::Xuan => "宣纸黄",
             ShareBg::Gold => "暗金黑",
             ShareBg::Plain => "极简白",
+            ShareBg::Keben => "仿刻本",
         }
     }
 }
@@ -261,6 +265,14 @@ pub fn palette(b: ShareBg) -> Palette {
             meta: 0x9A9A9A,
             accent: 0xC3272B,
         },
+        // 仿刻本：纸号与阅读主题严格同一只（`Theme::Ke.paper()`），
+        // 墨取焦墨，落款淡墨偏暖灰（冷纸上压一道暖灰才不脏）。
+        ShareBg::Keben => Palette {
+            bg: 0xF7F6F1,
+            ink: 0x1E1B18,
+            meta: 0x6E655B,
+            accent: 0xA8352A,
+        },
     }
 }
 
@@ -273,16 +285,29 @@ pub enum ShareFrame {
     Black,
     /// 无框：只留纸与字。
     None,
+    /// **仿刻本双边**（v1.83.0）：外框一道粗线、内框一道细线，
+    /// 中间隔一道气口——刻本的「四周双边」。
+    ///
+    /// 旧制（v1.61.0）把内外两条细线合成了一圈粗线，理由是「框感太弱」；
+    /// 那是**两条同粗的细线**的问题。真正的文武边栏是**外粗内细**，
+    /// 层次由粗细差立起来，粗线本身一分都不用收。
+    Double,
 }
 
 impl ShareFrame {
-    pub const ALL: [ShareFrame; 3] = [ShareFrame::Red, ShareFrame::Black, ShareFrame::None];
+    pub const ALL: [ShareFrame; 4] = [
+        ShareFrame::Red,
+        ShareFrame::Black,
+        ShareFrame::None,
+        ShareFrame::Double,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             ShareFrame::Red => "红线框",
             ShareFrame::Black => "黑线框",
             ShareFrame::None => "无边框",
+            ShareFrame::Double => "双边",
         }
     }
 }
@@ -293,6 +318,8 @@ pub fn frame_ink(f: ShareFrame, p: &Palette) -> Option<u32> {
         ShareFrame::Red => Some(p.accent),
         ShareFrame::Black => Some(p.ink),
         ShareFrame::None => None,
+        // 双边走**墨**：刻本的文武边栏是乌丝栏，红线双圈那是套印本的做法。
+        ShareFrame::Double => Some(p.ink),
     }
 }
 

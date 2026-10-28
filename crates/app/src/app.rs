@@ -709,6 +709,16 @@ pub struct Root {
     /// 古籍模式下句用「〇」、疑叹用大斜点、读用侧点（见 `gloss::jodu_of`）。
     /// 它只改**形制**，不改是否显示句读（那是 `show_punct`）。
     pub punct_mode: crate::gloss::PunctMode,
+    /// 进「仿刻本」之前的（字体 / 句读 / 丝栏）三件套（v1.83.0）。
+    ///
+    /// 仿刻本是一整套，进档时会替你把字体、句读、丝栏一起换成刻本的规矩；
+    /// 出档就得**原样还回去**。把旧值存这儿，而不是出档时猜「还是不是
+    /// 齐伋体」——猜法在「用户原本就选了齐伋体」时会把人家的选择改掉。
+    pub keben_prev: Option<(
+        crate::types::FontChoice,
+        crate::gloss::PunctMode,
+        crate::types::RuleColor,
+    )>,
     /// **句读墨色**：墨 / 朱砂；暗金那套一律淡金（见 `gloss::PunctInk::color`）。
     pub punct_ink: crate::gloss::PunctInk,
     /// **回锋**：读那一撇的出锋末端带不带一小勾。
@@ -1237,6 +1247,7 @@ impl Root {
             palette: InkPalette::Ink,
             show_punct: true,
             punct_mode: prefs.punct_mode(),
+            keben_prev: None,
             punct_ink: prefs.punct_ink(),
             punct_hook: prefs.punct_hook,
             // 改键记录：只装用户动过的那些，出厂值仍在 core 的表里。
@@ -1430,6 +1441,16 @@ impl Root {
             if let Ok(n) = v.parse::<usize>() {
                 root.set_columns(n);
             }
+        }
+        // 开发用：JIANDU_THEME=keben 直接进仿刻本（脚本点不到版字面板里的
+        // 那颗纸色小点）。走 `set_theme` 而不是就地改 `theme`——字体 / 句读
+        // / 丝栏那三件套必须一起上，否则截出来是「半套刻本」。
+        if std::env::var("JIANDU_THEME").map(|v| v == "keben").unwrap_or(false) {
+            let i = crate::theme::Theme::ALL
+                .iter()
+                .position(|t| t.is_keben())
+                .unwrap_or(4);
+            root.set_theme(i);
         }
         // 开发用：JIANDU_PAGE=3 直接翻到第 3 叶（0 基），便于核对章首版心。
         if let Ok(v) = std::env::var("JIANDU_PAGE") {
@@ -3663,6 +3684,8 @@ impl Root {
             paper: self.theme.paper(),
             ink: self.palette.ink(self.theme),
             rule: self.theme.rule_by(self.rule_color),
+            // 内框与界行退一档（仿刻本）；其余主题与 `rule` 逐值相同。
+            rule_soft: self.theme.rule_line(self.rule_color),
             note_ink: self.palette.note(self.theme),
             accent: self.theme.accent(),
             font: crate::pdf::PdfFontKind::from(self.share_font_kind()),

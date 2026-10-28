@@ -42,6 +42,7 @@ fn geo() -> PdfGeometry {
         paper: 0xFFFDF6,
         ink: 0x1A1A1A,
         rule: 0x999999,
+        rule_soft: 0x999999,
         note_ink: 0x555555,
         accent: 0xB03A2E,
         font: PdfFontKind::Song,

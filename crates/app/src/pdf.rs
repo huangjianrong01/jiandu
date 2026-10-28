@@ -369,16 +369,19 @@ fn draw_leaf(b: &mut Brush, leaf: &PdfLeaf, g: &PdfGeo, p: &Place) {
         y0 - pad + 3.0,
         fw + pad * 2.0 - 6.0,
         block_h + pad * 2.0 - 6.0,
-        g.rule,
+        g.rule_soft,
         Some(0.5),
     );
 
     // ── 界行（乌丝栏）：每列左缘一道通高细线，空列照样画 ──────────────
     // 1px 线骑在路径两侧各半个像素上，落在整数坐标会糊成两条灰边——
     // 故 x 取「整像素 + 0.5」（与 share_paint 同一处理）。
+    //
+    // v1.83.0：界行走 `rule_soft`（外框用 `rule`）——仿刻本里外框是浓墨、
+    // 界行退成一道灰，与内框同属「第二层」。其余主题两值相同。
     for i in 1..cols {
         let x = (x0 + i as f64 * cell_w).round() + 0.5;
-        b.line(x, y0, x, y0 + block_h, g.rule, 0.7);
+        b.line(x, y0, x, y0 + block_h, g.rule_soft, 0.7);
     }
 
     // ── 栏内裁切（兜底）────────────────────────────────────────────────
@@ -949,6 +952,7 @@ mod tests {
             paper: 0xF5EFE2,
             ink: 0x1A1A1A,
             rule: 0x8A7A5C,
+            rule_soft: 0x8A7A5C,
             note_ink: 0xC3272D,
             accent: 0xC3272D,
             font: PdfFontKind::Song,
@@ -1003,6 +1007,7 @@ mod tests {
             paper: 0xFFFFFF,
             ink: 0x000000,
             rule: 0x000000,
+            rule_soft: 0x000000,
             note_ink: 0x000000,
             accent: 0xC3272D,
             font: PdfFontKind::Song,

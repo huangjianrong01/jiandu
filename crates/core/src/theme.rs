@@ -67,6 +67,22 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         note: 0xA68E5C, // 暗金·批注（秋香）
         border: 0x4A4D4F, // 灰丝栏
     },
+    // ── v1.83.0 · 仿古籍精刻本 ──────────────────────────────────────
+    // 用户点名的那一档：**纸是 #F7F6F1**（冷一点的米白，不是宣纸黄），
+    // 墨是刻本的**焦墨**（近黑，比松烟墨更硬），界栏比正文再深半档——
+    // 照片里「外框最重、内框与界行退一档」的层次就靠这三个值拉开。
+    //
+    // 这一档不只是「换纸色」：`is_keben()` 一并把版框/界行的**笔路**
+    // 切换成精刻本的规矩（见 [`Theme::rule_line`]），出图那一层也改走
+    // `ShareFrame::Double`（外粗内细的双边）。
+    PaperTheme {
+        id: "keben",
+        name: "仿刻本",
+        paper: 0xF7F6F1,
+        text: 0x1E1B18,   // 焦墨（刻本的字比宋体屏显字更黑一档）
+        note: 0x8C2B22,   // 朱（比墨朱稍沉，压在冷米白上不刺）
+        border: 0x2E2823, // 版框：比正文更深，外框才立得住
+    },
 ];
 
 impl PaperTheme {
@@ -116,16 +132,19 @@ pub enum Theme {
     Qing,
     /// 夜读：暖调深底（联动「暗金」）。
     Ye,
+    /// **仿古籍精刻本**（v1.83.0）：冷米白纸 #F7F6F1 + 焦墨 + 双边版框。
+    Ke,
 }
 
 
 impl Theme {
     /// 顺序必须与 [`PAPER_THEMES`] 完全一致——下标即主题编号。
-    pub const ALL: [Theme; 4] = [
+    pub const ALL: [Theme; 5] = [
         Theme::Xuan,
         Theme::Mi,
         Theme::Qing,
         Theme::Ye,
+        Theme::Ke,
     ];
 
     /// 面板上显示的名字（直接取配置表，免得两套名字不同步）。
@@ -140,16 +159,26 @@ impl Theme {
             Theme::Mi => 1,
             Theme::Qing => 2,
             Theme::Ye => 3,
+            Theme::Ke => 4,
         }
+    }
+
+    /// **是否仿刻本模式**（v1.83.0）。
+    ///
+    /// 只此一处判定：版框笔路、界行淡度、出图底与框、默认字体、句读式样
+    /// 全都问这一个问题，绝不各区各写一份 `matches!(…)`——那样迟早分家，
+    /// 屏幕上是一套、导出的是另一套。
+    pub fn is_keben(self) -> bool {
+        matches!(self, Theme::Ke)
     }
 
     /// 「纸色 → 墨色」智能联动的默认配对（任务四：一键换肤）。
     ///
-    /// 宣纸→墨朱、米黄→赭朱、青简→松墨、夜读→暗金；用户随后仍可手动
-    /// 把墨色切到任意一套（手动覆盖默认联动）。
+    /// 宣纸→墨朱、米黄→赭朱、青简→松墨、夜读→暗金；仿刻本→墨朱（焦墨那套）；
+    /// 用户随后仍可手动把墨色切到任意一套（手动覆盖默认联动）。
     pub fn linked_palette(self) -> InkPalette {
         match self {
-            Theme::Xuan => InkPalette::Ink,
+            Theme::Xuan | Theme::Ke => InkPalette::Ink,
             Theme::Mi => InkPalette::Ochre,
             Theme::Qing => InkPalette::Forest,
             Theme::Ye => InkPalette::Gold,
@@ -266,6 +295,24 @@ impl Theme {
         }
     }
 
+    /// **界行 / 内框用色**（v1.83.0）：仿刻本退一档，其余主题原样。
+    ///
+    /// 精刻本的层次是「**外框最重 → 内框与界行退一档 → 字最重**」：
+    /// 照片里外框一道浓黑，内框和界行都淡成灰。旧制内外同色同粗，
+    /// 远看是「一圈粗细不匀的框」；这里只把**内**的那一笔退下去，
+    /// 外框的墨一分不动——所以非刻本主题逐值等于 [`Theme::rule_by`]，
+    /// 老版面一个像素都不变。
+    ///
+    /// 退的幅度 [`KB_RULE_FADE`] 是刻意的：再淡就散成一层雾，界行立不住。
+    pub fn rule_line(self, rc: crate::types::RuleColor) -> u32 {
+        let c = self.rule_by(rc);
+        if self.is_keben() {
+            mix(c, self.paper(), KB_RULE_FADE)
+        } else {
+            c
+        }
+    }
+
     /// 朱色：印章、句读、当前条目。
     ///
     /// 取夹注的朱色（与全书朱印同源），深底再向纸色提亮一档——
@@ -336,6 +383,12 @@ impl Theme {
 /// 双行夹注目色向纸色的兑淡比例：0.38 ≈ 墨色兑三成纸色。
 /// 再淡小字（半格）在纸上发虚；再浓又失去「夹注比正文淡」的层次。
 pub const Z_NOTE_FADE: f32 = 0.38;
+
+/// **仿刻本的界行淡度**（v1.83.0）：版框色向纸色掺 45%。
+///
+/// 照片上量的：外框是浓墨，内框与界行淡成一道灰。45% 是「看得见是线、
+/// 又绝不与正文抢」的那一档——再淡（>0.55）界行散成一层雾，行列就分不清了。
+pub const KB_RULE_FADE: f32 = 0.45;
 
 /// 把颜色 `a` 向颜色 `b` 混 `k`（0..=1，k=1 全为 b），返回 0xRRGGBB。
 /// 用于「墨色 + 纸色 → 夹注目色」的明暗底自动推导。
@@ -516,7 +569,7 @@ mod tests {
     fn four_paper_themes_are_registered_and_indexed() {
         // 主题数与配置表严格同长：加一套配色，两边必须同时加。
         assert_eq!(Theme::ALL.len(), PAPER_THEMES.len());
-        assert_eq!(PAPER_THEMES.len(), 4);
+        assert_eq!(PAPER_THEMES.len(), 5);
         assert_eq!(InkPalette::ALL.len(), 4);
         for (i, t) in Theme::ALL.iter().copied().enumerate() {
             let p = t.paper_theme();
@@ -586,15 +639,58 @@ mod tests {
 
     #[test]
     fn paper_themes_are_the_single_source_of_truth() {
-        assert_eq!(PAPER_THEMES.len(), 4);
+        assert_eq!(PAPER_THEMES.len(), 5);
         let ids: Vec<&str> = PAPER_THEMES.iter().map(|p| p.id).collect();
-        assert_eq!(ids, vec!["xuanzhi", "mihuang", "qingjian", "yedou"]);
+        assert_eq!(
+            ids,
+            vec!["xuanzhi", "mihuang", "qingjian", "yedou", "keben"]
+        );
         let names: Vec<&str> = PAPER_THEMES.iter().map(|p| p.name).collect();
-        assert_eq!(names, vec!["宣纸", "米黄", "青简", "夜读"]);
+        assert_eq!(
+            names,
+            vec!["宣纸", "米黄", "青简", "夜读", "仿刻本"]
+        );
         // 四色齐全、互不重复（纸 / 正文 / 夹注 / 界栏）。
         for p in PAPER_THEMES {
             assert!(luma(p.paper) != luma(p.text), "{} 纸与正文同色", p.id);
             assert_ne!(p.text, p.note, "{} 正文与夹注同色", p.id);
+        }
+    }
+
+    /// 仿刻本（v1.83.0）：纸号对不对、界行是否退了一档、其余主题是否
+    /// **一个像素都没动**——这是「不许碰老版面」的那道闸。
+    #[test]
+    fn keben_paper_is_f7f6f1_and_rules_fade_one_step() {
+        // ① 用户点名的纸号，逐位钉死（改纸色＝改这一档的全部气质）。
+        assert_eq!(Theme::Ke.paper(), 0xF7F6F1);
+        assert!(Theme::Ke.is_keben());
+        for t in [Theme::Xuan, Theme::Mi, Theme::Qing, Theme::Ye] {
+            assert!(!t.is_keben(), "{t:?} 不该被当成仿刻本");
+        }
+        // ② 仿刻本的界行 / 内框比外框淡一档（外框仍是 `frame_ink` 的浓墨）。
+        for rc in crate::types::RuleColor::ALL {
+            let outer = Theme::Ke.frame_ink();
+            let inner = Theme::Ke.rule_line(rc);
+            assert_ne!(inner, outer, "{rc:?} 的内框与界行必须退一档");
+            assert!(
+                luma(inner) > luma(outer),
+                "{rc:?} 的内框应比外框淡：{inner:06X} vs {outer:06X}"
+            );
+            assert!(
+                luma(Theme::Ke.paper()) - luma(inner) > 12.0,
+                "{rc:?} 的界行淡到看不见了：{inner:06X}"
+            );
+        }
+        // ③ 其余四套主题：`rule_line` 必须与 `rule_by` 逐值相同
+        //    （老版面的框线颜色一分都不许变）。
+        for t in [Theme::Xuan, Theme::Mi, Theme::Qing, Theme::Ye] {
+            for rc in crate::types::RuleColor::ALL {
+                assert_eq!(
+                    t.rule_line(rc),
+                    t.rule_by(rc),
+                    "{t:?}/{rc:?} 的界行色被新主题带偏了"
+                );
+            }
         }
     }
 

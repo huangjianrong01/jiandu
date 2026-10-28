@@ -183,6 +183,16 @@ pub const FRAME_W: f32 = 2.0;
 pub const RULE_W: f32 = 1.0;
 /// 版框墨色不透明度（`0xRRGGBBAA` 的低字节）：实心但不刺眼。
 pub const FRAME_ALPHA: u32 = 0xC8;
+/// **双边的内框**不透明度（v1.83.0）：比外框淡一档。
+///
+/// 照片上量的就是这个层次——外框浓黑压得住整版，内框与界行同属「退一档
+/// 的灰」。两者同浓的话，双线看着像两圈一样重的框，反而比单线更乱。
+pub const INNER_ALPHA: u32 = 0x96;
+/// **双边内外框之间的气口**（px，1080 基准，随卡宽缩放）。
+///
+/// 教科书上的文武边栏约「外线一分、气口半分、内线半分」。2px 在 1080 卡上
+/// 就是那个半分——再宽，双线会散成两个不相干的框。
+pub const DOUBLE_GAP: f32 = 2.0;
 /// 界行墨色不透明度：比版框**淡一档**，只作分列的骨架。
 pub const RULE_ALPHA: u32 = 0x38;
 /// 版框内缘 → 首字顶端的**气口**（px，1080 基准）：字顶不压线，也不留天头。
@@ -266,7 +276,15 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
     // v1.61.0：旧制是「内外两条细线」，框感太弱且不与首行咬合。现在只画一
     // 圈实心粗线（1080 卡上 2px），且**描边骑在路径上**（线宽一半在内、一半
     // 在外），故框的「内缘」= `inset + fw/2`——首行基准线就认这条内缘。
+    //
+    // v1.83.0：`ShareFrame::Double` 把「双线」请回来，但**不是**旧制那两条
+    // 同粗的细线——外粗内细（文武边栏），中间隔一道气口。刻本的层次全靠
+    // 这个粗细差，不是靠调淡墨色。
     let border = frame_ink(s.frame, &p);
+    let double = s.frame == ShareFrame::Double;
+    // 内细线宽（外框的一半）与气口（1080 基准，随卡宽缩放）。
+    let fi = (fw * 0.5).max(0.6);
+    let dg = if double { DOUBLE_GAP * scale } else { 0.0 };
     if let Some(ink) = border {
         out.rects.push(PlacedRect {
             x: pad_x,
@@ -276,13 +294,27 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
             color: (ink << 8) | FRAME_ALPHA,
             stroke: Some(fw),
         });
+        if double {
+            // 内框：整圈细线，向内让 `fw/2 + dg`（外框内缘 + 气口）。
+            let o = fw * 0.5 + dg;
+            out.rects.push(PlacedRect {
+                x: pad_x + o,
+                y: pad_y + o,
+                w: (w - (pad_x + o) * 2.0).max(20.0),
+                h: (h - (pad_y + o) * 2.0).max(20.0),
+                color: (ink << 8) | INNER_ALPHA,
+                stroke: Some(fi),
+            });
+        }
     }
 
     // ---- 版框内的工作区（版心）----
-    let inner_l = pad_x + fw * 0.5;
-    let inner_r = (w - pad_x - fw * 0.5).max(inner_l + 40.0);
-    let inner_t = pad_y + fw * 0.5;
-    let inner_b = (h - pad_y - fw * 0.5).max(inner_t + 40.0);
+    // 双边时再往里退一条内细线：正文绝不压在内框上。
+    let frame_pad = fw * 0.5 + if double { dg + fi } else { 0.0 };
+    let inner_l = pad_x + frame_pad;
+    let inner_r = (w - pad_x - frame_pad).max(inner_l + 40.0);
+    let inner_t = pad_y + frame_pad;
+    let inner_b = (h - pad_y - frame_pad).max(inner_t + 40.0);
 
     let n = s.body.len();
     let cols_max = norm_columns(s.columns).max(1);
@@ -740,6 +772,73 @@ mod tests {
     }
 
     /// 无边框：一层面框都不画（界框属于 `rects` 的 stroke 项）。
+    /// **四周双边**（v1.83.0）：外框一粗、内框一细，中间隔一道气口；
+    /// 正文退到内框以里，绝不压线。
+    ///
+    /// 钉死四件事：① 确实画出两条（不是一圈粗线冒充双线）；② 外粗内细；
+    /// ③ 内框比外框淡（照片上的层次）；④ 首字落在内框以里。
+    /// 另加一条反向闸：非双边的卡仍只画一条——老版面一个像素都不许变。
+    #[test]
+    fn double_frame_draws_an_outer_and_an_inner_line() {
+        let body: Vec<char> = "道可道非常道名可名非常名無名天地之始".chars().collect();
+        let red = vec![false; body.len()];
+        let mut s = spec(&body, &red);
+        s.frame = ShareFrame::Double;
+        s.bg = ShareBg::Keben;
+        let d = layout(&s);
+        // 只有「框线」带 stroke；引线 / 朱批是实心块，用 stroke 挑出来。
+        let frames: Vec<&PlacedRect> =
+            d.rects.iter().filter(|r| r.stroke.is_some()).collect();
+        assert_eq!(frames.len(), 2, "双边应画两条框线，实为 {}", frames.len());
+        let (outer, inner) = (frames[0], frames[1]);
+        let (wo, wi) = (outer.stroke.unwrap(), inner.stroke.unwrap());
+        assert!(wo > wi, "必须外粗内细：外 {wo} / 内 {wi}");
+        // 两条线不重叠：内框整圈向内让「外框半宽 + 气口」。
+        let off = inner.x - outer.x;
+        assert!(
+            off >= wo * 0.5 + 1.0,
+            "内外框贴在一起了（分不出双线）：偏移 {off} / 外框半宽 {}",
+            wo * 0.5
+        );
+        assert!(
+            (inner.y - outer.y - off).abs() < 0.01,
+            "内框四边让位不均：x {off} / y {}",
+            inner.y - outer.y
+        );
+        // 内框比外框淡一档（层次：外框最重）。
+        assert!(
+            (inner.color & 0xFF) < (outer.color & 0xFF),
+            "内框该比外框淡：{:02X} / {:02X}",
+            inner.color & 0xFF,
+            outer.color & 0xFF
+        );
+        // 首字必须落在内框以里——双边不是画着看的，正文得给它让位。
+        let first = d.chars.first().expect("应有正文");
+        assert!(
+            first.y >= inner.y,
+            "首字压到内框上了：{} < {}",
+            first.y,
+            inner.y
+        );
+        assert!(
+            first.x + first.cell <= inner.x + inner.w + 0.01,
+            "首字压到右内框：{} > {}",
+            first.x + first.cell,
+            inner.x + inner.w
+        );
+        // 反向闸：其余三档仍只画一条。
+        for f in [ShareFrame::Red, ShareFrame::Black] {
+            let mut one = spec(&body, &red);
+            one.frame = f;
+            let n = layout(&one)
+                .rects
+                .iter()
+                .filter(|r| r.stroke.is_some())
+                .count();
+            assert_eq!(n, 1, "{f:?} 不该画成双线");
+        }
+    }
+
     #[test]
     fn frameless_card_draws_no_border() {
         let body: Vec<char> = "道可道".chars().collect();

@@ -4947,7 +4947,7 @@ impl Root {
         if sides[3] {
             inner = inner.border_l_1();
         }
-        inner = inner.border_color(rgb(t.rule_by(self.rule_color)));
+        inner = inner.border_color(rgb(t.rule_line(self.rule_color)));
         // 卷首题署（卷端）：章首页开卷列顶部叠一卷端题名——
         // 第一行（顶格）写书名·卷次，第二行（低几格）写署名；
         // 落在 layout_book 预留的空白带上，与正文互不遮挡。
@@ -5005,7 +5005,13 @@ impl Root {
         // v1.32.0 行款重构后，版心（界行区）窄于纸面、在叶内居中——书耳
         // 若是纸面的子元素就会漂在留白里，与版框脱节。故改挂到 **frame**
         // （版框自身）上：left/top 均为 0，即「版框左上角」，框宽耳随。
-        if edge != LeafHalf::Right {
+        // v1.83.0：仿刻本不挂书耳。
+        //
+        // 书耳是「贴版框左上角」的一小片题签，它自带纸色底，正好把**内框
+        // 细线的左上角**盖掉——双线在那一角断成两截，一眼看出是贴上去的。
+        // 精刻本的原样（用户给的《大学章句》影印）框内干干净净，章题另由
+        // 中缝 / 篇题列承担，故这一档整枚不画。
+        if edge != LeafHalf::Right && !self.theme.is_keben() {
             let ear_w = (cell_w * 0.16).clamp(11.0, 14.0);
             // 耳高约一格（刻本书耳只有一两字高，不是一整条边）。
             let ear_h = (cell_h * 1.25).clamp(34.0, 150.0);
@@ -5045,7 +5051,10 @@ impl Root {
         }
         // 地脚牌记：天头宽、地脚窄，地脚那点留白缀一行极小宋体版权页
         // （「笺读数字刻本」），优雅地把底部空间利用起来，而不是靠居中去遮挡。
-        if geo.interactive {
+        //
+        // v1.83.0：仿刻本不画这行牌记——影印本的地脚只在左下角压一枚朱印，
+        // 居中一行现代版权字会把「这是一页刻本」的错觉戳破。
+        if geo.interactive && !self.theme.is_keben() {
             sheet = sheet.child(
                 div()
                     .absolute()
@@ -5161,7 +5170,7 @@ impl Root {
         // 丝栏：列间界行按版字面板所选（乌 / 金 / 朱）取色。
         // 最左一列不画（见 `first_col`）：版框内缘那道闭合细线就是它。
         if !first_col {
-            col = col.border_l_1().border_color(rgb(t.rule_by(self.rule_color)));
+            col = col.border_l_1().border_color(rgb(t.rule_line(self.rule_color)));
         }
         let mut content = div().w_full().flex().flex_col().items_center();
         // ── v1.56.0 顶格对齐 ──────────────────────────────────────────
@@ -5768,7 +5777,7 @@ impl Root {
             .flex_col()
             .items_center()
             .border_l_1()
-            .border_color(rgb(t.rule_by(self.rule_color)));
+            .border_color(rgb(t.rule_line(self.rule_color)));
         // 天头：与版心同制的**象鼻**——鱼尾吊在版框下面，不是贴框。
         // （v1.68.0：原来这里拍的是 `cell_h × 1.0`，与版心的象鼻长度对不上，
         //   章首页的鱼尾会与左半叶的鱼尾高低不齐。）
@@ -5895,7 +5904,7 @@ impl Root {
             .items_center()
             // 左缘细线；右缘由右邻列（正文列或章题列）的 border_l 提供。
             .border_l_1()
-            .border_color(rgb(t.rule_by(self.rule_color)))
+            .border_color(rgb(t.rule_line(self.rule_color)))
             .bg(rgb(t.paper()))
             .relative()
             // 地脚那一段不参与「垂直居中」，对鱼尾才落在正文区的正中。
@@ -6106,7 +6115,7 @@ impl Root {
             .flex()
             .flex_col()
             .items_center()
-            .border_color(rgb(t.rule_by(self.rule_color)))
+            .border_color(rgb(t.rule_line(self.rule_color)))
             .border_t_1()
             .border_b_1()
             .child(col);
@@ -10549,6 +10558,15 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
     /// 纸色按亮度分宣纸 / 暗金，栏色看丝栏偏朱还是偏墨——导出的图因此
     /// 与屏幕上正在读的那一叶同一个调子。
     fn leaf_bg_frame(&self) -> (crate::share::ShareBg, crate::share::ShareFrame) {
+        // 仿刻本（v1.83.0）：纸号与外框都跟主题走——`#F7F6F1` 的纸配
+        // **双边**（外粗内细）。若按亮度猜，这一档会被归到「宣纸黄」，
+        // 出图就比屏幕黄一格，两处对不上。
+        if self.theme.is_keben() {
+            return (
+                crate::share::ShareBg::Keben,
+                crate::share::ShareFrame::Double,
+            );
+        }
         let p = self.theme.paper();
         let lum = ((p >> 16) & 0xFF) + ((p >> 8) & 0xFF) + (p & 0xFF);
         let bg = if lum > 380 {
@@ -11526,18 +11544,27 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
     }
 
     /// 循环切换纸色主题（同时联动默认墨色）。
+    ///
+    /// 走 `set_theme` 而不是就地赋值：仿刻本那一档要连带换字体与句读，
+    /// 两条路各写一份的话，快捷键切进去是「半套刻本」，点面板才是整套。
     fn cycle_theme(&mut self) {
         let idx = Theme::ALL.iter().position(|x| *x == self.theme).unwrap_or(0);
-        self.theme = Theme::ALL[(idx + 1) % Theme::ALL.len()];
-        self.palette = self.theme.linked_palette();
-        self.persist();
+        let next = (idx + 1) % Theme::ALL.len();
+        self.set_theme(next);
     }
 
     /// 切到第 `i` 套纸面主题（配置表 `PAPER_THEMES` 下标）。
     /// 换纸即重排（纸色变了、夹注兑淡基点也变）；并智能联动墨色——
     /// 每套纸都有默认墨色配对（宣纸→墨朱 / 米黄→赭朱 / 青简→松墨 /
-    /// 夜读→暗金），一键换肤；用户随后仍可手动把墨色切到任意一套。
-    fn set_theme(&mut self, i: usize) {
+    /// 夜读→暗金 / 仿刻本→墨朱），一键换肤；用户随后仍可手动把墨色切到
+    /// 任意一套。
+    ///
+    /// **仿刻本是一整套，不是一层纸色**（v1.83.0）：切进这一档时顺手把
+    /// 「刻本的三件套」一起换掉——齐伋体（明刻活字，随包编入、必然可用）、
+    /// 古籍句读（句作空心「〇」、读作圆头点）、乌丝栏。切出去时只把
+    /// **仍然停在刻本配置上**的那几项还原：用户若自己挑过字体 / 丝栏，
+    /// 那是他的选择，不许替他改回去。
+    pub(crate) fn set_theme(&mut self, i: usize) {
         let Some(next) = Theme::ALL.get(i).copied() else {
             return;
         };
@@ -11545,11 +11572,56 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
         // 钉住当前阅读锚点（章 / 段 / 字），重排后立刻回找——正文纹丝不动，
         // 绝不「跳页」（用户报告：滚到书中段切暗金 / 宣纸，正文乱跳）。
         let anchor = self.page_anchor();
+        let was_keben = self.theme.is_keben();
         self.theme = next;
         self.palette = next.linked_palette();
+        if next.is_keben() {
+            // 只在**真正进档**时记旧值：连点两下同一颗点不许把作坊里的
+            // 「旧值」覆盖成刻本自己那套（那样出档就还原不回去了）。
+            if !was_keben {
+                self.keben_prev = Some((self.current_font(), self.punct_mode, self.rule_color));
+            }
+            self.apply_keben_preset();
+        } else if was_keben {
+            self.leave_keben_preset();
+        }
         self.fit_sizes();
         self.restore_anchor(anchor);
         self.persist();
+    }
+
+    /// 进入仿刻本时套上的「刻本三件套」（字体 / 句读 / 丝栏）。
+    fn apply_keben_preset(&mut self) {
+        // 齐伋体是唯一随包编入的字库（`include_bytes!`），选它绝不会落空；
+        // 落到系统字体上则是「换了个纸色，字一点没变」，白折腾。
+        self.set_font(FontChoice::Qiji);
+        // 句读：句作空心小圈「〇」、读作圆头斜点——影印本上就是这个。
+        self.punct_mode = crate::gloss::PunctMode::Classic;
+        // 精刻本用乌丝栏（朱丝栏是套印本另一路，留给「丝栏」那一排自选）。
+        self.rule_color = crate::types::RuleColor::Wu;
+    }
+
+    /// 离开仿刻本：把进档前那三件套**原样还回去**。
+    ///
+    /// 存不住旧值（例如冷启动就停在仿刻本、`keben_prev` 是空）时才退回
+    /// 「出厂配置」——绝不就地保留刻本那一套，否则用户出了档还以为自己在
+    /// 另一个模式里，字体 / 句读悄悄地没回来。
+    fn leave_keben_preset(&mut self) {
+        match self.keben_prev.take() {
+            Some((f, p, r)) => {
+                self.set_font(f);
+                self.punct_mode = p;
+                self.rule_color = r;
+            }
+            None => {
+                if self.current_font() == FontChoice::Qiji {
+                    self.set_font(FontChoice::WenJinMincho);
+                }
+                if self.punct_mode == crate::gloss::PunctMode::Classic {
+                    self.punct_mode = crate::gloss::PunctMode::Modern;
+                }
+            }
+        }
     }
 }
 

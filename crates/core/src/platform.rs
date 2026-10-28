@@ -64,6 +64,12 @@ pub struct PdfGeometry {
     pub paper: u32,
     pub ink: u32,
     pub rule: u32,
+    /// **内框与界行**的取色（v1.83.0）——版框外层仍用 `rule`。
+    ///
+    /// 刻本的层次是「外框最重、内框与界行退一档」；旧制两者同色，印出来
+    /// 是「一圈粗细不匀的框」。非仿刻本主题由壳子传**与 `rule` 相同的值**
+    /// （见 `Theme::rule_line`），所以老版面的 PDF 一个像素都不变。
+    pub rule_soft: u32,
     pub note_ink: u32,
     pub accent: u32,
     /// 正文 / 注文字体的**语义类**，由壳子翻译成具体字体。
@@ -223,6 +229,7 @@ mod tests {
             paper: 0,
             ink: 0,
             rule: 0,
+            rule_soft: 0,
             note_ink: 0,
             accent: 0,
             font: PdfFontKind::Song,
@@ -270,6 +277,7 @@ mod tests {
             paper: 0,
             ink: 0,
             rule: 0,
+            rule_soft: 0,
             note_ink: 0,
             accent: 0,
             font: PdfFontKind::Song,
