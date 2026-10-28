@@ -270,6 +270,18 @@ impl AiConfig {
         self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
         self.model = self.model.trim().to_string();
         self.api_key = self.api_key.trim().to_string();
+        // v1.85.2：**地址空着而预设本来就有 —— 补回预设值**。
+        //
+        // 旧存档里出现过 `provider_id: "deepseek"` 配 `base_url: ""` 的残档
+        // （某次「存设置」把空草稿写了回去）。此后 `ready()` 恒为假，人按回车
+        // 就只在会话里看到一句「先去设置」，看起来就是「问小笺根本不能用」。
+        // 选的是预设、预设又有地址，那这个空值只能是坏存档，不是人的本意。
+        if self.base_url.is_empty() && !p.base_url.is_empty() {
+            self.base_url = p.base_url.to_string();
+        }
+        if self.model.is_empty() {
+            self.model = p.models.first().copied().unwrap_or_default().to_string();
+        }
         if self.temperature.is_nan() || !(0.0..=2.0).contains(&self.temperature) {
             self.temperature = default_temperature();
         }
@@ -711,6 +723,36 @@ mod tests {
         assert_eq!(c.api_key, "sk-x");
         assert_eq!(c.temperature, 0.3);
         assert_eq!(c.ctx_chars, default_ctx_chars());
+    }
+
+    #[test]
+    fn sanitize_heals_an_empty_base_url_from_the_preset() {
+        // 坏存档：预设选了 deepseek，地址却被写成了空串。
+        let mut c = AiConfig {
+            provider: 0,
+            provider_id: "deepseek".to_string(),
+            base_url: String::new(),
+            model: String::new(),
+            api_key: "sk-x".to_string(),
+            ..AiConfig::default()
+        };
+        c.sanitize();
+        assert_eq!(c.base_url, "https://api.deepseek.com/v1");
+        assert!(!c.model.is_empty());
+        assert!(c.ready(), "补回预设地址后应可发问");
+    }
+
+    #[test]
+    fn sanitize_leaves_a_hand_written_url_alone() {
+        let mut c = AiConfig {
+            provider: 0,
+            provider_id: "deepseek".to_string(),
+            base_url: "http://127.0.0.1:8080/v1".to_string(),
+            api_key: "sk-x".to_string(),
+            ..AiConfig::default()
+        };
+        c.sanitize();
+        assert_eq!(c.base_url, "http://127.0.0.1:8080/v1", "自填地址不许被预设覆盖");
     }
 
     #[test]

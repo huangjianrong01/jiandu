@@ -1,97 +1,95 @@
-//! 竖排注音（生僻字拼音）几何：**整串顺时针旋转 90°**、贴字格右侧安居。
+//! 注音（生僻字拼音）几何：**横排、正立、从左到右**，落在汉字右侧的列间空白里。
 //!
-//! v1.85.0 定式。旧做法「一字母一行」是错的：每个字母独占一整个行高
-//! （`fs × 1.02`），四个字母就散成一串被拉长的「小蚂蚁」，既不紧凑又容易
-//! 顶破行高、与邻字粘连——正是用户截图里「挤压的小蚂蚁 + 跟旁边的字粘住」。
+//! v1.85.2 定式。此前两版都试过错：
 //!
-//! 正确形态：**整串拼音作为一个整体顺时针旋转 90°**。旋转之后：
+//!   * 「一字母一行」竖叠 —— 四个字母散成一串拉长的「小蚂蚁」，还容易顶破格高；
+//!   * 「整串转 90°」竖条 —— 字母躺着，读起来要歪头，用户否掉。
+//!
+//! 竖排古籍里给一个字注音，最自然的样子就是**在字的右边写一小串横排小字**：
+//! 与正文同向（自上而下读字、横着读音），不歪头、不挤格子。
 //!
 //! ```text
-//! ┌────────┐
-//! │      m │   ← 纵向长 = 整串连写的自然宽度（Σ 字母步进 ≈ 字母数 × fs × ADVANCE）
-//! │      ě │   ← 横向宽 = 单个字母的高度（asc + desc ≈ fs × CAP）
-//! │      n │   ← 右侧留 RUBY_GUTTER 呼吸间距，绝不贴死界栏
-//! │      g │
-//! │   猛   │
-//! └────────┘
+//! ┌──────────┬──┐
+//! │       猛 │měng│  ← 横排、正立、从左到右；字号 = 正文 40%
+//! │          │  │
+//! └──────────┴──┘
+//!       ↑ 汉字右缘的列间空白
 //! ```
 //!
-//! 于是「横排拼音串的宽度」变成了「纵向长度」：4 个字母 ≈ `2.24 × fs`，
-//! 比旧式 `4.08 × fs` 短了近一半，字号反倒能从 30% 提到 **40%** 仍放得下。
+//! 落点是这套几何的关键：**汉字在字格里居中**，字格左右各有一半留白，相邻两列
+//! 的留白连起来就是一条完整空隙。注音的横排宽度正是按这条空隙算的——
 //!
-//! ⚠️ 渲染层怎么真的转起来：GPUI 0.2.2 的 `Window::paint_glyph` 把
-//! `TransformationMatrix::unit()` 写死，屏幕侧**无法旋转字形**。故屏幕走
-//! `ruby_glyph`：CoreGraphics 离屏按本文件的度量把整串转 90° 渲成位图，
-//! 再由 `img` 元素贴上来（PDF 侧 CoreGraphics 直接转 CTM）。屏幕与纸面共用
-//! 同一套度量，逐字同位。
+//! ```text
+//! 可用宽 = 列宽 − 字号 − 两侧各留一点呼吸
+//! ```
+//!
+//! 放不下就按宽度反算字号（下限正文 22%），绝不越到下一列的**字形**上去；
+//! 纵向只占 `1.05 × 拼音字号`，远小于行高，上下都碰不到邻字。
+//!
+//! ⚠️ 屏幕侧怎么画：GPUI 0.2.2 的 `paint_glyph` 把变换矩阵写死，且没有排版
+//! 引擎可用，故走 `ruby_glyph`：CoreGraphics 离屏把整串按本文件的度量渲成
+//! 透明位图（**不旋转**，正立横排），再由 `img` 贴进字格。屏幕与纸面共用这
+//! 一套度量，逐字同位。
 
-/// 目标拼音字号 = 正文的 **40%**（v1.85.0 定稿，旧为 30%）。
+/// 目标拼音字号 = 正文的 **40%**。
 pub const RUBY_SCALE: f32 = 0.40;
-/// 收敛下限 = 正文的 22%（再小就不可读；旧版 18% 正是「小蚂蚁」的成因）。
+/// 收敛下限 = 正文的 22%（再小就不可读）。
 pub const RUBY_SCALE_MIN: f32 = 0.22;
-/// 拉丁字母的平均步进宽度（相对字号）——整串连写的自然宽度按它算。
-/// 取 0.56 略偏保守：宁可把串量长一点、字号收一档，也不能真的溢出格高。
+/// 拉丁字母的平均步进宽度（相对字号）——整串横排宽度按它估。
 pub const RUBY_ADVANCE: f32 = 0.56;
-/// 横向占宽 = 字号 × 1.05：旋转后横向是**字母的高度**（asc + desc），留一丝余量。
+/// 整串的高度 = 字号 × 1.05（升部 + 降部 + 一丝余量）。
 pub const RUBY_CAP: f32 = 1.05;
-/// 右侧呼吸间距 = 字格宽的这个比例（注音绝不贴死界栏、不压进邻列）。
-pub const RUBY_GUTTER: f32 = 0.08;
-/// 纵向最多只能吃掉的格高比例（余下的留给行气）。
-pub const RUBY_AVAIL: f32 = 0.94;
 
 /// 一次注音排版的度量结果。
+///
+/// 所有长度都是「屏幕逻辑像素」，且除 `fs` 外都是**相对字格左上角**的偏移
+/// （渲染层直接拿来定位，PDF 侧同一套）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RubyLayout {
-    /// 拼音字号（短拼音恒为正文 40%，超长时收敛）。
+    /// 拼音字号（短拼音恒为正文 40%，超长时按可用宽收敛）。
     pub fs: f32,
-    /// 旋转后**单个字母占的纵向长**（= `fs × RUBY_ADVANCE`）。
-    pub line_h: f32,
-    /// 整条拼音的纵向总长（字母数 × `line_h`）。
-    pub block_h: f32,
-    /// 整条拼音的横向宽（= 单字母的高度）。
+    /// 整串横排的宽（字距总和）。
     pub block_w: f32,
-    /// 顶部偏移：右上角安居，只留一丝上边距。
+    /// 整串横排的高（= 单字母的高度）。
+    pub block_h: f32,
+    /// 左缘相对字格左边的偏移（= 汉字右缘 + 呼吸）。
+    pub left: f32,
+    /// 上缘相对字格上边的偏移（整串在格内竖直居中）。
     pub top: f32,
-    /// 右侧呼吸间距（px）：注音外缘到界栏之间必须留出的空隙。
-    pub gutter: f32,
-    /// 是否已降到下限仍放不下（渲染层允许极少量下凸）。
+    /// 是否已降到下限仍放不下（渲染层允许极少量的右凸）。
     pub tight: bool,
 }
 
-/// 计算一条拼音的竖排度量（旋转 90° 之后的形态）。
+/// 计算一条拼音的横排度量。
 ///
 /// * `pinyin`：注音串（可含声调字符，如 `xiǎn` / `zhuāng`）；
 /// * `body_fs`：正文字号；
 /// * `cell_w` / `cell_h`：字格宽高。
 pub fn layout(pinyin: &str, body_fs: f32, cell_w: f32, cell_h: f32) -> RubyLayout {
     let letters = pinyin.chars().count().max(1) as f32;
-    let avail_h = (cell_h * RUBY_AVAIL).max(1.0);
+    // 呼吸：字与注音之间、注音与下一列字形之间各留一点。随格宽缩，但至少 1px。
+    let inset = (cell_w * 0.03).clamp(1.0, 3.0);
+    // 汉字居中 → 汉字右缘到下一列汉字左缘这段空白 = 列宽 − 字号。
+    let avail = (cell_w - body_fs - inset * 2.0).max(4.0);
+
     let mut fs = body_fs * RUBY_SCALE;
     let mut tight = false;
-
-    // ① 纵向（旋转后 = 串长）放不下 → 按可用高反算字号；触底则锁下限。
-    if letters * fs * RUBY_ADVANCE > avail_h {
-        fs = avail_h / (letters * RUBY_ADVANCE);
+    if letters * fs * RUBY_ADVANCE > avail {
+        fs = avail / (letters * RUBY_ADVANCE);
         if fs < body_fs * RUBY_SCALE_MIN {
             fs = body_fs * RUBY_SCALE_MIN;
             tight = true;
         }
     }
-    // ② 横向兜底：右侧先扣掉呼吸间距，余下的才是注音能占的宽。
-    let gutter = (cell_w * RUBY_GUTTER).max(1.0);
-    let max_w = ((cell_w * 0.45) - gutter).max(4.0);
-    if fs * RUBY_CAP > max_w {
-        fs = max_w / RUBY_CAP;
-    }
-    let fs = fs.max(4.0).min(body_fs * RUBY_SCALE);
-    let line_h = fs * RUBY_ADVANCE;
+    let fs = fs.max(3.0).min(body_fs * RUBY_SCALE);
+    let block_w = letters * fs * RUBY_ADVANCE;
+    let block_h = fs * RUBY_CAP;
     RubyLayout {
         fs,
-        line_h,
-        block_h: letters * line_h,
-        block_w: fs * RUBY_CAP,
-        top: body_fs * 0.02,
-        gutter,
+        block_w,
+        block_h,
+        left: (cell_w + body_fs) * 0.5 + inset,
+        top: ((cell_h - block_h) * 0.5).max(0.0),
         tight,
     }
 }
@@ -110,11 +108,9 @@ mod tests {
                 columns: cols,
                 dir: GridDir::Vertical,
                 margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
-                // 行款字数：按列数查行款表（v1.32.0）。
                 target_chars: crate::grid::LayoutConfig::by_columns(cols)
                     .map(|c| c.target_chars)
                     .unwrap_or(21),
-                // 留白默认档「中（75%）」（v1.33.0）。
                 banxin_ratio: crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT],
             },
             false,
@@ -122,97 +118,80 @@ mod tests {
             50.0,
             0.0,
             12.0,
-            0.0, crate::grid::GRID_FS_MAX);
+            0.0,
+            crate::grid::GRID_FS_MAX,
+        );
         (m.col_w, m.row_h, m.fs)
     }
 
-    #[test]
-    fn short_pinyin_fits_in_eight_and_fourteen_columns() {
-        for cols in [8usize, 14] {
-            let (cw, chh, fs) = cell(cols);
-            let l = layout("xǐ", fs, cw, chh);
-            assert!(!l.tight, "{cols} 列短拼音不该降到底");
-            assert!(l.block_h <= chh + 0.01, "{cols} 列：短拼音纵向溢出");
-            assert!(l.block_w + l.gutter <= cw * 0.45, "{cols} 列：拼音压到左列");
-            assert!(l.fs >= fs * RUBY_SCALE_MIN - 0.01);
-        }
+    /// 字格右缘到「下一列字形左缘」的距离——注音的硬边界。
+    fn room_right(cell_w: f32, body_fs: f32) -> f32 {
+        // 汉字居中：本格汉字右缘 = (w + fs)/2，下一格汉字左缘 = w + (w − fs)/2。
+        (cell_w + (cell_w - body_fs) * 0.5) - (cell_w + body_fs) * 0.5
     }
 
     #[test]
-    fn long_pinyin_shrinks_and_still_fits() {
-        for cols in [8usize, 14] {
-            let (cw, chh, fs) = cell(cols);
-            let l = layout("zhuāng", fs, cw, chh);
-            assert!(l.fs <= fs * RUBY_SCALE + 0.01);
-            assert!(l.fs >= fs * RUBY_SCALE_MIN - 0.01, "{cols} 列降到下限以下");
-            assert!(l.block_h <= chh * 1.10 + 0.01, "{cols} 列：长拼音纵向溢出");
-            assert!(l.block_w + l.gutter <= cw * 0.45, "{cols} 列：长拼音压到左列");
-        }
-    }
-
-    #[test]
-    fn longer_pinyin_gets_smaller_font() {
+    fn short_pinyin_keeps_the_forty_percent_size() {
         let (cw, chh, fs) = cell(10);
-        let short = layout("xi", fs, cw, chh);
-        let long = layout("zhuang", fs, cw, chh);
-        assert!(long.fs <= short.fs + 0.001);
-    }
-
-    #[test]
-    fn ruby_width_never_exceeds_four_tenths_cell() {
-        let (cw, chh, fs) = cell(14);
-        for py in ["a", "xi", "xian", "zhuang", "zhuangzhuang"] {
-            let l = layout(py, fs, cw, chh);
-            assert!(l.block_w + l.gutter <= cw * 0.45, "{py} 越界");
-        }
-    }
-
-    /// v1.85.0 定式：短拼音**吃满正文 40%**，且纵向长 = 整串连写的自然宽度
-    /// （旋转 90° 后的长度），绝不再是「一字母一行」的松散竖叠。
-    #[test]
-    fn short_pinyin_reaches_the_forty_percent_cap() {
-        let (cw, chh, fs) = cell(10);
-        for py in ["a", "xǐ", "bō", "rě", "měng"] {
+        for py in ["a", "xǐ", "bō", "rě"] {
             let l = layout(py, fs, cw, chh);
             assert!(
                 (l.fs - fs * RUBY_SCALE).abs() < 0.01,
                 "{py} 没吃满 40%（实得 {:.3}）",
                 l.fs / fs
             );
-            assert!((l.line_h - l.fs * RUBY_ADVANCE).abs() < 1e-4, "{py} 步进不是字母自然宽");
-            assert!((l.block_w - l.fs * RUBY_CAP).abs() < 1e-4, "{py} 横向不是单字母高");
+            assert!(l.block_h <= chh, "{py} 纵向溢出格高");
+            assert!((l.block_h - l.fs * RUBY_CAP).abs() < 1e-4);
         }
-        // 旧式「一字母一行」：四个字母要占到 4.08 × fs；旋转式只有 2.24 × fs。
+    }
+
+    /// **朝向与读序**：横排 → 宽 > 高，且宽度就是「字母数 × 步进」。
+    #[test]
+    fn ruby_is_set_horizontally_left_to_right() {
+        let (cw, chh, fs) = cell(14);
         let l = layout("měng", fs, cw, chh);
         assert!(
-            l.block_h < fs * 1.02 * 4.0 * 0.75,
-            "仍是「一字母一行」的松散排法（block_h={:.3}, fs={:.3}）",
-            l.block_h,
-            fs
+            l.block_w > l.block_h * 1.6,
+            "注音不是横排（宽 {:.2} / 高 {:.2}）",
+            l.block_w,
+            l.block_h
+        );
+        assert!(
+            (l.block_w - 4.0 * l.fs * RUBY_ADVANCE).abs() < 1e-3,
+            "横排宽度不是按字距累加的"
         );
     }
 
-    /// 与上下字、左右列之间都留得出气：**纵向不溢出格高，横向不越过界栏**。
+    /// 落点：左缘在汉字右缘之外，整串不越过下一列的**字形**。
     #[test]
-    fn ruby_never_glues_to_the_neighbouring_glyph_or_column() {
+    fn ruby_sits_in_the_gap_without_touching_the_next_column() {
         for cols in [8usize, 10, 12, 14] {
             let (cw, chh, fs) = cell(cols);
-            for py in ["a", "xi", "měng", "suān", "zhuāng", "xiǎn"] {
+            for py in ["a", "xi", "měng", "suān", "zhuāng"] {
                 let l = layout(py, fs, cw, chh);
-                assert!(l.gutter > 0.0, "{cols} 列：没有呼吸间距");
+                assert!(l.left > (cw + fs) * 0.5, "{cols} 列 / {py}：注音压住了汉字");
                 assert!(
-                    l.block_h <= chh * RUBY_AVAIL + 0.01 || l.tight,
-                    "{cols} 列 / {py}：注音纵向吃到下一个字（{:.2} > {:.2}）",
-                    l.block_h,
-                    chh * RUBY_AVAIL
+                    l.left + l.block_w <= cw + room_right(cw, fs) + 0.01 || l.tight,
+                    "{cols} 列 / {py}：注音够到下一列字形（右缘 {:.2} > 上限 {:.2}）",
+                    l.left + l.block_w,
+                    cw + room_right(cw, fs)
                 );
-                assert!(
-                    l.gutter + l.block_w <= cw * 0.45 + 0.01,
-                    "{cols} 列 / {py}：注音压过界栏（{:.2} > {:.2}）",
-                    l.gutter + l.block_w,
-                    cw * 0.45
-                );
+                assert!(l.top >= 0.0 && l.top + l.block_h <= chh + 0.01, "{cols} 列 / {py}：纵向出格");
             }
         }
+    }
+
+    /// 长拼音按宽度收敛，但不低于 22%；短拼音永远比长拼音大。
+    #[test]
+    fn long_pinyin_shrinks_but_stays_readable() {
+        let (cw, chh, fs) = cell(8);
+        let short = layout("xi", fs, cw, chh);
+        let long = layout("zhuāngzhuāng", fs, cw, chh);
+        assert!(long.fs <= short.fs + 1e-3);
+        assert!(
+            long.fs >= fs * RUBY_SCALE_MIN - 0.01,
+            "降到下限以下：{:.3}",
+            long.fs / fs
+        );
     }
 }
