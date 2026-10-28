@@ -363,6 +363,11 @@ pub const GRID_FS_MIN: f32 = 12.0;
 /// 触顶时**列宽跟着回缩**（见 `compute_grid` 第 5 步），字仍贴着格，
 /// 密度不会被大屏稀释。
 pub const GRID_FS_MAX: f32 = 32.0;
+/// 专注模式 / 导出的字号物理上限（v1.84.1）：常规阅读封顶 32px，但专注模式与
+/// 导出要「满版大字」，旧代码直接传 `f32::INFINITY`——一旦放大就无上限，既
+/// 可能把排版撑爆、也不符合「防呆」原则。这里给一个合理的极大值（128px，约
+/// 96pt，足够撑满一屏大字），触顶即夹住、行列绝不破防。
+pub const FOCUS_FS_MAX: f32 = 128.0;
 /// **字号 / 行高**（v1.32.0 行款）：`fs = row_h × FS_OF_ROW`。
 ///
 /// 行款重构后，行高由「每列目标字数」反算（`row_h = 可用高 / target_chars`），
@@ -469,6 +474,10 @@ pub const BANXIN_TOP_FRACS: [f32; 3] = [0.16, 0.12, 0.09];
 /// 列宽上限（相对行高）：满屏档把字格拉宽当字距，但宽过行高两倍，乌丝栏
 /// 就散成一道栅栏、不再像书。触顶时版心占比略降（字距优先让位版式感）。
 pub const COL_W_MAX_OF_ROW: f32 = 2.0;
+/// 列宽下限（相对字号）：横向必须留足呼吸空间，列宽永远 ≥ 字号 × 此值
+/// （v1.84.1：旧代码下限只到 `fs`，放大字号时字贴着格线、视觉上挤进邻列；
+/// 现在强制 ≥ 1.1× 字号，保证至少 10% 字距，字与字、列与列绝不粘连）。
+pub const COL_W_MIN_OF_FS: f32 = 1.1;
 
 /// 留白档 → 天头率。版心率落在 [`BANXIN_RATIOS`] 某一档上就取该档的天头率
 /// （「宽留白配大天头」的联动只此一处，不会两处漂移）；未登记的比值
@@ -658,7 +667,14 @@ pub fn compute_grid(
     //    单页滚动、状态栏提示「无法展示完整的 X 行 Y 字」——绝不拆行款，
     //    绝不把字压成一团黑疙瘩。
     let min_hit = row_h_std * FS_OF_ROW * zoom < GRID_FS_MIN;
-    let row_h = if min_hit { fs / FS_OF_ROW } else { row_h_std };
+    // **行高 = max(行款基准, 字号 / FS_OF_ROW)**（v1.84.1 修复「字号最大时字
+    // 叠在一起」）：这是 `fs = row_h × FS_OF_ROW` 的逆运算——一旦 zoom / 专注
+    // 模式把 fs 顶过 `row_h_std × FS_OF_ROW`，行高立即用 fs 反推撑开（= 字号
+    // × 1.176），保证 `row_h > fs` 恒成立（竖排字绝不上下重叠、也不挤进邻列）；
+    // 字号没顶过基准时仍用行款 row_h_std，维持版面与列数不变。旧代码只在
+    // `min_hit`（窗口过小）分支反推 row_h，常态 / 触顶（fs 被 fs_max 夹住）时
+    // row_h 停在 row_h_std，于是放大字号后 **fs > row_h**，字全叠在一起。
+    let row_h = row_h_std.max(fs / FS_OF_ROW);
     // 行数 = 可用高 / 行高。加 1e-4 再 floor：`inner_h/(inner_h/target)` 在浮点
     // 里可能落在 target−ε（如 25.999999999999996），直接 floor 会少算一行，
     // 状态栏报「行二十字」、纸高也短一行——epsilon 只吃掉浮点尘，吃不到
@@ -686,12 +702,13 @@ pub fn compute_grid(
         .max(0.0);
     let inner_w = (per_leaf - edge - 2.0 * mw).max(40.0);
     let want = (banxin_w - edge) / n; // 版心率反推的列宽
-    let col_w = if want >= fs {
-        want.clamp(fs, row_h * COL_W_MAX_OF_ROW)
+    let col_w = if want >= fs * COL_W_MIN_OF_FS {
+        want.clamp(fs * COL_W_MIN_OF_FS, row_h * COL_W_MAX_OF_ROW)
     } else {
-        // 窄屏（典型：手机 12/14 列）：75% 叶宽放不下 12px 下限的字，
-        // 退回可用宽均分——版心占比超标 → 滚动，字仍不破格。
-        (inner_w / n).clamp(fs, row_h * COL_W_MAX_OF_ROW)
+        // 窄屏（手机 12/14 列）或放大字号后：可用宽放不下「字号 × 下限」的字，
+        // 退回可用宽均分——版心占比超标 → 横向滚动，但列宽仍强制 ≥ 1.1× 字号，
+        // 字绝不破格、绝不挤进邻列。
+        (inner_w / n).clamp(fs * COL_W_MIN_OF_FS, row_h * COL_W_MAX_OF_ROW)
     };
 
     let grid_w = (cfg.columns as f32 + extra_cols) * col_w;
@@ -1047,6 +1064,56 @@ mod tests {
                 assert_eq!(p.m.chars_per_col, p.m.target_chars);
             }
         }
+    }
+
+    #[test]
+    fn font_scale_guard_never_overlaps_at_any_zoom() {
+        // v1.84.1 回归：字号放大（zoom Large/Huge）曾让 fs > row_h，竖排字
+        // 上下叠、挤进邻列。护栏 `row_h = max(row_h_std, fs / FS_OF_ROW)` 必须
+        // 保证任意字级下 row_h > fs 恒成立，且列宽强制 ≥ 1.1× 字号。
+        let (cw, ch) = content();
+        for &zoom in &[0.8_f32, 1.0, 1.3, 1.6, 2.0, 3.0] {
+            // 用 Single 模式 + 不同 zoom 穷举放大场景，验证护栏在任意字级下
+            // 都撑开行高、守住列宽下限。
+            let mut inp = input(LayoutMode::Single, 12, cw, ch);
+            inp.zoom = zoom;
+            let p = calculate_grid(inp);
+            assert!(
+                p.m.row_h > p.m.fs + 1e-3,
+                "zoom={} 时 row_h {:.2} 未严格大于 fs {:.2}（字会上下重叠）",
+                zoom, p.m.row_h, p.m.fs
+            );
+            assert!(
+                p.m.col_w >= p.m.fs * COL_W_MIN_OF_FS - 1e-3,
+                "zoom={} 时 col_w {:.2} 小于 1.1×fs {:.2}（字会挤进邻列）",
+                zoom, p.m.col_w, p.m.fs
+            );
+        }
+    }
+
+    #[test]
+    fn focus_mode_128px_never_overlaps() {
+        // v1.84.1 回归：专注模式字号封顶 128px（FOCUS_FS_MAX）。在超大视口
+        // 下字级触顶 128，护栏仍必须守住「行高严格大于字号、列宽 ≥ 1.1×
+        // 字号」——字绝不破格、绝不重叠。
+        let mut inp = input(LayoutMode::Facing, 12, 3840.0, 2400.0);
+        inp.fs_max = FOCUS_FS_MAX; // 生产专注模式上限
+        let p = calculate_grid(inp);
+        assert!(
+            p.m.fs <= FOCUS_FS_MAX + 0.01,
+            "专注模式字号 {:.2} 超 128 物理上限",
+            p.m.fs
+        );
+        assert!(
+            p.m.row_h > p.m.fs + 1e-3,
+            "触顶后 row_h {:.2} 未严格大于 fs {:.2}（字会重叠）",
+            p.m.row_h, p.m.fs
+        );
+        assert!(
+            p.m.col_w >= p.m.fs * COL_W_MIN_OF_FS - 1e-3,
+            "触顶后列宽 {:.2} 小于 1.1×fs {:.2}（字会挤进邻列）",
+            p.m.col_w, p.m.fs
+        );
     }
 
     #[test]

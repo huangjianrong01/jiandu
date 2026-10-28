@@ -2184,10 +2184,11 @@ impl Root {
         let line_scale = self.grid.line_scale;
         let dir = self.grid.dir;
         let zoom = self.zoom;
-        // 专注模式：整屏只排一叶，字号不设上限（要的就是满屏大字）；
+        // 专注模式：整屏只排一叶，要的是满屏大字；但仍受 128px 物理上限
+        // 约束（v1.84.1 防呆）—避免极端大屏把字号撑到离谱、渲染卡顿。
         // 常规阅读封顶 32px，免得大屏上一列没几个字、页面空旷。
         let fs_max = if self.focus_mode {
-            f32::INFINITY
+            crate::grid::FOCUS_FS_MAX
         } else {
             crate::grid::GRID_FS_MAX
         };
@@ -3588,9 +3589,10 @@ impl Root {
             line_ratio: cfg.line_ratio,
             banxin_ratio: self.banxin_ratio,
             dir: self.grid.dir,
-            // 印制不受「大屏别把字撑太大」那条 32px 上限约束——纸上要的就是
-            // A4 满版大字。
-            fs_max: f32::INFINITY,
+            // 印制不受「大屏别把字撑太大」那条 32px 上限约束，但仍受 128px
+            // 物理上限（v1.84.1 防呆）约束——纸上要的是 A4 满版大字，撑过
+            // 128 既无必要也伤渲染性能。
+            fs_max: crate::grid::FOCUS_FS_MAX,
         });
         let m = plan.m;
         // 纸面一旦超出 A4，整体等比收一号（行数不变，只是字号 / 格缩一点）。
@@ -6598,9 +6600,10 @@ mod tests {
             ANCIENT_HEAD,
             ANCIENT_FOOT,
             0.0,
-            // 专注模式不设字号上限（`fs_max = INFINITY`）：整屏只排一叶，
-            // 就是要大字撑满，否则触上限后纸会缩到七成、四周留白。
-            f32::INFINITY);
+            // 专注模式字号受 128px 物理上限（FOCUS_FS_MAX）约束（v1.84.1 防呆）；
+            // 在 iPad 量级视口下自然字级约 48px，远未触顶，整屏只排一叶的
+            // 「满屏大字」效果不变，故下方「撑满整宽」断言依旧成立。
+            crate::grid::FOCUS_FS_MAX);
         assert!(2.0 * m.outer_w + gap <= VW + 0.5);
         // 行款版式（v1.32.0）：字格取方，版心（界行区）窄于纸面——宋版书
         // 版心本就只占纸宽六成，两侧留白归纸面，故不再要求铺到 95%。
