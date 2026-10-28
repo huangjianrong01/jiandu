@@ -1729,6 +1729,11 @@ impl Root {
         if self.show_keys {
             root = root.child(self.render_keys_sheet(cx));
         }
+        // 文本量化分析抽屉（v1.81.0 · 模块五）：字词 / 句读 / 文风。
+        // 与「改键」同款居中浮层，画在最后 = 最上层。
+        if self.show_analysis {
+            root = root.child(self.render_analysis_sheet(cx));
+        }
         // 说明：检索 / 帮助 / 字书 / 分享几张浮层的**根**都在各自 render 里
         // 加了 `.occlude()`（与左侧栏同款），此处不重复。
         // 左上角那枚独立的书名签条（v1.27.0 删除）：它离书页有一段距离，
@@ -1983,6 +1988,10 @@ impl Root {
                         self.show_keys = false;
                         self.key_capture = None;
                         self.key_hint = None;
+                        // 文本分析抽屉（v1.81.0）：结果随面板一起丢——下次
+                        // 打开按那时的范围重算，不拿旧数糊弄人。
+                        self.show_analysis = false;
+                        self.analysis = None;
                         self.show_share_panel = false;
                         self.close_lookup();
                         self.clear_selection();
@@ -2083,6 +2092,16 @@ impl Root {
                 self.open_side();
             }
             A::Help => self.set_ui_state(AppUIState::Help, cx),
+            // 文本分析：有选区就数选区，没有就数本章。整本是一个显式选择
+            // （抽屉里的「本书」钮），不该让 ⌘I 悄悄跑百万字。
+            A::Analysis => {
+                let scope = if self.has_selection() {
+                    crate::app::AnalysisScope::Selection
+                } else {
+                    crate::app::AnalysisScope::Chapter
+                };
+                self.open_analysis(scope, cx);
+            }
             A::Palette1 => self.set_palette(0),
             A::Palette2 => self.set_palette(1),
             A::Palette3 => self.set_palette(2),
@@ -2390,6 +2409,596 @@ impl Root {
                     this.show_keys = false;
                     this.key_capture = None;
                     this.key_hint = None;
+                    cx.notify();
+                }),
+            )
+    }
+
+    // ── 文本量化分析（v1.81.0 · 模块五）──────────────────────────────────
+
+    /// 本叶（有选区则选区）的**原文**文本。
+    ///
+    /// 取 `g.ch` 而不是 `shown_glyph(g)`：繁简只是渲染层的一道滤镜（用户
+    /// 拍板「原文必须保留」），**数数必须数原文**——否则切到简体档，「生僻字」
+    /// 的个数会跟着变，那才是真错。
+    fn leaf_text(&self) -> String {
+        let pages = self.paginate();
+        if let Some((a, b)) = self.selection_range() {
+            let mut out = String::new();
+            for pg in [self.page, self.page + 1] {
+                if let Some(gs) = pages.get(pg) {
+                    for g in gs {
+                        if g.is_indent() {
+                            continue;
+                        }
+                        let k = (g.chapter, g.para, g.offset);
+                        if k >= a && k <= b {
+                            out.push(g.ch);
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+        pages
+            .get(self.page)
+            .map(|gs| {
+                gs.iter()
+                    .filter(|g| !g.is_indent())
+                    .map(|g| g.ch)
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// **算出一份分析结果**（纯读，不改任何状态）。
+    ///
+    /// 返回 `(范围标题, 统计)`；拿不到文本（没开书 / 空选区）就 `None`——
+    /// 调用方据此画空态，而不是画一堆 0。
+    ///
+    /// **只在这里遍历正文**：整本百万字一遍 n-gram 约几百毫秒，所以结果
+    /// 存进 `self.analysis`，切 Tab 不重算。
+    fn compute_analysis(
+        &self,
+        scope: crate::app::AnalysisScope,
+    ) -> Option<(String, jiandu_core::analysis::TextStats)> {
+        use crate::app::AnalysisScope as S;
+        use jiandu_core::analysis as an;
+        let book = self.book.as_ref()?;
+        match scope {
+            S::Card(id) => {
+                let c = self.cards.iter().find(|c| c.id == id)?;
+                let title = format!("{} · {}", c.book, c.chapter);
+                // 只数**原文**：朱批是读者的话，不是文章的话——混进来会把
+                // 「文风」往说话人的口语上拉偏。
+                Some((title, an::analyze_text(&c.quote)))
+            }
+            S::Selection => {
+                let t = self.selected_text();
+                let body = if t.trim().is_empty() {
+                    // 没选区 → 退化为本叶（比弹一句「请先选字」有用）。
+                    self.leaf_text()
+                } else {
+                    t
+                };
+                if body.trim().is_empty() {
+                    return None;
+                }
+                Some(("本叶 / 选区".to_string(), an::analyze_text(&body)))
+            }
+            S::Chapter => {
+                let ci = self.current_chapter.min(book.chapters.len().saturating_sub(1));
+                let ch = book.chapters.get(ci)?;
+                let title = self.chapter_title(ci);
+                let stats = an::analyze_paras(
+                    ch.paragraphs.iter().map(|p| (p.text.as_str(), p.notes.as_slice())),
+                );
+                Some((title, stats))
+            }
+            S::Book => {
+                let title = book.title.clone();
+                let stats = an::analyze_paras(book.chapters.iter().flat_map(|ch| {
+                    ch.paragraphs
+                        .iter()
+                        .map(|p| (p.text.as_str(), p.notes.as_slice()))
+                }));
+                Some((title, stats))
+            }
+        }
+    }
+
+    /// 结果还没算（或范围刚换过）就补算一次。
+    ///
+    /// 放在 `render` 里而不是 `open_analysis` 里，是为了让开发钩子
+    /// `JIANDU_PANEL=analysis`（直接置 `show_analysis = true`）也能出数。
+    fn ensure_analysis(&mut self) {
+        if self.analysis.is_none() {
+            let scope = self.analysis_scope;
+            self.analysis = self.compute_analysis(scope);
+        }
+    }
+
+    /// **打开分析抽屉**（更多菜单 / ⌘I / 卡片匣的「析」）。
+    pub fn open_analysis(&mut self, scope: crate::app::AnalysisScope, cx: &mut Context<Self>) {
+        self.analysis_scope = scope;
+        self.analysis = self.compute_analysis(scope);
+        self.show_analysis = true;
+        // 与其余顶层面板互斥：抽屉是覆盖层，压在版字 / 检索之上会打架。
+        self.show_style = false;
+        self.show_search = false;
+        self.show_help = false;
+        self.show_keys = false;
+        self.close_side();
+        self.close_transient_ui();
+        cx.notify();
+    }
+
+    /// **文本分析抽屉**：三 Tab（字词 / 句读 / 文风），居中宣纸浮层。
+    ///
+    /// 三条自律（改这里前先读）：
+    ///   1. **零图表库、零饼图、零蓝绿**。所有比例都是一根 3px 的手绘条，
+    ///      用色只有淡墨与朱砂，与「界行、鱼尾、朱丝栏」同一套几何语言。
+    ///   2. **一 Tab 不超过六行**。这是「这段文章什么脾气」，不是仪表盘——
+    ///      条子一多，读的人就变成看报表的人了。
+    ///   3. **数字说不清就不说**。零句时不显示「平均 0 字」，显示「—」。
+    fn render_analysis_sheet(&mut self, cx: &mut Context<Self>) -> Div {
+        use crate::app::{AnalysisScope as S, AnalysisTab as Tab};
+        let t = self.theme;
+        let vw = self.viewport_w;
+        let vh = self.viewport_h;
+        self.ensure_analysis();
+
+        let zhu = sheet_zhu(t);
+        // 淡墨：墨里兑 45% 纸——比正文淡一档，压得住又不飘。
+        let mo = crate::theme::mix(t.ink(), t.paper(), 0.45);
+        // 空的那一截：纸上抹一层 10% 墨，看得出「这里本可以有一截」。
+        let track = crate::theme::mix(t.paper(), t.ink(), 0.10);
+
+        let scope = self.analysis_scope;
+        let tab = self.analysis_tab;
+        let title = self
+            .analysis
+            .as_ref()
+            .map(|(s, _)| s.clone())
+            .unwrap_or_else(|| "—".to_string());
+
+        // ① 标题行：范围名 + 关闭。
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(t.chrome_line()))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(t.accent()))
+                            .child(SharedString::from("文本分析")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgb(t.ink_soft()))
+                            .child(SharedString::from(title)),
+                    ),
+            )
+            .child(small_button("关闭", false, t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.show_analysis = false;
+                    this.analysis = None;
+                    cx.notify();
+                }),
+            ));
+
+        // ② 范围 + Tab 两行控件。范围只在「有书」时给本书 / 本章两档；
+        //    卡片范围是只读的（不该在这儿改成去算别的卡）。
+        let scope_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(14.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from("范围")),
+            );
+        let mut scope_row = scope_row;
+        // 范围只比「哪一档」，`Card(id)` 与 `Card(other)` 算同一档。
+        let scope_key = |s: S| match s {
+            S::Book => 0u8,
+            S::Chapter => 1,
+            S::Selection => 2,
+            S::Card(_) => 3,
+        };
+        for s in [S::Book, S::Chapter, S::Selection] {
+            let on = !matches!(scope, S::Card(_)) && scope_key(scope) == scope_key(s);
+            scope_row = scope_row.child(ink_option(s.label(), on, t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.analysis_scope = s;
+                    this.analysis = None;
+                    cx.notify();
+                }),
+            ));
+        }
+        if matches!(scope, S::Card(_)) {
+            scope_row = scope_row.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(zhu))
+                    .child(SharedString::from("此卡")),
+            );
+        }
+
+        let tab_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(14.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from("栏")),
+            );
+        let mut tab_row = tab_row;
+        for x in Tab::ALL {
+            tab_row = tab_row.child(ink_option(x.label(), x == tab, t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.analysis_tab = x;
+                    cx.notify();
+                }),
+            ));
+        }
+
+        // ③ 内容区。
+        let body = match self.analysis.as_ref() {
+            None => div()
+                .p_4()
+                .text_size(px(11.5))
+                .text_color(rgb(t.ink_soft()))
+                .child(SharedString::from("此处无字可数。")),
+            Some((_, st)) if st.is_empty() => div()
+                .p_4()
+                .text_size(px(11.5))
+                .text_color(rgb(t.ink_soft()))
+                .child(SharedString::from("此处无字可数。")),
+            Some((_, st)) => match tab {
+                Tab::Char => {
+                    let c = &st.chars;
+                    let mut col = div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(an_line(
+                            "正文",
+                            format!("{} 字 · 不重 {} 字", sep(c.total), sep(c.unique)),
+                            t,
+                        ))
+                        .child(an_line(
+                            "生僻",
+                            if c.rare == 0 {
+                                "无".to_string()
+                            } else {
+                                format!("{} 字，其中异体 {} 字", c.rare, c.variant)
+                            },
+                            t,
+                        ))
+                        // 覆盖率比「不重复 / 总字数」有用：后者在长文本上
+                        // 必然趋近 0，什么都说明不了。
+                        .child(an_line(
+                            "字汇",
+                            format!(
+                                "前百字覆盖 {:.0}% · 叠字 {} 处",
+                                c.cover * 100.0,
+                                c.redup
+                            ),
+                            t,
+                        ));
+                    if !c.top.is_empty() {
+                        let max = c.top.first().map(|(_, k)| *k).unwrap_or(1).max(1);
+                        col = col.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgb(t.ink_soft()))
+                                .child(SharedString::from("常见")),
+                        );
+                        for (i, (w, k)) in c.top.iter().enumerate() {
+                            // 条宽按「占最高频的几成」——这是真比例，
+                            // 一眼能看出哪个词压着别的词。
+                            let ratio = *k as f32 / max as f32;
+                            let bar_color = if i < 3 { zhu } else { mo };
+                            col = col.child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .w(px(72.0))
+                                            .text_size(px(11.5))
+                                            .text_color(rgb(t.ink()))
+                                            .child(SharedString::from(w.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .w(px(AN_CLOUD_BAR_W * ratio))
+                                                    .h(px(3.0))
+                                                    .bg(rgb(bar_color)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(9.5))
+                                                    .text_color(rgb(t.ink_soft()))
+                                                    .child(SharedString::from(k.to_string())),
+                                            ),
+                                    ),
+                            );
+                        }
+                    }
+                    if !c.rare_top.is_empty() {
+                        let s: String = c
+                            .rare_top
+                            .iter()
+                            .take(8)
+                            .map(|(ch, _)| ch.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        col = col.child(an_line("难字", s, t));
+                    }
+                    col
+                }
+                Tab::Jodu => {
+                    let j = &st.jodu;
+                    let mut col = div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(mo))
+                                        .child(SharedString::from(format!("读 {}", j.dou))),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(zhu))
+                                        .child(SharedString::from(format!("句 {}", j.ju))),
+                                ),
+                        )
+                        // 一根条分两截：淡墨是读、朱砂是句。
+                        .child(split_bar(j.dou, j.ju, AN_BAR_W, mo, zhu, track))
+                        .child(an_line(
+                            "句长",
+                            if j.sentences == 0 {
+                                "—".to_string()
+                            } else {
+                                format!(
+                                    "平均 {:.1} 字 / 句 · 四言 {} 句",
+                                    j.avg, j.four
+                                )
+                            },
+                            t,
+                        ))
+                        .child(an_line(
+                            "俪句",
+                            if j.sentences == 0 {
+                                "—".to_string()
+                            } else {
+                                format!("{} 对 / 共 {} 句", j.parallel, j.sentences)
+                            },
+                            t,
+                        ));
+                    // 句长条：以 30 字为满格——文言一句多在 4~12 字，白话
+                    // 常上 20+，30 满格两头都看得见差别。
+                    if j.sentences > 0 {
+                        let r = (j.avg / AN_AVG_FULL).clamp(0.02, 1.0);
+                        col = col.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(div().w(px(AN_BAR_W * r)).h(px(3.0)).bg(rgb(mo)))
+                                .child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(rgb(t.ink_soft()))
+                                        .child(SharedString::from("30 字")),
+                                ),
+                        );
+                    }
+                    col
+                }
+                Tab::Style => {
+                    let s = &st.style;
+                    let bias = s.bias();
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(rgb(t.accent()))
+                                .child(SharedString::from(s.label)),
+                        )
+                        // 文 ↔ 白：左截墨（文言）、右截淡墨（白话），中点即
+                        // 「分不出」。不做渐变——刻本里没有渐变这回事。
+                        .child(split_bar_f(bias, 1.0 - bias, AN_BAR_W, t.ink(), mo, track))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .w(px(AN_BAR_W))
+                                .child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(rgb(t.ink_soft()))
+                                        .child(SharedString::from("文")),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(rgb(t.ink_soft()))
+                                        .child(SharedString::from("白")),
+                                ),
+                        )
+                        .child(an_line(
+                            "虚词",
+                            format!(
+                                "文 {:.1} · 白 {:.1}（每百字）",
+                                s.classical, s.vernacular
+                            ),
+                            t,
+                        ))
+                        .child(an_line(
+                            "记言",
+                            format!("{:.1}（每百字 · 曰云谓问答）", s.speech),
+                            t,
+                        ))
+                        .child(an_line(
+                            "引据",
+                            if s.refs == 0 {
+                                "未见书名 / 专名".to_string()
+                            } else {
+                                format!("{} 处", s.refs)
+                            },
+                            t,
+                        ))
+                }
+                Tab::Crit => {
+                    let c = &st.crit;
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(an_line(
+                            "注疏",
+                            if c.notes == 0 {
+                                "无夹注".to_string()
+                            } else {
+                                format!("{} 条 · 每百字 {:.1} 条", c.notes, c.note_rate)
+                            },
+                            t,
+                        ))
+                        .child(an_line(
+                            "音义",
+                            format!("注音 {} 处 · 通假 {} 处", c.ruby, c.tongjia),
+                            t,
+                        ))
+                        .child(an_line(
+                            "名物",
+                            format!("人 {} · 地 {} · 书 {}", c.person, c.place, c.book),
+                            t,
+                        ))
+                        .child(an_line(
+                            "纪年",
+                            if c.era == 0 {
+                                "未见干支 / 纪年".to_string()
+                            } else {
+                                format!("{} 处", c.era)
+                            },
+                            t,
+                        ))
+                        .child(an_line(
+                            "可疑",
+                            if c.odd == 0 {
+                                "未见重出 / 孤字句".to_string()
+                            } else {
+                                // 「待核」两个字必须留着：软件只负责把值得
+                                // 看一眼的地方捞出来，判定归人。
+                                format!("{} 处（待核）", c.odd)
+                            },
+                            t,
+                        ))
+                }
+            },
+        };
+
+        let sheet = div()
+            .w(px((vw * 0.46).clamp(380.0, 540.0)))
+            .max_h(px(vh * 0.82))
+            .flex()
+            .flex_col()
+            .occlude()
+            .bg(rgb(t.paper()))
+            .border_1()
+            .border_color(rgb(t.frame()))
+            .rounded(px(8.0))
+            .child(head)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .px_4()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(t.chrome_line()))
+                    .child(scope_row)
+                    .child(tab_row),
+            )
+            .child(
+                div()
+                    .id("analysis-body")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .px_4()
+                    .py_3()
+                    .overflow_y_scroll()
+                    .scrollbar_width(px(0.0))
+                    .child(body),
+            );
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w(px(vw))
+            .h(px(vh))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x14100ACC))
+            .child(sheet)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.show_analysis = false;
+                    this.analysis = None;
                     cx.notify();
                 }),
             )
@@ -3530,6 +4139,21 @@ impl Root {
                 if let Err(e) = r {
                     this.report_export_panic(e, cx);
                 }
+            }),
+        ));
+        // ③·c **文本分析**（v1.81.0 · 模块五）：字词 / 句读 / 文风三栏抽屉。
+        //      排在导出之后、說明之前——它是「读完了想想」的活儿，不是出活的。
+        menu = menu.child(mitem("more-analysis", "文本分析").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.more_menu = false;
+                let scope = if this.has_selection() {
+                    crate::app::AnalysisScope::Selection
+                } else {
+                    crate::app::AnalysisScope::Chapter
+                };
+                this.open_analysis(scope, cx);
             }),
         ));
         // ④ **說明**（v1.80.0）：原先顶栏最右那枚「帮助」钮搬进下拉。
@@ -10896,6 +11520,87 @@ enum StyleAct {
     InkZhu,
     /// 读点的回锋（出锋末端带一小勾）。
     Hook,
+}
+
+// ── 文本分析抽屉的小构件（v1.81.0 · 模块五）───────────────────────────────
+//
+// 全部是**手绘几何**：一根 3px 的条、一段小字、一段留白。零图表库、零饼图、
+// 零蓝绿——与「界行、鱼尾、朱丝栏」同一套语言。改这里前先想清楚：加一根
+// 条子之前，先问它能替用户省掉哪一眼。
+
+/// 比例条的总宽（像素）。
+const AN_BAR_W: f32 = 260.0;
+/// 高频词那几根条子的满格宽。
+const AN_CLOUD_BAR_W: f32 = 150.0;
+/// 「平均句长」那根条的满格：30 字。
+///
+/// 文言一句多在 4~12 字、白话常上 20+，30 满格两头都看得出差别。
+const AN_AVG_FULL: f32 = 30.0;
+
+/// 一行「标签 + 数字」：标签是书页边的批字（极小、淡一档），数字是正文。
+fn an_line(label: &'static str, value: String, t: Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .child(
+            div()
+                .w(px(40.0))
+                .text_size(px(10.0))
+                .text_color(rgb(t.ink_soft()))
+                .child(SharedString::from(label)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(11.5))
+                .text_color(rgb(t.ink()))
+                .child(SharedString::from(value)),
+        )
+}
+
+/// **两截比例条**（整数版）：`a` 一段、`b` 一段，宽度按两者之比分配。
+///
+/// 两端都是 0 时只剩一条极淡的底（看得出「这里本可以有一截」，而不是空白）。
+fn split_bar(a: usize, b: usize, w: f32, ca: u32, cb: u32, track: u32) -> Div {
+    let total = a + b;
+    let mut row = div().flex().flex_row().h(px(3.0)).w(px(w)).bg(rgb(track));
+    if total > 0 {
+        let wa = w * (a as f32 / total as f32);
+        row = row
+            .child(div().h(px(3.0)).w(px(wa)).bg(rgb(ca)))
+            .child(div().h(px(3.0)).w(px(w - wa)).bg(rgb(cb)));
+    }
+    row
+}
+
+/// **两截比例条**（浮点版）：给「文白倾向」这种 0~1 的值用。
+fn split_bar_f(a: f32, b: f32, w: f32, ca: u32, cb: u32, track: u32) -> Div {
+    let total = (a + b).max(0.0001);
+    let wa = (w * (a / total)).clamp(0.0, w);
+    div()
+        .flex()
+        .flex_row()
+        .h(px(3.0))
+        .w(px(w))
+        .bg(rgb(track))
+        .child(div().h(px(3.0)).w(px(wa)).bg(rgb(ca)))
+        .child(div().h(px(3.0)).w(px(w - wa)).bg(rgb(cb)))
+}
+
+/// 千分位：`12345 → "12,345"`。总字数动辄六位，不分段一眼数不清。
+fn sep(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        let tail = s.len() - i;
+        if i > 0 && tail % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// 版字面板的一行：左侧极小号标签（像书页边的批字），右侧一组控件。

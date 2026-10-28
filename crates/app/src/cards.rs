@@ -231,6 +231,24 @@ impl Root {
                 .hover(|s| s.bg(rgb(crate::theme::mix(t.paper(), zhu, 0.06))))
                 .child(body)
                 .child(
+                    // 「析」（v1.81.0 · 模块五）：就这一张卡做量化分析——
+                    // 字数 / 句读节奏 / 文白倾向。单字 CJK，同「刪」那枚。
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(ink_soft))
+                        .cursor_pointer()
+                        .hover(move |s| s.text_color(rgb(zhu)))
+                        .child(SharedString::from("析"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                // 拦住冒泡：分析不该顺带把人送回原文。
+                                cx.stop_propagation();
+                                this.open_analysis(crate::app::AnalysisScope::Card(id), cx);
+                            }),
+                        ),
+                )
+                .child(
                     // 「刪」：单字 CJK（✕ 那类拉丁符号在 GPUI 里是零宽，画不出来）。
                     div()
                         .text_size(px(10.5))

@@ -47,6 +47,8 @@ pub enum Action {
     Focus,
     Cards,
     Help,
+    /// **文本量化分析**（v1.81.0 · 模块五）：字词 / 句读 / 文风三栏抽屉。
+    Analysis,
     // ── 墨色（六套）────────────────────────────────────────
     Palette1,
     Palette2,
@@ -63,7 +65,7 @@ pub enum Action {
 
 impl Action {
     /// 面板渲染顺序 = 这份数组的顺序（分组靠 [`Action::section`] 相邻聚拢）。
-    pub const ALL: [Action; 25] = [
+    pub const ALL: [Action; 26] = [
         Action::Search,
         Action::Lookup,
         Action::Copy,
@@ -80,6 +82,7 @@ impl Action {
         Action::Focus,
         Action::Cards,
         Action::Help,
+        Action::Analysis,
         Action::Palette1,
         Action::Palette2,
         Action::Palette3,
@@ -110,6 +113,7 @@ impl Action {
             Action::Focus => "focus",
             Action::Cards => "cards",
             Action::Help => "help",
+            Action::Analysis => "analysis",
             Action::Palette1 => "palette1",
             Action::Palette2 => "palette2",
             Action::Palette3 => "palette3",
@@ -147,6 +151,7 @@ impl Action {
             Action::Focus => "专注模式",
             Action::Cards => "卡片匣",
             Action::Help => "帮助",
+            Action::Analysis => "文本分析（字词 / 句读 / 文风）",
             Action::Palette1 => "墨色：朱",
             Action::Palette2 => "墨色：墨",
             Action::Palette3 => "墨色：纸",
@@ -173,7 +178,12 @@ impl Action {
             | Action::Rare
             | Action::Traditional
             | Action::Theme => "阅读",
-            Action::Style | Action::Side | Action::Focus | Action::Cards | Action::Help => "视图",
+            Action::Style
+            | Action::Side
+            | Action::Focus
+            | Action::Cards
+            | Action::Help
+            | Action::Analysis => "视图",
             Action::Palette1
             | Action::Palette2
             | Action::Palette3
@@ -208,6 +218,7 @@ impl Action {
             Action::Focus => "cmd+z",
             Action::Cards => "cmd+k",
             Action::Help => "cmd+/",
+            Action::Analysis => "cmd+i",
             Action::Palette1 => "cmd+1",
             Action::Palette2 => "cmd+2",
             Action::Palette3 => "cmd+3",

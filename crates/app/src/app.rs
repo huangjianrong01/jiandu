@@ -194,6 +194,76 @@ pub enum AppUIState {
     Ai,
 }
 
+/// **文本分析抽屉的四个 Tab**（v1.81.0 · 模块五）。
+///
+/// 四栏对应文献学的四问：**写了什么字（字词） · 怎么断的句（句读） ·
+/// 什么脾气（文风） · 难在哪儿（考据）**。
+///
+/// 只有四栏是有意的：**一个 Tab 里超过六行就输了**。用户要的是「这段文章
+/// 什么脾气」，不是仪表盘。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AnalysisTab {
+    /// 字词：总字数 / 不重复 / 覆盖率 / 叠字 / 高频词 / 生僻·异体。
+    #[default]
+    Char,
+    /// 句读：读 vs 句、平均句长、四言、俪句。
+    Jodu,
+    /// 文风：文言 / 白话 / 记言 / 引经据典。
+    Style,
+    /// 考据：注疏 / 音义 / 名物 / 纪年 / 可疑（校勘提示）。
+    Crit,
+}
+
+impl AnalysisTab {
+    pub const ALL: [AnalysisTab; 4] = [
+        AnalysisTab::Char,
+        AnalysisTab::Jodu,
+        AnalysisTab::Style,
+        AnalysisTab::Crit,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AnalysisTab::Char => "字词",
+            AnalysisTab::Jodu => "句读",
+            AnalysisTab::Style => "文风",
+            AnalysisTab::Crit => "考据",
+        }
+    }
+}
+
+/// **分析范围**：算哪些字。
+///
+/// 四个口径共用同一套算法（见 `jiandu_core::analysis::Analyzer`）——差别只
+/// 在「喂进去哪些段落」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnalysisScope {
+    /// 整本。
+    Book,
+    /// 当前在读的那一章。
+    Chapter,
+    /// 当前选区（无选区则退化为本叶）。
+    Selection,
+    /// 卡片匣里那一张（`i64` 是卡片 id）。
+    Card(i64),
+}
+
+impl AnalysisScope {
+    /// 缺省范围：卡片匣里点进来就是卡片，其余一律本章。
+    ///
+    /// 为什么不默认「本书」：整本百万字的 n-gram 要跑几百毫秒，而用户点
+    /// 「文本分析」时心里想的通常是「**这一段**什么脾气」。全本是一个显式
+    /// 的选择，不是默认值。
+    pub fn label(self) -> &'static str {
+        match self {
+            AnalysisScope::Book => "本书",
+            AnalysisScope::Chapter => "本章",
+            AnalysisScope::Selection => "选区",
+            AnalysisScope::Card(_) => "此卡",
+        }
+    }
+}
+
 /// PNG 本叶导出的两段式阶段（v1.52.3 起，见 `Root::png_export`）。
 ///
 /// v1.71.0：出图已改**离屏重绘**，不再依赖「屏幕上一帧干净纸面」，但两段式
@@ -649,6 +719,18 @@ pub struct Root {
     pub key_capture: Option<jiandu_core::keys::Action>,
     /// 改键失败的一句话（冲突 / 不可用），显示到下次改键为止。
     pub key_hint: Option<String>,
+    /// **文本量化分析抽屉**开着没（v1.81.0 · 模块五）。
+    ///
+    /// 与 `show_keys` 同款：不进 `AppUIState` 那套互斥状态机——它自己就是
+    /// 一枚居中浮层，开合不牵动版字 / 检索 / 左栏的动画状态。
+    pub show_analysis: bool,
+    /// 抽屉当前看哪一栏。
+    pub analysis_tab: AnalysisTab,
+    /// 抽屉的分析范围（本书 / 本章 / 选区 / 某张卡片）。
+    pub analysis_scope: AnalysisScope,
+    /// **算好的结果**：开抽屉（或切范围）时算一次存着，绝不逐帧重算——
+    /// 整本百万字的 n-gram 每帧跑一遍，掉帧是必然的。
+    pub analysis: Option<(String, jiandu_core::analysis::TextStats)>,
     /// 生僻字显示：true 时给生僻字标注读音。
     pub show_rare: bool,
     /// 数字转汉字：true 时阿拉伯数字在竖排里显示为汉字（一六二八），
@@ -1129,6 +1211,10 @@ impl Root {
             show_keys: false,
             key_capture: None,
             key_hint: None,
+            show_analysis: false,
+            analysis_tab: AnalysisTab::Char,
+            analysis_scope: AnalysisScope::Chapter,
+            analysis: None,
             // 生僻字注音：默认开（`prefs.rare` 默认 true）——古籍里真有读不出
             // 的字，一根拐杖比「干净」重要。关掉的意愿会随下一版落盘。
             show_rare: prefs.rare,
@@ -1248,6 +1334,18 @@ impl Root {
                     root.show_search = true;
                     root.search_slide = 1.0;
                     root.search_target = true;
+                }
+                // 文本分析抽屉（v1.81.0）：`JIANDU_ANALYSIS_SCOPE=book|chapter`
+                // 可指定范围，默认本章。
+                "analysis" => {
+                    root.analysis_scope = match std::env::var("JIANDU_ANALYSIS_SCOPE")
+                        .unwrap_or_default()
+                        .as_str()
+                    {
+                        "book" => AnalysisScope::Book,
+                        _ => AnalysisScope::Chapter,
+                    };
+                    root.show_analysis = true;
                 }
                 _ => {}
             }
@@ -4235,6 +4333,8 @@ fn anki_push_card(
             || self.show_help
             || self.show_share_panel
             || self.show_ai
+            // v1.81.0：文本分析抽屉（与「改键」面板同款，独立浮层）。
+            || self.show_analysis
             // v1.80.0：两枚下拉（顶栏「更多」与旧「导出」）也算浮层——
             // 菜单摊着时，纸面上的单击不该翻页。
             || self.more_menu
