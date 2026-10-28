@@ -417,10 +417,14 @@ pub fn ancient_chain(choice: FontChoice) -> Vec<&'static str> {
             "serif",
         ],
         FontChoice::HuiwenMincho => vec![
+            // 实测 name 表（v1.83.0）：family / full / PS 全是 `Huiwen-mincho`
+            // （小写 m、连字符），中文名 `汇文明朝体`——三种写法都列上，
+            // GPUI 在不同平台报的名字形态不一。
+            "Huiwen-mincho",
             "Huiwen Mincho",
             "HuiwenMincho",
-            "汇文明朝",
             "汇文明朝体",
+            "汇文明朝",
             "Songti SC",
             "STSong",
             "serif",
@@ -456,6 +460,19 @@ pub fn ancient_chain(choice: FontChoice) -> Vec<&'static str> {
             "qiji",
             "齊伋體",
             "QijiFont",
+            "Songti SC",
+            "STSong",
+            "serif",
+        ],
+        // **清刻本匠体**（v1.83.0）：实测 name 表 family / full =
+        // `FZQingKeBenYueSongS-R-GB`、PostScript = `FZQKBYSJW--GB1-0`。
+        // 版权字库不随包，用户自备放进 fonts/ 即注册；没装则落到宋体。
+        FontChoice::FZQingKeBen => vec![
+            "FZQingKeBenYueSongS-R-GB",
+            "FZQingKeBenYueSongS",
+            "FZQKBYSJW--GB1-0",
+            "方正清刻本悦宋简体",
+            "方正清刻本悦宋",
             "Songti SC",
             "STSong",
             "serif",
@@ -497,6 +514,7 @@ pub fn modern_chain(choice: FontChoice) -> Vec<&'static str> {
         | FontChoice::SourceHanSerif
         | FontChoice::ZhuqueFangsong
         | FontChoice::JinghuaOldSong
+        | FontChoice::FZQingKeBen
         | FontChoice::HuiwenMincho
         | FontChoice::HuiwenZhengkai
         | FontChoice::HanchanHuofang
@@ -557,6 +575,22 @@ pub fn family_for(choice: FontChoice, script: Script) -> SharedString {
 
 /// 给定一个偏好字体的回退链，返回第一个「可用」的字体族名。
 /// `available` 为空（启动时取不到字体列表）时退回链首，交给系统兜底。
+/// 某款字体是否可用（别名任一对上即算）——仿刻本进档时用它挑字。
+///
+/// 走的是启动时缓存的那张系统族名表（`register_bundled_fonts` 填的
+/// `AVAILABLE`），不每次读盘。
+pub fn is_installed(aliases: &[&str]) -> bool {
+    let Some(avail) = AVAILABLE.get() else {
+        return false;
+    };
+    if avail.is_empty() {
+        return false;
+    }
+    aliases
+        .iter()
+        .any(|a| avail.iter().any(|f| f.eq_ignore_ascii_case(a)))
+}
+
 pub fn pick_font(chain: &[&str], available: &[String]) -> SharedString {
     if !available.is_empty() {
         for name in chain {
@@ -571,6 +605,34 @@ pub fn pick_font(chain: &[&str], available: &[String]) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **族名必须与字体 name 表逐字相符**（v1.83.0）。
+    ///
+    /// 这两款是用户自备的版权字库，族名一错 GPUI 就**静默**回退成宋体——
+    /// 界面上只看到「换了个字体没反应」，看不出是链写错了。实测 name 表：
+    ///   方正清刻本悦宋 → `FZQingKeBenYueSongS-R-GB`（PS：`FZQKBYSJW--GB1-0`）
+    ///   汇文明朝体     → `Huiwen-mincho`（小写 m、连字符）
+    #[test]
+    fn self_provided_fonts_are_named_exactly_as_their_name_table() {
+        let ke = ancient_chain(FontChoice::FZQingKeBen);
+        assert!(ke.contains(&"FZQingKeBenYueSongS-R-GB"), "清刻本悦宋族名错：{ke:?}");
+        assert!(ke.contains(&"FZQKBYSJW--GB1-0"), "清刻本悦宋 PostScript 名错：{ke:?}");
+        let hw = ancient_chain(FontChoice::HuiwenMincho);
+        assert!(hw.contains(&"Huiwen-mincho"), "汇文明朝族名错：{hw:?}");
+    }
+
+    /// **字体陈列表只许往后长**（v1.83.0）：`prefs.font_ancient` 存的是
+    /// `FontChoice::CLASSIC` 的下标，往前插一位，所有老存档都会「自己换了
+    /// 个字体」。这条测试把前 8 位钉死，新字体只能追加在队尾。
+    #[test]
+    fn classic_font_table_only_grows_at_the_tail() {
+        assert_eq!(FontChoice::CLASSIC.len(), 10);
+        assert_eq!(FontChoice::CLASSIC[0], FontChoice::WenJinMincho);
+        assert_eq!(FontChoice::CLASSIC[4], FontChoice::SourceHanSans);
+        assert_eq!(FontChoice::CLASSIC[7], FontChoice::Qiji);
+        assert_eq!(FontChoice::CLASSIC[8], FontChoice::FZQingKeBen);
+        assert_eq!(FontChoice::CLASSIC[9], FontChoice::HuiwenMincho);
+    }
 
     #[test]
     fn chain_prefers_installed_family() {

@@ -179,12 +179,21 @@ pub enum FontChoice {
     SystemDefault,
     /// 齐伋体（明刻本活字风貌，木味古拙，自带古籍刻本气韵；随包静态打包）
     Qiji,
+    /// **方正清刻本悦宋**（v1.83.0）：真正的**清刻本**匠体——横细竖粗、
+    /// 字面略窄、竖排标点规矩，与「仿古籍精刻本」主题是一对。
+    ///
+    /// **不随包**（版权字库，3 MB 且需授权）：用户自备放进
+    /// `Library::home()/fonts/` 即自动注册；没装时沿回退链落到宋体，
+    /// 版式不塌。仿刻本主题进入时优先选它，装不到才退回齐伋体。
+    FZQingKeBen,
 
-    // —— 旧版遗留：仅为兼容旧存档与内部兜底，UI 已不再陈列 ——
+    // —— 旧版遗留：仅为兼容旧存档与内部兜底 ——
     SongTi,
     SourceHanSerif,
     ZhuqueFangsong,
     JinghuaOldSong,
+    /// 汇文明朝（v1.83.0 起重新陈列）：明朝体骨架、笔画清瘦，
+    /// 竖排小字极耐看；同样不随包，用户自备即注册。
     HuiwenMincho,
     HuiwenZhengkai,
     HanchanHuofang,
@@ -203,6 +212,7 @@ impl FontChoice {
             FontChoice::LatinModern => "西文数字",
             FontChoice::SystemDefault => "默认字体",
             FontChoice::Qiji => "齐伋体",
+            FontChoice::FZQingKeBen => "清刻本悦宋",
             // 旧版遗留
             FontChoice::SongTi => "宋体",
             FontChoice::SourceHanSerif => "思源宋体",
@@ -218,7 +228,7 @@ impl FontChoice {
     /// 正文字体组（版字页的竖排字牌按此顺序陈列）：
     /// 两款大字库宋体打头，楷体 / 黑体 / 等宽 / 西文随后——一套字体覆盖
     /// 正文、批注、标题、混排西文四类角色，不必再装一堆零散字库。
-    pub const CLASSIC: [FontChoice; 8] = [
+    pub const CLASSIC: [FontChoice; 10] = [
         FontChoice::WenJinMincho,
         FontChoice::MengYuanSerif,
         FontChoice::XuandongKaishu,
@@ -227,6 +237,10 @@ impl FontChoice {
         FontChoice::ShangguMono,
         FontChoice::LatinModern,
         FontChoice::Qiji,
+        // v1.83.0 追加在**队尾**：`prefs.font_ancient` 存的是这张表的下标，
+        // 往前插会叫所有老存档「换了个字体」——只许往后长。
+        FontChoice::FZQingKeBen,
+        FontChoice::HuiwenMincho,
     ];
 
     /// **批注字体**组：楷体二选一（玄冬楷书 / 霞鹜文楷）。

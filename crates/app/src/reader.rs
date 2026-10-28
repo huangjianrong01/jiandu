@@ -11592,9 +11592,19 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
 
     /// 进入仿刻本时套上的「刻本三件套」（字体 / 句读 / 丝栏）。
     fn apply_keben_preset(&mut self) {
-        // 齐伋体是唯一随包编入的字库（`include_bytes!`），选它绝不会落空；
-        // 落到系统字体上则是「换了个纸色，字一点没变」，白折腾。
-        self.set_font(FontChoice::Qiji);
+        // 字体优先**方正清刻本悦宋**（真·清刻本匠体，用户自备放进 fonts/），
+        // 装不到才退**齐伋体**——后者是唯一随包编入的字库（`include_bytes!`），
+        // 绝不会落空。绝不随便落到系统宋体上：那是「换了个纸色，字一点没变」。
+        let f = if crate::fonts::is_installed(&[
+            "FZQingKeBenYueSongS-R-GB",
+            "FZQKBYSJW--GB1-0",
+            "方正清刻本悦宋简体",
+        ]) {
+            FontChoice::FZQingKeBen
+        } else {
+            FontChoice::Qiji
+        };
+        self.set_font(f);
         // 句读：句作空心小圈「〇」、读作圆头斜点——影印本上就是这个。
         self.punct_mode = crate::gloss::PunctMode::Classic;
         // 精刻本用乌丝栏（朱丝栏是套印本另一路，留给「丝栏」那一排自选）。
@@ -11614,7 +11624,12 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
                 self.rule_color = r;
             }
             None => {
-                if self.current_font() == FontChoice::Qiji {
+                // 进档时可能落的是清刻本悦宋、也可能是齐伋体——两档都算
+                // 「还是刻本那一套」，出档要一起还原。
+                if matches!(
+                    self.current_font(),
+                    FontChoice::Qiji | FontChoice::FZQingKeBen
+                ) {
                     self.set_font(FontChoice::WenJinMincho);
                 }
                 if self.punct_mode == crate::gloss::PunctMode::Classic {
