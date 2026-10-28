@@ -6717,14 +6717,16 @@ impl Root {
             base_ink
         };
 
-        // ── 竖排注音（生僻字拼音）──────────────────────────────────
-        // v1.85.0：整串拼音**顺时针旋转 90°** 贴在字格右侧——字号吃满正文
-        // 40%（长拼音才收敛），右侧留 `rl.gutter` 呼吸间距，纵向绝不溢出
-        // 格高、横向绝不越过界栏。
+        // ── 注音（生僻字拼音）────────────────────────────────────
+        // v1.85.2：整串**横排、正立、从左到右**，落在汉字右侧的列间空白里——
+        // 与竖排正文同向读（字自上而下、音横着念），不必歪头。字号吃满正文
+        // 40%（长拼音按可用宽收敛，下限 22%），左缘从汉字右缘让开一点呼吸，
+        // 右缘绝不碰到下一列的字形。
         //
-        // GPUI 的 `paint_glyph` 转不动字形，故真旋转走 `ruby_glyph`：CoreGraphics
-        // 离屏把整串转 90° 渲成位图，再用 `img` 贴上来（详见该文件头）。
-        // 万一光栅失败（无字体 / 非 macOS），才退回逐字母竖叠。
+        // GPUI 既转不动字形也没有排版引擎，故整串走 `ruby_glyph`：CoreGraphics
+        // 离屏渲成一张透明位图，再用 `img` 按 `ruby::layout` 给的框贴进字格
+        // （详见该两处的文件头）。万一光栅失败（无字体 / 非 macOS），退回
+        // 逐字母横排的 div。
         if let Some(py) = rare_py.as_deref() {
             let rl = crate::ruby::layout(py, fs, cell_w, cell_h);
             let note_ink = self.palette.note(t);
@@ -6732,28 +6734,30 @@ impl Root {
                 cell = cell.child(
                     div()
                         .absolute()
+                        .left(px(rl.left))
                         .top(px(rl.top))
-                        .right(px(rl.gutter))
                         .w(px(rl.block_w))
                         .h(px(rl.block_h))
                         .child(gpui::img(im).w(px(rl.block_w)).h(px(rl.block_h))),
                 );
             } else {
-                // 退化：逐字母竖叠（步进取字母全高，绝不叠墨）。
-                let step = rl.fs * 1.02;
+                // 退化：逐字母横排（等距分格，绝不叠墨、绝不越界）。
+                let n = py.chars().count().max(1) as f32;
+                let step = rl.block_w / n;
                 let mut ruby = div()
                     .absolute()
+                    .left(px(rl.left))
                     .top(px(rl.top))
-                    .right(px(rl.gutter))
                     .w(px(rl.block_w))
+                    .h(px(rl.block_h))
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .items_center();
                 for ch in py.chars() {
                     ruby = ruby.child(
                         div()
-                            .w_full()
-                            .h(px(step))
+                            .w(px(step))
+                            .h_full()
                             .flex()
                             .items_center()
                             .justify_center()

@@ -320,12 +320,12 @@ impl AiPanel {
             return;
         }
         self.pending_focus = false;
-        // 设置页（没配过密钥）时不抢：那页有地址 / 模型 / 密钥三栏，
-        // 抢到提问框反而挡住用户先要填的东西。
-        if self.settings {
-            return;
-        }
-        self.focus_field(F_ASK, window);
+        // 设置页（还没配好）落第一栏「接口地址」——这一页就是要人填字的。
+        // ⚠️ v1.85.2 修的正是这里：此前在设置页**直接 return、一栏都不聚焦**，
+        // 于是面板开着、光标却不在任何输入框里，敲什么都是空的（输入法没有
+        // 落点，`InputField::paint` 也就不给这个框登记 handler）。用户因此
+        // 连配置都填不进去 —— 表现为「问小笺用不了」。
+        self.focus_field(if self.settings { F_URL } else { F_ASK }, window);
     }
 
     /// 当前设置页是否开着（Root 决定是否给焦点）。
@@ -435,8 +435,17 @@ impl AiPanel {
             return;
         }
         if !self.cfg.ready() {
-            self.error = Some("先在设置里填好接口与密钥".to_string());
-            self.settings = true;
+            // v1.85.2：**绝不把人踹回设置页**。
+            //
+            // 旧逻辑在这一支里 `self.settings = true`，于是每按一次回车就跳一次
+            // 设置页——用户的体验正是「一对话就跳到设置界面，根本没法对话」
+            // （问答两页来回弹，刚打的字也丢了）。更常见的实情是：人已经在设置
+            // 页把三栏填好，只是没按「存」，`cfg` 里仍是空的，于是永远判不 ready。
+            // 现在先把三栏草稿收下（有值才写），仍不齐就只在会话里留一句人话。
+            self.collect_drafts();
+        }
+        if !self.cfg.ready() {
+            self.error = Some("先在右上『設置』填好接口地址、模型與密鑰".to_string());
             cx.notify();
             return;
         }
@@ -582,13 +591,27 @@ impl AiPanel {
         cx.notify();
     }
 
-    /// 存设置：三栏草稿回写配置 → 落盘（0600）→ 回会话页。
-    fn save_settings(&mut self, cx: &mut Context<Self>) {
-        self.cfg.base_url = self.drafts[F_URL].text.trim().to_string();
-        self.cfg.model = self.drafts[F_MODEL].text.trim().to_string();
-        self.cfg.api_key = self.drafts[F_KEY].text.trim().to_string();
+    /// 把设置页三栏的草稿收进 `cfg` 并落盘（「存」钮与发问前都走这条）。
+    ///
+    /// **三栏全空就什么都不做**：别拿空值把磁盘上已经存好的配置冲掉
+    /// （用户清空一栏是编辑动作，不该等价于「删掉配置」）。
+    fn collect_drafts(&mut self) {
+        let url = self.drafts[F_URL].text.trim().to_string();
+        let model = self.drafts[F_MODEL].text.trim().to_string();
+        let key = self.drafts[F_KEY].text.trim().to_string();
+        if url.is_empty() && model.is_empty() && key.is_empty() {
+            return;
+        }
+        self.cfg.base_url = url;
+        self.cfg.model = model;
+        self.cfg.api_key = key;
         self.cfg.sanitize();
         self.cfg.save();
+    }
+
+    /// 存设置：三栏草稿回写配置 → 落盘（0600）→ 回会话页。
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        self.collect_drafts();
         self.settings = false;
         self.error = None;
         cx.notify();

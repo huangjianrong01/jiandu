@@ -1,25 +1,24 @@
-//! 生僻字注音的**真·旋转**位图（v1.85.0）。
+//! 生僻字注音位图（v1.85.2）：**横排、正立、从左到右**。
 //!
 //! ## 为什么要有这个文件
 //!
-//! 竖排注音的正确形态是「整串拼音**顺时针旋转 90°** 贴在汉字右侧」。但
-//! GPUI 0.2.2 的 `Window::paint_glyph` 把 `TransformationMatrix::unit()`
-//! **写死**在场景图元里（见 `gpui-0.2.2/src/window.rs`），屏幕侧根本没有
-//! 旋转字形的入口——v0.5.0 那版 `west::rotated_slots` 就是把 `angle_deg`
-//! 算好了却无处施用，最后退化成「直立并排」（提交说明里写得很清楚）。
+//! GPUI 0.2.2 没有排版引擎可用（`paint_glyph` 只画单个字形、字距要自己算），
+//! 而注音是一整串带声调的拉丁字母，字距、升部、降部都得对。绕开的办法是：
+//! **CoreGraphics 离屏**把整串渲成一张透明位图，交给 GPUI 的 `img` 贴进字格。
 //!
-//! 这里绕开它：**CoreGraphics 离屏**把整串按 90° 转好、渲成一张透明位图，
-//! 再交给 GPUI 的 `img` 元素贴到字格右侧。位图内容是真的旋转过的字形，
-//! 不是「字母竖着摞」。
+//! 早先这里做的是「整串转 90°」，转出来是一条竖条——字母躺着，读起来要歪头，
+//! 用户否掉了。现在就是老老实实的横排正立：字头朝上、从左读到右。
 //!
 //! ## 坐标（照抄 `share_paint` 已验证的结论）
 //!
-//! * 位图缓冲的**第 0 行就是图像顶行**，故「屏幕 y」与「缓冲行号」同序；
+//! * CG 位图上下文的原点在**左下**（y 向上），但缓冲的**第 0 行就是图像顶行**；
 //! * **绝不翻 CTM**（`translate(0,h) + scale(1,-1)` 会把字形垂直镜像）；
-//!   这里只做 `scale → translate → rotate(-90°)`，字形保持正向。
+//! * 基线落在 `pad + descent`（距图像底边），升部向上顶到 `h - pad`。
 //!
-//! 旋转后：局部 `+x`（读序）→ 全局**向下**；局部 `+y`（字母的上）→ 全局**向右**。
-//! 正是竖排注音该有的「从上往下读、字头朝右」。
+//! ## 尺寸
+//!
+//! 位图 = 串的自然宽 + 两侧 pad × 字高（升部 + 降部）+ 上下 pad，
+//! 由 `ruby::layout` 给出目标框，`img` 按框缩放，屏幕与纸面逐字同位。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,7 +27,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 const SS: f64 = 3.0;
 
 /// 注音字体候选：拉丁字母 + 声调字符（ā á ǎ à ē ě ū ǚ …）必须齐全。
-/// PingFang 全覆盖；Helvetica 老系统兜底；都缺字形就**不画**（退回竖叠）。
+/// PingFang 全覆盖；Helvetica 老系统兜底；都缺字形就**不画**（退回逐字母）。
 const FONTS: [&str; 3] = ["PingFangSC", "Helvetica", "Menlo"];
 
 /// 位图格式：32 位**大端** + **预乘** alpha 在最后。
@@ -47,7 +46,7 @@ fn cache() -> &'static Mutex<HashMap<String, Arc<gpui::RenderImage>>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 一条拼音**顺时针旋转 90°** 后的位图。失败返回 `None`（调用方退化）。
+/// 一条拼音的横排位图。失败返回 `None`（调用方退化）。
 ///
 /// * `fs`：拼音字号（由 `ruby::layout` 给出）；
 /// * `color`：`0xRRGGBB` 墨色。
@@ -96,7 +95,7 @@ fn render(py: &str, fs: f64, color: u32) -> Option<gpui::RenderImage> {
 
 /// 光栅成 **BGRA** 缓冲（gpui 的 `RenderImage` 内部就是 BGRA，见
 /// `gpui/src/elements/img.rs` 里加载图片时的 RGBA→BGRA 交换）。
-/// 拆出这一层是为了让单测能直接验通道序——颜色画反了在屏幕上一眼可见。
+/// 拆出这一层是为了让单测能直接验通道序与朝向——画反了在屏幕上一眼可见。
 #[cfg(target_os = "macos")]
 fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
     use core_graphics::color_space::CGColorSpace;
@@ -137,7 +136,7 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
         return None;
     }
 
-    // ② 逐个步进 → 整串连写的自然宽度（这就是旋转后的**纵向**长度）。
+    // ② 逐个步进 → 整串连写的自然宽度（横排的宽就是它）。
     let mut sizes = vec![CGSize::new(0.0, 0.0); n];
     unsafe {
         font.get_advances_for_glyphs(
@@ -152,12 +151,12 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
         return None;
     }
 
-    // ③ 位图尺寸：横 = 字母的高（降部 + 升部），纵 = 串长。
+    // ③ 位图尺寸：横 = 串长，纵 = 字母的高（升部 + 降部）。
     let asc = font.ascent();
     let desc = font.descent();
     let pad = 1.0;
-    let w = (desc + asc + pad * 2.0).ceil().max(2.0);
-    let h = (run_w + pad * 2.0).ceil().max(2.0);
+    let w = (run_w + pad * 2.0).ceil().max(2.0);
+    let h = (asc + desc + pad * 2.0).ceil().max(2.0);
     let bw = (w * SS).round() as usize;
     let bh = (h * SS).round() as usize;
 
@@ -168,16 +167,11 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
     ctx.set_should_antialias(true);
     // 新建的位图上下文内容全零 —— 即透明底，注音因此只叠在纸面上，不糊白块。
 
-    // ④ **顺时针 90°**（竖排注音的标准朝向，用户 v1.85.0 定稿）：
-    //    放大到超采样网格 → 原点挪到「基线 / 顶行」→ 转 −90°。
-    //
-    //    转 −90° 后：局部 `+x`（读序）→ 全局向下；局部 `+y`（字母的上）
-    //    → 全局向右。即「字头朝右、自上而下读」——与竖排正文的行气同向。
-    //    平移量随之反算：基线放在 `x = pad + desc`（降部向左伸到 `pad`，
-    //    升部向右伸到 `w - pad`）；串起点放在 `y = h - pad`（顶行）。
+    // ④ 正立横排：放大到超采样网格 → 原点挪到「左内边距 / 基线」。
+    //    CG 位图上下文原点在左下、y 向上，故基线离底边 `pad + desc`，
+    //    升部正好顶到 `h - pad`。**不旋转、不翻 CTM**。
     ctx.scale(SS, SS);
-    ctx.translate(pad + desc, h - pad);
-    ctx.rotate(-std::f64::consts::FRAC_PI_2);
+    ctx.translate(pad, pad + desc);
 
     let (r, g, b) = rgb_of(color);
     ctx.set_rgb_fill_color(r, g, b, 1.0);
@@ -210,7 +204,7 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
 
 #[cfg(not(target_os = "macos"))]
 fn render(_py: &str, _fs: f64, _color: u32) -> Option<gpui::RenderImage> {
-    // 非 macOS 没有 CoreGraphics：退回竖叠（由 `reader` 侧自行降级）。
+    // 非 macOS 没有 CoreGraphics：由 `reader` 侧自行降级成逐字母横排。
     None
 }
 
@@ -218,47 +212,43 @@ fn render(_py: &str, _fs: f64, _color: u32) -> Option<gpui::RenderImage> {
 mod tests {
     use super::*;
 
-    /// 旋转后的注音必须是**竖长条**：纵向（串长）明显长于横向（字母高）。
-    /// 这一条同时钉死两件事：位图真的画出来了，且方向是「整串转 90°」
-    /// 而不是横排（横排的话宽会反过来大于高）。
+    /// 注音位图必须是**横长条**：宽（串长）明显大于高（字母高）。
+    /// 这条同时钉死两件事：位图真的画出来了，且是横排——若哪天又改回
+    /// 「转 90° 竖条」，宽高比会立刻反过来。
     #[test]
-    fn rotated_ruby_bitmap_is_tall_and_narrow() {
+    fn ruby_bitmap_is_wider_than_tall() {
         let im = ruby_image("měng", 12.0, 0x8C2B22).expect("注音位图应当渲染成功");
         let s = im.size(0);
         let (w, h) = (s.width.0 as f32, s.height.0 as f32);
         assert!(
-            h > w * 1.6,
-            "四个字母转 90° 后应是竖长条，实得 {w:.1}×{h:.1}"
+            w > h * 1.6,
+            "四个字母横排后应是横长条，实得 {w:.1}×{h:.1}"
         );
     }
 
-    /// **朝向钉死**：字母 `T` 转 **顺时针** 90° 后，T 顶部那条横杠（字母
-    /// 的「上」）落在位图**右侧**，竖杠变成横向。断言「墨最重的那一列在
-    /// 右半边」——若哪天把旋转方向改回逆时针，这条会立刻红。
-    ///
-    /// 之所以需要这条：屏幕侧位图的行序与 CG 的 y 轴方向正是当初判错朝向
-    /// 的地方，靠肉眼看截图定不了案。
+    /// **朝向钉死**：字母 `T` 顶部那条横杠（字母的「上」）必须落在位图**上半**，
+    /// 竖杠居中。若哪天又被转成侧躺，重墨的行会跑到左右两侧去。
     #[cfg(target_os = "macos")]
     #[test]
-    fn ruby_is_rotated_clockwise() {
+    fn ruby_letters_stand_upright() {
         let (bw, bh, buf) = raster("T", 40.0, 0xFF0000).expect("位图");
-        let mut col_ink = vec![0u32; bw];
+        let mut row_ink = vec![0u32; bh];
         for y in 0..bh {
             for x in 0..bw {
                 if buf[(y * bw + x) * 4 + 3] > 128 {
-                    col_ink[x] += 1;
+                    row_ink[y] += 1;
                 }
             }
         }
-        let heaviest = col_ink
+        let heaviest = row_ink
             .iter()
             .enumerate()
             .max_by_key(|(_, n)| *n)
             .map(|(i, _)| i)
             .expect("字形应有墨");
         assert!(
-            heaviest > bw / 2,
-            "T 的横杠落在左半边（列 {heaviest}/{bw}）——旋转方向成了逆时针"
+            heaviest < bh / 2,
+            "T 的横杠落在下半（行 {heaviest}/{bh}）——字母躺倒了"
         );
     }
 
