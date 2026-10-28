@@ -806,6 +806,24 @@ pub struct Root {
     /// 刚敲错：输入框下方浮一行朱砂小字，下一次输入自动清掉。
     pub beta_err: bool,
 
+    // ---- 授权（v1.81.0 · 模块六）----
+    /// **本机已激活**：启动时读凭据（`license::activated()`）。
+    ///
+    /// 与 `beta_ok` 是两件事：内测码管「能不能进这个包」，授权管「能不能
+    /// 出活」（导出 / 印制）。内测期间持邀请码者视同已激活——人家已经在
+    /// 帮忙测了，再把导出锁上没道理。
+    pub license_ok: bool,
+    /// 激活纸（居中浮层）开没开。与 `show_analysis` 同款：不进 `AppUIState`
+    /// 那套互斥状态机，开合不牵动别处的动画状态。
+    pub show_license: bool,
+    /// key 草稿与光标（字符下标）。
+    pub license_code: String,
+    pub license_cursor: usize,
+    /// 激活纸输入框的焦点句柄。
+    pub license_focus: FocusHandle,
+    /// 刚敲错：与 `beta_err` 同款，下一次输入自动清掉。
+    pub license_err: bool,
+
     // ---- 全文检索 ----
     /// 检索面板是否展开。
     pub show_search: bool,
@@ -1245,6 +1263,12 @@ impl Root {
             beta_cursor: 0,
             beta_focus: cx.focus_handle(),
             beta_err: false,
+            license_ok: jiandu_core::license::activated(),
+            show_license: false,
+            license_code: String::new(),
+            license_cursor: 0,
+            license_focus: cx.focus_handle(),
+            license_err: false,
             show_search: false,
             ui_state: AppUIState::None,
             search_draft: String::new(),
@@ -1354,6 +1378,10 @@ impl Root {
                     };
                     root.show_analysis = true;
                 }
+                // 激活纸（v1.81.0 · 模块六）：同款调试口子。想核对「已激活」
+                // 那一屏，先 `python3 scripts/gen_license.py` 铸一枚、用
+                // `JIANDU_HOME=<临时目录>` 起一次、在纸上敲进去即可。
+                "license" => root.show_license = true,
                 _ => {}
             }
         }
@@ -3326,8 +3354,29 @@ impl Root {
             cx.notify();
             return false;
         }
+        // v1.81.0 · 模块六：**未激活不许出活**。
+        //
+        // 卡在这一处（而不是八个出口各写一遍）是刻意的：PNG / PDF / MD /
+        // 批注 / 卡片 CSV / Obsidian 全都过这个闸门，漏一个就等于那条路免费。
+        // 阅读、批注、卡片匣、文本分析**不受影响**——没付钱也该能读完一本书。
+        if !self.licensed() {
+            self.notice = "未激活：导出与印制需先激活（更多 → 激活）".to_string();
+            cx.notify();
+            return false;
+        }
         self.export_busy = true;
         true
+    }
+
+    /// **能不能出活**（导出 / 印制）。
+    ///
+    /// 两条凭据取「或」：正式授权 key，或内测邀请码（内测期间持码者视同
+    /// 已激活——人家在帮忙测，把导出锁上没道理）。将来接 App Store 内购，
+    /// 在这里再加一条「或收据有效」即可，其余代码一行不动。
+    pub fn licensed(&self) -> bool {
+        // 用**缓存字段**而不是每次去读文件：`render_license_sheet` 每帧都要问
+        // 一次这一句，走 `gate::redeemed()` 就成了一帧一次磁盘读。
+        self.license_ok || self.beta_ok
     }
 
     pub fn export_page_png(&mut self, _window: &Window, cx: &mut Context<Self>) {
@@ -4453,6 +4502,8 @@ fn anki_push_card(
             || self.show_ai
             // v1.81.0：文本分析抽屉（与「改键」面板同款，独立浮层）。
             || self.show_analysis
+            // v1.81.0 · 模块六：激活纸（同上，独立浮层）。
+            || self.show_license
             // v1.80.0：两枚下拉（顶栏「更多」与旧「导出」）也算浮层——
             // 菜单摊着时，纸面上的单击不该翻页。
             || self.more_menu
@@ -6276,6 +6327,11 @@ impl Render for Root {
         } else if self.note_editing {
             // 笔记框要接中文：焦点必须落在它自己的句柄上，IME 才认这块区域。
             window.focus(&self.note_focus);
+        } else if self.show_license {
+            // 激活纸（v1.81.0 · 模块六）：key 是英数、不接 IME，但焦点仍须
+            // 落在纸张自己的句柄上——否则挂在 sheet 上的 `on_key_down`
+            // 收不到键，敲半天一个字也进不去。
+            window.focus(&self.license_focus);
         } else if self.show_ai && self.ai_panel.read(cx).holds_focus(window) {
             // 问小笺（v1.78.1）：**这里必须放手**。
             // 面板是独立 Entity，四个输入框的句柄都不在 `Root` 名下——焦点一
@@ -6365,6 +6421,14 @@ impl Render for Root {
                     .bottom(px(30.0))
                     .child(crate::reader::banxin_seal(22.0, 40.0)),
             );
+        }
+        // 激活纸（v1.81.0 · 模块六）：画在**最后** = 最上层。
+        //
+        // 与其余浮层不同，它挂在 Root 这一层而不是 `render_reading` 里：
+        // 授权是「这个 App 的事」，不是「这一本书的事」——书架上也该能打开
+        // （将来若加「开机即问激活」，才不必再挪一次位置）。
+        if self.show_license {
+            root = root.child(self.render_license_sheet(cx));
         }
         root.into_any_element()
     }

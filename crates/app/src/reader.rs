@@ -389,7 +389,7 @@ pub(crate) fn wrap_lines(s: &str, per_line: usize) -> Vec<String> {
         .collect()
 }
 
-fn small_button(label: &str, on: bool, t: Theme) -> Div {
+pub(crate) fn small_button(label: &str, on: bool, t: Theme) -> Div {
     let (bg, fg) = if on {
         (t.chip_on(), t.accent())
     } else {
@@ -1992,6 +1992,10 @@ impl Root {
                         // 打开按那时的范围重算，不拿旧数糊弄人。
                         self.show_analysis = false;
                         self.analysis = None;
+                        // 激活纸（v1.81.0 · 模块六）：一并收起。它自己也认 Esc
+                        // （焦点在纸上时走的是它那条 `on_key_down`），这里是
+                        // 「焦点不在纸上」时的兜底。
+                        self.show_license = false;
                         self.show_share_panel = false;
                         self.close_lookup();
                         self.clear_selection();
@@ -4186,6 +4190,18 @@ impl Root {
                     crate::app::AnalysisScope::Chapter
                 };
                 this.open_analysis(scope, cx);
+            }),
+        ));
+        // ③·f **激活**（v1.81.0 · 模块六）：未激活时导出与印制是锁着的，
+        //      菜单上必须有一处能走到那张纸——否则用户撞见「未激活」提示后
+        //      找不到门。已激活也留着这一项：点了是回执（凭据 + 不绑机说明）。
+        let lic_label = if self.licensed() { "已激活" } else { "激活" };
+        menu = menu.child(mitem("more-license", lic_label).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.more_menu = false;
+                this.open_license(cx);
             }),
         ));
         // ④ **說明**（v1.80.0）：原先顶栏最右那枚「帮助」钮搬进下拉。

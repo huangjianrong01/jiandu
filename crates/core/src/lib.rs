@@ -55,6 +55,10 @@ pub mod importer;
 /// 各格式先「断头」剥壳 → 清洗 → 落进 IR，引擎只认这一份数据。
 pub mod ir;
 pub mod library;
+/// **授权**（v1.81.0 · 模块六）：离线 key，自带校验位，**不绑机器**。
+/// 只防随手转发与手抄错字，不做加密对抗——真要对抗得靠服务器或 App Store
+/// 收据。铸 key 的脚本在 `scripts/gen_license.py`（算法必须与本模块同式）。
+pub mod license;
 pub mod numcn;
 pub mod parsers;
 pub mod pipeline;

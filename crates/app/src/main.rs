@@ -53,6 +53,9 @@ mod importer;
 // 归一化漏一处，整条 ⌘⇧A 就静默失效。
 mod keys;
 mod lines;
+/// **授权**（v1.81.0 · 模块六）：激活纸的 UI 层。纯逻辑（校验位 /
+/// 归一 / 凭据）在 `jiandu_core::license`。
+mod license;
 mod margin;
 /// **内存探针（macOS）**（v1.81.0）：`task_info(TASK_BASIC_INFO_64)` 读本进程
 /// 常驻内存，交给 `jiandu_core::mem` 的护栏。core 不许 `#[cfg(target_os)]`，
