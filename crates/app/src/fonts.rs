@@ -25,7 +25,7 @@
 use crate::types::{FontChoice, FontPreset, Script};
 use gpui::{App, SharedString};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 // ----------------------------------------------------------------------
 // 全局字体配置对象
@@ -155,10 +155,7 @@ pub const FONT_CONFIGS: [FontConfig; 4] = [
 
 /// 按角色取族名：`FONT_CONFIGS` 里那条链上第一个系统真正有的字体。
 pub fn family_for_role(role: FontRole) -> SharedString {
-    pick_font(
-        role.cfg().chain,
-        AVAILABLE.get().map(|v| v.as_slice()).unwrap_or(&[]),
-    )
+    with_avail(|av| pick_font(role.cfg().chain, av))
 }
 
 /// **排版字体**（设置面板那一行）对应的正文 / 批注族名。
@@ -240,7 +237,29 @@ const BUNDLED: &[&str] = &[
 ];
 
 /// 系统可用字体族名（启动时缓存一次）。
-static AVAILABLE: OnceLock<Vec<String>> = OnceLock::new();
+///
+/// v1.84.0：外层 `OnceLock` 只管「初始化一次」，里层 `Mutex` 允许**导入字体
+/// 后就地刷新**（`refresh_available`）——不然「导入本地字体」要重启才生效。
+static AVAILABLE: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+/// 借一眼可用字体表：传闭包而不是返回 `Vec`，免得每帧渲染都克隆几百个族名。
+fn with_avail<R>(f: impl FnOnce(&[String]) -> R) -> R {
+    let guard = AVAILABLE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    f(&guard)
+}
+
+/// 重新抓一次系统字体族名（导入字库后调用，使新字体**当场**可选）。
+pub fn refresh_available(cx: &mut App) {
+    let names = cx.text_system().all_font_names();
+    let mut guard = AVAILABLE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = names;
+}
 
 /// 字体文件可能所在的目录（源码树运行 / .app bundle / 免安装包 / 沙盒拖拽入口）。
 fn font_dirs() -> Vec<PathBuf> {
@@ -322,8 +341,7 @@ pub fn register_bundled_fonts(cx: &mut App) {
             }
         }
     }
-    let names = cx.text_system().all_font_names();
-    let _ = AVAILABLE.set(names);
+    refresh_available(cx);
 }
 
 /// 古文模式字体回退链。
@@ -534,7 +552,7 @@ pub fn modern_chain(choice: FontChoice) -> Vec<&'static str> {
 /// 走现代链只会退化成系统黑体。
 pub fn note_family(choice: FontChoice) -> SharedString {
     let chain = ancient_chain(choice);
-    pick_font(&chain, AVAILABLE.get().map(|v| v.as_slice()).unwrap_or(&[]))
+    with_avail(|av| pick_font(&chain, av))
 }
 
 /// **天头眉批**的族名（v1.52.0）：恒定楷体，与 `font_note` 的选择无关。
@@ -557,7 +575,7 @@ const KAI_CHAIN: &[&str] = &[
 ];
 
 pub fn head_family() -> SharedString {
-    pick_font(KAI_CHAIN, AVAILABLE.get().map(|v| v.as_slice()).unwrap_or(&[]))
+    with_avail(|av| pick_font(KAI_CHAIN, av))
 }
 
 /// 按当前模式与字体选择返回字体族名：回退链上第一个系统真正拥有的字体。
@@ -570,7 +588,7 @@ pub fn family_for(choice: FontChoice, script: Script) -> SharedString {
         Script::Ancient => ancient_chain(choice),
         Script::Modern => modern_chain(choice),
     };
-    pick_font(&chain, AVAILABLE.get().map(|v| v.as_slice()).unwrap_or(&[]))
+    with_avail(|av| pick_font(&chain, av))
 }
 
 /// 给定一个偏好字体的回退链，返回第一个「可用」的字体族名。
@@ -580,15 +598,80 @@ pub fn family_for(choice: FontChoice, script: Script) -> SharedString {
 /// 走的是启动时缓存的那张系统族名表（`register_bundled_fonts` 填的
 /// `AVAILABLE`），不每次读盘。
 pub fn is_installed(aliases: &[&str]) -> bool {
-    let Some(avail) = AVAILABLE.get() else {
-        return false;
-    };
-    if avail.is_empty() {
-        return false;
+    with_avail(|avail| {
+        if avail.is_empty() {
+            return false;
+        }
+        aliases
+            .iter()
+            .any(|a| avail.iter().any(|f| f.eq_ignore_ascii_case(a)))
+    })
+}
+
+/// **方正清刻本悦宋**是否装上了（v1.84.0：出厂正文默认就是它）。
+///
+/// 别名与 `ancient_chain(FZQingKeBen)` 同源，只写这一处，别在别处再抄一遍
+/// ——族名抄错一个字，GPUI 就静默回退成宋体（界面上只看到「换了没反应」）。
+pub fn qingkeben_installed() -> bool {
+    is_installed(&[
+        "FZQingKeBenYueSongS-R-GB",
+        "FZQKBYSJW--GB1-0",
+        "方正清刻本悦宋简体",
+    ])
+}
+
+/// 把用户挑来的字体收进 `Library::home()/fonts/` 并**当场注册**（v1.84.0）。
+///
+/// 之前只能「把文件拖进目录、重启应用」——那对第一次装字库的人太绕。现在
+/// 版字面板最下方那枚小钮直接调它：复制进用户字库目录（与启动时自动扫描
+/// 的入口是同一个，故下次启动照样在）、`add_fonts` 即时注册、再刷新族名
+/// 缓存，新字体**这一秒**就能在字体行里选中。
+///
+/// 返回 `(成功款数, 失败的文件名)`。写盘失败（只读卷 / 沙盒拒绝）的文件
+/// 仍会尝试即时注册——只是下次启动不再自动带上。
+pub fn import_user_fonts(paths: &[PathBuf], cx: &mut App) -> (usize, Vec<String>) {
+    let dir = jiandu_core::library::Library::fonts_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let mut ok = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for src in paths {
+        let ext = src
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
+            failed.push(
+                src.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string(),
+            );
+            continue;
+        }
+        let Some(name) = src.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+            failed.push("?".to_string());
+            continue;
+        };
+        let dst = dir.join(&name);
+        if std::fs::copy(src, &dst).is_err() {
+            failed.push(name.clone());
+        }
+        match std::fs::read(&dst).or_else(|_| std::fs::read(src)) {
+            Ok(bytes) => {
+                if cx.text_system().add_fonts(vec![bytes.into()]).is_ok() {
+                    ok += 1;
+                } else {
+                    failed.push(name);
+                }
+            }
+            Err(_) => failed.push(name),
+        }
     }
-    aliases
-        .iter()
-        .any(|a| avail.iter().any(|f| f.eq_ignore_ascii_case(a)))
+    // 新字体已进 GPUI，族名表要重抓一次，否则 `is_installed` / `pick_font`
+    // 还按旧表挑，选了新字体也落不到它身上。
+    refresh_available(cx);
+    (ok, failed)
 }
 
 pub fn pick_font(chain: &[&str], available: &[String]) -> SharedString {

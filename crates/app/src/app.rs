@@ -1101,6 +1101,14 @@ impl Root {
         // 阅读偏好（跨书持久化）：留白档从这里落下——文件缺失 / 损坏一律
         // 回落默认值（不让坏存档挡住启动），见 `prefs::Prefs::load`。
         let prefs = crate::prefs::Prefs::load();
+        // v1.84.0 出厂字体（用户定稿）：**正文清刻本悦宋、批注霞鹜文楷**。
+        // 清刻本悦宋是用户自备字库——没装就退**齐伋体**（随包编入，绝不会
+        // 落空），绝不静默退成系统宋体：那是「选了刻本，字一点没变」。
+        let default_ancient = if crate::fonts::qingkeben_installed() {
+            FontChoice::FZQingKeBen
+        } else {
+            FontChoice::Qiji
+        };
         let count = library.books.len();
         let mut root = Self {
             library,
@@ -1124,10 +1132,11 @@ impl Root {
             duplex: Duplex::Single,
             layout_mode: crate::grid::LayoutMode::Facing,
             full_scale: 1.0,
-            // 正文首选文津宋体：大字符集、生僻字全覆盖、竖排标点挤压正确。
-            font_ancient: FontChoice::WenJinMincho,
+            // v1.84.0：正文出厂清刻本悦宋（见上 `default_ancient`）、
+            // 批注出厂霞鹜文楷——刻本里「正文匠体、注文手写体」的层次。
+            font_ancient: default_ancient,
             font_modern: FontChoice::SourceHanSans,
-            font_note: FontChoice::XuandongKaishu,
+            font_note: FontChoice::LXGWWenKai,
             font_preset: FontPreset::Song,
             trad_mode: prefs.trad_mode(),
             trad_cache: std::cell::RefCell::new(std::collections::HashMap::new()),

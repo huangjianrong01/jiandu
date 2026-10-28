@@ -251,6 +251,28 @@ impl FontChoice {
 
     /// 横笺用的无衬线组（思源黑体 / 系统默认）。
     pub const MODERN: [FontChoice; 2] = [FontChoice::SourceHanSans, FontChoice::SystemDefault];
+
+    /// **已下架**（v1.84.0）：思源黑体 / 尚古等宽。
+    ///
+    /// 用户定：这两款现代体放在古籍阅读器里太出戏，版字面板不再陈列。
+    /// ⚠️ **只过滤、绝不从 `CLASSIC` / `MODERN` 数组里删元素**——两张表
+    /// 的下标就是 `prefs.font_ancient` / `font_modern` 的存档值，删中间
+    /// 一项会让所有老存档「自己换了个字体」。
+    pub fn is_retired(self) -> bool {
+        matches!(self, FontChoice::SourceHanSans | FontChoice::ShangguMono)
+    }
+
+    /// 面板实际陈列的字体（剔除已下架的现代体）。
+    ///
+    /// `modern` = 横笺（先列无衬线组），否则只列典籍组。
+    pub fn offered(modern: bool) -> Vec<FontChoice> {
+        let mut v: Vec<FontChoice> = Vec::new();
+        if modern {
+            v.extend(FontChoice::MODERN.iter().copied().filter(|c| !c.is_retired()));
+        }
+        v.extend(FontChoice::CLASSIC.iter().copied().filter(|c| !c.is_retired()));
+        v
+    }
 }
 
 /// **排版字体**（设置面板那一行）：刻本宋体 ↔ 手写楷体。
@@ -1821,6 +1843,40 @@ pub struct GlyphHit {
 mod tests {
     use super::*;
     use crate::types::{Chapter, NoteKind, Paragraph};
+
+    /// v1.84.0：思源黑体 / 尚古等宽两款现代体**下架**——面板不再陈列。
+    ///
+    /// 两条都钉住：① 面板看不到它们；② 数组本身**一个元素都没少**
+    /// （`prefs.font_ancient` 存的是下标，删元素＝老存档串档）。
+    #[test]
+    fn modern_faces_are_retired_but_the_tables_keep_their_indices() {
+        let offered = FontChoice::offered(false);
+        assert!(
+            !offered.contains(&FontChoice::SourceHanSans),
+            "思源黑体还在面板里：{offered:?}"
+        );
+        assert!(
+            !offered.contains(&FontChoice::ShangguMono),
+            "尚古等宽还在面板里：{offered:?}"
+        );
+        // 用户点的「完美阵容」七款必须全在。
+        for keep in [
+            FontChoice::WenJinMincho,
+            FontChoice::MengYuanSerif,
+            FontChoice::XuandongKaishu,
+            FontChoice::LXGWWenKai,
+            FontChoice::Qiji,
+            FontChoice::FZQingKeBen,
+            FontChoice::HuiwenMincho,
+        ] {
+            assert!(offered.contains(&keep), "{keep:?} 被误剔了：{offered:?}");
+        }
+        // 表长与下标不许动：齐伋体 7、清刻本悦宋 8、汇文明朝 9。
+        assert_eq!(FontChoice::CLASSIC.len(), 10, "CLASSIC 表被改短了");
+        assert_eq!(FontChoice::CLASSIC[7], FontChoice::Qiji);
+        assert_eq!(FontChoice::CLASSIC[8], FontChoice::FZQingKeBen);
+        assert_eq!(FontChoice::CLASSIC[9], FontChoice::HuiwenMincho);
+    }
 
     fn sample() -> Book {
         let mut b = Book::new("测试", "佚名");

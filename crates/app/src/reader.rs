@@ -11287,8 +11287,79 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
                 ),
         );
 
+        // ---- 导入本地字体（v1.84.0）：纸的最下方，极小一枚 ----
+        //
+        // 为什么放在这儿：字体行是竖排字牌，塞一枚方钮进去会把它挤散；
+        // 这张纸的规矩是「只管怎么排」，故收在最底下、用极小的字号与淡墨，
+        // 鼠标停上去才转朱砂——看得见、不抢戏。
+        //
+        // 收进 `Library::home()/fonts/`（启动时自动扫描的同一个目录）并
+        // **当场注册**：不用重启就能在字体行里选到新字库。
+        let import_btn = div()
+            .id(SharedString::from("import-font"))
+            .cursor_pointer()
+            .text_size(px(9.5))
+            .text_color(rgb(t.ink_soft()))
+            .hover(|s| s.text_color(rgb(zhu)))
+            .child(SharedString::from("＋ 導入本地字體（ttf / otf / ttc）"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.import_font_dialog(cx);
+                }),
+            );
+        sheet = sheet.child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .pt(px(2.0))
+                .child(import_btn),
+        );
+
         // 作为正文正下方的行内面板（像照片说明），宽度等于单张页面，不遮挡正文。
         sheet
+    }
+
+    /// 弹出系统文件选择器，把挑中的字库收进用户字库目录并当场注册。
+    ///
+    /// ⚠️ 与导入书籍同一条修复：rfd 的**同步**对话框必须前台直调
+    /// （`cx.spawn` + async 裸调），一旦包进 `background_executor`，
+    /// 主循环一挤就静默返回 None——点了「导入」毫无反应，最难查的那种。
+    fn import_font_dialog(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let picked = rfd::FileDialog::new()
+                    .set_title("導入本地字體")
+                    .add_filter("字體 (ttf / otf / ttc)", &["ttf", "otf", "ttc"])
+                    .add_filter("全部文件", &["*"])
+                    .pick_files();
+                let Some(paths) = picked else { return };
+                this.update(&mut cx, |this, cx| {
+                    let (ok, failed) = crate::fonts::import_user_fonts(&paths, cx);
+                    this.toast = Some(if ok > 0 {
+                        format!(
+                            "已收 {ok} 款字體，可直接在「字體」行選用{}",
+                            if failed.is_empty() {
+                                String::new()
+                            } else {
+                                format!("（{} 款未能讀入）", failed.len())
+                            }
+                        )
+                    } else {
+                        "字體未能讀入：請確認是 ttf / otf / ttc".to_string()
+                    });
+                    // 新字库可能正是「清刻本悦宋」这类出厂默认：重挑一次正文，
+                    // 让「装了就立刻生效」，不必重启。
+                    this.fit_sizes();
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
 
@@ -11473,11 +11544,9 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
     fn font_choices_row(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let cur = self.current_font();
-        let mut opts: Vec<FontChoice> = Vec::new();
-        if self.script == Script::Modern {
-            opts.extend_from_slice(&FontChoice::MODERN);
-        }
-        opts.extend_from_slice(&FontChoice::CLASSIC);
+        // v1.84.0：走 `offered`——思源黑体 / 尚古等宽两款现代体已下架，
+        // 面板不再陈列（数组本身没动，老存档下标不串）。
+        let opts: Vec<FontChoice> = FontChoice::offered(self.script == Script::Modern);
 
         let mut row = div()
             .flex()
@@ -11535,11 +11604,8 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
 
     /// 循环切换当前模式的字体（版字页的竖排字牌是点选，这里是快捷键 F）。
     fn cycle_font(&mut self) {
-        let mut opts: Vec<FontChoice> = Vec::new();
-        if self.script == Script::Modern {
-            opts.extend_from_slice(&FontChoice::MODERN);
-        }
-        opts.extend_from_slice(&FontChoice::CLASSIC);
+        // 与面板同一张陈列表（`offered`）：快捷键 F 绝不能切到已下架的字体上。
+        let opts: Vec<FontChoice> = FontChoice::offered(self.script == Script::Modern);
         let idx = opts
             .iter()
             .position(|c| *c == self.current_font())

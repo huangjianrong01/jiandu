@@ -35,7 +35,10 @@ pub struct Prefs {
     /// 现代（横笺）字体：`FontChoice::MODERN` 下标。
     pub font_modern: usize,
     /// **批注字体**（夹注小字 / 放大注卡）：`FontChoice::NOTE` 下标。
-    #[serde(default)]
+    ///
+    /// v1.84.0 起出厂是**霞鹜文楷**（`default_font_note`）：老存档没有这一项
+    /// 时也按它回落（原先是玄冬楷书）。
+    #[serde(default = "default_font_note")]
     pub font_note: usize,
     /// **排版字体**（刻本宋体 / 手写楷体）：`FontPreset::ALL` 下标。
     #[serde(default)]
@@ -139,9 +142,10 @@ impl Default for Prefs {
         Self {
             theme: 0,
             palette: 0,
-            font_ancient: 0,
+            // v1.84.0：正文出厂**清刻本悦宋**、批注出厂**霞鹜文楷**。
+            font_ancient: default_font_ancient(),
             font_modern: 0,
-            font_note: 0,
+            font_note: default_font_note(),
             font_preset: 0,
             zoom: 1.0,
             columns: 12,
@@ -178,6 +182,27 @@ impl Default for Prefs {
 /// 「默认开」的开关：老存档里没有这一项时按 true 回落（响应式开合是默认体验）。
 fn default_true() -> bool {
     true
+}
+
+/// **出厂正文**（v1.84.0 用户定稿）：**方正清刻本悦宋**——真·清刻本匠体，
+/// 横细竖粗、字面略窄，与「仿古籍精刻本」纸是一对。
+///
+/// 存的是 `FontChoice::CLASSIC` 下标：这里按名字反查，往后加字体也不会
+/// 把默认值顶歪。没装这款时渲染沿回退链落宋体（见 `fonts::pick_font`）。
+fn default_font_ancient() -> usize {
+    FontChoice::CLASSIC
+        .iter()
+        .position(|c| *c == FontChoice::FZQingKeBen)
+        .unwrap_or(0)
+}
+
+/// **出厂批注**：**霞鹜文楷**（`FontChoice::NOTE` 下标）——正文匠体、
+/// 注文手写体，正是刻本的层次。
+fn default_font_note() -> usize {
+    FontChoice::NOTE
+        .iter()
+        .position(|c| *c == FontChoice::LXGWWenKai)
+        .unwrap_or(0)
 }
 
 /// 留白档默认值：「中（标准 75%）」。老存档没有 `margin_tier` 时回落这里。
@@ -378,8 +403,24 @@ mod tests {
             "han_digits":false,"notes":true,"sound":true}"#;
         let p: Prefs = serde_json::from_str(old).expect("老存档应能读进来");
         assert!(p.auto_duplex, "响应式开合默认开");
-        assert_eq!(p.font_note(), FontChoice::NOTE[0]);
+        // v1.84.0：批注出厂改成霞鹜文楷，老存档缺这一项时同样按新默认值落
+        // （原来是玄冬楷书）。
+        assert_eq!(p.font_note(), FontChoice::LXGWWenKai);
         assert_eq!(p.font_preset(), FontPreset::Song);
+    }
+
+    /// v1.84.0 定稿：出厂**正文清刻本悦宋、批注霞鹜文楷**。
+    ///
+    /// 出厂值走「按名字反查下标」而不是写死数字——往后往 `CLASSIC` 队尾
+    /// 加字体也不会把默认值顶歪。
+    #[test]
+    fn factory_fonts_are_qingkeben_for_body_and_wenkai_for_notes() {
+        let p = Prefs::default();
+        assert_eq!(p.font_ancient(), FontChoice::FZQingKeBen, "正文出厂应为清刻本悦宋");
+        assert_eq!(p.font_note(), FontChoice::LXGWWenKai, "批注出厂应为霞鹜文楷");
+        // 「刻本宋体」预设的注文字体正是霞鹜文楷，两处不许打架。
+        assert_eq!(FontPreset::Song.note_choice(), FontChoice::LXGWWenKai);
+        assert_eq!(FontPreset::for_main(FontChoice::FZQingKeBen), FontPreset::Song);
     }
 
     #[test]
