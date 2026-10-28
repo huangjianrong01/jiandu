@@ -281,13 +281,15 @@ pub enum PngStage {
     Shoot,
 }
 
-/// **PDF 印制范围**（v1.80.0）：一叶一页，本章则一章一册。
+/// **PDF 印制范围**（v1.80.0）：一叶一页，本章则一章一册，整本则一本书一册。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PdfScope {
     /// 屏幕上正在读的**那一叶** → 一份一页的 PDF。
     Leaf,
     /// 当前**整章** → 一份多页的 PDF。
     Chapter,
+    /// **全书** → 一本一册的多页 PDF（每页按各自章节落篇题与卷首题署）。
+    Book,
 }
 
 
@@ -3619,22 +3621,40 @@ impl Root {
             (PdfScope::Leaf, Some(a)) => a.0,
             _ => self.current_chapter,
         };
-        let flow: Vec<Glyph> = book
-            .to_flow(self.show_punct)
-            .into_iter()
-            .filter(|g| g.chapter == ci)
-            .collect();
+        // 整本不让 `ci` 夹章节——全书的字都要印。
+        let flow: Vec<Glyph> = if matches!(scope, PdfScope::Book) {
+            book.to_flow(self.show_punct)
+        } else {
+            book
+                .to_flow(self.show_punct)
+                .into_iter()
+                .filter(|g| g.chapter == ci)
+                .collect()
+        };
         if flow.is_empty() {
             self.export_busy = false;
-            self.notice = "这一章没有可印制的正文".to_string();
-            self.toast = Some("这一章没有可印制的正文".to_string());
+            let msg = if matches!(scope, PdfScope::Book) {
+                "这本书没有可印制的正文".to_string()
+            } else {
+                "这一章没有可印制的正文".to_string()
+            };
+            self.notice = msg.clone();
+            self.toast = Some(msg);
             cx.notify();
             return;
         }
         // 注音表：**书上自带的优先**（EPUB `<ruby>` / `[拼音:]` / `X（bō）`
         // 导入的 `NoteKind::Ruby`），「生僻字注音」开着时再给空缺的补一条。
         // 键与 `GlyphKey` 同一把尺子（章, 段, 段内偏移），落笔时按键取音。
-        let ruby = self.chapter_ruby(ci, &flow);
+        // 整本收全书（`None`），本叶/本章只收当前章。
+        let ruby = self.chapter_ruby(
+            if matches!(scope, PdfScope::Book) {
+                None
+            } else {
+                Some(ci)
+            },
+            &flow,
+        );
         let pages = crate::gloss::layout_book_from_opts(
             &flow,
             |g| {
@@ -3658,9 +3678,9 @@ impl Root {
             cx.notify();
             return;
         }
-        // ③ 挑页：本章取全部；本叶取「装着那一个字的那一叶」。
+        // ③ 挑页：本章 / 整本取全部；本叶取「装着那一个字的那一叶」。
         let picked: Vec<usize> = match scope {
-            PdfScope::Chapter => (0..pages.len()).collect(),
+            PdfScope::Chapter | PdfScope::Book => (0..pages.len()).collect(),
             PdfScope::Leaf => {
                 let a = anchor.unwrap_or((0, 0, 0));
                 let hit = pages
@@ -3707,14 +3727,18 @@ impl Root {
             punct_ink: self.punct_ink.color(self.palette, self.theme),
         };
         let safe = crate::exporter::safe_file_stem(&book.title);
-        let default = format!(
-            "笺读_{}_{}.pdf",
-            safe,
-            crate::exporter::safe_file_stem(&title)
-        );
+        let default = match scope {
+            PdfScope::Book => format!("笺读_{}.pdf", safe),
+            _ => format!(
+                "笺读_{}_{}.pdf",
+                safe,
+                crate::exporter::safe_file_stem(&title)
+            ),
+        };
         let scope_label = match scope {
             PdfScope::Leaf => "本叶",
             PdfScope::Chapter => "本章",
+            PdfScope::Book => "整本",
         };
         // ④ 渲染：**走 core 定义的 `PdfExporter` 接口**。
         //
@@ -3722,14 +3746,39 @@ impl Root {
         // 可复制可检索）；跨平台壳子只要换一个实现了同一个 trait 的东西，
         // `pages`（`gloss::Page`）与 `geo` 一行都不用改——**排版的活早在
         // core 里做完了**，落到纸上只是换个落笔的人。
+        // 每叶的篇题 / 卷首题署 / 章号：**整本时按各自章节走**（每一章首页
+        // 该印自己的篇题与卷次），本叶 / 本章共用当前章的题署。
+        let mut leaf_titles: Vec<String> = Vec::with_capacity(picked.len());
+        let mut leaf_inscriptions: Vec<String> = Vec::with_capacity(picked.len());
+        let mut leaf_chapters: Vec<usize> = Vec::with_capacity(picked.len());
+        for &pi in &picked {
+            if matches!(scope, PdfScope::Book) {
+                let ch = pages[pi]
+                    .glyphs
+                    .iter()
+                    .find(|g| !g.is_indent())
+                    .map(|g| g.chapter)
+                    .unwrap_or(0);
+                let t = self.chapter_title(ch);
+                let v = crate::types::chapter_volume(ch, &t);
+                leaf_titles.push(t);
+                leaf_inscriptions.push(format!("{}{}", book.title, v));
+                leaf_chapters.push(ch);
+            } else {
+                leaf_titles.push(title.clone());
+                leaf_inscriptions.push(inscription.clone());
+                leaf_chapters.push(ci);
+            }
+        }
         let leaves: Vec<crate::pdf::PdfLeaf> = picked
             .iter()
-            .map(|&i| crate::pdf::PdfLeaf {
-                page: &pages[i],
-                title: &title,
-                chapter: ci,
-                leaf: i + 1,
-                inscription: &inscription,
+            .enumerate()
+            .map(|(k, &pi)| crate::pdf::PdfLeaf {
+                page: &pages[pi],
+                title: &leaf_titles[k],
+                chapter: leaf_chapters[k],
+                leaf: pi + 1,
+                inscription: &leaf_inscriptions[k],
                 author: &author,
                 ruby: &ruby,
             })

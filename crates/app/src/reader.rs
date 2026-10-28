@@ -4128,6 +4128,21 @@ impl Root {
                 }
             }),
         ));
+        // ①·d **导出整本 PDF**（v1.85.4）：一本书一册，逐叶按各自章节落篇题
+        // 与卷首题署；仍走流式落盘，整部《资治通鉴》也不爆内存。
+        menu = menu.child(mitem("export-pdf-book", "导出整本PDF").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.more_menu = false;
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    this.export_pdf(crate::app::PdfScope::Book, cx);
+                }));
+                if let Err(e) = r {
+                    this.report_export_panic(e, cx);
+                }
+            }),
+        ));
         // ② 导出当前章为 Anki 卡片：逐段生成 Front/Back 的 CSV，弹保存框落盘。
         menu = menu.child(mitem("export-anki", "导出当前章为卡片").on_mouse_down(
             MouseButton::Left,
@@ -7220,14 +7235,16 @@ impl Root {
     /// 标点不注（句读上顶一根拼音只会更乱）。
     pub fn chapter_ruby(
         &self,
-        ci: usize,
+        ci: Option<usize>,
         flow: &[Glyph],
     ) -> std::collections::HashMap<(usize, usize, usize), String> {
         let mut m: std::collections::HashMap<(usize, usize, usize), String> =
             std::collections::HashMap::new();
         for g in flow {
-            if g.chapter != ci {
-                continue;
+            if let Some(c) = ci {
+                if g.chapter != c {
+                    continue;
+                }
             }
             if let Some(py) = self.ruby_pinyin(*g) {
                 m.insert((g.chapter, g.para, g.offset), py);
