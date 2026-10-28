@@ -141,6 +141,13 @@ pub struct LayoutSpec<'a> {
     pub seal: ShareSeal,
     pub seal_text: &'a str,
     pub font: ShareFont,
+    /// **出图时间戳**（v1.82.0）：一行极简小字画在**右下地脚带**里。
+    /// 空串 = 不画。
+    ///
+    /// 它与 `date` 是两回事：`date` 走「版心内左下竖排列」，会占 `reserve`
+    /// 竖带、动到正文网格宽；时间戳**一个数都不改**，只往地脚留白里补一行。
+    /// 「不破坏版面」靠的就是这个分家。
+    pub stamp: &'a str,
     pub w: f32,
     pub h: f32,
 }
@@ -153,6 +160,12 @@ pub const MARK_ALPHA: u8 = 0x26;
 pub const NOTE_FS_RATIO: f32 = 0.44;
 /// 落款小字与正文的字号比。
 pub const META_FS_RATIO: f32 = 0.40;
+/// **出图时间戳的字号**（px，1080 基准，随卡宽缩放）：全卡最小的一档——
+/// 水印只要「看得见、认得出」，绝不能抢正文。硬下限 9px：再小就成噪点了。
+pub const STAMP_FS: f32 = 11.0;
+/// 时间戳的**淡度**：`0` = 全纸色（看不见），`1` = 满墨色。
+/// 0.5 是「比落款再淡一档」——落款是给人读的，时间戳只是个记号。
+pub const STAMP_FADE: f32 = 0.50;
 /// 朱批引线宽（px，按卡片宽缩放后的值）。
 pub const LEAD_W: f32 = 1.0;
 
@@ -500,6 +513,51 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
         text: s.seal_text.to_string(),
     });
 
+    // ---- 出图时间戳（v1.82.0）：右下**地脚带**里一行极简小字 ----
+    //
+    // 位置刻意选在版框**之外**的下留白（地脚）：那一带是空的，落一行小字
+    // 既不压正文、也不用给正文让 `reserve`，版面一个数都不用改——这就是
+    // 「不破坏版面」的落法。横排（竖排网格里塞一行横字太怪），右缘与版框
+    // 外缘齐平，颜色比落款再淡一档。
+    if !s.stamp.is_empty() {
+        let cs: Vec<char> = s.stamp.chars().collect();
+        let sfs = (STAMP_FS * scale).clamp(9.0, 18.0);
+        let total = cs.len() as f32 * sfs;
+        // 右缘：版框外缘（pad_x 处）往里收一个气口；左界兜住，绝不越出版心。
+        let right = (w - pad_x - 2.0 * scale).max(inner_l + total);
+        // 地脚带中心：版框下缘（h - pad_y）到画布底之间。
+        let cy = h - pad_y * 0.5;
+        let color = fade(p.meta, p.bg, STAMP_FADE);
+        for (i, ch) in cs.iter().enumerate() {
+            out.chars.push(PlacedChar {
+                ch: *ch,
+                x: right - total + i as f32 * sfs,
+                y: cy - sfs * 0.62,
+                cell: sfs,
+                fs: sfs,
+                color,
+                punct: false,
+                hung: false,
+            });
+        }
+    }
+
+    out
+}
+
+/// 把 `fg` 往 `bg` 方向掺淡（`ink` = 1 满色、0 全底），返回 `0xRRGGBB`。
+///
+/// 不走 alpha：字是逐个 `draw_glyphs` 落的，填充色里带 alpha 会在字与字的
+/// 重叠处叠出深浅不一的斑；直接算一个实色的中间色最稳。
+fn fade(fg: u32, bg: u32, ink: f32) -> u32 {
+    let k = ink.clamp(0.0, 1.0);
+    let mut out = 0u32;
+    for shift in (0..24).step_by(8) {
+        let a = ((fg >> shift) & 0xFF) as f32;
+        let b = ((bg >> shift) & 0xFF) as f32;
+        let v = (a * k + b * (1.0 - k)).round().clamp(0.0, 255.0) as u32;
+        out |= v << shift;
+    }
     out
 }
 
@@ -509,6 +567,13 @@ mod tests {
 
     const W: f32 = 1080.0;
     const H: f32 = 1920.0;
+
+    /// 带时间戳的 spec（其余与 [`spec`] 同）。
+    fn spec_stamp<'a>(body: &'a [char], red: &'a [bool], stamp: &'a str) -> LayoutSpec<'a> {
+        let mut s = spec(body, red);
+        s.stamp = stamp;
+        s
+    }
 
     fn spec<'a>(body: &'a [char], red: &'a [bool]) -> LayoutSpec<'a> {
         LayoutSpec {
@@ -526,12 +591,64 @@ mod tests {
             seal: ShareSeal::Twin,
             seal_text: "道德",
             font: ShareFont::Song,
+            stamp: "",
             w: W,
             h: H,
         }
     }
 
     /// 铁律 1：每一列的第一个字，y 必须绝对相同（首行顶格）。
+    #[test]
+    fn stamp_lands_in_the_foot_margin_and_never_moves_the_grid() {
+        let body: Vec<char> = "道可道非常道名可名非常名无名天地之始".chars().collect();
+        let red = vec![false; body.len()];
+        let a = layout(&spec_stamp(&body, &red, ""));
+        let b = layout(&spec_stamp(&body, &red, "丙午年季秋下浣"));
+        // ① 正文一个字都没挪：版画指令**逐条相同**，只在末尾多出戳那几个字。
+        //    这就是「不破坏版面」——戳不进正文网格、不占 reserve 竖带。
+        assert_eq!(
+            b.chars.len(),
+            a.chars.len() + 7,
+            "戳应是纯增量：{} vs {}",
+            b.chars.len(),
+            a.chars.len()
+        );
+        assert_eq!(&b.chars[..a.chars.len()], &a.chars[..], "正文被戳挪动了");
+        // ② 戳落在**版框之外**的下留白（地脚带）里，绝不压正文。
+        let pad_y = (H * 0.035).clamp(18.0, 72.0);
+        let frame_bottom = H - pad_y;
+        for c in &b.chars[a.chars.len()..] {
+            assert!(c.y > frame_bottom, "戳压进版框了：y={}", c.y);
+            assert!(c.y + c.fs * 1.3 < H, "戳掉出画布了：y={}", c.y);
+            assert!(c.x > 0.0 && c.x + c.fs <= W, "戳横向越界：x={}", c.x);
+        }
+        // ③ 右对齐：最后一个字的右缘贴住版框外缘（差一个气口）。
+        let last = b.chars.last().unwrap();
+        let pad_x = (W * 0.075).clamp(18.0, 46.0);
+        assert!(
+            (W - pad_x - (last.x + last.fs)).abs() < 6.0,
+            "戳没贴住右下角：右缘 {} / 版框外缘 {}",
+            last.x + last.fs,
+            W - pad_x
+        );
+        // ④ 字号是全卡最小的一档，且比正文小得多。
+        let body_fs = a.chars[0].fs;
+        assert!(last.fs < body_fs, "戳不该比正文还大：{} vs {}", last.fs, body_fs);
+        assert!(last.fs <= STAMP_FS + 0.01, "戳超过最小档：{}", last.fs);
+        // ⑤ 颜色比落款淡（往纸色方向掺过），不能是满墨。
+        let p = crate::share::palette(ShareBg::Xuan);
+        assert_ne!(last.color, p.meta, "戳该比落款淡");
+        let lum = |c: u32| -> i32 {
+            (((c >> 16) & 0xFF) as i32 * 3 + ((c >> 8) & 0xFF) as i32 * 6 + (c & 0xFF) as i32) / 10
+        };
+        assert!(
+            lum(last.color) > lum(p.meta),
+            "戳应比落款亮（更淡）：{} vs {}",
+            lum(last.color),
+            lum(p.meta)
+        );
+    }
+
     #[test]
     fn every_column_starts_on_the_same_baseline() {
         // 字数要能撑出多列（12 列档下每列约 24 字），否则无从比较列首。

@@ -64,6 +64,9 @@ impl Root {
         if crate::gate::valid(&self.beta_code) {
             crate::gate::remember(&self.beta_code);
             self.beta_ok = true;
+            // 当场落起算日并算一次剩余天数：不然刚敲完码还要重启一次才认得
+            // 内测期（`licensed()` 读的是这个缓存字段）。
+            self.beta_left = crate::gate::beta_days_left().unwrap_or(0);
             self.beta_err = false;
             // 进门后把焦点交回阅读键位（否则方向键不翻页）。
             true

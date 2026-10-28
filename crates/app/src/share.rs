@@ -455,6 +455,133 @@ pub fn cn_date_from_str(ymd: &str) -> String {
     format!("{ys}年{}月{}日", cn_small(m), cn_small(d))
 }
 
+// ----------------------------------------------------------------------
+// v1.82.0：出图时间戳（右下角极简落款）
+//
+// 用户口径：导出图片的右下角加一行生成时间，**极简、字号最小档、颜色淡、
+// 不破坏版面**。故它不走 `show_date` 那条「版心内左下竖排列」的老路——那条
+// 会占 `reserve` 竖带、影响正文网格宽。时间戳单独画在**地脚带**（版框下缘
+// 那一圈留白）里，一行小字，版式一个数都不用改。
+// ----------------------------------------------------------------------
+
+/// 出图时间戳的三档。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum StampStyle {
+    /// 古风：干支纪年 + 月季 + 浣（默认——对着一叶古籍，落个公历反而不搭）。
+    #[default]
+    Classic,
+    /// 公历：`2026.10.28`。
+    Plain,
+    /// 不落款。
+    Off,
+}
+
+impl StampStyle {
+    pub const ALL: [StampStyle; 3] = [StampStyle::Classic, StampStyle::Plain, StampStyle::Off];
+
+    /// 菜单上那一行的名字（短、能一眼看出当前档）。
+    pub fn label(&self) -> &'static str {
+        match self {
+            StampStyle::Classic => "古风",
+            StampStyle::Plain => "公历",
+            StampStyle::Off => "关",
+        }
+    }
+
+    /// 点一下切下一档（菜单项是循环的，不再开二级面板）。
+    pub fn next(self) -> StampStyle {
+        match self {
+            StampStyle::Classic => StampStyle::Plain,
+            StampStyle::Plain => StampStyle::Off,
+            StampStyle::Off => StampStyle::Classic,
+        }
+    }
+}
+
+/// 十天干。
+pub const GAN: [&str; 10] = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"];
+/// 十二地支。
+pub const ZHI: [&str; 12] = ["子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"];
+
+/// 干支纪年（如「丙午」）。
+///
+/// 干支年以**立春**（约 2 月 4 日）为界，不是元旦：2026-01-20 仍属乙巳年。
+/// 这里不用节气表，只取 2 月 4 日这个近似分界——差最多一两天，落在水印上
+/// 没人看得出来；真要考据另有别处，水印只管好看。
+pub fn ganzhi_year(y: i64, m: u32, d: u32) -> String {
+    let y = if m < 2 || (m == 2 && d < 4) { y - 1 } else { y };
+    let i = (y - 4).rem_euclid(60) as usize;
+    format!("{}{}", GAN[i % 10], ZHI[i % 12])
+}
+
+/// 月季雅称（孟 / 仲 / 季 + 春夏秋冬）。
+///
+/// ⚠️ 月份按**农历月 ≈ 公历月 − 1** 近拟（春节通常在 1 月下旬到 2 月中旬，
+/// 农历月整体滞后公历约一个月），误差最多一个月。水印只求一眼的古意，
+/// 不作考据用——故下面那行注释把它写明白，免得日后有人拿它对校历书。
+fn season_of_month(m: u32) -> &'static str {
+    // 农历月 = 公历月 − 1（1 月回卷为 11 → 季冬）。
+    let lm = if m == 1 { 12 } else { m - 1 };
+    let name = match lm {
+        1..=3 => "春",
+        4..=6 => "夏",
+        7..=9 => "秋",
+        _ => "冬",
+    };
+    match (lm - 1) % 3 {
+        0 => match name {
+            "春" => "孟春",
+            "夏" => "孟夏",
+            "秋" => "孟秋",
+            _ => "孟冬",
+        },
+        1 => match name {
+            "春" => "仲春",
+            "夏" => "仲夏",
+            "秋" => "仲秋",
+            _ => "仲冬",
+        },
+        _ => match name {
+            "春" => "季春",
+            "夏" => "季夏",
+            "秋" => "季秋",
+            _ => "季冬",
+        },
+    }
+}
+
+/// 旬的雅称：上浣 / 中浣 / 下浣（1–10 / 11–20 / 21–月末）。
+fn xun_of_day(d: u32) -> &'static str {
+    match d {
+        1..=10 => "上浣",
+        11..=20 => "中浣",
+        _ => "下浣",
+    }
+}
+
+/// 今天的（年, 月, 日）；系统时钟不可信时返回 `None`（调用方按「不落款」处理）。
+pub fn today_ymd() -> Option<(i64, u32, u32)> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let (y, m, d) = civil_from_days(secs / 86_400);
+    Some((y, m, d))
+}
+
+/// 按档生成时间戳文本；`Off` 或时钟异常一律给空串（空串＝不画）。
+pub fn stamp_text(style: StampStyle) -> String {
+    let (y, m, d) = match today_ymd() {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    match style {
+        StampStyle::Off => String::new(),
+        StampStyle::Plain => format!("{y:04}.{m:02}.{d:02}"),
+        StampStyle::Classic => format!("{}年{}{}", ganzhi_year(y, m, d), season_of_month(m), xun_of_day(d)),
+    }
+}
+
 /// 取系统当前日期的中文形式；失败返回空串（调用方按「不显示」处理）。
 ///
 /// v1.70.0：**不再 fork 一个 `date` 子进程**（App Store 沙盒下外部进程
@@ -1244,6 +1371,63 @@ mod tests {
         // 中文渲染。
         assert_eq!(cn_date_from_str("2026-10-27"), "二〇二六年十月二十七日");
         assert_eq!(cn_date_from_str("2024-02-29"), "二〇二四年二月二十九日");
+    }
+
+    #[test]
+    fn ganzhi_year_switches_at_lichun_not_new_year() {
+        // 2026 立春之前仍属乙巳年，之后才是丙午年——元旦不换甲子。
+        assert_eq!(ganzhi_year(2026, 1, 20), "乙巳");
+        assert_eq!(ganzhi_year(2026, 2, 3), "乙巳");
+        assert_eq!(ganzhi_year(2026, 2, 4), "丙午");
+        assert_eq!(ganzhi_year(2026, 10, 28), "丙午");
+        // 六十年一轮回。
+        assert_eq!(ganzhi_year(1966, 6, 6), "丙午");
+        assert_eq!(ganzhi_year(2086, 6, 6), "丙午");
+        assert_eq!(ganzhi_year(1984, 6, 6), "甲子");
+    }
+
+    #[test]
+    fn season_and_xun_are_stable_and_in_range() {
+        // 月季按「农历月 ≈ 公历月 − 1」走：公历 10 月 → 农历九月 → 季秋。
+        assert_eq!(season_of_month(10), "季秋");
+        assert_eq!(season_of_month(2), "孟春"); // 农历正月
+        assert_eq!(season_of_month(1), "季冬"); // 回卷：农历腊月
+        assert_eq!(season_of_month(5), "孟夏");
+        assert_eq!(season_of_month(8), "孟秋"); // 农历七月
+        assert_eq!(season_of_month(9), "仲秋"); // 农历八月
+        // 浣只按公历日分三旬。
+        assert_eq!(xun_of_day(1), "上浣");
+        assert_eq!(xun_of_day(10), "上浣");
+        assert_eq!(xun_of_day(11), "中浣");
+        assert_eq!(xun_of_day(20), "中浣");
+        assert_eq!(xun_of_day(21), "下浣");
+        assert_eq!(xun_of_day(31), "下浣");
+        // 十二个月都得出一个「孟/仲/季 + 春夏秋冬」的四字之内结果。
+        for m in 1..=12u32 {
+            let s = season_of_month(m);
+            assert_eq!(s.chars().count(), 2, "{m} 月：{s}");
+        }
+    }
+
+    #[test]
+    fn stamp_text_three_styles() {
+        // 关 → 空串（＝不画，连一个空格都不留）。
+        assert_eq!(stamp_text(StampStyle::Off), "");
+        // 公历：定长 `YYYY.MM.DD`，机器可读、不受历法近似影响。
+        let plain = stamp_text(StampStyle::Plain);
+        assert_eq!(plain.len(), 10, "{plain}");
+        assert_eq!(plain.matches('.').count(), 2, "{plain}");
+        // 古风：干支年 + 月季 + 浣，≤ 8 字（水印要极简，不能拉成一长条）。
+        let cl = stamp_text(StampStyle::Classic);
+        assert!(cl.ends_with("浣"), "{cl}");
+        assert!(cl.contains("年"), "{cl}");
+        assert!(cl.chars().count() <= 8, "太长了：{cl}");
+        // 三档循环：关 → 古风 → 公历 → 关。
+        assert_eq!(StampStyle::Off.next(), StampStyle::Classic);
+        assert_eq!(StampStyle::Classic.next(), StampStyle::Plain);
+        assert_eq!(StampStyle::Plain.next(), StampStyle::Off);
+        // 默认档是古风（对着一叶古籍，落个公历反而不搭）。
+        assert_eq!(StampStyle::default(), StampStyle::Classic);
     }
 
     /// 公历年月日 → epoch 天（与 `civil_from_days` 互逆，单测专用）。

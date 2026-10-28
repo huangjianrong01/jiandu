@@ -211,10 +211,18 @@ impl Root {
                 "····".to_string()
             };
             (format!("已激活 · 凭据 {masked}"), rgb(t.accent()))
-        } else if self.beta_ok {
+        } else if self.beta_left > 0 {
             (
-                "内测邀请码已放行，内测期间视同已激活".to_string(),
+                format!(
+                    "内测邀请码已放行 · 剩 {} 天（到期后须用授权 key）",
+                    self.beta_left
+                ),
                 rgb(t.ink_soft()),
+            )
+        } else if self.beta_left == 0 {
+            (
+                "内测期已满 · 导出与印制已锁（阅读不受影响）".to_string(),
+                rgb(zhu),
             )
         } else {
             (

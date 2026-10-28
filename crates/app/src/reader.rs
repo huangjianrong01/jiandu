@@ -3990,7 +3990,7 @@ impl Root {
         // `stop_propagation` 才是这条链上唯一可靠的接线。
         // 每枚都给 `.id()`（Stateful<Div>，与目录竹简条同一形态），
         // 命中测试与派发都走标准路径。
-        let mitem = |id: &'static str, label: &'static str| -> Stateful<Div> {
+        let mitem = |id: &'static str, label: &str| -> Stateful<Div> {
             div()
                 .id(SharedString::from(id))
                 .w_full()
@@ -4000,7 +4000,7 @@ impl Root {
                 .px(px(10.0))
                 .cursor_pointer()
                 .hover(|s| s.text_color(rgb(zhu)))
-                .child(SharedString::from(label))
+                .child(SharedString::from(label.to_string()))
         };
         let mut menu = div()
             .absolute()
@@ -4053,6 +4053,26 @@ impl Root {
                 if let Err(e) = r {
                     this.report_export_panic(e, cx);
                 }
+            }),
+        ));
+        // ①·a **出图时间**（v1.82.0）：本叶 PNG 右下角那一行极简落款。
+        //      三档循环（古风 → 公历 → 关），就摆在「导出当前页图片」下面——
+        //      它是那一项的**设置**，离得远了没人找得着。
+        let stamp_label = format!("出图時間 · {}", self.stamp_style.label());
+        menu = menu.child(mitem("more-stamp", &stamp_label).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                let next = this.stamp_style.next();
+                this.stamp_style = next;
+                this.notice = match next {
+                    crate::share::StampStyle::Off => "出图不再落時間".to_string(),
+                    crate::share::StampStyle::Plain => "出圖時間：公歷（2026.10.28）".to_string(),
+                    crate::share::StampStyle::Classic => {
+                        "出圖時間：古風（丙午年季秋下浣）".to_string()
+                    }
+                };
+                cx.notify();
             }),
         ));
         // ①·b **导出本叶 PDF**（v1.80.0）：A4 矢量、一叶一页。
@@ -10571,6 +10591,8 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
                 .map(|b| b.title.clone())
                 .unwrap_or_default(),
         );
+        // 右下角时间戳：按「出图时间」那一档现算（空串＝不画）。
+        let stamp = crate::share::stamp_text(self.stamp_style);
         let spec = crate::share_layout::LayoutSpec {
             body: &body,
             red: &red,
@@ -10586,6 +10608,7 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
             seal: crate::share::ShareSeal::Twin,
             seal_text: &seal_text,
             font: self.share_font_kind(),
+            stamp: &stamp,
             w,
             h,
         };
@@ -10624,6 +10647,9 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
             seal: crate::share::ShareSeal::Twin,
             seal_text: "笺讀",
             font: self.share_font_kind(),
+            // 分享卡的日期已是版心内左侧那一竖列（`show_date`），此处不再
+            // 叠一份右下时间戳——同一张纸上出现两遍日期最叫人出戏。
+            stamp: "",
             w: 1080.0,
             h: 1920.0,
         };

@@ -332,6 +332,7 @@ mod tests {
             font: ShareFont::Song,
             w: 1080.0,
             h: 1920.0,
+            stamp: "",
         };
         let l = layout(&spec);
         let png = match render_png(&l) {
@@ -383,6 +384,7 @@ mod tests {
             font: ShareFont::Song,
             w: 1080.0,
             h: 1920.0,
+            stamp: "",
         };
         let l = layout(&spec);
         let png = render_png(&l).expect("离屏出图失败");
@@ -496,6 +498,7 @@ mod tests {
             font: ShareFont::Song,
             w: 1080.0,
             h: 1920.0,
+            stamp: "",
         };
         let l = layout(&spec);
 

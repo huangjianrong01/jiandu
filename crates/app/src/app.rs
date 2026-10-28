@@ -636,6 +636,10 @@ pub struct Root {
     pub share_seal: usize,
     /// 是否连同**朱批 / 眉批**一起分享（关 = 只分享正文）。
     pub share_show_notes: bool,
+    /// **出图时间戳的档位**（v1.82.0）：古风 / 公历 / 关，见
+    /// [`crate::share::StampStyle`]。只作用于「导出本叶图片」——分享卡那份
+    /// 日期走版心内左侧竖排列，不在这里管。
+    pub stamp_style: crate::share::StampStyle,
     /// 快照：正文中每个字是否被划了红线（与 `share_body` 等长）。
     pub share_red: Vec<bool>,
     /// 快照：该段范围内用户写的眉批（已裁切合并）。
@@ -798,6 +802,10 @@ pub struct Root {
     /// 为 false 时 `Render::render` **只画那张纸**（书名 + 输入框 + 一行提示），
     /// 书架、正文、所有浮层一律不进场——没有「点旁边绕过」这条路。
     pub beta_ok: bool,
+    /// **内测剩余天数**（v1.82.0）：`-1` = 没走内测（无凭据）；`0` = 期已满；
+    /// `n > 0` = 还剩 `n` 天。启动时算一次存着——`licensed()` 每帧都要问，
+    /// 不能每帧去读两个文件。
+    pub beta_left: i64,
     /// 邀请码草稿与光标（字符下标）。
     pub beta_code: String,
     pub beta_cursor: usize,
@@ -1198,6 +1206,7 @@ impl Root {
             share_frame: 0,
             share_seal: 0,
             share_show_notes: true,
+            stamp_style: crate::share::StampStyle::default(),
             share_red: Vec::new(),
             share_notes: Vec::new(),
             share_seal_text: crate::share::seal_chars(""),
@@ -1259,6 +1268,7 @@ impl Root {
             line_modern: 26.0,
             rename_test_done: false,
             beta_ok: crate::gate::redeemed(),
+            beta_left: crate::gate::beta_days_left().unwrap_or(-1),
             beta_code: String::new(),
             beta_cursor: 0,
             beta_focus: cx.focus_handle(),
@@ -1409,6 +1419,11 @@ impl Root {
                 .min(root.library.books.len() - 1);
             root.open_book(idx);
             root.screen = Screen::Reading;
+        }
+        // 「更多」下拉（v1.82.0 调试口子）：必须在 `JIANDU_AUTO_READ` **之后**
+        // 再置一次——打开一本书会 `close_transient_ui()`，把前面设好的浮层清掉。
+        if std::env::var("JIANDU_PANEL").map(|v| v == "more").unwrap_or(false) {
+            root.more_menu = true;
         }
         // 开发用：JIANDU_COLUMNS=n 指定初始列数（8/10/12/14），便于逐列截图核对。
         if let Ok(v) = std::env::var("JIANDU_COLUMNS") {
@@ -3360,7 +3375,13 @@ impl Root {
         // 批注 / 卡片 CSV / Obsidian 全都过这个闸门，漏一个就等于那条路免费。
         // 阅读、批注、卡片匣、文本分析**不受影响**——没付钱也该能读完一本书。
         if !self.licensed() {
-            self.notice = "未激活：导出与印制需先激活（更多 → 激活）".to_string();
+            // 内测期满了要说清楚「满」而不是「没激活」——拿着邀请码却被告知
+            // 「未激活」，人只会以为码敲错了，然后一遍遍重敲。
+            self.notice = if self.beta_left == 0 {
+                "内测期已满（7 天）：导出与印制需用授权 key 激活（更多 → 激活）".to_string()
+            } else {
+                "未激活：导出与印制需先激活（更多 → 激活）".to_string()
+            };
             cx.notify();
             return false;
         }
@@ -3376,7 +3397,9 @@ impl Root {
     pub fn licensed(&self) -> bool {
         // 用**缓存字段**而不是每次去读文件：`render_license_sheet` 每帧都要问
         // 一次这一句，走 `gate::redeemed()` 就成了一帧一次磁盘读。
-        self.license_ok || self.beta_ok
+        // 内测码**只在期内**视同已激活（v1.82.0 起 7 天）：码被转发出去也不会
+        // 变成永久免费的出口；但到期只锁导出与印制，阅读一概不动。
+        self.license_ok || self.beta_left > 0
     }
 
     pub fn export_page_png(&mut self, _window: &Window, cx: &mut Context<Self>) {

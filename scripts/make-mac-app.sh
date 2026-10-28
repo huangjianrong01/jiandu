@@ -21,8 +21,8 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP_NAME="笺读"
 BUNDLE_ID="com.jiandu.app"
-VERSION="1.81.0"
-BUILD_NUM="201"
+VERSION="1.82.0"
+BUILD_NUM="202"
 MIN_MACOS="12.0"
 ARCH="${ARCH:-native}"
 
@@ -112,9 +112,16 @@ else
 fi
 
 # ---- 5) App 图标：PNG → icns ----
-ICON_SRC="$ROOT/assets/icon_1024.png"
+# v1.82.0：v1.0.0-beta 起改成了 Cargo Workspace，资产整体挪进 crates/app/assets，
+# 而脚本里这条路径还指着旧的 `$ROOT/assets/`——打出来的包会**没有图标**，
+# 甚至在这里直接中断。故按新位置优先、旧位置兜底。
+ICON_SRC="$ROOT/crates/app/assets/icon_1024.png"
+if [ ! -f "$ICON_SRC" ] && [ -f "$ROOT/assets/icon_1024.png" ]; then
+    ICON_SRC="$ROOT/assets/icon_1024.png"
+fi
 if [ ! -f "$ICON_SRC" ]; then
     echo "→ 生成图标..."
+    mkdir -p "$(dirname "$ICON_SRC")"
     swift "$ROOT/scripts/gen-icon.swift" "$ICON_SRC"
 fi
 ICONSET="$(mktemp -d)/AppIcon.iconset"
