@@ -243,6 +243,10 @@ pub struct AiPanel {
     error: Option<String>,
     /// 左历史抽屉是否展开（v1.84.1 写匠式侧栏）。
     drawer_open: bool,
+    /// **一次性聚焦请求**（v1.85.0）：面板弹出时必须让提问框拿到系统焦点，
+    /// 否则 IME 无从下手——中文会被静默吞掉。真正 `window.focus()` 只能在
+    /// `render` 里做（那里才拿得到 `Window`），故这里只下单，由 render 消费。
+    pending_focus: bool,
 }
 
 impl AiPanel {
@@ -284,6 +288,7 @@ impl AiPanel {
             ctx: None,
             error: None,
             drawer_open: true,
+            pending_focus: false,
         }
     }
 
@@ -298,6 +303,29 @@ impl AiPanel {
     /// 提问框的焦点句柄（开栏后 Root 用它把焦点递进来，否则打不进中文）。
     pub fn ask_focus(&self) -> FocusHandle {
         self.focuses[F_ASK].clone()
+    }
+
+    /// **下单：下一次渲染时把焦点抢到提问框**（v1.85.0）。
+    ///
+    /// 面板弹出后如果不主动抢焦点，焦点还留在纸面上——此时 IME 的落点登记在
+    /// 纸面那支 handler 上，敲出来的拼音一个字也进不了提问框（用户报的
+    /// 「输入法彻底失灵」）。开栏即抢，是唯一解。
+    pub fn request_focus(&mut self) {
+        self.pending_focus = true;
+    }
+
+    /// 消费一次性聚焦请求（只应在 `Render::render` 开头调用）。
+    fn take_pending_focus(&mut self, window: &mut Window) {
+        if !self.pending_focus {
+            return;
+        }
+        self.pending_focus = false;
+        // 设置页（没配过密钥）时不抢：那页有地址 / 模型 / 密钥三栏，
+        // 抢到提问框反而挡住用户先要填的东西。
+        if self.settings {
+            return;
+        }
+        self.focus_field(F_ASK, window);
     }
 
     /// 当前设置页是否开着（Root 决定是否给焦点）。
@@ -888,6 +916,9 @@ fn short(s: &str) -> String {
 
 impl Render for AiPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // v1.85.0：面板弹出的那一帧就把系统焦点抢到提问框——IME 只把字送给
+        // 「焦点所在元素登记的 handler」，焦点不在框里 = 中文一个字也打不进。
+        self.take_pending_focus(window);
         let t = self.theme;
         let zhu = crate::reader::sheet_zhu(t);
         let ink = t.ink();
@@ -1156,8 +1187,14 @@ impl Render for AiPanel {
             .child(main)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_, _, _, cx| {
+                cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
+                    // v1.85.0 **焦点防丢失**：点面板空白处也把焦点送回提问框——
+                    // 焦点一丢，IME 就没了落点，中文跟着失灵。设置页不抢
+                    // （那页有地址 / 模型 / 密钥三栏要填）。
+                    if !this.settings {
+                        this.focus_field(F_ASK, window);
+                    }
                 }),
             )
     }
@@ -1442,17 +1479,19 @@ impl AiPanel {
                 }),
             );
 
-        // 居中大输入框（宣纸 / 毛玻璃质感）：框内置范围选择器 + 发送钮。
+        // 输入框（宣纸 / 毛玻璃质感）：框内置范围选择器 + 发送钮。
+        // v1.85.0 瘦身：面板已挪到右下角悬浮，输入框不必再做「居中大块头」——
+        // 内边距与圆角一起收一档，整条压到一行多一点的高度。
         let glass = ((paper & 0xFFFFFF) << 8) | 0xD8;
         let input_box = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(7.0))
             .w_full()
-            .px(px(14.0))
-            .py(px(11.0))
-            .rounded(px(16.0))
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(10.0))
             .bg(rgba(glass))
             .border_1()
             .border_color(rgb(if cursor_on { zhu } else { sept }))
@@ -1509,10 +1548,6 @@ impl AiPanel {
                     ),
             );
         }
-        // 空输入时上方留白把输入框压低、显得居中；一旦有字 / 聚焦便上移贴住对话区。
-        if d.text.is_empty() && !cursor_on {
-            col = col.child(div().h(px(46.0)));
-        }
         col = col.child(input_box);
         // 翻检状态 / 结果：只在「不是本章」时才占这一行。
         if scope.needs_search() {
@@ -1537,18 +1572,18 @@ impl AiPanel {
             }
         }
         // 四枚快捷问法：只在还没开话时给（开话后它们只会挡住对话）。
+        // v1.85.0：**紧凑横排**——一行靠左排开，不再居中撑成一副大棋盘。
         if fresh {
             let mut chips = div()
                 .flex()
                 .flex_row()
-                .flex_wrap()
-                .justify_center()
-                .gap(px(6.0));
+                .items_center()
+                .gap(px(5.0));
             for (show, full) in SUGGESTS {
                 chips = chips.child(
                     div()
-                        .px(px(9.0))
-                        .py(px(3.0))
+                        .px(px(7.0))
+                        .py(px(2.0))
                         .border_1()
                         .border_color(rgb(sept))
                         .rounded(px(999.0))

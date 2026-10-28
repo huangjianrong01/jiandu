@@ -4542,6 +4542,8 @@ fn anki_push_card(
             let song = self.main_family();
             self.ai_panel.update(cx, |p, cx| {
                 p.sync_look(theme, song);
+                // v1.85.0：开栏即下单抢焦点——不抢，IME 就打不进中文。
+                p.request_focus();
                 cx.notify();
             });
         }

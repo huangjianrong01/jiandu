@@ -505,13 +505,16 @@ fn panel_close(t: Theme) -> Div {
         .px(px(5.0))
         .py(px(2.0))
         .cursor_pointer()
-        .text_size(px(14.0))
-        .text_color(rgb(t.ink_soft()))
+        .text_size(px(12.5))
+        // v1.85.0：大写 X 太抢眼（用户点名「突兀」）。改**小写 x**、字号收小一档，
+        // 墨色向纸色掺到 55%——退场记号该淡到几乎看不见，不该喧宾夺主。
+        // 悬停时才转朱砂，一眼能找回来。
+        .text_color(rgb(jiandu_core::theme::mix(t.paper(), t.ink_soft(), 0.55)))
         .hover(|s| s.text_color(rgb(sheet_zhu(t))))
-        // v1.64.0：改用 **ASCII 大写 X**。旧字 ✕（U+2715）落在拉丁区符号段，
-        // 本机字体里没有对应字形时会被画成零宽——按钮在、字不见，等于没有
-        // 关闭入口（用户点名「关闭用X表示」）。ASCII X 任何字体都有。
-        .child(SharedString::from("X"))
+        // ⚠️ 仍是 ASCII：U+2715（✕）/ U+00D7（×）在本机中文 UI 字体里可能没有
+        // 字形，会被画成零宽——按钮在、字不见，等于没有关闭入口。小写 x 任何
+        // 字体都有（v1.64.0 用 ✕ 踩过这个坑，别再踩）。
+        .child(SharedString::from("x"))
 }
 
 /// 面板的**选项文字**：整块面板的基本单位。
@@ -1790,14 +1793,34 @@ impl Root {
         let slide = self.ai_slide.clamp(0.0, 1.0);
         // v1.80.0：宽度按「问小文」那类现代伴读面板来定——一整行追问写得下，
         // 又不至于把纸面吃掉一半。380~560 之间跟着窗宽走（0.40）。
-        let panel_w = (self.viewport_w * 0.40).clamp(380.0, 560.0);
-        let off = -(1.0 - slide) * panel_w;
+        // v1.85.0：从「右侧通栏」改为**右下角悬浮小笺**。
+        //
+        // 通栏侧栏会把整个右半屏的竖排正文挡掉一大片——而竖排古籍的视线落点
+        // 恰恰在纸面正中那几列（用户点名「绝对不许遮挡视线正中心的正文」）。
+        // 现在：定宽 600（窄窗自己让一让）、限高不到半屏、坐在右下角，
+        // 正中那几列一眼看得到底。
+        let margin = 18.0;
+        let panel_w = 600.0_f32.min((self.viewport_w - margin * 2.0).max(320.0));
+        let panel_h = (self.viewport_h * 0.46).clamp(300.0, 460.0);
+        // 收起时整块滑出屏外（多滑一个 margin，免得在边上留一道）。
+        let off = -(1.0 - slide) * (panel_w + margin * 2.0);
+        let t = self.theme;
         div()
             .absolute()
-            .top(px(0.0))
-            .bottom(px(0.0))
-            .right(px(off))
+            .bottom(px(margin))
+            .right(px(margin + off))
             .w(px(panel_w))
+            .h(px(panel_h))
+            .rounded(px(10.0))
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(jiandu_core::theme::mix(t.paper(), t.ink(), 0.18)))
+            .shadow(vec![BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.18),
+                offset: gpui::point(px(0.0), px(4.0)),
+                blur_radius: px(14.0),
+                spread_radius: px(0.0),
+            }])
             // ★ 阻断鼠标穿透（v1.80.0，与左侧栏同因同款）：GPUI 的命中测试
             //   把压在同一点下的**所有** hitbox 都算 hovered，浮层即便自己
             //   stop_propagation，「抬起」事件仍会漏到正文那层 → 一点面板
@@ -6695,32 +6718,52 @@ impl Root {
         };
 
         // ── 竖排注音（生僻字拼音）──────────────────────────────────
-        // 一字母一行、贴字格右上角；字号 30%，长拼音自动降号（下限 18%）。
-        // 横向排会撑破一格宽、压到左边下一列——这正是必须修的病根。
+        // v1.85.0：整串拼音**顺时针旋转 90°** 贴在字格右侧——字号吃满正文
+        // 40%（长拼音才收敛），右侧留 `rl.gutter` 呼吸间距，纵向绝不溢出
+        // 格高、横向绝不越过界栏。
+        //
+        // GPUI 的 `paint_glyph` 转不动字形，故真旋转走 `ruby_glyph`：CoreGraphics
+        // 离屏把整串转 90° 渲成位图，再用 `img` 贴上来（详见该文件头）。
+        // 万一光栅失败（无字体 / 非 macOS），才退回逐字母竖叠。
         if let Some(py) = rare_py.as_deref() {
             let rl = crate::ruby::layout(py, fs, cell_w, cell_h);
-            let mut ruby = div()
-                .absolute()
-                .top(px(rl.top))
-                .right(px(0.0))
-                .w(px(rl.block_w))
-                .flex()
-                .flex_col()
-                .items_center();
-            for ch in py.chars() {
-                ruby = ruby.child(
+            let note_ink = self.palette.note(t);
+            if let Some(im) = crate::ruby_glyph::ruby_image(py, rl.fs, note_ink) {
+                cell = cell.child(
                     div()
-                        .w_full()
-                        .h(px(rl.line_h))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(rl.fs))
-                        .text_color(rgb(self.palette.note(t)))
-                        .child(SharedString::from(ch.to_string())),
+                        .absolute()
+                        .top(px(rl.top))
+                        .right(px(rl.gutter))
+                        .w(px(rl.block_w))
+                        .h(px(rl.block_h))
+                        .child(gpui::img(im).w(px(rl.block_w)).h(px(rl.block_h))),
                 );
+            } else {
+                // 退化：逐字母竖叠（步进取字母全高，绝不叠墨）。
+                let step = rl.fs * 1.02;
+                let mut ruby = div()
+                    .absolute()
+                    .top(px(rl.top))
+                    .right(px(rl.gutter))
+                    .w(px(rl.block_w))
+                    .flex()
+                    .flex_col()
+                    .items_center();
+                for ch in py.chars() {
+                    ruby = ruby.child(
+                        div()
+                            .w_full()
+                            .h(px(step))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(rl.fs))
+                            .text_color(rgb(note_ink))
+                            .child(SharedString::from(ch.to_string())),
+                    );
+                }
+                cell = cell.child(ruby);
             }
-            cell = cell.child(ruby);
             // 极细「虚」线：三点短横（GPUI 0.2.2 无 dashed 边框），
             // 贴字格下缘右侧，只作提示、不抢正文。
             let dots = 3usize;
