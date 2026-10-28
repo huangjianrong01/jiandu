@@ -648,6 +648,58 @@ pub fn layout_book_from_opts(
     pages
 }
 
+/// **流式版 `layout_book_from_opts`（v1.85.5）——只改分批，不动单页计算。**
+///
+/// 内部那一坨单页 / 单章布局逻辑（标点锚点、拼音旋转、禁则撤退、夹注跨列…）
+/// **一行都没动**：本函数只是「按章切分 → 逐章调用原本的 `layout_book_from_opts`
+/// → 通过 `emit` 回调把这一章的页面吐出去」。因此分批排出的页面与一次性整排
+/// **逐页逐字完全相同**——这是「零像素差异」的保证。
+///
+/// 切章口径与 `layout_book_from_opts` 内部 `chapter_start` 完全一致
+/// （`flow[i-1].chapter != g.chapter`），故每个章子流的第一个字都被当作章首，
+/// 与整排时该章首字的待遇一致（`page_limit = cols-1`、`reserve_rows` 预留）。
+///
+/// 调用方可以边收边写盘、边收边丢——**整本书永远只驻留一章的 `Page`，内存
+/// 与书的厚薄无关**。这是商业化印刷代排「整本导出不能卡死内存」的最后一环。
+///
+/// `emit(order, pages)`：`order` 是该章在全书中的出现序（0 起），`pages` 是该章
+/// 的全部页面（借用，回调返回后即被释放，调用方若不存就不占内存）。
+pub fn layout_book_streaming<F, E>(
+    flow: &[Glyph],
+    gloss: F,
+    cols: usize,
+    rows: usize,
+    reserve_rows: usize,
+    start_as_chapter: bool,
+    west_mode: bool,
+    mut emit: E,
+) where
+    F: Fn(&Glyph) -> Option<GlossPayload>,
+    E: FnMut(usize, &[Page]),
+{
+    let mut i = 0usize;
+    let mut first = true;
+    let mut order = 0usize;
+    while i < flow.len() {
+        let ch = flow[i].chapter;
+        let start = i;
+        // 把同一章的字收进一个连续子流（与内部 `chapter_start` 同口径）。
+        let mut j = i;
+        while j < flow.len() && flow[j].chapter == ch {
+            j += 1;
+        }
+        let sub = &flow[start..j];
+        // 首章用外部传入的 `start_as_chapter`，其后各章按内部逻辑必为章首。
+        let flag = if first { start_as_chapter } else { true };
+        // 复用**原本**那台排版引擎——黑盒，内部计算一字未改。
+        let pages = layout_book_from_opts(sub, &gloss, cols, rows, reserve_rows, flag, west_mode);
+        emit(order, &pages);
+        order += 1;
+        first = false;
+        i = j;
+    }
+}
+
 /// 双行夹注块的左侧留白比（占宿主字格宽的比例）。
 ///
 /// **v1.25.0 起为 0**：用户要求双行夹注「严格执行双行小字排版，宽度各占

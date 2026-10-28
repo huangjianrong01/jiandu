@@ -3561,9 +3561,87 @@ impl Root {
     /// `grid::calculate_grid` 按 A4 重新试算（行数变了、分页跟着变，这才叫
     /// 「按纸重排」而不是「把屏幕等比缩放」）。`pdf.rs` 只负责照着落笔。
     ///
-    /// 落盘仍走 `exporter::save_bytes`：先渲到临时文件读回字节，再交给保存框
-    /// ——复用「补后缀 + 建父目录 + 记住目录」那一条既有链路，不破坏
+    /// 落盘：本叶 / 本章走 `exporter::save_bytes`（渲到临时文件读回字节）；
+    /// **整本走 `render_book_streaming`**——按章分批排版、边排边写临时文件、
+    /// 边写边丢，最后由保存框把临时文件 `move_file` 到用户指定的路径。两条路
+    /// 都复用「补后缀 + 建父目录 + 记住目录」那一条既有链路，不破坏
     /// 「写盘唯一出口」的铁律。
+
+    /// **整本流式落盘**（v1.85.5）：按章分批排版（`core::gloss::layout_book_streaming`），
+    /// 一次只驻留一章的 `Page` + `Leaf`，写一章、交一章、丢一章——内存与书的厚薄
+    /// 无关。返回 `(总页数, 临时 PDF 路径)`；调用方（保存框）再把临时文件移到
+    /// 用户选中的路径。若排版为空则删临时文件并报错。
+    fn render_book_streaming(
+        &self,
+        book: &Book,
+        flow: &[Glyph],
+        ruby: &std::collections::HashMap<(usize, usize, usize), String>,
+        geo: &crate::pdf::PdfGeo,
+        author: &str,
+        reserve: usize,
+        notes_inline: bool,
+        west_mode: bool,
+    ) -> Result<(usize, PathBuf), String> {
+        let tmp = std::env::temp_dir().join(format!(
+            "jiandu-book-{}-{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut stream = crate::pdf::PdfStream::begin(&tmp).map_err(|e| e.to_string())?;
+        let mut leaf_no: usize = 0;
+        // 逐章收、逐章写：每个章子流的 `pages` 在 `emit` 返回后即被释放，
+        // 内存里同一时刻最多只有「一章」的页面。
+        crate::gloss::layout_book_streaming(
+            flow,
+            |g| {
+                if notes_inline {
+                    self.note_chars_with_source(*g)
+                        .map(|(s, src)| (s.to_string(), src, *g))
+                } else {
+                    None
+                }
+            },
+            geo.cols,
+            geo.rows,
+            reserve,
+            true,
+            west_mode,
+            |_order, pages| {
+                for (k, p) in pages.iter().enumerate() {
+                    let ch = p
+                        .glyphs
+                        .iter()
+                        .find(|g| !g.is_indent())
+                        .map(|g| g.chapter)
+                        .unwrap_or(0);
+                    let t = self.chapter_title(ch);
+                    let v = crate::types::chapter_volume(ch, &t);
+                    let insc = format!("{}{}", book.title, v);
+                    let lf = crate::pdf::PdfLeaf {
+                        page: p,
+                        title: &t,
+                        chapter: ch,
+                        leaf: leaf_no + k + 1,
+                        inscription: &insc,
+                        author,
+                        ruby,
+                    };
+                    stream.push(&lf, geo);
+                }
+                leaf_no += pages.len();
+            },
+        );
+        let n = stream.finish().map_err(|e| e.to_string())?;
+        if n == 0 {
+            let _ = std::fs::remove_file(&tmp);
+            return Err("排版结果为空，无法印制".into());
+        }
+        Ok((n, tmp))
+    }
+
     pub fn export_pdf(&mut self, scope: PdfScope, cx: &mut Context<Self>) {
         let Some(book) = self.book.clone() else {
             self.notice = "尚未打开书籍，无法印制 PDF".to_string();
@@ -3655,48 +3733,6 @@ impl Root {
             },
             &flow,
         );
-        let pages = crate::gloss::layout_book_from_opts(
-            &flow,
-            |g| {
-                if notes_inline {
-                    self.note_chars_with_source(*g)
-                        .map(|(s, src)| (s.to_string(), src, *g))
-                } else {
-                    None
-                }
-            },
-            m.columns,
-            m.rows,
-            reserve,
-            true,
-            west_mode,
-        );
-        if pages.is_empty() {
-            self.export_busy = false;
-            self.notice = "排版结果为空，无法印制".to_string();
-            self.toast = Some("排版结果为空".to_string());
-            cx.notify();
-            return;
-        }
-        // ③ 挑页：本章 / 整本取全部；本叶取「装着那一个字的那一叶」。
-        let picked: Vec<usize> = match scope {
-            PdfScope::Chapter | PdfScope::Book => (0..pages.len()).collect(),
-            PdfScope::Leaf => {
-                let a = anchor.unwrap_or((0, 0, 0));
-                let hit = pages
-                    .iter()
-                    .position(|p| {
-                        p.glyphs
-                            .iter()
-                            .any(|g| (g.chapter, g.para, g.offset) == a)
-                    })
-                    .unwrap_or(0);
-                vec![hit]
-            }
-        };
-        let title = self.chapter_title(ci);
-        let vol = crate::types::chapter_volume(ci, &title);
-        let inscription = format!("{}{}", book.title, vol);
         let author = if book.author.trim().is_empty() {
             "佚名".to_string()
         } else {
@@ -3726,6 +3762,7 @@ impl Root {
             punct_mode: self.punct_mode,
             punct_ink: self.punct_ink.color(self.palette, self.theme),
         };
+        let title = self.chapter_title(ci);
         let safe = crate::exporter::safe_file_stem(&book.title);
         let default = match scope {
             PdfScope::Book => format!("笺读_{}.pdf", safe),
@@ -3740,64 +3777,106 @@ impl Root {
             PdfScope::Chapter => "本章",
             PdfScope::Book => "整本",
         };
-        // ④ 渲染：**走 core 定义的 `PdfExporter` 接口**。
-        //
-        // 本平台拿到的实现是 CoreGraphics 矢量后端（字是真字、内嵌子集，
-        // 可复制可检索）；跨平台壳子只要换一个实现了同一个 trait 的东西，
-        // `pages`（`gloss::Page`）与 `geo` 一行都不用改——**排版的活早在
-        // core 里做完了**，落到纸上只是换个落笔的人。
-        // 每叶的篇题 / 卷首题署 / 章号：**整本时按各自章节走**（每一章首页
-        // 该印自己的篇题与卷次），本叶 / 本章共用当前章的题署。
-        let mut leaf_titles: Vec<String> = Vec::with_capacity(picked.len());
-        let mut leaf_inscriptions: Vec<String> = Vec::with_capacity(picked.len());
-        let mut leaf_chapters: Vec<usize> = Vec::with_capacity(picked.len());
-        for &pi in &picked {
-            if matches!(scope, PdfScope::Book) {
-                let ch = pages[pi]
-                    .glyphs
-                    .iter()
-                    .find(|g| !g.is_indent())
-                    .map(|g| g.chapter)
-                    .unwrap_or(0);
-                let t = self.chapter_title(ch);
-                let v = crate::types::chapter_volume(ch, &t);
-                leaf_titles.push(t);
-                leaf_inscriptions.push(format!("{}{}", book.title, v));
-                leaf_chapters.push(ch);
-            } else {
-                leaf_titles.push(title.clone());
-                leaf_inscriptions.push(inscription.clone());
-                leaf_chapters.push(ci);
-            }
+
+        // ④ 渲染
+        // 整本：**按章分批流式落盘**——core 的 `layout_book_streaming` 排一章、
+        // 吐一章，本模块写一章、交一章，永不在内存里攒下超过一章的页面；内存
+        // 与书的厚薄无关（商业化印刷代排「整本导出不能卡死内存」的最后一环）。
+        // 本叶 / 本章体量小（≤ 一章），沿用既有整批路径（`render_leaves`），
+        // 行为与从前完全一致。
+        enum PdfRender {
+            Bytes(Vec<u8>),
+            Temp(PathBuf),
         }
-        let leaves: Vec<crate::pdf::PdfLeaf> = picked
-            .iter()
-            .enumerate()
-            .map(|(k, &pi)| crate::pdf::PdfLeaf {
-                page: &pages[pi],
-                title: &leaf_titles[k],
-                chapter: leaf_chapters[k],
-                leaf: pi + 1,
-                inscription: &leaf_inscriptions[k],
-                author: &author,
-                ruby: &ruby,
-            })
-            .collect();
-        let rendered = crate::pdf::exporter()
-            .render_leaves(&leaves, &geo)
-            .map_err(|e| e.to_string());
-        let bytes = match rendered {
-            Ok(b) => b,
-            Err(e) => {
+        let mut n_leaf: usize = 0;
+        let render = if matches!(scope, PdfScope::Book) {
+            match self.render_book_streaming(&book, &flow, &ruby, &geo, &author, reserve, notes_inline, west_mode) {
+                Ok((n, tmp)) => {
+                    n_leaf = n;
+                    PdfRender::Temp(tmp)
+                }
+                Err(e) => {
+                    self.export_busy = false;
+                    let msg = format!("PDF 印制失败：{e}");
+                    self.notice = msg.clone();
+                    self.toast = Some(msg);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            // 本叶 / 本章：沿用既有整批路径（`render_leaves`）。
+            let pages = crate::gloss::layout_book_from_opts(
+                &flow,
+                |g| {
+                    if notes_inline {
+                        self.note_chars_with_source(*g)
+                            .map(|(s, src)| (s.to_string(), src, *g))
+                    } else {
+                        None
+                    }
+                },
+                m.columns,
+                m.rows,
+                reserve,
+                true,
+                west_mode,
+            );
+            if pages.is_empty() {
                 self.export_busy = false;
-                let msg = format!("PDF 印制失败：{e}");
-                self.notice = msg.clone();
-                self.toast = Some(msg);
+                self.notice = "排版结果为空，无法印制".to_string();
+                self.toast = Some("排版结果为空".to_string());
                 cx.notify();
                 return;
             }
+            // ③ 挑页：本章取全部；本叶取「装着那一个字的那一叶」。
+            let picked: Vec<usize> = match scope {
+                PdfScope::Chapter => (0..pages.len()).collect(),
+                PdfScope::Leaf => {
+                    let a = anchor.unwrap_or((0, 0, 0));
+                    let hit = pages
+                        .iter()
+                        .position(|p| {
+                            p.glyphs
+                                .iter()
+                                .any(|g| (g.chapter, g.para, g.offset) == a)
+                        })
+                        .unwrap_or(0);
+                    vec![hit]
+                }
+                PdfScope::Book => unreachable!("整本已走上面的流式分支"),
+            };
+            let vol = crate::types::chapter_volume(ci, &title);
+            let inscription = format!("{}{}", book.title, vol);
+            let leaves: Vec<crate::pdf::PdfLeaf> = picked
+                .iter()
+                .enumerate()
+                .map(|(k, &pi)| crate::pdf::PdfLeaf {
+                    page: &pages[pi],
+                    title: &title,
+                    chapter: ci,
+                    leaf: pi + 1,
+                    inscription: &inscription,
+                    author: &author,
+                    ruby: &ruby,
+                })
+                .collect();
+            match crate::pdf::exporter().render_leaves(&leaves, &geo) {
+                Ok(b) => {
+                    n_leaf = picked.len();
+                    PdfRender::Bytes(b)
+                }
+                Err(e) => {
+                    self.export_busy = false;
+                    let msg = format!("PDF 印制失败：{e}");
+                    self.notice = msg.clone();
+                    self.toast = Some(msg);
+                    cx.notify();
+                    return;
+                }
+            }
         };
-        let n_leaf = picked.len();
+
         cx.spawn(
             move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 let mut cx = cx.clone();
@@ -3809,25 +3888,46 @@ impl Root {
                         "PDF 文稿",
                         &["pdf"],
                     );
-                    let (msg, toast) = match picked_path {
-                        None => ("已取消保存".to_string(), "已取消保存".to_string()),
-                        Some(dest) => match crate::exporter::save_bytes(dest, "pdf", &bytes) {
-                            Ok(p) => {
-                                let kb = (bytes.len() / 1024).max(1);
-                                let name = p
-                                    .file_name()
-                                    .map(|f| f.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "本叶.pdf".to_string());
-                                (
-                                    format!("已保存到 {}（{} KB）", p.display(), kb),
-                                    format!("{scope_label}已印制（{n_leaf} 叶）\n{name}"),
-                                )
+                    let (msg, toast) = match (picked_path, render) {
+                        (None, _) => ("已取消保存".to_string(), "已取消保存".to_string()),
+                        (Some(dest), PdfRender::Bytes(bytes)) => {
+                            match crate::exporter::save_bytes(dest, "pdf", &bytes) {
+                                Ok(p) => {
+                                    let kb = (bytes.len() / 1024).max(1);
+                                    let name = p
+                                        .file_name()
+                                        .map(|f| f.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "本叶.pdf".to_string());
+                                    (
+                                        format!("已保存到 {}（{} KB）", p.display(), kb),
+                                        format!("{scope_label}已印制（{n_leaf} 叶）\n{name}"),
+                                    )
+                                }
+                                Err(e) => {
+                                    let m = format!("保存失败：{e}");
+                                    (m.clone(), m)
+                                }
                             }
-                            Err(e) => {
-                                let m = format!("保存失败：{e}");
-                                (m.clone(), m)
+                        }
+                        (Some(dest), PdfRender::Temp(tmp)) => {
+                            match crate::exporter::move_file(&tmp, dest, "pdf") {
+                                Ok(p) => {
+                                    let kb = (std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) / 1024).max(1);
+                                    let name = p
+                                        .file_name()
+                                        .map(|f| f.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "整本.pdf".to_string());
+                                    (
+                                        format!("已保存到 {}（{} KB）", p.display(), kb),
+                                        format!("{scope_label}已印制（{n_leaf} 叶）\n{name}"),
+                                    )
+                                }
+                                Err(e) => {
+                                    let m = format!("保存失败：{e}");
+                                    (m.clone(), m)
+                                }
                             }
-                        },
+                        }
                     };
                     this.update(&mut cx, |this, cx| {
                         this.export_busy = false;

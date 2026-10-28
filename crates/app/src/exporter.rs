@@ -538,6 +538,24 @@ pub fn copy_file(from: &Path, to: &Path) -> Result<PathBuf> {
     Ok(to.to_path_buf())
 }
 
+/// 移动（改名）一个已存在的文件（`src` → `to`）：流式 PDF 导出先写到临时
+/// 文件、再按用户选的位置落盘，这一步就是第二步。
+///
+/// 与 `copy_file` 不同，这里用 `rename` 原地挪动（临时文件与目标同卷时近乎
+/// 原子、且不复制字节），省掉一份整本 PDF 的拷贝开销。补后缀、建父目录、
+/// 记住导出目录都复用既有逻辑。
+pub fn move_file(src: &Path, dest: PathBuf, ext: &str) -> Result<PathBuf> {
+    let path = with_extension(dest, ext);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    std::fs::rename(src, &path).with_context(|| {
+        format!("保存失败：{} → {}", src.display(), path.display())
+    })?;
+    remember_export_dir(&path);
+    Ok(path)
+}
+
 /// 书名 → 安全的文件名主干：去掉路径分隔符与控制字符，并给长度设上限。
 ///
 /// 书名来自 epub 元数据，可能带 `/`、`:`、换行——直接拼进默认文件名会让

@@ -208,3 +208,82 @@ fn ffi_gate_is_the_same_gate_as_the_native_app() {
         0
     );
 }
+
+// ── 5) 流式分批排版：与一次性整排逐页逐字完全相同 ──────────────────────────
+
+/// 构造多章字流：每个字符串是一章正文（章号 = 在切片中的下标）。
+fn flow_of_chapters(chapters: &[&str]) -> Vec<Glyph> {
+    let mut v = Vec::new();
+    for (ci, s) in chapters.iter().enumerate() {
+        for (i, c) in s.chars().enumerate() {
+            v.push(Glyph {
+                chapter: ci,
+                para: 0,
+                offset: i,
+                ch: c,
+                kind: GlyphKind::Char,
+            });
+        }
+    }
+    v
+}
+
+#[test]
+fn streaming_layout_is_identical_to_whole_layout() {
+    // 三章内容不等长、章次跨越多面，足以触发章首预留与跨章收面、夹注流转。
+    let flow = flow_of_chapters(&[
+        "道可道非常道名可名非常名無名天地之始有名萬物之母故常無欲以觀其妙",
+        "五色令人目盲五音令人耳聾五味令人口爽馳騁畋獵令人心發狂難得之貨令人行妨",
+        "知人者智自知者明勝人者有力自勝者強知足者富強行者有志不失其所者久",
+    ]);
+    let whole = gloss::layout_book_from_opts(&flow, |_| None, 8, 8, 2, true, true);
+
+    let mut streamed: Vec<Page> = Vec::new();
+    gloss::layout_book_streaming(
+        &flow,
+        |_| None,
+        8,
+        8,
+        2,
+        true,
+        true,
+        |_order, pages| {
+            for p in pages {
+                streamed.push(p.clone());
+            }
+        },
+    );
+
+    // 最强等价：把两版整份页面 `{:?}` 全文比对——任何排版差异（字序、列结构、
+    // 章首标记、夹注归属）都会让字符串不等。
+    assert_eq!(
+        format!("{whole:#?}"),
+        format!("{streamed:#?}"),
+        "分批排版必须与一次性整排逐页逐字完全相同（零像素差异）"
+    );
+}
+
+#[test]
+fn streaming_layout_emits_every_chapter_once_in_order() {
+    // 回调应按全书章序、每章恰好吐一次，且收到的页数之和等于整排页数。
+    let flow = flow_of_chapters(&["甲乙丙丁", "戊己庚辛壬", "癸子丑寅卯辰"]);
+    let whole = gloss::layout_book_from_opts(&flow, |_| None, 8, 8, 0, true, true);
+
+    let mut seen: Vec<usize> = Vec::new();
+    let mut total = 0usize;
+    gloss::layout_book_streaming(
+        &flow,
+        |_| None,
+        8,
+        8,
+        0,
+        true,
+        true,
+        |order, pages| {
+            seen.push(order);
+            total += pages.len();
+        },
+    );
+    assert_eq!(seen, vec![0, 1, 2], "应按章序每章吐一次");
+    assert_eq!(total, whole.len(), "吐出的总页数应等于整排页数");
+}
