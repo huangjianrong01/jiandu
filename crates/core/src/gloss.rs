@@ -835,6 +835,27 @@ pub fn jodu_of(c: char, mode: PunctMode) -> Option<Jodu> {
             PunctMode::Classic => Jodu::Seed,
         });
     }
+    // **兜底一（v1.83.1）：半角 ASCII 句读**。
+    //
+    // EPUB / 网页文本里 `,` `;` `:` 极常见（清洗不彻底、中英混排、从 HTML
+    // 直接抓下来的段落）。它们**不在** `types::is_punct` 里（那集合只列全角），
+    // 于是从符号库漏出去、按原字形排——竖排里就是一枚**躺倒的半角逗号**，
+    // 真机上看着像「断开的两截小棍」。从此一律归符号库。
+    if matches!(c, ',' | ';' | ':') {
+        // 两种模式都画**斜点**：全角 `，；：` 在现代模式本来就是 Seed
+        // （见 `jodu_lib_modern_draws_one_ring_for_every_stop`），半角没道理
+        // 单独降成圈——同一个标点，形状不该随全角 / 半角变。
+        return Some(Jodu::Seed);
+    }
+    // **兜底二（v1.83.1）：Unicode 竖排呈现形**（U+FE10–FE19）。
+    //
+    // 有的 EPUB 直接把标点转成竖排形再打包：`︐`（竖排逗号）、`︑`（竖排顿号）、
+    // `︓`（竖排冒号）、`︔`（竖排分号）。字库里未必有这几枚，缺字时 GPUI
+    // 会回退到别的字体，字形**更不可控**（用户看到的那枚怪符号正是此类）。
+    // `︒`（竖排句号）与 `︕︖`（竖排叹问）上面已先认下，这里补齐读类。
+    if matches!(c, '︐' | '︑' | '︓' | '︔') {
+        return Some(Jodu::Seed);
+    }
     // 其余句读（逗号 / 顿号 / 分号 / 冒号 / 破折号 / 间隔号）都算「读」。
     // 引号 / 括号 / 书名号虽然也在 `is_punct` 里，但它们要「括住」东西、
     // 有自己的一对字形，绝不换成点子——故一并排掉。
@@ -1569,6 +1590,83 @@ mod tests {
                 "{c} 现代模式应画斜点"
             );
         }
+    }
+
+    /// **EPUB 标点扫雷**（v1.83.1）：凡是在电子书里真会出现的句读，
+    /// 两种模式都必须落进符号库，一枚都不许漏到「按原字形排」。
+    ///
+    /// 起因：用户看到「兮」后面那枚标点**断成两截**。查下来 `is_punct`
+    /// 只列全角标点，半角 `,` `;` `:` 与竖排形 `︐︑︓︔` 全在集合之外——
+    /// 它们不归符号库管，于是按**原字形**排：竖排里就是一枚躺倒的半角
+    /// 逗号，2× 光栅下细尾被抗锯齿吃掉，看着像两根小棍。
+    ///
+    /// 这条测试把「常见标点 → 符号库」这条底线钉死；将来再加字符，
+    /// 漏一个就红。
+    #[test]
+    fn epub_punctuation_sweep_all_land_in_the_jodu_library() {
+        // 逗号 / 顿号：全角、半角、竖排呈现形
+        for c in ['，', ',', '︐', '、', '︑'] {
+            for m in [PunctMode::Classic, PunctMode::Modern] {
+                assert_eq!(jodu_of(c, m), Some(Jodu::Seed), "U+{:04X} {c:?} 漏了", c as u32);
+            }
+        }
+        // 分号 / 冒号
+        for c in ['；', ';', '︔', '：', ':', '︓'] {
+            for m in [PunctMode::Classic, PunctMode::Modern] {
+                assert_eq!(jodu_of(c, m), Some(Jodu::Seed), "U+{:04X} {c:?} 漏了", c as u32);
+            }
+        }
+        // 句号：全角、全角句点、竖排句号
+        for c in ['。', '．', '︒'] {
+            assert_eq!(jodu_of(c, PunctMode::Classic), Some(Jodu::Ring), "{c} 古诗模式该画〇");
+            assert_eq!(jodu_of(c, PunctMode::Modern), Some(Jodu::Dot), "{c} 现代模式该画圈");
+        }
+        // 疑 / 叹：全角、半角、竖排形
+        for c in ['？', '?', '︖', '！', '!', '︕'] {
+            assert_eq!(jodu_of(c, PunctMode::Classic), Some(Jodu::BigSeed), "U+{:04X} {c:?} 漏了", c as u32);
+        }
+        // 省略 / 破折 / 间隔号
+        for c in ['…', '‥', '—', '·'] {
+            assert_eq!(jodu_of(c, PunctMode::Classic), Some(Jodu::Seed), "U+{:04X} {c:?} 漏了", c as u32);
+        }
+    }
+
+    /// **扫雷（结构性）**：`types::is_punct` 里除「成对符号」外，每一枚
+    /// 都必须被符号库认下。这条不依赖手写清单——将来往 `is_punct` 里加
+    /// 一个标点却忘了配形制，这里立刻红。
+    #[test]
+    fn every_punct_char_has_a_shape_except_the_paired_ones() {
+        // 成对符号各有字形，**故意**不换成点子。
+        let paired = ['「', '」', '『', '』', '（', '）', '《', '》', '“', '”', '‘', '’'];
+        let mut checked = 0;
+        for cp in 0x3000u32..=0x303F {
+            let Some(c) = char::from_u32(cp) else { continue };
+            if !crate::types::is_punct(c) || paired.contains(&c) {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                jodu_of(c, PunctMode::Classic).is_some(),
+                "U+{cp:04X} {c:?} 在 is_punct 里却没有形制——会按原字形画成怪符号"
+            );
+        }
+        for cp in 0x2000u32..=0x206F {
+            let Some(c) = char::from_u32(cp) else { continue };
+            if !crate::types::is_punct(c) || paired.contains(&c) {
+                continue;
+            }
+            checked += 1;
+            assert!(jodu_of(c, PunctMode::Classic).is_some(), "U+{cp:04X} {c:?} 没有形制");
+        }
+        for cp in 0xFF00u32..=0xFF65 {
+            let Some(c) = char::from_u32(cp) else { continue };
+            if !crate::types::is_punct(c) || paired.contains(&c) {
+                continue;
+            }
+            checked += 1;
+            assert!(jodu_of(c, PunctMode::Classic).is_some(), "U+{cp:04X} {c:?} 没有形制");
+        }
+        assert!(checked >= 8, "扫到的标点太少（{checked}），这测试可能空转了");
     }
 
     /// 符号库：古籍模式下句画「〇」、疑叹画**大一号**斜点、读画斜点。

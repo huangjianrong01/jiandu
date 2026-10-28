@@ -16,6 +16,14 @@ use crate::types::{FontChoice, FontPreset};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// 缺 `punct_ink` 时的落点：**朱砂**（`PunctInk::ALL[1]`）。
+///
+/// 单独写成函数是因为 serde 的 `default = "..."` 要一条**路径**，
+/// 不能直接写 `1`；也让「为什么不是 0」这件事在代码里有名有姓。
+fn cinnabar() -> usize {
+    1
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Prefs {
     /// `Theme::ALL` 下标。
@@ -96,7 +104,12 @@ pub struct Prefs {
     ///
     /// 只在**浅纸**上分这两档：深底（暗金 / 夜读）一律走淡金，朱砂压在
     /// 深底上会发闷，也压过了正文的月白。
-    #[serde(default)]
+    ///
+    /// ⚠️ **必须显式指定默认函数**：这一项是 v1.66.0 才加的，之前所有存档
+    /// 都没有它；光写 `#[serde(default)]` 会落到 `usize::default()` = **0**，
+    /// 也就是「墨」——升级后句读会**悄悄从朱笔变墨笔**，而 `Default for Prefs`
+    /// 里明明写着 1。用户那句「是不是朱砂红？」问的就是这个。
+    #[serde(default = "cinnabar")]
     pub punct_ink: usize,
     /// **繁简显示档**（v1.81.0）：0 = 原文、1 = 简体、2 = 繁体。
     ///
@@ -294,6 +307,27 @@ mod tests {
         assert_eq!(back.zoom, p.zoom);
         assert_eq!(back.theme, p.theme);
         assert!(back.notes_inline);
+    }
+
+    /// **老存档缺 `punct_ink` 必须落到朱砂**（v1.83.1）。
+    ///
+    /// 这一项 v1.66.0 才加，之前所有 prefs.json 里都没有它。原来写的是
+    /// `#[serde(default)]`，落到 `usize::default()` = 0 = **墨**——于是
+    /// 所有老用户升级后句读从朱笔悄悄变墨笔（用户原话：「是不是朱砂红？」）。
+    /// 这条测试把「缺项 = 朱砂」钉死，`Default for Prefs` 与 serde 两条路
+    /// 从此必须同口径。
+    #[test]
+    fn missing_punct_ink_falls_back_to_cinnabar() {
+        let mut v = serde_json::to_value(Prefs::default()).expect("序列化");
+        v.as_object_mut().expect("对象").remove("punct_ink");
+        let p: Prefs = serde_json::from_value(v).expect("反序列化");
+        assert_eq!(
+            p.punct_ink(),
+            crate::gloss::PunctInk::Zhu,
+            "老存档缺 punct_ink 落到了墨色——句读不该悄悄换笔"
+        );
+        // 内存默认值与 serde 缺省值必须是同一个档。
+        assert_eq!(Prefs::default().punct_ink(), crate::gloss::PunctInk::Zhu);
     }
 
     #[test]

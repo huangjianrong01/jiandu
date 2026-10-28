@@ -6782,11 +6782,17 @@ impl Root {
                         crate::types::vertical_quote(g.ch).to_string(),
                     )),
             );
-        } else if is_punct(g.ch) {
+        } else if crate::punct::kind_for(g.ch, self.punct_mode).is_some() {
             // 句读（标点）：**正文字号 × 0.35** 的朱砂小手绘（空心圈 / 小弧），
             // 中心钉在字格右下角（x + 格宽×0.7、y + 格高×0.7），格心整个
             // 让给正文。几何与绘制全在 `punct`（纯函数 + `paint_path`，
             // 有单测），这里只照抄——**严禁**在这里回落字体字形或 SVG。
+            //
+            // ⚠️ 判据用**符号库**（`kind_for`）而不是 `is_punct`（v1.83.1）：
+            // `is_punct` 只列全角标点，半角 `,` `;` `:` 与竖排形 `︐︑︓︔`
+            // 都漏在外面，于是掉进下面的「按原字形排」分支——真机上就是一枚
+            // 躺倒的半角逗号（用户原话「断开的双截棍」）。符号库认下谁，
+            // 这里就画谁，两处不再各判一次。
             cell = cell
                 .relative()
                 .child(self.punct_overlay(g.ch, cell_w, cell_h, fs, back, false));
