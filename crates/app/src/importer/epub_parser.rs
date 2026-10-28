@@ -780,13 +780,25 @@ fn is_ascii_word(c: char) -> bool {
     c.is_ascii_alphanumeric()
 }
 
-/// 连续 ASCII 空白折成一个。**不动全角空格 `　`**——它是段首缩进记号，
-/// 折掉就把古人「抬头 / 空格」的格式丢了。
+/// 连续空白折成一个（半角空格 / `&nbsp;` / 零宽 / **全角空格**都算）。
+///
+/// 劣质件动辄用一整串 `　　　` 或 `&nbsp;&nbsp;&nbsp;` 当缩进，竖排时
+/// 每一个都会被当成真空格占掉字格，一行没几个字就「到边」了。
+///
+/// ⚠️ 是折成**一个**而不是删光：段首那一个全角空格正是古人「抬头 /
+/// 空格」的记号，删了就把格式丢了。
 fn squeeze_spaces(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
     for c in s.chars() {
-        if c == ' ' || c == '\u{00A0}' || c == '\u{200B}' {
+        if c == '\u{3000}' {
+            // 全角空格：保留**原样**（它是缩进记号，换成半角就不叫抬头了）
+            if !prev_space {
+                out.push(c);
+                prev_space = true;
+            }
+        } else if c == ' ' || c == '\u{00A0}' || c == '\u{200B}' {
+            // 半角 / `&nbsp;` / 零宽：一律归一成普通空格
             if !prev_space {
                 out.push(' ');
                 prev_space = true;
@@ -1027,9 +1039,21 @@ mod tests {
 
     #[test]
     fn full_width_indent_is_preserved() {
-        // 全角空格是段首缩进记号，去噪不该动它（只折 ASCII 空白）。
+        // 全角空格是段首缩进记号：压成**一个**而不是删光。
         let got = clean_text_level("　　天地玄黄。");
-        assert!(got.starts_with('\u{3000}'), "段首缩进被吃掉：{got:?}");
+        assert!(got.starts_with('\u{3000}'), "段首缩进被吃光：{got:?}");
+        assert_eq!(
+            got.chars().filter(|c| *c == '\u{3000}').count(),
+            1,
+            "连续全角空格没被压成一个：{got:?}"
+        );
+    }
+
+    #[test]
+    fn nbsp_runs_collapse_to_one_space() {
+        let got = clean_text_level("天地\u{00A0}\u{00A0}\u{00A0}玄黄。");
+        assert!(!got.contains('\u{00A0}'), "&nbsp; 串没被折掉：{got:?}");
+        assert_eq!(got, "天地 玄黄。", "该只留一个空格：{got:?}");
     }
 
     #[test]

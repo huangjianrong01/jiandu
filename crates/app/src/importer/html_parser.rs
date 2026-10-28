@@ -426,6 +426,46 @@ mod tests {
         assert!(!t.contains("<u>") && !t.contains("class="), "{t}");
     }
 
+    /// 插图：`<img>` 与「只有图的 `<div>`」一律不进正文，**连 alt 都不取**
+    /// （alt 常是「印章」「藏书票」这类出版杂字，取了就是往正文里塞垃圾）。
+    #[test]
+    fn images_are_dropped_and_alt_never_leaks() {
+        let src = r#"<html><body>
+            <p>道可道，非常道。</p>
+            <div class="illus"><img src="seal.png" alt="藏書票"/></div>
+            <div><img src="blank.gif"/></div>
+            <p><img src="inline.png" alt="印章"/>名可名，非常名。</p>
+            <svg><text>矢量水印</text></svg>
+            </body></html>"#;
+        let (t, e) = extract_html_str(src);
+        assert!(e.is_none(), "不该报错：{e:?}");
+        assert!(!t.contains("藏書票"), "alt 漏进正文：{t:?}");
+        assert!(!t.contains("印章"), "alt 漏进正文：{t:?}");
+        assert!(!t.contains("seal.png") && !t.contains("src="), "标签壳漏进正文：{t:?}");
+        assert!(!t.contains("矢量水印"), "svg 漏进正文：{t:?}");
+        // 纯图容器不该留下空行（空段被 push_break 吞掉）
+        assert_eq!(
+            t.lines().filter(|l| !l.trim().is_empty()).count(),
+            2,
+            "纯图 div 不该留下空段：{t:?}"
+        );
+        assert!(t.contains("道可道，非常道。"), "正文被误删：{t:?}");
+        assert!(t.contains("名可名，非常名。"), "正文被误删：{t:?}");
+    }
+
+    /// 实体还原：`&nbsp;` 变空格、`&ldquo;/&rdquo;` 变中文弯引号、
+    /// `&mdash;` 变破折号——还原成**汉字标点**而不是留着 `&xxx;` 的字面量。
+    #[test]
+    fn named_entities_become_real_punctuation() {
+        let (t, _) = extract_html_str(
+            r#"<html><body><p>&ldquo;道&rdquo;&mdash;&nbsp;可道也&hellip;</p></body></html>"#,
+        );
+        assert!(t.contains("“道”—"), "弯引号/破折号没还原：{t:?}");
+        assert!(t.contains("可道也…"), "省略号没还原：{t:?}");
+        assert!(!t.contains("&ldquo;") && !t.contains("&mdash;"), "实体没还原：{t:?}");
+        assert!(!t.contains('\u{00A0}'), "&nbsp; 该还原成普通空格：{t:?}");
+    }
+
     #[test]
     fn unknown_entities_are_kept_verbatim() {
         assert_eq!(unescape_html("&foo;道"), "&foo;道");
