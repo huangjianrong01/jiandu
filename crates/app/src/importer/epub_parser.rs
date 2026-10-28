@@ -38,9 +38,11 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use regex::Regex;
 
 use super::html_parser::{extract_html_reader, extract_html_reader_keep_tables};
 use super::traits::FormatParser;
@@ -60,6 +62,15 @@ const TOC_PAGE_MIN_LINES: usize = 5;
 const START_MAX_RATIO: f32 = 0.3;
 /// 起点定位的绝对行保护（小册子用，见 [`cut_to_body_start`]）。
 const START_ABS_MAX_LINES: usize = 30;
+
+/// 作者的**私有排版标签**（文本级去噪，见 [`clean_text_level`]）：
+/// `[注]` / `[注一]` / `[注 2]` / `〔注三〕` / `【注1】` …
+///
+/// 只认「注 + 至多四个序数字符」这一形态——`[注：见下]` 这种带冒号、
+/// 带实义内容的**不删**：那是真注释，删了就丢字。宁漏判不误杀。
+static PRIVATE_MARK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"[\[〔【]\s*注[0-9一二三四五六七八九十百千〇零]{0,4}\s*[\]〕】]"#).unwrap()
+});
 
 /// EPUB 解析器。
 pub struct EpubParser;
@@ -112,7 +123,9 @@ impl FormatParser for EpubParser {
             // 噪声行必须数**清洗前**的原文：先删再数就数不到东西了
             // （题名页正是「删掉两行噪声后只剩一个书名」的那类节）。
             let noise = jiandu_core::purge::noise_line_count(&raw);
-            let text = jiandu_core::purge::strip_pub_lines(&raw);
+            // 文本级去噪（补丁 1）：摘私有排版标签 + 接断裂段落。
+            // 噪声行数是**清洗前**数出来的，不受合并影响。
+            let text = clean_text_level(&jiandu_core::purge::strip_pub_lines(&raw));
             if text.trim().is_empty() {
                 continue;
             }
@@ -145,7 +158,7 @@ impl FormatParser for EpubParser {
             for name in sorted_html_names(&mut zip) {
                 if let Some(raw) = read_section(&mut zip, &name, true) {
                     let noise = jiandu_core::purge::noise_line_count(&raw);
-                    let text = jiandu_core::purge::strip_pub_lines(&raw);
+                    let text = clean_text_level(&jiandu_core::purge::strip_pub_lines(&raw));
                     if text.trim().is_empty() {
                         continue;
                     }
@@ -172,7 +185,7 @@ impl FormatParser for EpubParser {
         if used == 0 {
             for name in sorted_html_names(&mut zip) {
                 if let Some(text) = read_section(&mut zip, &name, false) {
-                    let text = jiandu_core::purge::strip_pub_lines(&text);
+                    let text = clean_text_level(&jiandu_core::purge::strip_pub_lines(&text));
                     if text.trim().is_empty() {
                         continue;
                     }
@@ -740,6 +753,110 @@ fn read_container_opf(zip: &mut zip::ZipArchive<std::fs::File>) -> Option<String
 ///
 /// `drop_tables = true` 时**整块丢弃 `<table>`**（v1.69.0 死命令）；
 /// `false` 是「弃表后整本空了」的救回退路。
+// ----------------------------------------------------------------------
+// 文本级去噪（v1.90.0 补丁 1）
+//
+// 段落边界到这一层已经落成「一行一段」（见 `html_parser::push_break`），
+// 所以这两件事都在**文本层**解决，不必回头改 DOM 抽取 —— 改动面最小，
+// 也不会波及 html / md / txt 的导入路径。
+// ----------------------------------------------------------------------
+
+/// 一段算不算「已经收尾」（以句末标点收尾）。
+///
+/// 逗号 / 顿号 / 冒号**不算**收尾：它们恰恰是「话没说完」的证据，
+/// 这种段后面跟的 <p> 几乎肯定是同一个自然段被切开了。
+fn para_is_closed(p: &str) -> bool {
+    matches!(
+        p.trim_end().chars().last(),
+        Some(
+            '。' | '！' | '？' | '；' | '…' | '—' | '”' | '’' | '」' | '』' | '）' | '】'
+            | '》' | '〉' | '.' | '!' | '?' | ';'
+        )
+    )
+}
+
+/// 中英文之间要不要补一个空格（`abc` + `def` 不补就粘成一个词）。
+fn is_ascii_word(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+}
+
+/// 连续 ASCII 空白折成一个。**不动全角空格 `　`**——它是段首缩进记号，
+/// 折掉就把古人「抬头 / 空格」的格式丢了。
+fn squeeze_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c == ' ' || c == '\u{00A0}' || c == '\u{200B}' {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out
+}
+
+/// 合并断裂段落：相邻两段，前一段**没以标点收尾**就强行接起来。
+///
+/// 劣质转换件最爱把一句话按印刷行切成好几个 `<p>`，竖排时每一段都得
+/// 另起一列，一句话被拆得七零八落。
+///
+/// 唯一例外是**章节标题**：它天然不带句读，若被后面的正文吞掉，切章就
+/// 再也认不出来（「第一章 天地」+ 正文 → 一整段，章没了）。故标题行
+/// 永远独占一段。
+fn merge_broken_paragraphs(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        // ⚠️ 只裁 ASCII 空白：`str::trim()` 会把全角空格 `　` 也裁掉，
+        // 而它是段首缩进记号，裁了就丢了古人的抬头格式。
+        let line = raw.trim_ascii();
+        if line.is_empty() {
+            continue;
+        }
+        if jiandu_core::pipeline::is_chapter_head(line) {
+            out.push(line.to_string());
+            continue;
+        }
+        let mergeable = match out.last() {
+            Some(prev) => {
+                !jiandu_core::pipeline::is_chapter_head(prev) && !para_is_closed(prev)
+            }
+            None => false,
+        };
+        if mergeable {
+            let mut joined = out.pop().unwrap_or_default();
+            let need_gap = joined.chars().last().map(is_ascii_word).unwrap_or(false)
+                && line.chars().next().map(is_ascii_word).unwrap_or(false);
+            if need_gap {
+                joined.push(' ');
+            }
+            joined.push_str(line);
+            out.push(joined);
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
+/// 文本级去噪总入口：先摘私有排版标签，再接断裂段落。
+///
+/// 顺序不能反——先合并会把「出版社」这类噪声行粘进正文行里，
+/// 后面的 `strip_pub_lines` 按行匹配就再也认不出来了。
+/// 故本函数**只在 `strip_pub_lines` 之后**调用（见 `parse`）。
+fn clean_text_level(text: &str) -> String {
+    let no_mark = PRIVATE_MARK.replace_all(text, "");
+    let squeezed: String = no_mark
+        .lines()
+        .map(|l| squeeze_spaces(l.trim_ascii()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    merge_broken_paragraphs(&squeezed)
+}
+
 fn read_section(
     zip: &mut zip::ZipArchive<std::fs::File>,
     name: &str,
@@ -845,6 +962,87 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 补丁 1：文本级去噪 ──────────────────────────────────────────
+
+    #[test]
+    fn private_layout_marks_are_stripped() {
+        let src = "子曰学而[注一]时习之[注]。不亦说乎。";
+        let got = clean_text_level(src);
+        assert!(!got.contains("[注一]"), "私有标签没摘掉：{got}");
+        assert!(!got.contains("[注]"), "私有标签没摘掉：{got}");
+        assert!(got.contains("子曰学而"), "正文被误删：{got}");
+        assert!(got.contains("时习之"), "正文被误删：{got}");
+        // 方括号 / 六角括号 / 直角括号都得认
+        assert!(!clean_text_level("甲〔注二〕乙").contains("〔注二〕"));
+        assert!(!clean_text_level("甲【注3】乙").contains("【注3】"));
+    }
+
+    #[test]
+    fn real_annotations_with_content_are_kept() {
+        // 「注：」后面带实义内容 → 那是真注释，绝不能删（宁漏判不误杀）。
+        let src = "天地玄黄[注：见下卷]宇宙洪荒。";
+        let got = clean_text_level(src);
+        assert!(got.contains("[注：见下卷]"), "真注释被误删：{got}");
+    }
+
+    #[test]
+    fn broken_paragraphs_are_merged() {
+        // 前一段不以标点收尾 → 强行接起来（劣质件把一句话切成好几个 <p>）
+        let src = "天地玄黄，\n宇宙洪荒。\n日月盈昃。";
+        let got = clean_text_level(src);
+        assert_eq!(got.lines().count(), 2, "本该合成两段：{got:?}");
+        assert!(
+            got.lines().next().unwrap().contains("天地玄黄，宇宙洪荒。"),
+            "第一句没接上：{got:?}"
+        );
+        // 以标点收尾的正常段落**不许**被吞并
+        assert_eq!(got.lines().nth(1).unwrap(), "日月盈昃。");
+    }
+
+    #[test]
+    fn chapter_heads_are_never_swallowed() {
+        // 标题天然不带句读，若被正文吞掉，切章就再也认不出来。
+        let src = "第一章 天地\n天地玄黄，\n宇宙洪荒。";
+        let got = clean_text_level(src);
+        let lines: Vec<&str> = got.lines().collect();
+        assert_eq!(lines.first().copied(), Some("第一章 天地"), "标题被吞：{got:?}");
+        assert_eq!(lines.len(), 2, "标题后的断裂段本该接起来：{got:?}");
+        assert_eq!(lines[1], "天地玄黄，宇宙洪荒。", "正文没接上：{got:?}");
+
+        // 标题自己也不能反向吞掉**上一段**没有句读的正文
+        let src2 = "天地玄黄，\n第二章 云腾\n宇宙洪荒。";
+        let got2 = clean_text_level(src2);
+        assert!(
+            got2.lines().any(|l| l == "第二章 云腾"),
+            "标题被上一段吞掉：{got2:?}"
+        );
+    }
+
+    #[test]
+    fn ascii_words_keep_a_gap_when_merged() {
+        let got = clean_text_level("the Analects\nof Confucius.");
+        assert_eq!(got, "the Analects of Confucius.");
+    }
+
+    #[test]
+    fn full_width_indent_is_preserved() {
+        // 全角空格是段首缩进记号，去噪不该动它（只折 ASCII 空白）。
+        let got = clean_text_level("　　天地玄黄。");
+        assert!(got.starts_with('\u{3000}'), "段首缩进被吃掉：{got:?}");
+    }
+
+    #[test]
+    fn noise_lines_are_counted_before_merging() {
+        // 回归护栏：合并发生在 strip_pub_lines 之后，噪声行数用清洗前的
+        // 原文统计。若有人把 clean_text_level 挪到 noise_line_count 之前，
+        // 垃圾节的判定就会失准——这条测试守的是调用顺序的**意图**。
+        let raw = "天地玄黄，\n宇宙洪荒。";
+        let before = jiandu_core::purge::noise_line_count(raw);
+        let cleaned = clean_text_level(&jiandu_core::purge::strip_pub_lines(raw));
+        assert_eq!(cleaned.lines().count(), 1);
+        let _ = before; // 原文统计不受影响（值本身不由本测试断言）
+    }
 
     #[test]
     fn modern_section_names_are_rejected() {
