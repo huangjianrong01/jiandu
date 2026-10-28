@@ -275,12 +275,12 @@ impl Brush {
     }
 }
 
-/// 竖排注音：**一字母一行**、贴字格右上角（与屏幕 `ruby::layout` 同一套几何）。
+/// 竖排注音：**紧凑竖叠**、贴字格右侧（与屏幕 `ruby::layout` 同一套几何）。
 ///
 /// 屏幕那侧是 GPUI 里一串竖排小 div；这里是 CG 逐字母落笔。两者共用
-/// `jiandu_core::ruby::layout` 的度量（字号 30%、长拼音降号、下限 18%、
-/// 块宽恒为一个字母），所以 PDF 里的 `bō rě` 与屏幕逐字同位——
-/// **绝不横向排**（横向会撑破一格宽、压到左边下一列）。
+/// `jiandu_core::ruby::layout` 的度量（字号 40%、步进 0.82、长拼音收敛下限
+/// 22%、右侧留呼吸间距），所以 PDF 里的 `bō rě` 与屏幕逐字同位——
+/// **绝不横向排**（横向会撑破一格宽、压到邻列），纵向也绝不溢出格高。
 fn draw_ruby(
     b: &mut Brush,
     py: &str,
@@ -292,23 +292,26 @@ fn draw_ruby(
     g: &PdfGeo,
 ) {
     let rl = crate::ruby::layout(py, fs as f32, cell_w as f32, cell_h as f32);
-    let bw = rl.block_w as f64;
-    let lh = rl.line_h as f64;
-    // 右缘内缩一格宽的 6%：纸上的界行是 0.5pt 实线，字若贴到格边就压线了
-    // （屏幕上格线更淡，不会露这个破绽；纸上会）。
-    let bx = x + cell_w - bw - cell_w * 0.06;
-    let mut ty = y + rl.top as f64;
-    for c in py.chars() {
-        b.glyph_at(
-            c,
-            bx + bw * 0.5,
-            ty,
-            lh,
-            rl.fs as f64,
-            g.note_ink,
-            ShareFont::from(g.note_font),
-        );
-        ty += lh;
+    // 右上角落点（屏幕坐标）：右缘内缩一个 `rl.gutter`（与屏幕同一套度量）。
+    let right = x + cell_w - rl.gutter as f64;
+    let top = y + rl.top as f64;
+    if draw_ruby_rotated(b, py, right, top, &rl, g.note_ink, ShareFont::from(g.note_font)).is_err() {
+        // 退化：逐字母竖叠（步进取字母全高，绝不叠墨）。
+        let bw = rl.block_w as f64;
+        let step = rl.fs as f64 * 1.02;
+        let mut ty = top;
+        for c in py.chars() {
+            b.glyph_at(
+                c,
+                right - bw + bw * 0.5,
+                ty,
+                step,
+                rl.fs as f64,
+                g.note_ink,
+                ShareFont::from(g.note_font),
+            );
+            ty += step;
+        }
     }
     // 三点提示（与屏幕同款）：贴字格下缘右侧，三道极细短横——只作
     // 「此字有音」的暗示，不抢正文。宽高都随格缩，A4 上是一道灰线。
@@ -320,6 +323,68 @@ fn draw_ruby(
     for i in 0..3 {
         b.rect(left + i as f64 * (dw + gap), dy, dw, 0.7, g.note_ink, None);
     }
+}
+
+/// 整串**顺时针旋转 90°** 落笔（与屏幕 `ruby_glyph` 同一套度量）。
+///
+/// 纸面上 CoreGraphics 的 CTM **能真转**（不像 GPUI 把变换矩阵写死），
+/// 所以这里直接 `translate → rotate(-90°) → 逐字落笔`：
+/// 局部 `+x`（读序）→ 全局向下；局部 `+y`（字母的上）→ 全局向右。
+fn draw_ruby_rotated(
+    b: &mut Brush,
+    py: &str,
+    right_x: f64,
+    top_y: f64,
+    rl: &crate::ruby::RubyLayout,
+    color: u32,
+    kind: ShareFont,
+) -> Result<(), String> {
+    use core_graphics::font::CGGlyph;
+    use core_graphics::geometry::{CGPoint, CGSize};
+    use core_text::font_descriptor::kCTFontOrientationHorizontal;
+
+    let fs = rl.fs as f64;
+    let (font, asc, _desc) = b.font(kind, fs)?;
+    let mut glyphs: Vec<CGGlyph> = Vec::new();
+    let mut advs: Vec<f64> = Vec::new();
+    for c in py.chars() {
+        let mut unit: [u16; 1] = [0];
+        c.encode_utf16(&mut unit);
+        let mut gl: CGGlyph = 0;
+        let ok = unsafe { font.get_glyphs_for_characters(unit.as_ptr(), &mut gl, 1) };
+        if !ok {
+            return Err(format!("字体缺字形 {c:?}"));
+        }
+        let mut sz = CGSize::new(0.0, 0.0);
+        unsafe {
+            font.get_advances_for_glyphs(kCTFontOrientationHorizontal, &gl, &mut sz, 1)
+        };
+        glyphs.push(gl);
+        advs.push(sz.width);
+    }
+    let run_w: f64 = advs.iter().sum();
+    if run_w <= 0.0 {
+        return Err("串宽为零".to_string());
+    }
+    // 真实串宽比 core 预留的长时整体缩一档——绝不溢出到同列下一个字。
+    let k = (rl.block_h as f64 / run_w).min(1.0);
+
+    let (r, gg, bb) = rgb(color);
+    b.ctx.save();
+    // CG 坐标（原点左下、y 向上）：字母顶部朝 +x，故基线在 `right_x - asc`。
+    b.ctx.translate(right_x - asc, b.cy(top_y));
+    b.ctx.rotate(-std::f64::consts::FRAC_PI_2);
+    if k < 1.0 {
+        b.ctx.scale(k, k);
+    }
+    b.ctx.set_rgb_fill_color(r, gg, bb, 1.0);
+    let mut ax = 0.0f64;
+    for i in 0..glyphs.len() {
+        font.draw_glyphs(&[glyphs[i]], &[CGPoint::new(ax, 0.0)], b.ctx.clone());
+        ax += advs[i];
+    }
+    b.ctx.restore();
+    Ok(())
 }
 
 // ── 画一叶 ────────────────────────────────────────────────────────────
