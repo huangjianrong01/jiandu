@@ -731,6 +731,12 @@ pub struct Root {
     /// **算好的结果**：开抽屉（或切范围）时算一次存着，绝不逐帧重算——
     /// 整本百万字的 n-gram 每帧跑一遍，掉帧是必然的。
     pub analysis: Option<(String, jiandu_core::analysis::TextStats)>,
+    /// **卡片匣导出 Anki 时出哪种卡**（v1.81.0 · 模块六）。
+    ///
+    /// 三种卡面各有各的用处：挖空练背诵、问答练接句、释义练认字。选一次
+    /// 记住到关程序为止——它是「这一次整理卡片匣的打算」，不是该写进偏好
+    /// 文件的长期设置（写进去反而会让下次导出莫名换了卡面）。
+    pub anki_kind: crate::exporter::AnkiKind,
     /// 生僻字显示：true 时给生僻字标注读音。
     pub show_rare: bool,
     /// 数字转汉字：true 时阿拉伯数字在竖排里显示为汉字（一六二八），
@@ -1215,6 +1221,7 @@ impl Root {
             analysis_tab: AnalysisTab::Char,
             analysis_scope: AnalysisScope::Chapter,
             analysis: None,
+            anki_kind: crate::exporter::AnkiKind::Cloze,
             // 生僻字注音：默认开（`prefs.rare` 默认 true）——古籍里真有读不出
             // 的字，一根拐杖比「干净」重要。关掉的意愿会随下一版落盘。
             show_rare: prefs.rare,
@@ -4115,6 +4122,117 @@ fn anki_push_card(
         .detach();
     }
 
+
+    /// 匣中**能出卡**的张数：空引文的卡（历史上存过，但原文后来被删了）
+    /// 不算——导出去是一张空白卡，宁可不说。
+    fn exportable_card_count(&self) -> usize {
+        self.cards
+            .iter()
+            .filter(|c| !c.quote.trim().is_empty())
+            .count()
+    }
+
+    /// 『卡片匣 → Obsidian』（v1.81.0 · 模块六）：**一卡一 md**。
+    ///
+    /// 用户拍板走「一卡一档」而不是「全书一个大 md」：原子笔记 + 双链才是
+    /// Obsidian 的用法，一卡一档才能被 `[[书名]]` 反向聚合、被 Dataview 查。
+    /// 选的是**目录**不是文件——一次导几十篇，选文件就得敲名字，那是找罪受。
+    pub fn export_obsidian_cards(&mut self, cx: &mut Context<Self>) {
+        let n = self.exportable_card_count();
+        if n == 0 {
+            self.notice = "匣中空空，无可导出".to_string();
+            cx.notify();
+            return;
+        }
+        let cards: Vec<jiandu_core::cards::Card> = self.cards.clone();
+        // 作者按 `store_id` 从书架条目带出来：卡片只存了书名（跨书摘录，
+        // 匣里的卡未必来自当前这本），作者得回架上查。
+        let mut authors: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for e in self.library.books.iter() {
+            if let Some(sid) = e.store_id.as_ref() {
+                if !e.author.trim().is_empty() {
+                    authors.insert(sid.clone(), e.author.trim().to_string());
+                }
+            }
+        }
+        if !self.export_begin(cx) {
+            return;
+        }
+        cx.spawn(
+            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    // rfd 选目录同样必须**前台直调**（与 PNG / MD 同一条铁律）。
+                    let res = crate::exporter::export_obsidian_folder(&cards, &authors);
+                    this.update(&mut cx, |this, cx| {
+                        this.export_busy = false;
+                        this.notice = match res {
+                            Ok(Some((dir, k))) => format!("已导出 {k} 篇笔记 → {}", dir.display()),
+                            Ok(None) => "已取消导出".to_string(),
+                            Err(e) => format!("导出失败：{e}"),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// 『卡片匣 → Anki』：整匣按 `anki_kind` 出一份 CSV。
+    ///
+    /// 提示里**必须带笔记类型**：挖空挂到 Basic 上时 `{{c1::}}` 会被当普通
+    /// 文本，导入后卡片正面就是一行带花括号的字——「导进去了却不生效」的
+    /// 头号原因，得在落地这一刻就说明白。
+    pub fn export_anki_cards(&mut self, cx: &mut Context<Self>) {
+        let n = self.exportable_card_count();
+        if n == 0 {
+            self.notice = "匣中空空，无可导出".to_string();
+            cx.notify();
+            return;
+        }
+        let kind = self.anki_kind;
+        let cards: Vec<jiandu_core::cards::Card> = self.cards.clone();
+        let stem = self
+            .book
+            .as_ref()
+            .map(|b| crate::exporter::safe_file_stem(&b.title))
+            .unwrap_or_else(|| "卡片匣".to_string());
+        let file_name = format!("{stem}_卡片_{}.csv", kind.label());
+        if !self.export_begin(cx) {
+            return;
+        }
+        cx.spawn(
+            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let res = crate::exporter::export_anki_cards_csv(&cards, kind, &file_name);
+                    this.update(&mut cx, |this, cx| {
+                        this.export_busy = false;
+                        this.notice = match res {
+                            Ok(Some(_)) => format!(
+                                "已导出 {n} 张「{}」卡；导入 Anki 请选笔记类型：{}",
+                                kind.label(),
+                                kind.note_type()
+                            ),
+                            Ok(None) => "已取消导出".to_string(),
+                            Err(e) => format!("导出失败：{e}"),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// 换卡片匣出 Anki 时的卡面（挖空 / 问答 / 释义）。
+    pub fn set_anki_kind(&mut self, kind: crate::exporter::AnkiKind) {
+        self.anki_kind = kind;
+        self.notice = format!("卡片匣出卡：{}（Anki {}）", kind.label(), kind.note_type());
+    }
 
     /// 某章的第一面页码；找不到就回 0。
     pub fn page_of_chapter(&self, chapter: usize) -> usize {

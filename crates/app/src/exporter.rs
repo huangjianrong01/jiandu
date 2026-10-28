@@ -8,6 +8,7 @@
 //!   * md   —— 标题用 `#` / `##` 表达层级，便于再导入或被别的工具读取。
 
 use crate::types::{Book, Note, NoteKind};
+use jiandu_core::cards::{Card, CardKind};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -627,10 +628,412 @@ pub fn csv_two_quoted(front: &str, back: &str) -> String {
     )
 }
 
+// ------------------------------------------------------------------
+// Obsidian / Anki 卡片（v1.81.0 · P3 模块三）
+// ------------------------------------------------------------------
+//
+// 用户拍板：**一卡一 md**（不是一本书一个 md）。理由是对的——Obsidian 的
+// 价值在双链与原子笔记，一卷长文塞进一个档就只是一个「文档」，拆成一卡
+// 一档才成为可被别的笔记 `[[ ]]` 引用的**节点**。
+//
+// 落盘口径不变：仍然只走 [`write_bytes`] / [`save_bytes`] 那一个出口，
+// 绝不在这里手写 `std::fs::write`。
+
+/// Anki 制卡的三种形状。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnkiKind {
+    /// **挖空**：原文里最该背的那个字包成 `{{c1::字}}`（默认）。
+    Cloze,
+    /// **问答**：正面首句，背面全句 + 批注。
+    Qa,
+    /// **释义**：正面难字，背面读音 + 批注。
+    Gloss,
+}
+
+impl AnkiKind {
+    pub const ALL: [AnkiKind; 3] = [AnkiKind::Cloze, AnkiKind::Qa, AnkiKind::Gloss];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AnkiKind::Cloze => "挖空",
+            AnkiKind::Qa => "问答",
+            AnkiKind::Gloss => "释义",
+        }
+    }
+
+    /// 导入 Anki 时要选的笔记类型——CSV 里写不进去，只能告诉用户。
+    ///
+    /// 挖空必须挂 **Cloze** 类型，否则 `{{c1::}}` 会被当成普通文本，卡片
+    /// 正面就是一行带花括号的字——这是「导进去了却不生效」的头号原因。
+    pub fn note_type(self) -> &'static str {
+        match self {
+            AnkiKind::Cloze => "Cloze（挖空）",
+            _ => "Basic（基础）",
+        }
+    }
+}
+
+/// epoch 毫秒 → 公历 `(年, 月, 日)`（Howard Hinnant 的 civil-from-days）。
+///
+/// 不引 chrono：这十行算术就够了，而且可以被单测钉死（含闰年 / 跨年）。
+fn ymd(ms: i64) -> (i32, u32, u32) {
+    let z = ms.div_euclid(86_400_000) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe.div_euclid(1460) + doe.div_euclid(36_524) - doe.div_euclid(146_096))
+        .div_euclid(365); // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe.div_euclid(4) - yoe.div_euclid(100)); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let y = (if m <= 2 { y + 1 } else { y }) as i32;
+    (y, m, d)
+}
+
+/// YAML 双引号字符串：`"` 与 `\` 必须转义，否则 frontmatter 直接解析失败。
+fn yaml_str(s: &str) -> String {
+    let esc: String = s
+        .chars()
+        .map(|c| match c {
+            '\\' => "\\\\".to_string(),
+            '"' => "\\\"".to_string(),
+            '\n' | '\r' => " ".to_string(),
+            _ => c.to_string(),
+        })
+        .collect();
+    format!("\"{esc}\"")
+}
+
+/// Obsidian 标签：空格 / `#` / `,` / `[` / `]` / `/` 换成 `-`。
+///
+/// 标签里带空格会被切成两个标签，带 `#` 会让 Obsidian 把后面整段当成嵌套
+/// 层级——书名来自 epub 元数据，什么都可能带，必须洗。
+fn tag_of(s: &str) -> String {
+    let t: String = s
+        .chars()
+        .map(|c| {
+            if c.is_whitespace() || matches!(c, '#' | ',' | '[' | ']' | '/' | '"' | '\'') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let t = t.trim_matches('-').to_string();
+    if t.is_empty() {
+        "未标注".to_string()
+    } else {
+        t
+    }
+}
+
+/// 卡片标题：取原文第一句（≤24 字），没有句读就截断。
+fn card_title(c: &Card) -> String {
+    let cs: Vec<char> = c.quote.chars().collect();
+    let end = cs
+        .iter()
+        .position(|x| matches!(x, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n'))
+        .map(|i| i + 1)
+        .unwrap_or(cs.len());
+    let head: String = cs[..end.min(cs.len())].iter().collect();
+    let head = head.trim().to_string();
+    if head.is_empty() {
+        "摘录".to_string()
+    } else if head.chars().count() > 24 {
+        format!("{}…", head.chars().take(24).collect::<String>())
+    } else {
+        head
+    }
+}
+
+/// **难字注音行**：只给生僻字注音——与 App 内「生僻字注音」**同一把尺子**
+/// （`analysis::is_rare_char` + `dict::auto_pinyin`）。
+///
+/// 全句注音会把卡片变成一张拼音表，反而没法读；只注难字才是「拐杖」的
+/// 本分。一个难字都没有就返回空串，调用方据此整段不写。
+fn gloss_line(text: &str) -> String {
+    let mut seen: Vec<char> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    for c in text.chars() {
+        if !jiandu_core::analysis::is_rare_char(c) || seen.contains(&c) {
+            continue;
+        }
+        seen.push(c);
+        if let Some(p) = jiandu_core::dict::auto_pinyin(c) {
+            parts.push(format!("{c} {p}"));
+        }
+    }
+    parts.join(" · ")
+}
+
+/// **一张卡一份 Markdown**（Obsidian 原子笔记）。
+///
+/// ```text
+/// ---
+/// date / book / chapter / author / tags / source
+/// ---
+/// # 首句
+/// ## 原文 … ## 注音 … ## 朱批 …
+/// [[书名]] · [[章名]]     ← 双链的落点
+/// ```
+pub fn to_card_md(c: &Card, author: &str) -> String {
+    let (y, m, d) = ymd(c.created_ms);
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str(&format!("date: {y:04}-{m:02}-{d:02}\n"));
+    out.push_str(&format!("book: {}\n", yaml_str(&c.book)));
+    if !c.chapter.trim().is_empty() {
+        out.push_str(&format!("chapter: {}\n", yaml_str(&c.chapter)));
+    }
+    if !author.trim().is_empty() {
+        out.push_str(&format!("author: {}\n", yaml_str(author.trim())));
+    }
+    out.push_str("tags:\n");
+    let kind_tag = match c.kind {
+        CardKind::Quote => "笺读/摘录",
+        CardKind::Ai => "笺读/问笺",
+    };
+    out.push_str(&format!("  - {kind_tag}\n"));
+    out.push_str(&format!("  - {}\n", tag_of(&c.book)));
+    // 回跳锚点：书还在架上时，凭它能在笺读里找回这一处。
+    out.push_str(&format!(
+        "source: {}\n",
+        yaml_str(&format!(
+            "jiandu://{}/{}/{}/{}",
+            c.store_id, c.key.0, c.key.1, c.key.2
+        ))
+    ));
+    out.push_str("---\n\n");
+
+    out.push_str(&format!("# {}\n\n", card_title(c)));
+
+    out.push_str("## 原文\n\n");
+    out.push_str(&c.quote.trim());
+    out.push_str("\n\n");
+
+    let gloss = gloss_line(&c.quote);
+    if !gloss.is_empty() {
+        out.push_str("## 注音\n\n");
+        out.push_str(&gloss);
+        out.push_str("\n\n");
+    }
+
+    let note = c.note.trim();
+    if !note.is_empty() {
+        out.push_str("## 朱批\n\n");
+        out.push_str(note);
+        out.push_str("\n\n");
+    }
+
+    // 双链：书名与章名各一枚，于是「按书聚合」「按章聚合」都成立。
+    out.push_str("---\n\n");
+    let book_link = if c.book.trim().is_empty() {
+        String::new()
+    } else {
+        format!("[[{}]]", c.book.trim())
+    };
+    let chap_link = if c.chapter.trim().is_empty() {
+        String::new()
+    } else {
+        format!("[[{}]]", c.chapter.trim())
+    };
+    match (book_link.is_empty(), chap_link.is_empty()) {
+        (true, true) => {}
+        (false, true) => out.push_str(&format!("{book_link}\n")),
+        (true, false) => out.push_str(&format!("{chap_link}\n")),
+        (false, false) => out.push_str(&format!("{book_link} · {chap_link}\n")),
+    }
+    out
+}
+
+/// 卡片 → 文件名主干：`20261028-庄子-逍遥游-北冥有鱼`。
+///
+/// 日期打头是刻意的：Obsidian 的文件浏览器按名字排序，日期打头＝入匣
+/// 顺序，扫一眼就知道最近读了什么。
+pub fn card_file_name(c: &Card) -> String {
+    let (y, m, d) = ymd(c.created_ms);
+    let head: String = c.quote.chars().take(12).collect();
+    let stem = safe_file_stem(&format!("{}-{}-{}", c.book, c.chapter, head));
+    let stem = stem.replace('·', "-");
+    format!("{y:04}{m:02}{d:02}-{stem}")
+}
+
+/// 同名就加序号，绝不覆盖用户已有的笔记。
+///
+/// 两张卡抄了同一句、同一天入匣——文件名会撞。覆盖等于静默丢一篇笔记，
+/// 这是最不可接受的错误。
+fn unique_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    for i in 2..999 {
+        let mut p = path.clone();
+        p.set_file_name(format!("{stem}-{i}.md"));
+        if !p.exists() {
+            return p;
+        }
+    }
+    path
+}
+
+// ── Anki ──────────────────────────────────────────────────────────────────
+
+/// **挖空**：把原文里「最该背的那个字」包成 `{{c1::字}}`。
+///
+/// 挑字的规矩：**生僻字优先**——常用字谁都认得，挖了没有训练价值；
+/// 一句里没有生僻字就挖正中那个字（位置确定，不随机，故可单测、可复现）。
+pub fn anki_cloze_front(text: &str) -> String {
+    let cs: Vec<char> = text.chars().collect();
+    if cs.is_empty() {
+        return text.to_string();
+    }
+    let idx = cs
+        .iter()
+        .position(|c| jiandu_core::analysis::is_rare_char(*c))
+        .unwrap_or(cs.len() / 2);
+    let mut out = String::new();
+    for (i, c) in cs.iter().enumerate() {
+        if i == idx {
+            out.push_str(&format!("{{{{c1::{c}}}}}"));
+        } else {
+            out.push(*c);
+        }
+    }
+    out
+}
+
+/// 一张卡 → `(正面, 背面)`，形状由 [`AnkiKind`] 定。
+pub fn anki_cells(c: &Card, kind: AnkiKind) -> (String, String) {
+    let src = c.source();
+    let gloss = gloss_line(&c.quote);
+    let note = c.note.trim();
+    let tail = {
+        // 背面固定三段：出处 → 注音（有就给）→ 朱批（有就给）。
+        let mut t = format!("【出处】{src}");
+        if !gloss.is_empty() {
+            t.push_str(&format!("<br>【注音】{gloss}"));
+        }
+        if !note.is_empty() {
+            t.push_str(&format!("<br>【朱批】{note}"));
+        }
+        t
+    };
+    match kind {
+        AnkiKind::Cloze => (anki_cloze_front(&c.quote), tail),
+        AnkiKind::Qa => {
+            // 正面只给首句，背面给全句——「下一句是什么」是最合背诵的问法。
+            let cs: Vec<char> = c.quote.chars().collect();
+            let end = cs
+                .iter()
+                .position(|x| matches!(x, '。' | '！' | '？' | '；' | '!' | '?' | ';'))
+                .map(|i| i + 1)
+                .unwrap_or(cs.len());
+            let first: String = cs[..end].iter().collect();
+            let front = format!("{first}<br><br>（下句为何？）<br><small>{src}</small>");
+            let back = format!("{}<br>{}", c.quote.trim(), tail);
+            (front, back)
+        }
+        AnkiKind::Gloss => {
+            // 正面就那一枚难字；没有难字时退回整句（否则会导出一张空卡）。
+            let cs: Vec<char> = c.quote.chars().collect();
+            let rare = cs
+                .iter()
+                .copied()
+                .find(|c| jiandu_core::analysis::is_rare_char(*c));
+            let front = match rare {
+                Some(ch) => ch.to_string(),
+                None => c.quote.trim().to_string(),
+            };
+            (front, tail)
+        }
+    }
+}
+
+/// 整匣卡片 → Anki 可导入的 CSV（两列：正面 / 背面，恒加引号）。
+pub fn to_anki_csv(cards: &[Card], kind: AnkiKind) -> String {
+    let mut out = String::new();
+    for c in cards {
+        let (f, b) = anki_cells(c, kind);
+        if f.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&csv_two_quoted(&f, &b));
+    }
+    out
+}
+
+/// **导出整匣为 Obsidian 笔记**：选一个目录 → 一卡一 md。
+///
+/// `authors`：`store_id → 作者`，从书架条目带出来。查不到就留空——
+/// frontmatter 里少一行 `author:` 只是一行，硬填「佚名」才是造假。
+///
+/// 返回 `Ok(None)` = 取消；`Ok(Some((目录, 写出张数)))`。
+pub fn export_obsidian_folder(
+    cards: &[Card],
+    authors: &std::collections::HashMap<String, String>,
+) -> Result<Option<(PathBuf, usize)>> {
+    let Some(dir) = pick_folder("把卡片匣导出为 Obsidian 笔记（一卡一档）") else {
+        return Ok(None);
+    };
+    let mut n = 0usize;
+    for c in cards {
+        if c.quote.trim().is_empty() {
+            continue;
+        }
+        let author = authors.get(&c.store_id).map(|s| s.as_str()).unwrap_or("");
+        let path = unique_path(dir.join(format!("{}.md", card_file_name(c))));
+        save_bytes(path, "md", to_card_md(c, author).as_bytes())?;
+        n += 1;
+    }
+    remember_export_dir(&dir);
+    Ok(Some((dir, n)))
+}
+
+/// **导出整匣为 Anki 卡片**：系统保存框 → 一份 CSV。
+pub fn export_anki_cards_csv(
+    cards: &[Card],
+    kind: AnkiKind,
+    file_name: &str,
+) -> Result<Option<PathBuf>> {
+    let Some(picked) = pick_save_path(
+        &format!("导出卡片匣为 Anki 卡片（{}）", kind.label()),
+        file_name,
+        "CSV",
+        &["csv"],
+    ) else {
+        return Ok(None);
+    };
+    let path = with_extension(picked, "csv");
+    let body = to_anki_csv(cards, kind);
+    // 走 `save_bytes`：与其余六条导出链路同一出口（补后缀 / 建父目录 /
+    // 记住目录），不在这里另起一套写盘。
+    save_bytes(path, "csv", body.as_bytes()).map(Some)
+}
+
+/// 选一个**目录**（Obsidian 库用）。返回 `None` = 取消。
+///
+/// 与 [`pick_save_path`] 同一条规矩：必须在主线程直调，不许包
+/// `background_executor`（rfd 同步面板会被 GPUI 主循环挤掉、静默返回 None）。
+pub fn pick_folder(title: &str) -> Option<PathBuf> {
+    let mut dlg = rfd::FileDialog::new().set_title(title);
+    if let Some(dir) = remembered_export_dir() {
+        dlg = dlg.set_directory(dir);
+    } else if let Some(d) = desktop_dir() {
+        dlg = dlg.set_directory(d);
+    }
+    dlg.pick_folder()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Book, Chapter, Paragraph, TocEntry};
+    use jiandu_core::cards::{Card, CardKind};
 
     fn sample() -> Book {
         let mut b = Book::new("测试书", "某人");
@@ -826,6 +1229,175 @@ mod tests {
             "目录已不在就该当没记过（降级到桌面 / 系统记忆）"
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+
+    // ── v1.81.0 · P3：Obsidian / Anki 卡片 ────────────────────────────
+
+    fn card(quote: &str, note: &str) -> Card {
+        Card {
+            id: 1,
+            book: "庄子".into(),
+            chapter: "逍遥游".into(),
+            store_id: "abc123".into(),
+            key: (3, 1, 7),
+            len: quote.chars().count(),
+            quote: quote.into(),
+            note: note.into(),
+            kind: CardKind::Quote,
+            created_ms: 1_763_000_000_000, // 2025-11-11 前后
+        }
+    }
+
+    #[test]
+    fn civil_date_from_epoch_millis() {
+        assert_eq!(ymd(0), (1970, 1, 1));
+        // 闰年 2 月 29（2024-02-29 = day 19782；次日即 3 月 1 日）
+        assert_eq!(ymd(19782 * 86_400_000), (2024, 2, 29));
+        assert_eq!(ymd((19782 + 1) * 86_400_000), (2024, 3, 1));
+        // 跨年
+        assert_eq!(ymd((365 * 55 + 14) * 86_400_000), (2025, 1, 1));
+    }
+
+    #[test]
+    fn card_md_has_parseable_frontmatter_and_backlinks() {
+        let md = to_card_md(&card("北冥有鱼，其名为鲲。", "此句最妙"), "庄周");
+        assert!(md.starts_with("---\n"), "frontmatter 必须在最前：\n{md}");
+        let body = md.trim_start_matches("---\n");
+        let end = body.find("\n---").expect("frontmatter 要有收束");
+        let fm = &body[..end];
+        assert!(fm.contains("date: "), "缺 date：\n{fm}");
+        assert!(fm.contains("book: \"庄子\""), "缺 book：\n{fm}");
+        assert!(fm.contains("chapter: \"逍遥游\""), "缺 chapter：\n{fm}");
+        assert!(fm.contains("author: \"庄周\""), "缺 author：\n{fm}");
+        assert!(fm.contains("  - 笺读/摘录"), "缺标签：\n{fm}");
+        assert!(fm.contains("jiandu://abc123/3/1/7"), "缺回跳锚点：\n{fm}");
+        // 正文三段
+        assert!(md.contains("## 原文"), "缺原文段：\n{md}");
+        assert!(md.contains("北冥有鱼，其名为鲲。"));
+        assert!(md.contains("**朱批**") || md.contains("## 朱批"), "缺朱批段：\n{md}");
+        // 双链：书名与章名都要能被 [[ ]] 引用
+        assert!(md.contains("[[庄子]]"), "缺书名双链：\n{md}");
+        assert!(md.contains("[[逍遥游]]"), "缺章名双链：\n{md}");
+    }
+
+    #[test]
+    fn card_md_escapes_quotes_so_frontmatter_still_parses() {
+        // 书名里带双引号 / 反斜杠：不转义会让整个 frontmatter 解析失败，
+        // Obsidian 直接不认这份笔记。
+        let mut c = card("原文", "");
+        c.book = "《庄\"子》\\".into();
+        let md = to_card_md(&c, "");
+        assert!(md.contains("book: \"《庄\\\"子》\\\\\""), "没转义：\n{md}");
+    }
+
+    #[test]
+    fn card_md_omits_empty_sections() {
+        // 没有任何批注 / 难字时，不该留下「## 朱批」底下空一行。
+        let md = to_card_md(&card("道可道，非常道。", ""), "");
+        assert!(!md.contains("## 朱批"), "空批注不该出段：\n{md}");
+        assert!(md.contains("## 原文"));
+    }
+
+    #[test]
+    fn card_title_takes_the_first_sentence_only() {
+        let c = card("北冥有鱼，其名为鲲。化而为鸟，其名为鹏。", "");
+        assert_eq!(card_title(&c), "北冥有鱼，其名为鲲。");
+    }
+
+    #[test]
+    fn card_file_name_starts_with_the_date() {
+        // 日期打头：Obsidian 文件浏览器按名排序＝入匣顺序。
+        let name = card_file_name(&card("北冥有鱼", ""));
+        assert!(name.ends_with(".md") == false, "不该带后缀：{name}");
+        assert!(
+            name.chars().take(8).all(|c| c.is_ascii_digit()),
+            "必须以日期打头：{name}"
+        );
+        assert!(name.contains("庄子"), "{name}");
+    }
+
+    #[test]
+    fn same_named_cards_never_overwrite_each_other() {
+        let dir = std::env::temp_dir().join(format!("jiandu-uniq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let first = dir.join("同一天.md");
+        std::fs::write(&first, "旧").ok();
+        let second = unique_path(first.clone());
+        assert_ne!(second, first, "撞名必须让位：{second:?}");
+        assert!(!second.exists(), "挑出来的必须是空位：{second:?}");
+        assert!(second.to_string_lossy().contains("-2"), "{second:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cloze_hides_the_rarest_character() {
+        // 「埵」是生僻字（不在常用字表里），该被挖掉；常用字不挖。
+        let front = anki_cloze_front("道可道埵非常道");
+        assert!(front.contains("{{c1::埵}}"), "没挖到生僻字：{front}");
+        // 没有生僻字时挖正中那个字（位置确定，可复现）。
+        // 四字句取偏右一枚（idx = len/2 = 2 → 玄）；两处都钉死，免得日后
+        // 有人「顺手改成 (len-1)/2」却忘了同步测试。
+        assert_eq!(anki_cloze_front("天地玄黄"), "天地{{c1::玄}}黄");
+    }
+
+    #[test]
+    fn anki_csv_has_exactly_two_columns_per_row() {
+        let cards = vec![card("北冥有鱼，其名为鲲。", "此句最妙")];
+        let csv = to_anki_csv(&cards, AnkiKind::Cloze);
+        let line = csv.lines().next().expect("应有一行");
+        assert!(line.starts_with('"'), "两列都必须包引号：{line}");
+        assert!(line.contains("\",\"") , "列分隔只该有一处：{line}");
+        assert!(csv.contains("{{c1::"), "挖空标记要落到 CSV 里：{csv}");
+        assert!(csv.contains("【出处】庄子·逍遥游"), "背面要有出处：{csv}");
+        assert!(csv.contains("【朱批】此句最妙"), "背面要有批注：{csv}");
+    }
+
+    #[test]
+    fn anki_kinds_differ_in_front_but_share_the_back() {
+        let c = card("北冥有鱼，其名为鲲。", "批");
+        let (cf, cb) = anki_cells(&c, AnkiKind::Cloze);
+        let (qf, qb) = anki_cells(&c, AnkiKind::Qa);
+        let (gf, gb) = anki_cells(&c, AnkiKind::Gloss);
+        assert_ne!(cf, qf, "挖空与问答的正面不该一样：{cf} / {qf}");
+        // 背面只有 **问答** 多带一句全句（正面只给首句，答题要对照），
+        // 故只比挖空 / 释义；问答的背面单独核它带全句。
+        assert_eq!(cb, gb, "挖空与释义背面应当一致");
+        assert!(qb.contains("北冥有鱼，其名为鲲。"), "问答背面要带全句：{qb}");
+        assert!(qb.contains("【出处】"), "问答背面也要有出处：{qb}");
+        assert!(qf.contains("（下句为何？）"), "{qf}");
+        // 释义卡正面就那一枚难字：「冥」不在 GB2312 一级字里，故判为难字
+        // （与 App 内「生僻字注音」同一把尺子，两边不许各说一套）。
+        assert_eq!(gf, "冥", "释义卡该只出难字：{gf}");
+    }
+
+    #[test]
+    fn gloss_card_falls_back_to_the_whole_quote_when_no_rare_char() {
+        // 一句里没有难字时，释义卡退回整句——绝不导出一张空卡。
+        let plain = "人之初性本善";
+        let cs: Vec<char> = plain.chars().collect();
+        assert!(
+            !cs.iter().any(|c| jiandu_core::analysis::is_rare_char(*c)),
+            "这句里已经有难字了，换个样例：{plain}"
+        );
+        let (gf, _) = anki_cells(&card(plain, ""), AnkiKind::Gloss);
+        assert_eq!(gf, plain, "无难字该退回整句：{gf}");
+    }
+
+    #[test]
+    fn anki_note_type_is_cloze_only_for_cloze() {
+        // 挖空挂错笔记类型 = `{{c1::}}` 变成普通文本，卡片静默失效。
+        assert!(AnkiKind::Cloze.note_type().contains("Cloze"));
+        assert!(!AnkiKind::Qa.note_type().contains("Cloze"));
+    }
+
+    #[test]
+    fn tags_are_sanitized_for_obsidian() {
+        // 空格会被切成两个标签；`#` 会被当成嵌套层级——书名来自 epub，
+        // 什么都可能带。
+        assert_eq!(tag_of("庄 子"), "庄-子");
+        assert_eq!(tag_of("a#b/c"), "a-b-c");
+        assert_eq!(tag_of("  "), "未标注");
     }
 
     /// `save_bytes`：补后缀 + 建父目录——用户手敲一个还不存在的子目录也该成。

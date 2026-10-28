@@ -138,7 +138,56 @@ impl Root {
     ///
     /// 为什么不该两处各滚一次：260px 宽的栏里摆两条独立滚动区，会出现两套
     /// 滚动条，用户根本不知道该滚哪一个（实测在旧版右栏里就是这么别扭）。
-    /// 故这里只吐条目，滚动交给外层那一页。
+    /// **出卡面三枚小印**（v1.81.0 · 模块六）：挖空 / 问答 / 释义。
+    ///
+    /// 摆在卡片匣题头下面而不是塞进「更多」菜单：卡面是**这一匣的打算**，
+    /// 得在看见卡片的地方挑；菜单里再挂三条就太长了。当前那一枚用朱砂，
+    /// 其余用淡墨——与顶栏高亮「只比 current_chapter」同款规矩。
+    pub(crate) fn render_anki_kind_row(&mut self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme;
+        let zhu = sheet_zhu(t);
+        let ink_soft = t.ink_soft();
+        let cur = self.anki_kind;
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(9.0))
+            .px(px(12.0))
+            .pb(px(5.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(ink_soft))
+                    .child(SharedString::from("出卡")),
+            );
+        for k in crate::exporter::AnkiKind::ALL {
+            let on = k == cur;
+            row = row.child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgb(if on { zhu } else { ink_soft }))
+                    .cursor_pointer()
+                    .hover(move |s| s.text_color(rgb(zhu)))
+                    .child(SharedString::from(k.label()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            // 拦住冒泡：挑卡面不该顺带翻页 / 跳原文。
+                            cx.stop_propagation();
+                            this.set_anki_kind(k);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        row
+    }
+
+    /// **卡片匣的条目列表**（v1.80.0）：跨书摘录卡，点一条即收栏并跳回原文。
+    ///
+    /// **只有条目，不含外壳、不含滚动容器**——理由见上一条 `render_anki_kind_row`
+    /// 上方的说明：滚动交给外层那一页，两处各滚一次会出两套滚动条。
     pub(crate) fn render_cards_list(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let zhu = sheet_zhu(t);

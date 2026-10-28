@@ -3768,6 +3768,9 @@ impl Root {
             zhu,
             ink_soft,
         ));
+        // v1.81.0 · 模块六：出卡面三枚小印（挖空 / 问答 / 释义）——决定
+        // 「更多 → 卡片匣→Anki」出哪种卡，故摆在条目之上、题头之下。
+        list = list.child(self.render_anki_kind_row(cx));
         list = list.child(self.render_cards_list(cx));
         list
     }
@@ -4135,6 +4138,35 @@ impl Root {
                 this.more_menu = false;
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     this.export_markdown_file(cx);
+                }));
+                if let Err(e) = r {
+                    this.report_export_panic(e, cx);
+                }
+            }),
+        ));
+        // ③·d **卡片匣 → Obsidian**（v1.81.0 · 模块六）：一卡一 md，选目录。
+        menu = menu.child(mitem("export-obsidian", "卡片匣→Obsidian").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.more_menu = false;
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    this.export_obsidian_cards(cx);
+                }));
+                if let Err(e) = r {
+                    this.report_export_panic(e, cx);
+                }
+            }),
+        ));
+        // ③·e **卡片匣 → Anki**（v1.81.0 · 模块六）：整匣一份 CSV，卡面由
+        //      左栏「批」页那三枚小印（挖空 / 问答 / 释义）决定，默认挖空。
+        menu = menu.child(mitem("export-anki-cards", "卡片匣→Anki").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.more_menu = false;
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    this.export_anki_cards(cx);
                 }));
                 if let Err(e) = r {
                     this.report_export_panic(e, cx);
