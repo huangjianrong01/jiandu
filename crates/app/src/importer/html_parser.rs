@@ -103,6 +103,55 @@ fn mark_kind_for(name: &str, class: &str) -> Option<&'static str> {
     None
 }
 
+/// 一枚正在采集的注音壳 `<ruby>`。
+///
+/// 古籍 EPUB 的注音长这样（三种都常见）：
+/// ```html
+/// <ruby>漢<rt>hàn</rt></ruby>
+/// <ruby><rb>漢</rb><rb>字</rb><rt>hàn</rt><rt>zì</rt></ruby>
+/// <ruby>漢<rp>(</rp><rt>hàn</rt><rp>)</rp></ruby>
+/// ```
+/// 不处理的话，`rt` 里的拉丁字母会**散在正文里当字排**——竖排时就是一排
+/// 「电线杆」。故整壳收下来，落成 core 认识的 `字[拼音:x]` 记号
+/// （`ir::line_to_spans` 认它，会自动变成 `IrSpan::Ruby`）。
+#[derive(Default)]
+struct RubyCap {
+    /// 宿主字（可能多字）。
+    base: String,
+    /// 已收的注音（有几个 `<rt>` 就有几条）。
+    rts: Vec<String>,
+    /// 正在收的这一条注音。
+    cur: String,
+    /// 正处在 `<rt>` 里。
+    in_rt: bool,
+    /// 正处在 `<rp>` 里（那是给不支持 ruby 的浏览器看的括号，**丢弃**）。
+    in_rp: bool,
+}
+
+/// 注音壳落成文本：`漢` + `hàn` → `漢[拼音:hàn]`。
+///
+/// 一个字对一条音就逐字绑；字数与音数对不上（转换件常见）时，把整串音
+/// 挂在最后一字上——宁可注音位置不完美，也**绝不丢字、绝不丢音**。
+/// 宿主为空（只有音没有字）时整壳丢弃：孤零零一串拼音排在正文里毫无意义。
+fn ruby_to_text(base: &str, rts: &[String]) -> String {
+    let rts: Vec<&str> = rts.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let bs: Vec<char> = base.chars().collect();
+    if bs.is_empty() || rts.is_empty() {
+        return base.to_string(); // 没有注音，字照排
+    }
+    let mut out = String::new();
+    if bs.len() == rts.len() {
+        for (c, rt) in bs.iter().zip(rts.iter()) {
+            out.push(*c);
+            out.push_str(&format!("[拼音:{rt}]"));
+        }
+    } else {
+        out.push_str(base);
+        out.push_str(&format!("[拼音:{}]", rts.join(" ")));
+    }
+    out
+}
+
 /// 取 `class` 属性的值（没有就是空串）。
 fn class_of(e: &quick_xml::events::BytesStart) -> String {
     for a in e.attributes().flatten() {
@@ -131,6 +180,8 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
     // **专名线**，而不是正文里多出来的几个字。只采一层（嵌套不叠），
     // 因为古籍里的专名不会套着书名再套着专名。
     let mut mark_cap: Option<(String, &'static str, String)> = None;
+    // 正在采集的**注音壳**：`<ruby>漢<rt>hàn</rt></ruby>`（见 [`RubyCap`]）。
+    let mut ruby_cap: Option<RubyCap> = None;
 
     // 块级标签：结束时要断段。
     let is_block = |n: &str| -> bool {
@@ -175,6 +226,25 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
                 if is_skip(&name) {
                     skip += 1;
                 } else if skip == 0 {
+                    // 注音壳开壳 / 壳内换轨（rt 收音、rb 收字、rp 丢弃）。
+                    if ruby_cap.is_none() && name == "ruby" {
+                        ruby_cap = Some(RubyCap::default());
+                        buf.clear();
+                        continue;
+                    }
+                    if let Some(r) = ruby_cap.as_mut() {
+                        match name.as_str() {
+                            "rt" => {
+                                r.cur.clear();
+                                r.in_rt = true;
+                            }
+                            "rb" => r.in_rt = false,
+                            "rp" => r.in_rp = true,
+                            _ => {}
+                        }
+                        buf.clear();
+                        continue;
+                    }
                     // 划线标记开壳：只认一层，且块级标签先断段（`<u>` 不会
                     // 是块，但 `<span class=book>` 里可能有）——标记绝不跨段。
                     if mark_cap.is_none() {
@@ -201,6 +271,26 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
                 if is_skip(&name) {
                     skip = skip.saturating_sub(1);
                 } else if skip == 0 {
+                    // 注音壳收壳：`<rt>` 收一条音，`<ruby>` 结束整壳落成文本。
+                    if let Some(r) = ruby_cap.as_mut() {
+                        match name.as_str() {
+                            "rt" => {
+                                let t = std::mem::take(&mut r.cur);
+                                if !t.trim().is_empty() {
+                                    r.rts.push(t);
+                                }
+                                r.in_rt = false;
+                            }
+                            "rp" => r.in_rp = false,
+                            "ruby" => {
+                                let cap = ruby_cap.take().unwrap_or_default();
+                                para.push_str(&ruby_to_text(&cap.base, &cap.rts));
+                            }
+                            _ => {}
+                        }
+                        buf.clear();
+                        continue;
+                    }
                     // 收壳：跨度合法就转成 core 的划线标记，否则原样留字
                     // （宁可少画一条线，也不能把「整句下划线」标成人名）。
                     let closing = matches!(&mark_cap, Some((t, _, _)) if *t == name);
@@ -222,14 +312,26 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
                 if skip == 0 {
                     let raw = String::from_utf8_lossy(t.as_ref());
                     let txt = unescape_html(&raw);
-                    match mark_cap.as_mut() {
-                        Some((_, _, cap)) => cap.push_str(&txt),
-                        None => para.push_str(&txt),
+                    // 注音壳内：`<rp>` 里的括号丢掉，`<rt>` 里收音，
+                    // 其余（含 `<rb>` 里的字）收作宿主。
+                    if let Some(r) = ruby_cap.as_mut() {
+                        if r.in_rp {
+                            // 丢弃：那是给不支持 ruby 的浏览器看的括号
+                        } else if r.in_rt {
+                            r.cur.push_str(&txt);
+                        } else {
+                            r.base.push_str(&txt);
+                        }
+                    } else {
+                        match mark_cap.as_mut() {
+                            Some((_, _, cap)) => cap.push_str(&txt),
+                            None => para.push_str(&txt),
+                        }
                     }
                 }
             }
             Ok(Event::CData(c)) => {
-                if skip == 0 {
+                if skip == 0 && ruby_cap.is_none() {
                     para.push_str(&String::from_utf8_lossy(c.as_ref()));
                 }
             }
@@ -464,6 +566,47 @@ mod tests {
         assert!(t.contains("可道也…"), "省略号没还原：{t:?}");
         assert!(!t.contains("&ldquo;") && !t.contains("&mdash;"), "实体没还原：{t:?}");
         assert!(!t.contains('\u{00A0}'), "&nbsp; 该还原成普通空格：{t:?}");
+    }
+
+    /// 注音（**不许碎裂**）：`<ruby>漢<rt>hàn</rt></ruby>` 必须落成
+    /// `漢[拼音:hàn]`——拼音绝不能散在正文里当字排（竖排就是一排电线杆）。
+    #[test]
+    fn ruby_becomes_a_bound_pinyin_never_loose_letters() {
+        let src = r#"<html><body><p>子曰：<ruby>漢<rt>hàn</rt></ruby>字。</p></body></html>"#;
+        let (t, e) = extract_html_str(src);
+        assert!(e.is_none(), "不该报错：{e:?}");
+        assert!(t.contains("漢[拼音:hàn]"), "注音没绑到字上：{t:?}");
+        assert!(t.contains("子曰："), "正文被误删：{t:?}");
+        assert!(t.contains("字。"), "正文被误删：{t:?}");
+        // 「拼音散落」的形态：拉丁字母紧挨着汉字、却没有 [拼音:] 记号
+        assert!(!t.contains("hàn字"), "拼音散进正文：{t:?}");
+        assert!(!t.contains("<rt>") && !t.contains("ruby"), "标签壳漏进正文：{t:?}");
+    }
+
+    /// 多字多音（`<rb>` 分段）逐字绑；`<rp>` 的括号**丢弃**——那是给不支持
+    /// ruby 的浏览器看的，排进正文就是两个多余的全角括号。
+    #[test]
+    fn ruby_handles_rb_rp_and_multiple_readings() {
+        let src = r#"<html><body>
+            <p><ruby><rb>漢</rb><rb>字</rb><rt>hàn</rt><rt>zì</rt></ruby>也。</p>
+            <p><ruby>道<rp>(</rp><rt>dào</rt><rp>)</rp></ruby>可道。</p>
+            </body></html>"#;
+        let (t, e) = extract_html_str(src);
+        assert!(e.is_none(), "不该报错：{e:?}");
+        assert!(t.contains("漢[拼音:hàn]字[拼音:zì]"), "多字多音没逐字绑：{t:?}");
+        assert!(t.contains("道[拼音:dào]可道"), "单字注音没绑上：{t:?}");
+        assert!(!t.contains('(') && !t.contains(')'), "`<rp>` 括号没丢：{t:?}");
+    }
+
+    /// 只有音没有字的空壳（转换件常见）→ 整壳丢弃。
+    /// 孤零零一串拼音排在正文里毫无意义，还占字格。
+    #[test]
+    fn ruby_without_a_base_is_dropped() {
+        let (t, _) = extract_html_str(
+            r#"<html><body><p>甲<ruby><rt>hàn</rt></ruby>乙</p></body></html>"#,
+        );
+        assert!(!t.contains("hàn"), "孤立的拼音漏进正文：{t:?}");
+        assert!(t.contains("甲乙") || (t.contains("甲") && t.contains("乙")), "正文被误删：{t:?}");
     }
 
     #[test]

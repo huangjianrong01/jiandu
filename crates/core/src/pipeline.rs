@@ -194,7 +194,12 @@ pub fn classicize(s: &str) -> String {
     // 现代括号不进正文流（与 `parsers::cleanup_ancient_text` 同源）：EPUB
     // 那条链也走这里，两链一致才不会「时有时无」。
     let s = crate::parsers::purge_bracket_marks(&s);
-    crate::numcn::normalize_numbers(&fullwidth_punct(&s))
+    // ⚠️ 全角化**只跑在标记之外**：`[拼音:hàn]` 里的冒号是注音语法不是标点，
+    // 折成全角 `：` 之后下游 `line_to_spans` 就认不出这枚标记，注音会散进
+    // 正文——竖排里就是一排「电线杆」。这条链（txt / epub / docx 都走
+    // `parse_txt`）此前正栽在这里。
+    let s = crate::vclean::map_outside_markers(&s, |seg| fullwidth_punct(seg));
+    crate::numcn::normalize_numbers(&s)
 }
 
 /// 章序号的中文写法（`1 -> 一`、`15 -> 十五`），切卷时用。

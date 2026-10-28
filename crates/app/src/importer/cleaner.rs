@@ -67,11 +67,18 @@ pub fn clean(raw: &str) -> String {
 /// 带开关的清洗。顺序有讲究，别乱调：
 ///
 /// ```text
-///   换行归一 → 去不可见字符 → 空白规整 → 标点 → 简繁 → 闭合注疏
+///   摘注音 → 换行归一 → 去不可见字符 → 空白规整 → 标点 → 简繁 → 闭合注疏
+///   → 注音还回去
 ///   （简繁必须在标点之后：否则全角化会把刚折好的字再判一次）
 /// ```
+///
+/// **注音标记为什么要先摘出来**：`[拼音:hàn]` 里的冒号是**语法**不是标点，
+/// `cjk_punct` 会把它折成全角 `：`，后面再去方括号，注音就散成
+/// `拼音：hàn` 混进正文——竖排里就是一排「电线杆」。故整枚先摘、洗完原样
+/// 放回，一个字母都不能动。
 pub fn clean_with(raw: &str, opt: &CleanOptions) -> String {
-    let mut s = normalize_newlines(raw);
+    let (staged, pinyin) = take_pinyin_marks(&normalize_newlines(raw));
+    let mut s = staged;
 
     if opt.zero_width {
         s = strip_invisible(&s);
@@ -92,7 +99,50 @@ pub fn clean_with(raw: &str, opt: &CleanOptions) -> String {
     }
     s = fix_common_typos(&s);
 
-    tidy_blocks(&s)
+    put_pinyin_marks(&tidy_blocks(&s), &pinyin)
+}
+
+/// 注音标记的占位符（`U+FDD0` 是 Unicode 非字符，正常文本里绝不会出现；
+/// `strip_invisible` 也不认它，不会被顺手删掉）。
+const PINYIN_HOLDER: char = '\u{FDD0}';
+
+/// 把 `[拼音:xxx]` 整枚摘出来，原位留占位符。
+fn take_pinyin_marks(s: &str) -> (String, Vec<String>) {
+    if !s.contains("[拼音") {
+        return (s.to_string(), Vec::new());
+    }
+    let mut marks: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("[拼音") {
+        let Some(rel) = rest[at..].find(']') else { break };
+        let end = at + rel + 1;
+        out.push_str(&rest[..at]);
+        marks.push(rest[at..end].to_string());
+        out.push(PINYIN_HOLDER);
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    (out, marks)
+}
+
+/// 把摘出去的注音按原顺序放回占位符处。
+fn put_pinyin_marks(s: &str, marks: &[String]) -> String {
+    if marks.is_empty() {
+        return s.to_string();
+    }
+    let mut it = marks.iter();
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == PINYIN_HOLDER {
+            if let Some(m) = it.next() {
+                out.push_str(m);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // ----------------------------------------------------------------------

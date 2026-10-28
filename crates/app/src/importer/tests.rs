@@ -331,3 +331,78 @@ fn cleaner_is_the_only_outlet() {
     assert!(v.contains("第12回"), "回目数字被折成全角了：{v:?}");
     assert!(v.contains("３０"), "正文数字没全角化：{v:?}");
 }
+
+// ----------------------------------------------------------------------
+// 九、注音（`<ruby><rt>`）：拼音必须绑在字上，绝不能散进正文
+// ----------------------------------------------------------------------
+
+/// 建一本只有一章、正文里带 `<ruby>` 的 epub（ patches 7 的验收件）。
+fn ruby_epub(dir: &Path) -> PathBuf {
+    let container = r#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#;
+    let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <manifest><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#;
+    let ch = r#"<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<h1>第一章 天地</h1>
+<p>子曰：<ruby>漢<rt>han4</rt></ruby>字，<ruby>道<rp>(</rp><rt>dao4</rt><rp>)</rp></ruby>可道也。</p>
+</body></html>"#;
+    write_zip(
+        dir,
+        "注音.epub",
+        &[
+            ("mimetype", "application/epub+zip"),
+            ("META-INF/container.xml", container),
+            ("OEBPS/content.opf", opf),
+            ("OEBPS/ch1.xhtml", ch),
+        ],
+    )
+}
+
+#[test]
+fn ruby_pinyin_stays_bound_to_its_character() {
+    let dir = tmpdir("ruby");
+    let p = ruby_epub(&dir);
+    let ir = import_file(&p).expect("注音 epub 应能导入");
+    let b = ir.to_book();
+
+    let body: String = b
+        .chapters
+        .iter()
+        .flat_map(|c| c.paragraphs.iter().map(|p| p.text.as_str()))
+        .collect();
+    // ① 拼音绝不散在正文里（散了就是竖排里的一排「电线杆」）
+    assert!(!body.contains("han4") && !body.contains("dao4"), "拼音散进正文：{body:?}");
+    assert!(!body.contains("拼音"), "注音壳漏进正文：{body:?}");
+    // ② 宿主字一个都不能少
+    assert!(body.contains("子曰：漢字，道可道也。"), "正文被误删：{body:?}");
+
+    // ③ 注音挂在正确的字上：漢(idx 3) / 道(idx 6)
+    let rubys: Vec<(usize, &str)> = b
+        .chapters
+        .iter()
+        .flat_map(|c| c.paragraphs.iter())
+        .flat_map(|p| p.notes.iter())
+        .filter(|n| n.kind == jiandu_core::types::NoteKind::Ruby)
+        .map(|n| (n.at, n.text.as_str()))
+        .collect();
+    assert_eq!(rubys.len(), 2, "该有两条注音，实际：{rubys:?}");
+    assert!(rubys.iter().any(|(at, t)| *at == 3 && t.trim() == "han4"), "漢 的注音没绑上：{rubys:?}");
+    assert!(rubys.iter().any(|(at, t)| *at == 6 && t.trim() == "dao4"), "道 的注音没绑上：{rubys:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `classicize` 不得把注音标记里的冒号折成全角——折了下游就认不出这枚标记。
+#[test]
+fn classicize_never_touches_inside_a_pinyin_mark() {
+    let s = jiandu_core::pipeline::classicize("子[拼音:han4]曰,道.");
+    assert!(s.contains("[拼音:han4]"), "注音标记被破坏：{s:?}");
+    assert!(!s.contains("[拼音："), "冒号被折成全角：{s:?}");
+    // 标记之外照常古籍化
+    assert!(s.contains('，') && s.contains('。'), "标记外的标点没古籍化：{s:?}");
+}
