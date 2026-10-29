@@ -4,24 +4,34 @@
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>笺读 · 古籍测试书页</title>
+    <title>笺读 · 导入阅读</title>
     <script type="module" src="/main.js" defer></script>
   </head>
 
   <body>
-    <!-- 古籍书页：宣纸底 + 竖排 + 中缝红线 -->
-    <div class="page">
-      <div class="fold"></div>
-      <div class="book">
-        <div class="title">静夜思</div>
-        <div class="verse">
-          床前明月光<span class="dian">，</span>疑是地上霜<span class="dian">。</span>举头望明月<span class="dian">，</span>低头思故乡<span class="dian">。</span>
-        </div>
-        <div class="author">唐 · 李白</div>
-      </div>
+    <!-- 顶栏：导入按钮 + 测试按钮 + 当前文件名 -->
+    <div class="topbar">
+      <button id="import-btn" type="button">导入书籍</button>
+      <button id="test-core-btn" type="button">测试 core 大脑</button>
+      <span id="file-name" class="file-name"></span>
     </div>
 
-    <!-- 保留的测试按钮：右下角半透明，绝对定位不扰正文 -->
-    <button id="test-core-btn" type="button">测试 core 大脑</button>
+    <!-- 阅读区：宣纸背景、可滚动 -->
+    <main id="reader" class="reader">
+      <!-- 默认欢迎：古籍竖排测试页（未导入时显示） -->
+      <div class="welcome" id="welcome">
+        <div class="fold"></div>
+        <div class="book">
+          <div class="title">静夜思</div>
+          <div class="verse">
+            床前明月光<span class="dian">，</span>疑是地上霜<span class="dian">。</span>举头望明月<span class="dian">，</span>低头思故乡<span class="dian">。</span>
+          </div>
+          <div class="author">唐 · 李白</div>
+        </div>
+      </div>
+
+      <!-- 导入后的书籍渲染区（JS 注入，hidden 初始隐藏） -->
+      <div class="book-view" id="book-view" hidden></div>
+    </main>
   </body>
 </html>

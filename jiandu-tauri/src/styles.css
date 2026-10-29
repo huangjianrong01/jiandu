@@ -1,9 +1,7 @@
 /* ===========================================================
-   笺读 · 古籍测试书页（纯原生 CSS，无框架）
-   目标：宣纸底色 + 竖排网格 + 中缝红线 + 朱砂句读
-   关键修复：居中容器用物理轴(flow horizontal-tb)做 flex 居中，
-            竖排只在 .book 内部恢复，避免 translate 在 vertical-rl
-            下百分比基准错乱把整块推出屏幕。
+   笺读 · 导入阅读页（纯原生 CSS，无框架）
+   宣纸底色 + 顶栏 + 可滚动阅读区（长文本 overflow-y:auto 防裁切）
+   默认欢迎为古籍竖排测试页；导入书籍后切换为横排章节渲染。
    =========================================================== */
 
 * {
@@ -14,35 +12,90 @@ html,
 body {
   margin: 0;
   height: 100%;
-  /* ① 宣纸底色：极简浅米黄 */
+  /* 宣纸底色：极简浅米黄 */
   background-color: #f5f4ef;
-  color: #333; /* 强制深灰，防止继承到不可见色 */
-  /* 字体回退链：优先宋体/明朝体，证明古籍质感 */
+  color: #333;
+  /* 古籍宋体/明朝体回退链 */
   font-family: "Songti SC", "STSong", "SimSun", "Noto Serif CJK SC",
     "Source Han Serif SC", serif;
 }
 
-/* body 仅承载基础排版；具体居中交给 .page */
+/* 全站默认竖排；顶栏与阅读区重置为物理轴（横排） */
 body {
-  writing-mode: vertical-rl; /* 竖排默认，但 .page 会重置为物理轴 */
+  writing-mode: vertical-rl;
   text-orientation: upright;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* ② 书页铺满视口：用物理轴做 flex 居中，确保文字不被挤出屏幕 */
-.page {
+/* 顶栏：固定顶部，物理横排 */
+.topbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 48px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  writing-mode: horizontal-tb; /* 顶栏横排 */
+  background: rgba(245, 244, 239, 0.96);
+  border-bottom: 1px solid rgba(176, 52, 44, 0.2);
+}
+
+.topbar button {
+  font-family: inherit;
+  font-size: 13px;
+  color: #5a4a3a;
+  background: rgba(255, 255, 255, 0.8);
+  border: 1px solid rgba(176, 52, 44, 0.4);
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.topbar button:hover {
+  background: rgba(176, 52, 44, 0.12);
+}
+
+.file-name {
+  margin-left: auto;
+  font-size: 12px;
+  color: #6b5d4f;
+  max-width: 50vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 阅读区：可滚动，长文本不裁切 */
+.reader {
+  writing-mode: horizontal-tb; /* 阅读区横排（章节正文） */
+  margin-top: 48px;
+  height: calc(100vh - 48px);
+  overflow-y: auto; /* 长文本滚动，绝不裁切 */
+}
+
+/* 让 hidden 属性对 .welcome/.book-view 生效（其 CSS 设了 display，会覆盖 UA 的 [hidden]） */
+.welcome[hidden],
+.book-view[hidden] {
+  display: none;
+}
+
+/* —— 默认欢迎：古籍竖排测试页 —— */
+.welcome {
   position: relative;
-  width: 100%;
-  height: 100vh;
-  writing-mode: horizontal-tb; /* 重置为物理轴，flex 居中按物理方向 */
+  min-height: calc(100vh - 48px);
+  writing-mode: horizontal-tb;
   display: flex;
   align-items: center; /* 物理垂直居中 */
   justify-content: center; /* 物理水平居中 */
   overflow: hidden;
 }
 
-/* ③ 中缝（版心）：物理竖直居中细红线 */
 .fold {
   position: absolute;
   top: 8vh;
@@ -50,71 +103,77 @@ body {
   left: 50%;
   width: 1px;
   transform: translateX(-0.5px);
-  background: #b0342c; /* 朱砂红 */
+  background: #b0342c; /* 朱砂红 中缝 */
   opacity: 0.8;
   z-index: 1;
 }
 
-/* 书卷主体：内部恢复竖排；限高让长诗自动折成多栏（古籍正解） */
 .book {
   position: relative;
   z-index: 2;
   writing-mode: vertical-rl; /* 内部竖排：从右到左 */
   text-orientation: upright;
-  height: 90vh; /* 限制高度 → 超出部分折成下一栏（向左）；比 86vh 多留余量防裁切 */
-  color: #333; /* 强制深灰 */
+  height: 86vh;
+  color: #333;
 }
 
-/* 书名（最右一栏） */
 .title {
   font-size: 32px;
   font-weight: 700;
   letter-spacing: 0.3em;
   color: #1f1b16;
-  margin-left: 0.5em; /* 物理左侧空隙，与正文分离 */
+  margin-left: 0.5em;
 }
 
-/* 正文诗句（中间主栏，可折多栏） */
 .verse {
   font-size: 26px;
-  line-height: 2; /* 竖排行距 */
+  line-height: 2;
   letter-spacing: 0.14em;
-  color: #333; /* 强制深灰，杜绝消失 */
-  overflow-y: auto; /* 篇幅过长时兜底可滚，避免裁切 */
+  color: #333;
 }
 
-/* 落款（最左一栏） */
 .author {
   font-size: 16px;
   color: #6b5d4f;
   margin-right: 0.5em;
 }
 
-/* ④ CSS 伪标点：句读染成朱砂红圈（不用贝塞尔，纯 CSS 染色） */
 .dian {
   color: #b0342c;
-  font-size: 0.7em; /* 比正文字小，呈“点”感 */
-  /* 标点原生即圈形，染色即为红圈，证明网页也能调排版 */
+  font-size: 0.7em;
 }
 
-/* ⑤ 保留测试按钮：右下角半透明，绝对定位不扰正文 */
-#test-core-btn {
-  position: fixed;
-  right: 16px;
-  bottom: 16px;
-  z-index: 10;
-  opacity: 0.45;
-  font-family: inherit;
-  font-size: 13px;
+/* —— 导入后书籍渲染：横排章节 —— */
+.book-view {
+  padding: 24px 32px 48px;
+}
+
+.book-title {
+  font-size: 22px;
+  font-weight: 700;
+  color: #1f1b16;
+  margin: 0 0 18px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid rgba(176, 52, 44, 0.3);
+}
+
+.book-view section {
+  margin-bottom: 1.8em;
+}
+
+.book-view h2 {
+  font-size: 17px;
+  font-weight: 700;
   color: #5a4a3a;
-  background: rgba(255, 255, 255, 0.7);
-  border: 1px solid rgba(176, 52, 44, 0.4);
-  border-radius: 6px;
-  padding: 6px 12px;
-  cursor: pointer;
-  transition: opacity 0.2s ease;
+  margin: 0 0 8px;
+  padding-left: 8px;
+  border-left: 3px solid #b0342c; /* 朱砂章节标记 */
 }
 
-#test-core-btn:hover {
-  opacity: 0.85;
+.book-view p {
+  font-size: 16px;
+  line-height: 1.9;
+  margin: 0.35em 0;
+  text-indent: 2em; /* 中文段落首行缩进 */
+  color: #2b2620;
 }
