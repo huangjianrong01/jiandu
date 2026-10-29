@@ -302,6 +302,90 @@ pub(crate) fn is_numeral(c: char) -> bool {
         || ('０'..='９').contains(&c)
 }
 
+/// **TXT 专用**：把全角括号 `〔…〕` / `【…】` 整段连同内容转成 `[注]…[/注]`
+/// （双行夹注）。这是「裸文本」里被 Calibre 之类压平的胡三省注 / 校勘记
+/// 的唯一救赎——它们丢掉了所有 HTML 标签，只剩一对全角括号。
+///
+/// 与 [`crate::parsers::purge_bracket_marks`]（通用、有 80 字上限、六格式共用）
+/// 不同，这里**不设长度上限**：裸文本里一整段索隱 / 爾雅引文也该是夹注，不该
+/// 散进正文。且**只作用于 TXT 解析链**（`parse_txt`），绝不波及 EPUB / HTML。
+///
+/// 容错：左 / 右括号数量对不上（实测《资治通鉴》90,757 对 91,551）绝对不能
+/// Panic——用栈单趟扫描，落单的开 / 闭括号直接丢弃，内容照常保留；结尾把
+/// 仍未闭合的开括号补上收壳，保证 `[注]…[/注]` 成对，下游 `split_body_marks`
+/// 不会看到悬空开壳。
+pub fn txt_bracket_notes(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    // 栈里存「开括号类型」（0 = 〔，1 = 【）。遇到对应闭括号才闭合。
+    let mut stack: Vec<u8> = Vec::new();
+    let mut i = 0usize;
+    while i < cs.len() {
+        match cs[i] {
+            '〔' => {
+                stack.push(0);
+                out.push_str("[注]");
+            }
+            '【' => {
+                stack.push(1);
+                out.push_str("[注]");
+            }
+            '〕' => {
+                // 与栈顶 〔 配对才闭；否则落单右括号，丢弃。
+                if let Some(&0) = stack.last() {
+                    stack.pop();
+                    out.push_str("[/注]");
+                }
+            }
+            '】' => {
+                if let Some(&1) = stack.last() {
+                    stack.pop();
+                    out.push_str("[/注]");
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    // 兜底：残留未闭合的开括号——补收壳，保证标记成对。
+    while stack.pop().is_some() {
+        out.push_str("[/注]");
+    }
+    out
+}
+
+/// **TXT 专用**：极短且无句读的纯文本行 → 章节标题（标题大字）。
+///
+/// 兜底 `is_chapter_head` 认不到的「裸标题」：古籍裸文本常把章题写成一行
+/// 孤零零的短字（如「序」「跋」「卷一」「周紀一」），既没有「第 X 章」也
+/// 没有后置序数。这类行在竖排里本就该是标题大字，不该混进正文。
+///
+/// 判据（全部满足才认，宁可漏判不可误杀）：
+/// 1. 长度 2–14 字（用户规定「少于 15 字」）；
+/// 2. 不含任何句读 / 括号 / 书名号（带这些的是正文或带注疏的正文）；
+/// 3. 至少含一个汉字（纯数字 / 字母孤行如页码、编号不认）。
+///
+/// 只加在 `parse_txt` 的行循环里，**绝不**写进 `is_chapter_head`——后者被
+/// EPUB / HTML 的 `resplit_by_heads` 共用，动它就是动 EPUB 逻辑。
+pub fn txt_is_title_line(line: &str) -> bool {
+    let cs: Vec<char> = line.chars().collect();
+    let n = cs.len();
+    if n < 2 || n >= 15 {
+        return false;
+    }
+    if cs.iter().any(|c| {
+        matches!(
+            c,
+            '。' | '，' | '、' | '；' | '！' | '？' | '：' | '…' | '—'
+                | '（' | '）' | '〔' | '〕' | '【' | '】' | '《' | '》'
+                | '“' | '”' | '‘' | '’' | '．' | '·'
+        )
+    }) {
+        return false;
+    }
+    cs.iter().any(|c| crate::cleaner::is_han(*c))
+}
+
 /// txt → 标准章数组。
 pub fn parse_txt(text: &str) -> Vec<RawChapter> {
     // 头部幽灵先切一刀（BOM / 零宽 / 全角空格 / YAML 元数据块 / 连续空行）：
@@ -312,6 +396,11 @@ pub fn parse_txt(text: &str) -> Vec<RawChapter> {
     let norm = crate::cleaner::split_inline_heads(&crate::cleaner::strip_head_junk(
         &text.replace("\r\n", "\n").replace('\r', "\n"),
     ));
+    // TXT 专用：裸文本里被压平的全角括号注疏（胡三省注 / 校勘记）先归一成
+    // `[注]…[/注]`，下游 `split_body_marks` 自然落成双行夹注。这一步只在 TXT
+    // 链走，不动 EPUB / HTML（它们有自己的清洗，且 `purge_bracket_marks` 有
+    // 长度上限，不在本函数里改）。
+    let norm = txt_bracket_notes(&norm);
     let mut chapters: Vec<RawChapter> = Vec::new();
     let mut title = "正文".to_string();
     let mut paras: Vec<String> = Vec::new();
@@ -332,7 +421,7 @@ pub fn parse_txt(text: &str) -> Vec<RawChapter> {
             flush(&mut paras, &mut buf);
             continue;
         }
-        if is_chapter_head(line) {
+        if is_chapter_head(line) || txt_is_title_line(line) {
             flush(&mut paras, &mut buf);
             push_chapter(&mut chapters, &title, &mut paras);
             title = line.to_string();
@@ -1987,6 +2076,68 @@ mod tests {
         let cs = parse_txt("第一章\n建安223年，策为尚书郎.共15卷。");
         assert!(cs[0].content.contains("建安二二三年"), "{}", cs[0].content);
         assert!(cs[0].content.contains("共十五卷"));
+    }
+
+    // ── v1.9.4：裸文本全角括号 → 双行夹注 ─────────────────────────
+    #[test]
+    fn txt_bracket_notes_turns_parens_into_gloss() {
+        // 短注：正常成对 → [注]…[/注]
+        assert_eq!(
+            txt_bracket_notes("分，扶問翻；下同。〔惎，毒也。〕尾"),
+            "分，扶問翻；下同。[注]惎，毒也。[/注]尾"
+        );
+        // 校勘记 【…】 同样归一成夹注
+        assert_eq!(
+            txt_bracket_notes("正文【章：乙十一行本，「六」作「四」。】续"),
+            "正文[注]章：乙十一行本，「六」作「四」。[/注]续"
+        );
+    }
+
+    #[test]
+    fn txt_bracket_notes_long_gloss_not_dropped() {
+        // 超过旧 80 字上限的长注疏（索隱 / 爾雅引文）现在也落为双行夹注。
+        let long = format!("〔{}〕", "甲".repeat(120));
+        let out = txt_bracket_notes(&long);
+        assert!(out.starts_with("[注]"), "{}", out);
+        assert!(out.ends_with("[/注]"), "{}", out);
+        assert!(!out.contains('〔'), "{}", out);
+    }
+
+    #[test]
+    fn txt_bracket_notes_never_panics_on_mismatched() {
+        // 左少右多 / 只有开 / 只有闭 都不该 Panic，且标记成对。
+        let only_close = txt_bracket_notes("正文〕尾巴");
+        assert!(!only_close.contains('〕'));
+        assert!(!only_close.contains("[注]")); // 没有 opener 就不开壳
+        let only_open = txt_bracket_notes("〔孤零零的注");
+        assert!(only_open.starts_with("[注]"));
+        assert!(only_open.ends_with("[/注]")); // 结尾补收壳，成对
+        let nested = txt_bracket_notes("〔外〔內〕尾〕");
+        assert_eq!(nested, "[注]外[注]內[/注]尾[/注]");
+    }
+
+    #[test]
+    fn txt_long_bracket_note_becomes_gloss_in_parse() {
+        let cs = parse_txt(&format!(
+            "卷一\n正文一句。{}又一句。",
+            format!("〔{}〕", "註".repeat(100))
+        ));
+        let joined: String = cs.iter().map(|c| c.content.clone()).collect();
+        assert!(joined.contains("[注]"), "长括注应转夹注: {}", joined);
+        assert!(!joined.contains('〔'), "不应残留全角开括号: {}", joined);
+    }
+
+    #[test]
+    fn txt_is_title_line_heuristic_rules() {
+        // 极短无句读的汉字行 → 标题
+        assert!(txt_is_title_line("周紀一"));
+        assert!(txt_is_title_line("卷一"));
+        // 带句读 / 太长 / 纯数字 / 带括号 → 不是标题
+        assert!(!txt_is_title_line("话说天下大势。"));
+        assert!(!txt_is_title_line("建安二二三年，策为尚书郎。"));
+        assert!(!txt_is_title_line("12345"));
+        assert!(!txt_is_title_line("周紀一（起著雍攝提格）"));
+        assert!(!txt_is_title_line("这是一句明显超过十四字长度限制的正文内容行"));
     }
 
     // ---- markdown ----
