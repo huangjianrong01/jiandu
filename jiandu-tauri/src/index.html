@@ -35,5 +35,15 @@
       <!-- 导入后的书籍渲染区（JS 注入，hidden 初始隐藏） -->
       <div class="book-view" id="book-view" hidden></div>
     </main>
+
+    <!-- 系统不支持引导页：老旧 Windows（如 Win7）触发，引导至「云端代排服务」 -->
+    <div class="unsupported" id="unsupported" hidden>
+      <div class="unsupported-card">
+        <h1>系统版本过低</h1>
+        <p id="unsupported-msg"></p>
+        <button id="cloud-btn" type="button">前往「云端代排服务」</button>
+        <p class="hint">Windows 10（1803 及以上）/ Windows 11 可正常安装使用。</p>
+      </div>
+    </div>
   </body>
 </html>

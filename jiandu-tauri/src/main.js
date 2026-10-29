@@ -9,6 +9,39 @@ const welcome = document.querySelector("#welcome");
 const bookView = document.querySelector("#book-view");
 const fileNameEl = document.querySelector("#file-name");
 
+// 系统不支持引导页：老旧 Windows（如 Win7）→ 引导「云端代排服务」
+const unsupported = document.querySelector("#unsupported");
+const unsupportedMsg = document.querySelector("#unsupported-msg");
+const cloudBtn = document.querySelector("#cloud-btn");
+// TODO: 替换为真实「云端代排服务」地址
+const CLOUD_URL = "https://jiandu.example.com/cloud";
+
+if (cloudBtn) {
+  cloudBtn.addEventListener("click", () => {
+    const opener = tauri && tauri.opener;
+    if (opener && opener.openUrl) opener.openUrl(CLOUD_URL);
+    else window.open(CLOUD_URL, "_blank");
+  });
+}
+
+// 首屏系统支持检查：不支持则显示引导页并隐藏阅读区/顶栏
+if (invoke) {
+  invoke("os_support")
+    .then((res) => {
+      if (res && res.supported === false) {
+        if (unsupportedMsg) unsupportedMsg.textContent = res.message || "当前系统不支持。";
+        if (unsupported) unsupported.hidden = false;
+        if (welcome) welcome.hidden = true;
+        if (bookView) bookView.hidden = true;
+        const topbar = document.querySelector(".topbar");
+        if (topbar) topbar.style.display = "none";
+      }
+    })
+    .catch(() => {
+      /* 检查失败则放行，不阻断正常使用 */
+    });
+}
+
 // 导入书籍：选文件 → invoke import_and_parse → 渲染 Book
 if (importBtn) {
   importBtn.addEventListener("click", async () => {

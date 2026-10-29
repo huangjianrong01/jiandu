@@ -199,3 +199,67 @@ body {
   background: rgba(176, 52, 44, 0.12);
   border-radius: 4px;
 }
+
+/* —— 系统不支持引导页（老旧 Windows 触发） —— */
+.unsupported[hidden] {
+  display: none;
+}
+
+.unsupported {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  writing-mode: horizontal-tb;
+  padding: 24px;
+  background: rgba(245, 244, 239, 0.98);
+}
+
+.unsupported-card {
+  max-width: 460px;
+  text-align: center;
+  background: #fff;
+  border: 1px solid rgba(176, 52, 44, 0.25);
+  border-radius: 12px;
+  padding: 32px 28px;
+  box-shadow: 0 8px 30px rgba(31, 27, 22, 0.1);
+}
+
+.unsupported-card h1 {
+  font-size: 22px;
+  color: #b0342c;
+  margin: 0 0 16px;
+}
+
+.unsupported-card p#unsupported-msg {
+  font-size: 15px;
+  line-height: 1.8;
+  color: #2b2620;
+  white-space: pre-line; /* 保留换行 */
+  margin: 0 0 22px;
+}
+
+.unsupported-card button {
+  font-family: inherit;
+  font-size: 15px;
+  color: #f5f4ef;
+  background: #b0342c;
+  border: none;
+  border-radius: 8px;
+  padding: 12px 22px;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.unsupported-card button:hover {
+  background: #93302a;
+}
+
+.unsupported-card .hint {
+  font-size: 12px;
+  color: #6b5d4f;
+  margin: 18px 0 0;
+  white-space: normal;
+}

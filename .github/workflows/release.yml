@@ -1,0 +1,84 @@
+name: Build Windows Installer
+
+# 触发条件：
+#   1. 推送到 main 分支 → 仅构建并上传 Artifact（.msi / .exe）
+#   2. 推送形如 v* 的 tag（如 v1.0.0）→ 构建并把安装包发布到 GitHub Release
+#   3. 手动在 Actions 页面点 "Run workflow" 触发
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# 发布 Release 时需要写权限（仅 tag 触发那一步用到；Artifact 上传用默认 token 即可）
+permissions:
+  contents: write
+
+jobs:
+  windows-build:
+    name: Build Windows installer (.msi / .exe)
+    runs-on: windows-latest
+    # Tauri 工程在仓库子目录 jiandu-tauri/，其 Rust 端在 jiandu-tauri/src-tauri/，
+    # 且通过相对路径 ../../crates/core 引用主仓库的纯 Rust 内核。
+    # 因此所有 cargo 命令都从 jiandu-tauri/ 目录执行（Tauri CLI 默认找 ./src-tauri）。
+    defaults:
+      run:
+        working-directory: jiandu-tauri
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Rust toolchain (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # windows-latest 自带 MSVC 链接器（Visual Studio Build Tools），
+          # 这里只显式装上 windows-msvc 标准库，确保 rusqlite 的 bundled SQLite
+          # 能用 MSVC 工具链交叉/原生编译。
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 缓存作用域锁定到 Tauri 的 Rust 工程，避免与主仓库 workspace 混淆
+          workspaces: jiandu-tauri/src-tauri
+
+      - name: Install Tauri CLI
+        # 显式安装 v2 CLI，随后用 cargo tauri build 构建并打包。
+        # （等价更快的替代方案：npm install 后 npx tauri build，见 WINDOWS_BUILD_GUIDE.md）
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build and bundle (cargo tauri build)
+        # 产物：src-tauri/target/release/bundle/msi/*.msi 与 bundle/nsis/*.exe
+        run: cargo tauri build
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiandu-windows-installer
+          # Artifact 路径相对仓库根（不受 working-directory 影响）
+          path: |
+            jiandu-tauri/src-tauri/target/release/bundle/msi/*.msi
+            jiandu-tauri/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release (only on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: jiandu ${{ github.ref_name }}
+          body: |
+            笺读 Windows 桌面安装包（自动构建）
+
+            - Windows 10 (1803 及以上) / Windows 11 适用
+            - 老旧系统（Windows 7/8 等）请改用「云端代排服务」
+          files: |
+            jiandu-tauri/src-tauri/target/release/bundle/msi/*.msi
+            jiandu-tauri/src-tauri/target/release/bundle/nsis/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
