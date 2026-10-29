@@ -4972,17 +4972,22 @@ impl Root {
         // 的内侧缘（左叶右缘 / 右叶左缘）也必须画——此前内侧留空，中缝像
         // 一条孤立的马路悬在中央（用户实测）。界行的上下两端因此接到
         // 横框上，字格围成完全封闭的网格。
+        //
+        // v1.85.0「版框形制」：外框恒四边（3px），**内框按款式裁边**——
+        // 四周双边满画、左右双边只留左右两道竖线、四周单边整圈不画。
+        // 裁的只是这一层 1px 细线，`grid` 的子元素树一个都不碰。
         let sides = crate::grid::frame_sides(edge);
-        if sides[0] {
+        let in_sides = self.frame_style.inner_sides(sides);
+        if in_sides[0] {
             inner = inner.border_t_1();
         }
-        if sides[1] {
+        if in_sides[1] {
             inner = inner.border_r_1();
         }
-        if sides[2] {
+        if in_sides[2] {
             inner = inner.border_b_1();
         }
-        if sides[3] {
+        if in_sides[3] {
             inner = inner.border_l_1();
         }
         inner = inner.border_color(rgb(t.rule_line(self.rule_color)));
@@ -5007,7 +5012,7 @@ impl Root {
             }
         }
         let mut frame = div()
-            .border_color(rgb(t.frame_ink()))
+            .border_color(rgb(t.frame_outer()))
             .p(px(3.0))
             .child(inner);
         // **外层框线一律加粗（3px）**：8 / 10 / 12 / 14 列都是「外粗内细」
@@ -6142,21 +6147,26 @@ impl Root {
             .flex()
             .flex_col()
             .items_center()
-            .border_color(rgb(t.frame_ink()))
+            .border_color(rgb(t.frame_outer()))
             .border_t_3()
             .border_b_3();
         // 内框细线（与两叶的 inner 同层）：1px、与界行同色同起止，
         // 只画上下——中缝的上下两端因此与左右叶的上下框**逐层闭合**，
         // 界行（乌丝栏）也顺着这两条线接到横框上，字格围成封闭网格。
-        let inner = div()
+        //
+        // v1.85.0：中缝的上下两道正是「横框」——只有「四周双边」才在内侧
+        // 再压一道 1px（此时上下也是双线）；「左右双边」「四周单边」的上下
+        // 都是单线，故这一层整条不画，与两叶的上下缘保持同一口气。
+        let mut inner = div()
             .w_full()
             .flex()
             .flex_col()
             .items_center()
-            .border_color(rgb(t.rule_line(self.rule_color)))
-            .border_t_1()
-            .border_b_1()
-            .child(col);
+            .border_color(rgb(t.rule_line(self.rule_color)));
+        if self.frame_style == crate::types::FrameStyle::DoubleAll {
+            inner = inner.border_t_1().border_b_1();
+        }
+        let inner = inner.child(col);
         // 折痕：纸**对折**的那一道物理褶，落在版心正中——0.5px、`#999999`、
         // 实线（v1.28.0 由虚线改来），只作「纸的痕迹」，比界行还淡。
         // 起止夹在两条内框细线之间（mt+6 ⇄ h-mb-6），与两叶的内框同界。
@@ -11141,6 +11151,87 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
 
         // ---- 墨色：五套正文 / 小字注色（两枚小色点 + 一行墨字）----
         sheet = sheet.child(style_row("墨色", self.palette_chips(cx), t));
+
+        // ---- 版框：四周双边 / 左右双边 / 四周单边（v1.85.0）----
+        //
+        // 三个**小图形按钮**，每个里画一枚缩小版的框：外圈粗、内圈细，
+        // 内圈画在哪几边就是哪一档——用户不必读「1.00 / 3.00」这种数字，
+        // 一眼看到的是这根线本身。预览用的是**当前主题的真实取色**
+        // （`frame_outer` / `rule_line`），换纸换墨时预览跟着变。
+        let mut frames_row = div().flex().flex_row().items_end().gap_2();
+        for &style in crate::types::FrameStyle::ALL.iter() {
+            let on = style == self.frame_style;
+            let outer_c = t.frame_outer();
+            let inner_c = t.rule_line(self.rule_color);
+            // 框身：外粗 2px + 框内留边 2px（屏幕上 3px + 3px 的等比缩小）。
+            let mut body = div()
+                .w(px(24.0))
+                .h(px(17.0))
+                .p(px(2.0))
+                .border_2()
+                .border_color(rgb(outer_c));
+            // 内层细线：按款式裁边；四周单边整圈不画。
+            let ins = style.inner_sides([true; 4]);
+            if ins.iter().any(|s| *s) {
+                let mut line = div()
+                    .w_full()
+                    .h_full()
+                    .border_color(rgb(inner_c));
+                if ins[0] {
+                    line = line.border_t_1();
+                }
+                if ins[1] {
+                    line = line.border_r_1();
+                }
+                if ins[2] {
+                    line = line.border_b_1();
+                }
+                if ins[3] {
+                    line = line.border_l_1();
+                }
+                body = body.child(line);
+            }
+            frames_row = frames_row.child(
+                div()
+                    .id(SharedString::from(format!("frame-{:?}", style)))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w(px(38.0))
+                            .h(px(28.0))
+                            .bg(rgb(t.paper()))
+                            .border_1()
+                            .border_color(rgb(if on { sheet_zhu(t) } else { t.rule() }))
+                            .rounded(px(2.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(body),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(if on { sheet_zhu(t) } else { t.ink_soft() }))
+                            .child(SharedString::from(style.label())),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.frame_style = style;
+                            // 单点落盘（与「丝栏」「繁简」同款：全仓没有
+                            // 「界面 → Prefs」的总收口，改一处就得自己写一下）。
+                            crate::prefs::Prefs::save_frame_style(style);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        sheet = sheet.child(style_row("版框", frames_row, t));
 
         // ---- 丝栏：乌 / 金 / 朱 三色界行（竖排列间那道细线）----
         // 色块里立三道竖线，直接预览界行颜色与粗细。

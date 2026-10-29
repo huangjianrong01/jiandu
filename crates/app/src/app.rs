@@ -678,6 +678,11 @@ pub struct Root {
     pub share_card_rect: Option<(f32, f32, f32, f32)>,
     /// 丝栏（竖排列间界行）颜色：乌丝栏 / 金丝栏 / 朱丝栏，版字面板可选。
     pub rule_color: RuleColor,
+    /// **版框形制**（v1.85.0）：四周双边 / 左右双边 / 四周单边。
+    ///
+    /// 只影响边框渲染层（外框恒四边 3px，变的只是内层 1px 细线画哪几边），
+    /// 字格与界行一个像素不动；PDF 由 `PdfGeo::frame_style` 取同一个值。
+    pub frame_style: crate::types::FrameStyle,
     /// **当前纸面（整幅双叶）在窗口内容区里的矩形** (x, y, w, h)。
     ///
     /// 由阅读视图里一枚**不绘制任何东西**的测量探针在 prepaint 时写入
@@ -1244,6 +1249,8 @@ impl Root {
             share_leaf: 0,
             share_date: String::new(),
             rule_color: RuleColor::Wu,
+            // v1.85.0：出厂「四周双边」——旧制观感一分不动。
+            frame_style: prefs.frame_style(),
             share_card_rect: None,
             page_rect: Rc::new(Cell::new(None)),
             popup: None,
@@ -3750,9 +3757,12 @@ impl Root {
             margin_bot: m.margin_bot * k,
             paper: self.theme.paper(),
             ink: self.palette.ink(self.theme),
-            rule: self.theme.rule_by(self.rule_color),
-            // 内框与界行退一档（仿刻本）；其余主题与 `rule` 逐值相同。
+            // 外框：深底提亮一档（夜读），浅纸 = 版框色——与屏幕 `frame_outer` 同源。
+            rule: self.theme.frame_outer(),
+            // 内框与界行退一档（仿刻本 / 深底）；浅纸主题与 `rule` 逐值相同。
             rule_soft: self.theme.rule_line(self.rule_color),
+            // 版框形制：屏幕上按它裁内框，纸上照同一张表落笔。
+            frame_style: self.frame_style,
             note_ink: self.palette.note(self.theme),
             accent: self.theme.accent(),
             font: crate::pdf::PdfFontKind::from(self.share_font_kind()),

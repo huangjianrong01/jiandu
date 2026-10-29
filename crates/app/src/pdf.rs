@@ -65,6 +65,68 @@ extern "C" {
 pub const A4_W: f64 = 595.276;
 pub const A4_H: f64 = 841.89;
 
+/// **版框层的四个数**（v1.85.0）。它们是「双线永不粘连」的全部依据，
+/// 故提成模块常量、由 [`frame_plan`] 单测钉死——绘制代码里不再散落魔数。
+///
+/// * 线宽只有两档：外 1.0pt（粗栏线）、内 0.5pt（细栏线）。0.5 是细线在
+///   PDF 栅格化后仍不消失的下限，再细就被抗锯齿吃掉。
+/// * 内外线**中心距恒为 3.0pt**，与字号、列数、行数全不相干：改字级只让
+///   格子变大，框层照旧——这就是「无论怎么缩放字号，双线间距一分不差」。
+///   净距 = 3.0 − 半个粗线 − 半个细线 = 2.25pt（≈0.8mm），肉眼是一道缝，
+///   纸面分辨率下绝不会并成一根。
+pub const FRAME_OUTER_W: f64 = 1.0;
+pub const FRAME_INNER_W: f64 = 0.5;
+/// 内外线中心距（pt）。
+pub const FRAME_GAP: f64 = 3.0;
+
+/// 半像素对齐：线宽 ≤1pt 时，坐标落在 0.5 的整数倍上才不会糊成两条灰边。
+fn snap(v: f64) -> f64 {
+    (v * 2.0).round() / 2.0
+}
+
+/// 一叶版框的落笔几何（**纯数据**，不碰 `CGContext`，故可单测）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FramePlan {
+    /// 外框矩形：`(x, y, w, h)`，坐标是**线的中心线**。
+    pub outer: (f64, f64, f64, f64),
+    /// 内框两角：左上 + 右下（同样是中心线）。
+    pub inner: (f64, f64, f64, f64),
+}
+
+impl FramePlan {
+    /// 内外线的**净距**（两根线之间露出的纸）——「粘不粘连」就看它。
+    pub fn gap(&self) -> f64 {
+        (self.inner.0 - FRAME_INNER_W * 0.5) - (self.outer.0 + FRAME_OUTER_W * 0.5)
+    }
+}
+
+/// 算一叶的版框几何。`x0/y0` 是字格区左上，`fw/block_h` 是字格区宽高。
+///
+/// 位置关系（与屏幕 `reader::render_ancient` 同一套层次）：
+/// **纸缘 → 外框粗线 → 一道缝 → 内框细线 → 框内留边 → 字格**。
+/// 内线永远缩在外线之内的 [`FRAME_GAP`] 处，不跟着字格跑——所以字级
+/// 从 14 调到 40、列数从 8 换到 14，这两根线的间距仍是 3pt。
+pub fn frame_plan(edge: f64, x0: f64, y0: f64, fw: f64, block_h: f64) -> FramePlan {
+    let pad = edge * 0.5;
+    // 外框：路径内收半个线宽 → 整根线落在纸面之内（与屏幕 `border_3` 同位）。
+    let half = FRAME_OUTER_W * 0.5;
+    let ox = snap(x0 - pad) + half;
+    let oy = snap(y0 - pad) + half;
+    let ow = snap(fw + pad * 2.0) - FRAME_OUTER_W;
+    let oh = snap(block_h + pad * 2.0) - FRAME_OUTER_W;
+    // 内框：外框之内 FRAME_GAP 处。整份 PDF 只此一个间距，故逐页一致。
+    let d = FRAME_GAP;
+    FramePlan {
+        outer: (ox, oy, ow, oh),
+        inner: (
+            snap(ox + d),
+            snap(oy + d),
+            snap(ox + ow - d),
+            snap(oy + oh - d),
+        ),
+    }
+}
+
 /// 一叶要印的一页 / 整份 PDF 的版式与配色：
 /// **定义住在 `jiandu_core::platform`**（壳子无关），本模块只是拿来用。
 ///
@@ -508,17 +570,35 @@ fn draw_leaf(b: &mut Brush, leaf: &PdfLeaf, g: &PdfGeo, p: &Place) {
     let x0 = p.gx;
     let y0 = p.gy;
 
-    // ── 版框：刻本「四周双边」——外框一粗、内框一细 ──────────────────
+    // ── 版框（v1.85.0）：外框一粗四边满画，内框一细按形制裁边 ──────────
+    //
+    // 屏幕上的层次（见 `reader::render_ancient`）：外框 3px → 框内留边
+    // 3px → 内框 1px → 字格。纸上照同一张表落笔（`frame_plan`）：外线贴
+    // 着纸缘（线在纸内，与屏幕 border 一样），内线贴着字格（屏幕的内框
+    // 就是字格的那一圈边）。间距由 `frame_plan` 保证，见那里的单测。
     let fw = cols as f64 * cell_w;
-    b.rect(x0 - pad, y0 - pad, fw + pad * 2.0, block_h + pad * 2.0, g.rule, Some(1.0));
-    b.rect(
-        x0 - pad + 3.0,
-        y0 - pad + 3.0,
-        fw + pad * 2.0 - 6.0,
-        block_h + pad * 2.0 - 6.0,
-        g.rule_soft,
-        Some(0.5),
-    );
+    let plan = frame_plan(g.edge as f64, x0, y0, fw, block_h);
+    let (ox, oy, ow, oh) = plan.outer;
+    b.rect(ox, oy, ow, oh, g.rule, Some(FRAME_OUTER_W));
+
+    // 内框：只在形制给的边上画（四周双边满画 / 左右双边只两道竖线 /
+    // 四周单边一道也不画）。`sides` 与屏幕上 `FrameStyle::inner_sides`
+    // 是同一个函数的输出，故屏幕与纸上不可能一密一疏。
+    let (ix0, iy0, ix1, iy1) = plan.inner;
+    let sides = g.inner_sides();
+    if sides[0] {
+        b.line(ix0, iy0, ix1, iy0, g.rule_soft, FRAME_INNER_W);
+    }
+    if sides[1] {
+        b.line(ix1, iy0, ix1, iy1, g.rule_soft, FRAME_INNER_W);
+    }
+    if sides[2] {
+        b.line(ix0, iy1, ix1, iy1, g.rule_soft, FRAME_INNER_W);
+    }
+    if sides[3] {
+        b.line(ix0, iy0, ix0, iy1, g.rule_soft, FRAME_INNER_W);
+    }
+
 
     // ── 界行（乌丝栏）：每列左缘一道通高细线，空列照样画 ──────────────
     // 1px 线骑在路径两侧各半个像素上，落在整数坐标会糊成两条灰边——
@@ -1216,6 +1296,7 @@ mod tests {
             ink: 0x1A1A1A,
             rule: 0x8A7A5C,
             rule_soft: 0x8A7A5C,
+            frame_style: crate::types::FrameStyle::default(),
             note_ink: 0xC3272D,
             accent: 0xC3272D,
             font: PdfFontKind::Song,
@@ -1254,6 +1335,130 @@ mod tests {
         std::fs::remove_file(&out).ok();
     }
 
+    /// **三种版框形制都印得出来**（v1.85.0）。
+    ///
+    /// 同一叶纸印三份到临时目录（`jiandu-frame-check/`），留给人眼验收
+    /// 「像不像刀刻」；这里只钉「不报错、页数对、文件是 PDF」。
+    #[test]
+    fn all_three_frame_styles_print() {
+        use crate::types::FrameStyle;
+        let main = |ch: char, off: usize| Glyph {
+            chapter: 0,
+            para: 0,
+            offset: off,
+            ch,
+            kind: GlyphKind::Char,
+        };
+        let body: Vec<char> =
+            "版框者一書之面也四周雙邊文武為欄左右雙邊坊刻常見四周單邊公文紙式".chars().collect();
+        let col: Vec<Piece> = body
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Piece::Main(main(*c, i)))
+            .collect();
+        let page = Page {
+            glyphs: body
+                .iter()
+                .enumerate()
+                .map(|(i, c)| main(*c, i))
+                .collect(),
+            start_chapter: false,
+            columns: vec![col],
+        };
+        let dir = std::env::temp_dir().join("jiandu-frame-check");
+        std::fs::create_dir_all(&dir).ok();
+        let ruby = std::collections::HashMap::new();
+        let leaf = PdfLeaf {
+            page: &page,
+            title: "版框",
+            chapter: 0,
+            leaf: 1,
+            inscription: "",
+            author: "",
+            ruby: &ruby,
+        };
+        for style in FrameStyle::ALL {
+            let g = PdfGeo {
+                frame_style: style,
+                ..test_geo()
+            };
+            let out = dir.join(format!("frame-{}.pdf", style.index()));
+            let n = write_pdf(&out, std::slice::from_ref(&leaf), &g)
+                .unwrap_or_else(|e| panic!("{} 印不出来：{e}", style.label()));
+            assert_eq!(n, 1, "{} 页数不对", style.label());
+            let bytes = std::fs::read(&out).expect("读回 PDF 失败");
+            assert!(bytes.starts_with(b"%PDF-"), "{} 不是 PDF", style.label());
+        }
+    }
+
+    /// **版框几何**（v1.85.0）：间距永不粘连、且与字号无关。
+    ///
+    /// 这是用户点名的「拿刀刻」那条要求：字体放大缩小只改字格，框层的
+    /// 两根线该在哪儿还在哪儿——间距是个常量，不是字号的函数。
+    #[test]
+    fn frame_plan_keeps_the_two_lines_apart_at_any_type_size() {
+        // ① 同一个 edge、不同字格 / 行数：净距一模一样（字大只让格子变大）。
+        let mut gaps = Vec::new();
+        for (cell, rows) in [(24.0, 28), (30.0, 22), (46.0, 10), (60.0, 8)] {
+            let plan = frame_plan(34.0, 100.0, 120.0, cell * 12.0, cell * 1.4 * rows as f64);
+            gaps.push(plan.gap());
+            // 中心距恒 = FRAME_GAP。
+            assert!(
+                (plan.inner.0 - plan.outer.0 - FRAME_GAP).abs() < 1e-9,
+                "内外线中心距被字级带偏：{:.3}",
+                plan.inner.0 - plan.outer.0
+            );
+        }
+        for w in gaps.windows(2) {
+            assert!((w[0] - w[1]).abs() < 1e-9, "字号一变净距就漂了：{:?}", gaps);
+        }
+        // ② 任何 edge 都留得出 2pt 以上净距（A4 缩放的极端值都在里面）。
+        for edge in [10.0_f64, 14.0, 20.0, 34.0, 40.0, 56.0] {
+            let plan = frame_plan(edge, 0.0, 0.0, 360.0, 600.0);
+            assert!(
+                plan.gap() >= 2.0,
+                "edge={edge} 时双线贴到了一起：净距 {:.2}",
+                plan.gap()
+            );
+            // ③ 内线缩在外线之内（不许戳出纸缘、也不许越出外框）。
+            assert!(plan.inner.0 > plan.outer.0, "edge={edge} 内线越过了外框");
+            assert!(plan.inner.2 < plan.outer.0 + plan.outer.2, "edge={edge} 内线戳出右缘");
+        }
+        // ④ 外框整根落在纸面之内：路径内收半个线宽。
+        let plan = frame_plan(34.0, 100.0, 120.0, 360.0, 600.0);
+        assert!((plan.outer.0 - (100.0 - 17.0 + 0.5)).abs() < 1e-9);
+        assert!((plan.outer.2 - (360.0 + 34.0 - 1.0)).abs() < 1e-9);
+        // ⑤ 外框四条边的位置与字架无关（不碰网格：字格区一个像素都不动）。
+        let a = frame_plan(34.0, 100.0, 120.0, 360.0, 600.0);
+        let b = frame_plan(34.0, 100.0, 120.0, 300.0, 500.0);
+        assert_eq!(a.outer.0, b.outer.0, "改字格宽不该挪动外框左缘");
+        assert_eq!(a.outer.1, b.outer.1, "改行数不该挪动外框上缘");
+    }
+
+    /// **形制与四周表同源**：屏幕裁内框、纸上裁内线，用的是同一个函数。
+    #[test]
+    fn inner_sides_follow_the_frame_style() {
+        use crate::types::FrameStyle;
+        let all = [true; 4];
+        assert_eq!(FrameStyle::DoubleAll.inner_sides(all), [true; 4]);
+        // 左右双边：只留左右两道竖线（上 / 下是单线）。
+        assert_eq!(
+            FrameStyle::DoubleSides.inner_sides(all),
+            [false, true, false, true]
+        );
+        // 四周单边：内层整圈不画。
+        assert_eq!(FrameStyle::Single.inner_sides(all), [false; 4]);
+        // 四边表的「缺边」照样生效（三层裁边是**叠加**，不是覆盖）。
+        let no_bottom = [true, true, false, true];
+        assert_eq!(
+            FrameStyle::DoubleAll.inner_sides(no_bottom),
+            [true, true, false, true]
+        );
+        // 档位越界回落出厂值（老存档 / 手改档都不许 panic）。
+        assert_eq!(FrameStyle::from_index(99), FrameStyle::DoubleAll);
+        assert_eq!(FrameStyle::DoubleAll.index(), 0);
+    }
+
     /// 纸面尺寸 = 字格区 + 版框 + 天头地脚；A4 上必须放得下。
     #[test]
     fn sheet_fits_on_a4() {
@@ -1271,6 +1476,7 @@ mod tests {
             ink: 0x000000,
             rule: 0x000000,
             rule_soft: 0x000000,
+            frame_style: crate::types::FrameStyle::default(),
             note_ink: 0x000000,
             accent: 0xC3272D,
             font: PdfFontKind::Song,
@@ -1300,6 +1506,7 @@ mod tests {
             ink: 0x1A1A1A,
             rule: 0x8A7A5C,
             rule_soft: 0x8A7A5C,
+            frame_style: crate::types::FrameStyle::default(),
             note_ink: 0xC3272D,
             accent: 0xC3272D,
             font: PdfFontKind::Song,
