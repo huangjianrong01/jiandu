@@ -469,6 +469,66 @@ impl RuleColor {
     }
 }
 
+/// **版框形制**（v1.85.0）：四周双边 / 左右双边 / 四周单边。
+///
+/// 只动**边框渲染层**——外框永远是四边 3px 的粗栏线，变的只是里层那道
+/// 1px 细线画在哪几边。字格、界行、天头地脚、中缝宽一个像素都不改
+/// （`grid::compute_grid` 完全不认识这个枚举）。
+///
+/// 影印本里的三路做法：宋刻本多「四周双边」（文武边栏，四周皆粗细双线）；
+/// 建阳坊刻常见「左右双边」（只左右两边双线，上下单线）；坊间普及本
+/// 与公文纸多用「四周单边」（四边各一道）。三者差别在**内层细线的有无**，
+/// 故一个枚举 + 一张四边表就够，不必给边框另起一套几何。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FrameStyle {
+    /// 四周双边（文武边栏）：四边外粗内细——旧制，出厂值。
+    #[default]
+    DoubleAll,
+    /// 左右双边：左右各有粗细双线，上下只一道单线。
+    DoubleSides,
+    /// 四周单边：四边各一道单线（里层细线整圈不画）。
+    Single,
+}
+
+impl FrameStyle {
+    /// 版字面板的按钮顺序（由繁到简，用户一眼看出是「降级」）。
+    pub const ALL: [FrameStyle; 3] = [
+        FrameStyle::DoubleAll,
+        FrameStyle::DoubleSides,
+        FrameStyle::Single,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FrameStyle::DoubleAll => "四周双边",
+            FrameStyle::DoubleSides => "左右双边",
+            FrameStyle::Single => "四周单边",
+        }
+    }
+
+    /// 存档用下标（`Prefs::frame_style`）。
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|x| *x == self).unwrap_or(0)
+    }
+
+    /// 档位越界一律回落出厂值——老存档 / 手改档都不许 panic。
+    pub fn from_index(i: usize) -> Self {
+        Self::ALL.get(i).copied().unwrap_or_default()
+    }
+
+    /// **内层细线**画在哪几边：入参是外框的四边表（`grid::frame_sides`）。
+    ///
+    /// 外框（3px）恒为四边，故这里只裁内框（1px）——「左右双边」留下的
+    /// 上下两道正是单线，「四周单边」则整圈不画。四边序：上 / 右 / 下 / 左。
+    pub fn inner_sides(self, outer: [bool; 4]) -> [bool; 4] {
+        match self {
+            FrameStyle::DoubleAll => outer,
+            FrameStyle::DoubleSides => [false, outer[1], false, outer[3]],
+            FrameStyle::Single => [false; 4],
+        }
+    }
+}
+
 /// 划线的「起笔」判定：本字已划线、而阅读顺序上的前一个字没划线时，
 /// 它就是一段连续划线的起点——起点处画朱点（🔴），其后只画朱线。
 /// 段落 / 章节切换（offset == 0）一律视为新起笔。

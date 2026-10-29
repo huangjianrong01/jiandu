@@ -123,6 +123,12 @@ pub struct Prefs {
     /// **回锋**（v1.80.0）：读那一撇的出锋末端带不带一小勾。
     #[serde(default)]
     pub punct_hook: bool,
+    /// **版框形制**下标（[`crate::types::FrameStyle::ALL`]，v1.85.0）：
+    /// 0 = 四周双边、1 = 左右双边、2 = 四周单边。
+    ///
+    /// 老存档没有这一项 → 0（四周双边），也就是升级前的观感，一字不动。
+    #[serde(default)]
+    pub frame_style: usize,
     /// **改过的快捷键**（v1.81.0）：`(动作 id, 键位串)`，只存改过的那些。
     ///
     /// 出厂键位在 [`crate::keys::Action::default_chord`] 里，这里留空即「全按
@@ -173,6 +179,8 @@ impl Default for Prefs {
             punct_ink: 1,
             trad_mode: None,
             punct_hook: false,
+            // 出厂「四周双边」：与升级前的老版面逐像素一致。
+            frame_style: 0,
             keys: Vec::new(),
             narrow_hint_seen: false,
         }
@@ -277,6 +285,18 @@ impl Prefs {
         pick(&crate::gloss::PunctInk::ALL, self.punct_ink)
     }
 
+    /// 版框形制（四周双边 / 左右双边 / 四周单边）。越界回落出厂档。
+    pub fn frame_style(&self) -> crate::types::FrameStyle {
+        crate::types::FrameStyle::from_index(self.frame_style)
+    }
+
+    /// 只把**版框形制**写盘（与 `save_trad` 同款单点写）。
+    pub fn save_frame_style(s: crate::types::FrameStyle) {
+        let mut p = Self::load();
+        p.frame_style = s.index();
+        p.save();
+    }
+
     /// 只把**繁简档**写盘（不动其它字段）。
     ///
     /// 全仓没有「界面 → Prefs」的总收口，所以每一处改设置都得自己写这一下；
@@ -353,6 +373,31 @@ mod tests {
         );
         // 内存默认值与 serde 缺省值必须是同一个档。
         assert_eq!(Prefs::default().punct_ink(), crate::gloss::PunctInk::Zhu);
+    }
+
+    /// **版框形制**（v1.85.0）：老存档缺这一项 = 四周双边（升级前观感）。
+    #[test]
+    fn missing_frame_style_falls_back_to_double_all() {
+        use crate::types::FrameStyle;
+        let mut v = serde_json::to_value(Prefs::default()).expect("序列化");
+        v.as_object_mut()
+            .expect("对象")
+            .remove("frame_style");
+        let p: Prefs = serde_json::from_value(v).expect("反序列化");
+        assert_eq!(
+            p.frame_style(),
+            FrameStyle::DoubleAll,
+            "老存档缺 frame_style 不该把版框改成别的样式"
+        );
+        assert_eq!(Prefs::default().frame_style(), FrameStyle::DoubleAll);
+        // 三档存取往返（下标 ↔ 枚举）。
+        for s in FrameStyle::ALL {
+            let q = Prefs {
+                frame_style: s.index(),
+                ..Prefs::default()
+            };
+            assert_eq!(q.frame_style(), s);
+        }
     }
 
     #[test]

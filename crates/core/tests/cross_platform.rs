@@ -43,6 +43,7 @@ fn geo() -> PdfGeometry {
         ink: 0x1A1A1A,
         rule: 0x999999,
         rule_soft: 0x999999,
+        frame_style: jiandu_core::types::FrameStyle::DoubleAll,
         note_ink: 0x555555,
         accent: 0xB03A2E,
         font: PdfFontKind::Song,

@@ -259,6 +259,25 @@ impl Theme {
         self.paper_theme().border
     }
 
+    /// **版框外层粗线用色**（v1.85.0）：深底提亮一档，浅纸原样。
+    ///
+    /// 夜读里 `border`（0x4A4D4F）压在深纸上只比纸亮十来级，3px 粗框与
+    /// 1px 内框几乎同亮度，远看是一圈「糊在一起的灰」——层次全无。故外框
+    /// 向**正文色**提 [`DARK_FRAME_LIFT`]，内框（`rule_line`）反而向纸压
+    /// [`DARK_RULE_FADE`]，一进一出，粗线压得住、细线退得开。
+    ///
+    /// 浅纸四套主题**逐值等于** [`Theme::frame_ink`]（即 `border`），老版面
+    /// 一个像素都不动；`frame_ink` 本身仍严格等于 `border`，鱼尾、象鼻、
+    /// 牌记那些「浓墨一笔」照旧取它。
+    pub fn frame_outer(self) -> u32 {
+        let p = self.paper_theme();
+        if p.is_dark() {
+            mix(p.border, self.ink(), DARK_FRAME_LIFT)
+        } else {
+            p.border
+        }
+    }
+
     /// 乌丝栏：竖排列间界行——**界栏色**（配置表的 `borderColor`）。
     pub fn rule_ink(self) -> u32 {
         self.paper_theme().border
@@ -308,19 +327,27 @@ impl Theme {
         }
     }
 
-    /// **界行 / 内框用色**（v1.83.0）：仿刻本退一档，其余主题原样。
+    /// **界行 / 内框用色**（v1.83.0）：仿刻本与深底主题各退一档。
     ///
     /// 精刻本的层次是「**外框最重 → 内框与界行退一档 → 字最重**」：
     /// 照片里外框一道浓黑，内框和界行都淡成灰。旧制内外同色同粗，
     /// 远看是「一圈粗细不匀的框」；这里只把**内**的那一笔退下去，
-    /// 外框的墨一分不动——所以非刻本主题逐值等于 [`Theme::rule_by`]，
+    /// 外框的墨一分不动——所以浅纸主题逐值等于 [`Theme::rule_by`]，
     /// 老版面一个像素都不变。
     ///
-    /// 退的幅度 [`KB_RULE_FADE`] 是刻意的：再淡就散成一层雾，界行立不住。
+    /// v1.85.0 起深底（夜读）也退一档（[`DARK_RULE_FADE`]）：夜里 1px 细线
+    /// 压在深纸上本就发糊，外框按 [`Theme::frame_outer`] 提亮后若不把内框
+    /// 压下去，双线就并成一条亮带。**内框与界行共用这一笔**，故一起退，
+    /// 框角与界行才不会在深底上断成两截。
+    ///
+    /// 退的幅度是刻意的：再淡就散成一层雾，界行立不住。
     pub fn rule_line(self, rc: crate::types::RuleColor) -> u32 {
         let c = self.rule_by(rc);
+        let p = self.paper();
         if self.is_keben() {
-            mix(c, self.paper(), KB_RULE_FADE)
+            mix(c, p, KB_RULE_FADE)
+        } else if self.is_dark() {
+            mix(c, p, DARK_RULE_FADE)
         } else {
             c
         }
@@ -416,6 +443,16 @@ pub const Z_NOTE_FADE: f32 = 0.38;
 /// 照片上量的：外框是浓墨，内框与界行淡成一道灰。45% 是「看得见是线、
 /// 又绝不与正文抢」的那一档——再淡（>0.55）界行散成一层雾，行列就分不清了。
 pub const KB_RULE_FADE: f32 = 0.45;
+
+/// **深底（夜读）版框的提亮 / 内框的压暗**（v1.85.0）。
+///
+/// 夜读纸 0x1E1F21、版框色 0x4A4D4F，两者只差十来级亮度；外框 3px 与内框
+/// 1px 同色时，远看是「一圈灰带」，看不出文武边栏的双线。故外框向正文色
+/// 提 0.20（≈0x6D6E6E 一级），内框与界行向纸压 0.22（≈0x3D3F41）——
+/// 一进一出拉开约 0x30 的亮度差，双线在暗金底上才分得开。
+/// 两值都是「刚好看得出层次、又不至于跳出来抢字」的那一档。
+pub const DARK_FRAME_LIFT: f32 = 0.20;
+pub const DARK_RULE_FADE: f32 = 0.22;
 
 /// 把颜色 `a` 向颜色 `b` 混 `k`（0..=1，k=1 全为 b），返回 0xRRGGBB。
 /// 用于「墨色 + 纸色 → 夹注目色」的明暗底自动推导。
@@ -735,9 +772,10 @@ mod tests {
                 "{rc:?} 的界行淡到看不见了：{inner:06X}"
             );
         }
-        // ③ 其余四套主题：`rule_line` 必须与 `rule_by` 逐值相同
-        //    （老版面的框线颜色一分都不许变）。
-        for t in [Theme::Xuan, Theme::Mi, Theme::Qing, Theme::Ye] {
+        // ③ 浅纸三套：`rule_line` 必须与 `rule_by` 逐值相同
+        //    （老版面的框线颜色一分都不许变）。夜读自 v1.85.0 起另退一档，
+        //    见下一段。
+        for t in [Theme::Xuan, Theme::Mi, Theme::Qing] {
             for rc in crate::types::RuleColor::ALL {
                 assert_eq!(
                     t.rule_line(rc),
@@ -745,6 +783,37 @@ mod tests {
                     "{t:?}/{rc:?} 的界行色被新主题带偏了"
                 );
             }
+        }
+        // ④ 夜读（v1.85.0）：外框提亮、内框退暗，双线才分得开。
+        for rc in crate::types::RuleColor::ALL {
+            let outer = Theme::Ye.frame_outer();
+            let inner = Theme::Ye.rule_line(rc);
+            assert!(
+                luma(outer) > luma(Theme::Ye.rule_ink()),
+                "{rc:?} 夜读的外框没提亮：{outer:06X}"
+            );
+            assert!(
+                luma(inner) < luma(Theme::Ye.rule_by(rc)),
+                "{rc:?} 夜读的内框没退暗：{inner:06X}"
+            );
+            // 层次 = 「一进一出」的亮度差；金丝栏本是亮金，方向反着也算拉开。
+            assert!(
+                (luma(outer) - luma(inner)).abs() >= 12.0,
+                "{rc:?} 夜读的双线拉不开层次：{outer:06X} vs {inner:06X}"
+            );
+            // 退了还得看得见：内框与纸之间必须有可辨的亮度差。
+            assert!(
+                (luma(inner) - luma(Theme::Ye.paper())).abs() > 8.0,
+                "{rc:?} 夜读的界行淡到看不见了：{inner:06X}"
+            );
+        }
+        // ⑤ 浅纸四套的外框取色一分不动（提亮只发生在深底）。
+        for t in [Theme::Xuan, Theme::Mi, Theme::Qing, Theme::Ke] {
+            assert_eq!(
+                t.frame_outer(),
+                t.paper_theme().border,
+                "{t:?} 的外框色被带偏了"
+            );
         }
     }
 

@@ -63,13 +63,20 @@ pub struct PdfGeometry {
     /// 纸色 / 墨色 / 界行色 / 注文色 / 朱砂（皆 `0xRRGGBB`）。
     pub paper: u32,
     pub ink: u32,
+    /// **版框外层粗线**的取色（v1.85.0：深底提亮一档，浅纸 = 版框色）。
     pub rule: u32,
-    /// **内框与界行**的取色（v1.83.0）——版框外层仍用 `rule`。
+    /// **内框与界行**的取色（v1.83.0）——版框外层走 `rule`。
     ///
     /// 刻本的层次是「外框最重、内框与界行退一档」；旧制两者同色，印出来
     /// 是「一圈粗细不匀的框」。非仿刻本主题由壳子传**与 `rule` 相同的值**
     /// （见 `Theme::rule_line`），所以老版面的 PDF 一个像素都不变。
     pub rule_soft: u32,
+    /// **版框形制**（v1.85.0）：四周双边 / 左右双边 / 四周单边。
+    ///
+    /// 屏幕上 `reader::render_ancient` 按它决定内层细线画在哪几边，纸上
+    /// 由 `pdf::draw_leaf` 按同一张表落笔——**同一枚举、同一几何**，屏幕
+    /// 与 PDF 才不会一个双边一个单边。
+    pub frame_style: crate::types::FrameStyle,
     pub note_ink: u32,
     pub accent: u32,
     /// 正文 / 注文字体的**语义类**，由壳子翻译成具体字体。
@@ -103,6 +110,11 @@ impl PdfGeometry {
     /// 地脚条高（叶码）。
     pub fn foot_h(&self) -> f32 {
         (self.fs * 0.36).max(9.0) + 10.0
+    }
+    /// 内层细线画在哪几边（上 / 右 / 下 / 左）——PDF 一叶是完整一纸，
+    /// 外框恒四边，故直接拿 `frame_style` 裁 [`crate::types::FrameStyle::inner_sides`]。
+    pub fn inner_sides(&self) -> [bool; 4] {
+        self.frame_style.inner_sides([true; 4])
     }
 }
 
@@ -230,6 +242,7 @@ mod tests {
             ink: 0,
             rule: 0,
             rule_soft: 0,
+            frame_style: crate::types::FrameStyle::default(),
             note_ink: 0,
             accent: 0,
             font: PdfFontKind::Song,
@@ -278,6 +291,7 @@ mod tests {
             ink: 0,
             rule: 0,
             rule_soft: 0,
+            frame_style: crate::types::FrameStyle::default(),
             note_ink: 0,
             accent: 0,
             font: PdfFontKind::Song,
