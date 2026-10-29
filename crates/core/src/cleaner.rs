@@ -1123,6 +1123,104 @@ pub fn paren_to_note(s: &str) -> String {
     out
 }
 
+/// **统一「括号→双行夹注」入口**：把 `〔…〕` / `【…】` 与全角圆括号 `（）`、
+/// 半角 `()` 都归一成系统一等公民的 `[注]…[/注]` 标记。
+///
+/// 这样 TXT / DOCX（走 `pipeline::parse_txt`）与 EPUB（走 `vclean::clean_epub`）
+/// 三条导入路共享同一套夹注识别——这才是真正的「全格式」。
+///
+/// 设计要点：
+/// - `〔…〕` / `【…】` 一律升格（古籍注疏、校勘记的正规写法，不限额长）。
+/// - `（）` / `()` 用**保守判据**升格：内容 1–30 字、不含句读（含句读说明是正文）、
+///   不含嵌套括号、且不是已存在的 `[注]` 壳；否则原样保留，绝不吞字。
+/// - `（）` 若嵌在 `〔…〕` / `【…】` 注内，原样透传，绝不套出双层 `[注]`。
+/// - 残留未闭合的括号一律兜底成对，绝不产生不配对的 `[注]` 标记。
+pub fn brackets_to_notes(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    // 栈记「注壳类型」：0 = 〔，1 = 【。遇到对应闭壳才收口。
+    let mut stack: Vec<u8> = Vec::new();
+    // 圆括号注缓冲：仅当不在 〔〕/【】 注内时收集 `（）` 内容。
+    let mut paren: Option<String> = None;
+    let mut i = 0usize;
+    while i < cs.len() {
+        let c = cs[i];
+        match c {
+            '〔' => {
+                stack.push(0);
+                out.push_str("[注]");
+            }
+            '【' => {
+                stack.push(1);
+                out.push_str("[注]");
+            }
+            '〕' => {
+                // 与栈顶 〔 配对才闭；落单右括号（正文里的噪声）丢弃，与旧
+                // `txt_bracket_notes` 行为一致。
+                if let Some(&0) = stack.last() {
+                    stack.pop();
+                    out.push_str("[/注]");
+                }
+            }
+            '】' => {
+                if let Some(&1) = stack.last() {
+                    stack.pop();
+                    out.push_str("[/注]");
+                }
+            }
+            '（' | '(' => {
+                if paren.is_some() {
+                    paren.as_mut().unwrap().push(c);
+                } else if stack.is_empty() {
+                    paren = Some(String::new());
+                } else {
+                    // 处在 〔〕/【】 注内：原样透传，绝不嵌套。
+                    out.push(c);
+                }
+            }
+            '）' | ')' => {
+                if let Some(mut b) = paren.take() {
+                    b.push(c);
+                    let body = b
+                        .trim()
+                        .trim_matches(|x| matches!(x, '（' | '(' | '）' | ')'))
+                        .to_string();
+                    let n = body.chars().count();
+                    let ok = (1..=30).contains(&n)
+                        && !body.chars().any(is_sentence_punct)
+                        && !body.contains(['（', '）', '(', ')'])
+                        && !body.contains("[注]");
+                    if ok {
+                        out.push_str(&format!("[注]{body}[/注]"));
+                    } else {
+                        // 不升格：把开闭括号原样补回，绝不吞字。
+                        out.push('（');
+                        out.push_str(&body);
+                        out.push('）');
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            _ => {
+                if let Some(b) = paren.as_mut() {
+                    b.push(c);
+                } else {
+                    out.push(c);
+                }
+            }
+        }
+        i += 1;
+    }
+    if let Some(b) = paren.take() {
+        out.push_str(&b);
+    }
+    while stack.pop().is_some() {
+        out.push_str("[/注]");
+    }
+    out
+}
+
 /// 把一段正文里的括号注转成 IR 的夹注节点。
 fn rebuild_notes_juan(j: &mut IrJuan) {
     for b in j.blocks.iter_mut() {
@@ -1539,6 +1637,24 @@ mod tests {
         assert_eq!(paren_to_note("他说（不对，其实是错的）。"), "他说（不对，其实是错的）。");
         // 没闭合：绝不吞字
         assert_eq!(paren_to_note("道（可道"), "道（可道");
+    }
+
+    #[test]
+    fn brackets_to_notes_unifies_all_bracket_kinds() {
+        // 〔〕 / 【】 一律升格
+        assert_eq!(brackets_to_notes("甲〔注曰〕乙"), "甲[注]注曰[/注]乙");
+        assert_eq!(brackets_to_notes("甲【注曰】乙"), "甲[注]注曰[/注]乙");
+        // （）保守升格（无句读）
+        assert_eq!(
+            brackets_to_notes("名可名（河上公注）非常名"),
+            "名可名[注]河上公注[/注]非常名"
+        );
+        // （）含句读不升格——那是正文自己带的括号
+        assert_eq!(brackets_to_notes("他说（不对，错的）。"), "他说（不对，错的）。");
+        // （）嵌在〔〕注内不嵌套，原样透传
+        assert_eq!(brackets_to_notes("〔外（內）尾〕"), "[注]外（內）尾[/注]");
+        // 半角 ()
+        assert_eq!(brackets_to_notes("道(a note)名"), "道[注]a note[/注]名");
     }
 
     #[test]

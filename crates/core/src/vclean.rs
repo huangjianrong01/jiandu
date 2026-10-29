@@ -1510,6 +1510,10 @@ pub fn clean_epub(html: &str) -> Vec<RawChapter> {
             // 真机实测：传习录、Rust 教程这些 epub 里，上标注号被拆得只剩
             // 一个收标记，方括号就原样印进正文了（用户点名不许有 []）。
             c.content = crate::types::strip_dangling_note_marks(&c.content);
+            // 「全格式」夹注：EPUB 正文里的 `（）`/`()` 注疏也归一成双行夹注
+            // （TXT / DOCX 走 `parse_txt` 同样调用 `brackets_to_notes`）。放在
+            // scrub / strip_dangling 之后，避免短注被当成上标残渣删掉。
+            c.content = crate::cleaner::brackets_to_notes(&c.content);
             c
         })
         .collect();
@@ -2074,6 +2078,25 @@ mod tests {
         assert!(!c.content.contains("14428"), "{}", c.content);
         assert!(!c.content.lines().any(|l| l.trim() == "七"), "{}", c.content);
         assert!(c.content.contains('\n'), "段间应有换行：{}", c.content);
+    }
+
+    #[test]
+    fn clean_epub_fullwidth_paren_becomes_gloss() {
+        // EPUB 正文里的 `（）` 注疏也应归一成双行夹注（全格式）。
+        let cs = clean_epub(
+            "<html><body><p>道可道（河上公注）非常名。</p><p>無名天地之始。</p></body></html>",
+        );
+        let joined: String = cs.iter().flat_map(|c| c.content.chars()).collect();
+        assert!(
+            joined.contains("[注]河上公注[/注]"),
+            "epub （）应归一成夹注：{}",
+            joined
+        );
+        assert!(
+            !joined.contains("（河上公注）"),
+            "原括号不应残留：{}",
+            joined
+        );
     }
 
     #[test]

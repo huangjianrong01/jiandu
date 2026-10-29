@@ -314,44 +314,10 @@ pub(crate) fn is_numeral(c: char) -> bool {
 /// Panic——用栈单趟扫描，落单的开 / 闭括号直接丢弃，内容照常保留；结尾把
 /// 仍未闭合的开括号补上收壳，保证 `[注]…[/注]` 成对，下游 `split_body_marks`
 /// 不会看到悬空开壳。
+/// 兼容别名：旧代码仍可调它；新代码请直接用 `crate::cleaner::brackets_to_notes`
+/// （后者**同时**处理 `（）`/`()`，是真正的全格式入口）。
 pub fn txt_bracket_notes(s: &str) -> String {
-    let cs: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len());
-    // 栈里存「开括号类型」（0 = 〔，1 = 【）。遇到对应闭括号才闭合。
-    let mut stack: Vec<u8> = Vec::new();
-    let mut i = 0usize;
-    while i < cs.len() {
-        match cs[i] {
-            '〔' => {
-                stack.push(0);
-                out.push_str("[注]");
-            }
-            '【' => {
-                stack.push(1);
-                out.push_str("[注]");
-            }
-            '〕' => {
-                // 与栈顶 〔 配对才闭；否则落单右括号，丢弃。
-                if let Some(&0) = stack.last() {
-                    stack.pop();
-                    out.push_str("[/注]");
-                }
-            }
-            '】' => {
-                if let Some(&1) = stack.last() {
-                    stack.pop();
-                    out.push_str("[/注]");
-                }
-            }
-            c => out.push(c),
-        }
-        i += 1;
-    }
-    // 兜底：残留未闭合的开括号——补收壳，保证标记成对。
-    while stack.pop().is_some() {
-        out.push_str("[/注]");
-    }
-    out
+    crate::cleaner::brackets_to_notes(s)
 }
 
 /// **TXT 专用**：极短且无句读的纯文本行 → 章节标题（标题大字）。
@@ -400,7 +366,9 @@ pub fn parse_txt(text: &str) -> Vec<RawChapter> {
     // `[注]…[/注]`，下游 `split_body_marks` 自然落成双行夹注。这一步只在 TXT
     // 链走，不动 EPUB / HTML（它们有自己的清洗，且 `purge_bracket_marks` 有
     // 长度上限，不在本函数里改）。
-    let norm = txt_bracket_notes(&norm);
+    // 全格式夹注归一：`〔…〕`/`【…】`/`（）`/`()` 全部归一成 `[注]…[/注]`，
+    // 下游 `split_body_marks` 自然落成双行夹注。这一行让 TXT / DOCX 走通夹注。
+    let norm = crate::cleaner::brackets_to_notes(&norm);
     let mut chapters: Vec<RawChapter> = Vec::new();
     let mut title = "正文".to_string();
     let mut paras: Vec<String> = Vec::new();
