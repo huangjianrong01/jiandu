@@ -61,6 +61,13 @@ body {
   background: rgba(176, 52, 44, 0.12);
 }
 
+/* TTS 朗读按钮：激活态（正在朗读）带朱砂底色 */
+.topbar button.tts-btn.active {
+  background: rgba(176, 52, 44, 0.85);
+  color: #f5f4ef;
+  border-color: rgba(176, 52, 44, 0.85);
+}
+
 .file-name {
   margin-left: auto;
   font-size: 12px;
@@ -176,4 +183,19 @@ body {
   margin: 0.35em 0;
   text-indent: 2em; /* 中文段落首行缩进 */
   color: #2b2620;
+  transition: background 0.25s ease;
+}
+
+/* TTS 正在朗读的片段：朱砂淡底 + 左侧朱砂标，跟随滚动 */
+.book-view p.reading,
+.book-view h2.reading {
+  background: rgba(176, 52, 44, 0.14);
+  box-shadow: inset 3px 0 0 #b0342c;
+  border-radius: 3px;
+}
+
+/* 默认欢迎页竖排诗句朗读高亮 */
+.verse.reading {
+  background: rgba(176, 52, 44, 0.12);
+  border-radius: 4px;
 }
