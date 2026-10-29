@@ -142,19 +142,25 @@ pub fn import_docx_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
     let full = crate::importer::book_from_plaintext(&fallback, &text);
     drop(text); // 原文到此为止，后面只剩章数组
 
-    // 书名：**先信包里的 `dc:title`**（作者 / Calibre 导出时填的真书名），
-    // 读不到才退回文件名。无论如何都不猜正文首行——首行多是「某某序」，
-    // 一本《資治通鑑》会被命名成《胡三省新註資治通鑑序》。
+    // 元数据：书名 / 作者都从这里来（见 `read_core_props`）。
+    // 书名**先信 `dc:title`**，读不到才退回文件名。无论如何都不猜正文首行——
+    // 首行多是「某某序」，一本《資治通鑑》会被命名成《胡三省新註資治通鑑序》。
     // 两条来源都要过一遍 `tidy_docx_title`：元数据本身也可能是脏的
     // （序跋 / 注疏题名 / 网址 / 拼音），而书架只该摆一个干净的名字。
+    let (meta_title, meta_author) = read_core_props(&mut zip);
     let mut full = full;
-    let title = read_core_title(&mut zip)
+    let title = meta_title
         .as_deref()
         .and_then(tidy_docx_title)
         .or_else(|| tidy_docx_title(&fallback));
     if let Some(t) = title {
         full.title = t;
         full.cover.title = full.title.clone();
+    }
+    // 作者：元数据里的 `dc:creator` 比正文首行可靠得多（古籍序跋本的
+    // 首行是篇题，认不出作者）。清洗后仍为空才保留漏斗认出来的那个。
+    if let Some(a) = meta_author.as_deref().and_then(tidy_docx_author) {
+        full.author = a;
     }
 
     let n = full.chapters.len().max(1);
@@ -173,77 +179,130 @@ pub fn import_docx_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
 }
 
 // ---------------------------------------------------------------------------
-// 元数据：docProps/core.xml → dc:title
+// 元数据：docProps/core.xml → dc:title / dc:creator
 // ---------------------------------------------------------------------------
 
-/// 从包里的 `docProps/core.xml` 读 `dc:title`（真正的书名）。
+/// 从包里的 `docProps/core.xml` 读 `(dc:title, dc:creator)`。
 ///
-/// Word / Pages / WPS / Calibre 导出时都会写这一项，比猜正文首行可靠得多。
-/// 读不到（包不完整、字段是空的、XML 坏）→ `None`，调用方回退文件名。
-fn read_core_title<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> Option<String> {
+/// Word / Pages / WPS / Calibre 导出时都会写这两项，比猜正文首行可靠得多。
+/// 读不到（包不完整、字段是空的、XML 坏）→ 对应项为 `None`。
+fn read_core_props<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> (Option<String>, Option<String>) {
     // 元数据文件正常只有几百字节；仍上 256KiB 上限，防畸形包把内存吃掉。
-    let entry = zip.by_name("docProps/core.xml").ok()?;
+    let Some(entry) = zip.by_name("docProps/core.xml").ok() else {
+        return (None, None);
+    };
     let mut buf = Vec::with_capacity(1024);
-    entry.take(256 * 1024).read_to_end(&mut buf).ok()?;
-    parse_core_title(&String::from_utf8_lossy(&buf))
+    if entry.take(256 * 1024).read_to_end(&mut buf).is_err() {
+        return (None, None);
+    }
+    parse_core_props(&String::from_utf8_lossy(&buf))
 }
 
-/// 从 `core.xml` 里刮出第一个 `dc:title` 的文本（纯函数，给单测用）。
+/// 从 `core.xml` 里刮出 `dc:title` 与 `dc:creator`（纯函数，给单测用）。
 ///
-/// 按**本地名**认元素（`title` / `TITLE`），不认前缀——不同工具写出来的
+/// 按**本地名**认元素（`title` / `creator`），不认前缀——不同工具写出来的
 /// 前缀花样很多（`dc:` `dcterms:` 甚至没有前缀），认前缀就会漏。
-fn parse_core_title(xml: &str) -> Option<String> {
+/// 每一项都**必须读到闭合标签才算数**：包被截断时留下的半个书名 /
+/// 半个作者名比没有还糟。
+fn parse_core_props(xml: &str) -> (Option<String>, Option<String>) {
+    #[derive(Clone, Copy, PartialEq)]
+    enum F {
+        Title,
+        Creator,
+    }
     let local = |e: &quick_xml::events::BytesStart<'_>| -> String {
         let n = e.name();
         String::from_utf8_lossy(n.local_name().as_ref()).to_ascii_lowercase()
     };
     let mut reader = Reader::from_str(xml);
-    let mut in_title = false;
-    // 必须读到 `</dc:title>` 才算数：包被截断时留下的半个书名比没有还糟
-    // （书架会摆出「資治通」），不如退回文件名。
-    let mut closed = false;
-    let mut out = String::new();
+    let mut field: Option<F> = None;
+    let mut buf = String::new();
+    let mut title: Option<String> = None;
+    let mut creator: Option<String> = None;
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                in_title = local(&e) == "title";
-                // 只跟着 title 元素重置：后面的 `<dc:creator>` 不能把
-                // 刚闭合的 `</dc:title>` 又当成「没闭合」。
-                if in_title {
-                    closed = false;
-                }
+                let name = local(&e);
+                field = match name.as_str() {
+                    "title" => Some(F::Title),
+                    "creator" => Some(F::Creator),
+                    _ => None,
+                };
+                buf.clear();
             }
             Ok(Event::Text(e)) => {
-                if in_title {
+                if field.is_some() {
                     if let Ok(s) = e.unescape() {
-                        out.push_str(&s);
+                        buf.push_str(&s);
                     }
                 }
             }
             Ok(Event::CData(e)) => {
-                if in_title {
-                    out.push_str(&String::from_utf8_lossy(e.as_ref()));
+                if field.is_some() {
+                    buf.push_str(&String::from_utf8_lossy(e.as_ref()));
                 }
             }
             Ok(Event::End(e)) => {
-                if String::from_utf8_lossy(e.name().local_name().as_ref())
-                    .eq_ignore_ascii_case("title")
-                {
-                    in_title = false;
-                    closed = true;
+                let name = String::from_utf8_lossy(e.name().local_name().as_ref()).to_lowercase();
+                let t = buf.trim().to_string();
+                if name == "title" && field == Some(F::Title) && title.is_none() && !t.is_empty() {
+                    title = Some(t.clone());
                 }
+                if name == "creator" && field == Some(F::Creator) && creator.is_none() && !t.is_empty()
+                {
+                    creator = Some(t);
+                }
+                field = None;
+                buf.clear();
             }
             // 坏 XML / 读到尾：拿已经刮到的部分，绝不报错。
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
     }
-    let t = out.trim();
-    if t.is_empty() || !closed {
-        None
-    } else {
-        Some(t.to_string())
+    (title, creator)
+}
+
+/// 作者名清洗：`[宋] 司馬光 編著 / [元] 胡三省 音注` → `司馬光、胡三省`。
+///
+/// `dc:creator` 是「人 + 角色」的自由文本，直接上书架会又长又乱。三步：
+/// 1. 按 `/ ／ ; ；` 拆成多个人；
+/// 2. 每个剥掉朝代 / 籍贯括注（`[宋]` `〔元〕` `（清）`）与角色词
+///    （編著 / 音注 / 撰 / 校注…）；
+/// 3. 多个人用「、」连起来，超 24 字截断。
+fn tidy_docx_author(raw: &str) -> Option<String> {
+    /// 角色词：从长到短匹配（「校注」要先于「注」被试到）。
+    const ROLES: &[&str] = &[
+        "編著", "编著", "主編", "主编", "校注", "校訂", "校订", "音註", "音注", "註釋", "注释",
+        "譯註", "译注", "翻譯", "翻译", "撰寫", "撰写", "原著", "著", "撰", "編", "编", "譯", "译",
+        "註", "注", "輯", "辑", "續", "续", "補", "补", "訂", "订", "等",
+    ];
+    let mut names: Vec<String> = Vec::new();
+    for part in raw.split(['/', '／', ';', '；', '、', ',', '，']) {
+        // ① 剥括注（朝代 / 籍贯 / 生卒）——统一走 vclean 的实现。
+        let mut t = crate::vclean::drop_bracketed(part);
+        // ② 剥角色词。
+        for r in ROLES {
+            t = t.replace(r, " ");
+        }
+        // ③ 空白折成一个、首尾去白。
+        let folded = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        if folded.chars().count() >= 2 {
+            names.push(folded);
+        }
     }
+    // 去重（同一人重复署名很常见），保持原顺序。
+    names.dedup();
+    if names.is_empty() {
+        return None;
+    }
+    let mut out = names.join("、");
+    if out.chars().count() > 24 {
+        out = out.chars().take(24).collect();
+    }
+    Some(out)
 }
 
 /// 序跋标记：出现即视为「书名到此为止」。
@@ -941,18 +1000,32 @@ mod tests {
     }
 
     #[test]
-    fn core_xml_title_is_parsed() {
+    fn core_props_title_and_creator_are_parsed() {
         let core = r#"<?xml version="1.0" encoding="UTF-8"?>
-<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>資治通鑑</dc:title><dc:creator>[宋] 司馬光</dc:creator></cp:coreProperties>"#;
-        assert_eq!(parse_core_title(core).as_deref(), Some("資治通鑑"));
-        // 实体要解开；空字段 → None；坏 XML → 拿已读到的。
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>資治通鑑</dc:title><dc:creator>[宋] 司馬光 編著 / [元] 胡三省 音注</dc:creator><dc:language>zh</dc:language></cp:coreProperties>"#;
+        let (t, c) = parse_core_props(core);
+        assert_eq!(t.as_deref(), Some("資治通鑑"));
+        assert_eq!(c.as_deref(), Some("[宋] 司馬光 編著 / [元] 胡三省 音注"));
+        // 实体要解开；空字段 → None；截断（无闭合标签）→ None。
+        let (t2, c2) = parse_core_props("<dc:title>A&amp;B</dc:title><dc:creator>  </dc:creator>");
+        assert_eq!(t2.as_deref(), Some("A&B"));
+        assert_eq!(c2, None);
+        assert_eq!(parse_core_props("<dc:title>截断").0, None);
+        assert_eq!(parse_core_props("").0, None);
+    }
+
+    #[test]
+    fn creator_is_cleaned_into_a_shelf_author() {
+        // 人 + 角色 + 朝代括注 → 只留人名，多人用「、」连。
         assert_eq!(
-            parse_core_title("<dc:title>A&amp;B</dc:title>").as_deref(),
-            Some("A&B")
+            tidy_docx_author("[宋] 司馬光 編著 / [元] 胡三省 音注").as_deref(),
+            Some("司馬光、胡三省")
         );
-        assert_eq!(parse_core_title("<dc:title>   </dc:title>"), None);
-        assert_eq!(parse_core_title("<dc:title>截断"), None);
-        assert_eq!(parse_core_title(""), None);
+        assert_eq!(tidy_docx_author("曹雪芹 著").as_deref(), Some("曹雪芹"));
+        assert_eq!(tidy_docx_author("（清）曹雪芹，高鶚 續").as_deref(), Some("曹雪芹、高鶚"));
+        // 只有角色词 / 空 → None（不能把「編著」当作者）。
+        assert_eq!(tidy_docx_author("編著"), None);
+        assert_eq!(tidy_docx_author("   "), None);
     }
 
     /// 造一个最小 docx（可选塞 `docProps/core.xml`）。
@@ -999,7 +1072,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("jiandu-docx-meta-{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         let path = dir.join("胡三省新註資治通鑑序.docx");
-        let core = r#"<cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>資治通鑑</dc:title></cp:coreProperties>"#;
+        let core = r#"<cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>資治通鑑</dc:title><dc:creator>[宋] 司馬光 編著</dc:creator></cp:coreProperties>"#;
         write_docx(
             &path,
             &format!("{}{}", p("胡三省新註資治通鑑序"), p("古者國各有史以紀年書事。")),
@@ -1008,6 +1081,7 @@ mod tests {
         let book = import_docx_into(&path, &mut NullSink).expect("导入不该失败");
         assert_eq!(book.title, "資治通鑑", "没优先用 dc:title：{}", book.title);
         assert_eq!(book.cover.title, "資治通鑑");
+        assert_eq!(book.author, "司馬光", "作者没从 dc:creator 取：{}", book.author);
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }

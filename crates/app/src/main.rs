@@ -39,6 +39,11 @@ mod clipboard;
 /// **繁简转换引擎（macOS · ICU）**（v1.81.0）：`Hans-Hant` / `Hant-Hans` 词组级
 /// 变换。core 只定档位与兜底表，真正转字在这里——core 不许碰 objc。
 mod conv;
+/// **拖拽入书**（v1.9.5）：把 Finder 拖进来的文件接住。
+///
+/// gpui 0.2.2 没有文件拖放 API，这里手写 libobjc / AppKit 直调，给窗口
+/// 的 NSView 补上 `performDragOperation:`——不加任何新依赖（纪律同 `sound`）。
+mod dropzone;
 mod exporter;
 mod fonts;
 // `gloss`（双行夹注排版引擎）v1.0.0-beta 起住在 `jiandu-core`，本 crate 只

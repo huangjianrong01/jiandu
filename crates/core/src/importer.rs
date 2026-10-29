@@ -55,7 +55,7 @@ pub fn import_from_path(path: &Path) -> Result<Book> {
     let max = crate::vclean::META_TITLE_MAX;
     book.title = tidy_meta(&book.title, max);
     book.cover.title = tidy_meta(&book.cover.title, max);
-    book.author = tidy_meta(&book.author, max);
+    book.author = tidy_meta_author(&book.author, max);
     Ok(book)
 }
 
@@ -161,6 +161,26 @@ fn tidy_meta(s: &str, max: usize) -> String {
     let t = crate::vclean::strip_meta_junk(s);
     let t = crate::vclean::tidy_meta_title(&t);
     clip_chars(&t, max)
+}
+
+/// **作者收口**：与书名同一套粉碎机，但**保留顿号**。
+///
+/// 中文多作者的标准写法是「司馬光、胡三省」，而 [`tidy_meta`] 走的
+/// `tidy_meta_title` 把顿号当杂质切掉——切完就成了「司馬光胡三省」，
+/// 看着像一个人的复姓。所以这里按顿号拆开，各自粉碎，再用顿号接回去。
+fn tidy_meta_author(s: &str, max: usize) -> String {
+    // 先扔掉括注（「曹雪芹（清）」→「曹雪芹」），否则括号被当标点删掉、
+    // 「清」字却留在名字里。
+    let s = crate::vclean::drop_bracketed(s);
+    let parts: Vec<String> = s
+        .split('、')
+        .map(|p| tidy_meta(p, max))
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    clip_chars(&parts.join("、"), max)
 }
 
 fn clip_chars(s: &str, max: usize) -> String {
@@ -1412,7 +1432,7 @@ pub fn import_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> {
     let max = crate::vclean::META_TITLE_MAX;
     book.title = tidy_meta(&book.title, max);
     book.cover.title = tidy_meta(&book.cover.title, max);
-    book.author = tidy_meta(&book.author, max);
+    book.author = tidy_meta_author(&book.author, max);
     Ok(book)
 }
 
@@ -2038,6 +2058,18 @@ mod tests {
         assert_eq!(title, "道德经", "叶码被当成书名了：{title}");
         assert_eq!(b.title, "水浒传");
         assert_eq!(b.author, "施耐庵");
+    }
+
+    /// 多作者必须留着顿号：`tidy_meta_title` 会把 `、` 当杂质切掉，
+    /// 一刀下去「司馬光、胡三省」就成了「司馬光胡三省」（看着像一个人）。
+    #[test]
+    fn multi_author_keeps_the_ideographic_comma() {
+        let max = crate::vclean::META_TITLE_MAX;
+        assert_eq!(tidy_meta_author("司馬光、胡三省", max), "司馬光、胡三省");
+        assert_eq!(tidy_meta_author("曹雪芹", max), "曹雪芹");
+        // 单个人名照旧过粉碎机（网址 / 括号 / 标点都要清）。
+        assert_eq!(tidy_meta_author("曹雪芹（清）", max), "曹雪芹");
+        assert_eq!(tidy_meta_author("", max), "");
     }
 
     /// v1.9.4 修复验证：**大 JSON 导入必须报进度，且不能 panic / 被看门狗误杀**。

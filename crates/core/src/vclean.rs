@@ -1057,6 +1057,48 @@ pub fn hyphen_to_dot(s: &str) -> String {
 /// 也说明那段字符串根本不是书名（而是盗版站塞进去的文件名）。
 pub const META_TITLE_MAX: usize = 15;
 
+/// 去掉成对括号**连同里面的字**：`曹雪芹（清）` → `曹雪芹`。
+///
+/// 作者 / 书名里的括注几乎都是「朝代 / 籍贯 / 册数 / 生卒」这类附注，
+/// 留在名字里只会变成「曹雪芹清」（`tidy_meta_title` 把括号当标点删了，
+/// 里面的字却留着）。
+///
+/// **`〔〕` 不在剔除之列**：古籍署名里它是标朝代的正规括号
+/// （`〔周〕李耳`），删了就成了「李耳」，丢的是版本信息。
+///
+/// **括号不配对就原样返回**：宁可留着一对括号，也绝不因为一个孤零零的
+/// `（` 把后面整段正文吞掉。
+pub fn drop_bracketed(s: &str) -> String {
+    const OPEN: &[char] = &['（', '(', '[', '【', '「'];
+    const CLOSE: &[char] = &['）', ')', ']', '】', '」'];
+    let mut open = 0i32;
+    for c in s.chars() {
+        if OPEN.contains(&c) {
+            open += 1;
+        } else if CLOSE.contains(&c) {
+            open -= 1;
+            if open < 0 {
+                return s.to_string(); // 先闭后开：不是附件注，别动
+            }
+        }
+    }
+    if open != 0 {
+        return s.to_string(); // 有开无闭：不配动刀
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0usize;
+    for c in s.chars() {
+        if OPEN.contains(&c) {
+            depth += 1;
+        } else if CLOSE.contains(&c) {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// 盗版站 / 下载站的站名与格式词（命中即整词删除，大小不敏感）。
 ///
 /// 这些都是**纯 ASCII** 词，中文书名里不可能出现，删掉绝不误伤。

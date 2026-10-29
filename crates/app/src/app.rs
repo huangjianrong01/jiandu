@@ -17,7 +17,7 @@ use gpui::{
     WeakEntity, Window,
 };
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// **渲染帧 → 事件层的一次性矩形探针**（x, y, w, h）。
@@ -1096,6 +1096,51 @@ impl ImportJob {
     pub fn take_done(&self) -> Option<std::result::Result<(Book, String, PathBuf), String>> {
         self.done.lock().ok().and_then(|mut g| g.take())
     }
+}
+
+/// **导入防呆**（v1.9.5）：进后台之前就把「注定读不动」的文件挡下。
+///
+/// 只读前 8 个字节，主线程毫秒级。返回一句给用户看的人话；`None` = 放行。
+///
+/// 拦四类：
+/// * `.doc` —— Word 97 二进制，管线只认 OOXML，直接告诉他另存；
+/// * OLE 复合文件魔数 `D0 CF 11 E0` —— **加密的 .docx 就长这个样子**
+///   （Word 把加密后的 OOXML 装进 OLE 容器），只改后缀骗不过这一关；
+/// * 0 字节空文件；
+/// * 后缀 `.docx` 但头不是 `PK` —— 改了后缀的假货 / 下载中断的残包。
+fn reject_reason(path: &Path) -> Option<&'static str> {
+    const DOC: &str = "暂不支持老版 .doc 格式：请在 Word 里「另存为」.docx 再导入";
+    const OLE: &str =
+        "这份文档是加密的或老版 Word 格式：请在 Word 里取消密码、另存为 .docx 再导入";
+    const EMPTY: &str = "这个文件是空的（0 字节），没有可导的内容";
+    const FAKE: &str = "这不是有效的 .docx（文件可能已损坏，或只是改了后缀）";
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "doc" {
+        return Some(DOC);
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() == 0 {
+        return Some(EMPTY);
+    }
+    if ext != "docx" {
+        return None;
+    }
+    use std::io::Read;
+    let mut head = [0u8; 8];
+    let mut f = std::fs::File::open(path).ok()?;
+    let n = f.read(&mut head).unwrap_or(0);
+    if n >= 4 && head[..4] == [0xD0, 0xCF, 0x11, 0xE0] {
+        return Some(OLE);
+    }
+    if n >= 2 && &head[..2] != b"PK" {
+        return Some(FAKE);
+    }
+    None
 }
 
 impl Root {
@@ -2956,8 +3001,37 @@ impl Root {
             self.notice = "还有一部书正在刻印，请稍候".into();
             return;
         }
+        // v1.9.5：**防呆前置**。加密 / 老版 .doc / 空文件 / 假 docx 在开刻
+        // 之前就挡下——否则它们要占着进度条跑到看门狗超时才报错，用户对着
+        // 0% 干等三秒，看到的还是「文件可能损坏」这种没头没脑的话。
+        if let Some(why) = reject_reason(&path) {
+            self.notice = why.to_string();
+            return;
+        }
         self.notice.clear();
         self.import_job = Some(ImportJob::start(path));
+    }
+
+    /// **这一帧收到的拖入文件**（v1.9.5）：一本直接刻，多本走批量。
+    ///
+    /// AppKit 的拖放回调只把路径塞进队列（见 [`crate::dropzone`]），
+    /// 真正开刻必须在主线程这里做——GPUI 的实体不能跨线程碰。
+    pub fn poll_dropped(&mut self, cx: &mut Context<Self>) {
+        let paths = crate::dropzone::take();
+        if paths.is_empty() {
+            return;
+        }
+        let mut it = paths.into_iter();
+        match (it.next(), it.next()) {
+            (Some(one), None) => self.add_import(one),
+            (Some(one), Some(two)) => {
+                let mut v = vec![one, two];
+                v.extend(it);
+                self.start_batch(v);
+            }
+            _ => return,
+        }
+        cx.notify();
     }
 
     /// **批量导入**（v1.77.0）：一次喂进一批文件，后台**串行**刻印。
@@ -2973,6 +3047,27 @@ impl Root {
         if paths.is_empty() {
             return;
         }
+        // v1.9.5：先把注定读不动的挡下（加密 / 老 .doc / 空文件 / 假 docx）。
+        // 否则它们要占着队列跑到看门狗超时才报错，白等几十秒。
+        let mut ok: Vec<PathBuf> = Vec::with_capacity(paths.len());
+        let mut first_reject: Option<&'static str> = None;
+        for p in paths {
+            match reject_reason(&p) {
+                Some(why) => {
+                    if first_reject.is_none() {
+                        first_reject = Some(why);
+                    }
+                }
+                None => ok.push(p),
+            }
+        }
+        if ok.is_empty() {
+            if let Some(why) = first_reject {
+                self.notice = why.to_string();
+            }
+            return;
+        }
+        let paths = ok;
         self.notice.clear();
         self.batch_cards.clear();
         self.batch_consumed = 0;
@@ -3376,6 +3471,10 @@ impl Root {
                             "epub", "docx", "json",
                         ],
                     )
+                    // v1.9.5：Word 单独一档，**连 .doc 一起列出来**——不让选，
+                    // 用户只会以为「我的 Word 文件不支持」；选中后由
+                    // `reject_reason` 给一句「请另存为 .docx」的人话。
+                    .add_filter("Word 文档 (docx / doc)", &["docx", "doc"])
                     .add_filter("全部文件", &["*"])
                     .pick_files();
 
@@ -6628,6 +6727,10 @@ impl Render for Root {
         let show_seal = self.screen == Screen::Reading && !self.focus_mode && !self.show_side;
         // v1.50.0：每帧探一眼后台导入（完成就登记入架，没完成就刷新进度）。
         self.poll_import(cx);
+        // v1.9.5：把 Finder 拖进来的文件接住。挂载只在第一帧做成一次；
+        // 之后每帧只是一次原子读 + 一次取空队列。
+        crate::dropzone::arm_once();
+        self.poll_dropped(cx);
         // v1.77.0：每帧探一眼批量导入（点检 / 上架 / 收工）与后台建索引。
         self.poll_batch(cx);
         self.poll_fts();
