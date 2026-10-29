@@ -28,6 +28,16 @@
 //!
 //! 另外：Word 的**目录域**（`TOC \h`）会自动生成一份「章名列表」，那是索引不是
 //! 正文。整段跳过——否则一本书前面会凭空多出几百个只有标题、没有内容的幽灵章。
+//! 域外的「Table of Contents / 目录 / 目錄」这类**整段标签行**也一律丢弃
+//! （见 [`is_toc_label`]）；正文里出现「目录」两个字的句子不受影响。
+//!
+//! # 书名从哪来
+//!
+//! 先读包里的 `docProps/core.xml` → `dc:title`（作者导出时填的真书名），
+//! 读不到才退回**文件名**。两者都不例外地过一遍 [`tidy_docx_title`]：
+//! 先剥序跋 / 注疏题名（`胡三省新註資治通鑑序` → `資治通鑑`），再走全项目
+//! 统一的 [`crate::vclean::clean_book_title`]。**绝不用正文首行猜书名**——
+//! 首行多是「某某序」，一本《資治通鑑》会被命名成《胡三省新註資治通鑑序》。
 //!
 //! # 容错（绝不 Panic）
 //!
@@ -132,14 +142,18 @@ pub fn import_docx_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
     let full = crate::importer::book_from_plaintext(&fallback, &text);
     drop(text); // 原文到此为止，后面只剩章数组
 
-    // 书名：docx 的**文件名**通常就是书名（Word / Calibre 用户都这么存）。
-    // 而正文首行往往是「某某序」「卷一」——让首行识别去猜，一本《资治通鉴》
-    // 会被命名成《胡三省新註資治通鑑序》。所以 docx 以文件名为准，截 12 字
-    // （与 TXT 链同一口径）。
-    let stem: String = fallback.trim().chars().take(12).collect();
+    // 书名：**先信包里的 `dc:title`**（作者 / Calibre 导出时填的真书名），
+    // 读不到才退回文件名。无论如何都不猜正文首行——首行多是「某某序」，
+    // 一本《資治通鑑》会被命名成《胡三省新註資治通鑑序》。
+    // 两条来源都要过一遍 `tidy_docx_title`：元数据本身也可能是脏的
+    // （序跋 / 注疏题名 / 网址 / 拼音），而书架只该摆一个干净的名字。
     let mut full = full;
-    if stem.chars().count() >= 2 {
-        full.title = stem;
+    let title = read_core_title(&mut zip)
+        .as_deref()
+        .and_then(tidy_docx_title)
+        .or_else(|| tidy_docx_title(&fallback));
+    if let Some(t) = title {
+        full.title = t;
         full.cover.title = full.title.clone();
     }
 
@@ -156,6 +170,165 @@ pub fn import_docx_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
     }
     sink.tick(1.0, "刻本 完成");
     Ok(skeleton)
+}
+
+// ---------------------------------------------------------------------------
+// 元数据：docProps/core.xml → dc:title
+// ---------------------------------------------------------------------------
+
+/// 从包里的 `docProps/core.xml` 读 `dc:title`（真正的书名）。
+///
+/// Word / Pages / WPS / Calibre 导出时都会写这一项，比猜正文首行可靠得多。
+/// 读不到（包不完整、字段是空的、XML 坏）→ `None`，调用方回退文件名。
+fn read_core_title<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> Option<String> {
+    // 元数据文件正常只有几百字节；仍上 256KiB 上限，防畸形包把内存吃掉。
+    let entry = zip.by_name("docProps/core.xml").ok()?;
+    let mut buf = Vec::with_capacity(1024);
+    entry.take(256 * 1024).read_to_end(&mut buf).ok()?;
+    parse_core_title(&String::from_utf8_lossy(&buf))
+}
+
+/// 从 `core.xml` 里刮出第一个 `dc:title` 的文本（纯函数，给单测用）。
+///
+/// 按**本地名**认元素（`title` / `TITLE`），不认前缀——不同工具写出来的
+/// 前缀花样很多（`dc:` `dcterms:` 甚至没有前缀），认前缀就会漏。
+fn parse_core_title(xml: &str) -> Option<String> {
+    let local = |e: &quick_xml::events::BytesStart<'_>| -> String {
+        let n = e.name();
+        String::from_utf8_lossy(n.local_name().as_ref()).to_ascii_lowercase()
+    };
+    let mut reader = Reader::from_str(xml);
+    let mut in_title = false;
+    // 必须读到 `</dc:title>` 才算数：包被截断时留下的半个书名比没有还糟
+    // （书架会摆出「資治通」），不如退回文件名。
+    let mut closed = false;
+    let mut out = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                in_title = local(&e) == "title";
+                // 只跟着 title 元素重置：后面的 `<dc:creator>` 不能把
+                // 刚闭合的 `</dc:title>` 又当成「没闭合」。
+                if in_title {
+                    closed = false;
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if in_title {
+                    if let Ok(s) = e.unescape() {
+                        out.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if in_title {
+                    out.push_str(&String::from_utf8_lossy(e.as_ref()));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if String::from_utf8_lossy(e.name().local_name().as_ref())
+                    .eq_ignore_ascii_case("title")
+                {
+                    in_title = false;
+                    closed = true;
+                }
+            }
+            // 坏 XML / 读到尾：拿已经刮到的部分，绝不报错。
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    let t = out.trim();
+    if t.is_empty() || !closed {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// 序跋标记：出现即视为「书名到此为止」。
+const PREFACE_TAIL: &[&str] = &["序言", "自序", "原序", "後序", "后序", "序", "跋", "弁言", "引言"];
+
+/// 注释**版本**标记：书名常写成「某書集注 / 某書音注」，真书名在标记**之前**。
+/// 只收两字以上的组合——单字「注」不能当尾标记，否则《水經注》会被切歪。
+const COMMENT_TAIL: &[&str] = &[
+    "新註", "新注", "音註", "音注", "箋註", "箋注", "集註", "集注", "註疏", "注疏",
+];
+
+/// 注释标记：书名常写成「某某新註某書」，真书名在标记**之后**。
+const COMMENT_HEAD: &[&str] = &[
+    "新註", "新注", "音註", "音注", "箋註", "箋注", "集註", "集注", "註", "注", "箋", "笺", "疏",
+    "評", "评",
+];
+
+/// 剥序跋 / 注疏题名：`胡三省新註資治通鑑序` → `資治通鑑`。
+///
+/// 只下两刀，且每刀都要求**切口两侧都还有字**，否则宁可不动——
+/// 《秩序》《程序》《水經注》这些带「序 / 注」的正常书名一个字都不能少。
+fn strip_preface_noise(raw: &str) -> String {
+    let src = raw.trim();
+    if src.is_empty() {
+        return String::new();
+    }
+
+    // 第一刀：切掉「序 / 跋」与「集注 / 音注」这类**尾标记**。
+    // 两个条件缺一不可：
+    //   * 标记**后面基本没字**（≤2 字）——否则它就不是尾巴，而是前缀
+    //     （`胡三省新註資治通鑑` 的「新註」后面还有四个字，不能在这儿切）；
+    //   * 标记**前面至少两个字**——《秩序》的「序」在第二字，不切。
+    let mut cut = None;
+    for m in PREFACE_TAIL.iter().chain(COMMENT_TAIL.iter()) {
+        if let Some(i) = src.find(m) {
+            let head = src[..i].trim().chars().count();
+            let tail = src[i + m.len()..].trim().chars().count();
+            if head >= 2 && tail <= 2 && cut.map_or(true, |c: usize| i < c) {
+                cut = Some(i);
+            }
+        }
+    }
+    let t = match cut {
+        Some(i) => src[..i].trim().to_string(),
+        None => src.to_string(),
+    };
+
+    // 第二刀：切掉「注 / 疏 / 評」之前的头。两侧都要有字。
+    let mut head_end = None;
+    for m in COMMENT_HEAD {
+        if let Some(i) = t.find(m) {
+            let before = t[..i].trim().chars().count();
+            let after = t[i + m.len()..].trim().chars().count();
+            if before >= 2 && after >= 2 && head_end.map_or(true, |c: usize| i < c) {
+                head_end = Some(i + m.len());
+            }
+        }
+    }
+    let out = match head_end {
+        Some(i) => t[i..].trim().to_string(),
+        None => t,
+    };
+
+    // 切得太狠（剩不到两个字）→ 退回原样，让后面的清洗去处理。
+    if out.chars().count() >= 2 {
+        out
+    } else {
+        src.to_string()
+    }
+}
+
+/// 书名收口：剥序跋题名 → 走全项目统一的 [`crate::vclean::clean_book_title`]
+/// （粉碎网址 / 拼音 / 站名 / 符号，并按 `META_TITLE_MAX` 硬截）。
+///
+/// 与 TXT / EPUB 链**同一个清洗器**，不另立规矩。清洗后不足两字 → `None`
+/// （调用方保留漏斗自己认出来的书名）。
+fn tidy_docx_title(raw: &str) -> Option<String> {
+    let t = strip_preface_noise(raw);
+    let t = crate::vclean::clean_book_title(&t);
+    let t = t.trim().to_string();
+    if t.chars().count() >= 2 {
+        Some(t)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -722,5 +895,133 @@ mod tests {
             ticks.last()
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    // -- 目录标签 / 书名元数据 ------------------------------------------------
+
+    /// 域外的目录标题行（「Table of Contents」/「目录」）整段丢弃；
+    /// 正文里带「目录」二字的句子不受影响。
+    #[test]
+    fn toc_label_lines_are_dropped() {
+        let xml = doc(&format!(
+            "{}{}{}{}",
+            p("Table of Contents"),
+            p("目錄"),
+            p_styled("Heading1", "卷一 周紀一"),
+            p("此書目錄甚詳，今不具錄。")
+        ));
+        let (text, _) = extract_docx_text(&xml);
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines,
+            vec!["卷一 周紀一", "此書目錄甚詳，今不具錄。"],
+            "目录标签没被挡掉：{lines:?}"
+        );
+    }
+
+    #[test]
+    fn strip_preface_noise_keeps_real_titles() {
+        // 序跋 / 注疏题名：切到真书名。
+        assert_eq!(
+            strip_preface_noise("胡三省新註資治通鑑序"),
+            "資治通鑑",
+            "序跋题名没剥干净"
+        );
+        assert_eq!(strip_preface_noise("資治通鑑序"), "資治通鑑");
+        // 「集注 / 注疏 / 音注」是**版本后缀**：切掉它，书名留前半。
+        assert_eq!(strip_preface_noise("論語集注"), "論語");
+        assert_eq!(strip_preface_noise("十三經注疏"), "十三經");
+        assert_eq!(strip_preface_noise("資治通鑑音注"), "資治通鑑");
+        // 带「序 / 注 / 疏」的正常书名，一个字都不许少。
+        assert_eq!(strip_preface_noise("秩序"), "秩序");
+        assert_eq!(strip_preface_noise("程序"), "程序");
+        assert_eq!(strip_preface_noise("水經注"), "水經注");
+        assert_eq!(strip_preface_noise("論語疏證"), "論語疏證");
+        assert_eq!(strip_preface_noise("資治通鑑"), "資治通鑑");
+    }
+
+    #[test]
+    fn core_xml_title_is_parsed() {
+        let core = r#"<?xml version="1.0" encoding="UTF-8"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>資治通鑑</dc:title><dc:creator>[宋] 司馬光</dc:creator></cp:coreProperties>"#;
+        assert_eq!(parse_core_title(core).as_deref(), Some("資治通鑑"));
+        // 实体要解开；空字段 → None；坏 XML → 拿已读到的。
+        assert_eq!(
+            parse_core_title("<dc:title>A&amp;B</dc:title>").as_deref(),
+            Some("A&B")
+        );
+        assert_eq!(parse_core_title("<dc:title>   </dc:title>"), None);
+        assert_eq!(parse_core_title("<dc:title>截断"), None);
+        assert_eq!(parse_core_title(""), None);
+    }
+
+    /// 造一个最小 docx（可选塞 `docProps/core.xml`）。
+    fn write_docx(path: &std::path::Path, body: &str, core: Option<&str>) {
+        use std::io::Write;
+        let f = std::fs::File::create(path).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let opt = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        z.start_file("word/document.xml", opt).unwrap();
+        z.write_all(doc(body).as_bytes()).unwrap();
+        if let Some(c) = core {
+            z.start_file("docProps/core.xml", opt).unwrap();
+            z.write_all(c.as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+    }
+
+    /// 只关心书名时用的空 sink。
+    struct NullSink;
+    impl ChapterSink for NullSink {
+        fn push(&mut self, _ch: crate::types::Chapter) {}
+        fn len(&self) -> usize {
+            0
+        }
+        fn sizes(&self) -> &[usize] {
+            &[]
+        }
+        fn titles(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn sample(&self, _i: usize) -> &str {
+            ""
+        }
+        fn tick(&self, _pct: f32, _label: &str) {}
+        fn advance(&mut self, _done: usize, _label: &str) {}
+        fn drop_front(&mut self, _n: usize) {}
+        fn drop_at(&mut self, _idxs: &[usize]) {}
+        fn set_title(&mut self, _idx: usize, _title: &str) {}
+    }
+
+    #[test]
+    fn book_title_comes_from_core_xml_not_first_line() {
+        let dir = std::env::temp_dir().join(format!("jiandu-docx-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("胡三省新註資治通鑑序.docx");
+        let core = r#"<cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>資治通鑑</dc:title></cp:coreProperties>"#;
+        write_docx(
+            &path,
+            &format!("{}{}", p("胡三省新註資治通鑑序"), p("古者國各有史以紀年書事。")),
+            Some(core),
+        );
+        let book = import_docx_into(&path, &mut NullSink).expect("导入不该失败");
+        assert_eq!(book.title, "資治通鑑", "没优先用 dc:title：{}", book.title);
+        assert_eq!(book.cover.title, "資治通鑑");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn book_title_falls_back_to_filename_and_gets_cleaned() {
+        let dir = std::env::temp_dir().join(format!("jiandu-docx-stem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("胡三省新註資治通鑑序.docx");
+        // 没有 core.xml → 退文件名，且文件名同样要被剥序跋。
+        write_docx(&path, &p("古者國各有史以紀年書事。"), None);
+        let book = import_docx_into(&path, &mut NullSink).expect("导入不该失败");
+        assert_eq!(book.title, "資治通鑑", "文件名没被清洗：{}", book.title);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
