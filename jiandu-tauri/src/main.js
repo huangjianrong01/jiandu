@@ -124,7 +124,15 @@ function getReadableItems() {
       /\s+/g,
       ""
     );
-    if (text) return [{ node: verse, text }];
+    if (text) {
+      // 按句读切分成短句逐句朗读：规避语音引擎对长/含标点文本静默截断的坑
+      // （《静夜思》曾"断在低头"，根因就是整首诗作为单条 utterance 被截断）
+      const clauses = text.match(/[^。，、；！？]+[。，、；！？]?/g);
+      if (clauses && clauses.length > 1) {
+        return clauses.map((c) => ({ node: verse, text: c }));
+      }
+      return [{ node: verse, text }];
+    }
   }
   return [];
 }
