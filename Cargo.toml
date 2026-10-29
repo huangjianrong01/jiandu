@@ -21,7 +21,7 @@ resolver = "2"
 # 版本 / 元数据统一在一处，两个 crate 用 `version.workspace = true` 继承，
 # 免得出现「core 1.47、app 1.0」这种对不上账的版本号。
 [workspace.package]
-version = "1.9.4"
+version = "1.9.5"
 edition = "2021"
 license = "MIT"
 authors = ["you"]

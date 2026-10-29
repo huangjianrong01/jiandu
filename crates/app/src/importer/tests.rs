@@ -210,7 +210,7 @@ fn dirty_html_drops_chrome_and_keeps_prose() {
 #[test]
 fn dirty_markdown_strips_marks_and_front_matter() {
     let dir = tmpdir("md");
-    let md = "---\ntitle: 道德經\nauthor: 老子\ntags: [a, b]\n---\n\n# 第一章\n\n> **道**可道，*非常*道。\n\n```\n名可名，非常名。\n```\n\n- 上善若水\n- [链接](http://example.com)\n\n![图](x.png)\n";
+    let md = "---\ntitle: 道德經\nauthor: 老子\ntags: [a, b]\n---\n\n# 第一章\n\n> **道**可道，*非常*道。\n\n```\n名可名，非常名。\n```\n\n- 上善若水，水善利万物而不争。\n- [链接](http://example.com)\n\n![图](x.png)\n";
     let p = write_bytes(&dir, "脏.md", md.as_bytes());
     let ir = import_file(&p).expect("Markdown 应该能读");
     let t = all_text(&ir);
@@ -237,9 +237,9 @@ fn dirty_docx_reads_paragraphs_and_skips_field_codes() {
   <w:p><w:pPr/><w:r><w:t>第一章　道經</w:t></w:r></w:p>
   <w:p><w:r><w:t xml:space="preserve">道可道，非常道&amp;名可名。</w:t></w:r></w:p>
   <w:p><w:r><w:instrText>PAGE \* MERGEFORMAT</w:instrText></w:r>
-       <w:r><w:t>正文一</w:t></w:r><w:r><w:br/><w:t>正文二</w:t></w:r></w:p>
-  <w:tbl><w:tr><w:tc><w:p><w:r><w:t>表格单元</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
-  <w:p><w:del><w:r><w:delText>被删掉的字</w:delText></w:r></w:del><w:r><w:t>末段</w:t></w:r></w:p>
+       <w:r><w:t>正文一：道可道，非常道；名可名，非常名。</w:t></w:r><w:r><w:br/><w:t>正文二：天下皆知美之为美，斯恶已。</w:t></w:r></w:p>
+  <w:tbl><w:tr><w:tc><w:p><w:r><w:t>表格单元内的说明文字亦须完整保留，不可遗失。</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+  <w:p><w:del><w:r><w:delText>被删掉的字</w:delText></w:r></w:del><w:r><w:t>末段：此书终。</w:t></w:r></w:p>
 </w:body></w:document>"#;
     let p = write_zip(
         &dir,
