@@ -1369,6 +1369,10 @@ pub fn import_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> {
     let mut book = match ext.as_str() {
         "txt" | "text" => import_txt_into(path, sink)?,
         "epub" => import_epub_into(path, sink)?,
+        // DOCX：OOXML 是「带样式的段落流」，先还原成纯文本，再走 TXT 漏斗
+        // （切章 / 夹注归一 / 全角化 / 数字转汉字全复用同一套）。
+        // 抽取阶段每 64 段 tick 一次，切章后逐章 tick——大文档不会假死。
+        "docx" => crate::docx::import_docx_into(path, sink)?,
         // JSON：结构化书稿，整本读入后由 core 数据适配器归一为统一 `Book`，
         // 再逐章交 sink 落盘。
         // **必须向 sink 报进度**——否则进度条停在 0%，看门狗会在 3 秒后误判
@@ -1383,7 +1387,7 @@ pub fn import_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> {
                 "html" | "htm" | "xhtml" | "xml" => import_html(path)?,
                 _ => {
                     return Err(anyhow!(
-                        "不支持的格式：.{other}（支持 md / txt / html / xml / epub / json）"
+                        "不支持的格式：.{other}（支持 md / txt / html / xml / epub / docx / json）"
                     ))
                 }
             };

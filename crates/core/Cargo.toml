@@ -18,8 +18,10 @@ crate-type = ["lib", "cdylib", "staticlib"]
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# EPUB 导入（zip + opf 解析）
+# EPUB / DOCX 导入（zip + opf / OOXML 解析）
 zip = { workspace = true }
+# DOCX：流式读 `word/document.xml`（与 app 层同一版本，避免重复编译两份）
+quick-xml = "0.36"
 # 编码探测：老书 txt 多为 GBK
 encoding_rs = { workspace = true }
 # 简繁对照表 / 惰性静态表

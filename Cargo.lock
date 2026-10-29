@@ -2963,6 +2963,7 @@ dependencies = [
  "encoding_rs",
  "once_cell",
  "pinyin",
+ "quick-xml 0.36.2",
  "rusqlite",
  "serde",
  "serde_json",

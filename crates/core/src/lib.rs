@@ -40,6 +40,9 @@ pub mod content;
 /// 文件由 `scripts/gen_common_chars.py` 生成，勿手改。
 pub mod common_chars;
 pub mod dict;
+/// **DOCX 导入**（v1.9.5）：zip + quick-xml 流式抽 `<w:t>`，还原成纯文本后
+/// 喂 TXT 漏斗（切章 / 夹注归一 / 全角化全复用），带进度心跳、可边解析边落盘。
+pub mod docx;
 /// **内测邀请码**（v1.0.0-beta）：纯本地闸门，无服务器。
 pub mod gate;
 pub mod grid;
