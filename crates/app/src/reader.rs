@@ -1402,6 +1402,7 @@ impl Root {
                             } else {
                                 ch.to_string()
                             };
+                            this.more_open = false;
                             this.popup = Some(GlyphHit {
                                 key,
                                 ch,
@@ -1450,6 +1451,7 @@ impl Root {
                                 } else {
                                     ch.to_string()
                                 };
+                                this.more_open = false;
                                 this.popup = Some(GlyphHit {
                                     key,
                                     ch,
@@ -7020,6 +7022,7 @@ impl Root {
                                         return;
                                     }
                                 }
+                                this.more_open = false;
                                 this.popup = Some(GlyphHit {
                                     key,
                                     ch: g.ch,
@@ -7865,6 +7868,7 @@ impl Root {
                     if gb.glyph.kind == crate::types::GlyphKind::Char {
                         let key = gb.key();
                         let ch = gb.glyph.ch;
+                        self.more_open = false;
                         self.popup = Some(crate::types::GlyphHit {
                             key,
                             ch,
@@ -8890,12 +8894,10 @@ impl Root {
         let item_h = fs * 2.5; // 两字一钮（竖排）
         let gap = 8.0; // 钮间距
         let pad = 6.0;
-        // v1.55.0：加一枚「眉批」——选中文字后直接到天头题批，锚点取全书
-        // 扁平字符下标（见 `Root::start_margin_note`）。
-        // v1.74.0：再加一枚「存卡」——选中即入卡片匣（见 `Root::save_selection_card`）。
-        // v1.76.0：撤下「人名 / 地名 / 书名」三枚专名线（有了问小笺，字词来历
-        // 问一句比手划一条线更快，且划线的判据本就全靠人眼），补一枚「问笺」。
-        let n: f32 = 7.0; // 查典 / 朱批 / 存卡 / 眉批 / 夹注 / 拓印 / 问笺
+        // v1.95.0（feature/tts-voice 极简重构）：**克制**——
+        //   高频外露 4 枚：查典 / 听(TTS) / 朱批 / 问笺；低频 4 枚（存卡 / 眉批 /
+        //   夹注 / 拓印）收进「更多」二级菜单，绝不堆满一排挡字。
+        let n: f32 = 5.0; // 查典 / 听 / 朱批 / 问笺 / 更多
         let w = pad * 2.0 + item_w * n + gap * (n - 1.0) + 2.0;
         let h = pad * 2.0 + item_h + 2.0;
         let place = crate::hit::place_card(
@@ -8925,12 +8927,10 @@ impl Root {
             );
         };
         push_btn("查典", &mut items);
+        push_btn("听", &mut items);
         push_btn("朱批", &mut items);
-        push_btn("存卡", &mut items);
-        push_btn("眉批", &mut items);
-        push_btn("夹注", &mut items);
-        push_btn("拓印", &mut items);
         push_btn("问笺", &mut items);
+        push_btn("更多", &mut items);
 
         // 夹注：先看看这个字上有没有旧注，有就预填（算改写）。
         let existing_note = self
@@ -8948,7 +8948,7 @@ impl Root {
             .map(|n| n.text.clone())
             .unwrap_or_default();
 
-        // ── 逐枚绑上动作（与上面 push 的次序一一对应）────────────────
+        // ── 逐枚绑上动作（与上面 push 的次序一一对应：查典 / 听 / 朱批 / 问笺 / 更多）──
         let mut items = items.into_iter();
         let b_query = items
             .next()
@@ -8974,62 +8974,37 @@ impl Root {
                     });
                     this.open_lookup(key, ch, text, Some(hit_xy), anchor_rect);
                     this.hover_card = false;
+                    this.more_open = false;
                     this.popup = None;
                     this.clear_selection();
                     cx.notify();
                 }),
             );
+        // 听（feature/tts-voice MVP）：把选中的这句交给系统语音合成朗读。
+        // 放在「查典」之后最顺手的位置——划词后先查再听是最高频组合。
+        let b_ting = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                let t = this.selected_text();
+                if !t.is_empty() {
+                    crate::tts::speak(&t);
+                    this.notice = "正在朗读…".to_string();
+                } else {
+                    this.notice = "没有可朗读的内容".to_string();
+                }
+                this.more_open = false;
+                this.popup = None;
+                cx.notify();
+            }),
+        );
         let b_note = items.next().unwrap().on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 this.start_note_edit_at(Some(hit_xy));
+                this.more_open = false;
                 this.popup = None;
-                cx.notify();
-            }),
-        );
-        // 存卡（v1.74.0）：选中即入匣。
-        // ⚠️ 不在这里清 `popup`——没拖选时 `save_selection_card` 要靠
-        // `popup.hit.key` 才知道摘的是哪个字，清早了就取不到锚点。
-        let b_card = items.next().unwrap().on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.save_selection_card(cx);
-            }),
-        );
-        let b_margin = items.next().unwrap().on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                // 天头眉批：锚点 = 选区起点的 charIndex，草稿就地出现在
-                // 天头留白里（不是模态窗口）。
-                this.start_margin_note();
-                this.popup = None;
-                cx.notify();
-            }),
-        );
-        let b_gloss = items.next().unwrap().on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                // 已有夹注则预填（算改写），没有则从空白起。
-                this.start_note_inject(key, &existing_note, Some(hit_xy));
-                this.popup = None;
-                cx.notify();
-            }),
-        );
-        let b_copy = items.next().unwrap().on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                if !this.has_selection() {
-                    this.sel_anchor = Some(key);
-                    this.sel_focus = Some(key);
-                }
-                this.copy_page_text(cx);
-                this.popup = None;
-                this.clear_selection();
                 cx.notify();
             }),
         );
@@ -9041,13 +9016,24 @@ impl Root {
             cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 this.ask_ai_selection(window, cx);
+                this.more_open = false;
                 this.popup = None;
+                cx.notify();
+            }),
+        );
+        // 更多：切换二级菜单（存卡 / 眉批 / 夹注 / 拓印），**不收起**主工具条。
+        let b_more = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.more_open = !this.more_open;
                 cx.notify();
             }),
         );
 
         // ── 面板本体：横排圆角面板，钮内文字竖排 ──────────────────────
-        let paper_washi = rgba((t.paper() << 8) | 0xFA); // 半透明宣纸底（≈0.98）
+        // 极简克制 + 半透明毛玻璃感：底调透（≈0.84），不抢正文视线。
+        let paper_washi = rgba((t.paper() << 8) | 0xD8);
         // 钮与钮之间**只用留白**分档（不画线、不加框）：一枚钮就是面板上的
         // 一列字，靠呼吸感隔开；面板整体横排，文字逐列竖读。
         let mut row = div()
@@ -9057,9 +9043,116 @@ impl Root {
             .justify_center()
             .gap(px(gap))
             .child(b_query);
-        for b in [b_note, b_card, b_margin, b_gloss, b_copy, b_ask] {
+        for b in [b_ting, b_note, b_ask, b_more] {
             row = row.child(b);
         }
+
+        // ── 二级菜单（更多）：存卡 / 眉批 / 夹注 / 拓印，平时藏起不挡字 ──
+        let m_card = vertical_text("存卡", fs, kai.clone())
+            .w(px(item_w))
+            .text_color(rgb(t.ink()))
+            .cursor_pointer()
+            .hover(move |s| s.text_color(rgb(sheet_zhu(t))))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.save_selection_card(cx);
+                    this.more_open = false;
+                    this.popup = None;
+                    cx.notify();
+                }),
+            );
+        let m_margin = vertical_text("眉批", fs, kai.clone())
+            .w(px(item_w))
+            .text_color(rgb(t.ink()))
+            .cursor_pointer()
+            .hover(move |s| s.text_color(rgb(sheet_zhu(t))))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.start_margin_note();
+                    this.more_open = false;
+                    this.popup = None;
+                    cx.notify();
+                }),
+            );
+        let m_gloss = vertical_text("夹注", fs, kai.clone())
+            .w(px(item_w))
+            .text_color(rgb(t.ink()))
+            .cursor_pointer()
+            .hover(move |s| s.text_color(rgb(sheet_zhu(t))))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.start_note_inject(key, &existing_note, Some(hit_xy));
+                    this.more_open = false;
+                    this.popup = None;
+                    cx.notify();
+                }),
+            );
+        let m_copy = vertical_text("拓印", fs, kai.clone())
+            .w(px(item_w))
+            .text_color(rgb(t.ink()))
+            .cursor_pointer()
+            .hover(move |s| s.text_color(rgb(sheet_zhu(t))))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if !this.has_selection() {
+                        this.sel_anchor = Some(key);
+                        this.sel_focus = Some(key);
+                    }
+                    this.copy_page_text(cx);
+                    this.more_open = false;
+                    this.clear_selection();
+                    this.popup = None;
+                    cx.notify();
+                }),
+            );
+        let mut more_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap(px(gap));
+        for b in [m_card, m_margin, m_gloss, m_copy] {
+            more_row = more_row.child(b);
+        }
+        let sub_w = pad * 2.0 + item_w * 4.0 + gap * 3.0 + 2.0;
+        // 二级菜单位于主面板下方；若下方出界则翻到上方，绝不压住选中行。
+        let sub_top_rel = if place.top + h + gap + h <= vh {
+            h + gap
+        } else {
+            -(h + gap)
+        };
+        let more_panel = div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(sub_top_rel))
+            .w(px(sub_w))
+            .h(px(h))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .bg(paper_washi)
+            .border_1()
+            .border_color(rgb(sheet_zhu(t)))
+            .rounded(px(7.0))
+            .shadow_sm()
+            .p(px(pad))
+            .child(more_row)
+            // 二级面板内也不冒泡：点存卡 / 眉批等不触发根容器收起。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            );
 
         div()
             .absolute()
@@ -9078,6 +9171,7 @@ impl Root {
             .shadow_sm()
             .p(px(pad))
             .child(row)
+            .child(if self.more_open { more_panel } else { div() })
             // 面板内不冒泡：否则一点钮，根容器的「点别处收起」就把面板收了。
             .on_mouse_down(
                 MouseButton::Left,

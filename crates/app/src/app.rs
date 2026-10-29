@@ -698,6 +698,8 @@ pub struct Root {
     pub page_rect: RectProbe,
     /// 点字弹出的工具条所锚定的字（None 表示未弹出）。
     pub popup: Option<GlyphHit>,
+    /// 划词工具条「更多」二级菜单的展开状态（feature/tts-voice 极简重构）。
+    pub more_open: bool,
     /// 拖拽选区的起点 / 焦点（(chapter, para, offset)）。
     pub sel_anchor: Option<(usize, usize, usize)>,
     pub sel_focus: Option<(usize, usize, usize)>,
@@ -1306,6 +1308,7 @@ impl Root {
             share_card_rect: None,
             page_rect: Rc::new(Cell::new(None)),
             popup: None,
+            more_open: false,
             sel_anchor: None,
             sel_focus: None,
             dragging: false,

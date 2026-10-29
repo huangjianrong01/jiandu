@@ -90,6 +90,7 @@ mod share_layout;
 mod share_paint;
 mod shelf;
 mod sound;
+mod tts;
 mod zen_kit;
 
 // 纯逻辑核心（v1.47.0 解耦）：`grid` / `parsers` / `dict` 等 17 个模块已
