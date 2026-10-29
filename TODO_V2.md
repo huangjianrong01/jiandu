@@ -258,11 +258,13 @@ Rope（编辑态，增量）
   - AVFoundation 必须在**主线程**跑 → `pthread_main_np` 判定 + 非主线程 `dispatch_async` 抛回主队列；并加 `objc_autoreleasePoolPush/Pop` 释放池，防止非主线程悬垂指针 SIGBUS
   - TTS 单测因 AVFoundation 主线程限制加 `#[ignore]` 跳过（`cargo test` 跑在 worker 线程），真机以主线程点 [听] 验证
 
-### 后续待办（用户点名，推迟到再下一轮）
+### 后续待办（用户点名，推迟到再下一轮，本轮 1.9.7 只交付 MVP 听书 + 精简 UI）
 
-1. **优先高级 / 增强中文语音包**（用户原话：系统默认「婷婷」有点机械，要 premium / enhanced）
+0. **优先高级 / 增强中文语音包**（系统默认「婷婷」有点机械）
    - Apple `AVSpeechSynthesisVoice` 的 `quality` 枚举实测：`default=1 / enhanced=2 / premium=3`
    - 做法：枚举 `AVSpeechSynthesisVoice.speechVoices()`，挑 `language=="zh-CN"` 中 `quality` 最高者（premium > enhanced > default），系统没装高级包自动降级；**绝不写死名字**（用户日后装「婷婷 高级版」会被自动选中）
    - 本机探测现状：未装 premium，但有 enhanced 神经语音「声音2 / Linfei」（`com.apple.ttsbundle.gryphon-neural_Linfei_zh-CN_premium`，quality=2），该路一旦实现会自动选中，比默认 Tingting 自然很多
-2. **开放自定义 TTS 接口（用户要的 `TTS_API` 字段）**：在 `Root` / 设置页预留 URL + Key 字段，让软件自请求火山 / Azure 等第三方真人音（高级真人音）
-3. **朗读语速极简配置**（可选）：默认正常语速，允许用户调慢一点（古文读太快没韵味）
+1. **语速控制**：允许用户调节语速（文言文读太快没韵味），默认正常语速，可放慢
+2. **播放本页 / 本章**：不局限于划词朗读，实现自动连续朗读整页 / 整章
+3. **开放第三方 TTS API 配置**：在设置页预留 `TTS_PROVIDER` + `API_KEY`（URL 一并预留）字段，以后接入火山 / 微软 / Azure 等顶级真人音
+4. **字音同步高亮**：朗读时 UI 层高亮当前读到的字（借助 `punct.rs` 句读 / 字形流做逐字定位）
