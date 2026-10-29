@@ -1,44 +1,27 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh">
   <head>
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
+    <title>笺读 · 古籍测试书页</title>
     <script type="module" src="/main.js" defer></script>
   </head>
 
   <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
-
-      <div class="row">
-        <a href="https://tauri.app" target="_blank">
-          <img src="/assets/tauri.svg" class="logo tauri" alt="Tauri logo" />
-        </a>
-        <a
-          href="https://developer.mozilla.org/en-US/docs/Web/JavaScript"
-          target="_blank"
-        >
-          <img
-            src="/assets/javascript.svg"
-            class="logo vanilla"
-            alt="JavaScript logo"
-          />
-        </a>
+    <!-- 古籍书页：宣纸底 + 竖排 + 中缝红线 -->
+    <div class="page">
+      <div class="fold"></div>
+      <div class="book">
+        <div class="title">静夜思</div>
+        <div class="verse">
+          床前明月光<span class="dian">，</span>疑是地上霜<span class="dian">。</span>举头望明月<span class="dian">，</span>低头思故乡<span class="dian">。</span>
+        </div>
+        <div class="author">唐 · 李白</div>
       </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
+    </div>
 
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
-
-      <div class="row">
-        <button id="test-core-btn" type="button">测试 core 大脑</button>
-      </div>
-      <p id="core-result"></p>
-    </main>
+    <!-- 保留的测试按钮：右下角半透明，绝对定位不扰正文 -->
+    <button id="test-core-btn" type="button">测试 core 大脑</button>
   </body>
 </html>

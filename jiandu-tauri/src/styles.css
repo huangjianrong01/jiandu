@@ -1,112 +1,120 @@
-.logo.vanilla:hover {
-  filter: drop-shadow(0 0 2em #ffe21c);
+/* ===========================================================
+   笺读 · 古籍测试书页（纯原生 CSS，无框架）
+   目标：宣纸底色 + 竖排网格 + 中缝红线 + 朱砂句读
+   关键修复：居中容器用物理轴(flow horizontal-tb)做 flex 居中，
+            竖排只在 .book 内部恢复，避免 translate 在 vertical-rl
+            下百分比基准错乱把整块推出屏幕。
+   =========================================================== */
+
+* {
+  box-sizing: border-box;
 }
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
 
-  color: #0f0f0f;
-  background-color: #f6f6f6;
+html,
+body {
+  margin: 0;
+  height: 100%;
+  /* ① 宣纸底色：极简浅米黄 */
+  background-color: #f5f4ef;
+  color: #333; /* 强制深灰，防止继承到不可见色 */
+  /* 字体回退链：优先宋体/明朝体，证明古籍质感 */
+  font-family: "Songti SC", "STSong", "SimSun", "Noto Serif CJK SC",
+    "Source Han Serif SC", serif;
+}
 
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
+/* body 仅承载基础排版；具体居中交给 .page */
+body {
+  writing-mode: vertical-rl; /* 竖排默认，但 .page 会重置为物理轴 */
+  text-orientation: upright;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
 }
 
-.container {
-  margin: 0;
-  padding-top: 10vh;
+/* ② 书页铺满视口：用物理轴做 flex 居中，确保文字不被挤出屏幕 */
+.page {
+  position: relative;
+  width: 100%;
+  height: 100vh;
+  writing-mode: horizontal-tb; /* 重置为物理轴，flex 居中按物理方向 */
   display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
+  align-items: center; /* 物理垂直居中 */
+  justify-content: center; /* 物理水平居中 */
+  overflow: hidden;
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
+/* ③ 中缝（版心）：物理竖直居中细红线 */
+.fold {
+  position: absolute;
+  top: 8vh;
+  bottom: 8vh;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-0.5px);
+  background: #b0342c; /* 朱砂红 */
+  opacity: 0.8;
+  z-index: 1;
 }
 
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
+/* 书卷主体：内部恢复竖排；限高让长诗自动折成多栏（古籍正解） */
+.book {
+  position: relative;
+  z-index: 2;
+  writing-mode: vertical-rl; /* 内部竖排：从右到左 */
+  text-orientation: upright;
+  height: 90vh; /* 限制高度 → 超出部分折成下一栏（向左）；比 86vh 多留余量防裁切 */
+  color: #333; /* 强制深灰 */
 }
 
-.row {
-  display: flex;
-  justify-content: center;
+/* 书名（最右一栏） */
+.title {
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: 0.3em;
+  color: #1f1b16;
+  margin-left: 0.5em; /* 物理左侧空隙，与正文分离 */
 }
 
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
+/* 正文诗句（中间主栏，可折多栏） */
+.verse {
+  font-size: 26px;
+  line-height: 2; /* 竖排行距 */
+  letter-spacing: 0.14em;
+  color: #333; /* 强制深灰，杜绝消失 */
+  overflow-y: auto; /* 篇幅过长时兜底可滚，避免裁切 */
 }
 
-a:hover {
-  color: #535bf2;
+/* 落款（最左一栏） */
+.author {
+  font-size: 16px;
+  color: #6b5d4f;
+  margin-right: 0.5em;
 }
 
-h1 {
-  text-align: center;
+/* ④ CSS 伪标点：句读染成朱砂红圈（不用贝塞尔，纯 CSS 染色） */
+.dian {
+  color: #b0342c;
+  font-size: 0.7em; /* 比正文字小，呈“点”感 */
+  /* 标点原生即圈形，染色即为红圈，证明网页也能调排版 */
 }
 
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
+/* ⑤ 保留测试按钮：右下角半透明，绝对定位不扰正文 */
+#test-core-btn {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 10;
+  opacity: 0.45;
   font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
+  font-size: 13px;
+  color: #5a4a3a;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(176, 52, 44, 0.4);
+  border-radius: 6px;
+  padding: 6px 12px;
   cursor: pointer;
+  transition: opacity 0.2s ease;
 }
 
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
+#test-core-btn:hover {
+  opacity: 0.85;
 }
