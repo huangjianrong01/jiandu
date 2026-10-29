@@ -1345,6 +1345,13 @@ impl Root {
 
         let hovered = self.shelf_hover == Some(idx);
         let confirming = self.delete_confirm == Some(idx);
+        // v1.9.3：新书入架的 150ms 内整体渐显（封面 + 书名一起浮现），
+        // 不再「啪」地蹦出。老书没记过出生，透明度恒为 1。
+        let birth_key = e
+            .store_id
+            .clone()
+            .unwrap_or_else(|| format!("whole:{}", e.title));
+        let birth_op = self.shelf_card_opacity(&birth_key);
         let mut outer = div()
             .relative()
             .w(px(W))
@@ -1352,6 +1359,7 @@ impl Root {
             // GPUI 会把 160 的卡片压成 130，边界与比例全废。钉死「不收缩」，
             // 塞不下就让 `flex_wrap` 折行。
             .flex_shrink_0()
+            .opacity(birth_op)
             .flex()
             .flex_col()
             .items_center()

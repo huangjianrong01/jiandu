@@ -401,6 +401,12 @@ pub struct Root {
     /// 与单本 `import_job` 互斥——同一时刻只跑一条导入线，免得两条线程
     /// 同时写 `chapters.db`（SQLite 会撞 `busy_timeout`）。
     pub batch: Option<crate::batch::BatchJob>,
+    /// **书架新书浮现**（v1.9.3）：书刚入架的 150ms 内做渐显，免得「啪」地蹦出。
+    ///
+    /// 键是 `store_id`（漏斗兜底的整本入库书用 `whole:<书名>`），值是首次
+    /// 出现的时刻。`render_slip_card` 据此算不透明度，`tick_shelf_birth`
+    /// 每帧清过期记录、渐显中则续帧。只动 UI 表现，绝不碰解析 / 入库逻辑。
+    pub shelf_birth: std::collections::HashMap<String, std::time::Instant>,
     /// 点检出来的**待刻书衣**（书架上的占位卡）。
     ///
     /// 点检是毫秒级的：书还没刻，书名已经知道，先让它出现在书架上——
@@ -1162,6 +1168,7 @@ impl Root {
             toc_need_scroll: false,
             side_follow: None,
             import_job: None,
+            shelf_birth: std::collections::HashMap::new(),
             batch: None,
             batch_cards: Vec::new(),
             batch_consumed: 0,
@@ -3018,6 +3025,7 @@ impl Root {
             match admitted {
                 Ok(_) => {
                     self.batch_done += 1;
+                    self.mark_shelf_birth(&sid, book.store_id.as_deref(), &book.title);
                     if !sid.is_empty() {
                         self.batch_admitted.push(sid.clone());
                         // 索引不在这里建——推给后台慢慢补（见 `enqueue_fts`）。
@@ -3129,6 +3137,51 @@ impl Root {
         }
     }
 
+    /// **书架新书浮现**（v1.9.3）：书刚入架记一笔「出生时刻」，书架据此
+    /// 做 150ms 渐显。键优先用 `store_id`；漏斗兜底（整本入库、`sid` 为空）
+    /// 没有 `store_id`，退而用 `whole:<书名>` 当稳定键。
+    fn mark_shelf_birth(&mut self, sid: &str, extra_id: Option<&str>, title: &str) {
+        let key = if !sid.is_empty() {
+            sid.to_string()
+        } else {
+            extra_id
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("whole:{title}"))
+        };
+        self.shelf_birth.insert(key, std::time::Instant::now());
+    }
+
+    /// 书架卡当前不透明度：出生 150ms 内从 0 缓动（ease-out）到 1，之后恒为 1。
+    /// 没记过出生的书（开卷就在书架上的老书）直接返回 1，绝不影响它们。
+    pub(crate) fn shelf_card_opacity(&self, key: &str) -> f32 {
+        const DUR: f32 = 150.0;
+        match self.shelf_birth.get(key) {
+            None => 1.0,
+            Some(t0) => {
+                let t = (t0.elapsed().as_millis() as f32 / DUR).clamp(0.0, 1.0);
+                // ease-out：前段快、后段缓，像宣纸被墨一点点浸开。
+                (1.0 - (1.0 - t) * (1.0 - t)).clamp(0.0, 1.0)
+            }
+        }
+    }
+
+    /// 每帧清理过期的出生记录；只要还有卡在渐显窗口内，就请求下一帧继续画。
+    fn tick_shelf_birth(&mut self, cx: &mut Context<Self>) {
+        const CUTOFF: std::time::Duration = std::time::Duration::from_millis(220);
+        let mut animating = false;
+        self.shelf_birth.retain(|_, t0| {
+            if t0.elapsed() <= CUTOFF {
+                animating = true;
+                true
+            } else {
+                false
+            }
+        });
+        if animating {
+            cx.notify();
+        }
+    }
+
     /// 漏斗兜底入架（v1.62.0）：整本书写成一个书稿 json，再走旧的非流式入架。
     ///
     /// 为什么不做流式：流式入库（`admit_streamed`）要求正文已经在 `chapters.db`
@@ -3207,6 +3260,7 @@ impl Root {
                 match admitted {
                     Ok(_) => {
                         // 索引不在这里建：推给后台慢慢补，首屏不为它等。
+                        self.mark_shelf_birth(&sid, book.store_id.as_deref(), &book.title);
                         self.enqueue_fts(sid);
                         self.notice = format!("已上架：{title}");
                     }
@@ -6577,6 +6631,8 @@ impl Render for Root {
         // v1.77.0：每帧探一眼批量导入（点检 / 上架 / 收工）与后台建索引。
         self.poll_batch(cx);
         self.poll_fts();
+        // v1.9.3：每帧推进书架新书渐显（清过期 + 渐显中续帧）。
+        self.tick_shelf_birth(cx);
         // v1.80.0：小笺「全庫 / 全書」那一问的翻检派活（DB + FTS5 在后台线程）。
         self.poll_ai(cx);
         // v1.70.0：**空闲帧渐进铺索引**。开卷后每帧只啃 8 章（≈1ms，60 FPS
