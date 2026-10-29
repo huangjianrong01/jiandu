@@ -522,6 +522,33 @@ pub fn import_json(path: &Path) -> Result<Book> {
     parse_json_book(&text, &file_stem(path))
 }
 
+/// JSON **流式**导入：整本读入 → core 数据适配器归一为统一 `Book` → 逐章
+/// 交 sink 落盘、随即释放。
+///
+/// 与 [`import_json`]（旧入口，给老条目 / 导出 / 单测用）的唯一差别：这里
+/// 边解析边向 `sink` 报进度，进度条才会动、看门狗才不会误杀大文件——JSON
+/// 整条解析是「读整本 + 一次性反序列化」，没有 EPUB 那种逐篇粒度，但至少
+/// 在「读毕」「落盘」「完成」三个节点各 tick 一次，足以让 UI 不假死。
+pub fn import_json_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> {
+    sink.tick(0.05, "雕版 读取 JSON");
+    // 读整本 + 反序列化（JSON 天然是一棵对象，不能像 EPUB 那样逐篇流式；
+    // 但只读一次、反序列化后即逐章落盘释放，峰值内存只多「一份原文」）。
+    let full = import_json(path)?;
+    sink.tick(
+        0.6,
+        &format!("雕版 {} 章 · 落盘", full.chapters.len().max(1)),
+    );
+    let mut skeleton = Book::new(&full.title, &full.author);
+    skeleton.cover = full.cover.clone();
+    skeleton.tongjia = full.tongjia.clone();
+    skeleton.head_notes = full.head_notes.clone();
+    for ch in full.chapters {
+        sink.push(ch);
+    }
+    sink.tick(1.0, "雕版 完成");
+    Ok(skeleton)
+}
+
 /// 把解析好的书写成书架用的 JSON。
 ///
 /// EPUB 入库时走这条路：一次性解析成结构化 `Book` 后存成 `.json`，
@@ -1342,19 +1369,26 @@ pub fn import_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> {
     let mut book = match ext.as_str() {
         "txt" | "text" => import_txt_into(path, sink)?,
         "epub" => import_epub_into(path, sink)?,
-        // md / html / json 一般是单篇或结构化小书：走旧解析（整体读入），
-        // 解析完立刻逐章交出去落盘、随即释放——内存峰值只多出「一份原文」。
+        // JSON：结构化书稿，整本读入后由 core 数据适配器归一为统一 `Book`，
+        // 再逐章交 sink 落盘。
+        // **必须向 sink 报进度**——否则进度条停在 0%，看门狗会在 3 秒后误判
+        // 「卡死」而中止导入（v1.9.4 修复：此前 JSON 整条链路不报进度，
+        // 大文件会被 False Kill 成「文件可能损坏」）。
+        "json" => import_json_into(path, sink)?,
+        // md / html 一般是单篇小书：走旧解析（整体读入），解析完立刻逐章
+        // 交出去落盘、随即释放——内存峰值只多出「一份原文」。
         other => {
             let full = match other {
                 "md" | "markdown" => import_md(path)?,
                 "html" | "htm" | "xhtml" | "xml" => import_html(path)?,
-                "json" => import_json(path)?,
                 _ => {
                     return Err(anyhow!(
                         "不支持的格式：.{other}（支持 md / txt / html / xml / epub / json）"
                     ))
                 }
             };
+            // 单篇小书也报一下进度，免得看门狗误杀。
+            sink.tick(0.5, "雕版 落盘");
             let mut skeleton = Book::new(&full.title, &full.author);
             skeleton.cover = full.cover.clone();
             skeleton.tongjia = full.tongjia.clone();
@@ -1362,6 +1396,7 @@ pub fn import_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> {
             for ch in full.chapters {
                 sink.push(ch);
             }
+            sink.tick(1.0, "雕版 完成");
             skeleton
         }
     };
@@ -1999,5 +2034,88 @@ mod tests {
         assert_eq!(title, "道德经", "叶码被当成书名了：{title}");
         assert_eq!(b.title, "水浒传");
         assert_eq!(b.author, "施耐庵");
+    }
+
+    /// v1.9.4 修复验证：**大 JSON 导入必须报进度，且不能 panic / 被看门狗误杀**。
+    ///
+    /// 旧实现 `import_into` 的 JSON 分支整条链路不向 sink 报进度——进度条停在
+    /// 0%，看门狗会在 3 秒后误判「卡死」而中止导入（用户侧表现就是「JSON 导入
+    /// 不丝滑 / 大文件报文件损坏」）。这里造一份 >10MB 的结构化 Book JSON，走
+    /// `import_json_into`，断言：① 进度回调 `tick` 至少被调三次（读毕 / 落盘 /
+    /// 完成）；② 大书被正常拆成多章；③ 不 panic。
+    #[test]
+    fn json_import_reports_progress_and_handles_large_file() {
+        use std::io::Write;
+        // 造料：每章一段长正文，凑到 >10MB。
+        let para = "天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏闰余成岁律吕调阳云腾致雨露结为霜金生丽水玉出昆冈剑号巨阙珠称夜光。";
+        let mut chapters = Vec::new();
+        for i in 0..2000u32 {
+            let content: String = (0..40).map(|_| para).collect::<String>();
+            chapters.push(format!(
+                "{{\"title\":\"卷{}\",\"paragraphs\":[\"{}\"]}}",
+                i, content
+            ));
+        }
+        let book_json = format!(
+            "{{\"title\":\"大书\",\"author\":\"佚名\",\"chapters\":[{}]}}",
+            chapters.join(",")
+        );
+        let bytes = book_json.len();
+        assert!(bytes > 10_000_000, "测试样本须 >10MB，实际 {bytes} 字节");
+
+        let dir = std::env::temp_dir().join(format!("jiandu-json-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("大书.json");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(book_json.as_bytes()).unwrap();
+        }
+
+        // 记录进度的 sink。
+        struct RecSink {
+            ticks: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+            pushes: usize,
+        }
+        impl ChapterSink for RecSink {
+            fn push(&mut self, _c: Chapter) {
+                self.pushes += 1;
+            }
+            fn len(&self) -> usize {
+                self.pushes
+            }
+            fn sizes(&self) -> &[usize] {
+                &[]
+            }
+            fn titles(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn sample(&self, _i: usize) -> &str {
+                ""
+            }
+            fn tick(&self, pct: f32, _label: &str) {
+                self.ticks.lock().unwrap().push(pct);
+            }
+            fn advance(&mut self, _d: usize, _l: &str) {}
+            fn drop_front(&mut self, _n: usize) {}
+            fn drop_at(&mut self, _idxs: &[usize]) {}
+            fn set_title(&mut self, _i: usize, _t: &str) {}
+        }
+
+        let ticks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut sink = RecSink {
+            ticks: ticks.clone(),
+            pushes: 0,
+        };
+        let book = import_json_into(&path, &mut sink).expect("大 JSON 解析失败");
+        let ticks = ticks.lock().unwrap().clone();
+        assert!(
+            ticks.len() >= 3,
+            "JSON 导入必须至少报三次进度（读毕/落盘/完成），实际 {} 次：{:?}",
+            ticks.len(),
+            ticks
+        );
+        assert!(sink.pushes >= 100, "大书应拆成多章，实际 {} 章", sink.pushes);
+        assert!(!book.title.is_empty());
+        std::fs::remove_file(&path).ok();
     }
 }
