@@ -406,3 +406,69 @@ fn classicize_never_touches_inside_a_pinyin_mark() {
     // 标记之外照常古籍化
     assert!(s.contains('，') && s.contains('。'), "标记外的标点没古籍化：{s:?}");
 }
+
+// ----------------------------------------------------------------------
+// 真实书验收（**不进 CI**）：`cargo test -p jiandu --bin jiandu real_books -- --ignored
+//   --nocapture`，文件路径由环境变量给。
+//
+// 这两本是「极端脏」的两极：一本把全书句读做成 91 万张 `<img>`，
+// 另一本是中华书局点校本（`〔〕` 夹注 + `【章：】` 校勘记）。它们证明了
+// 漏斗的两条分支各自有效，人工跑一次看统计即可。
+// ----------------------------------------------------------------------
+
+/// 讀環境變數指定的真書，回傳（清洗後正文, 抽到的字數）。
+fn parse_real(var: &str) -> Option<(String, String)> {
+    let p = std::env::var(var).ok()?;
+    if p.is_empty() {
+        return None;
+    }
+    let t = super::epub_parser::EpubParser::parse(std::path::Path::new(&p)).ok()?;
+    Some((p, t))
+}
+
+#[test]
+#[ignore = "需要真书：设 JIANDU_EPUB_IMG / JIANDU_EPUB_ZH 后手动跑"]
+fn real_books_are_cleaned() {
+    for (var, tag) in [
+        ("JIANDU_EPUB_IMG", "图片句读本"),
+        ("JIANDU_EPUB_ZH", "中华书局点校本"),
+    ] {
+        let Some((path, text)) = parse_real(var) else {
+            println!("[{tag}] 未设 {var}，跳过");
+            continue;
+        };
+        println!("\n════ {tag}：{path} ════");
+        println!("  总字符数 {}", text.chars().count());
+        println!("  行数     {}", text.lines().count());
+        for (name, c) in [("逗号", '，'), ("句号", '。'), ("顿号", '、'), ("分号", '；')] {
+            println!("  {name} {c} × {}", text.matches(c).count());
+        }
+        // 句读图片绝不能留下任何痕迹
+        assert!(!text.contains("image19703"), "[{tag}] 句读图片没换成标点");
+        assert!(!text.contains("<img"), "[{tag}] 标签壳漏进正文");
+        assert!(!text.contains("class="), "[{tag}] 标签壳漏进正文");
+        // 校勘记整条剔除
+        if let Some(k) = text.find("『") {
+            let a = text.floor_char_boundary(k.saturating_sub(40));
+            let b = text.floor_char_boundary((k + 500).min(text.len()));
+            println!("  ~~ 首个『 上下文: {:?}", &text[a..b]);
+        }
+        for kw in ["章：乙十一行本", "章：十二行本"] {
+            if let Some(k) = text.find(kw) {
+                let a = text.floor_char_boundary(k.saturating_sub(120));
+                let b = text.floor_char_boundary((k + 160).min(text.len()));
+                println!("  !! 残留 {kw} → {:?}", &text[a..b]);
+            }
+            assert!(!text.contains(kw), "[{tag}] 校勘记没剔除：{kw}");
+        }
+        // 结果得像文言：句号 + 逗号得有量
+        assert!(
+            text.matches('。').count() > 100,
+            "[{tag}] 句号太少，句读多半没还原"
+        );
+        println!("  ── 首 6 行 ──");
+        for l in text.lines().take(24) {
+            println!("    {}", l.chars().take(90).collect::<String>());
+        }
+    }
+}

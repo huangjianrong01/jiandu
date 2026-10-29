@@ -34,6 +34,7 @@
 
 pub mod cleaner;
 pub mod docx_parser;
+pub mod epub_rules;
 pub mod epub_parser;
 pub mod html_parser;
 pub mod json_parser;

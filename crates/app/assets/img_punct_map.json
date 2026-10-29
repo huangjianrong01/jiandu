@@ -1,0 +1,159 @@
+{
+  "_readme": [
+    "笺读 · EPUB 脏数据清洗规则表（外置，可改）",
+    "",
+    "改法：编辑本文件后**重启笺读**即生效。",
+    "本文件首次导入 EPUB 时会被复制到：~/Library/Application Support/com.jiandu.app/rules/img_punct_map.json",
+    "那份才是真正生效的；想恢复默认，删掉那份即可。",
+    "",
+    "img_punct —— 句读图片的映射表。劣质古籍 EPUB 常把句读做成 <img>，",
+    "  正文里一个真标点都没有。这里按**图片文件名（去扩展名）**查表，",
+    "  命中就把整张图替换成那个字符（于是笺读照常画朱砂句读），没命中就当插图丢掉。",
+    "  怎么知道该填什么？在书里找一段上下文：",
+    "    「魏斯{图}趙籍{图}韓虔」→ 顿号；「嗚呼{图}」→ 感叹号；句末那个空心圈 → 句号。",
+    "",
+    "profiles —— 按书分派的清洗方案。detect 是在抽样 XHTML 里数 raw_contains 的",
+    "  命中次数，达到 min_hits 就选中该方案；一个都没中就用最后一条 id=generic。"
+  ],
+  "version": 5,
+  "img_punct": {
+    "image19703": "，",
+    "image19802": "。",
+    "image19801": "、",
+    "image19803": "；",
+    "image19804": "！",
+    "image19805": "？"
+  },
+  "img_punct_note": "《資治通鑑》胡注繁體直排本（class=\"ytz\"）的六种主力句读图，覆盖全书 91.4 万张里的 99.93%。",
+  "drop_symbols": [
+    "◇",
+    "◆",
+    "□"
+  ],
+  "junk_brackets_note": "中华书局校勘记：整条剔除。判据是「开壳后 6 字内出现全角冒号，且冒号前的标签在 labels 白名单里」——〔〕既是夹注壳又是校勘记壳，靠标签区分：〔師古曰：…〕是真夹注，〔章：…〕才是校勘记。 标签可能被转换件写到壳外（`齊章：〔十二行本…〕`），故同时看壳内壳外；且内容须命中「行本」等校勘记体例词，避免误杀真夹注。",
+  "junk_brackets": [
+    {
+      "open": "【",
+      "close": "】",
+      "labels": [
+        "章",
+        "嚴",
+        "張",
+        "延"
+      ],
+      "label_max_chars": 6,
+      "require_colon": true,
+      "note": "【章：乙十一行本漢上有以字；孔本同；傳校同。】",
+      "body_must_contain": [
+        "行本",
+        "校同",
+        "本同",
+        "校云",
+        "章："
+      ],
+      "min_len": 8,
+      "label_before_open": true
+    },
+    {
+      "open": "〔",
+      "close": "〕",
+      "labels": [
+        "章",
+        "嚴",
+        "張",
+        "延"
+      ],
+      "label_max_chars": 6,
+      "require_colon": true,
+      "note": "同上的另一副壳：〔章：十二行本二字互乙；乙十一行本同；孔本同。〕",
+      "body_must_contain": [
+        "行本",
+        "校同",
+        "本同",
+        "校云",
+        "章："
+      ],
+      "min_len": 8,
+      "label_before_open": true
+    },
+    {
+      "open": "『",
+      "close": "』",
+      "labels": [
+        "章",
+        "嚴",
+        "張",
+        "延"
+      ],
+      "label_max_chars": 6,
+      "require_colon": true,
+      "note": "竖排本的壳：『章：十二行本「莫」下有「敢」字；乙十一行本同。』",
+      "body_must_contain": [
+        "行本",
+        "校同",
+        "本同",
+        "校云",
+        "章："
+      ],
+      "min_len": 8,
+      "label_before_open": true
+    }
+  ],
+  "profiles": [
+    {
+      "id": "ytz-img-punct",
+      "note": "句读被做成 <img class=\"ytz\"> 的竖排本（資治通鑑 胡注繁體直排本）",
+      "detect": {
+        "raw_contains": [
+          "class=\"ytz\"",
+          "ytz"
+        ],
+        "min_hits": 8
+      },
+      "img_class": [
+        "ytz"
+      ],
+      "vertical_forms": true,
+      "strip_leading_indent": false,
+      "drop_class": [
+        "number"
+      ],
+      "merge_broken": true,
+      "note_class": [
+        "note"
+      ]
+    },
+    {
+      "id": "zhonghua-jiaokan",
+      "note": "中华书局点校本：〔〕夹注 + 校勘记 + 全角缩进（資治通鑑 繁體）",
+      "detect": {
+        "raw_contains": [
+          "class=\"zhushi\"",
+          "zhushi"
+        ],
+        "min_hits": 8
+      },
+      "img_class": [],
+      "vertical_forms": false,
+      "strip_leading_indent": true,
+      "drop_class": [],
+      "merge_broken": true,
+      "note_class": []
+    },
+    {
+      "id": "generic",
+      "note": "认不出门派时的保守方案：只做通用净化，不动结构",
+      "detect": {
+        "raw_contains": [],
+        "min_hits": 0
+      },
+      "img_class": [],
+      "vertical_forms": true,
+      "strip_leading_indent": false,
+      "drop_class": [],
+      "merge_broken": true,
+      "note_class": []
+    }
+  ],
+  "toc_block_min_lines": 30
+}

@@ -19,6 +19,7 @@ use std::path::Path;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use super::epub_rules::ImgPunct;
 use super::traits::FormatParser;
 use super::txt_parser::decode_bytes;
 use super::{read_streamed, ImportError};
@@ -55,7 +56,7 @@ pub fn extract_html_str(src: &str) -> (String, Option<String>) {
 /// 返回（正文, 解析错误）。**即使出错也返回已读到的部分**：一本 300 节的 EPUB
 /// 里有 1 节畸形，不该让整本书打不开。
 pub fn extract_html_reader<R: BufRead>(reader: R) -> (String, Option<String>) {
-    extract_html_with(reader, true)
+    extract_html_with(reader, true, &ImgPunct::empty(), &[], &[])
 }
 
 /// 同上，但**保留表格文字**（v1.69.0 的退路）。
@@ -64,7 +65,23 @@ pub fn extract_html_reader<R: BufRead>(reader: R) -> (String, Option<String>) {
 /// 一个字都不剩，那时再跑一遍本函数把表格文字当正文救回来——**有字胜过
 /// 无字**，表格排版再丑也比空书强。
 pub fn extract_html_reader_keep_tables<R: BufRead>(reader: R) -> (String, Option<String>) {
-    extract_html_with(reader, false)
+    extract_html_with(reader, false, &ImgPunct::empty(), &[], &[])
+}
+
+/// 同上，但带上 EPUB 的**门派方案**：把句读图片换成真标点、整块丢掉
+/// 指定 `class` 的 `<span>`（中华书局的段号就是这类）。
+///
+/// 只有 EPUB 入口用它：`img` / `drop_class` 都来自
+/// [`super::epub_rules`] 选中的那套方案，其它格式一律走上面两个函数，
+/// 行为与从前**一字不差**。
+pub fn extract_html_epub<R: BufRead>(
+    reader: R,
+    drop_tables: bool,
+    img: &ImgPunct,
+    drop_class: &[String],
+    note_class: &[String],
+) -> (String, Option<String>) {
+    extract_html_with(reader, drop_tables, img, drop_class, note_class)
 }
 
 /// 单次导入里允许读的**最大 XML 事件数**（v1.69.0）。
@@ -154,15 +171,50 @@ fn ruby_to_text(base: &str, rts: &[String]) -> String {
 
 /// 取 `class` 属性的值（没有就是空串）。
 fn class_of(e: &quick_xml::events::BytesStart) -> String {
+    attr_of(e, "class")
+}
+
+/// 取任意属性的值（没有就是空串）。
+fn attr_of(e: &quick_xml::events::BytesStart, key: &str) -> String {
     for a in e.attributes().flatten() {
-        if a.key.as_ref() == b"class" {
+        if a.key.as_ref() == key.as_bytes() {
             return String::from_utf8_lossy(a.value.as_ref()).to_string();
         }
     }
     String::new()
 }
 
-fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Option<String>) {
+/// 这个 `<span>` 是不是方案指定「整块丢掉」的（`drop_class` 里点名的）。
+fn is_dropped_class(e: &quick_xml::events::BytesStart, drop_class: &[String]) -> bool {
+    if drop_class.is_empty() || local_name(e.name().as_ref()) != "span" {
+        return false;
+    }
+    let c = class_of(e).to_ascii_lowercase();
+    drop_class.iter().any(|k| c.contains(&k.to_ascii_lowercase()))
+}
+
+/// 这个 `<span>` 是不是方案认定的**夹注**（`note_class` 里点名的）。
+///
+/// 胡注竖排本把胡三省的小字注做成 `<span class="note">…</span>`；中华书局
+/// 本则是 `<span class="zhushi">〔…〕</span>`（括号是原文自带的，不用我们加）。
+/// 认出来就转成 core 的 `[注]…[/注]`，排出来才是**双行小字**而不是混在正文里。
+fn is_note_class(e: &quick_xml::events::BytesStart, note_class: &[String]) -> bool {
+    if note_class.is_empty() || local_name(e.name().as_ref()) != "span" {
+        return false;
+    }
+    let c = class_of(e).to_ascii_lowercase();
+    note_class
+        .iter()
+        .any(|k| c.split_whitespace().any(|w| w == k.to_ascii_lowercase()))
+}
+
+fn extract_html_with<R: BufRead>(
+    reader: R,
+    drop_tables: bool,
+    img: &ImgPunct,
+    drop_class: &[String],
+    note_class: &[String],
+) -> (String, Option<String>) {
     let mut xml = Reader::from_reader(reader);
     // 不 trim：行内空格是词边界（`<b>道</b> 可道` 里的空格不能丢）。
     xml.config_mut().trim_text(false);
@@ -182,6 +234,12 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
     let mut mark_cap: Option<(String, &'static str, String)> = None;
     // 正在采集的**注音壳**：`<ruby>漢<rt>hàn</rt></ruby>`（见 [`RubyCap`]）。
     let mut ruby_cap: Option<RubyCap> = None;
+    // 方案指定「整块丢掉」的 `<span>` 的嵌套深度（中华书局本的段号
+    // `class="number"` 就会在正文里留下「1初命晉大夫…」这种脏前缀）。
+    let mut drop_depth = 0usize;
+    // 夹注壳的**配对栈**：每个开标签压一个「是不是夹注壳」，闭标签弹一个；
+    // 弹出来为真就补 `[/注]`。用栈而不是布尔量，嵌套 `<span>` 才不会提前收注。
+    let mut note_stack: Vec<bool> = Vec::new();
 
     // 块级标签：结束时要断段。
     let is_block = |n: &str| -> bool {
@@ -225,7 +283,9 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
                 let name = local_name(e.name().as_ref());
                 if is_skip(&name) {
                     skip += 1;
-                } else if skip == 0 {
+                } else if skip == 0 && drop_depth == 0 && is_dropped_class(&e, drop_class) {
+                    drop_depth += 1;
+                } else if skip == 0 && drop_depth == 0 {
                     // 注音壳开壳 / 壳内换轨（rt 收音、rb 收字、rp 丢弃）。
                     if ruby_cap.is_none() && name == "ruby" {
                         ruby_cap = Some(RubyCap::default());
@@ -245,6 +305,14 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
                         buf.clear();
                         continue;
                     }
+                    // 夹注壳开壳：`<span class="note">` → `[注]`。
+                    // 必须在 ruby / 划线标记的 `continue` **之前**压栈，
+                    // 闭标签那边才弹得回来。
+                    let is_note = is_note_class(&e, note_class);
+                    if is_note {
+                        para.push_str("[注]");
+                    }
+                    note_stack.push(is_note);
                     // 划线标记开壳：只认一层，且块级标签先断段（`<u>` 不会
                     // 是块，但 `<span class=book>` 里可能有）——标记绝不跨段。
                     if mark_cap.is_none() {
@@ -262,13 +330,27 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
             }
             Ok(Event::Empty(e)) => {
                 let name = local_name(e.name().as_ref());
-                if skip == 0 && matches!(name.as_str(), "br" | "hr") {
+                if skip > 0 || drop_depth > 0 {
+                    // 丢弃块里的行内元素一概不管
+                } else if name == "img" {
+                    // 句读图片 → 真标点（见 [`ImgPunct`]）；查不到就当插图丢掉。
+                    //
+                    // 这是整条漏斗里最关键的一步：某些竖排本把全书 91 万个
+                    // 句读全做成 `<img>`，不换回来的话正文里**一个标点都没有**，
+                    // 笺读自然也画不出朱砂句读。
+                    let src = attr_of(&e, "src");
+                    if let Some(c) = img.punct_for(&src, &class_of(&e)) {
+                        para.push(c);
+                    }
+                } else if matches!(name.as_str(), "br" | "hr") {
                     push_break(&mut para, &mut out);
                 }
             }
             Ok(Event::End(e)) => {
                 let name = local_name(e.name().as_ref());
-                if is_skip(&name) {
+                if drop_depth > 0 && name == "span" {
+                    drop_depth -= 1;
+                } else if is_skip(&name) {
                     skip = skip.saturating_sub(1);
                 } else if skip == 0 {
                     // 注音壳收壳：`<rt>` 收一条音，`<ruby>` 结束整壳落成文本。
@@ -291,6 +373,10 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
                         buf.clear();
                         continue;
                     }
+                    // 夹注壳收壳（先于划线标记处理，两者互不相干）。
+                    if note_stack.pop().unwrap_or(false) {
+                        para.push_str("[/注]");
+                    }
                     // 收壳：跨度合法就转成 core 的划线标记，否则原样留字
                     // （宁可少画一条线，也不能把「整句下划线」标成人名）。
                     let closing = matches!(&mark_cap, Some((t, _, _)) if *t == name);
@@ -309,7 +395,7 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
                 }
             }
             Ok(Event::Text(t)) => {
-                if skip == 0 {
+                if skip == 0 && drop_depth == 0 {
                     let raw = String::from_utf8_lossy(t.as_ref());
                     let txt = unescape_html(&raw);
                     // 注音壳内：`<rp>` 里的括号丢掉，`<rt>` 里收音，
@@ -331,7 +417,7 @@ fn extract_html_with<R: BufRead>(reader: R, drop_tables: bool) -> (String, Optio
                 }
             }
             Ok(Event::CData(c)) => {
-                if skip == 0 && ruby_cap.is_none() {
+                if skip == 0 && drop_depth == 0 && ruby_cap.is_none() {
                     para.push_str(&String::from_utf8_lossy(c.as_ref()));
                 }
             }

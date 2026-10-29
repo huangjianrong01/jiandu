@@ -367,6 +367,15 @@ impl Library {
         Self::home().join("fonts")
     }
 
+    /// 外置清洗规则的**用户编辑入口**：`com.jiandu.app/rules/`。
+    ///
+    /// 放 `img_punct_map.json`（句读图片 → 标点映射表）。首次导入时若不存在，
+    /// 会把内置默认表**落一份到这里**，用户照着自己手上那本书的图片名改即可——
+    /// 盗版书的图片文件名千奇百怪，不可能靠内置表穷举，必须让用户能改。
+    pub fn rules_dir() -> PathBuf {
+        Self::home().join("rules")
+    }
+
     pub fn index_path() -> PathBuf {
         Self::home().join("library.json")
     }

@@ -44,7 +44,8 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use regex::Regex;
 
-use super::html_parser::{extract_html_reader, extract_html_reader_keep_tables};
+use super::epub_rules::{self, ImgPunct, Profile, Rules};
+use super::html_parser::extract_html_epub;
 use super::traits::FormatParser;
 use super::ImportError;
 
@@ -64,12 +65,16 @@ const START_MAX_RATIO: f32 = 0.3;
 const START_ABS_MAX_LINES: usize = 30;
 
 /// 作者的**私有排版标签**（文本级去噪，见 [`clean_text_level`]）：
-/// `[注]` / `[注一]` / `[注 2]` / `〔注三〕` / `【注1】` …
+/// `[注一]` / `[注 2]` / `〔注三〕` / `【注1】` …
 ///
-/// 只认「注 + 至多四个序数字符」这一形态——`[注：见下]` 这种带冒号、
-/// 带实义内容的**不删**：那是真注释，删了就丢字。宁漏判不误杀。
+/// 只认「注 + **至少一位**序数」这一形态——
+///   * `[注：见下]` 带冒号、带实义内容的**不删**：那是真注释，删了就丢字；
+///   * 光秃秃的 `[注]` 也**不删**：那是笺读自己的夹注协议（双行小字），
+///     由 `<span class="note">` 转来，删了夹注就散进正文了。
+///
+/// 宁漏判不误杀。
 static PRIVATE_MARK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"[\[〔【]\s*注[0-9一二三四五六七八九十百千〇零]{0,4}\s*[\]〕】]"#).unwrap()
+    Regex::new(r#"[\[〔【]\s*注[0-9一二三四五六七八九十百千〇零]{1,4}\s*[\]〕】]"#).unwrap()
 });
 
 /// EPUB 解析器。
@@ -113,11 +118,29 @@ impl FormatParser for EpubParser {
         // ④ 漏斗第一层：定出「收哪些节」
         let plan = build_plan(&opf, &toc);
 
+        // ④′ 探针：抽几节原始 XHTML 认门派，选中一套清洗方案
+        //     （认不出就用 generic —— 只做通用净化，绝不乱动结构）。
+        let rules = epub_rules::rules();
+        let names: Vec<String> = if plan.is_empty() {
+            sorted_html_names(&mut zip)
+        } else {
+            plan.iter().map(|s| s.name.clone()).collect()
+        };
+        let profile = probe_profile(rules, &mut zip, &names);
+        let img = rules.img_punct_for(profile);
+
         // ⑤ 逐节抽正文并过第二层（文本屏蔽）
         let mut out = String::new();
         let mut used = 0usize;
         for sec in &plan {
-            let Some(raw) = read_section(&mut zip, &sec.name, true) else {
+            let Some(raw) = read_section(
+                    &mut zip,
+                    &sec.name,
+                    true,
+                    &img,
+                    &profile.drop_class,
+                    &profile.note_class,
+                ) else {
                 continue;
             };
             // 噪声行必须数**清洗前**的原文：先删再数就数不到东西了
@@ -125,7 +148,11 @@ impl FormatParser for EpubParser {
             let noise = jiandu_core::purge::noise_line_count(&raw);
             // 文本级去噪（补丁 1）：摘私有排版标签 + 接断裂段落。
             // 噪声行数是**清洗前**数出来的，不受合并影响。
-            let text = clean_text_level(&jiandu_core::purge::strip_pub_lines(&raw));
+            let text = clean_text_level_with(
+                &jiandu_core::purge::strip_pub_lines(&raw),
+                rules,
+                profile,
+            );
             if text.trim().is_empty() {
                 continue;
             }
@@ -156,9 +183,20 @@ impl FormatParser for EpubParser {
         if used == 0 {
             out.clear();
             for name in sorted_html_names(&mut zip) {
-                if let Some(raw) = read_section(&mut zip, &name, true) {
+                if let Some(raw) = read_section(
+                        &mut zip,
+                        &name,
+                        true,
+                        &img,
+                        &profile.drop_class,
+                        &profile.note_class,
+                    ) {
                     let noise = jiandu_core::purge::noise_line_count(&raw);
-                    let text = clean_text_level(&jiandu_core::purge::strip_pub_lines(&raw));
+                    let text = clean_text_level_with(
+                        &jiandu_core::purge::strip_pub_lines(&raw),
+                        rules,
+                        profile,
+                    );
                     if text.trim().is_empty() {
                         continue;
                     }
@@ -184,8 +222,19 @@ impl FormatParser for EpubParser {
         // 正常的本子。
         if used == 0 {
             for name in sorted_html_names(&mut zip) {
-                if let Some(text) = read_section(&mut zip, &name, false) {
-                    let text = clean_text_level(&jiandu_core::purge::strip_pub_lines(&text));
+                if let Some(text) = read_section(
+                        &mut zip,
+                        &name,
+                        false,
+                        &img,
+                        &profile.drop_class,
+                        &profile.note_class,
+                    ) {
+                    let text = clean_text_level_with(
+                        &jiandu_core::purge::strip_pub_lines(&text),
+                        rules,
+                        profile,
+                    );
                     if text.trim().is_empty() {
                         continue;
                     }
@@ -869,20 +918,140 @@ fn clean_text_level(text: &str) -> String {
     merge_broken_paragraphs(&squeezed)
 }
 
+/// 文本级去噪**总入口**（终极漏斗阶段 ③）：先跑通用规则，再叠加门派方案。
+///
+/// 顺序有讲究：
+///   1. 装饰符（◇ ◆ □）—— 与内容无关，先扫掉；
+///   2. 竖排兼容字符归一（`︰`→`：`、`﹃﹄`→`『』`、`︵︶`→`（）`）；
+///   3. 校勘记壳 `【章：…】` —— **必须在竖排归一之后**。竖排本的校勘记
+///      壳用的正是竖排引号 `﹃…﹄`、冒号用的正是 `︰`；先归一，它们就落回
+///      `『…』` 和 `：`，规则表才认得出标签形态；
+///   4. 段首全角缩进 + 行首孤立句读串（笺读绝对顶格，行首不该有 `、、，。`）；
+///   5. 目录块；
+///   6. 通用去噪（私有标签 + 空白折叠 + 断裂段落合并）。
+fn clean_text_level_with(text: &str, rules: &Rules, p: &Profile) -> String {
+    let mut s = epub_rules::strip_symbols(text, &rules.drop_symbols);
+    if p.vertical_forms {
+        s = epub_rules::normalize_vertical_forms(&s);
+    }
+    s = epub_rules::strip_junk_brackets(&s, &rules.junk);
+    if p.strip_leading_indent {
+        s = epub_rules::strip_leading_indent(&s);
+    }
+    s = epub_rules::strip_leading_punct_runs(&s);
+    s = epub_rules::strip_empty_zhu(&s);
+    // 目录块必须在**段落合并之前**剔：目录行都不带句读，一合并就粘成一行，
+    // 再也看不出那是目录了。
+    s = epub_rules::strip_toc_blocks(&s, rules.toc_block_min_lines);
+    let mut s = clean_text_level(&s);
+    if !p.merge_broken {
+        s = s
+            .lines()
+            .map(|l| l.trim_ascii())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    s
+}
+
+// ----------------------------------------------------------------------
+// 门派探针（v1.91.0 终极清洗漏斗 · 阶段 ①）
+//
+// 两本《資治通鑑》已经证明：脏的**维度**各不相同——一本把句读做成 91 万张
+// 图片，另一本用 `<span class="zhushi">〔…〕</span>` 包夹注、`【章：…】`
+// 塞校勘记。硬编码规则不可能穷举，所以改成「先认门派、再按方子抓药」。
+// 认不出就用 generic：只做通用净化，绝不动结构。
+// ----------------------------------------------------------------------
+
+/// 探针抽样的节数（均摊在全书前后，避免只看封面页）。
+const PROBE_SECTIONS: usize = 6;
+/// 抽样原文上限（字节）：够探针用即可，不为一本书多读几十 MB。
+const PROBE_MAX_BYTES: usize = 400_000;
+/// 每节最多读这么多字节（604 节 × 8 KB ≈ 5 MB，一眨眼的事）。
+const PROBE_HEAD_BYTES: usize = 8 * 1024;
+/// 小于这个的节当封面 / 卷标题页跳过（正文页动辄上百 KB）。
+const PROBE_MIN_SECTION_BYTES: usize = 4 * 1024;
+
+/// 认门派：抽几节原始 XHTML，交给 [`Rules::select`]。
+///
+/// ⚠️ 按固定步长抽会**抽空**：《資治通鑑》竖排本 604 节里，正文章节只有两百
+/// 多节是「大页」，其余全是 700 字节的封面 / 卷标题页，固定步长正好每次都
+/// 落在小页上，探针于是认成 generic，句读图的门派方子（竖排归一、丢段号）
+/// 全都没用上。故改成**分段找第一个「有分量」的节**。
+fn probe_profile<'a>(
+    rules: &'a Rules,
+    zip: &mut zip::ZipArchive<std::fs::File>,
+    names: &[String],
+) -> &'a Profile {
+    if names.is_empty() {
+        return rules.select("");
+    }
+    let want = PROBE_SECTIONS.min(names.len());
+    let seg = (names.len() / want).max(1);
+    let mut sample = String::new();
+    let mut n = 0usize;
+    for s in 0..want {
+        let hi = ((s + 1) * seg).min(names.len());
+        let mut picked = None;
+        // 段内最多试 24 节：够找到正文页了，不必为一本书把目录翻到底。
+        for i in (s * seg..hi).take(24) {
+            let Some(raw) = read_head(zip, &names[i], PROBE_HEAD_BYTES) else {
+                continue;
+            };
+            if raw.len() >= PROBE_MIN_SECTION_BYTES {
+                picked = Some(raw);
+                break;
+            }
+            // 整段都是小页时就地取材，别让这一段白跑。
+            picked = Some(raw);
+        }
+        if let Some(raw) = picked {
+            sample.push_str(&raw);
+            n += 1;
+        }
+        if sample.len() >= PROBE_MAX_BYTES {
+            break;
+        }
+    }
+    eprintln!(
+        "[jiandu][probe] {} 节 → {}（抽样 {n} 节 / {} 字节）",
+        names.len(),
+        rules.select(&sample).id,
+        sample.len()
+    );
+    rules.select(&sample)
+}
+
+/// 一节的**开头若干字节**（只给探针用，不进正文）。
+fn read_head(
+    zip: &mut zip::ZipArchive<std::fs::File>,
+    name: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    if !is_html_name(name) {
+        return None;
+    }
+    let mut f = zip.by_name(name).ok()?;
+    let mut buf = Vec::with_capacity(max_bytes);
+    f.take(max_bytes as u64).read_to_end(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
+}
+
 fn read_section(
     zip: &mut zip::ZipArchive<std::fs::File>,
     name: &str,
     drop_tables: bool,
+    img: &ImgPunct,
+    drop_class: &[String],
+    note_class: &[String],
 ) -> Option<String> {
     if !is_html_name(name) {
         return None;
     }
     let f = zip.by_name(name).ok()?;
-    let (text, _err) = if drop_tables {
-        extract_html_reader(BufReader::new(f))
-    } else {
-        extract_html_reader_keep_tables(BufReader::new(f))
-    };
+    let (text, _err) =
+        extract_html_epub(BufReader::new(f), drop_tables, img, drop_class, note_class);
     Some(text)
 }
 
@@ -979,15 +1148,25 @@ mod tests {
 
     #[test]
     fn private_layout_marks_are_stripped() {
-        let src = "子曰学而[注一]时习之[注]。不亦说乎。";
+        let src = "子曰学而[注一]时习之[注二]。不亦说乎。";
         let got = clean_text_level(src);
         assert!(!got.contains("[注一]"), "私有标签没摘掉：{got}");
-        assert!(!got.contains("[注]"), "私有标签没摘掉：{got}");
+        assert!(!got.contains("[注二]"), "私有标签没摘掉：{got}");
         assert!(got.contains("子曰学而"), "正文被误删：{got}");
         assert!(got.contains("时习之"), "正文被误删：{got}");
         // 方括号 / 六角括号 / 直角括号都得认
         assert!(!clean_text_level("甲〔注二〕乙").contains("〔注二〕"));
         assert!(!clean_text_level("甲【注3】乙").contains("【注3】"));
+    }
+
+    /// 光秃秃的 `[注]` 是**笺读自己的夹注协议**（`<span class="note">` 转来的
+    /// 双行小字），绝不能被当成作者的私有排版标签删掉 —— 删了夹注就散进正文。
+    #[test]
+    fn bare_zhu_mark_is_the_annotation_protocol_and_survives() {
+        let src = "夫君子能勤小物[注]夫，音扶。[/注]故無大患。";
+        let got = clean_text_level(src);
+        assert!(got.contains("[注]"), "夹注协议被误删：{got}");
+        assert!(got.contains("[/注]"), "夹注协议被误删：{got}");
     }
 
     #[test]
