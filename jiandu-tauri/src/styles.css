@@ -1,8 +1,18 @@
 /* ===========================================================
    笺读 · 导入阅读页（纯原生 CSS，无框架）
-   宣纸底色 + 顶栏 + 可滚动阅读区（长文本 overflow-y:auto 防裁切）
-   默认欢迎为古籍竖排测试页；导入书籍后切换为横排章节渲染。
+   宣纸底色 + 宋体回退 + 竖排古籍测试页 + 横排章节
+   移动端重构：右下角悬浮圆形操作钮 + 双线版框 + 天头地脚
    =========================================================== */
+
+:root {
+  --paper: #f5f4ef;                          /* 宣纸底 */
+  --ink: #2b2620;                            /* 墨色正文 */
+  --ink-strong: #1f1b16;                     /* 标题浓墨 */
+  --zhu: #b0342c;                            /* 朱砂红 */
+  --zhu-soft: rgba(176, 52, 44, 0.85);
+  /* 古籍宋体/明朝体回退链：绝不允许安卓用黑体显示古籍 */
+  --serif: "Songti SC", "STSong", "SimSun", serif;
+}
 
 * {
   box-sizing: border-box;
@@ -12,12 +22,10 @@ html,
 body {
   margin: 0;
   height: 100%;
-  /* 宣纸底色：极简浅米黄 */
-  background-color: #f5f4ef;
-  color: #333;
-  /* 古籍宋体/明朝体回退链 */
-  font-family: "Songti SC", "STSong", "SimSun", "Noto Serif CJK SC",
-    "Source Han Serif SC", serif;
+  background-color: var(--paper);
+  color: var(--ink);
+  /* 强制宋体回退：安卓无 Songti/STSong/SimSun 时落到 serif（系统衬线体） */
+  font-family: var(--serif);
 }
 
 /* 全站默认竖排；顶栏与阅读区重置为物理轴（横排） */
@@ -28,51 +36,26 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* 顶栏：固定顶部，物理横排 */
+/* —— 顶部极简条：仅显示书名，无按钮 —— */
 .topbar {
   position: fixed;
   top: 0;
   left: 0;
   right: 0;
-  height: 48px;
+  height: 40px;
   z-index: 20;
   display: flex;
   align-items: center;
-  gap: 12px;
   padding: 0 16px;
   writing-mode: horizontal-tb; /* 顶栏横排 */
-  background: rgba(245, 244, 239, 0.96);
-  border-bottom: 1px solid rgba(176, 52, 44, 0.2);
-}
-
-.topbar button {
-  font-family: inherit;
-  font-size: 13px;
-  color: #5a4a3a;
-  background: rgba(255, 255, 255, 0.8);
-  border: 1px solid rgba(176, 52, 44, 0.4);
-  border-radius: 6px;
-  padding: 6px 14px;
-  cursor: pointer;
-  transition: background 0.2s ease;
-}
-
-.topbar button:hover {
-  background: rgba(176, 52, 44, 0.12);
-}
-
-/* TTS 朗读按钮：激活态（正在朗读）带朱砂底色 */
-.topbar button.tts-btn.active {
-  background: rgba(176, 52, 44, 0.85);
-  color: #f5f4ef;
-  border-color: rgba(176, 52, 44, 0.85);
+  background: rgba(245, 244, 239, 0.9);
+  border-bottom: 1px solid rgba(176, 52, 44, 0.18);
 }
 
 .file-name {
-  margin-left: auto;
   font-size: 12px;
   color: #6b5d4f;
-  max-width: 50vw;
+  max-width: 70vw;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -81,12 +64,11 @@ body {
 /* 阅读区：可滚动，长文本不裁切 */
 .reader {
   writing-mode: horizontal-tb; /* 阅读区横排（章节正文） */
-  margin-top: 48px;
-  height: calc(100vh - 48px);
-  overflow-y: auto; /* 长文本滚动，绝不裁切 */
+  margin-top: 40px;
+  height: calc(100vh - 40px);
+  overflow-y: auto;
 }
 
-/* 让 hidden 属性对 .welcome/.book-view 生效（其 CSS 设了 display，会覆盖 UA 的 [hidden]） */
 .welcome[hidden],
 .book-view[hidden] {
   display: none;
@@ -95,12 +77,13 @@ body {
 /* —— 默认欢迎：古籍竖排测试页 —— */
 .welcome {
   position: relative;
-  min-height: calc(100vh - 48px);
+  min-height: calc(100vh - 40px);
   writing-mode: horizontal-tb;
   display: flex;
   align-items: center; /* 物理垂直居中 */
   justify-content: center; /* 物理水平居中 */
   overflow: hidden;
+  padding: 4vh 0; /* 上下留白 */
 }
 
 .fold {
@@ -110,33 +93,38 @@ body {
   left: 50%;
   width: 1px;
   transform: translateX(-0.5px);
-  background: #b0342c; /* 朱砂红 中缝 */
+  background: var(--zhu); /* 朱砂红 中缝 */
   opacity: 0.8;
   z-index: 1;
 }
 
+/* 书页：竖排 + 双线版框 + 天头地脚留白 */
 .book {
   position: relative;
   z-index: 2;
   writing-mode: vertical-rl; /* 内部竖排：从右到左 */
   text-orientation: upright;
-  height: 86vh;
-  color: #333;
+  height: 78vh;
+  padding: 4vh 1.4em; /* 天头地脚（竖排上下为天头地脚） */
+  color: var(--ink);
+  /* 四周双线版框：内细线 + 外细线（朱砂） */
+  border: 2px solid rgba(176, 52, 44, 0.55);
+  box-shadow: 0 0 0 4px var(--paper), 0 0 0 5px rgba(176, 52, 44, 0.35);
 }
 
 .title {
   font-size: 32px;
   font-weight: 700;
   letter-spacing: 0.3em;
-  color: #1f1b16;
+  color: var(--ink-strong);
   margin-left: 0.5em;
 }
 
 .verse {
   font-size: 26px;
-  line-height: 2;
+  line-height: 2.1;
   letter-spacing: 0.14em;
-  color: #333;
+  color: var(--ink);
 }
 
 .author {
@@ -145,20 +133,35 @@ body {
   margin-right: 0.5em;
 }
 
+/* 标点 → 朱砂红圆点：原标点透明占位，伪元素画红点覆盖其上 */
 .dian {
-  color: #b0342c;
-  font-size: 0.7em;
+  position: relative;
+  color: transparent; /* 原标点隐形（仍保留字宽，排版不塌） */
+}
+.dian::after {
+  content: "•";
+  color: var(--zhu);
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 0.55em;
+  font-family: serif; /* 点是几何形，不依赖 CJK 字体 */
 }
 
-/* —— 导入后书籍渲染：横排章节 —— */
+/* —— 导入后书籍渲染：横排章节 + 双线版框 —— */
 .book-view {
-  padding: 24px 32px 48px;
+  padding: 22px 20px 110px; /* 底部留白，避开右下角悬浮钮 */
+  border: 2px solid rgba(176, 52, 44, 0.45);
+  box-shadow: 0 0 0 4px var(--paper), 0 0 0 5px rgba(176, 52, 44, 0.3);
+  border-radius: 3px;
+  margin: 14px;
 }
 
 .book-title {
   font-size: 22px;
   font-weight: 700;
-  color: #1f1b16;
+  color: var(--ink-strong);
   margin: 0 0 18px;
   padding-bottom: 10px;
   border-bottom: 2px solid rgba(176, 52, 44, 0.3);
@@ -174,7 +177,7 @@ body {
   color: #5a4a3a;
   margin: 0 0 8px;
   padding-left: 8px;
-  border-left: 3px solid #b0342c; /* 朱砂章节标记 */
+  border-left: 3px solid var(--zhu); /* 朱砂章节标记 */
 }
 
 .book-view p {
@@ -182,7 +185,7 @@ body {
   line-height: 1.9;
   margin: 0.35em 0;
   text-indent: 2em; /* 中文段落首行缩进 */
-  color: #2b2620;
+  color: var(--ink);
   transition: background 0.25s ease;
 }
 
@@ -190,7 +193,7 @@ body {
 .book-view p.reading,
 .book-view h2.reading {
   background: rgba(176, 52, 44, 0.14);
-  box-shadow: inset 3px 0 0 #b0342c;
+  box-shadow: inset 3px 0 0 var(--zhu);
   border-radius: 3px;
 }
 
@@ -198,6 +201,52 @@ body {
 .verse.reading {
   background: rgba(176, 52, 44, 0.12);
   border-radius: 4px;
+}
+
+/* —— 右下角悬浮操作：导入 / 朗读 / 停止（圆形图标，半透明毛玻璃） —— */
+.fab {
+  position: fixed;
+  right: 18px;
+  bottom: 24px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column; /* 竖排：导入钮最靠下，手指最近 */
+  align-items: center;
+  gap: 12px;
+}
+
+.fab-item {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: 1px solid rgba(176, 52, 44, 0.4);
+  background: rgba(245, 244, 239, 0.92);
+  color: var(--zhu);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(31, 27, 22, 0.18);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--serif);
+  transition: transform 0.16s ease, background 0.2s ease;
+}
+
+.fab-item:active {
+  transform: scale(0.92);
+}
+
+/* TTS 激活态：朱砂填充 */
+.fab-item.active {
+  background: var(--zhu-soft);
+  color: var(--paper);
+}
+
+.fab-import {
+  font-size: 26px;
 }
 
 /* —— 系统不支持引导页（老旧 Windows 触发） —— */
@@ -229,14 +278,14 @@ body {
 
 .unsupported-card h1 {
   font-size: 22px;
-  color: #b0342c;
+  color: var(--zhu);
   margin: 0 0 16px;
 }
 
 .unsupported-card p#unsupported-msg {
   font-size: 15px;
   line-height: 1.8;
-  color: #2b2620;
+  color: var(--ink);
   white-space: pre-line; /* 保留换行 */
   margin: 0 0 22px;
 }
@@ -244,8 +293,8 @@ body {
 .unsupported-card button {
   font-family: inherit;
   font-size: 15px;
-  color: #f5f4ef;
-  background: #b0342c;
+  color: var(--paper);
+  background: var(--zhu);
   border: none;
   border-radius: 8px;
   padding: 12px 22px;
@@ -264,38 +313,13 @@ body {
   white-space: normal;
 }
 
-/* —— 移动端适配（荣耀/OPPO/vivo 等手机·平板：触摸优先、字号加大、按钮热区放大） —— */
+/* —— 移动端适配（荣耀/OPPO/vivo 等手机·平板：触摸优先） —— */
 /* 命中条件：窄屏(≤820px) 或 粗指针(触摸屏)。避免桌面被误判。 */
 @media (max-width: 820px), (pointer: coarse) {
-  /* 顶栏加高，按钮热区放大到手指友好尺寸 */
-  .topbar {
-    height: 58px;
-    padding: 0 12px;
-    gap: 10px;
-  }
-  .topbar button {
-    font-size: 16px;
-    padding: 12px 18px; /* 更大的触摸热区，方便手指点击 */
-    border-radius: 10px;
-    min-height: 44px; /* 苹果/安卓 HIG 推荐的最小触摸目标 */
-  }
-  .file-name {
-    font-size: 12px;
-    max-width: 34vw;
-  }
-
-  /* 阅读区跟随加高后的顶栏，避免内容被遮挡 */
-  .reader {
-    margin-top: 58px;
-    height: calc(100vh - 58px);
-  }
-  .welcome {
-    min-height: calc(100vh - 58px);
-  }
-
-  /* 欢迎竖排页：字号放大、不挤成一团 */
+  /* 书页：字号放大、留足天头地脚、不顶天立地 */
   .book {
-    height: 80vh;
+    height: 72vh;
+    padding: 4vh 1.1em;
   }
   .title {
     font-size: 40px;
@@ -303,7 +327,7 @@ body {
   }
   .verse {
     font-size: 30px;
-    line-height: 2.2; /* 行距放宽，手指滑动不误触 */
+    line-height: 2.3; /* 行距放宽，手指滑动不误触 */
     letter-spacing: 0.18em;
   }
   .author {
@@ -312,7 +336,8 @@ body {
 
   /* 导入后章节正文：字号加大、段距放宽 */
   .book-view {
-    padding: 20px 18px 48px;
+    padding: 20px 16px 120px;
+    margin: 12px;
   }
   .book-title {
     font-size: 24px;
@@ -329,5 +354,17 @@ body {
     line-height: 2;
     margin: 0.5em 0;
     text-indent: 2em;
+  }
+
+  /* 悬浮钮放大到手指友好尺寸 */
+  .fab {
+    right: 14px;
+    bottom: 18px;
+    gap: 10px;
+  }
+  .fab-item {
+    width: 56px;
+    height: 56px;
+    font-size: 24px;
   }
 }

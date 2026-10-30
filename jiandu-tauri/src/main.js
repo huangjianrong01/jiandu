@@ -4,7 +4,6 @@ const invoke = tauri?.core?.invoke;
 const dialog = tauri?.dialog;
 
 const importBtn = document.querySelector("#import-btn");
-const testCoreBtn = document.querySelector("#test-core-btn");
 const welcome = document.querySelector("#welcome");
 const bookView = document.querySelector("#book-view");
 const fileNameEl = document.querySelector("#file-name");
@@ -88,6 +87,22 @@ if (window.speechSynthesis) {
   loadZhVoice();
 }
 
+// 转义 HTML 特殊字符（书名/正文可能含 < > &，防 XSS 与排版错乱）
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[c]));
+}
+
+// 把标点包裹成 .dian（CSS 伪元素会将其渲染为朱砂红圆点）
+function punctuate(html) {
+  return html.replace(/([，。、；！？：])/g, '<span class="dian">$1</span>');
+}
+
 // 把 Book 结构（title / author / chapters[].paragraphs[].text）塞进宣纸 div
 function renderBook(book) {
   welcome.hidden = true;
@@ -97,25 +112,27 @@ function renderBook(book) {
 
   const h1 = document.createElement("h1");
   h1.className = "book-title";
-  h1.textContent =
-    (book.title || "无题") + (book.author ? " · " + book.author : "");
+  h1.innerHTML = punctuate(
+    escapeHtml((book.title || "无题") + (book.author ? " · " + book.author : ""))
+  );
   bookView.appendChild(h1);
 
   const chapters = book.chapters || [];
   for (const ch of chapters) {
     const section = document.createElement("section");
     const h2 = document.createElement("h2");
-    h2.textContent = ch.title || "（无题）";
+    h2.innerHTML = punctuate(escapeHtml(ch.title || "（无题）"));
     section.appendChild(h2);
-    ttsItems.push({ node: h2, text: h2.textContent }); // 章标题也读
+    ttsItems.push({ node: h2, text: ch.title || "（无题）" }); // 章标题也读
 
     const paras = ch.paragraphs || [];
     for (const p of paras) {
       const para = document.createElement("p");
-      para.textContent = p.text || "";
+      const raw = p.text || "";
+      para.innerHTML = punctuate(escapeHtml(raw));
       section.appendChild(para);
-      if ((p.text || "").trim()) {
-        ttsItems.push({ node: para, text: p.text });
+      if (raw.trim()) {
+        ttsItems.push({ node: para, text: raw });
       }
     }
     bookView.appendChild(section);
@@ -153,8 +170,9 @@ function clearReadingHighlight() {
 function setTtsBtn() {
   const b = document.querySelector("#tts-btn");
   if (!b) return;
+  // 圆形悬浮钮内用符号表达状态，避免长文字溢出
   b.textContent =
-    ttsState === "playing" ? "暂停" : ttsState === "paused" ? "继续" : "朗读";
+    ttsState === "playing" ? "⏸" : ttsState === "paused" ? "▶" : "♪";
   b.classList.toggle("active", ttsState !== "idle");
 }
 
@@ -247,15 +265,3 @@ const ttsStopBtn = document.querySelector("#tts-stop-btn");
 if (ttsBtn) ttsBtn.addEventListener("click", onTtsClick);
 if (ttsStopBtn) ttsStopBtn.addEventListener("click", stopTts);
 setTtsBtn(); // 初始化按钮文案
-
-// 测试 core 大脑：点击 → 调用 Rust 的 test_core 命令 → alert 跨平台数据目录
-if (testCoreBtn) {
-  testCoreBtn.addEventListener("click", async () => {
-    try {
-      const res = await invoke("test_core");
-      alert(res);
-    } catch (e) {
-      alert("调用 core 失败：" + e);
-    }
-  });
-}
