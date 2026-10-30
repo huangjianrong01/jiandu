@@ -42,22 +42,29 @@ if (invoke) {
     });
 }
 
-// 导入书籍：选文件 → invoke import_and_parse → 渲染 Book
-if (importBtn) {
-  importBtn.addEventListener("click", async () => {
+// 导入书籍（**字节优先**，Android / 桌面通用）：
+// Android 作用域存储下文件选择器只给 content:// URI，拿不到能直接 fs::read 的路径，
+// 所以统一走 <input type="file"> + FileReader 把文件读成 Uint8Array，直接 invoke
+// `import_from_bytes` 交给 core 内存解析（不落盘）。桌面端同样适用。
+const fileInput = document.querySelector("#file-input");
+if (importBtn && fileInput) {
+  importBtn.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
     try {
-      const path = await dialog.open({
-        multiple: false,
-        filters: [
-          { name: "书籍", extensions: ["epub", "txt", "docx", "json", "md"] },
-        ],
+      fileNameEl.textContent = file.name;
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const book = await invoke("import_from_bytes", {
+        fileName: file.name,
+        bytes,
       });
-      if (!path) return; // 用户取消
-      fileNameEl.textContent = path;
-      const book = await invoke("import_and_parse", { path });
       renderBook(book);
     } catch (e) {
-      alert("导入失败：" + e);
+      alert("导入失败：" + String(e));
+    } finally {
+      fileInput.value = ""; // 允许重复选同一个文件
     }
   });
 }

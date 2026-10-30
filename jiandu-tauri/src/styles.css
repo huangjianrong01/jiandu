@@ -263,3 +263,71 @@ body {
   margin: 18px 0 0;
   white-space: normal;
 }
+
+/* —— 移动端适配（荣耀/OPPO/vivo 等手机·平板：触摸优先、字号加大、按钮热区放大） —— */
+/* 命中条件：窄屏(≤820px) 或 粗指针(触摸屏)。避免桌面被误判。 */
+@media (max-width: 820px), (pointer: coarse) {
+  /* 顶栏加高，按钮热区放大到手指友好尺寸 */
+  .topbar {
+    height: 58px;
+    padding: 0 12px;
+    gap: 10px;
+  }
+  .topbar button {
+    font-size: 16px;
+    padding: 12px 18px; /* 更大的触摸热区，方便手指点击 */
+    border-radius: 10px;
+    min-height: 44px; /* 苹果/安卓 HIG 推荐的最小触摸目标 */
+  }
+  .file-name {
+    font-size: 12px;
+    max-width: 34vw;
+  }
+
+  /* 阅读区跟随加高后的顶栏，避免内容被遮挡 */
+  .reader {
+    margin-top: 58px;
+    height: calc(100vh - 58px);
+  }
+  .welcome {
+    min-height: calc(100vh - 58px);
+  }
+
+  /* 欢迎竖排页：字号放大、不挤成一团 */
+  .book {
+    height: 80vh;
+  }
+  .title {
+    font-size: 40px;
+    letter-spacing: 0.35em;
+  }
+  .verse {
+    font-size: 30px;
+    line-height: 2.2; /* 行距放宽，手指滑动不误触 */
+    letter-spacing: 0.18em;
+  }
+  .author {
+    font-size: 18px;
+  }
+
+  /* 导入后章节正文：字号加大、段距放宽 */
+  .book-view {
+    padding: 20px 18px 48px;
+  }
+  .book-title {
+    font-size: 24px;
+    margin: 0 0 16px;
+    padding-bottom: 12px;
+  }
+  .book-view h2 {
+    font-size: 20px;
+    margin: 0 0 10px;
+    padding-left: 10px;
+  }
+  .book-view p {
+    font-size: 18px; /* 手机上正文更清晰 */
+    line-height: 2;
+    margin: 0.5em 0;
+    text-indent: 2em;
+  }
+}

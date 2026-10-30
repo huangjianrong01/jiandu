@@ -13,7 +13,7 @@
 use crate::stream::{ChapterSink, MAX_CHAPTER_CHARS};
 use crate::types::{Book, Chapter, Note, NoteKind, Paragraph, TocEntry};
 use anyhow::{anyhow, Context, Result};
-use std::io::Read;
+use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 
 /// 根据扩展名导入。
@@ -36,28 +36,112 @@ pub fn import_from_path(path: &Path) -> Result<Book> {
             ))
         }
     };
-    // **统一清洗**（v1.54.0）：剥壳之后先落 IR，两遍扫完再交回排版引擎——
-    // 从此引擎只见一种数据，新增格式只要写解析器。这一步同时做**生僻字兜底**：
-    // 生僻但可渲染的字（CJK 扩展 A/B 等）原样保留、交字体回退显示，只进扫描清单；
-    // PUA 私用区 / 乱码（任何字库都无字形）换成「□」古风占位，绝不 Panic。
-    crate::cleaner::clean_book(&mut book, crate::ir::IrSource::from_ext(&ext));
-    // 正文里残留（或旧 JSON 里本就存着）的 `[注]…[/注]` 标签：摘成夹注，
-    // 绝不让 `[` `注` `]` 四个字占掉字格。
+    post_process(&mut book, &ext);
+    Ok(book)
+}
+
+/// 导入后的**统一后处理**（`import_from_path` 与 `import_from_bytes` 同源共用）：
+/// 清洗 IR → 行内夹注 → 砍前言 → 补目录 → 元数据限长。
+fn post_process(book: &mut Book, ext: &str) {
+    crate::cleaner::clean_book(book, crate::ir::IrSource::from_ext(ext));
     book.ingest_inline_notes();
-    // 前言 / 序言 / 导读同样不进书架（epub 在自己的流程末尾已砍过一次）。
-    skip_front_matter(&mut book);
-    // 没有目录的格式（txt / md / json）在这里统一按章节标题补齐。
+    skip_front_matter(book);
     book.ensure_toc();
-    // 书名 / 作者统一过「元数据粉碎机」再限长（v1.69.0）：盗版 EPUB 的题名
-    // 常是那一长串文件名（`…(z-library.sk, 1lib.sk, z-lib.sk)`），里面塞着
-    // 网址、拼音和站名。限长按 `META_TITLE_MAX`（15 字）——书架卡片一行、
-    // 版心书口一格，超长既排不下也说明那不是书名。
     let max = crate::vclean::META_TITLE_MAX;
     book.title = tidy_meta(&book.title, max);
     book.cover.title = tidy_meta(&book.cover.title, max);
     book.author = tidy_meta_author(&book.author, max);
+}
+
+// ---------------------------------------------------------------------------
+// 内存字节导入（Android / Web / iOS）
+// ---------------------------------------------------------------------------
+//
+// Android 的**作用域存储**（Scoped Storage）下，文件选择器只给 `content://` URI，
+// 拿不到能直接 `fs::read` 的路径——壳子读出字节后走这里，**不落盘、直接内存解析**。
+// 解析逻辑与 `import_from_path` 完全同源（同一套 parser + 同一套后处理）。
+
+/// 从文件名取主干（去掉扩展名），仅作书名兜底。
+pub fn stem_of(file_name: &str) -> String {
+    Path::new(file_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file_name)
+        .to_string()
+}
+
+/// **内存字节导入**：按 `file_name` 的扩展名分派到各格式的内存版解析器。
+pub fn import_from_bytes(file_name: &str, bytes: Vec<u8>) -> Result<Book> {
+    let ext = Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut book = match ext.as_str() {
+        "txt" | "text" => import_txt_bytes(file_name, bytes)?,
+        "md" | "markdown" => import_md_bytes(file_name, bytes)?,
+        "html" | "htm" | "xhtml" | "xml" => import_html_bytes(file_name, bytes)?,
+        "json" => import_json_bytes(file_name, bytes)?,
+        "epub" => import_epub_bytes(file_name, bytes)?,
+        "docx" => import_docx_bytes(file_name, bytes)?,
+        other => {
+            return Err(anyhow!(
+                "不支持的格式：.{other}（支持 md / txt / html / xml / epub / docx / json）"
+            ))
+        }
+    };
+    post_process(&mut book, &ext);
     Ok(book)
 }
+
+pub fn import_txt_bytes(file_name: &str, bytes: Vec<u8>) -> Result<Book> {
+    let text = crate::pipeline::decode_bytes(&bytes);
+    Ok(book_from_plaintext(&stem_of(file_name), &text))
+}
+
+pub fn import_md_bytes(file_name: &str, bytes: Vec<u8>) -> Result<Book> {
+    let text = crate::pipeline::decode_bytes(&bytes);
+    Ok(book_from_markdown(&stem_of(file_name), &text))
+}
+
+pub fn import_html_bytes(file_name: &str, bytes: Vec<u8>) -> Result<Book> {
+    let text = crate::pipeline::decode_bytes(&bytes);
+    let chapters = crate::pipeline::parse_html(&text);
+    let title = extract_html_title(&text)
+        .map(|t| clip_chars(&t, 12))
+        .unwrap_or_else(|| stem_of(file_name));
+    let mut book = crate::pipeline::chapters_to_book(&title, "", chapters);
+    if book.cover.title.is_empty() {
+        book.cover.title = book.title.clone();
+    }
+    Ok(book)
+}
+
+pub fn import_docx_bytes(file_name: &str, bytes: Vec<u8>) -> Result<Book> {
+    let chapters = crate::pipeline::parse_docx(&bytes)?;
+    let mut book = crate::pipeline::chapters_to_book(&stem_of(file_name), "", chapters);
+    let (t, a) = detect_title_author(&book.chapters.first().map(|c| {
+        c.paragraphs
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }).unwrap_or_default());
+    if !t.is_empty() {
+        book.title = t;
+    }
+    if !a.is_empty() {
+        book.author = a;
+    }
+    book.cover.title = book.title.clone();
+    Ok(book)
+}
+
+pub fn import_json_bytes(file_name: &str, bytes: Vec<u8>) -> Result<Book> {
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    parse_json_book(&text, &stem_of(file_name))
+}
+
 
 /// **智能跳过前言**：把「总目录 / 版权页 / 书影 / 前言 / 目录」从卷首砍掉，
 /// 让书架第一页就是真正文。
@@ -764,8 +848,23 @@ fn looks_like_json(s: &str) -> bool {
 pub fn import_epub(path: &Path) -> Result<Book> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("打开 epub 失败: {}", path.display()))?;
-    let mut zip = zip::ZipArchive::new(file).context("epub 不是合法的 zip 容器")?;
+    let zip = zip::ZipArchive::new(file).context("epub 不是合法的 zip 容器")?;
+    import_epub_zip(zip, &file_stem(path))
+}
 
+/// **内存版 epub**：bytes 直接喂给 zip 容器（`Cursor` 实现 `Read + Seek`），
+/// **不落盘**。Android / Web / iOS 的文件选择器只给字节时走这个。
+pub fn import_epub_bytes(file_name: &str, bytes: Vec<u8>) -> Result<Book> {
+    let zip = zip::ZipArchive::new(Cursor::new(bytes)).context("epub 不是合法的 zip 容器")?;
+    import_epub_zip(zip, &stem_of(file_name))
+}
+
+/// epub 解析主体：只依赖「一个 zip 容器」+「书名兜底」，因此磁盘 `File` 与
+/// 内存 `Cursor` 共用这一套逻辑（epub 是唯一需要 zip 的格式，其余天然吃 bytes）。
+fn import_epub_zip<R: Read + Seek>(
+    mut zip: zip::ZipArchive<R>,
+    fallback_title: &str,
+) -> Result<Book> {
     let container =
         read_zip_text(&mut zip, "META-INF/container.xml").context("缺少 META-INF/container.xml")?;
     let opf_path = find_attr(&container, "full-path")
@@ -775,7 +874,7 @@ pub fn import_epub(path: &Path) -> Result<Book> {
     // 书名先过一道清洗：`dc:title` 里常带着整条书眉（`…精华录卷十九`），
     // 版心只有一格宽，多一个字就挤掉一个卷次。
     let title = crate::vclean::clean_book_title(
-        &extract_tag_text(&opf, "dc:title").unwrap_or_else(|| file_stem(path)),
+        &extract_tag_text(&opf, "dc:title").unwrap_or_else(|| fallback_title.to_string()),
     );
     let author = extract_tag_text(&opf, "dc:creator").unwrap_or_default();
 

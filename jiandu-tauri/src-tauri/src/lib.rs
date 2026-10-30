@@ -96,12 +96,38 @@ fn os_support() -> serde_json::Value {
     })
 }
 
+/// **内存字节导入**（Android / Web / 桌面通用）。
+///
+/// Android 的**作用域存储**下，文件选择器只给 `content://` URI，拿不到能直接
+/// `std::fs::read` 的路径——所以前端统一用 FileReader 把文件读成 `Uint8Array`
+/// 直接传进来，走 core 的 `import_from_bytes` **内存解析、不落盘**。
+/// 解析管线与桌面端 `import_and_parse` 完全同源（同一套 parser + 后处理）。
+#[tauri::command]
+async fn import_from_bytes(
+    file_name: String,
+    bytes: Vec<u8>,
+) -> Result<jiandu_core::types::Book, String> {
+    let book = tauri::async_runtime::spawn_blocking(move || {
+        jiandu_core::importer::import_from_bytes(&file_name, bytes)
+    })
+    .await
+    .map_err(|e| format!("导入线程崩溃：{e}"))?
+    .map_err(|e| e.to_string())?;
+    Ok(book)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![greet, test_core, import_and_parse, os_support])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            test_core,
+            import_and_parse,
+            import_from_bytes,
+            os_support
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
