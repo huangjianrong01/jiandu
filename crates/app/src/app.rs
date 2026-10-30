@@ -1365,7 +1365,7 @@ impl Root {
             note_menu: None,
             line_modern: 26.0,
             rename_test_done: false,
-            beta_ok: crate::gate::redeemed(),
+            beta_ok: crate::beta::gate_passed(),
             beta_left: crate::gate::beta_days_left().unwrap_or(-1),
             beta_code: String::new(),
             beta_cursor: 0,

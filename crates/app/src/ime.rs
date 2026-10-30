@@ -193,8 +193,14 @@ impl Root {
     /// 此刻哪个输入框该接字：重命名框 → 笔记框 → 书架搜索 → 阅读页检索；
     /// 都没有则 None（IME 接口收到 None 即不接管，键盘走普通 keydown）。
     pub fn input_target(&self) -> Option<InputTarget> {
-        // 闸门没验过时：这张纸上只收 keydown（邀请码是英数，见 `beta.rs`），
-        // **不接输入法**——接了就与 keydown 叠字（实测 `abc123` 得 `ABCABC112233`）。
+        // 闸门没过时：整个界面只有「邀请码」那一张纸（`Render::render` 岔开，
+        // 见 `beta.rs` 顶部），其余输入框都不存在——此时不接 IME 是对的：
+        // 那张纸只收英数 keydown，接了会叠字（实测 `abc123` → `ABCABC112233`）。
+        //
+        // ⚠️ 这个判据**只该挡住邀请码那一屏**，不能当成全应用的总闸。
+        // 商店版根本没有内测码，`beta_ok` 必须恒 true（见 `beta::gate_passed`），
+        // 否则这一句会把眉批 / 夹注 / 检索的中文输入**全部株连掉**——
+        // 中文不走 keydown，全靠 `EntityInputHandler` 回传，断了就是整个框废掉。
         if !self.beta_ok {
             return None;
         }

@@ -14,6 +14,26 @@ use crate::app::Root;
 use crate::theme::Theme;
 use gpui::*;
 
+/// 启动时定一次：内测闸门是否已过。
+///
+/// v1.9.9：商店版**恒 true**。App Store 没有内测码这回事，用户从商店装下来
+/// 就该直接进应用。若沿用 `gate::redeemed()`（读本机那枚凭据文件），商店版
+/// 永远读不到，`beta_ok` 恒 false，后果是两层：
+///   ① `Render::render` 只画邀请码那一屏（见本文件顶部）——应用等于打不开；
+///   ② `ime::input_target()` 开头直接 `return None`，**所有输入框都不接
+///      输入法**：眉批 / 夹注 / 检索一个汉字都打不进去。中文不走 keydown，
+///      全靠 `EntityInputHandler` 回传，这一条断了就是整个输入框废掉。
+pub fn gate_passed() -> bool {
+    #[cfg(feature = "appstore")]
+    {
+        true
+    }
+    #[cfg(not(feature = "appstore"))]
+    {
+        crate::gate::redeemed()
+    }
+}
+
 impl Root {
     /// 把一串字符追加进邀请码草稿（已归一：只留 ASCII 英数，转大写）。
     pub fn beta_push(&mut self, text: &str) {
