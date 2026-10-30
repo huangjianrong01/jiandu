@@ -20,12 +20,13 @@ use crate::types::{
     MarkKind, NoteKind, NoteSource, Script, TocEntry,
 };
 use gpui::{
-    canvas, div, point, prelude::*, px, rgb, rgba, svg, AnyElement, App,
+    canvas, div, point, prelude::*, px, rgb, rgba, svg, Animation, AnimationExt, AnyElement, App,
     AsyncApp, BoxShadow, Bounds, Context, Div, FontWeight, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow, ParentElement, PathBuilder, Pixels,
     SharedString, Stateful, Styled, WeakEntity, Window,
 };
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// 字书浮签的纸色透明度（v1.43.0）：**0.92**。
 ///
@@ -440,11 +441,31 @@ const TITLE_HEAD_CELLS: f32 = 2.0;
 
 /// 顶栏高度：一处定义——动画位移、命中判定全用它。
 ///
-/// v1.52.1 起顶栏**常驻显示**：用户反馈「找不到工具」，故撤掉整套自动隐藏
-/// （触发带 `BAR_HOT` / 退出回差 `BAR_GAP` / 显隐判据 `bar_wants_show` /
-/// 面板留驻 `bar_pinned` 一并删除）。`bar_shown` 恒为 `true`，只有专注模式
-/// 会在渲染层把整块顶栏撤下（见 `Root::render` 的 `focus_mode` 分支）。
+/// v1.52.1 曾把整套自动隐藏撤掉（用户反馈「找不到工具」），`bar_shown` 恒
+/// `true`；v1.86.0 用户重提「天头常驻太吵」——恢复为**顶部悬停滑出**：
+/// 平时整条收到窗顶之外，鼠标贴到屏幕上沿再滑下。为解决当年「找不到」的
+/// 老问题，两处补偿：① 开卷时顶栏先露一息（`bar_shown` 初值 true），鼠标
+/// 一动才收回；② 触发带给足 10px、退出回差 16px，手抖也不会闪。
 pub(crate) const BAR_H: f32 = 44.0;
+
+/// **顶栏触发带**（px）：鼠标进到窗顶这么深就滑出。
+///
+/// 取 10 而非 1：macOS 把指针钉在屏幕边缘，用户「甩到最上面」时落点常在
+/// 0–6px 之间抖动；1px 的带子要瞄，10px 才叫「贴上去就出来」。
+pub(crate) const BAR_HOT: f32 = 10.0;
+
+/// **顶栏退出回差**（px）：已在栏内 / 栏下这么深仍算「还在天头」。
+///
+/// 只靠 `BAR_HOT` 一条线会「一下去就收、一上来又出」，来回闪。给 16px
+/// 迟滞，滑出后把鼠标移到栏下沿之外才收——手感是「退开一步才收」。
+pub(crate) const BAR_GAP: f32 = 16.0;
+
+/// **正文与版框的横向留白**（px，v1.86.0）。
+///
+/// 刻本正文是顶着边栏排的，屏幕上却显闷：字与那道朱线贴死，整版像被
+/// 框死。内缩 8px 之后，字与边栏之间留出一线呼吸，仍远窄于天头地脚，
+/// 「天宽地窄」的格局不动。左右对称内缩，故两叶仍严格镜像。
+pub(crate) const INNER_PAD: f32 = 8.0;
 
 /// **左侧栏宽度**（v1.79.0）：一处定义——面板自身宽度、滑出位移、目录题名
 /// 能排几字全用它。
@@ -1280,6 +1301,19 @@ impl Root {
                             event.position.x.to_f64() as f32,
                             event.position.y.to_f64() as f32,
                         );
+                        // v1.86.0：**抬指落在正文 = 已经回到书里**——收「更多」
+                        // 下拉、收顶栏。为什么不在 `on_mouse_down` 里做：字格自己
+                        // 会 `stop_propagation` 拦下按下事件，根容器那条「点纸面
+                        // 收浮层」根本收不到（v1.52.3 的导出菜单也栽在这儿）；
+                        // 抬起事件却一路冒到 body，且 body 只在正文上挂监听
+                        // （顶栏是它的兄弟，不会被误伤）。
+                        this.more_menu = false;
+                        if !this.focus_mode
+                            && uy > BAR_H
+                            && !(this.show_style || this.show_search || this.show_ai)
+                        {
+                            this.bar_shown = false;
+                        }
                         // ★ 天头眉批（v1.37.0）：按下落在天头 → 抬起就地开写。
                         //   必须排在最前：天头那一下不能翻页、不能弹工具条。
                         //   已在写另一条时，先落笔存好手上这条，再在新位置起一条。
@@ -1509,7 +1543,7 @@ impl Root {
             // 同时清除拖选选区。
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|this, _event, _window, cx| {
+            cx.listener(|this, event: &MouseDownEvent, _window, cx| {
                 // 笔记浮层开着时，点浮层以外的任何地方＝自动保存笔记；
                 // 同时「吃掉」本次按下记录，避免松手时误翻页。
                 // 打开浮层那一下的按下要放过（见 note_suppress_commit）。
@@ -1543,6 +1577,19 @@ impl Root {
                 // （工具条上其它入口都走 set_ui_state → close_transient_ui，已覆盖；
                 //  菜单项自身 stop_propagation，不受影响。）
                 this.export_menu = false;
+                // 「更多」下拉同理（v1.86.0 补齐）：v1.80.0 把它搬进顶栏时，
+                // 只接了按钮自身的开合，没接「点外部即收」——于是菜单展开后
+                // 点纸面收不掉，只能再点一次按钮。这里补上，与导出菜单同待遇。
+                this.more_menu = false;
+                // 点纸面即收顶栏（v1.86.0）：天头是「要用才下来」的，点正文
+                // 就说明用户已经回到书里，栏该退回去。**点在栏身上不算**
+                // （y ≤ BAR_H 的空白处），否则点栏内的空当会把栏自己收掉。
+                if !this.focus_mode
+                    && event.position.y.to_f64() as f32 > BAR_H
+                    && !(this.show_style || this.show_search || this.show_ai)
+                {
+                    this.bar_shown = false;
+                }
                 // 导出收尾话看完即走：下一次点纸面就清（v1.52.3）。
                 this.toast = None;
                 // 窄屏引导同理：点一下纸面即收（v1.52.3）。
@@ -1552,13 +1599,30 @@ impl Root {
         );
         // 悬停查词：鼠标停在一个字上满 500ms 就浮出字书浮签。
         // 只在**非专注模式**生效（专注模式连顶栏都收了，不该冒签）。
-        // v1.52.1 起顶栏常驻，此处不再驱动显隐——`bar_shown` 恒 true。
-        // root 铺满整窗、又是冒泡链末端，鼠标在纸面任何一处都会到这里。
+        //
+        // v1.86.0：这一条同时驱动**顶栏显隐**——root 铺满整窗、又是冒泡链
+        // 末端，鼠标在窗口任何一处移动都会到这里，正好拿 y 判「在不在天头」。
+        // 判据三档：
+        //   ① 鼠标贴顶（y ≤ BAR_HOT）→ 出；
+        //   ② 已经出来且还在栏下沿外一点点（y ≤ BAR_H + BAR_GAP）→ 留着（迟滞）；
+        //   ③ 有面板正开着（版字 / 检索 / 问笺 / 更多）→ 钉住不收，否则用户
+        //      正在调字号，鼠标一往下，入口连同面板的「归属感」一起消失。
         root = root.on_mouse_move(cx.listener(
             |this, event: &MouseMoveEvent, _window, cx| {
                 if !this.focus_mode {
                     let x = event.position.x.to_f64() as f32;
                     let y = event.position.y.to_f64() as f32;
+                    let pinned = this.more_menu
+                        || this.show_style
+                        || this.show_search
+                        || this.show_ai;
+                    let want = pinned
+                        || y <= BAR_HOT
+                        || (this.bar_shown && y <= BAR_H + BAR_GAP);
+                    if this.bar_shown != want {
+                        this.bar_shown = want;
+                        cx.notify();
+                    }
                     this.probe_hover(x, y, cx);
                 }
             },
@@ -3924,7 +3988,11 @@ impl Root {
         };
 
         // ---- 左组：书阁（回书架） / 目录（卷目） ----
-        let mut left = div().h(px(BAR_H)).flex().items_center().pl(px(26.0));
+        //
+        // v1.86.0：三组不再分居左右两端——**六枚整体居中**成一行。原先左组
+        // 贴左、中组绝对居中、右组贴右，屏幕上六枚散成三簇，视线要来回扫；
+        // 合成一行之后，天头只有「一小段字」，两边留白托着它，反而更静。
+        let mut left = div().h(px(BAR_H)).flex().items_center();
         left = left.child(item("书阁", false).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
@@ -3963,7 +4031,7 @@ impl Root {
         mid = mid.child(sep());
 
         // ---- 右组：检索 / 笔记 / 问笺 / 导出 / 帮助（最右那枚降权）----
-        let mut right = div().h(px(BAR_H)).flex().items_center().pr(px(26.0));
+        let mut right = div().h(px(BAR_H)).flex().items_center();
         right = right.child(item("检索", self.show_search).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
@@ -3989,14 +4057,10 @@ impl Root {
         // 几次的「帮助」，现在都住在这一枚里——顶栏只需留「天天点的那几件」。
         // 点哪条都直接弹系统保存对话框；菜单本体与旧的「导出」同形同构，
         // 只是名字更中性（里头不只有导出）。
-        right = right.child(item("更多", self.more_menu).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.more_menu = !this.more_menu;
-                cx.notify();
-            }),
-        ));
+        //
+        // v1.86.0：钮与菜单一起包进一层 `relative`（见下方菜单构造完之后），
+        // 因为六枚已居中，「更多」不再贴右缘——菜单若还钉在窗右侧，就与
+        // 自己的钮脱开了。包一层之后菜单跟着钮走，位置由钮决定。
 
         // v1.52.2：**导出下拉本体**。`export_menu` 为 true 时在「导出」钮正
         // 下方画一枚极简纸签（宣纸 veil 底 + 一线界框 + 微阴影），四条导出
@@ -4030,7 +4094,9 @@ impl Root {
         let mut menu = div()
             .absolute()
             .top(px(BAR_H + 4.0))
-            .right(px(12.0))
+            // v1.86.0：菜单挂在「更多」钮那一层 `relative` 里，故这里的 right
+            // 以钮的右缘为基准（负值 = 往右探出一点），整张纸签正好垂在钮下。
+            .right(px(-6.0))
             .w(px(136.0))
             .bg(rgba(veil))
             .border_1()
@@ -4276,12 +4342,33 @@ impl Root {
             }),
         ));
 
+        // 「更多」+ 下拉：包一层 `relative` 当定位基准（见函数里「更多」那段
+        // 注释）。菜单绝对定位、挂在钮的正下方——钮居中到哪，菜单就跟到哪。
+        let mut more_wrap = div().relative().h(px(BAR_H)).flex().items_center();
+        more_wrap = more_wrap.child(item("更多", self.more_menu).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.more_menu = !this.more_menu;
+                cx.notify();
+            }),
+        ));
+        if self.more_menu {
+            more_wrap = more_wrap.child(menu);
+        }
+        right = right.child(more_wrap);
+
         // v1.52.1 排障：常驻顶栏曾不显示，两因叠加——① `.absolute()` 与
         // `.relative()` 并存（relative 覆盖 absolute，掉出绝对定位、被 flex_1
         // 正文挤飞）；② 出场动画 `top(-BAR_H*(1-v))` 在 bar_shown 恒 true 时
         // 不再重播、卡在 v=0 → top:-44 藏到窗顶外。现改：纯 absolute 钉 top:0、
-        // 去 relative、flex_none 防挤、去显隐动画（常驻无需滑入滑出），靠「最后
-        // 绘制的子节点」天然盖在纸面之上（GPUI 0.2.2 无 z_index API）。
+        // 去 relative、flex_none 防挤，靠「最后绘制的子节点」天然盖在纸面之上
+        // （GPUI 0.2.2 无 z_index API）。
+        //
+        // v1.86.0 恢复滑出：当年「卡在 v=0」的根因是**元素 id 不变**——
+        // `with_animation` 只在 id 变化时重播。故显隐两态各用一个 id
+        // （`reading-bar-in` / `reading-bar-out`），每次翻转 id 都换，动画
+        // 必然从头跑一遍，不会再卡住。
         let mut bar = div()
             .absolute()
             .top(px(0.0))
@@ -4292,48 +4379,44 @@ impl Root {
             .flex()
             .flex_row()
             .items_center()
+            .justify_center()
             .bg(rgba(veil))
             .font_family(family)
             .text_color(rgb(t.ink()));
 
-        // 三列等分：左组贴左、中组绝对居中、右组贴右——中组不会被左右两组的
-        // 宽度推歪（三格 `flex_1` 而不是 `space-between`）。
+        // **一行居中**（v1.86.0）：六枚 + 两道界行编成一条，整条在天头里居中。
+        // 不再是「三格等分」（左贴左 / 中居中 / 右贴右）——那样的六枚散成三簇，
+        // 视线要在屏幕两端来回扫；编成一行后，天头只剩中间一小段字，两侧留白
+        // 把它托住，读古籍时才「静」。
         bar = bar
-            .child(
-                div()
-                    .flex_1()
-                    .h(px(BAR_H))
-                    .flex()
-                    .items_center()
-                    .justify_start()
-                    .child(left),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .h(px(BAR_H))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(mid),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .h(px(BAR_H))
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .child(right),
-            );
+            .child(left)
+            .child(mid)
+            .child(right);
 
-        // 导出下拉展开时挂到栏容器最末：绝对定位不占 flex 流，后绘制盖住纸面。
-        if self.more_menu {
-            bar = bar.child(menu);
-        }
+        // 导出下拉展开时挂到「更多」钮那一层（见上），不再挂到整条栏容器上。
 
-        // v1.52.1：常驻顶栏不再有滑入 / 滑出动画（显隐已撤销，bar_shown 恒 true，
-        // 动画反而会把 top 卡在 -BAR_H 藏上窗顶）。直接静态 top:0 交付。
+        // v1.86.0：**滑出 / 收回**。平时整条落在窗顶之外（top = -(BAR_H+2)），
+        // 鼠标贴上屏幕最上沿（`BAR_HOT`）才滑下来；滑出后带 16px 迟滞
+        // （`BAR_GAP`），退开一步才收回——不会「一下去就收、一上来又出」。
+        //
+        // 显隐两态用**两个 id**：`with_animation` 只在 id 变化时重播，这也是
+        // v1.52.1「卡在 v=0 藏到窗顶外」的真正病根（当年 bar_shown 恒 true，
+        // id 永不变，动画只跑过一次就被钉死在起点）。
+        let shown = self.bar_shown;
+        // 2px 余量：收起时连那道 1px 的顶边也不留，彻底「无栏」。
+        let bar = bar.with_animation(
+            SharedString::from(if shown {
+                "reading-bar-in"
+            } else {
+                "reading-bar-out"
+            }),
+            Animation::new(Duration::from_millis(220)),
+            move |bar, delta| {
+                let v = if shown { delta } else { 1.0 - delta };
+                bar.top(px(-(BAR_H + 2.0) * (1.0 - v))).opacity(v)
+            },
+        );
+
         let _ = total;
         bar.into_any_element()
     }
@@ -4924,7 +5007,9 @@ impl Root {
         // 贯通到版框底。
         let foot = div()
             .absolute()
-            .left(px(0.0))
+            // v1.86.0：内框有了 `INNER_PAD` 横向内衬，地脚这条绝对定位的叶码
+            // 要跟着一起右移，否则会压到左边那道朱线上。
+            .left(px(INNER_PAD))
             .bottom(px(0.0))
             .w(px(grid_w))
             .h(px(foot_h))
@@ -4963,8 +5048,15 @@ impl Root {
         // 右叶左缘）也设框线——左右两叶拼成一整张纸时，外框围住整页外缘、
         // 内侧各一道粗竖框把中缝夹住；单叶（Alone）同样四边全封闭。
         // 内层 `relative`：地脚 / 卷首题署都用绝对定位叠在行格之上。
+        //
+        // v1.86.0「呼吸感」：内框横向加 `INNER_PAD` 的内衬——字与左右两道
+        // 朱线之间留一线白，整版不再被框死。**只加横向**：天头地脚的 3:2
+        // 铁律（`TOP_OF_BOT`）一寸不动；左右对称，两叶仍严格镜像。
+        // 版框本身因此宽出 2×`INNER_PAD`，正好吃掉引擎给版框预留的
+        // `ANCIENT_EDGE`（50）余量，不会挤到中缝。
         let mut inner = div()
             .relative()
+            .px(px(INNER_PAD))
             .border_color(rgb(t.frame_ink()))
             .child(grid)
             .child(foot);
@@ -5160,17 +5252,25 @@ impl Root {
         // 故翻页 / 改字号 / 换列数 / 换留白档都自动跟随。非交互（导出长图、
         // 分享卡）不画——那两处不该带上阅读时随手写下的批语。
         if geo.interactive {
+            // `pl + INNER_PAD`：天头眉批挂在**纸面**上按纸面坐标画，而字格
+            // 自 v1.86.0 起又往内缩了一道 `INNER_PAD`，故画布原点同步右移，
+            // 引线才仍落在字上（宽度同步加两倍内衬）。
             sheet = sheet.child(self.render_margin_layer(
                 columns,
                 start_chapter,
                 back,
-                pl,
-                grid_w + pl + pr + FRAME_OFF * 2.0,
+                pl + INNER_PAD,
+                grid_w + pl + pr + FRAME_OFF * 2.0 + INNER_PAD * 2.0,
                 cx,
             ));
             // 正在写的那条：输入框就地落在天头（canvas 接不了 IME，故这一处
             // 仍是元素）。存下来之后就归画布那一层画了。
-            sheet = sheet.child(self.render_margin_draft(columns, start_chapter, pl, cx));
+            sheet = sheet.child(self.render_margin_draft(
+                columns,
+                start_chapter,
+                pl + INNER_PAD,
+                cx,
+            ));
         }
 
         sheet
