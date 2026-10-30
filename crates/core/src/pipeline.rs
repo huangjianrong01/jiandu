@@ -117,6 +117,16 @@ pub fn sniff_kind(name: &str, head: &str) -> SrcKind {
 /// 所以这里不能只看 `from_utf8` 成功与否就完事——但也不能一上来就按 GBK
 /// 解（那会把 UTF-8 的中文解成「锟斤拷」）。顺序是：BOM → UTF-8 → GBK。
 pub fn decode_bytes(bytes: &[u8]) -> String {
+    // v1.9.9：**加强版编码嗅探**。老逻辑只要 `from_utf8` 成功就交差，于是
+    // 「UTF-8 合法但其实是乱码」（BOM 骗人 / 中途被转过码 / PUA 缺字成片）
+    // 会一路放行，用户看到的就是满页方框。新漏斗多加两道：乱码体检 + Big5，
+    // 见 [`crate::dclean::sniff_decode`]（它是本函数的严格超集，行为兼容）。
+    crate::dclean::sniff_decode(bytes)
+}
+
+/// 老解码路径，原样保留给单测对照（BOM → UTF-8 → GBK，不做体检）。
+#[doc(hidden)]
+pub fn decode_bytes_legacy(bytes: &[u8]) -> String {
     // UTF-8 BOM
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return String::from_utf8_lossy(&bytes[3..]).into_owned();
@@ -373,6 +383,10 @@ pub fn parse_txt(text: &str) -> Vec<RawChapter> {
     let mut title = "正文".to_string();
     let mut paras: Vec<String> = Vec::new();
     let mut buf = String::new();
+    // `buf` 的字数**增量累加**：每加一行就加上该行的字数。`should_break_para`
+    // 每行都要问一次「攒够了没」，每次对 buf 全量 `chars().count()` 是 O(n²)
+    // ——50MB 文件实测白白吃掉两秒。
+    let mut buf_chars = 0usize;
     let mut saw_head = false;
 
     let flush = |paras: &mut Vec<String>, buf: &mut String| {
@@ -387,16 +401,27 @@ pub fn parse_txt(text: &str) -> Vec<RawChapter> {
         let line = raw.trim();
         if line.is_empty() {
             flush(&mut paras, &mut buf);
+            buf_chars = 0;
             continue;
         }
         if is_chapter_head(line) || txt_is_title_line(line) {
             flush(&mut paras, &mut buf);
+            buf_chars = 0;
             push_chapter(&mut chapters, &title, &mut paras);
             title = line.to_string();
             saw_head = true;
             continue;
         }
+        // v1.9.9 **智能断行**：原本是「非空行一律接到 buf，空行才分段」，
+        // 结果整章几千字糊成一段。现在改成攒够 [`dclean::MERGE_PARA_CHARS`]
+        // 字且上一行已收句才另起一段——碎片行照样被并掉（没标点绝不断），
+        // 长章也不会糊成一坨。见 `dclean::should_break_para`。
+        if crate::dclean::should_break_para(&buf, buf_chars, crate::dclean::MERGE_PARA_CHARS) {
+            flush(&mut paras, &mut buf);
+            buf_chars = 0;
+        }
         buf.push_str(line);
+        buf_chars += line.chars().count();
     }
     flush(&mut paras, &mut buf);
     push_chapter(&mut chapters, &title, &mut paras);
@@ -1575,6 +1600,10 @@ pub fn paragraph_of(line: &str) -> Paragraph {
 pub fn parse_docx(bytes: &[u8]) -> Result<Vec<RawChapter>> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| anyhow!("这不是一个能打开的 docx（zip 打不开：{e}）"))?;
+    // v1.9.9：脚注表先读（双行夹注在 Word 里常常就是脚注）。包里没有就是
+    // 空表，`attach_footnotes` 自然什么也不做——与 `docx::import_docx_into`
+    // 那条链同口径，两条路径都要支持，否则 UI 走老路径时注文照样丢。
+    let notes = read_footnotes_zip(&mut zip);
     let mut xml = String::new();
     {
         let mut f = zip.by_name("word/document.xml").map_err(|_| {
@@ -1583,7 +1612,23 @@ pub fn parse_docx(bytes: &[u8]) -> Result<Vec<RawChapter>> {
         f.read_to_string(&mut xml)
             .map_err(|e| anyhow!("读不出正文：{e}"))?;
     }
+    // 哨兵 → `[注]…[/注]`，下游自然落成双行夹注。
+    let xml = crate::dclean::attach_footnotes(&xml, &notes);
     Ok(docx_xml_to_chapters(&xml))
+}
+
+/// 从已打开的 docx 包里读 `word/footnotes.xml`（没有就是空表，不算错）。
+fn read_footnotes_zip<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> std::collections::HashMap<i64, String> {
+    let Ok(mut f) = zip.by_name("word/footnotes.xml") else {
+        return std::collections::HashMap::new();
+    };
+    let mut s = String::new();
+    if f.read_to_string(&mut s).is_err() {
+        return std::collections::HashMap::new();
+    }
+    crate::dclean::parse_footnotes_xml(&s)
 }
 
 /// `w:p` 段落流 → 章数组（标题级 ≤2 开新章，3 级以下当章内小标题段）。

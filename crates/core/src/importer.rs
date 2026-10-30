@@ -474,7 +474,10 @@ pub fn book_from_plaintext(fallback_title: &str, text: &str) -> Book {
     // 头部幽灵先切一刀（BOM / 零宽 / 全角空格 / YAML 元数据块 / 连续空行）：
     // 书名自动识别看的是「第一行」，不先洗就会把 `---` / `title:` 认成书名。
     // 切章（`parse_txt`）内部还会再洗一次，两次结果一致（幂等）。
-    let clean = crate::cleaner::strip_head_junk(text);
+    // v1.9.9：**防盗版广告整行剔除**放在书名识别**之前**——网上下载的 txt
+    // 头几行往往就是「本书由XX提供下载 / 更多精品请访问www…」，不先剔掉，
+    // 自动识别出来的书名就是一句广告词（`detect_title_author` 看的是首行）。
+    let clean = crate::dclean::strip_piracy_lines(&crate::cleaner::strip_head_junk(text));
     let (detected, author) = detect_title_author(&clean);
     let chapters = crate::pipeline::parse_txt(&clean);
     let mut book = crate::pipeline::chapters_to_book(fallback_title, &author, chapters);
@@ -795,10 +798,13 @@ fn value_to_chapter(ch: &serde_json::Value) -> Chapter {
         .unwrap_or("")
         .to_string();
     let mut paragraphs: Vec<Paragraph> = Vec::new();
+    // v1.9.9：JSON 里的内容字段常常整段塞着 `<p>正文</p>`，先洗净再入段。
     if let Some(ps) = ch.get("paragraphs").and_then(|x| x.as_array()) {
         for p in ps {
             match p {
-                serde_json::Value::String(s) => paragraphs.push(para_of(s)),
+                serde_json::Value::String(s) => {
+                    paragraphs.push(para_of(&crate::dclean::strip_html_residue(s)))
+                }
                 serde_json::Value::Object(_) => {
                     if let Ok(pp) = serde_json::from_value::<Paragraph>(p.clone()) {
                         paragraphs.push(pp);
@@ -808,10 +814,23 @@ fn value_to_chapter(ch: &serde_json::Value) -> Chapter {
             }
         }
     } else if let Some(content) = ch.get("content").and_then(|x| x.as_str()) {
-        for seg in content.split('\n') {
+        let washed = crate::dclean::strip_html_residue(content);
+        for seg in washed.split('\n') {
             let seg = seg.trim();
             if !seg.is_empty() {
                 paragraphs.push(para_of(seg));
+            }
+        }
+    }
+    // v1.9.9 **递归字段寻址兜底**：结构千奇百怪（正文埋在
+    // `data.list[].body.text` 这种地方），取不到就全局捞一遍像正文的字段。
+    if paragraphs.is_empty() {
+        for s in crate::dclean::deep_pick_text(ch) {
+            for seg in s.split('\n') {
+                let seg = seg.trim();
+                if !seg.is_empty() {
+                    paragraphs.push(para_of(seg));
+                }
             }
         }
     }
@@ -1586,6 +1605,10 @@ pub fn import_txt_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> 
     let mut paras: Vec<Paragraph> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
     let mut done: usize = 0;
+    // v1.9.9：段的累积器（智能断行）+ 本章已攒字数（**增量**，见下面 acc 注释）。
+    let mut para_buf = String::new();
+    let mut para_chars = 0usize;
+    let mut acc: usize = 0;
     let mut head: Vec<String> = Vec::new(); // 前几行留着认书名 / 作者
     // YAML / TOML 式元数据块（`---` … `---`）：notion / Obsidian / Jekyll 导出的
     // txt 常见。整块跳过——否则 `title:` `author:` 会变成第一章的第一段，
@@ -1627,11 +1650,24 @@ pub fn import_txt_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> 
                 continue; // 块内一律丢
             }
         }
+        // v1.9.9 **防盗版广告整行剔除**：必须在**书名识别之前**——网上下载的
+        // txt 头几行就是「本书由XX提供下载 / 更多精品请访问www…」，不先剔掉，
+        // `detect_title_author` 认出来的书名就是一句广告词。
+        if crate::dclean::is_piracy_line(l) {
+            continue;
+        }
         if head.len() < 6 {
             head.push(l.to_string());
         }
         // 章题：交掉手上的一章，另起一章。
         if crate::pipeline::is_chapter_head(l) && l.chars().count() <= 40 {
+            // 先把攒着的半段交出去，免得它串到下一章开头。
+            if !para_buf.is_empty() {
+                paras.push(crate::pipeline::paragraph_of(&para_buf));
+                para_buf.clear();
+                para_chars = 0;
+            }
+            acc = 0;
             if !paras.is_empty() {
                 sink.push(Chapter {
                     title: cur_title.clone(),
@@ -1641,16 +1677,40 @@ pub fn import_txt_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> 
             cur_title = l.to_string();
             continue;
         }
-        paras.push(crate::pipeline::paragraph_of(l));
+        // v1.9.9 **智能断行**：原先是**每行一段**，扫描本的碎行落到竖排里就是
+        // 满屏只有几个字的碎片列。改成攒够 `MERGE_PARA_CHARS` 字且上一行已收句
+        // 才收段（没标点绝不断），见 `dclean::should_break_para`。
+        if crate::dclean::should_break_para(&para_buf, para_chars, crate::dclean::MERGE_PARA_CHARS) {
+            paras.push(crate::pipeline::paragraph_of(&para_buf));
+            acc += para_chars;
+            para_buf.clear();
+            para_chars = 0;
+        }
+        para_buf.push_str(l);
+        para_chars += l.chars().count();
         // **硬上限**：攒够 5000 字就交出去——整本没有一条章题的书（扫描本
         // 常见）靠这一刀切成等长的卷，绝不会攒成百万字的一章。
-        let acc: usize = paras.iter().map(|p| p.text.chars().count()).sum();
-        if acc >= MAX_CHAPTER_CHARS {
+        //
+        // ⚠️ 字数改为**增量累加**：原先每读一行就把整章 `paras` 全量 sum 一遍，
+        // 攒到 5000 字要算几百次全章求和 —— O(n²)，50MB 文件光这一项就吃掉
+        // 好几秒。现在只在收段时加一次。
+        if acc + para_chars >= MAX_CHAPTER_CHARS {
+            if !para_buf.is_empty() {
+                paras.push(crate::pipeline::paragraph_of(&para_buf));
+                acc += para_chars;
+                para_buf.clear();
+                para_chars = 0;
+            }
             sink.push(Chapter {
                 title: cur_title.clone(),
                 paragraphs: std::mem::take(&mut paras),
             });
+            acc = 0;
         }
+    }
+    // 收尾：最后那半段别落下。
+    if !para_buf.is_empty() {
+        paras.push(crate::pipeline::paragraph_of(&para_buf));
     }
     if !paras.is_empty() {
         sink.push(Chapter {
@@ -1685,7 +1745,20 @@ fn detect_utf8(path: &Path) -> bool {
     if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return true;
     }
-    std::str::from_utf8(&head).is_ok()
+    // ⚠️ **这里曾是整本变乱码的元凶**：固定切前 8192 字节，而这个位置几乎
+    // 必然落在某个汉字的第 2 / 第 3 个字节上（8192 不能被 3 整除，纯中文
+    // 文件必中），`from_utf8` 于是判失败 → 一本好好的 UTF-8 书被当成 GBK
+    // 解，正文满屏「鍗�」、书名也跟着烂掉。
+    //
+    // 修法：末尾最多回退 3 字节（UTF-8 一个字符最长 4 字节），退到最近的
+    // **合法字符边界**再判。只在真的整段都解不开时才认它不是 UTF-8。
+    for back in 0..4usize {
+        let end = n.saturating_sub(back);
+        if std::str::from_utf8(&head[..end]).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// EPUB **流式**导入：按 spine 顺序**逐篇**读一个 zip 条目、清洗、切片、

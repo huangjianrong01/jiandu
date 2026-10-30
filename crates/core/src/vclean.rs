@@ -1493,6 +1493,14 @@ pub fn clean_epub(html: &str) -> Vec<RawChapter> {
     // 排在最前面——晚一步表格里的字就被当成正文收进来了，再也分不出
     // 哪些是表格里的、哪些是正文。
     let html = drop_tag_blocks(html, &TABLE_TAGS);
+    // v1.9.9 加强版三件套，顺序有讲究：
+    //   ① 先剥内联样式（**只删 style 属性，标签留着**——`<p>` 是段落边界，
+    //      连标签一起删会把段落糊成一片）；
+    //   ② 再认专名号（要读 class，所以必须在 ① 之后、且 ① 不能吃掉 class）；
+    //   ③ 最后处理图片假标点（同样要读 class / alt）。
+    let html = crate::dclean::strip_inline_styles(&html);
+    let html = crate::dclean::proper_noun_marks(&html);
+    let html = crate::dclean::img_punct_to_text(&html);
     // `<sup>` 幽灵字先吃掉（见 `parsers::strip_sup_marks`）：导入走的是逐份
     // xhtml 直接调本函数，不经过 `UniversalParser`，这道闸必须装在这里。
     let html = crate::parsers::strip_sup_marks(&html);

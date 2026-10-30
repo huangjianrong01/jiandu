@@ -110,6 +110,11 @@ pub fn import_docx_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| anyhow!("这不是一个能打开的 docx（zip 打不开：{e}）"))?;
 
+    // v1.9.9：先读 `word/footnotes.xml`。古籍的双行夹注在 Word 里常常就是
+    // 脚注，老漏斗只抽 document.xml，注文整片丢，正文里只剩一个光秃秃的注号。
+    // 读不到（包里没有脚注）就是空表，后面 `attach_footnotes` 自然什么也不做。
+    let notes = read_footnotes(&mut zip);
+
     // 正文只认主文档；缺了它就是坏包 / 老版 .doc。
     let (text, stats) = {
         let mut entry = zip.by_name("word/document.xml").map_err(|_| {
@@ -125,6 +130,9 @@ pub fn import_docx_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
         };
         extract_docx_stream(&mut entry, &mut cb)?
     };
+
+    // 哨兵 → 真注文（`[注]…[/注]`，下游 TXT 漏斗自然落成双行夹注）。
+    let text = crate::dclean::attach_footnotes(&text, &notes);
 
     if text.trim().is_empty() {
         return Err(anyhow!(
@@ -176,6 +184,23 @@ pub fn import_docx_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
     }
     sink.tick(1.0, "刻本 完成");
     Ok(skeleton)
+}
+
+/// 从包里的 `word/footnotes.xml` 读脚注表（`脚注 id → 注文`）。
+///
+/// 包里没这个条目（多数 docx 根本没有脚注）→ 返回空表，不是错误。XML 坏 /
+/// 截断 → 保留已读到的部分（与 `dclean::parse_footnotes_xml` 同口径）。
+fn read_footnotes<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> std::collections::HashMap<i64, String> {
+    let Ok(mut entry) = zip.by_name("word/footnotes.xml") else {
+        return std::collections::HashMap::new();
+    };
+    let mut xml = String::new();
+    if std::io::Read::read_to_string(&mut entry, &mut xml).is_err() {
+        return std::collections::HashMap::new();
+    }
+    crate::dclean::parse_footnotes_xml(&xml)
 }
 
 // ---------------------------------------------------------------------------
@@ -419,14 +444,18 @@ struct ExtractSink {
 
 impl ExtractSink {
     fn flush(&mut self) {
-        let t = self.para.trim();
+        // v1.9.9：`<w:br/>`（软回车）与缩进垃圾必须在**这里**收拾掉——一旦
+        // 进了纯文本就分不出「哪个换行是软回车」。软回车两侧都是中文就直接
+        // 接上（不留缝，留缝就是竖排里的空格子），段首的全角空格 / Tab 全
+        // 部 trim。见 [`crate::dclean::tidy_docx_para`]。
+        let t = crate::dclean::tidy_docx_para(&self.para);
         if t.is_empty() {
             self.para.clear();
             return;
         }
         // 目录的**标题行**（「Table of Contents」/「目录」）站在域外面，
         // 不单独挡掉就会变成「正文」第一章里孤零零的一行洋文。
-        if is_toc_label(t) {
+        if is_toc_label(&t) {
             self.para.clear();
             return;
         }
@@ -437,7 +466,7 @@ impl ExtractSink {
         if !self.out.is_empty() {
             self.out.push('\n');
         }
-        self.out.push_str(&curly_to_note(t));
+        self.out.push_str(&curly_to_note(&t));
         self.out.push('\n');
         self.para.clear();
     }
@@ -523,6 +552,16 @@ fn run_extract<R: BufRead>(
                 }
                 "tab" if st.skip == 0 && st.instr == 0 && !st.in_toc => st.para.push(' '),
                 "br" if st.skip == 0 && st.instr == 0 && !st.in_toc => st.para.push('\n'),
+                // v1.9.9：脚注引用 —— 埋一个哨兵，等整篇抽完再换成真注文
+                // （见 `dclean::attach_footnotes`）。注号本身不落进正文，
+                // 免得变成光秃秃一个数字杵在句子里。
+                "footnotereference" if st.skip == 0 => {
+                    if let Some(v) = attr(&e, b"id") {
+                        if let Ok(n) = v.trim().parse::<i64>() {
+                            st.para.push_str(&crate::dclean::footnote_sentinel(n));
+                        }
+                    }
+                }
                 _ => {}
             },
 

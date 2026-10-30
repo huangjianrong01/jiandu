@@ -38,6 +38,10 @@ pub mod search;
 pub mod kg;
 /// **清洗器**（v1.54.0）：两遍扫描——去噪 + 重建语义，产出 IR。
 pub mod cleaner;
+/// **加强版深度清洗漏斗**（v1.9.9）：TXT 广告行 / 智能断行 / 编码嗅探，
+/// EPUB 内联样式 / 图片假标点 / 专名号，JSON 递归寻址 / HTML 残留，
+/// DOCX 脚注 / 软回车 / 缩进垃圾。全是纯函数，先过单测才准接进漏斗。
+pub mod dclean;
 pub mod content;
 /// **常用字白名单**（v1.81.0）：自动注音的判据（GB2312 一级字 + 其繁体形）。
 /// 文件由 `scripts/gen_common_chars.py` 生成，勿手改。
