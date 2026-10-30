@@ -90,6 +90,7 @@ mod share_layout;
 mod share_paint;
 mod shelf;
 mod sound;
+mod storekit;
 mod tts;
 mod zen_kit;
 

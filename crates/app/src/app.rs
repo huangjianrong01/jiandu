@@ -1489,7 +1489,14 @@ impl Root {
                 // 激活纸（v1.81.0 · 模块六）：同款调试口子。想核对「已激活」
                 // 那一屏，先 `python3 scripts/gen_license.py` 铸一枚、用
                 // `JIANDU_HOME=<临时目录>` 起一次、在纸上敲进去即可。
-                "license" => root.show_license = true,
+                "license" => {
+                    // v1.9.9：商店版不认这枚调试口子（2.4.5(vi)）——调试钩子
+                    // 也要一起摘，否则审核照着备注敲一下就能翻出激活屏。
+                    #[cfg(not(feature = "appstore"))]
+                    {
+                        root.show_license = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -3595,13 +3602,26 @@ impl Root {
         // 批注 / 卡片 CSV / Obsidian 全都过这个闸门，漏一个就等于那条路免费。
         // 阅读、批注、卡片匣、文本分析**不受影响**——没付钱也该能读完一本书。
         if !self.licensed() {
-            // 内测期满了要说清楚「满」而不是「没激活」——拿着邀请码却被告知
-            // 「未激活」，人只会以为码敲错了，然后一遍遍重敲。
-            self.notice = if self.beta_left == 0 {
-                "内测期已满（7 天）：导出与印制需用授权 key 激活（更多 → 激活）".to_string()
-            } else {
-                "未激活：导出与印制需先激活（更多 → 激活）".to_string()
-            };
+            // v1.9.9：商店版没有「激活 key」这条路，提示必须指向内购，
+            // 不能指向一个压根不存在的「更多 → 激活」。
+            //
+            // ⚠️ TODO(上架)：接真 StoreKit 后，菜单里要补一项「解锁全部功能」
+            // 调 `storekit::purchase()`（外加一项「恢复购买」调 `restore()`），
+            // 否则这里的提示说了去处却没有门可走。
+            #[cfg(feature = "appstore")]
+            {
+                self.notice = "导出与印制需先解锁（App Store 内购）".to_string();
+            }
+            #[cfg(not(feature = "appstore"))]
+            {
+                // 内测期满了要说清楚「满」而不是「没激活」——拿着邀请码却被告知
+                // 「未激活」，人只会以为码敲错了，然后一遍遍重敲。
+                self.notice = if self.beta_left == 0 {
+                    "内测期已满（7 天）：导出与印制需用授权 key 激活（更多 → 激活）".to_string()
+                } else {
+                    "未激活：导出与印制需先激活（更多 → 激活）".to_string()
+                };
+            }
             cx.notify();
             return false;
         }
@@ -3615,11 +3635,23 @@ impl Root {
     /// 已激活——人家在帮忙测，把导出锁上没道理）。将来接 App Store 内购，
     /// 在这里再加一条「或收据有效」即可，其余代码一行不动。
     pub fn licensed(&self) -> bool {
+        // v1.9.9 · 商店版：**只认 App Store 收据**。
+        //
+        // App Review 2.4.5(vi) 禁止 licence screen / licence key / 自有 copy
+        // protection，所以离线 key 与内测码在商店版里**一律不参与判断**——
+        // 不是「不用它解锁」，而是它压根不该存在（UI 入口也一并摘了）。
+        #[cfg(feature = "appstore")]
+        {
+            return crate::storekit::purchased();
+        }
         // 用**缓存字段**而不是每次去读文件：`render_license_sheet` 每帧都要问
         // 一次这一句，走 `gate::redeemed()` 就成了一帧一次磁盘读。
         // 内测码**只在期内**视同已激活（v1.82.0 起 7 天）：码被转发出去也不会
         // 变成永久免费的出口；但到期只锁导出与印制，阅读一概不动。
-        self.license_ok || self.beta_left > 0
+        #[cfg(not(feature = "appstore"))]
+        {
+            self.license_ok || self.beta_left > 0
+        }
     }
 
     pub fn export_page_png(&mut self, _window: &Window, cx: &mut Context<Self>) {

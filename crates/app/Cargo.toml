@@ -48,6 +48,15 @@ rusqlite = { version = "0.32.1", features = ["bundled"] }
 # 旧制用 `screencapture` 截屏：依赖屏幕录制权限、分辨率随窗口、锁屏即失败。
 # 现在走 CoreGraphics 位图上下文 + CoreText 逐字落笔，**真正离屏**渲染
 # 1080×1920 高清 PNG，再交给系统保存框 / 剪贴板。仅 macOS 目标编译。
+# v1.9.9 · Mac App Store 上架开关。
+#
+# 打开后：应用不再有激活屏 / 激活码 / 内测码——App Review 2.4.5(vi) 明令
+# 禁止 licence screen、licence key 与自有 copy protection。「能不能出活」
+# 改由 App Store 收据说了算（见 `storekit`）。
+# 官网分发版不带此 feature，仍走离线 key（`jiandu_core::license`）。
+[features]
+appstore = []
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"
 core-text = "21"

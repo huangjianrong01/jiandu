@@ -4505,15 +4505,22 @@ impl Root {
         // ③·f **激活**（v1.81.0 · 模块六）：未激活时导出与印制是锁着的，
         //      菜单上必须有一处能走到那张纸——否则用户撞见「未激活」提示后
         //      找不到门。已激活也留着这一项：点了是回执（凭据 + 不绑机说明）。
-        let lic_label = if self.licensed() { "已激活" } else { "激活" };
-        menu = menu.child(mitem("more-license", lic_label).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.more_menu = false;
-                this.open_license(cx);
-            }),
-        ));
+        //
+        //      v1.9.9：商店版**不挂这一项**。App Review 2.4.5(vi) 禁止
+        //      licence screen 与 licence key，菜单上留个「激活」等于给审核
+        //      递把柄；商店版的解锁由 StoreKit 收据决定，用户侧没有可点的门。
+        #[cfg(not(feature = "appstore"))]
+        {
+            let lic_label = if self.licensed() { "已激活" } else { "激活" };
+            menu = menu.child(mitem("more-license", lic_label).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.more_menu = false;
+                    this.open_license(cx);
+                }),
+            ));
+        }
         // ④ **說明**（v1.80.0）：原先顶栏最右那枚「帮助」钮搬进下拉。
         //    一年点几次的东西不该占天头一格——它在这里，且排在导出之后。
         menu = menu.child(mitem("more-help", "說明").on_mouse_down(

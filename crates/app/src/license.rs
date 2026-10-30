@@ -46,17 +46,28 @@ impl Root {
     ///
     /// 与其余顶层面板互斥：它是覆盖层，压在版字 / 检索之上会打架。
     pub fn open_license(&mut self, cx: &mut Context<Self>) {
-        self.show_license = true;
-        self.show_style = false;
-        self.show_search = false;
-        self.show_help = false;
-        self.show_keys = false;
-        self.show_analysis = false;
-        self.analysis = None;
-        self.more_menu = false;
-        self.close_side();
-        self.close_transient_ui();
-        cx.notify();
+        // v1.9.9：商店版没有激活屏。App Review 2.4.5(vi) 禁止 licence screen
+        // 与 licence key——菜单项和 dev 钩子都已摘掉，这里是第三道保险，
+        // 免得将来有人再接一条入口时漏掉。
+        //
+        // 整个函数体在商店版下**不编进来**（而不是 return 掉）——后者会留下
+        // 一截 unreachable 的死代码，编译告警里平白多一条。
+        #[cfg(feature = "appstore")]
+        let _ = cx;
+        #[cfg(not(feature = "appstore"))]
+        {
+            self.show_license = true;
+            self.show_style = false;
+            self.show_search = false;
+            self.show_help = false;
+            self.show_keys = false;
+            self.show_analysis = false;
+            self.analysis = None;
+            self.more_menu = false;
+            self.close_side();
+            self.close_transient_ui();
+            cx.notify();
+        }
     }
 
     /// 收下几枚字符（已归一：大写 + 只留字符表内的字形）。
