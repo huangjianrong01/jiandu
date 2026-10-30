@@ -7,6 +7,15 @@ plugins {
     id("rust")
 }
 
+// 绕过 Tauri CLI 移动端 frontendDist 拷贝缺陷：在 Gradle 合并资源前，
+// 把前端源目录（jiandu-tauri/src）灌进独立的 frontend_assets/，
+// 再经 sourceSets 声明为额外 assets 源目录（避免与默认 src/main/assets 的 lint 冲突）。
+val copyFrontendAssets = tasks.register<Copy>("copyFrontendAssets") {
+    // app 模块位于 src-tauri/gen/android/app，前端源在 jiandu-tauri/src，需向上 4 级
+    from("../../../../src")
+    into("frontend_assets")
+}
+
 val tauriProperties = Properties().apply {
     val propFile = file("tauri.properties")
     if (propFile.exists()) {
@@ -57,11 +66,33 @@ android {
     buildFeatures {
         buildConfig = true
     }
+
+    sourceSets {
+        getByName("main") {
+            assets.srcDir("frontend_assets")
+        }
+    }
+
+    applicationVariants.all {
+        tasks.named("merge${name.replaceFirstChar { it.uppercase() }}Assets") {
+            dependsOn(copyFrontendAssets)
+        }
+    }
 }
 
 kotlin {
     compilerOptions {
         jvmTarget = JvmTarget.JVM_1_8
+    }
+}
+
+// 让所有 lint 任务显式依赖前端拷贝任务，消除 Gradle 隐式依赖校验报错
+// （frontend_assets 既是 sourceSet 源目录又被 copyFrontendAssets 产出）
+afterEvaluate {
+    tasks.configureEach {
+        if (name.contains("Lint", ignoreCase = true)) {
+            dependsOn(copyFrontendAssets)
+        }
     }
 }
 

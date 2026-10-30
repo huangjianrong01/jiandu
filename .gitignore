@@ -13,3 +13,9 @@ ios/**/build/
 dist/
 *.app
 
+# Android 签名密钥（机密，绝不入库）
+*.keystore
+
+# Android 前端资源由 Gradle 拷贝任务生成，属构建产物
+jiandu-tauri/src-tauri/gen/android/app/frontend_assets/
+
