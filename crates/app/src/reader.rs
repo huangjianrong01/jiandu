@@ -756,12 +756,16 @@ fn banxin_vtext(line: &crate::banxin::BanxinLine, w: f32, family: &SharedString,
 /// `seal_du.svg`，等粗圆头线稿），这里只用 `text_color` 着朱砂色，
 /// 印面自留白（朱文）。
 pub(crate) fn banxin_seal(w: f32, h: f32) -> Div {
+    // v1.86.0 精致化：印面留一圈白边（朱文印本就该「红框 + 白地 + 红字」），
+    // 篆字不再贴着框线走——缩到 20px 见方时，贴边会让两字糊成一团。
+    let pad = 2.0;
     // 每枚篆字约占印面一半高：两字竖排相叠，正好是一方竖长小印。
-    let gw = (w * 0.74).max(9.0);
-    let gh = (h - 2.0) / 2.0;
+    let gw = ((w - pad * 2.0) * 0.92).max(8.0);
+    let gh = (h - pad * 2.0 - 1.0) / 2.0;
     div()
         .w(px(w))
         .h(px(h))
+        .p(px(pad))
         .border_1()
         .border_color(rgb(crate::share::CINNABAR))
         .flex()
@@ -911,6 +915,45 @@ pub(crate) fn han_num(n: usize) -> String {
         }
         _ => n.to_string(),
     }
+}
+
+/// 汉字数字（四位以内）：「八千八百五十四」。
+///
+/// 只给**底部状态栏**用。`han_num` 仍停在两位以内、越界退回阿拉伯数字——
+/// 因为它的另一批调用方是版心书口叶码（宽度按 ≤10 字预算），一旦放开到四位，
+/// 一万叶的书会把「二万七千六百三十七」塞进一条窄中缝里叠字。状态栏横排、
+/// 无宽度预算，才吃得下这么长一串。
+fn han_num4(n: usize) -> String {
+    if n < 100 {
+        return han_num(n);
+    }
+    if n >= 10_000 {
+        return n.to_string();
+    }
+    const D: [&str; 10] = ["〇", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+    let q = n / 1000;
+    let mut out = format!("{}千", D[q]);
+    let r = n % 1000;
+    let h = r / 100;
+    match h {
+        0 => {
+            // 一千零五十四：百位是空位，但后面还有数，补一个「〇」。
+            if r >= 10 {
+                out.push('〇');
+            }
+        }
+        _ => out.push_str(&format!("{}百", D[h])),
+    }
+    let r2 = r % 100;
+    if r2 == 0 {
+        // 整百 / 整千：末位不留「〇」。
+    } else if r2 < 10 {
+        out.push('〇');
+        out.push_str(D[r2]);
+    } else {
+        out.push_str(&han_num(r2));
+    }
+    out
 }
 
 /// 叶码小字「第27637葉」：极小**宋体**、纯文本，无边框、无墨签。
@@ -5192,6 +5235,9 @@ impl Root {
         // v1.83.0：仿刻本不画这行牌记——影印本的地脚只在左下角压一枚朱印，
         // 居中一行现代版权字会把「这是一页刻本」的错觉戳破。
         if geo.interactive && !self.theme.is_keben() {
+            // v1.86.0：牌记也降级成刻本口吻——繁体「箋讀數字刻本」、宋体、
+            // 8px（原先 9px 的简体现代字号仍嫌跳），再往纸色混一档。
+            let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
             sheet = sheet.child(
                 div()
                     .absolute()
@@ -5203,9 +5249,10 @@ impl Root {
                     .justify_center()
                     .child(
                         div()
-                            .text_size(px(9.0))
-                            .text_color(rgb(t.ink_soft()))
-                            .child(SharedString::from("笺读数字刻本")),
+                            .font_family(song)
+                            .text_size(px(8.0))
+                            .text_color(rgb(crate::theme::mix(t.ink_soft(), t.paper(), 0.35)))
+                            .child(SharedString::from("箋讀數字刻本")),
                     ),
             );
         }
@@ -7386,11 +7433,23 @@ impl Root {
 
     fn render_reading_status(&mut self, total: usize, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
+        // v1.86.0：古籍视图一律写繁体「葉」（版心书口叶码同字），现代视图仍是「页」。
         let unit = match self.script {
-            Script::Ancient => "叶",
+            Script::Ancient => "葉",
             Script::Modern => "页",
         };
-        let left = format!("第 {} {} / 共 {} {}", self.page + 1, unit, total, unit);
+        // v1.86.0 古风化：不再写「第 3 叶 / 共 8854 叶」——斜杠加阿拉伯数字
+        // 是仪表盘的口径。改成刻本牌记的一行小字「第三葉 · 全八千八百五十四葉」：
+        // 汉字数字、间隔号、繁体「葉」；`han_digits` 关掉时仍退回阿拉伯数字。
+        // 判据用 `script` 而不是 `han_digits`：后者是**行款**里的「叶码 / 页数码」
+        // 偏好（默认关），而这一行是纸面牌记的一部分——古籍视图就该是刻本口径，
+        // 不该跟着正文数字样式在两套口径之间摇摆。
+        let (pa, ta) = if matches!(self.script, Script::Ancient) {
+            (han_num4(self.page + 1), han_num4(total))
+        } else {
+            ((self.page + 1).to_string(), total.to_string())
+        };
+        let left = format!("第{pa}{unit} · 全{ta}{unit}");
         // 页码处**双击**＝一键回到卷首（v1.38.0）。
         //
         // 状态栏那一行「第 X 叶 / 共 Y 叶」本就是全书坐标，双击它回卷首
@@ -7398,10 +7457,16 @@ impl Root {
         // GPUI 0.2.2 没有 `on_double_click`，只有 `MouseDownEvent::click_count`
         // （双击时系统会连发两次 mousedown，第二次的 click_count 为 2），
         // 故这里判 `>= 2`；单击（click_count == 1）一律放行，不吞事件。
+        // v1.86.0：叶码**平时隐去、鼠标拂到才显形**（用户点名要的降级）。
+        // 用 `opacity` 而不是「不渲染子节点」——后者会让底下那行牌记跟着
+        // 上下跳；留着占位、只把墨色抽掉，版面一次也不动。
+        let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
         let page_chip = div()
             .cursor_pointer()
-            .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.35)))
-            .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+            .font_family(song.clone())
+            .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.30)))
+            .opacity(0.0)
+            .hover(|s| s.opacity(1.0).text_color(rgb(sheet_zhu(t))))
             .child(SharedString::from(left.clone()))
             .on_mouse_down(
                 MouseButton::Left,
@@ -7447,17 +7512,20 @@ impl Root {
         // 颜色极淡（chrome_text 再向栏底混一档），它只是全书坐标，不是仪表盘。
         // 右下那一长串配置信息与中段的四枚导出按钮全部撤掉：导出已收进顶栏
         // 「导出」下拉（见 `render_reading_toolbar`），屏幕只留纯粹的古籍。
+        // v1.86.0 古风化降级：撤掉那道 chrome 底与分隔横杠——一道贯穿全宽的
+        // 横线是「现代工具软件」的口音，压在纸面之下把古籍感戳破。现在这一行
+        // 直接坐在纸的地脚余白上：无底、无框、无横杠，字号压到 8.5，只留正中的
+        // 一行极小宋体，像刻本牌记末尾那行刊记小字。
         div()
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
-            .p_2p5()
-            .bg(rgb(t.chrome()))
-            .border_t_1()
-            .border_color(rgb(t.chrome_line()))
-            .text_size(px(10.0))
-            .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.35)))
+            .pt(px(0.0))
+            .pb(px(7.0))
+            .font_family(song.clone())
+            .text_size(px(8.5))
+            .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.30)))
             .child(center)
     }
 

@@ -6800,13 +6800,21 @@ impl Render for Root {
                 cx, i, n, &name, pct, &label, done, skipped, canceling,
             ));
         }
-        if show_seal {
+        // v1.86.0：藏印回到**卷首右下角**——真正的古籍只在卷首盖一方藏书印，
+        // 不会每叶都落印。竖排自右向左，卷首在**右**，故钉纸面右下；且只在
+        // 第一叶显形（`self.page == 0`），翻过去就只剩干净的纸。
+        //
+        // 印面压到 0.62 不透明、鼠标拂过才转实：它是一枚「这是我的本子」的
+        // 暗记，不该跟正文抢墨色（用户原话：不要抢了正文的风头）。
+        if show_seal && self.page == 0 {
             root = root.child(
                 div()
                     .absolute()
-                    .left(px(12.0))
+                    .right(px(14.0))
                     .bottom(px(30.0))
-                    .child(crate::reader::banxin_seal(22.0, 40.0)),
+                    .opacity(0.62)
+                    .hover(|s| s.opacity(1.0))
+                    .child(crate::reader::banxin_seal(20.0, 36.0)),
             );
         }
         // 激活纸（v1.81.0 · 模块六）：画在**最后** = 最上层。
