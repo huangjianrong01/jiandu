@@ -62,23 +62,40 @@ if (importBtn) {
   });
 }
 
-// 朗读状态机：'idle' | 'playing' | 'paused'
+// 朗读状态机：'idle' | 'playing'
 let ttsState = "idle";
 let ttsItems = []; // [{ node, text }] —— 当前书依次朗读的片段
 let ttsIdx = 0;
-let zhVoice = null;
 
-// 选一个中文语音（macOS/Windows WebView 都内置 zh-CN 语音）
-function loadZhVoice() {
-  const vs = window.speechSynthesis.getVoices();
-  zhVoice =
-    vs.find((v) => /^(zh|cmn|zh-CN|zh_CN)/i.test(v.lang)) ||
-    vs.find((v) => /chinese|中文|普通话|国语/i.test(v.name)) ||
-    null;
+// 单句朗读：macOS 走原生 say（经 Rust invoke "speak"），其余环境回退 Web Speech。
+// 返回一个在「本句结束（自然或被中止）」时 resolve 的 Promise，便于顺序串联。
+// 改用原生 say 的根因：WKWebView 未实现 speechSynthesis，调用即崩溃渲染进程。
+function speakOne(text) {
+  if (invoke) {
+    return invoke("speak", { text, voice: "", rate: 0.95 });
+  }
+  return new Promise((resolve) => {
+    try {
+      if (!window.speechSynthesis) { resolve(); return; }
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "zh-CN";
+      u.rate = 0.95;
+      u.onend = () => resolve();
+      u.onerror = () => resolve();
+      window.speechSynthesis.speak(u);
+    } catch (e) {
+      console.error("TTS fallback error", e);
+      resolve();
+    }
+  });
 }
-if (window.speechSynthesis) {
-  window.speechSynthesis.onvoiceschanged = loadZhVoice;
-  loadZhVoice();
+
+function stopOne() {
+  if (invoke) {
+    invoke("stop_speak").catch(() => {});
+  } else if (window.speechSynthesis) {
+    window.speechSynthesis.cancel();
+  }
 }
 
 // 把 Book 结构（title / author / chapters[].paragraphs[].text）塞进宣纸 div
@@ -151,44 +168,30 @@ function setTtsBtn() {
   b.classList.toggle("active", ttsState !== "idle");
 }
 
-function speakNext() {
-  if (ttsState !== "playing") return;
-  if (ttsIdx >= ttsItems.length) {
-    finishTts();
-    return;
+// 顺序朗读循环：逐句 await speakOne，每句前后检查状态（被 stop 则退出）。
+async function speakLoop() {
+  while (ttsIdx < ttsItems.length) {
+    if (ttsState !== "playing") break;
+    const item = ttsItems[ttsIdx];
+    clearReadingHighlight();
+    if (item.node) {
+      item.node.classList.add("reading");
+      item.node.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+    try {
+      await speakOne(item.text);
+    } catch (e) {
+      console.error("TTS speak error", e);
+    }
+    if (ttsState !== "playing") break; // 朗读中被中止
+    ttsIdx++;
   }
-  const item = ttsItems[ttsIdx];
-  const u = new SpeechSynthesisUtterance(item.text);
-  u.lang = "zh-CN";
-  u.rate = 0.95; // 略慢，更适合听书
-  if (zhVoice) u.voice = zhVoice;
-
   clearReadingHighlight();
-  if (item.node) {
-    item.node.classList.add("reading");
-    item.node.scrollIntoView({ block: "center", behavior: "smooth" });
-  }
-
-  u.onend = () => {
-    if (ttsState !== "playing") return;
-    ttsIdx++;
-    speakNext();
-  };
-  u.onerror = (e) => {
-    console.error("TTS error", e);
-    if (ttsState !== "playing") return;
-    ttsIdx++;
-    speakNext();
-  };
-  window.speechSynthesis.speak(u);
+  ttsState = "idle";
+  setTtsBtn();
 }
 
 function startTts() {
-  if (!window.speechSynthesis) {
-    alert("当前环境不支持语音合成（speechSynthesis）");
-    return;
-  }
-  window.speechSynthesis.cancel(); // 清掉任何残留队列
   ttsItems = getReadableItems();
   if (!ttsItems.length) {
     alert("没有可朗读的内容");
@@ -197,42 +200,19 @@ function startTts() {
   ttsIdx = 0;
   ttsState = "playing";
   setTtsBtn();
-  speakNext();
-}
-
-function pauseTts() {
-  ttsState = "paused";
-  window.speechSynthesis.pause();
-  setTtsBtn();
-}
-
-function resumeTts() {
-  ttsState = "playing";
-  window.speechSynthesis.resume();
-  setTtsBtn();
+  speakLoop();
 }
 
 function stopTts() {
   ttsState = "idle";
-  if (window.speechSynthesis) window.speechSynthesis.cancel();
-  clearReadingHighlight();
-  setTtsBtn();
-}
-
-function finishTts() {
-  ttsState = "idle";
+  stopOne();
   clearReadingHighlight();
   setTtsBtn();
 }
 
 function onTtsClick() {
-  if (!window.speechSynthesis) {
-    alert("当前环境不支持语音合成（speechSynthesis）");
-    return;
-  }
   if (ttsState === "idle") startTts();
-  else if (ttsState === "playing") pauseTts();
-  else if (ttsState === "paused") resumeTts();
+  else stopTts();
 }
 
 const ttsBtn = document.querySelector("#tts-btn");

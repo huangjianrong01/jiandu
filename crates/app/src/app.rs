@@ -6800,12 +6800,17 @@ impl Render for Root {
                 cx, i, n, &name, pct, &label, done, skipped, canceling,
             ));
         }
+        // v1.9.x：每叶淡淡盖一枚藏书印——这是「这是我的本子」的暗记，
+        // 不该跟正文抢墨色（用户原话：不要抢了正文的风头）。印面压到 0.62
+        // 不透明、鼠标拂过才转实；位置钉纸面左下角外侧。
         if show_seal {
             root = root.child(
                 div()
                     .absolute()
                     .left(px(12.0))
                     .bottom(px(30.0))
+                    .opacity(0.62)
+                    .hover(|s| s.opacity(1.0))
                     .child(crate::reader::banxin_seal(22.0, 40.0)),
             );
         }
