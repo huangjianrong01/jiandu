@@ -33,6 +33,9 @@ pub mod ai;
 pub mod cards;
 /// **全文检索索引**（v1.75.0）：SQLite FTS5 按需建索引，毫秒级定位候选章。
 pub mod search;
+/// **知识图谱**（V2.0 · MVP）：实体抽取 + 溯源落盘层（kg_entities / kg_relations /
+/// kg_mentions / kg_meta）。纯逻辑，零 UI 依赖；Ollama 主路径 + 词典回退。
+pub mod kg;
 /// **清洗器**（v1.54.0）：两遍扫描——去噪 + 重建语义，产出 IR。
 pub mod cleaner;
 pub mod content;

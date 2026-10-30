@@ -1480,6 +1480,7 @@ impl Root {
                                 ch.to_string()
                             };
                             this.more_open = false;
+                            this.lookup_entity(&text);
                             this.popup = Some(GlyphHit {
                                 key,
                                 ch,
@@ -1529,6 +1530,7 @@ impl Root {
                                     ch.to_string()
                                 };
                                 this.more_open = false;
+                                this.lookup_entity(&text);
                                 this.popup = Some(GlyphHit {
                                     key,
                                     ch,
@@ -1889,6 +1891,11 @@ impl Root {
             root = root.child(self.render_glyph_menu(cx));
         }
 
+        // v2.0 知识图谱：选中人名后右侧弹出的极简人物卡片（绝不连线图 UI）。
+        if self.entity_card.is_some() {
+            root = root.child(self.render_entity_card(cx));
+        }
+
         root
     }
 
@@ -1898,6 +1905,131 @@ impl Root {
     ///
     /// 这里只做三件事——定宽、按 `ai_slide` 给偏移、拦住冒泡；**不碰**面板
     /// 内部状态。流式输出时 notify 只重绘 Entity 子树，纸上的书不重排。
+    /// 知识图谱（V2.0）：右侧极简人物卡片——只列本体 + 相关人物 + 跳回原文。
+    ///
+    /// **红线**：绝不做连线图。这是一张「查到某人 → 看他是谁、和谁相关、在哪」
+    /// 的轻浮层，与阅读排版零耦合；点相关人物就地换卡，点跳转原文回到那一页。
+    pub(crate) fn render_entity_card(&mut self, cx: &mut Context<Self>) -> Div {
+        let Some(card) = self.entity_card.clone() else {
+            return div();
+        };
+        let t = self.theme;
+        let margin = 18.0;
+        let panel_w = 340.0_f32.min((self.viewport_w - margin * 2.0).max(280.0));
+        let song = crate::fonts::family_for_role(crate::fonts::FontRole::Note);
+        let ink = rgb(t.ink());
+        let zhu = rgb(crate::share::CINNABAR);
+        let jump_len = card.name.chars().count();
+
+        div()
+            .absolute()
+            .top(px(margin))
+            .right(px(margin))
+            .w(px(panel_w))
+            .rounded(px(10.0))
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(crate::theme::mix(t.paper(), t.ink(), 0.18)))
+            .shadow(vec![BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.18),
+                offset: gpui::point(px(0.0), px(4.0)),
+                blur_radius: px(14.0),
+                spread_radius: px(0.0),
+            }])
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .p(px(14.0))
+                    .gap(px(8.0))
+                    .bg(rgb(t.paper()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .font_family(song.clone())
+                                    .text_size(px(22.0))
+                                    .text_color(ink)
+                                    .child(SharedString::from(format!(
+                                        "{}（{}）",
+                                        card.name, card.etype
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .cursor_pointer()
+                                    .text_color(zhu)
+                                    .text_size(px(18.0))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.entity_card = None;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(SharedString::from("✕")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(t.ink_soft()))
+                            .child(SharedString::from("相关人物")),
+                    )
+                    .children(card.related.iter().map(|(n, ty, rel)| {
+                        let n2 = n.clone();
+                        div()
+                            .cursor_pointer()
+                            .text_size(px(15.0))
+                            .text_color(ink)
+                            .hover(move |s| s.text_color(zhu))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.lookup_entity(&n2);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(SharedString::from(format!(
+                                "{}（{}）· {}",
+                                n, ty, rel
+                            )))
+                    }))
+                    .child(if let Some((c, p, o)) = card.jump {
+                        div()
+                            .mt(px(6.0))
+                            .cursor_pointer()
+                            .text_size(px(14.0))
+                            .text_color(zhu)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.jump_to_key((c, p, o), jump_len, cx);
+                                    this.entity_card = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(SharedString::from("跳转原文 ↩"))
+                    } else {
+                        div()
+                    }),
+            )
+    }
+
     pub(crate) fn render_ai_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let slide = self.ai_slide.clamp(0.0, 1.0);
         // v1.80.0：宽度按「问小文」那类现代伴读面板来定——一整行追问写得下，
@@ -2003,6 +2135,15 @@ impl Root {
                         && (k == "escape" || k == "Escape" || k == "esc")
                     {
                         self.toast = None;
+                        cx.notify();
+                        return;
+                    }
+
+                    // ⓪″ **知识图谱人物卡片**：Esc 收起（点纸面 / 选别的字也会重算）。
+                    if self.entity_card.is_some()
+                        && (k == "escape" || k == "Escape" || k == "esc")
+                    {
+                        self.entity_card = None;
                         cx.notify();
                         return;
                     }

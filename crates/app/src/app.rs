@@ -306,6 +306,17 @@ pub(crate) fn panic_payload_to_string(e: Box<dyn std::any::Any + Send>) -> Strin
     }
 }
 
+/// 知识图谱（V2.0）：选中人名后弹出的极简人物卡片数据。
+#[derive(Clone)]
+pub struct EntityCard {
+    pub name: String,
+    pub etype: String,
+    /// 相关实体：（名字 · 类型 · 关系类型）。
+    pub related: Vec<(String, String, String)>,
+    /// 首次出现位置（章 · 段 · 字符偏移），用于「跳转原文」。
+    pub jump: Option<(usize, usize, usize)>,
+}
+
 pub struct Root {
     pub library: Library,
     pub screen: Screen,
@@ -698,6 +709,8 @@ pub struct Root {
     pub page_rect: RectProbe,
     /// 点字弹出的工具条所锚定的字（None 表示未弹出）。
     pub popup: Option<GlyphHit>,
+    /// v2.0 知识图谱：选中人名后弹出的极简人物卡片（数据），`None` 即不显示。
+    pub entity_card: Option<EntityCard>,
     /// 划词工具条「更多」二级菜单的展开状态（feature/tts-voice 极简重构）。
     pub more_open: bool,
     /// 拖拽选区的起点 / 焦点（(chapter, para, offset)）。
@@ -1308,6 +1321,7 @@ impl Root {
             share_card_rect: None,
             page_rect: Rc::new(Cell::new(None)),
             popup: None,
+            entity_card: None,
             more_open: false,
             sel_anchor: None,
             sel_focus: None,
@@ -2882,6 +2896,16 @@ impl Root {
                 // 同位置的眉批（第二条自动向左让开一列）——注入点放在
                 // `render_head_notes` 里，因为此刻才有页锚点（开卷那一刻
                 // 版面还没排，`page_anchor()` 是 None）。只动内存，不写 JSON。
+                // v2.0 知识图谱：开卷后后台静默抽取实体（Ollama 优先，未装则词典回退）。
+                // 抽取在独立线程跑，不阻塞 UI；读库走另一连接，WAL 互不阻塞。
+                if let Some(kg_id) = book.store_id.clone() {
+                    let kg_chapters = book.chapters.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = jiandu_core::kg::ensure_extracted(&kg_id, &kg_chapters) {
+                            eprintln!("[jiandu] 知识图谱抽取失败（已忽略）：{e}");
+                        }
+                    });
+                }
                 self.book = Some(book);
                 // v1.60.0：换书必须作废分页器与题署缓存——两本章数恰好
                 // 相同时若不清，会拿上一本的面数索引去查这一本。
@@ -5121,6 +5145,30 @@ fn anki_push_card(
         }
     }
 
+    /// 知识图谱（V2.0）：用选中的文字去查实体；查到则弹出人物卡片，查不到则收起。
+    ///
+    /// 在选区定稿（`mouse_up`）时调用——选中人名就弹卡片，选中别的无声退场。
+    pub fn lookup_entity(&mut self, name: &str) {
+        let Some(id) = self
+            .book
+            .as_ref()
+            .and_then(|b| b.store_id.clone())
+        else {
+            self.entity_card = None;
+            return;
+        };
+        self.entity_card = jiandu_core::kg::lookup(&id, name).map(|v| EntityCard {
+            name: v.name,
+            etype: v.etype,
+            related: v
+                .related
+                .into_iter()
+                .map(|r| (r.name, r.etype, r.relation))
+                .collect(),
+            jump: v.mention,
+        });
+    }
+
     // ---- 全文检索 ----
 
     /// 在书稿正文里找出 `q` 的全部出现位置，按「章 → 段 → 字」阅读顺序排列。
@@ -5365,6 +5413,7 @@ fn anki_push_card(
         self.show_search = false;
         self.clear_selection();
         self.popup = None;
+        self.entity_card = None;
         self.flash_note(key, len, cx);
         cx.notify();
     }

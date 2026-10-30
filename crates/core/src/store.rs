@@ -128,6 +128,8 @@ fn init(c: &Connection) -> Result<()> {
     // v1.75.0：全文检索索引。失败**静默降级**——没有 FTS5 只是退回线性扫描，
     // 不该让 App 起不来（老库、精简编译的 SQLite 都可能没编 FTS5）。
     crate::search::init(c).ok();
+    // v2.0：知识图谱三表（幂等 DDL，失败静默降级）。
+    crate::kg::init(c).ok();
     Ok(())
 }
 
