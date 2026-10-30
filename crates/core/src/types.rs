@@ -364,6 +364,16 @@ pub enum ZoomLevel {
 }
 
 
+/// 连续缩放的三条边界（v1.9.10）。
+///
+/// 字级四档是「气象」，⌘+/⌘- 是「寸尺」：档与档之间还要能细调，否则
+/// 老读者只能被迫在「中楷太糊、大字太大」之间二选一。但细调也得有边——
+/// 小于 0.6 笔画糊成一团，大于 2.5 一叶装不下一句，两者都失去阅读意义。
+pub const ZOOM_MIN: f32 = 0.60;
+pub const ZOOM_MAX: f32 = 2.50;
+/// 每按一次 ⌘+ / ⌘- 走多少：0.1 的手感是「按三下约等于跳一档」。
+pub const ZOOM_STEP: f32 = 0.10;
+
 impl ZoomLevel {
     pub const ALL: [ZoomLevel; 4] = [
         ZoomLevel::Small,
@@ -402,6 +412,22 @@ impl ZoomLevel {
             ZoomLevel::Large => 1.30,
             ZoomLevel::Huge => 1.60,
         }
+    }
+
+    /// 把任意倍率夹回可排版的区间（连续缩放的唯一入口）。
+    ///
+    /// `NaN` 一律回落到 1.0——存档被人手改坏、或某个算式除了零，都不该让
+    /// 版式算出个 NaN 字号把整叶画没。
+    pub fn clamp_zoom(z: f32) -> f32 {
+        if !z.is_finite() {
+            return 1.0;
+        }
+        z.clamp(ZOOM_MIN, ZOOM_MAX)
+    }
+
+    /// 面板上给人看的百分比：`1.3 → "130%"`。
+    pub fn zoom_percent(z: f32) -> String {
+        format!("{}%", (Self::clamp_zoom(z) * 100.0).round() as i32)
     }
 
     /// 由倍率反查档位：取最接近的一档（旧存档 / 连续缩放的残留值都收得进来）。

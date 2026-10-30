@@ -2323,6 +2323,10 @@ impl Root {
         use jiandu_core::keys::Action as A;
         match a {
             A::Search => self.set_ui_state(AppUIState::Search, cx),
+            // 下一处 / 上一处：函数早就写好，此前只差一个键位。没结果时
+            // 两个方法都自己 return，不会把 search_idx 推到越界。
+            A::SearchNext => self.search_next(cx),
+            A::SearchPrev => self.search_prev(cx),
             A::Lookup => self.act_lookup(cx),
             A::Copy => {
                 self.copy_page_text(cx);
@@ -2379,6 +2383,9 @@ impl Root {
                 };
                 self.open_analysis(scope, cx);
             }
+            // 连续缩放：与字级四档写同一个 `zoom`，档位是「跳」、微调是「走」。
+            A::ZoomIn => self.nudge_zoom(crate::types::ZOOM_STEP),
+            A::ZoomOut => self.nudge_zoom(-crate::types::ZOOM_STEP),
             A::Palette1 => self.set_palette(0),
             A::Palette2 => self.set_palette(1),
             A::Palette3 => self.set_palette(2),

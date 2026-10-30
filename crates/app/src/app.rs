@@ -4730,6 +4730,32 @@ fn anki_push_card(
         self.persist();
     }
 
+    /// 连续缩放（⌘+ / ⌘-）：按 [`crate::types::ZOOM_STEP`] 走一小步。
+    ///
+    /// 与字级四档写**同一个** `zoom` 倍率——档位是「跳」，微调是「走」，二者
+    /// 不必分家：面板那四档由 `ZoomLevel::from_zoom` 反查，微调到 1.3 时
+    /// 「大字」依然亮着，不会出现「面板说中楷、眼睛看大字」这种对不上账。
+    pub fn nudge_zoom(&mut self, delta: f32) {
+        let next = crate::types::ZoomLevel::clamp_zoom(self.zoom + delta);
+        let pct = crate::types::ZoomLevel::zoom_percent(next);
+        if (next - self.zoom).abs() < 1e-4 {
+            // 已经顶到边界：别再刷一条「没变化」的提示，直接说清到边了。
+            self.notice = format!(
+                "字级已到{}：{}",
+                if delta > 0.0 { "上限" } else { "下限" },
+                pct
+            );
+            return;
+        }
+        self.zoom = next;
+        self.notice = format!(
+            "字级：{}（{}）",
+            pct,
+            crate::types::ZoomLevel::from_zoom(next).ancient_name()
+        );
+        self.persist();
+    }
+
     /// 跳到指定章的首面（目录跳转用）。
     ///
     /// 走 `goto_page` 而不是直接赋值：双面对开时页码必须落在偶数上，

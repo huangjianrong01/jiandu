@@ -31,6 +31,10 @@ use std::collections::BTreeMap;
 pub enum Action {
     // ── 阅读 ──────────────────────────────────────────────
     Search,
+    /// **下一处命中**：`search_next` 早就写好了，只差一个键位绑上去
+    /// （v1.9.10）。检索框里敲完词，就该能一路按下去跳，不必回鼠标点。
+    SearchNext,
+    SearchPrev,
     Lookup,
     Copy,
     Underline,
@@ -49,6 +53,10 @@ pub enum Action {
     Help,
     /// **文本量化分析**（v1.81.0 · 模块五）：字词 / 句读 / 文风三栏抽屉。
     Analysis,
+    /// **连续缩放**（v1.9.10）：字级四档是「气象」，⌘+/⌘- 是「寸尺」——
+    /// 档位给人换手感，微调给人换眼睛。两者写同一个 `zoom` 倍率。
+    ZoomIn,
+    ZoomOut,
     // ── 墨色（六套）────────────────────────────────────────
     Palette1,
     Palette2,
@@ -65,8 +73,10 @@ pub enum Action {
 
 impl Action {
     /// 面板渲染顺序 = 这份数组的顺序（分组靠 [`Action::section`] 相邻聚拢）。
-    pub const ALL: [Action; 26] = [
+    pub const ALL: [Action; 30] = [
         Action::Search,
+        Action::SearchNext,
+        Action::SearchPrev,
         Action::Lookup,
         Action::Copy,
         Action::Underline,
@@ -83,6 +93,8 @@ impl Action {
         Action::Cards,
         Action::Help,
         Action::Analysis,
+        Action::ZoomIn,
+        Action::ZoomOut,
         Action::Palette1,
         Action::Palette2,
         Action::Palette3,
@@ -98,6 +110,8 @@ impl Action {
     pub fn id(self) -> &'static str {
         match self {
             Action::Search => "search",
+            Action::SearchNext => "search_next",
+            Action::SearchPrev => "search_prev",
             Action::Lookup => "lookup",
             Action::Copy => "copy",
             Action::Underline => "underline",
@@ -114,6 +128,8 @@ impl Action {
             Action::Cards => "cards",
             Action::Help => "help",
             Action::Analysis => "analysis",
+            Action::ZoomIn => "zoom_in",
+            Action::ZoomOut => "zoom_out",
             Action::Palette1 => "palette1",
             Action::Palette2 => "palette2",
             Action::Palette3 => "palette3",
@@ -136,6 +152,8 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Action::Search => "全库检索",
+            Action::SearchNext => "下一处命中",
+            Action::SearchPrev => "上一处命中",
             Action::Lookup => "查字（选区或本页首字）",
             Action::Copy => "复制（有选区复制选区，否则整页）",
             Action::Underline => "划线（有选区划选区）",
@@ -152,6 +170,8 @@ impl Action {
             Action::Cards => "卡片匣",
             Action::Help => "帮助",
             Action::Analysis => "文本分析（字词 / 句读 / 文风）",
+            Action::ZoomIn => "放大字号（连续微调）",
+            Action::ZoomOut => "缩小字号（连续微调）",
             Action::Palette1 => "墨色：朱",
             Action::Palette2 => "墨色：墨",
             Action::Palette3 => "墨色：纸",
@@ -168,6 +188,8 @@ impl Action {
     pub fn section(self) -> &'static str {
         match self {
             Action::Search
+            | Action::SearchNext
+            | Action::SearchPrev
             | Action::Lookup
             | Action::Copy
             | Action::Underline
@@ -183,7 +205,9 @@ impl Action {
             | Action::Focus
             | Action::Cards
             | Action::Help
-            | Action::Analysis => "视图",
+            | Action::Analysis
+            | Action::ZoomIn
+            | Action::ZoomOut => "视图",
             Action::Palette1
             | Action::Palette2
             | Action::Palette3
@@ -202,6 +226,9 @@ impl Action {
     pub fn default_chord(self) -> &'static str {
         match self {
             Action::Search => "cmd+f",
+            // ⌘⇧G 是「查找下一个」的行规（⌘G 已被「查字」占着，让不出来）。
+            Action::SearchNext => "cmd+shift+g",
+            Action::SearchPrev => "cmd+alt+g",
             Action::Lookup => "cmd+g",
             Action::Copy => "cmd+c",
             Action::Underline => "cmd+u",
@@ -219,6 +246,10 @@ impl Action {
             Action::Cards => "cmd+k",
             Action::Help => "cmd+/",
             Action::Analysis => "cmd+i",
+            // 键名经 norm_key 归一：`+` / `plus` / `equal` 一律落 `=`，
+            // 所以无论框架报 ⌘= 还是 ⌘+（Shift 态），都认得出来。
+            Action::ZoomIn => "cmd+=",
+            Action::ZoomOut => "cmd+-",
             Action::Palette1 => "cmd+1",
             Action::Palette2 => "cmd+2",
             Action::Palette3 => "cmd+3",
@@ -348,6 +379,11 @@ fn norm_key(k: &str) -> String {
     match t.as_str() {
         "esc" => "escape".to_string(),
         "return" => "enter".to_string(),
+        // ⌘+ 在有的框架里报 `"+"`、有的报 `"="`（还有报 `"equal"` 的），
+        // 三种都收敛到 `"="`，否则「放大」这条键在部分键盘上永远按不响。
+        // ⌘- 同理收 `"minus"`；`/` 上的 `⌘?` 不受影响（那是 shift 态的 `/`）。
+        "+" | "plus" | "equal" => "=".to_string(),
+        "minus" => "-".to_string(),
         _ => t,
     }
 }
@@ -534,6 +570,43 @@ mod tests {
 
         map.reset(Action::Lookup);
         assert!(!map.is_custom(Action::Lookup));
+        assert_eq!(map.resolve(&Chord::parse("cmd+g").unwrap()), Some(Action::Lookup));
+    }
+
+    #[test]
+    fn plus_and_equal_are_the_same_zoom_key() {
+        let map = KeyMap::new();
+        // 框架报 ⌘= 或 ⌘+（乃至 ⌘plus / ⌘equal）都得落到「放大字号」。
+        // 走 `Chord::new`（框架那条路）——`parse` 里 `+` 是修饰分隔符，
+        // 写不出 `"cmd++"`，出厂串因此一律用 `"cmd+="`。
+        for k in ["=", "+", "plus", "equal", "PLUS"] {
+            let c = Chord::new(true, false, false, false, k);
+            assert_eq!(c.key, "=", "键名未归一：{k} → {}", c.key);
+            assert_eq!(map.resolve(&c), Some(Action::ZoomIn), "⌘{k} 没落到放大");
+        }
+        for k in ["-", "minus"] {
+            let c = Chord::new(true, false, false, false, k);
+            assert_eq!(c.key, "-", "键名未归一：{k} → {}", c.key);
+            assert_eq!(map.resolve(&c), Some(Action::ZoomOut), "⌘{k} 没落到缩小");
+        }
+        // 出厂串本身也要能解析回来（改键面板靠它）。
+        assert_eq!(Chord::parse("cmd+=").unwrap().key, "=");
+        assert_eq!(Chord::parse("cmd+-").unwrap().key, "-");
+    }
+
+    #[test]
+    fn next_hit_has_its_own_chord() {
+        let map = KeyMap::new();
+        assert_eq!(map.resolve(&Chord::parse("cmd+f").unwrap()), Some(Action::Search));
+        assert_eq!(
+            map.resolve(&Chord::parse("cmd+shift+g").unwrap()),
+            Some(Action::SearchNext)
+        );
+        assert_eq!(
+            map.resolve(&Chord::parse("cmd+alt+g").unwrap()),
+            Some(Action::SearchPrev)
+        );
+        // ⌘G 仍是「查字」，没被挤掉。
         assert_eq!(map.resolve(&Chord::parse("cmd+g").unwrap()), Some(Action::Lookup));
     }
 
