@@ -1,5 +1,70 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+
+/// 当前正在朗读的系统语音进程（macOS /usr/bin/say）。
+/// WKWebView 未实现 Web Speech 的 speechSynthesis，调用即崩溃渲染进程；
+/// 因此 macOS 的「听」改为原生调用系统 say 命令，由这里持有子进程以便停止。
+static SAY_CHILD: Mutex<Option<Arc<Mutex<Child>>>> = Mutex::new(None);
+
+/// 杀掉当前朗读进程（若存在）。供 speak 入口与 stop_speak 共用。
+fn stop_say_inner() {
+    if let Ok(guard) = SAY_CHILD.lock() {
+        if let Some(arc) = guard.as_ref() {
+            if let Ok(mut c) = arc.lock() {
+                let _ = c.kill();
+            }
+        }
+    }
+}
+
+/// 原生朗读：调用系统 /usr/bin/say 朗读一段文本（默认中文 Tingting 语音）。
+/// 在阻塞线程里等待进程结束（或被 stop_speak 杀掉）后返回。
+#[tauri::command]
+async fn speak(text: String, voice: String, rate: f64) -> Result<(), String> {
+    stop_say_inner(); // 先清掉上一段，避免叠加
+    let v = if voice.is_empty() {
+        "Tingting".to_string()
+    } else {
+        voice
+    };
+    let wpm = ((200.0 * rate).max(50.0).min(400.0)).round() as i32;
+    let child = Command::new("/usr/bin/say")
+        .arg("-v")
+        .arg(&v)
+        .arg("-r")
+        .arg(wpm.to_string())
+        .arg(&text)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("无法启动系统语音(say)：{e}"))?;
+    let arc = Arc::new(Mutex::new(child));
+    *SAY_CHILD.lock().unwrap() = Some(arc.clone());
+    let arc2 = arc.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        if let Ok(mut c) = arc2.lock() {
+            c.wait()
+                .map(|_| ())
+                .map_err(|e| format!("等待语音进程失败：{e}"))
+        } else {
+            Err("无法锁定语音进程".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("语音线程错误：{e}"))?;
+    *SAY_CHILD.lock().unwrap() = None;
+    res
+}
+
+/// 停止朗读：杀掉当前 say 进程。
+#[tauri::command]
+fn stop_speak() -> Result<(), String> {
+    stop_say_inner();
+    Ok(())
+}
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -126,7 +191,9 @@ pub fn run() {
             test_core,
             import_and_parse,
             import_from_bytes,
-            os_support
+            os_support,
+            speak,
+            stop_speak
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
