@@ -88,8 +88,8 @@ body {
 
 .fold {
   position: absolute;
-  top: 8vh;
-  bottom: 8vh;
+  top: 12vh;   /* 上下各留白，中缝不顶到屏幕边缘 */
+  bottom: 12vh;
   left: 50%;
   width: 1px;
   transform: translateX(-0.5px);
@@ -144,14 +144,16 @@ body {
   position: absolute;
   left: 50%;
   top: 50%;
-  transform: translate(-50%, -50%);
-  font-size: 0.55em;
+  /* 稍缩小 + 轻微倾斜拉长：纯圆旋转看不出效果，故配合纵向拉伸，
+     形成一个微倾的椭圆，呼应桌面端 42° 墨滴句读的斜势 */
+  transform: translate(-50%, -50%) rotate(-20deg) scale(0.92, 1.16);
+  font-size: 0.46em;
   font-family: serif; /* 点是几何形，不依赖 CJK 字体 */
 }
 
 /* —— 导入后书籍渲染：横排章节 + 双线版框 —— */
 .book-view {
-  padding: 22px 20px 110px; /* 底部留白，避开右下角悬浮钮 */
+  padding: 22px 20px 132px; /* 底部留白，避开抬高后的右下角悬浮钮 */
   border: 2px solid rgba(176, 52, 44, 0.45);
   box-shadow: 0 0 0 4px var(--paper), 0 0 0 5px rgba(176, 52, 44, 0.3);
   border-radius: 3px;
@@ -207,7 +209,7 @@ body {
 .fab {
   position: fixed;
   right: 18px;
-  bottom: 24px;
+  bottom: 44px; /* 抬高，避免压在版框朱砂线上 */
   z-index: 50;
   display: flex;
   flex-direction: column; /* 竖排：导入钮最靠下，手指最近 */
@@ -336,7 +338,7 @@ body {
 
   /* 导入后章节正文：字号加大、段距放宽 */
   .book-view {
-    padding: 20px 16px 120px;
+    padding: 20px 16px 142px;
     margin: 12px;
   }
   .book-title {
@@ -359,7 +361,7 @@ body {
   /* 悬浮钮放大到手指友好尺寸 */
   .fab {
     right: 14px;
-    bottom: 18px;
+    bottom: 40px; /* 抬高，别压在版框朱砂线上 */
     gap: 10px;
   }
   .fab-item {
