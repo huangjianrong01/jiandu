@@ -61,6 +61,9 @@ appstore = []
 core-graphics = "0.24"
 core-text = "21"
 core-foundation = "0.10"
+# PDFKit 文本层抽取（真实坐标映射数据源）：PDFDocument / PDFPage 逐字包围盒。
+# 仅 macOS 目标编译；链接系统 PDFKit 框架（见 `pdf_text.rs` 的 `#[link]`）。
+objc = "0.2"
 # v1.80.0 PDF 印制：CGPDFContextCreateWithURL 返回裸 `CGContextRef`，
 # 要用 `CGContext::from_ptr` 包成 core-graphics 的 `CGContext`（之后全部走
 # 安全方法）。`from_ptr` 是 `ForeignType` 的方法，须显式引入该 crate。

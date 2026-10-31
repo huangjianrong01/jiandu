@@ -30,6 +30,9 @@ mod app;
 /// 顶层状态机 `AppMode` 在此；进入时 `Root::render` 直接返回它的视图实体，
 /// 根本不构建阅读界面（见 `collation.rs` 文件头）。
 mod collation;
+/// **PDF 文本层坐标抽取**（macOS / PDFKit）：把带文本层的古籍 PDF 逐字包围盒
+/// 聚合成 `SourceRegion`，是 `collation` 真实坐标映射的数据源。
+mod pdf_text;
 /// **内测闸门**（v1.0.0-beta）：启动时那张「箋讀 + 邀請碼」的纸。
 /// 纯逻辑（码表 / 归一 / 凭据）在 `jiandu_core::gate`。
 mod beta;

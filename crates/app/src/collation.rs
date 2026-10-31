@@ -26,8 +26,8 @@
 //!   （见 `regenerate_preview` + `render_preview_overlay`，纯 `share_*` 链路）。
 //! ・真实坐标映射：删除 N*BAND_H 行带 Mock，新增 `SourceRegion`{x,y,w,h,text}
 //!   数据源结构；右文点击段落 → 查 `regions[i]` → 自然像素坐标按 `source_size()`
-//!   缩放后高亮原图区域并滚动。当前 `regions` 由 `mock_regions()` 提供假数据
-//!   跑通数学，待真实 PDF 文本层 / OCR 接入后仅替换数据源即可（结构不变）。
+//!   缩放后高亮原图区域并滚动。载入带文本层 PDF 时由 `pdf_text` 抽真实坐标
+//!   替换 `mock_regions()`；扫描图（无文本层）退回 Mock 演示，需 OCR 才是下一步。
 
 use crate::ime::{
     char_to_utf16, effective_replace_range, utf16_len, utf16_slice, utf16_to_char,
@@ -89,24 +89,13 @@ fn preview_page_cap(columns: usize) -> usize {
     }
 }
 
-/// 原图文本层 / OCR 识别出的一个文本区域（自然像素坐标，单位 = 原图像素）。
+/// 文本区域结构定义在 `pdf_text::SourceRegion`（PDF 文本层抽取的数据源）。
 ///
-/// 真实接入时由 PDF 文本层或 OCR 引擎填充（每个识别片段一条）；MVP 由
-/// `mock_regions()` 提供假数据。右文第 i 段 ↔ `regions[i]`（转录逐行对齐原图行）。
-/// 坐标恒为原图自然像素，显示时按 `source_size()` 的缩放比换算，绝不写死像素。
-#[derive(Clone)]
-struct SourceRegion {
-    /// 左上角 X（原图像素）。
-    x: f32,
-    /// 左上角 Y（原图像素）。
-    y: f32,
-    /// 区域宽（原图像素）。
-    w: f32,
-    /// 区域高（原图像素）。
-    h: f32,
-    /// 该区域识别出的文本（用于校对核对 / 状态展示；映射本身按段落顺序索引）。
-    text: String,
-}
+/// 真实接入时由带文本层的 PDF 填充（每个识别片段一条）；无文本层（扫描图）时
+/// 退回 `mock_regions()` 假数据演示机制。右文第 i 段 ↔ `regions[i]`
+/// （转录逐行对齐原图行）。坐标恒为原图自然像素（PDF 点），显示时按
+/// `source_size()` 的缩放比换算，绝不写死像素。
+use crate::pdf_text::SourceRegion;
 
 /// 笺校工作台视图：拥有自己的编辑缓冲、焦点、滚动柄，**不引用 Reader 任何字段**。
 pub struct CollationWorkspace {
@@ -609,11 +598,23 @@ impl CollationWorkspace {
                             }
                             this.image_path = Some(r.path);
                             this.last_temp = r.temp;
-                            // 记录原图自然像素尺寸，供真实坐标映射缩放使用。
+                            // 记录原图自然像素尺寸（PDF 点），供真实坐标映射缩放使用。
                             this.src_nat_w = r.nat_w as f32;
                             this.src_nat_h = r.nat_h as f32;
                             this.image_error = None;
                             this.image_note = r.note;
+                            // 真实坐标映射：带文本层的 PDF 用 PDFKit 抽出的文本层
+                            // 坐标替换 Mock；无文本层（扫描图 / 位图）extract 返回空
+                            // → 清空 Mock，避免高亮落在错误位置，由状态栏提示需 OCR。
+                            let real = crate::pdf_text::extract_pdf_text_regions(&path);
+                            if !real.is_empty() {
+                                this.regions = real;
+                            } else {
+                                this.regions.clear();
+                                this.image_note = Some(
+                                    "该原图无文本层（扫描图），无法坐标映射，需 OCR".to_string(),
+                                );
+                            }
                         }
                         Err(e) => {
                             this.image_error = Some(e);
@@ -734,15 +735,17 @@ impl CollationWorkspace {
     /// 既是高亮矩形（由 `render_left_content` 渲染）也是滚动目标。无对应区域
     /// （段落数 ≠ 区域数）则不高亮也不滚动。
     fn link_to_paragraph(&mut self, para_idx: usize, vw: f32, cx: &mut Context<Self>) {
+        // 无对应区域（段落数 ≠ 区域数 / 原图无文本层）→ 不高亮、不滚动、不标记。
+        let Some(r) = self.regions.get(para_idx) else {
+            return;
+        };
         self.active_para_idx = Some(para_idx);
-        if let Some(r) = self.regions.get(para_idx) {
-            let (nw, _nh) = self.source_size();
-            let disp_w = vw * 0.4;
-            let scale = if nw > 0.0 { disp_w / nw } else { 1.0 };
-            // 滚动使区域顶部进入视野（向下偏移取负）。
-            self.left_scroll
-                .set_offset(Point::new(px(0.0), px(-(r.y * scale))));
-        }
+        let (nw, _nh) = self.source_size();
+        let disp_w = vw * 0.4;
+        let scale = if nw > 0.0 { disp_w / nw } else { 1.0 };
+        // 滚动使区域顶部进入视野（向下偏移取负）。
+        self.left_scroll
+            .set_offset(Point::new(px(0.0), px(-(r.y * scale))));
         cx.notify();
     }
 
@@ -1370,8 +1373,6 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
     use core_foundation::url::CFURL;
     use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::CGContext;
-    use core_graphics::geometry::{CGPoint, CGSize, CGRect};
-    use core_graphics::image::CGImage;
     use core_graphics::sys;
     use foreign_types::ForeignType;
     use std::os::raw::c_void;
@@ -1412,7 +1413,10 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
         fn CGPDFDocumentCreateWithURL(url: core_foundation::url::CFURLRef) -> *mut c_void;
         fn CGPDFDocumentGetNumberOfPages(doc: *mut c_void) -> usize;
         fn CGPDFDocumentGetPage(doc: *mut c_void, page_number: usize) -> *mut c_void;
-        fn CGPDFPageCreateImage(page: *mut c_void) -> sys::CGImageRef;
+        fn CGPDFPageGetBoxRect(page: *mut c_void, box_: u32) -> CGBox;
+        fn CGContextTranslateCTM(ctx: sys::CGContextRef, tx: f64, ty: f64);
+        fn CGContextScaleCTM(ctx: sys::CGContextRef, sx: f64, sy: f64);
+        fn CGContextDrawPDFPage(ctx: sys::CGContextRef, page: *mut c_void);
         fn CGPDFDocumentRelease(doc: *mut c_void);
         fn CGPDFPageRelease(page: *mut c_void);
         fn CGBitmapContextCreate(
@@ -1426,6 +1430,15 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
         ) -> sys::CGContextRef;
     }
 
+    // 媒体框矩形（PDF 点，72/inch）：与文本层坐标同单位，供坐标映射缩放。
+    #[repr(C)]
+    struct CGBox {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+
     let url = CFURL::from_path(path, false).ok_or_else(|| format!("无法解析路径：{:?}", path))?;
     let doc = unsafe { CGPDFDocumentCreateWithURL(url.as_concrete_TypeRef()) };
     if doc.is_null() {
@@ -1437,16 +1450,12 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
     if page.is_null() {
         return Err("PDF 第一页不存在".to_string());
     }
-    let cgimage_ref = unsafe { CGPDFPageCreateImage(page) };
-    unsafe { CGPDFPageRelease(page) };
-    if cgimage_ref.is_null() {
-        return Err("PDF 页面栅格化失败".to_string());
-    }
-    let cgimage = unsafe { CGImage::from_ptr(cgimage_ref) };
-
-    let nat_w = cgimage.width() as f64;
-    let nat_h = cgimage.height() as f64;
+    // 媒体框（PDF 点）：坐标映射的基准尺寸，与文本层坐标同单位。
+    let mb = unsafe { CGPDFPageGetBoxRect(page, 0) }; // kCGPDFMediaBox = 0
+    let nat_w = mb.w;
+    let nat_h = mb.h;
     if nat_w <= 0.0 || nat_h <= 0.0 {
+        unsafe { CGPDFPageRelease(page) };
         return Err("PDF 页面尺寸为 0".to_string());
     }
 
@@ -1490,14 +1499,15 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
         ));
     }
     let mut ctx = unsafe { CGContext::from_ptr(raw) };
-    let rect = CGRect {
-        origin: CGPoint { x: 0.0, y: 0.0 },
-        size: CGSize {
-            width: w as f64,
-            height: h as f64,
-        },
-    };
-    ctx.draw_image(rect, &cgimage);
+    // 把 PDF 页直接绘进位图上下文：PDF 坐标系 y 向上、位图 y 向下，故先翻转 + 缩放，
+    // 使媒体框映射到整张位图（mb.x / mb.y 一般为 0）。
+    unsafe {
+        CGContextTranslateCTM(ctx.as_ptr(), 0.0, nat_h * scale);
+        CGContextScaleCTM(ctx.as_ptr(), scale, -scale);
+        CGContextTranslateCTM(ctx.as_ptr(), -mb.x, -mb.y);
+        CGContextDrawPDFPage(ctx.as_ptr(), page);
+        CGPDFPageRelease(page);
+    }
 
     // CoreGraphics 位图内存序为 BGRA，转成 img / PNG 需要的 RGBA；并按实际
     // bytes_per_row 去填充（CG 可能按 16 字节对齐放大行距）。
