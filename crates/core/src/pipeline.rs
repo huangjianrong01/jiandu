@@ -649,9 +649,26 @@ pub fn parse_markdown(md: &str) -> Vec<RawChapter> {
         }
         flush_quote(&mut quote, &mut paras);
         // ---- 列表 / 表格：留下文字，丢掉标记 ----
-        // v1.9.15：药名 + 剂量拆成「正文[注]剂量[/注]」（中医方书专用，
-        // 详见 `dclean::split_dosage_to_gloss`）。炮制词（炒 / 炙…）留正文。
-        let body = crate::dclean::split_dosage_to_gloss(&md_inline(strip_list_marker(t)));
+        // v1.9.16：先拆「药名 + 剂量」→「正文[注]剂量[/注]」，再剥括号 /
+        // 古籍化标点 / 清废标点（详见 `dclean::{split_dosage_to_gloss, tcm_clean}`）。
+        // 炮制词（炒 / 炙…）留正文。
+        let body = crate::dclean::tcm_clean(
+            &crate::dclean::split_dosage_to_gloss(&md_inline(strip_list_marker(t))),
+        );
+        // 智能方名升格：极短、以 方 / 湯 / 散 / 丸 / 丹 结尾、无剂量单位、无句读
+        // → 独立成章（榜眼大字）。先把上一章收尾，再升格为章题；药行因带剂量
+        // 单位必落第，绝不误升格。
+        if crate::dclean::is_fang_title(&body) {
+            if !title.is_empty() || !paras.is_empty() {
+                if title.is_empty() {
+                    push_chapter_md(&mut chapters, "正文", &mut paras, false);
+                } else {
+                    push_chapter_md(&mut chapters, &title, &mut paras, true);
+                }
+            }
+            title = body.trim().to_string();
+            continue;
+        }
         if !body.trim().is_empty() {
             paras.push(body.trim().to_string());
         }

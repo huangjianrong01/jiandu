@@ -234,3 +234,49 @@ fn tcm_markdown_is_detected_as_fang_like() {
         "纯方剂短行应判为方书（自动上密排预设）"
     );
 }
+
+#[test]
+fn tcm_markdown_strips_parens_and_promotes_fang_names() {
+    let md = "# 驗方集\n\
+牙痛妙方\n\
+瞿麥壹錢\n\
+川芎（炒）二钱\n\
+血山崩方\n\
+五靈脂（醋炒）三錢";
+    let book = jiandu_core::importer::book_from_markdown("驗方集", md);
+    // 方名升格：牙痛妙方 / 血山崩方 成为独立章题（榜眼大字）。
+    let titles: Vec<&str> = book.chapters.iter().map(|c| c.title.as_str()).collect();
+    assert!(
+        titles.iter().any(|t| t.contains("牙痛妙方")),
+        "方名应升格为章题：{:?}",
+        titles
+    );
+    assert!(
+        titles.iter().any(|t| t.contains("血山崩方")),
+        "方名应升格为章题：{:?}",
+        titles
+    );
+    // 括号彻底消失：任何章题与段落都不含 （）。
+    for c in &book.chapters {
+        assert!(
+            !c.title.contains('（') && !c.title.contains('）'),
+            "章题漏括号：{}",
+            c.title
+        );
+        for p in &c.paragraphs {
+            assert!(
+                !p.text.contains('（') && !p.text.contains('）'),
+                "段落漏括号：{}",
+                p.text
+            );
+        }
+    }
+    // 炮制词「炒」仍在正文（括号被剥但字不丢）。
+    let all_text: String = book
+        .chapters
+        .iter()
+        .flat_map(|c| c.paragraphs.iter())
+        .map(|p| p.text.clone())
+        .collect();
+    assert!(all_text.contains("炒"), "炮制词炒被误删：{}", all_text);
+}

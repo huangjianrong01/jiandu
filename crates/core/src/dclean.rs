@@ -1257,6 +1257,112 @@ pub fn split_dosage_to_gloss(text: &str) -> String {
 }
 
 // ===========================================================================
+// 中医方剂导入专用：标点彻底古籍化 + 剥壳夹注 + 清理废标点 + 方名升格
+// （v1.9.16，用户硬规矩：现代标点绝不准进竖排网格）
+// ===========================================================================
+
+/// **剥壳 + 古籍化 + 清废标点**——中医秘方 Markdown 进排版引擎前的最后一道。
+///
+/// 三道死命令：
+/// 1. **剥壳夹注**：中英文括号 `（）()` 一律从文本流删除。笺读用 `[注]` 标记
+///    承载夹注，括号在竖排里只会被渲染层当成「竖排括号 / 引号」画出来，极丑；
+///    真机截图里 `川芎（三錢）` 的括号正是这么漏出的。
+/// 2. **标点古籍化**：半角 `,` `.` → 全角 `，` `。`；`、`，` `。` `、` 直接交给
+///    渲染层的朱砂句读（读类→实心墨滴、句类→空心圈〇），绝不让原字形进网格。
+/// 3. **清理废标点**：OCR / Markdown 产生的 `· • ※ ◇` 等不规则记号，以及残余
+///    ASCII 标点（`!@#$%^&*_+=~|\/<>?` 等）直接滤掉。
+///
+/// **不动 `[注]…[/注]` 等标记内部**（沿用 `map_outside_markers` 口径）：否则会把
+/// 注音 / 夹注标记里的冒号也洗掉、断掉解析。
+pub fn tcm_clean(text: &str) -> String {
+    let cs: Vec<char> = text.chars().collect();
+    let n = cs.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        // 标记内部原样透传（注音 / 夹注 / 高亮 …）。
+        if cs[i] == '[' {
+            let mut j = i + 1;
+            while j < n && cs[j] != ']' {
+                j += 1;
+            }
+            if j < n {
+                out.extend(&cs[i..=j]);
+                i = j + 1;
+                continue;
+            }
+        }
+        let c = cs[i];
+        // ① 括号：中英文一律删（剥壳夹注）。
+        if matches!(c, '（' | '）' | '(' | ')') {
+            i += 1;
+            continue;
+        }
+        // ③ 废标点 / 不规则记号：直接滤掉。
+        if is_junk_punct(c) {
+            i += 1;
+            continue;
+        }
+        // ② 半角句读 → 全角（交给渲染层画朱砂记号，绝不印原字形）。
+        match c {
+            ',' => out.push('，'),
+            '.' => out.push('。'),
+            other => out.push(other),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 不规则记号 / 残余 ASCII 标点（古籍竖排里无处安放，直接剔除）。
+fn is_junk_punct(c: char) -> bool {
+    matches!(
+        c,
+        '·' | '・' | '•' | '※' | '◇' | '◆' | '□' | '■' | '○' | '△' | '▲' | '=' | '+' | '*'
+            | '&' | '%' | '#' | '@' | '$' | '^' | '~' | '`' | '|' | '\\' | '/' | '<' | '>' | '?'
+            | '_' | '“' | '”' | '‘' | '’' | '—' | '–' | '―' | '：' | '；'
+    )
+}
+
+/// **智能方名升格**：极严格的方书标题判定（用户 v1.9.16）。
+///
+/// 同时满足以下四条才认作「方名 → ChapterTitle（榜眼大字）」，否则当普通正文：
+/// * 该行以 **方 / 湯 / 散 / 丸 / 丹** 结尾（如 `牙痛妙方`、`血山崩方`、`六味丸`）；
+/// * 不含任何**剂量单位**（錢 钱 兩 两 分 克 斤 寸 升 斗 合 匕 撮 片 枚 粒）——
+///   药行（如 `川芎三錢`）必含 `錢` 而落第，绝不误升格；
+/// * 字数 ≤ 8（极短）；
+/// * 不含任何句读（方名是「没有标点的独立短句」）。
+///
+/// ⚠️ 剂量单位集**故意不含** 方/湯/散/丸/丹 自身——它们是方名后缀，可能在
+/// 方名里出现（`六味丸`），不能当剂量排掉。
+pub fn is_fang_title(s: &str) -> bool {
+    let t: Vec<char> = s.trim().chars().filter(|c| !c.is_whitespace()).collect();
+    if t.is_empty() || t.len() > 8 {
+        return false;
+    }
+    // 结尾必须是五种方名后缀之一。
+    match t.last() {
+        Some(c) if matches!(c, '方' | '湯' | '散' | '丸' | '丹') => {}
+        _ => return false,
+    }
+    // 含剂量单位 → 是药行 / 剂量说明，不是方名。
+    if t.iter().any(|c| {
+        matches!(
+            c,
+            '錢' | '钱' | '兩' | '两' | '分' | '克' | '斤' | '寸' | '升' | '斗' | '合' | '匕'
+                | '撮' | '片' | '枚' | '粒'
+        )
+    }) {
+        return false;
+    }
+    // 含句读 → 是正文句，不是方名。
+    if t.iter().any(|&c| crate::types::is_punct(c)) {
+        return false;
+    }
+    true
+}
+
+// ===========================================================================
 // 测试：带乱码 / 广告 / 假标点的脏文本
 // ===========================================================================
 
@@ -1751,5 +1857,61 @@ mod tests {
         assert_eq!(split_dosage_to_gloss("三國演義"), "三國演義");
         // 极短修饰词绝不丢：单独的「炒」留在正文。
         assert_eq!(split_dosage_to_gloss("炒"), "炒");
+    }
+
+    // ---------- v1.9.16：剥括号 + 标点古籍化 + 清废标点 ----------
+
+    #[test]
+    fn tcm_clean_strips_parens_everywhere() {
+        // 夹注括号（中英文）一律删，只留纯文本。
+        assert_eq!(tcm_clean("川芎（三錢）"), "川芎三錢");
+        assert_eq!(tcm_clean("當歸(二錢)"), "當歸二錢");
+        // 剂量已拆成 [注] 标记时，外侧括号仍要剥。
+        assert_eq!(tcm_clean("川芎（[注]三錢[/注]）"), "川芎[注]三錢[/注]");
+        // 括号绝不进网格。
+        assert!(!tcm_clean("血山崩方（附方）").contains('（'));
+        assert!(!tcm_clean("血山崩方（附方）").contains('）'));
+    }
+
+    #[test]
+    fn tcm_clean_halfwidth_punct_to_fullwidth() {
+        // 半角句读 → 全角（交给渲染层画朱砂记号）。
+        assert_eq!(tcm_clean("救中風,童便灌飲即甦."), "救中風，童便灌飲即甦。");
+        // 全角句读原样保留（不被当废标点滤掉）。
+        assert_eq!(tcm_clean("甘草，川烏。"), "甘草，川烏。");
+    }
+
+    #[test]
+    fn tcm_clean_filters_junk_punct() {
+        // OCR / Markdown 不规则记号 + 残余 ASCII 标点直接滤掉。
+        assert_eq!(tcm_clean("淨·水煎服"), "淨水煎服");
+        assert_eq!(tcm_clean("每服三錢#"), "每服三錢");
+        assert_eq!(tcm_clean("右咀*片"), "右咀片");
+        // 标记内部不动：注音冒号保住。
+        assert_eq!(tcm_clean("[拼音:hàn]漢"), "[拼音:hàn]漢");
+    }
+
+    // ---------- v1.9.16：智能方名升格 ----------
+
+    #[test]
+    fn fang_title_detects_real_names() {
+        assert!(is_fang_title("牙痛妙方"));
+        assert!(is_fang_title("血山崩方"));
+        assert!(is_fang_title("六味丸"));
+        assert!(is_fang_title("小兒三朝不飲乳方")); // 8 字，卡在阈值上
+        assert!(is_fang_title("湯")); // 单字后缀也算
+    }
+
+    #[test]
+    fn fang_title_rejects_medicine_lines() {
+        // 药行含剂量单位 → 落第。
+        assert!(!is_fang_title("川芎三錢"));
+        assert!(!is_fang_title("五靈脂醋炒三錢"));
+        assert!(!is_fang_title("當歸[注]二錢[/注]"));
+        // 太长 → 落第。
+        assert!(!is_fang_title("治婦人血氣心痛及冷氣攻心方")); // > 8
+        // 带句读 → 落第（是正文句不是方名）。
+        assert!(!is_fang_title("牙痛妙方。"));
+        assert!(!is_fang_title("血山崩，方"));
     }
 }
