@@ -138,8 +138,12 @@ unsafe fn cluster(chars: Vec<(f64, f64, f64, f64, u32)>, page_h: f64) -> Vec<Sou
     let mut hs: Vec<f64> = chars.iter().map(|c| c.3).collect();
     ws.sort_by(|a, b| a.partial_cmp(b).unwrap());
     hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = if vertical { ws[ws.len() / 2] } else { hs[hs.len() / 2] };
-    let tol = med * 0.6;
+    let med_w = ws[ws.len() / 2];
+    let med_h = hs[hs.len() / 2];
+    let med = if vertical { med_w } else { med_h };
+    // 聚类容差：取「半个字」而非 0.6 个字。0.6 会把间距偏窄的相邻列/行并成一个
+    // 胖块（实测出现过 201x183 的假框）；0.35 只认同一列 / 同一行的抖动。
+    let tol = med * 0.35;
     let mut buckets: Vec<Vec<(f64, f64, f64, f64, u32)>> = Vec::new();
     for c in chars {
         let key = if vertical { c.0 } else { c.1 };
@@ -189,6 +193,17 @@ unsafe fn cluster(chars: Vec<(f64, f64, f64, f64, u32)>, page_h: f64) -> Vec<Sou
             }
         }
         if maxx <= minx || maxy <= miny {
+            continue;
+        }
+        let rw = maxx - minx;
+        let rh = maxy - miny;
+        // —— 异常块过滤：行 / 列必须是**细长**的 ——
+        // 正常的竖排列窄边 ≈ 一个字宽、横排行窄边 ≈ 一个字高。若**窄边**也超过
+        // 4 个字的大小，说明这个桶把多行多列并成了一个大方块（某些 PDF 的
+        // characterBoundsAtIndex 按文本 run 而非单字返回所致）。这种框画在原图上
+        // 完全对不上任何一行 / 一列文字，宁可丢掉，也绝不误导校对。
+        let min_med = med_w.min(med_h);
+        if min_med > 0.0 && rw.min(rh) > 4.0 * min_med {
             continue;
         }
         regions.push(SourceRegion {

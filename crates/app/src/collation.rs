@@ -108,6 +108,33 @@ const PREVIEW_TIME_BUDGET_MS: u128 = 2500;
 /// 的**布局反馈环**，会让 GPUI 反复求解尺寸直至卡死。给显式上限即可解耦。
 const PREVIEW_IMG_MAX_H: f32 = 880.0;
 
+/// 右文段 ↔ 原图区域文字的**最低字面对合度**（0.0–1.0）。
+///
+/// 段落索引对齐的前提是「右侧转录 ≈ 原图该区域文字」。用户实测过一类典型误用：
+/// 导入《資治通鑑》却在右侧贴《千字文》——两者毫不相干，索引对齐失去意义，画出的
+/// 框必然是错的。故联动前先做字面校验，低于此值就**绝不画框、绝不滚动**。
+const MATCH_MIN_SIM: f32 = 0.5;
+
+/// 计算右文段落在原图区域文字里的**连续二字对覆盖率**（0.0–1.0）。
+///
+/// 不用单字重合：中文常见字（之 / 不 / 而）单字命中率虚高，会把不相干的文本判定
+/// 成匹配；二字对（bigram）要求相邻两字连续出现，抗巧合能力强得多。
+fn bigram_overlap(seg: &str, region: &str) -> f32 {
+    let s: Vec<char> = seg.chars().filter(|c| !c.is_whitespace()).collect();
+    let r: String = region.chars().filter(|c| !c.is_whitespace()).collect();
+    if s.len() < 2 || r.is_empty() {
+        return 0.0;
+    }
+    let mut hit = 0usize;
+    for w in s.windows(2) {
+        let pair: String = w.iter().collect();
+        if r.contains(&pair) {
+            hit += 1;
+        }
+    }
+    hit as f32 / (s.len() - 1) as f32
+}
+
 /// 文本区域结构定义在 `pdf_text::SourceRegion`（PDF 文本层抽取的数据源）。
 ///
 /// 真实接入时由带文本层的 PDF 填充（每个识别片段一条）；无文本层（扫描图）时
@@ -159,6 +186,14 @@ pub struct CollationWorkspace {
     preview_error: Option<String>,
     /// 预览的温和提示（非错误）：如「长稿仅预览前 900 字 / 前 6 页」。
     preview_note: Option<String>,
+    /// 预览是否正在后台排版（true 时不叠加任务，只挂 pending）。
+    preview_busy: bool,
+    /// 排版期间又有新请求（连点 / 连改样式）→ 当前任务回来后补跑一次。
+    preview_pending: bool,
+    /// 预览代际令牌：每次发起请求 +1，旧代际的结果回来即丢弃（含临时文件）。
+    preview_gen: usize,
+    /// 上次发起预览请求的时间（节流窗口 1s 的基准）。
+    preview_last_req: std::time::Instant,
     /// 竖排预览样式：底色（宣纸黄 / 暗金黑 / 极简白 / 仿刻本）。
     preview_bg: ShareBg,
     /// 竖排预览样式：版框（红线框 / 黑线框 / 无边框 / 双边）。
@@ -174,6 +209,10 @@ pub struct CollationWorkspace {
     src_nat_w: f32,
     /// 左图原图自然像素高（由栅格化结果填充；无原图时由区域包围盒推导）。
     src_nat_h: f32,
+    /// 联动提示（非错误）：如「该段与原图此处文字不匹配，已跳过定位」。
+    match_note: Option<String>,
+    /// 排障用帧计数（每 120 帧打一次日志，狂刷 = 存在无限重绘循环）。
+    frame_count: usize,
     /// 原图文本层 / OCR 识别出的文本区域（自然像素坐标）。真实接入时由 PDF 文本层
     /// 或 OCR 引擎填充；MVP 由 `mock_regions()` 提供假数据跑通映射数学。
     regions: Vec<SourceRegion>,
@@ -204,6 +243,13 @@ impl CollationWorkspace {
             preview_page: 0,
             preview_error: None,
             preview_note: None,
+            preview_busy: false,
+            preview_pending: false,
+            preview_gen: 0,
+            // 初始化成「很久以前」，保证首次请求不被节流窗口拦下。
+            preview_last_req: std::time::Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(std::time::Instant::now),
             preview_bg: ShareBg::Xuan,
             preview_frame: ShareFrame::Red,
             preview_columns: 12,
@@ -211,6 +257,8 @@ impl CollationWorkspace {
             active_para_idx: None,
             src_nat_w: 0.0,
             src_nat_h: 0.0,
+            match_note: None,
+            frame_count: 0,
             regions: Self::mock_regions(),
         }
     }
@@ -684,30 +732,30 @@ impl CollationWorkspace {
     /// 版面一致，绝不前大后小。用 `layout` 返回的实际落字数 `CardLayout.chars.len()`
     /// 当页边界推进——零猜测、绝不丢字，列数 / 底色 / 版框怎么变都安全。
     /// 任意一页失败则整体报错并清空已有页（绝不留下半截图）。
-    fn regenerate_preview(&mut self) {
+    /// 预览栅格化的**纯计算核心**（关联函数，不碰 `self`）。
+    ///
+    /// 可在后台线程安全执行：`share_layout` / `share_paint` 只依赖 CoreGraphics +
+    /// CoreText，不涉及 AppKit / 主线程 API。返回 (各页临时 PNG 路径, 温和提示)。
+    /// 三重防卡死闸门（字数 / 页数 / 时间预算）依旧生效，但在后台里它们只限制
+    /// 单批任务时长，不再阻塞 UI 一分一毫。
+    fn render_preview_pages(
+        text: &str,
+        preview_columns: usize,
+        preview_bg: ShareBg,
+        preview_frame: ShareFrame,
+    ) -> Result<(Vec<PathBuf>, Option<String>), String> {
         let t0 = std::time::Instant::now();
-        // 先清旧页（绝不碰用户原文件）。
-        for p in self.preview_paths.drain(..) {
-            let _ = std::fs::remove_file(&p);
-        }
-        self.preview_error = None;
-        self.preview_note = None;
-
         // 预览是一条连续竖排流：去掉编辑器里的换行（段落概念不在简单预览里
         // 体现），否则 '\n' 会占一格变成竖排里的空白格。
-        let mut body: Vec<char> = self
-            .text
+        let mut body: Vec<char> = text
             .chars()
             .filter(|c| *c != '\n' && *c != '\r')
             .collect();
         if body.is_empty() {
-            self.preview_page = 0;
-            return; // 空稿：无图，浮层显示占位提示。
+            return Ok((Vec::new(), None)); // 空稿：无图，浮层显示占位提示。
         }
 
         // —— 防卡死闸门 ①：字数上限 ——
-        // 栅格化是主线程同步的 CG 绘制 + PNG 编码，不做上限时长稿会把主线程堵死
-        // （鼠标转圈、关闭/Esc 全无响应）。宁可只预览前 N 字，也要保住 UI 响应。
         let orig_len = body.len();
         let mut note: Option<String> = None;
         if body.len() > PREVIEW_MAX_CHARS {
@@ -720,7 +768,7 @@ impl CollationWorkspace {
         let red = vec![false; body.len()];
 
         // 按当前列数取整页容量，喂入 ≤ 此值保证不缩字；再用实际落字数推进。
-        let cap = preview_page_cap(self.preview_columns);
+        let cap = preview_page_cap(preview_columns);
         let mut pages: Vec<PathBuf> = Vec::new();
         let mut start = 0usize;
         let mut cut = false; // 是否被闸门 ②/③ 截断
@@ -731,7 +779,6 @@ impl CollationWorkspace {
                 break;
             }
             // —— 防卡死闸门 ③：时间预算 ——
-            // 每页开渲前先看累计耗时，超预算立即收手（已渲的页照常显示）。
             if t0.elapsed().as_millis() > PREVIEW_TIME_BUDGET_MS {
                 cut = true;
                 break;
@@ -746,9 +793,9 @@ impl CollationWorkspace {
                 show_sign: false,
                 date: "",
                 show_date: false,
-                columns: self.preview_columns,
-                bg: self.preview_bg,
-                frame: self.preview_frame,
+                columns: preview_columns,
+                bg: preview_bg,
+                frame: preview_frame,
                 seal: ShareSeal::Twin,
                 seal_text: "笺校",
                 font: ShareFont::Song,
@@ -768,19 +815,17 @@ impl CollationWorkspace {
                     if std::fs::write(&out, &png).is_ok() {
                         pages.push(out);
                     } else {
-                        self.preview_error = Some("预览图写入临时文件失败".to_string());
                         for p in pages.drain(..) {
                             let _ = std::fs::remove_file(&p);
                         }
-                        return;
+                        return Err("预览图写入临时文件失败".to_string());
                     }
                 }
                 Err(e) => {
-                    self.preview_error = Some(e);
                     for p in pages.drain(..) {
                         let _ = std::fs::remove_file(&p);
                     }
-                    return;
+                    return Err(e);
                 }
             }
             start += laid;
@@ -793,21 +838,103 @@ impl CollationWorkspace {
                 orig_len
             ));
         }
-        self.preview_paths = pages;
-        // 列数 / 样式变动可能改变页数，钳制当前页到有效范围。
-        let max_idx = self.preview_paths.len().saturating_sub(1);
-        if self.preview_page > max_idx {
-            self.preview_page = max_idx;
-        }
-        self.preview_note = note;
-        // 防卡死排障日志：字数 / 页数 / 耗时一目了然，便于真机判断是否还需要收紧。
+        // 防卡死排障日志：字数 / 页数 / 耗时一目了然。
         eprintln!(
             "[preview] chars={}/{} pages={} elapsed={}ms",
             body.len(),
             orig_len,
-            self.preview_paths.len(),
+            pages.len(),
             t0.elapsed().as_millis()
         );
+        Ok((pages, note))
+    }
+
+    /// 请求重排预览（**绝不阻塞 UI**）：节流 + 代际令牌 + 后台栅格化。
+    ///
+    /// ・**节流**：1s 内不重复起任务；连点只挂 `preview_pending`，当前任务回来后
+    ///   自动补跑一次（既不堆积任务，也不会「点了没反应」）。
+    /// ・**代际令牌** `preview_gen`：连改样式时旧结果回来即丢弃（含临时文件），
+    ///   绝不让过期的版面覆盖新样式。
+    /// ・**后台执行**：`share_*` 是纯 CG/CT 离屏计算，无主线程依赖，故可安全
+    ///   扔到 background_executor，主线程只管 UI。
+    /// ・**关闭优先**：结果回来时若预览已关闭，直接丢弃结果 —— 关闭 / Esc 因此
+    ///   永远畅通，不受任何后台排版任务影响。
+    fn request_preview(&mut self, cx: &mut Context<Self>) {
+        if self.preview_busy || self.preview_last_req.elapsed() < Duration::from_millis(1000) {
+            self.preview_pending = true;
+            return;
+        }
+        self.preview_last_req = std::time::Instant::now();
+        self.preview_busy = true;
+        self.preview_gen += 1;
+        let gen = self.preview_gen;
+        // 进后台前先把输入快照出来（绝不把 self 带进后台任务）。
+        let text = self.text.clone();
+        let columns = self.preview_columns;
+        let bg = self.preview_bg;
+        let frame = self.preview_frame;
+
+        cx.spawn(
+            // ⚠️ 必须 move：把快照（text/columns/bg/frame/gen）的所有权交给异步块，
+            // 否则 async move 捕获的是对局部变量的借用，过不了 'static。
+            move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    let exec = app.background_executor().clone();
+                    let out = exec
+                        .spawn(async move {
+                            CollationWorkspace::render_preview_pages(&text, columns, bg, frame)
+                        })
+                        .await;
+                    if let Some(entity) = this.upgrade() {
+                        let _ = entity.update(&mut app, |this, cx| {
+                            this.preview_busy = false;
+                            // 预览已关闭 / 代际过期 → 丢弃这批结果（连临时文件一起清）。
+                            if !this.show_preview || gen != this.preview_gen {
+                                if let Ok((pages, _)) = &out {
+                                    for p in pages {
+                                        let _ = std::fs::remove_file(p);
+                                    }
+                                }
+                                cx.notify();
+                                return;
+                            }
+                            match out {
+                                Ok((pages, note)) => {
+                                    // 先清旧页（绝不碰用户原文件）。
+                                    for p in this.preview_paths.drain(..) {
+                                        let _ = std::fs::remove_file(&p);
+                                    }
+                                    this.preview_paths = pages;
+                                    this.preview_note = note;
+                                    this.preview_error = None;
+                                    // 列数 / 样式变动可能改变页数，钳制当前页到有效范围。
+                                    let max_idx = this.preview_paths.len().saturating_sub(1);
+                                    if this.preview_page > max_idx {
+                                        this.preview_page = max_idx;
+                                    }
+                                }
+                                Err(e) => {
+                                    this.preview_error = Some(e);
+                                    this.preview_note = None;
+                                }
+                            }
+                            cx.notify();
+                            // 期间又有新请求（连点 / 连改样式）→ 立刻补跑一次。
+                            if this.preview_pending {
+                                this.preview_pending = false;
+                                // 清掉节流窗口，保证补跑不被再次拦下。
+                                this.preview_last_req = std::time::Instant::now()
+                                    .checked_sub(Duration::from_secs(10))
+                                    .unwrap_or_else(std::time::Instant::now);
+                                this.request_preview(cx);
+                            }
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
     }
 
     /// 右文某段 → 左图联动：记录段索引 + 左侧滚动到对应区域。
@@ -819,9 +946,27 @@ impl CollationWorkspace {
     fn link_to_paragraph(&mut self, para_idx: usize, vw: f32, cx: &mut Context<Self>) {
         // 无对应区域（段落数 ≠ 区域数 / 原图无文本层）→ 不高亮、不滚动、不标记。
         let Some(r) = self.regions.get(para_idx) else {
+            self.active_para_idx = None;
+            self.match_note = None;
             return;
         };
+        // —— 兜底容错：文本对合度校验 ——
+        // 索引对齐只在「右侧转录 ≈ 原图该区域文字」时才有意义。内容不相干（如导入
+        // 《資治通鑑》却贴《千字文》）时，按索引取到的区域必然对不上，画框只会误导
+        // 校对。故先校验字面重合，过低就跳过定位（不高亮、不滚动），并明确提示。
+        let sim = bigram_overlap(&self.paragraph_text(para_idx), &r.text);
+        if sim < MATCH_MIN_SIM {
+            self.active_para_idx = None;
+            self.match_note = Some(format!(
+                "该段与原图此处文字不匹配（字对重合 {:.0}% < {}%），已跳过定位",
+                sim * 100.0,
+                (MATCH_MIN_SIM * 100.0) as u32
+            ));
+            cx.notify();
+            return;
+        }
         self.active_para_idx = Some(para_idx);
+        self.match_note = None;
         let (nw, _nh) = self.source_size();
         let disp_w = vw * 0.4;
         let scale = if nw > 0.0 { disp_w / nw } else { 1.0 };
@@ -829,6 +974,20 @@ impl CollationWorkspace {
         self.left_scroll
             .set_offset(Point::new(px(0.0), px(-(r.y * scale))));
         cx.notify();
+    }
+
+    /// 取右文第 `idx` 段的纯文本（用于与原图区域文字做字面相似度校验）。
+    fn paragraph_text(&self, idx: usize) -> String {
+        self.line_ranges()
+            .get(idx)
+            .map(|&(s, e)| {
+                self.text
+                    .chars()
+                    .skip(s)
+                    .take(e.saturating_sub(s))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// 左图原图自然像素尺寸：已载入原图用栅格化得到的真实尺寸；无原图时由
@@ -873,6 +1032,18 @@ impl CollationWorkspace {
 
     /// 右侧联动状态条：显示当前已联动段对应的原图区域坐标（自然像素）。
     fn render_link_status(&self) -> gpui::Div {
+        // 不匹配提示优先（此时 active_para_idx 为 None，否则会显示空条）。
+        if let Some(n) = &self.match_note {
+            return div()
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .px(px(PAD))
+                .bg(rgba(0xb0342c1f))
+                .text_color(rgb(0xb0342c))
+                .text_size(px(13.0))
+                .child(SharedString::from(n.clone()));
+        }
         match self.active_para_idx {
             Some(idx) => {
                 let coord = self
@@ -949,7 +1120,7 @@ impl CollationWorkspace {
                     .child(self.button("竖排预览", |c, _, _, cx| {
                         c.show_preview = !c.show_preview;
                         if c.show_preview {
-                            c.regenerate_preview();
+                            c.request_preview(cx);
                         }
                         cx.notify();
                     }, cx)),
@@ -1143,7 +1314,7 @@ impl CollationWorkspace {
                     .child(self.button(
                         "刷新预览",
                         |c, _, _, cx| {
-                            c.regenerate_preview();
+                            c.request_preview(cx);
                             cx.notify();
                         },
                         cx,
@@ -1243,7 +1414,7 @@ impl CollationWorkspace {
                 b.label(),
                 move |c, _, _, cx| {
                     c.preview_bg = b;
-                    c.regenerate_preview();
+                    c.request_preview(cx);
                     cx.notify();
                 },
                 cx,
@@ -1268,7 +1439,7 @@ impl CollationWorkspace {
                 f.label(),
                 move |c, _, _, cx| {
                     c.preview_frame = f;
-                    c.regenerate_preview();
+                    c.request_preview(cx);
                     cx.notify();
                 },
                 cx,
@@ -1299,7 +1470,7 @@ impl CollationWorkspace {
                 },
                 move |c, _, _, cx| {
                     c.preview_columns = cols;
-                    c.regenerate_preview();
+                    c.request_preview(cx);
                     cx.notify();
                 },
                 cx,
@@ -1435,6 +1606,14 @@ impl Render for CollationWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let vw = px_f32(window.viewport_size().width);
         let vh = px_f32(window.viewport_size().height);
+        // 排障：帧计数。静止时也狂刷 → 说明有无限重绘循环（脏标记漏了）。
+        self.frame_count += 1;
+        if self.frame_count % 120 == 0 {
+            eprintln!(
+                "[render] frames={} preview={} busy={}",
+                self.frame_count, self.show_preview, self.preview_busy
+            );
+        }
         // 焦点归属：预览开启时把焦点引到 `preview_focus`，使其落在「根元素」派发
         // 路径上 → 根 div 的 `on_key_down` 能收到 ←/→/Esc；同时编辑器（IME 焦点在
         // `focus`）自然失焦，不再抢方向键去移动光标。预览关闭则焦点还给编辑器，
