@@ -482,15 +482,16 @@ impl Brush {
         self.missing += 1;
         false
     }
+
 }
 
 /// 注音：**横排、正立、从左到右**，落在汉字右侧的列间空白里
-/// （与屏幕 `ruby::layout` 同一套几何）。
+/// （与屏幕 `ruby::layout` 同一套几何、同一颜色 `#8C2B22`）。
 ///
 /// 屏幕那侧是一张 CoreGraphics 离屏位图；这里是 CG 逐字落笔。两者共用
 /// `jiandu_core::ruby::layout` 的度量（字号 40%、按可用宽收敛到 22%、
 /// 左缘从汉字右缘让开），所以 PDF 里的 `měng` 与屏幕逐字同位——
-/// 绝不歪着排、绝不被转 90°，也绝不碰到下一列的字形。
+/// 绝不歪着排、也绝不碰到下一列的字形。颜色锁死朱砂红 `#8C2B22`。
 fn draw_ruby(
     b: &mut Brush,
     py: &str,
@@ -514,7 +515,7 @@ fn draw_ruby(
             top,
             rl.block_h as f64,
             rl.fs as f64,
-            g.note_ink,
+            0x8C2B22,
             ShareFont::from(g.note_font),
         );
     }
@@ -526,7 +527,7 @@ fn draw_ruby(
     let left = x + cell_w - cell_w * 0.10 - total;
     let dy = y + cell_h - cell_h * 0.055 - 0.7;
     for i in 0..3 {
-        b.rect(left + i as f64 * (dw + gap), dy, dw, 0.7, g.note_ink, None);
+        b.rect(left + i as f64 * (dw + gap), dy, dw, 0.7, 0x8C2B22, None);
     }
 }
 

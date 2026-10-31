@@ -7059,21 +7059,19 @@ impl Root {
         };
 
         // ── 注音（生僻字拼音）────────────────────────────────────
-        // v1.85.2：整串**横排、正立、从左到右**，落在汉字右侧的列间空白里——
-        // 与竖排正文同向读（字自上而下、音横着念），不必歪头。字号吃满正文
-        // 40%（长拼音按可用宽收敛，下限 22%），左缘从汉字右缘让开一点呼吸，
-        // 右缘绝不碰到下一列的字形。
-        //
-        // GPUI 既转不动字形也没有排版引擎，故整串走 `ruby_glyph`：CoreGraphics
-        // 离屏渲成一张透明位图，再用 `img` 按 `ruby::layout` 给的框贴进字格
-        // （详见该两处的文件头）。万一光栅失败（无字体 / 非 macOS），退回
-        // 逐字母横排的 div。
+        // 最终态（v1.9.14）：拼音**横排、正立、从左到右**，作为整体贴在汉字右侧
+        // 的列间空白里。整串宽度**硬封顶到字格右缘**，绝不横跨整列宽、绝不挤占左侧
+        // 句读、绝不溢出右界栏；纵向只占 `1.05× 拼音字号`、在格内竖直居中。
+        // 颜色锁死朱砂红 `#8C2B22`、透明度 0.75（朱砂微微晕染宣纸的透气感，详见
+        // `ruby_glyph.rs`）。GPUI 没有排版引擎，整串走 `ruby_glyph`：CoreGraphics
+        // 离屏按 `ruby::layout` 的度量（**不旋转**）渲成透明位图，再用 `img` 贴进
+        // 字格。万一光栅失败（无字体 / 非 macOS），退回逐字母横排的 div。
         if let Some(py) = rare_py.as_deref() {
             let rl = crate::ruby::layout(py, fs, cell_w, cell_h);
-            // 回滚到「原来」：拼音颜色重新与批注同源（`palette.note`，朱砂红），
-            // 不再拆成独立灰墨；透明度保留 0.8（ruby_glyph 内）的半透宣纸感，
-            // 几何由 `ruby::layout` 硬封顶到字格右缘，绝不越界 / 压句读 / 出界栏。
-            let ruby_ink = self.palette.note(t);
+            // 锁定：拼音颜色 = 朱砂红 #8C2B22、透明度 0.75（朱砂微微晕染宣纸的透气感，
+            // 不与批注混色）；整串横排正立、垂直居中于汉字右侧，宽度硬封顶到字格右缘，
+            // 绝不横跨整列宽、绝不挤占左侧句读、绝不溢出右界栏。
+            let ruby_ink = 0x8C2B22u32;
             if let Some(im) = crate::ruby_glyph::ruby_image(py, rl.fs, ruby_ink) {
                 cell = cell.child(
                     div()
@@ -7106,7 +7104,7 @@ impl Root {
                             .items_center()
                             .justify_center()
                             .text_size(px(rl.fs))
-                            .text_color(rgba((ruby_ink << 8) | 0xCC))
+                            .text_color(rgba((ruby_ink << 8) | 0xBF))
                             .child(SharedString::from(ch.to_string())),
                     );
                 }

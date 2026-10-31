@@ -1,4 +1,4 @@
-//! 生僻字注音位图（v1.85.2）：**横排、正立、从左到右**。
+//! 生僻字注音位图（v1.9.13）：**横排、正立、从左到右**，落在汉字右侧的列间空白里。
 //!
 //! ## 为什么要有这个文件
 //!
@@ -6,8 +6,9 @@
 //! 而注音是一整串带声调的拉丁字母，字距、升部、降部都得对。绕开的办法是：
 //! **CoreGraphics 离屏**把整串渲成一张透明位图，交给 GPUI 的 `img` 贴进字格。
 //!
-//! 早先这里做的是「整串转 90°」，转出来是一条竖条——字母躺着，读起来要歪头，
-//! 用户否掉了。现在就是老老实实的横排正立：字头朝上、从左读到右。
+//! 用户铁律（v1.9.13 最终态）：**拼音保持横排（字母横向排列）**，严格垂直居中于
+//! 汉字右侧，整串宽度硬封顶到字格右缘——绝不横跨整列宽、绝不挤占左侧句读、
+//! 绝不溢出右界栏。
 //!
 //! ## 坐标（照抄 `share_paint` 已验证的结论）
 //!
@@ -15,10 +16,12 @@
 //! * **绝不翻 CTM**（`translate(0,h) + scale(1,-1)` 会把字形垂直镜像）；
 //! * 基线落在 `pad + descent`（距图像底边），升部向上顶到 `h - pad`。
 //!
-//! ## 尺寸
+//! ## 样式（用户精调，只动这里）
 //!
-//! 位图 = 串的自然宽 + 两侧 pad × 字高（升部 + 降部）+ 上下 pad，
-//! 由 `ruby::layout` 给出目标框，`img` 按框缩放，屏幕与纸面逐字同位。
+//! * **颜色**：`ruby_image` 的调用方传入朱砂红 `#8C2B22`（锁死）；
+//! * **透明度**：填充 alpha = **0.75**（朱砂微微晕染宣纸的透气感，绝不刺眼）；
+//! * **字体**：**强制 Songti SC（宋体）**优先，绝不用 PingFang 等黑体；
+//! * **字号**：由 `ruby::layout` 给出，恒为正文 40%（蝇头小楷感）。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -26,10 +29,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// 超采样倍数：位图按 3× 渲、按 1× 尺寸显示——Retina 上小字不糊。
 const SS: f64 = 3.0;
 
-/// 注音字体候选：拉丁字母 + 声调字符（ā á ǎ à ē ě ū ǚ …）必须齐全。
-/// **宋体优先**（Songti SC / STSong），古风铅字感；Helvetica 老系统兜底；
-/// 都缺字形就**不画**（退回逐字母）。
-const FONTS: [&str; 3] = ["Songti SC", "STSong", "Helvetica"];
+/// 注音字体候选：**强制 Songti SC（宋体）优先**，绝不用 PingFang 等黑体；
+/// 后备仍是衬线（STSong / Songti TC），保证带调元音（ā á ǎ à …）齐全不缺字形。
+/// 都缺字形就**不画**（退回逐字母横排）。
+const FONTS: [&str; 3] = ["Songti SC", "STSong", "Songti TC"];
 
 /// 位图格式：32 位**大端** + **预乘** alpha 在最后。
 ///
@@ -41,6 +44,9 @@ const BYTE_ORDER_32_BIG: u32 = 4 << 12;
 const ALPHA_PREMULTIPLIED_LAST: u32 = 1;
 const BITMAP_INFO: u32 = BYTE_ORDER_32_BIG | ALPHA_PREMULTIPLIED_LAST;
 
+/// 注音位图填充透明度（朱砂微微晕染在宣纸上的透气感）。
+const RUBY_ALPHA: f64 = 0.75;
+
 /// 缓存：同一（拼音, 字号档, 墨色）只光栅一次。
 fn cache() -> &'static Mutex<HashMap<String, Arc<gpui::RenderImage>>> {
     static C: OnceLock<Mutex<HashMap<String, Arc<gpui::RenderImage>>>> = OnceLock::new();
@@ -49,8 +55,8 @@ fn cache() -> &'static Mutex<HashMap<String, Arc<gpui::RenderImage>>> {
 
 /// 一条拼音的横排位图。失败返回 `None`（调用方退化）。
 ///
-/// * `fs`：拼音字号（由 `ruby::layout` 给出）；
-/// * `color`：`0xRRGGBB` 墨色。
+/// * `fs`：拼音字号（由 `ruby::layout` 给出，恒为正文 40%）；
+/// * `color`：`0xRRGGBB` 墨色（调用方锁死 `#8C2B22`）。
 pub fn ruby_image(py: &str, fs: f32, color: u32) -> Option<Arc<gpui::RenderImage>> {
     if py.is_empty() || fs < 2.0 {
         return None;
@@ -106,7 +112,7 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
     use core_text::font::new_from_name;
     use core_text::font_descriptor::kCTFontOrientationHorizontal;
 
-    // ① 挑一台能覆盖整串的字体（缺任何一个字形就换下一台）。
+    // ① 挑一台能覆盖整串的字体（缺任何一个字形就换下一台）。强制 Songti SC 优先。
     let mut picked: Option<core_text::font::CTFont> = None;
     let mut glyphs: Vec<CGGlyph> = Vec::new();
     for name in FONTS {
@@ -170,13 +176,13 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
 
     // ④ 正立横排：放大到超采样网格 → 原点挪到「左内边距 / 基线」。
     //    CG 位图上下文原点在左下、y 向上，故基线离底边 `pad + desc`，
-    //    升部正好顶到 `h - pad`。**不旋转、不翻 CTM**。
+    //    升部正好顶到 `h - pad`。**不旋转、不翻 CTM**（横排正立）。
     ctx.scale(SS, SS);
     ctx.translate(pad, pad + desc);
 
     let (r, g, b) = rgb_of(color);
-    // 注音墨色半透明（0.8）：透出一点纸色，朱砂轻盈不抢正文（v1.9.11）。
-    ctx.set_rgb_fill_color(r, g, b, 0.8);
+    // 注音墨色半透明（0.75）：朱砂微微晕染宣纸的透气感，绝不刺眼。
+    ctx.set_rgb_fill_color(r, g, b, RUBY_ALPHA);
     let mut x = 0.0f64;
     for i in 0..n {
         // `draw_glyphs` 按值取 context：`clone()` 是 CGContextRetain，随调用
@@ -191,8 +197,8 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
     let mut buf: Vec<u8> = Vec::with_capacity(bw * bh * 4);
     for y in 0..bh {
         let base = y * stride;
-        for x in 0..bw {
-            let i = base + x * 4;
+        for xx in 0..bw {
+            let i = base + xx * 4;
             let a = data[i + 3];
             let (pr, pg, pb) = (data[i], data[i + 1], data[i + 2]);
             buf.push(unpremul(pb, a));
@@ -216,9 +222,7 @@ mod tests {
 
     /// 注音位图必须是**横长条**：宽（串长）明显大于高（字母高）。
     /// 这条同时钉死两件事：位图真的画出来了，且是横排——若哪天又改回
-    /// 「转 90° 竖条」，宽高比会立刻反过来（w<h）。阈值取 1.25：宋体（Songti
-    /// SC）的拉丁字身比 PingFang 略高，1.53× 已是稳稳的横条，留足余量仍能
-    /// 一眼识破竖条（竖条 w/h<1）。
+    /// 「转 90° 竖条」，宽高比会立刻反过来（w<h）。
     #[test]
     fn ruby_bitmap_is_wider_than_tall() {
         let im = ruby_image("měng", 12.0, 0x8C2B22).expect("注音位图应当渲染成功");
@@ -258,7 +262,7 @@ mod tests {
 
     /// 通道序钉死：给纯红，缓冲里字形内部必须是 `B=0,G=0,R=255`（gpui 存 BGRA）。
     /// 这条防的是 `BITMAP_INFO` 写错导致 CG 退回主机序、朱砂注音变蓝。
-    /// 注意：自 v1.9.11 起填充 alpha 为 0.8，字内像素 `a≈204`（不再等于 255），
+    /// 注意：填充 alpha 为 0.75，字内像素 `a≈191`（不再等于 255），
     /// 故这里取「最不透明的字内像素」来验通道序，而非强求 a==255。
     #[cfg(target_os = "macos")]
     #[test]
@@ -289,5 +293,26 @@ mod tests {
         let a = ruby_image("bō", 11.0, 0x8C2B22).expect("位图");
         let b = ruby_image("bō", 11.0, 0x8C2B22).expect("位图");
         assert!(a.id == b.id, "缓存未命中：同一条拼音被光栅了两次");
+    }
+
+    /// 透明度确实落在 0.75 附近（取「最不透明字内像素」的 alpha）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ruby_alpha_is_the_ink_wash() {
+        let (bw, bh, buf) = raster("měng", 20.0, 0x8C2B22).expect("位图");
+        let mut best_a: u8 = 0;
+        for y in 0..bh {
+            for x in 0..bw {
+                let a = buf[(y * bw + x) * 4 + 3];
+                if a > best_a {
+                    best_a = a;
+                }
+            }
+        }
+        // 0.75 × 255 ≈ 191，允许少量抗锯齿误差。
+        assert!(
+            (best_a as i32 - 191).abs() <= 8,
+            "注音 alpha 应为 ~0.75（≈191），实得 {best_a}"
+        );
     }
 }
