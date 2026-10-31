@@ -68,8 +68,10 @@ const LINE_H: f32 = FONT_SIZE * 1.7;
 const CHAR_W: f32 = FONT_SIZE * 0.95;
 /// 左图 mock 行高（骨架阶段：右文第 N 段 → 左图 Y = N * BAND_H）。
 const BAND_H: f32 = 100.0;
-/// 竖排预览单页大约可容纳的正文字数（12 列 1080×1920 卡实测 ~264）。
-/// 超过则提示「仅预览首页」，翻页后续支持。
+/// 竖排预览每页切块的字数上限（12 列 1080×1920 卡、不落款时 `layout` 默认
+/// 字号下整页容量 ≈ 288 字）。切成 ≤ 此值的页块后，各页都不会触发 `layout`
+/// 的自动缩字号循环（share_layout.rs:346 的 `cols_max * rows < n` 永不成立），
+/// 因此整本文稿字号恒定、版面一致，绝不出现「前几页大后几页小」。
 const PREVIEW_PAGE_CHARS: usize = 264;
 
 /// 左侧高亮矩形（内容坐标系，随原图一起滚动）。
@@ -109,10 +111,10 @@ pub struct CollationWorkspace {
     image_error: Option<String>,
     /// 非错误的温和提示（如多页 PDF 仅渲首页）。
     image_note: Option<String>,
-    /// 竖排预览（离屏栅格化）位图路径；None 时浮层显示占位。
-    preview_path: Option<PathBuf>,
-    /// 上一张预览临时 PNG；重新生成时删除以免堆积。
-    preview_temp: Option<PathBuf>,
+    /// 竖排预览（离屏栅格化）各页位图路径（按页序；均为临时 PNG，重生成时清空）。
+    preview_paths: Vec<PathBuf>,
+    /// 当前预览页码（0-based）；`preview_paths` 为空时无意义。
+    preview_page: usize,
     /// 预览栅格化失败信息（红色提示，如系统缺中文字体）。
     preview_error: Option<String>,
     /// 左图高亮矩形（内容坐标，随原图滚动）。None = 无高亮。
@@ -126,8 +128,9 @@ pub struct CollationWorkspace {
 impl CollationWorkspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
-            // 示例转录：让用户一进来就能看到编辑器并立即尝试选择/输入。
-            text: "天地玄黃 宇宙洪荒\n日月盈昃 辰宿列張\n寒來暑往 秋收冬藏\n閏餘成歲 律呂調陽\n雲騰致雨 露結為霜"
+            // 示例转录：一段较长的古文（千字文节选），让用户一进来就能看到
+            // 编辑器、立即尝试选择/输入，并直接打开「竖排预览」看到多页分页。
+            text: "天地玄黄 宇宙洪荒 日月盈昃 辰宿列张 寒来暑往 秋收冬藏 闰余成岁 律吕调阳 云腾致雨 露结为霜 金生丽水 玉出昆冈 剑号巨阙 珠称夜光 果珍李柰 菜重芥姜 海咸河淡 鳞潜羽翔 龙师火帝 鸟官人皇 始制文字 乃服衣裳 推位让国 有虞陶唐 吊民伐罪 周发殷汤 坐朝问道 垂拱平章 爱育黎首 臣伏戎羌 遐迩一体 率宾归王 鸣凤在竹 白驹食场 化被草木 赖及万方\n盖此身发 四大五常 恭惟鞠养 岂敢毁伤 女慕贞洁 男效才良 知过必改 得能莫忘 罔谈彼短 靡恃己长 信使可覆 器欲难量 墨悲丝染 诗赞羔羊 景行维贤 克念作圣 德建名立 形端表正 空谷传声 虚堂习听 祸因恶积 福缘善庆 尺璧非宝 寸阴是竞 资父事君 曰严与敬 孝当竭力 忠则尽命 临深履薄 夙兴温凊 似兰斯馨 如松之盛 川流不息 渊澄取映 容止若思 言辞安定 笃初诚美 慎终宜令 荣业所基 藉甚无竟 学优登仕 摄职从政 存以甘棠 去而益咏"
                 .to_string(),
             cursor: 0,
             selection: None,
@@ -142,8 +145,8 @@ impl CollationWorkspace {
             last_temp: None,
             image_error: None,
             image_note: None,
-            preview_path: None,
-            preview_temp: None,
+            preview_paths: Vec::new(),
+            preview_page: 0,
             preview_error: None,
             highlight: None,
             active_para_idx: None,
@@ -582,58 +585,79 @@ impl CollationWorkspace {
     ///
     /// 设计取舍（MVP）：只渲「首页」——`layout` 按版心容量自动截断超长文本；
     /// 翻页（多页卡预览）留待后续。文本改动后需点浮层「刷新预览」重生成。
+    /// 把转录文本离屏栅格化成「笺读风」竖排书页（**多页**）。
+    ///
+    /// 长文按 [`PREVIEW_PAGE_CHARS`] 逐块切页，每块独立 `layout` + `render_png`。
+    /// 因每块都 ≤ 整页容量，`layout` 不会触发自动缩字，整本字号恒定、版面一致。
+    /// 任意一页失败则整体报错并清空已有页（绝不留下半截图）。
     fn regenerate_preview(&mut self) {
-        let body: Vec<char> = self.text.chars().collect();
-        // 空稿：清掉旧预览，不留残图。
+        // 先清旧页（绝不碰用户原文件）。
+        for p in self.preview_paths.drain(..) {
+            let _ = std::fs::remove_file(&p);
+        }
+        self.preview_page = 0;
+        self.preview_error = None;
+
+        // 预览是一条连续竖排流：去掉编辑器里的换行（段落概念不在简单预览里
+        // 体现），否则 '\n' 会占一格变成竖排里的空白格。
+        let body: Vec<char> = self
+            .text
+            .chars()
+            .filter(|c| *c != '\n' && *c != '\r')
+            .collect();
         if body.is_empty() {
-            if let Some(old) = self.preview_temp.take() {
-                let _ = std::fs::remove_file(&old);
-            }
-            self.preview_path = None;
-            self.preview_error = None;
-            return;
+            return; // 空稿：无图，浮层显示占位提示。
         }
         let red = vec![false; body.len()];
-        // 默认版式：宣纸黄 + 朱丝栏 + 双鱼尾印 + 宋体 12 列（与分享卡同源）。
-        // 落款 / 批注 / 时间戳首版全关，聚焦正文竖排本身。
-        let spec = LayoutSpec {
-            body: &body,
-            red: &red,
-            note: "",
-            show_notes: false,
-            sign: "",
-            show_sign: false,
-            date: "",
-            show_date: false,
-            columns: 12,
-            bg: ShareBg::Xuan,
-            frame: ShareFrame::Red,
-            seal: ShareSeal::Twin,
-            seal_text: "笺校",
-            font: ShareFont::Song,
-            stamp: "",
-            w: 1080.0,
-            h: 1920.0,
-        };
-        match render_png(&layout(&spec)) {
-            Ok(png) => {
-                let out = temp_png_path(); // 纳秒唯一命名，每次生成独立路径，绕开 img 缓存。
-                if std::fs::write(&out, &png).is_ok() {
-                    // 删旧临时图（绝不碰用户原文件），再上新路径。
-                    if let Some(old) = self.preview_temp.take() {
-                        let _ = std::fs::remove_file(&old);
+
+        let mut pages: Vec<PathBuf> = Vec::new();
+        let mut start = 0usize;
+        while start < body.len() {
+            let end = (start + PREVIEW_PAGE_CHARS).min(body.len());
+            let spec = LayoutSpec {
+                body: &body[start..end],
+                red: &red[start..end],
+                note: "",
+                show_notes: false,
+                sign: "",
+                show_sign: false,
+                date: "",
+                show_date: false,
+                columns: 12,
+                bg: ShareBg::Xuan,
+                frame: ShareFrame::Red,
+                seal: ShareSeal::Twin,
+                seal_text: "笺校",
+                font: ShareFont::Song,
+                stamp: "",
+                w: 1080.0,
+                h: 1920.0,
+            };
+            match render_png(&layout(&spec)) {
+                Ok(png) => {
+                    let out = temp_png_path(); // 纳秒唯一命名，绕开 img 缓存。
+                    if std::fs::write(&out, &png).is_ok() {
+                        pages.push(out);
+                    } else {
+                        self.preview_error = Some("预览图写入临时文件失败".to_string());
+                        for p in pages.drain(..) {
+                            let _ = std::fs::remove_file(&p);
+                        }
+                        return;
                     }
-                    self.preview_path = Some(out.clone());
-                    self.preview_temp = Some(out);
-                    self.preview_error = None;
-                } else {
-                    self.preview_error = Some("预览图写入临时文件失败".to_string());
+                }
+                Err(e) => {
+                    self.preview_error = Some(e);
+                    for p in pages.drain(..) {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                    return;
                 }
             }
-            Err(e) => {
-                self.preview_error = Some(e);
-            }
+            start = end;
         }
+
+        self.preview_paths = pages;
     }
 
     /// 右文某段 → 左图联动：记录段文本 + 左侧滚动到对应 Y + 高亮。
@@ -862,8 +886,9 @@ impl CollationWorkspace {
 
     /// 竖排预览浮层：把转录文本离屏栅格化成「笺读风」竖排书页，`gpui::img` 贴图。
     ///
-    /// 全屏遮罩 + 顶部工具条（刷新 / 关闭）+ 居中整页图（随窗口高度自适应，
-    /// 比例保持竖排书页）。底部状态条显示栅格化错误或「长文仅预览首页」提示。
+    /// 全屏遮罩 + 顶部工具条（翻页器 / 刷新 / 关闭）+ 居中整页图（随窗口高度
+    /// 自适应，比例保持竖排书页）。底部状态条仅显示栅格化错误（如缺中文字体）。
+    /// 长文自动按页切块，用顶部「← 第 X / Y 页 →」翻页（见 [`regenerate_preview`]）。
     fn render_preview_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .absolute()
@@ -889,6 +914,7 @@ impl CollationWorkspace {
                             .child(SharedString::from("竖排预览")),
                     )
                     .child(div().flex_1())
+                    .child(self.preview_pager(cx))
                     .child(self.button(
                         "刷新预览",
                         |c, _, _, cx| {
@@ -914,18 +940,21 @@ impl CollationWorkspace {
                     .items_center()
                     .justify_center()
                     .overflow_y_scroll()
-                    .child(match &self.preview_path {
-                        Some(p) => div().child(img(p.clone()).h_full()),
-                        None => div()
-                            .px(px(20.0))
-                            .py(px(16.0))
-                            .bg(rgb(0xf4ecd8))
-                            .rounded(px(8.0))
-                            .text_color(rgb(0x2b2620))
-                            .text_size(px(14.0))
-                            .child(SharedString::from(
-                                "（转录为空：写入文字后点「竖排预览」或「刷新预览」）",
-                            )),
+                    .child({
+                        let idx = self.preview_page.min(self.preview_paths.len().saturating_sub(1));
+                        match self.preview_paths.get(idx) {
+                            Some(p) => div().child(img(p.clone()).h_full()),
+                            None => div()
+                                .px(px(20.0))
+                                .py(px(16.0))
+                                .bg(rgb(0xf4ecd8))
+                                .rounded(px(8.0))
+                                .text_color(rgb(0x2b2620))
+                                .text_size(px(14.0))
+                                .child(SharedString::from(
+                                    "（转录为空：写入文字后点「竖排预览」或「刷新预览」）",
+                                )),
+                        }
                     }),
             )
             .child(match self.render_preview_status() {
@@ -934,37 +963,63 @@ impl CollationWorkspace {
             })
     }
 
-    /// 底部状态条：优先显示预览栅格化错误（红），否则长文提示（如仅预览首页）。
+    /// 翻页器：多页时显示「← 第 X / Y 页 →」，单页（或无图）时返回空 div。
+    fn preview_pager(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let n = self.preview_paths.len();
+        if n <= 1 {
+            return div();
+        }
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .child(self.button(
+                "←",
+                |c, _, _, cx| {
+                    if c.preview_page > 0 {
+                        c.preview_page -= 1;
+                    }
+                    cx.notify();
+                },
+                cx,
+            ))
+            .child(
+                div()
+                    .text_color(rgb(0xf4ecd8))
+                    .text_size(px(14.0))
+                    .child(SharedString::from(format!(
+                        "第 {} / {} 頁",
+                        self.preview_page + 1,
+                        n
+                    ))),
+            )
+            .child(self.button(
+                "→",
+                |c, _, _, cx| {
+                    if c.preview_page + 1 < c.preview_paths.len() {
+                        c.preview_page += 1;
+                    }
+                    cx.notify();
+                },
+                cx,
+            ))
+    }
+
+    /// 底部状态条：仅显示预览栅格化错误（红）。多页提示由顶部翻页器承载。
     fn render_preview_status(&self) -> Option<gpui::Div> {
-        if let Some(e) = &self.preview_error {
-            return Some(
-                div()
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .px(px(PAD))
-                    .bg(rgba(0xb0342c33))
-                    .text_color(rgb(0xb0342c))
-                    .text_size(px(13.0))
-                    .child(SharedString::from(e.clone())),
-            );
-        }
-        if self.text.chars().count() > PREVIEW_PAGE_CHARS {
-            return Some(
-                div()
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .px(px(PAD))
-                    .bg(rgba(0x8c2b2210))
-                    .text_color(rgb(0x8c2b22))
-                    .text_size(px(13.0))
-                    .child(SharedString::from(
-                        "长文仅预览首页，翻页后续支持（文本有改动点「刷新预览」）",
-                    )),
-            );
-        }
-        None
+        let e = self.preview_error.as_ref()?;
+        Some(
+            div()
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .px(px(PAD))
+                .bg(rgba(0xb0342c33))
+                .text_color(rgb(0xb0342c))
+                .text_size(px(13.0))
+                .child(SharedString::from(e.clone())),
+        )
     }
 }
 
