@@ -12,9 +12,10 @@
 //!      且**不与 reader 耦合**（本模块绝不 import reader）。
 //!
 //! 本文件是 MVP 的** UI 骨架**：AppMode 切换 + 40/60 分屏 + 可编辑/可选择的
-//! 原生编辑器 + 左图右文联动（骨架阶段：左图 mock 行带 + 右文点击段 → 左图
-//! `ScrollHandle` 滚动到 N*BAND_H 并叠加半透明高亮矩形）。原图预栅格化位图
-//! 真实接入（PDF 文本层 / OCR 坐标匹配）在后续提交替换 Mock 映射。
+//! 原生编辑器 + 左图右文联动（真实坐标映射：右文第 N 段 → `SourceRegion` 的
+//! (x,y,w,h) 自然像素坐标 → 缩放后高亮原图区域 + `ScrollHandle` 滚动）。
+//! `SourceRegion` 同时承载「真实 PDF 文本层 / OCR」坐标与「Mock 假数据」，
+//! 二者共用同一套映射数学，仅数据源不同（见 `mock_regions` 与后续接入点）。
 //!
 //! —— 已落地 ——
 //! ・方向①（真实图片）：左侧【打开文件】按钮 → rfd 选 PDF / PNG → CoreGraphics
@@ -23,6 +24,10 @@
 //! ・竖排预览：右侧【竖排预览】按钮 → 把转录文本离屏栅格化成「笺读风」竖排书页
 //!   （宣纸黄 + 朱丝栏 + 双鱼尾印 + 宋体 12 列），`gpui::img` 整页贴图
 //!   （见 `regenerate_preview` + `render_preview_overlay`，纯 `share_*` 链路）。
+//! ・真实坐标映射：删除 N*BAND_H 行带 Mock，新增 `SourceRegion`{x,y,w,h,text}
+//!   数据源结构；右文点击段落 → 查 `regions[i]` → 自然像素坐标按 `source_size()`
+//!   缩放后高亮原图区域并滚动。当前 `regions` 由 `mock_regions()` 提供假数据
+//!   跑通数学，待真实 PDF 文本层 / OCR 接入后仅替换数据源即可（结构不变）。
 
 use crate::ime::{
     char_to_utf16, effective_replace_range, utf16_len, utf16_slice, utf16_to_char,
@@ -66,10 +71,9 @@ const HEADER_H: f32 = 44.0;
 const PAD: f32 = 14.0;
 const FONT_SIZE: f32 = 17.0;
 const LINE_H: f32 = FONT_SIZE * 1.7;
-/// 近似字宽：原图转录以 CJK 为主，按字号取值做点击定位（精确映射在下一步替换）。
+/// 近似字宽：原图转录以 CJK 为主，按字号取值做编辑器内点击定位（仅用于右文
+/// 落光标 / 选区估算，不影响左图高亮精度——左图高亮走 `SourceRegion` 真实映射）。
 const CHAR_W: f32 = FONT_SIZE * 0.95;
-/// 左图 mock 行高（骨架阶段：右文第 N 段 → 左图 Y = N * BAND_H）。
-const BAND_H: f32 = 100.0;
 /// 竖排预览各列数档位下的整页容量（由 `share_layout` 版式几何精算得出，
 /// 预览固定 1080×1920、不落款不批注：8→120 / 10→190 / 12→264 / 14→364）。
 /// 每页喂入 ≤ 此值可保证 `layout` 不触发自动缩字号（share_layout.rs:346 的
@@ -85,11 +89,23 @@ fn preview_page_cap(columns: usize) -> usize {
     }
 }
 
-/// 左侧高亮矩形（内容坐标系，随原图一起滚动）。
-#[derive(Clone, Copy)]
-struct Highlight {
+/// 原图文本层 / OCR 识别出的一个文本区域（自然像素坐标，单位 = 原图像素）。
+///
+/// 真实接入时由 PDF 文本层或 OCR 引擎填充（每个识别片段一条）；MVP 由
+/// `mock_regions()` 提供假数据。右文第 i 段 ↔ `regions[i]`（转录逐行对齐原图行）。
+/// 坐标恒为原图自然像素，显示时按 `source_size()` 的缩放比换算，绝不写死像素。
+#[derive(Clone)]
+struct SourceRegion {
+    /// 左上角 X（原图像素）。
+    x: f32,
+    /// 左上角 Y（原图像素）。
     y: f32,
+    /// 区域宽（原图像素）。
+    w: f32,
+    /// 区域高（原图像素）。
     h: f32,
+    /// 该区域识别出的文本（用于校对核对 / 状态展示；映射本身按段落顺序索引）。
+    text: String,
 }
 
 /// 笺校工作台视图：拥有自己的编辑缓冲、焦点、滚动柄，**不引用 Reader 任何字段**。
@@ -141,12 +157,16 @@ pub struct CollationWorkspace {
     preview_columns: usize,
     /// 样式选择面板是否展开。
     show_style_panel: bool,
-    /// 左图高亮矩形（内容坐标，随原图滚动）。None = 无高亮。
-    highlight: Option<Highlight>,
-    /// 当前联动的右文段索引（0-based）。None = 尚未联动。
+    /// 当前联动的右文段索引（0-based）。None = 尚未联动。右文第 i 段 ↔
+    /// `regions[i]`（转录逐行对齐原图行）。
     active_para_idx: Option<usize>,
-    /// 当前联动段提取出的纯文本（为后续真实坐标匹配预留）。
-    active_para_text: String,
+    /// 左图原图自然像素宽（由栅格化结果填充；无原图时由区域包围盒推导）。
+    src_nat_w: f32,
+    /// 左图原图自然像素高（由栅格化结果填充；无原图时由区域包围盒推导）。
+    src_nat_h: f32,
+    /// 原图文本层 / OCR 识别出的文本区域（自然像素坐标）。真实接入时由 PDF 文本层
+    /// 或 OCR 引擎填充；MVP 由 `mock_regions()` 提供假数据跑通映射数学。
+    regions: Vec<SourceRegion>,
 }
 
 impl CollationWorkspace {
@@ -177,9 +197,10 @@ impl CollationWorkspace {
             preview_frame: ShareFrame::Red,
             preview_columns: 12,
             show_style_panel: false,
-            highlight: None,
             active_para_idx: None,
-            active_para_text: String::new(),
+            src_nat_w: 0.0,
+            src_nat_h: 0.0,
+            regions: Self::mock_regions(),
         }
     }
 
@@ -353,8 +374,8 @@ impl CollationWorkspace {
 
     /// 由点击/拖拽位置（窗口坐标）近似推出字符下标。
     ///
-    /// 骨架阶段用固定布局常量 + 平均字宽估算；**精确像素映射（对齐原图几何）
-    /// 在「选中联动高亮」提交中替换**。
+    /// 右文编辑器内用固定布局常量 + 平均字宽估算（仅用于编辑器内落光标 / 选区）；
+    /// 左图高亮坐标则来自 `SourceRegion` 的真实自然像素映射，二者互不影响。
     fn caret_from_point(&self, x: f32, y: f32, vw: f32) -> usize {
         let editor_left = vw * 0.4 + PAD;
         let editor_top = HEADER_H + PAD;
@@ -385,7 +406,7 @@ impl CollationWorkspace {
         window.focus(&self.focus);
         // 落光标即联动：右文点击第 N 段 → 左图滚动 + 高亮。
         if let Some(li) = self.line_of(self.cursor) {
-            self.link_to_paragraph(li, cx);
+            self.link_to_paragraph(li, vw, cx);
         } else {
             cx.notify();
         }
@@ -498,7 +519,7 @@ impl CollationWorkspace {
                             .h_full()
                             .overflow_y_scroll()
                             .track_scroll(&self.left_scroll)
-                            .child(self.render_left_content()),
+                            .child(self.render_left_content(vw)),
                     )
                     .child(
                         self.button("打开文件", |c, _, _, cx| c.open_image_picker(cx), cx)
@@ -513,73 +534,48 @@ impl CollationWorkspace {
             })
     }
 
-    /// 左图内容：已载入位图则贴 `img`（按宽自适应高度，随原图滚动），否则画 mock
-    /// 行带（每段一行，便于演示联动）。高亮矩形作为绝对定位子节点叠加在内容之上，
-    /// 随内容一起滚动。
-    fn render_left_content(&self) -> gpui::Div {
-        let mut page = div().relative().w_full();
-        match &self.image_path {
-            Some(p) => {
-                // 真实位图：img 自带宽高比，按宽自适应高度，整页随滚动容器滚动。
-                page = page.child(img(p.clone()).w_full());
-            }
-            None => {
-                let h = self.page_height();
-                page = page.h(px(h)).bg(rgb(0xf1e8cf));
-                let n = self.line_ranges().len().max(1);
-                for i in 0..n {
-                    page = page.child(self.render_band(i));
-                }
-            }
+    /// 左图内容：已载入原图则贴 `img`（按宽自适应高度），否则画占位页（按
+    /// `source_size()` 自然尺寸等比缩放），两种情况都叠加 `regions` 区域参考框与
+    /// 当前联动段的高亮矩形——高亮坐标全部来自 `SourceRegion` 的真实 (x,y,w,h)
+    /// 自然像素，按 `src_nat` 缩放后落到显示坐标（彻底告别 N*BAND_H Mock）。
+    fn render_left_content(&self, vw: f32) -> gpui::Div {
+        let (nw, nh) = self.source_size();
+        let disp_w = vw * 0.4;
+        let scale = if nw > 0.0 { disp_w / nw } else { 1.0 };
+        let disp_h = nh * scale;
+        let mut page = div().relative().w_full().h(px(disp_h)).bg(rgb(0xf1e8cf));
+
+        if let Some(p) = &self.image_path {
+            page = page.child(img(p.clone()).w_full());
         }
-        if let Some(hl) = &self.highlight {
+        // 区域参考框：无原图时画出全部 regions（验证映射数学），有原图时仅画
+        // 当前联动段（避免遮挡整图）；真实文本层接入后这些框即原图真实文本位置。
+        for (i, r) in self.regions.iter().enumerate() {
+            let active = self.active_para_idx == Some(i);
+            if self.image_path.is_some() && !active {
+                continue;
+            }
             page = page.child(
                 div()
                     .absolute()
-                    .top(px(hl.y))
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .h(px(hl.h))
-                    .bg(rgba(0x8c2b2244))
+                    .top(px(r.y * scale))
+                    .left(px(r.x * scale))
+                    .w(px(r.w * scale))
+                    .h(px(r.h * scale))
                     .border_1()
-                    .border_color(rgba(0x8c2b22cc)),
+                    .border_color(if active {
+                        rgba(0x8c2b22cc)
+                    } else {
+                        rgba(0x8c2b2255)
+                    })
+                    .bg(if active {
+                        rgba(0x8c2b2222)
+                    } else {
+                        rgba(0x00000000)
+                    }),
             );
         }
         page
-    }
-
-    /// mock 行带：左图第 i 行，直接显示右侧第 i 段的真实文本（自证式演示联动）。
-    /// 真实接入预栅格化位图后，本行带被 `img` 取代，段文本转为坐标匹配依据。
-    fn render_band(&self, i: usize) -> gpui::Div {
-        let bg = if i % 2 == 0 { rgb(0xe9dfc4) } else { rgb(0xf1e8cf) };
-        let text = self
-            .line_ranges()
-            .get(i)
-            .map(|&(s, e)| {
-                self.text
-                    .chars()
-                    .skip(s)
-                    .take(e.saturating_sub(s))
-                    .collect::<String>()
-            })
-            .unwrap_or_default();
-        div()
-            .h(px(BAND_H))
-            .w_full()
-            .flex()
-            .items_center()
-            .px(px(PAD))
-            .bg(bg)
-            .child(SharedString::from(format!(
-                "左图第 {} 行 ｜ 右文：{}",
-                i + 1,
-                text
-            )))
-    }
-
-    /// 左图内容高度（骨架 mock = 段数 * BAND_H，至少 12 行保证可滚动）。
-    fn page_height(&self) -> f32 {
-        (self.line_ranges().len().max(12)) as f32 * BAND_H
     }
 
     /// 导入原图（PDF / PNG）：弹出系统文件选择框（rfd **前台直调**），
@@ -606,15 +602,18 @@ impl CollationWorkspace {
             if let Some(entity) = this.upgrade() {
                 let _ = entity.update(&mut app, |this, cx| {
                     match result {
-                        Ok((display, temp, note)) => {
+                        Ok(r) => {
                             // 删除上一张临时栅格化图（绝不碰用户原文件）。
                             if let Some(old) = this.last_temp.take() {
                                 let _ = std::fs::remove_file(&old);
                             }
-                            this.image_path = Some(display);
-                            this.last_temp = temp;
+                            this.image_path = Some(r.path);
+                            this.last_temp = r.temp;
+                            // 记录原图自然像素尺寸，供真实坐标映射缩放使用。
+                            this.src_nat_w = r.nat_w as f32;
+                            this.src_nat_h = r.nat_h as f32;
                             this.image_error = None;
-                            this.image_note = note;
+                            this.image_note = r.note;
                         }
                         Err(e) => {
                             this.image_error = Some(e);
@@ -728,38 +727,87 @@ impl CollationWorkspace {
         }
     }
 
-    /// 右文某段 → 左图联动：记录段文本 + 左侧滚动到对应 Y + 高亮。
+    /// 右文某段 → 左图联动：记录段索引 + 左侧滚动到对应区域。
     ///
-    /// 骨架阶段用 mock 映射：右文第 `para_idx` 段 → 左图 Y = para_idx * BAND_H。
-    /// 真实坐标（PDF 文本层 / OCR）在后续提交替换此函数体。
-    fn link_to_paragraph(&mut self, para_idx: usize, cx: &mut Context<Self>) {
-        let y = para_idx as f32 * BAND_H;
-        self.highlight = Some(Highlight { y, h: BAND_H });
+    /// 真实坐标映射（替换 N*BAND_H Mock）：右文第 `para_idx` 段 ↔ `regions[para_idx]`
+    /// （转录逐行对齐原图行）。区域 (x,y,w,h) 为原图自然像素，按 `src_nat` 缩放后
+    /// 既是高亮矩形（由 `render_left_content` 渲染）也是滚动目标。无对应区域
+    /// （段落数 ≠ 区域数）则不高亮也不滚动。
+    fn link_to_paragraph(&mut self, para_idx: usize, vw: f32, cx: &mut Context<Self>) {
         self.active_para_idx = Some(para_idx);
-        // 提取该段纯文本（为后续真实坐标匹配预留数据）。
-        if let Some(&(s, e)) = self.line_ranges().get(para_idx) {
-            self.active_para_text = self.text.chars().skip(s).take(e.saturating_sub(s)).collect();
+        if let Some(r) = self.regions.get(para_idx) {
+            let (nw, _nh) = self.source_size();
+            let disp_w = vw * 0.4;
+            let scale = if nw > 0.0 { disp_w / nw } else { 1.0 };
+            // 滚动使区域顶部进入视野（向下偏移取负）。
+            self.left_scroll
+                .set_offset(Point::new(px(0.0), px(-(r.y * scale))));
         }
-        // 驱动左侧 ScrollHandle 滚动（向下偏移取负）。
-        self.left_scroll.set_offset(Point::new(px(0.0), px(-y)));
         cx.notify();
     }
 
-    /// 右侧联动状态条：显示当前已联动的段与左图目标 Y。
+    /// 左图原图自然像素尺寸：已载入原图用栅格化得到的真实尺寸；无原图时由
+    /// `regions` 包围盒推导（Mock 演示用，保证占位页能框住全部区域）。
+    fn source_size(&self) -> (f32, f32) {
+        if self.src_nat_w > 0.0 && self.src_nat_h > 0.0 {
+            return (self.src_nat_w, self.src_nat_h);
+        }
+        let mut max_x: f32 = 800.0;
+        let mut max_y: f32 = 1100.0;
+        for r in &self.regions {
+            max_x = max_x.max(r.x + r.w);
+            max_y = max_y.max(r.y + r.h);
+        }
+        (max_x, max_y)
+    }
+
+    /// Mock 坐标数组：替代被删除的 N*BAND_H 行带，提供一套假的原图文本层坐标，
+    /// 用于在无真实扫描件时跑通「右文段落 → 左图真实 X/Y 高亮 + 滚动」的底层数学。
+    /// 每个 `SourceRegion` 对应右文一段（按索引对齐），坐标为假设原图 900×1300
+    /// 自然像素空间；真实接入时整段替换为 PDF 文本层 / OCR 输出即可（结构不变）。
+    fn mock_regions() -> Vec<SourceRegion> {
+        // 与 `new()` 中的示例转录两段对应：第 1 段落在原图上方偏左，第 2 段落在
+        // 下方偏右——两个框的 x/y/w/h 都不同，便于直观验证映射同时用到了四项坐标。
+        vec![
+            SourceRegion {
+                x: 90.0,
+                y: 120.0,
+                w: 720.0,
+                h: 480.0,
+                text: "天地玄黄 宇宙洪荒 …（示例转录第一段）".to_string(),
+            },
+            SourceRegion {
+                x: 300.0,
+                y: 700.0,
+                w: 500.0,
+                h: 460.0,
+                text: "盖此身发 四大五常 …（示例转录第二段）".to_string(),
+            },
+        ]
+    }
+
+    /// 右侧联动状态条：显示当前已联动段对应的原图区域坐标（自然像素）。
     fn render_link_status(&self) -> gpui::Div {
         match self.active_para_idx {
-            Some(idx) => div()
-                .h(px(26.0))
-                .flex()
-                .items_center()
-                .px(px(PAD))
-                .bg(rgba(0x8c2b2214))
-                .text_color(rgb(0x8c2b22))
-                .child(SharedString::from(format!(
-                    "已联动：右文第 {} 段 → 左侧 Y={:.0}px 高亮",
-                    idx + 1,
-                    idx as f32 * BAND_H
-                ))),
+            Some(idx) => {
+                let coord = self
+                    .regions
+                    .get(idx)
+                    .map(|r| format!("x={:.0} y={:.0} w={:.0} h={:.0}", r.x, r.y, r.w, r.h))
+                    .unwrap_or_else(|| "（无对应区域）".to_string());
+                div()
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
+                    .px(px(PAD))
+                    .bg(rgba(0x8c2b2214))
+                    .text_color(rgb(0x8c2b22))
+                    .child(SharedString::from(format!(
+                        "已联动：右文第 {} 段 → 原图区域 {}（自然像素）",
+                        idx + 1,
+                        coord
+                    )))
+            }
             None => div().h(px(0.0)),
         }
     }
@@ -1305,8 +1353,19 @@ fn temp_png_path() -> PathBuf {
     std::env::temp_dir().join(format!("jiandu_collation_{}.png", nanos))
 }
 
+/// 栅格化结果：显示路径、临时路径、原图自然像素尺寸、温和提示。
+/// `nat_w` / `nat_h` 供真实坐标映射（`source_size`）把 `SourceRegion` 自然像素
+/// 缩放到显示坐标；无原图时回退到区域包围盒。
+struct Rasterized {
+    path: PathBuf,
+    temp: Option<PathBuf>,
+    nat_w: f64,
+    nat_h: f64,
+    note: Option<String>,
+}
+
 #[cfg(target_os = "macos")]
-fn rasterize_source(path: &Path) -> Result<(PathBuf, Option<PathBuf>, Option<String>), String> {
+fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
     use core_foundation::base::TCFType;
     use core_foundation::url::CFURL;
     use core_graphics::color_space::CGColorSpace;
@@ -1329,7 +1388,17 @@ fn rasterize_source(path: &Path) -> Result<(PathBuf, Option<PathBuf>, Option<Str
         Some("png") | Some("jpg") | Some("jpeg") | Some("tif") | Some("tiff") | Some("bmp")
             | Some("gif") | Some("webp")
     ) {
-        return Ok((path.to_path_buf(), None, None));
+        // 位图原图：gpui::img 自带解码器，无需预栅格化；读其自然尺寸填坐标。
+        let (nw, nh) = image::image_dimensions(path)
+            .map(|(w, h)| (w as f64, h as f64))
+            .unwrap_or((800.0, 1100.0));
+        return Ok(Rasterized {
+            path: path.to_path_buf(),
+            temp: None,
+            nat_w: nw,
+            nat_h: nh,
+            note: None,
+        });
     }
     // 首版仅支持 PDF 栅格化。
     if ext.as_deref() != Some("pdf") {
@@ -1456,11 +1525,17 @@ fn rasterize_source(path: &Path) -> Result<(PathBuf, Option<PathBuf>, Option<Str
     } else {
         None
     };
-    Ok((out.clone(), Some(out), note))
+    Ok(Rasterized {
+        path: out.clone(),
+        temp: Some(out),
+        nat_w,
+        nat_h,
+        note,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn rasterize_source(_path: &Path) -> Result<(PathBuf, Option<PathBuf>, Option<String>), String> {
+fn rasterize_source(_path: &Path) -> Result<Rasterized, String> {
     Err("原图导入仅在 macOS 支持".to_string())
 }
 
