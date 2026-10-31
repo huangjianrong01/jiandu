@@ -127,9 +127,28 @@ const MATCH_MIN_SIM: f32 = 0.5;
 ///
 /// 不用单字重合：中文常见字（之 / 不 / 而）单字命中率虚高，会把不相干的文本判定
 /// 成匹配；二字对（bigram）要求相邻两字连续出现，抗巧合能力强得多。
+/// 比对用「净文本」：先按 Markdown 洗一遍，再只留汉字 / 字母 / 数字。
+///
+/// 校对的常态是「左 PDF 文本层（或 OCR）纯文本 ↔ 右转录」，而右转录可能是
+/// Markdown：`#`、`**`、`>`、`---`、表格的 `|` 全在。拿带记号的串去和纯文本做
+/// 连续二字比对，命中率会被这些噪声直接拉到阈值以下 —— 表现就是「明明同一段话，
+/// 却提示不匹配、高亮不出来」。
+///
+/// 所以两道洗：① `share_layout::clean_md` 剥掉全部 Markdown 记号（与竖排预览
+/// 用的是**同一套**清洗，绝不让「预览里干净、匹配时装了记号」两套标准并存）；
+/// ② 再滤掉标点 / 空白 / 符号 —— PDF 文本层常常没有标点，OCR 也常错标点，
+/// 留着它们只会制造假阴性。汉字本身就是 `is_alphanumeric()`，故 CJK 全保留。
+fn match_text(raw: &str) -> String {
+    crate::share_layout::clean_md(raw)
+        .text()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
 fn bigram_overlap(seg: &str, region: &str) -> f32 {
-    let s: Vec<char> = seg.chars().filter(|c| !c.is_whitespace()).collect();
-    let r: String = region.chars().filter(|c| !c.is_whitespace()).collect();
+    let s: Vec<char> = match_text(seg).chars().collect();
+    let r = match_text(region);
     if s.len() < 2 || r.is_empty() {
         return 0.0;
     }
@@ -241,6 +260,15 @@ pub struct CollationWorkspace {
     page_busy: bool,
     /// 左图栅格化的代际令牌：连按方向键时，旧页结果回来即丢弃（绝不闪回）。
     page_gen: usize,
+    /// 下一次 render 要不要**强制重建输入焦点**（true 时先 blur 再 focus）。
+    ///
+    /// 为什么必须有这个开关：`rfd` 是原生 NSOpenPanel，它关掉之后窗口的 first
+    /// responder 已经被系统收走；而 GPUI 的 `Window::focus()` 头一句就是
+    /// `if self.focus == Some(handle.id) { return }`——它以为还聚焦着，于是永远
+    /// 不再把输入上下文交还给平台。结果就是「刚导入完的文件，右侧编辑器看着好好的，
+    /// 却一个字都打不进去」。唯一解法是显式 `blur()` + `focus()`，让焦点 id 变一次，
+    /// 从而重走一遍「注册 first responder / 输入法上下文」的路径。
+    refocus: bool,
     /// 原图文本层 / OCR 识别出的文本区域（自然像素坐标）。真实接入时由 PDF 文本层
     /// 或 OCR 引擎填充；MVP 由 `mock_regions()` 提供假数据跑通映射数学。
     regions: Vec<SourceRegion>,
@@ -305,6 +333,7 @@ impl CollationWorkspace {
             pdf_pages: 1,
             page_busy: false,
             page_gen: 0,
+            refocus: false,
             text_file: None,
             text_note: None,
             text_err: false,
@@ -777,6 +806,8 @@ impl CollationWorkspace {
                             if this.image_note.is_none() {
                                 this.image_note = r.note;
                             }
+                            // 原生对话框刚关 → 强制重建输入焦点（见 `refocus`）。
+                            this.refocus = true;
                         }
                         Err(e) => {
                             this.image_error = Some(e);
@@ -833,6 +864,9 @@ impl CollationWorkspace {
                                     this.text_file = Some(path.clone());
                                     this.text_note = Some(note);
                                     this.text_err = false;
+                                    // 原生对话框刚关 → 下一帧强制重建输入焦点，
+                                    // 否则「导入完就能看、打不进字」（见 `refocus`）。
+                                    this.refocus = true;
                                 }
                                 Err(e) => {
                                     this.text_note = Some(e);
@@ -1220,45 +1254,54 @@ impl CollationWorkspace {
                         let _ = entity.update(&mut app, |this, cx| {
                             this.preview_busy = false;
                             // 预览已关闭 / 代际过期 → 丢弃这批结果（连临时文件一起清）。
-                            if !this.show_preview || gen != this.preview_gen {
+                            //
+                            // ⚠️ 这里**绝不能提前 return**：`preview_pending` 的补跑写在
+                            // 函数末尾，一旦 return 就把排队中的请求一起吞了 —— 表现是
+                            // 「后台明明排好了 6 页，浮层却一直显示『正文为空』」，而且
+                            // 再点刷新也没用（那一批图刚被删干净）。真机就踩了这个坑。
+                            let stale = !this.show_preview || gen != this.preview_gen;
+                            if stale {
                                 if let Ok((pages, _)) = &out {
                                     for p in pages {
                                         let _ = std::fs::remove_file(p);
                                     }
                                 }
-                                cx.notify();
-                                return;
                             }
-                            match out {
-                                Ok((pages, note)) => {
-                                    // 先清旧页（绝不碰用户原文件）：挪进待删队列，
-                                    // 下一帧 render 统一删盘（见 `temp_gc`）。
-                                    this.temp_gc.append(&mut this.preview_paths);
-                                    this.preview_paths = pages;
-                                    this.preview_note = note;
-                                    this.preview_error = None;
-                                    // 记住这批图对应的版式指纹：同一请求再来直接跳过。
-                                    this.preview_sig = Some(key_at_start);
-                                    // 列数 / 样式变动可能改变页数，钳制当前页到有效范围。
-                                    let max_idx = this.preview_paths.len().saturating_sub(1);
-                                    if this.preview_page > max_idx {
-                                        this.preview_page = max_idx;
+                            if !stale {
+                                match out {
+                                    Ok((pages, note)) => {
+                                        // 先清旧页（绝不碰用户原文件）：挪进待删队列，
+                                        // 下一帧 render 统一删盘（见 `temp_gc`）。
+                                        this.temp_gc.append(&mut this.preview_paths);
+                                        this.preview_paths = pages;
+                                        this.preview_note = note;
+                                        this.preview_error = None;
+                                        // 记住这批图对应的版式指纹：同一请求再来直接跳过。
+                                        this.preview_sig = Some(key_at_start);
+                                        // 列数 / 样式变动可能改变页数，钳制当前页到有效范围。
+                                        let max_idx = this.preview_paths.len().saturating_sub(1);
+                                        if this.preview_page > max_idx {
+                                            this.preview_page = max_idx;
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    this.preview_error = Some(e);
-                                    this.preview_note = None;
+                                    Err(e) => {
+                                        this.preview_error = Some(e);
+                                        this.preview_note = None;
+                                    }
                                 }
                             }
                             cx.notify();
-                            // 期间又有新请求（连点 / 连改样式）→ 立刻补跑一次。
+                            // 期间又有新请求（连点 / 连改样式 / 关掉又打开）→ 立刻补跑一次。
+                            // 预览已关就不补跑：那是纯浪费（结果回来还是会被丢弃）。
                             if this.preview_pending {
                                 this.preview_pending = false;
-                                // 清掉节流窗口，保证补跑不被再次拦下。
-                                this.preview_last_req = std::time::Instant::now()
-                                    .checked_sub(Duration::from_secs(10))
-                                    .unwrap_or_else(std::time::Instant::now);
-                                this.request_preview(cx);
+                                if this.show_preview {
+                                    // 清掉节流窗口，保证补跑不被再次拦下。
+                                    this.preview_last_req = std::time::Instant::now()
+                                        .checked_sub(Duration::from_secs(10))
+                                        .unwrap_or_else(std::time::Instant::now);
+                                    this.request_preview(cx);
+                                }
                             }
                         });
                     }
@@ -1743,7 +1786,8 @@ impl CollationWorkspace {
                                     .child(img(p.clone()).w(px(img_w)).h(px(img_h)))
                                     .into_any_element()
                             }
-                            None => div()
+                            None => {
+                                div()
                                 .px(px(20.0))
                                 .py(px(16.0))
                                 .bg(rgb(0xf4ecd8))
@@ -1757,7 +1801,8 @@ impl CollationWorkspace {
                                 } else {
                                     "（正文为空：写入文字或【导入 MD】后，点「刷新预览」）"
                                 }))
-                                .into_any_element(),
+                                .into_any_element()
+                            }
                         }
                     }),
             )
@@ -2002,6 +2047,15 @@ impl Render for CollationWorkspace {
         // 量很小（每轮预览 ≤6 张），同步删几个文件远不到一帧的预算。
         for p in self.temp_gc.drain(..) {
             let _ = std::fs::remove_file(&p);
+        }
+        // 刚关过原生文件对话框（rfd）→ 强制重建输入焦点。
+        // `Window::focus()` 在「已是焦点」时直接 return，故必须先 blur 一次把
+        // 焦点 id 清掉，平台才会重新把 first responder / 输入法上下文交回来。
+        // 不这么做，导入完的文件在右侧「看得见、打不进字」（只读假象）。
+        if self.refocus {
+            self.refocus = false;
+            window.blur();
+            window.focus(&self.focus);
         }
         let vw = px_f32(window.viewport_size().width);
         let vh = px_f32(window.viewport_size().height);
@@ -2552,5 +2606,37 @@ impl CollationWorkspace {
         self.text = chars.into_iter().collect();
         self.cursor = (a + clean.chars().count()).min(self.text.chars().count());
         char_to_utf16(&self.text, a)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 右文带 Markdown 记号时，**剥记号再比**必须仍然命中同一段原图文字。
+    ///
+    /// 这就是真机上「明明同一段话，却提示不匹配、高亮不出来」的复现与回归：
+    /// 拿 `## 第一節 四時` / `**寒來暑往**` 这种带记号的串直接去和 PDF 纯文本做
+    /// 连续二字比对，命中率会被 `#`、`*` 拉垮到阈值以下。
+    #[test]
+    fn markdown_markers_do_not_break_matching() {
+        let region = "昃，辰宿列張。第一節 四時寒來暑往，秋收冬藏。閏餘成歲";
+        let md = "## 第一節 四時\n\n**寒來暑往**，秋收冬藏。";
+        assert!(
+            bigram_overlap(md, region) > 0.85,
+            "MD 剥记号后应高度命中：{}",
+            bigram_overlap(md, region)
+        );
+        // 表格行（`|`）与引用（`>`）同理。
+        assert!(bigram_overlap("> | 第一節 | 四時 |", region) > 0.3);
+    }
+
+    /// OCR / 纯文本（.txt）这条路**优先级更高**：不带任何记号时必须原样命中。
+    #[test]
+    fn plain_ocr_text_matches_best() {
+        let region = "資治通鑑卷第一 周紀一 起著雍攝提格";
+        assert!(bigram_overlap("資治通鑑卷第一，周紀一，起著雍攝提格", region) > 0.95);
+        // 标点不同 / PDF 无标点也不该扣分（比对前统一滤标点）。
+        assert!(bigram_overlap("資治通鑑卷第一周紀一起著雍攝提格", region) > 0.95);
     }
 }
