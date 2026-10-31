@@ -68,11 +68,20 @@ const LINE_H: f32 = FONT_SIZE * 1.7;
 const CHAR_W: f32 = FONT_SIZE * 0.95;
 /// 左图 mock 行高（骨架阶段：右文第 N 段 → 左图 Y = N * BAND_H）。
 const BAND_H: f32 = 100.0;
-/// 竖排预览每页切块的字数上限（12 列 1080×1920 卡、不落款时 `layout` 默认
-/// 字号下整页容量 ≈ 288 字）。切成 ≤ 此值的页块后，各页都不会触发 `layout`
-/// 的自动缩字号循环（share_layout.rs:346 的 `cols_max * rows < n` 永不成立），
-/// 因此整本文稿字号恒定、版面一致，绝不出现「前几页大后几页小」。
-const PREVIEW_PAGE_CHARS: usize = 264;
+/// 竖排预览各列数档位下的整页容量（由 `share_layout` 版式几何精算得出，
+/// 预览固定 1080×1920、不落款不批注：8→120 / 10→190 / 12→264 / 14→364）。
+/// 每页喂入 ≤ 此值可保证 `layout` 不触发自动缩字号（share_layout.rs:346 的
+/// `cols_max * rows < n` 永不成立），整本文稿字号恒定、版面一致，绝不前大后小。
+/// 列数经 `norm_columns` 吸附到这四档，非档位值不会命中。
+fn preview_page_cap(columns: usize) -> usize {
+    match crate::share::norm_columns(columns) {
+        8 => 120,
+        10 => 190,
+        12 => 264,
+        14 => 364,
+        _ => 264, // 不应命中：norm_columns 只产出 8/10/12/14
+    }
+}
 
 /// 左侧高亮矩形（内容坐标系，随原图一起滚动）。
 #[derive(Clone, Copy)]
@@ -117,6 +126,14 @@ pub struct CollationWorkspace {
     preview_page: usize,
     /// 预览栅格化失败信息（红色提示，如系统缺中文字体）。
     preview_error: Option<String>,
+    /// 竖排预览样式：底色（宣纸黄 / 暗金黑 / 极简白 / 仿刻本）。
+    preview_bg: ShareBg,
+    /// 竖排预览样式：版框（红线框 / 黑线框 / 无边框 / 双边）。
+    preview_frame: ShareFrame,
+    /// 竖排预览样式：列数（8 / 10 / 12 / 14，经 norm_columns 锁定）。
+    preview_columns: usize,
+    /// 样式选择面板是否展开。
+    show_style_panel: bool,
     /// 左图高亮矩形（内容坐标，随原图滚动）。None = 无高亮。
     highlight: Option<Highlight>,
     /// 当前联动的右文段索引（0-based）。None = 尚未联动。
@@ -148,6 +165,10 @@ impl CollationWorkspace {
             preview_paths: Vec::new(),
             preview_page: 0,
             preview_error: None,
+            preview_bg: ShareBg::Xuan,
+            preview_frame: ShareFrame::Red,
+            preview_columns: 12,
+            show_style_panel: false,
             highlight: None,
             active_para_idx: None,
             active_para_text: String::new(),
@@ -403,6 +424,30 @@ impl CollationWorkspace {
             )
     }
 
+    /// 样式面板里的单选项胶囊：选中态朱底白字，未选中浅朱底。点下即触发 `on_click`。
+    fn style_option(
+        &self,
+        selected: bool,
+        label: &'static str,
+        on_click: impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .px(px(10.0))
+            .py(px(4.0))
+            .mr(px(6.0))
+            .mb(px(8.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(if selected { rgb(0x8c2b22) } else { rgba(0x8c2b221f) })
+            .text_color(if selected { rgb(0xf4ecd8) } else { rgb(0x8c2b22) })
+            .child(SharedString::from(label))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |c, event, window, cx| on_click(c, event, window, cx)),
+            )
+    }
+
     /// 顶部返回栏。
     fn render_header(&self, cx: &mut Context<Self>) -> gpui::Div {
         div()
@@ -587,15 +632,16 @@ impl CollationWorkspace {
     /// 翻页（多页卡预览）留待后续。文本改动后需点浮层「刷新预览」重生成。
     /// 把转录文本离屏栅格化成「笺读风」竖排书页（**多页**）。
     ///
-    /// 长文按 [`PREVIEW_PAGE_CHARS`] 逐块切页，每块独立 `layout` + `render_png`。
-    /// 因每块都 ≤ 整页容量，`layout` 不会触发自动缩字，整本字号恒定、版面一致。
+    /// 长文按 [`preview_page_cap`]（随当前列数）逐块喂入 `layout`：每块都 ≤ 整页
+    /// 容量，故 `layout` 不会触发自动缩字号（share_layout.rs:346），整本字号恒定、
+    /// 版面一致，绝不前大后小。用 `layout` 返回的实际落字数 `CardLayout.chars.len()`
+    /// 当页边界推进——零猜测、绝不丢字，列数 / 底色 / 版框怎么变都安全。
     /// 任意一页失败则整体报错并清空已有页（绝不留下半截图）。
     fn regenerate_preview(&mut self) {
         // 先清旧页（绝不碰用户原文件）。
         for p in self.preview_paths.drain(..) {
             let _ = std::fs::remove_file(&p);
         }
-        self.preview_page = 0;
         self.preview_error = None;
 
         // 预览是一条连续竖排流：去掉编辑器里的换行（段落概念不在简单预览里
@@ -606,14 +652,17 @@ impl CollationWorkspace {
             .filter(|c| *c != '\n' && *c != '\r')
             .collect();
         if body.is_empty() {
+            self.preview_page = 0;
             return; // 空稿：无图，浮层显示占位提示。
         }
         let red = vec![false; body.len()];
 
+        // 按当前列数取整页容量，喂入 ≤ 此值保证不缩字；再用实际落字数推进。
+        let cap = preview_page_cap(self.preview_columns);
         let mut pages: Vec<PathBuf> = Vec::new();
         let mut start = 0usize;
         while start < body.len() {
-            let end = (start + PREVIEW_PAGE_CHARS).min(body.len());
+            let end = (start + cap).min(body.len());
             let spec = LayoutSpec {
                 body: &body[start..end],
                 red: &red[start..end],
@@ -623,9 +672,9 @@ impl CollationWorkspace {
                 show_sign: false,
                 date: "",
                 show_date: false,
-                columns: 12,
-                bg: ShareBg::Xuan,
-                frame: ShareFrame::Red,
+                columns: self.preview_columns,
+                bg: self.preview_bg,
+                frame: self.preview_frame,
                 seal: ShareSeal::Twin,
                 seal_text: "笺校",
                 font: ShareFont::Song,
@@ -633,7 +682,13 @@ impl CollationWorkspace {
                 w: 1080.0,
                 h: 1920.0,
             };
-            match render_png(&layout(&spec)) {
+            // 让 layout 自己按整页容量落字；取实际落字数当页边界（双保险，绝不丢字）。
+            let card = layout(&spec);
+            let laid = card.chars.len();
+            if laid == 0 {
+                break; // 异常：一字未落，避免死循环。
+            }
+            match render_png(&card) {
                 Ok(png) => {
                     let out = temp_png_path(); // 纳秒唯一命名，绕开 img 缓存。
                     if std::fs::write(&out, &png).is_ok() {
@@ -654,10 +709,15 @@ impl CollationWorkspace {
                     return;
                 }
             }
-            start = end;
+            start += laid;
         }
 
         self.preview_paths = pages;
+        // 列数 / 样式变动可能改变页数，钳制当前页到有效范围。
+        let max_idx = self.preview_paths.len().saturating_sub(1);
+        if self.preview_page > max_idx {
+            self.preview_page = max_idx;
+        }
     }
 
     /// 右文某段 → 左图联动：记录段文本 + 左侧滚动到对应 Y + 高亮。
@@ -886,9 +946,10 @@ impl CollationWorkspace {
 
     /// 竖排预览浮层：把转录文本离屏栅格化成「笺读风」竖排书页，`gpui::img` 贴图。
     ///
-    /// 全屏遮罩 + 顶部工具条（翻页器 / 刷新 / 关闭）+ 居中整页图（随窗口高度
-    /// 自适应，比例保持竖排书页）。底部状态条仅显示栅格化错误（如缺中文字体）。
-    /// 长文自动按页切块，用顶部「← 第 X / Y 页 →」翻页（见 [`regenerate_preview`]）。
+    /// 全屏遮罩 + 顶部工具条（翻页器 / 刷新 / 样式 / 关闭）+ 居中整页图（随窗口
+    /// 高度自适应，比例保持竖排书页）+ 样式面板（底色 / 版框 / 列数，点按即重栅格
+    /// 化）+ 底部状态条（仅栅格化错误，如缺中文字体）。长文自动按页切块，用顶部
+    /// 「← 第 X / Y 页 →」翻页（见 [`regenerate_preview`]）。
     fn render_preview_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .absolute()
@@ -919,6 +980,14 @@ impl CollationWorkspace {
                         "刷新预览",
                         |c, _, _, cx| {
                             c.regenerate_preview();
+                            cx.notify();
+                        },
+                        cx,
+                    ))
+                    .child(self.button(
+                        "样式",
+                        |c, _, _, cx| {
+                            c.show_style_panel = !c.show_style_panel;
                             cx.notify();
                         },
                         cx,
@@ -957,10 +1026,113 @@ impl CollationWorkspace {
                         }
                     }),
             )
+            .child(self.render_style_panel(cx))
             .child(match self.render_preview_status() {
                 Some(s) => s,
                 None => div().h(px(0.0)),
             })
+    }
+
+    /// 样式选择面板（浮在预览图之上）：底色 / 版框 / 列数三组切换。
+    /// 每个选项点下即设置对应样式并 [`regenerate_preview`] 重栅格化；选中态
+    /// 高亮（朱底白字），当前列数随 `norm_columns` 吸附到 8/10/12/14 四档。
+    fn render_style_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if !self.show_style_panel {
+            return div();
+        }
+
+        // —— 底色行 ——
+        let mut bg_row = div()
+            .flex()
+            .flex_wrap()
+            .child(
+                div()
+                    .w_full()
+                    .mb(px(4.0))
+                    .text_color(rgb(0x8c2b22))
+                    .text_size(px(13.0))
+                    .child(SharedString::from("底色")),
+            );
+        for b in ShareBg::ALL {
+            bg_row = bg_row.child(self.style_option(
+                self.preview_bg == b,
+                b.label(),
+                move |c, _, _, cx| {
+                    c.preview_bg = b;
+                    c.regenerate_preview();
+                    cx.notify();
+                },
+                cx,
+            ));
+        }
+
+        // —— 版框行 ——
+        let mut frame_row = div()
+            .flex()
+            .flex_wrap()
+            .child(
+                div()
+                    .w_full()
+                    .mb(px(4.0))
+                    .text_color(rgb(0x8c2b22))
+                    .text_size(px(13.0))
+                    .child(SharedString::from("版框")),
+            );
+        for f in ShareFrame::ALL {
+            frame_row = frame_row.child(self.style_option(
+                self.preview_frame == f,
+                f.label(),
+                move |c, _, _, cx| {
+                    c.preview_frame = f;
+                    c.regenerate_preview();
+                    cx.notify();
+                },
+                cx,
+            ));
+        }
+
+        // —— 列数行（8/10/12/14，经 norm_columns 锁定）——
+        let mut col_row = div()
+            .flex()
+            .flex_wrap()
+            .child(
+                div()
+                    .w_full()
+                    .mb(px(4.0))
+                    .text_color(rgb(0x8c2b22))
+                    .text_size(px(13.0))
+                    .child(SharedString::from("列数")),
+            );
+        for cols in [8usize, 10, 12, 14] {
+            col_row = col_row.child(self.style_option(
+                crate::share::norm_columns(self.preview_columns) == cols,
+                match cols {
+                    8 => "八列",
+                    10 => "十列",
+                    12 => "十二列",
+                    14 => "十四列",
+                    _ => "列",
+                },
+                move |c, _, _, cx| {
+                    c.preview_columns = cols;
+                    c.regenerate_preview();
+                    cx.notify();
+                },
+                cx,
+            ));
+        }
+
+        div()
+            .absolute()
+            .top(px(HEADER_H + 6.0))
+            .left(px(PAD))
+            .w(px(252.0))
+            .bg(rgb(0xf4ecd8))
+            .rounded(px(8.0))
+            .p(px(12.0))
+            .child(bg_row)
+            .child(frame_row)
+            .child(col_row)
     }
 
     /// 翻页器：多页时显示「← 第 X / Y 页 →」，单页（或无图）时返回空 div。
