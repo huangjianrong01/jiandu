@@ -7,20 +7,31 @@
 //!   ② 本模块只依赖 `jiandu-core` 与现有 `ime` 基础设施，**绝不 import reader 模块**。
 //!   ③ 右侧编辑器用 GPUI 原生轻量元素 + 复用 `crate::ime::InputField` /
 //!      `EntityInputHandler` 做中文输入（GPUI 0.2.2 没有内置 Editor）。
-//!   ④ 竖排预览（下一步）会走「离屏栅格化 + `img` 贴图」，不在每帧重绘朱砂点。
+//!   ④ 竖排预览（已落地）走「离屏栅格化 + `img` 贴图」：复用阅读引擎的
+//!      `share_layout::layout` + `share_paint::render_png`，不在每帧重绘朱砂点，
+//!      且**不与 reader 耦合**（本模块绝不 import reader）。
 //!
 //! 本文件是 MVP 的** UI 骨架**：AppMode 切换 + 40/60 分屏 + 可编辑/可选择的
 //! 原生编辑器 + 左图右文联动（骨架阶段：左图 mock 行带 + 右文点击段 → 左图
 //! `ScrollHandle` 滚动到 N*BAND_H 并叠加半透明高亮矩形）。原图预栅格化位图
-//! 真实接入（PDF 文本层 / OCR 坐标匹配）、竖排预览栅格化在后续提交中落地。
+//! 真实接入（PDF 文本层 / OCR 坐标匹配）在后续提交替换 Mock 映射。
 //!
-//! —— 方向①（真实图片）已落地：左侧【打开文件】按钮 → rfd 选 PDF / PNG →
-//! CoreGraphics 把 PDF 首页（或复用 PNG）预栅格化为位图 → `gpui::img` 贴图，
-//! 带超大尺寸 / 空指针 / 多页三道防护（见文件末尾 `rasterize_source`）。
+//! —— 已落地 ——
+//! ・方向①（真实图片）：左侧【打开文件】按钮 → rfd 选 PDF / PNG → CoreGraphics
+//!   把 PDF 首页（或复用 PNG）预栅格化为位图 → `gpui::img` 贴图，带超大尺寸 /
+//!   空指针 / 多页三道防护（见文件末尾 `rasterize_source`）。
+//! ・竖排预览：右侧【竖排预览】按钮 → 把转录文本离屏栅格化成「笺读风」竖排书页
+//!   （宣纸黄 + 朱丝栏 + 双鱼尾印 + 宋体 12 列），`gpui::img` 整页贴图
+//!   （见 `regenerate_preview` + `render_preview_overlay`，纯 `share_*` 链路）。
 
 use crate::ime::{
     char_to_utf16, effective_replace_range, utf16_len, utf16_slice, utf16_to_char,
 };
+// 竖排预览：复用阅读引擎的「纯数据版式 + CoreGraphics 离屏光栅」链路，与 reader
+// 解耦（本模块绝不 import reader）。这三条都是 crate 内模块，reader 同款用法。
+use crate::share::{ShareBg, ShareFrame, ShareSeal};
+use crate::share_layout::{layout, LayoutSpec, ShareFont};
+use crate::share_paint::render_png;
 use gpui::prelude::*;
 use gpui::{
     div, img, px, rgb, rgba, Bounds, Context, EntityInputHandler, EventEmitter, FocusHandle,
@@ -57,6 +68,9 @@ const LINE_H: f32 = FONT_SIZE * 1.7;
 const CHAR_W: f32 = FONT_SIZE * 0.95;
 /// 左图 mock 行高（骨架阶段：右文第 N 段 → 左图 Y = N * BAND_H）。
 const BAND_H: f32 = 100.0;
+/// 竖排预览单页大约可容纳的正文字数（12 列 1080×1920 卡实测 ~264）。
+/// 超过则提示「仅预览首页」，翻页后续支持。
+const PREVIEW_PAGE_CHARS: usize = 264;
 
 /// 左侧高亮矩形（内容坐标系，随原图一起滚动）。
 #[derive(Clone, Copy)]
@@ -95,6 +109,12 @@ pub struct CollationWorkspace {
     image_error: Option<String>,
     /// 非错误的温和提示（如多页 PDF 仅渲首页）。
     image_note: Option<String>,
+    /// 竖排预览（离屏栅格化）位图路径；None 时浮层显示占位。
+    preview_path: Option<PathBuf>,
+    /// 上一张预览临时 PNG；重新生成时删除以免堆积。
+    preview_temp: Option<PathBuf>,
+    /// 预览栅格化失败信息（红色提示，如系统缺中文字体）。
+    preview_error: Option<String>,
     /// 左图高亮矩形（内容坐标，随原图滚动）。None = 无高亮。
     highlight: Option<Highlight>,
     /// 当前联动的右文段索引（0-based）。None = 尚未联动。
@@ -122,6 +142,9 @@ impl CollationWorkspace {
             last_temp: None,
             image_error: None,
             image_note: None,
+            preview_path: None,
+            preview_temp: None,
+            preview_error: None,
             highlight: None,
             active_para_idx: None,
             active_para_text: String::new(),
@@ -550,6 +573,69 @@ impl CollationWorkspace {
         .detach();
     }
 
+    /// 重新生成竖排预览：把当前编辑器文本离屏栅格化成「笺读风」竖排书页 PNG。
+    ///
+    /// 复用阅读引擎的纯数据版式（`share_layout::LayoutSpec` + `layout`）与
+    /// CoreGraphics 离屏光栅（`share_paint::render_png`），与 reader 完全解耦；
+    /// 输出 PNG 字节写临时文件，交给 `gpui::img` 异步解码贴图（与 PDF 导入同款
+    /// 字节 → 路径 → 贴图 路径）。栅格化在主线程同步完成（单页毫秒级，导出亦同）。
+    ///
+    /// 设计取舍（MVP）：只渲「首页」——`layout` 按版心容量自动截断超长文本；
+    /// 翻页（多页卡预览）留待后续。文本改动后需点浮层「刷新预览」重生成。
+    fn regenerate_preview(&mut self) {
+        let body: Vec<char> = self.text.chars().collect();
+        // 空稿：清掉旧预览，不留残图。
+        if body.is_empty() {
+            if let Some(old) = self.preview_temp.take() {
+                let _ = std::fs::remove_file(&old);
+            }
+            self.preview_path = None;
+            self.preview_error = None;
+            return;
+        }
+        let red = vec![false; body.len()];
+        // 默认版式：宣纸黄 + 朱丝栏 + 双鱼尾印 + 宋体 12 列（与分享卡同源）。
+        // 落款 / 批注 / 时间戳首版全关，聚焦正文竖排本身。
+        let spec = LayoutSpec {
+            body: &body,
+            red: &red,
+            note: "",
+            show_notes: false,
+            sign: "",
+            show_sign: false,
+            date: "",
+            show_date: false,
+            columns: 12,
+            bg: ShareBg::Xuan,
+            frame: ShareFrame::Red,
+            seal: ShareSeal::Twin,
+            seal_text: "笺校",
+            font: ShareFont::Song,
+            stamp: "",
+            w: 1080.0,
+            h: 1920.0,
+        };
+        match render_png(&layout(&spec)) {
+            Ok(png) => {
+                let out = temp_png_path(); // 纳秒唯一命名，每次生成独立路径，绕开 img 缓存。
+                if std::fs::write(&out, &png).is_ok() {
+                    // 删旧临时图（绝不碰用户原文件），再上新路径。
+                    if let Some(old) = self.preview_temp.take() {
+                        let _ = std::fs::remove_file(&old);
+                    }
+                    self.preview_path = Some(out.clone());
+                    self.preview_temp = Some(out);
+                    self.preview_error = None;
+                } else {
+                    self.preview_error = Some("预览图写入临时文件失败".to_string());
+                }
+            }
+            Err(e) => {
+                self.preview_error = Some(e);
+            }
+        }
+    }
+
     /// 右文某段 → 左图联动：记录段文本 + 左侧滚动到对应 Y + 高亮。
     ///
     /// 骨架阶段用 mock 映射：右文第 `para_idx` 段 → 左图 Y = para_idx * BAND_H。
@@ -637,6 +723,9 @@ impl CollationWorkspace {
                     .child(div().flex_1())
                     .child(self.button("竖排预览", |c, _, _, cx| {
                         c.show_preview = !c.show_preview;
+                        if c.show_preview {
+                            c.regenerate_preview();
+                        }
                         cx.notify();
                     }, cx)),
             )
@@ -771,8 +860,11 @@ impl CollationWorkspace {
         div().flex_1().child(editor)
     }
 
-    /// 竖排预览占位浮层（真实栅格化在下一步提交）。
-    fn render_preview_overlay(&self) -> gpui::Div {
+    /// 竖排预览浮层：把转录文本离屏栅格化成「笺读风」竖排书页，`gpui::img` 贴图。
+    ///
+    /// 全屏遮罩 + 顶部工具条（刷新 / 关闭）+ 居中整页图（随窗口高度自适应，
+    /// 比例保持竖排书页）。底部状态条显示栅格化错误或「长文仅预览首页」提示。
+    fn render_preview_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .absolute()
             .top(px(HEADER_H))
@@ -781,19 +873,98 @@ impl CollationWorkspace {
             .bottom(px(0.0))
             .bg(rgba(0x00000059))
             .flex()
-            .items_center()
-            .justify_center()
+            .flex_col()
             .child(
                 div()
-                    .px(px(20.0))
-                    .py(px(16.0))
-                    .bg(rgb(0xf4ecd8))
-                    .rounded(px(8.0))
-                    .text_color(rgb(0x2b2620))
-                    .child(SharedString::from(
-                        "竖排预览（42° 朱砂点 · 离屏栅格化贴图）— 下一步接入",
+                    .h(px(HEADER_H))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px(px(PAD))
+                    .bg(rgb(0x2b2620))
+                    .child(
+                        div()
+                            .text_color(rgb(0xf4ecd8))
+                            .text_size(px(15.0))
+                            .child(SharedString::from("竖排预览")),
+                    )
+                    .child(div().flex_1())
+                    .child(self.button(
+                        "刷新预览",
+                        |c, _, _, cx| {
+                            c.regenerate_preview();
+                            cx.notify();
+                        },
+                        cx,
+                    ))
+                    .child(self.button(
+                        "✕ 关闭",
+                        |c, _, _, cx| {
+                            c.show_preview = false;
+                            cx.notify();
+                        },
+                        cx,
                     )),
             )
+            .child(
+                div()
+                    .id(SharedString::from("collation-preview-scroll"))
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_y_scroll()
+                    .child(match &self.preview_path {
+                        Some(p) => div().child(img(p.clone()).h_full()),
+                        None => div()
+                            .px(px(20.0))
+                            .py(px(16.0))
+                            .bg(rgb(0xf4ecd8))
+                            .rounded(px(8.0))
+                            .text_color(rgb(0x2b2620))
+                            .text_size(px(14.0))
+                            .child(SharedString::from(
+                                "（转录为空：写入文字后点「竖排预览」或「刷新预览」）",
+                            )),
+                    }),
+            )
+            .child(match self.render_preview_status() {
+                Some(s) => s,
+                None => div().h(px(0.0)),
+            })
+    }
+
+    /// 底部状态条：优先显示预览栅格化错误（红），否则长文提示（如仅预览首页）。
+    fn render_preview_status(&self) -> Option<gpui::Div> {
+        if let Some(e) = &self.preview_error {
+            return Some(
+                div()
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .px(px(PAD))
+                    .bg(rgba(0xb0342c33))
+                    .text_color(rgb(0xb0342c))
+                    .text_size(px(13.0))
+                    .child(SharedString::from(e.clone())),
+            );
+        }
+        if self.text.chars().count() > PREVIEW_PAGE_CHARS {
+            return Some(
+                div()
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .px(px(PAD))
+                    .bg(rgba(0x8c2b2210))
+                    .text_color(rgb(0x8c2b22))
+                    .text_size(px(13.0))
+                    .child(SharedString::from(
+                        "长文仅预览首页，翻页后续支持（文本有改动点「刷新预览」）",
+                    )),
+            );
+        }
+        None
     }
 }
 
@@ -817,7 +988,7 @@ impl Render for CollationWorkspace {
                     .child(self.render_right(vw, cx)),
             );
         if self.show_preview {
-            root = root.child(self.render_preview_overlay());
+            root = root.child(self.render_preview_overlay(cx));
         }
         root
     }
