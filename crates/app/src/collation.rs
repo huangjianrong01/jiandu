@@ -39,7 +39,7 @@ use crate::share_layout::{layout, LayoutSpec, ShareFont};
 use crate::share_paint::render_png;
 use gpui::prelude::*;
 use gpui::{
-    div, img, px, rgb, rgba, Animation, AnimationExt, Bounds, Context,
+    div, img, px, rgb, rgba, Bounds, Context,
     EntityInputHandler, EventEmitter, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ParentElement, Render,
     ScrollHandle, SharedString, Styled, Window,
@@ -75,17 +75,17 @@ const LINE_H: f32 = FONT_SIZE * 1.7;
 /// 落光标 / 选区估算，不影响左图高亮精度——左图高亮走 `SourceRegion` 真实映射）。
 const CHAR_W: f32 = FONT_SIZE * 0.95;
 /// 竖排预览各列数档位下的整页容量（由 `share_layout` 版式几何精算得出，
-/// 预览固定 1080×1920、不落款不批注：8→120 / 10→190 / 12→264 / 14→364）。
+/// 预览固定 720×1280、不落款不批注：8→50 / 10→79 / 12→110 / 14→152）。
 /// 每页喂入 ≤ 此值可保证 `layout` 不触发自动缩字号（share_layout.rs:346 的
 /// `cols_max * rows < n` 永不成立），整本文稿字号恒定、版面一致，绝不前大后小。
 /// 列数经 `norm_columns` 吸附到这四档，非档位值不会命中。
 fn preview_page_cap(columns: usize) -> usize {
     match crate::share::norm_columns(columns) {
-        8 => 120,
-        10 => 190,
-        12 => 264,
-        14 => 364,
-        _ => 264, // 不应命中：norm_columns 只产出 8/10/12/14
+        8 => 50,
+        10 => 79,
+        12 => 110,
+        14 => 152,
+        _ => 110, // 不应命中：norm_columns 只产出 8/10/12/14
     }
 }
 
@@ -800,8 +800,10 @@ impl CollationWorkspace {
                 seal_text: "笺校",
                 font: ShareFont::Song,
                 stamp: "",
-                w: 1080.0,
-                h: 1920.0,
+                // 画布降到 720×1280（仍 9:16）：PNG 体积与 img 解码 / 纹理开销
+                // 约为 1080×1920 的 1/2.2，显著减轻预览图对主线程的呈现压力。
+                w: 720.0,
+                h: 1280.0,
             };
             // 让 layout 自己按整页容量落字；取实际落字数当页边界（双保险，绝不丢字）。
             let card = layout(&spec);
@@ -847,6 +849,21 @@ impl CollationWorkspace {
             t0.elapsed().as_millis()
         );
         Ok((pages, note))
+    }
+
+    /// 彻底关闭预览：**立即卸载预览图 + 作废在途后台任务**。
+    ///
+    /// 这是「关闭 / Esc 拥有最高响应优先级」的落点：
+    /// ・`preview_gen += 1` → 在途任务的代际立即过期，结果回来即丢弃，绝不回写 UI；
+    /// ・`preview_paths.clear()` → `img` 元素随本帧 render 消失，与预览图相关的
+    ///   任何解码 / 纹理开销立刻停止。故无论后台排到哪一步，关闭都能当场生效。
+    /// 只清路径、不删文件（避免删掉 img 正异步加载的文件），临时文件交给系统回收。
+    fn close_preview(&mut self) {
+        self.show_preview = false;
+        self.preview_gen += 1;
+        self.preview_pending = false;
+        self.preview_paths.clear();
+        self.preview_page = 0;
     }
 
     /// 请求重排预览（**绝不阻塞 UI**）：节流 + 代际令牌 + 后台栅格化。
@@ -1118,8 +1135,10 @@ impl CollationWorkspace {
                     .bg(rgb(0xece2c8))
                     .child(div().flex_1())
                     .child(self.button("竖排预览", |c, _, _, cx| {
-                        c.show_preview = !c.show_preview;
                         if c.show_preview {
+                            c.close_preview();
+                        } else {
+                            c.show_preview = true;
                             c.request_preview(cx);
                         }
                         cx.notify();
@@ -1310,6 +1329,16 @@ impl CollationWorkspace {
                             .child(SharedString::from("竖排预览")),
                     )
                     .child(div().flex_1())
+                    // Loading：后台排版期间给出明确反馈（用户点了不会「没反应」）。
+                    .child(if self.preview_busy {
+                        div()
+                            .px(px(8.0))
+                            .text_color(rgb(0xd8c9a8))
+                            .text_size(px(13.0))
+                            .child(SharedString::from("排版中…"))
+                    } else {
+                        div()
+                    })
                     .child(self.preview_pager(cx))
                     .child(self.button(
                         "刷新预览",
@@ -1330,7 +1359,8 @@ impl CollationWorkspace {
                     .child(self.button(
                         "✕ 关闭",
                         |c, _, _, cx| {
-                            c.show_preview = false;
+                            // 彻底关闭：卸载预览图 + 作废在途后台任务（见 close_preview）。
+                            c.close_preview();
                             cx.notify();
                         },
                         cx,
@@ -1356,15 +1386,11 @@ impl CollationWorkspace {
                                 let img_h = (vh - HEADER_H * 2.0 - 64.0)
                                     .clamp(240.0, PREVIEW_IMG_MAX_H);
                                 let img_w = img_h * (1080.0 / 1920.0);
+                                // ⚠️ 不要给 img 套 with_animation：动画期间每帧重绘，
+                                // 1080×1920 级的位图反复解码 / 重上传会把主线程拖垮。
+                                // 翻页已由「← 第 X / Y 頁 →」明确指示，不需要淡入。
                                 div()
                                     .child(img(p.clone()).w(px(img_w)).h(px(img_h)))
-                                    // 翻页淡入：动画 id 含页下标，翻到新页 id 变 → 重播，
-                                    // 同页重绘（hover 等）id 不变 → 停在 opacity 1 不闪。
-                                    .with_animation(
-                                        SharedString::from(format!("preview-page-{}", idx)),
-                                        Animation::new(Duration::from_millis(180)),
-                                        |page, delta| page.opacity(delta),
-                                    )
                                     .into_any_element()
                             }
                             None => div()
@@ -1594,7 +1620,7 @@ impl CollationWorkspace {
                 }
             }
             "escape" => {
-                self.show_preview = false;
+                self.close_preview();
                 cx.notify();
             }
             _ => {}
@@ -1608,7 +1634,7 @@ impl Render for CollationWorkspace {
         let vh = px_f32(window.viewport_size().height);
         // 排障：帧计数。静止时也狂刷 → 说明有无限重绘循环（脏标记漏了）。
         self.frame_count += 1;
-        if self.frame_count % 120 == 0 {
+        if self.frame_count % 30 == 0 {
             eprintln!(
                 "[render] frames={} preview={} busy={}",
                 self.frame_count, self.show_preview, self.preview_busy
