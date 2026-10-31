@@ -759,6 +759,21 @@ pub struct Root {
     pub show_keys: bool,
     /// 正在等新键位的动作：`Some` 时下一次按键被吃掉当新键位。
     pub key_capture: Option<jiandu_core::keys::Action>,
+    /// **出图比例档**（v1.9.10）：0 随纸面 / 1 九比十六 / 2 方 / 3 三比四。
+    ///
+    /// 只作用于「导出本叶图片」；分享卡恒 9:16（它本就是给手机屏幕看的）。
+    /// 与 `style_presets` 同理：启动读一次，渲染期不读盘。
+    pub png_ratio: usize,
+    /// **用户样式预设**（v1.9.10）：开「版字」面板时读一次，渲染期间不再读盘。
+    ///
+    /// 内建那四套在 `jiandu_core::preset::BUILTIN` 里（常量，不落盘），这里只放
+    /// 用户自己存的那几个槽位。
+    pub style_presets: Vec<jiandu_core::preset::StylePreset>,
+    /// **朗读语速倍率**（P1-5 · 连读）：0.8 / 1.0 / 1.25。
+    ///
+    /// 只作**进程内**记忆（不落盘）——语速是临时偏好，重启回到 1.0 无伤大雅；
+    /// 也免得为它动 `Prefs` 的存档迁移。
+    pub tts_rate: f32,
     /// 改键失败的一句话（冲突 / 不可用），显示到下次改键为止。
     pub key_hint: Option<String>,
     /// **文本量化分析抽屉**开着没（v1.81.0 · 模块五）。
@@ -1341,6 +1356,9 @@ impl Root {
             keymap: jiandu_core::keys::KeyMap::from_pairs(&prefs.keys),
             show_keys: false,
             key_capture: None,
+            png_ratio: prefs.png_ratio,
+            style_presets: Vec::new(),
+            tts_rate: 1.0,
             key_hint: None,
             show_analysis: false,
             analysis_tab: AnalysisTab::Char,
@@ -4756,6 +4774,130 @@ fn anki_push_card(
         self.persist();
     }
 
+    /// 应用一套**样式预设**（版字面板「样式」一行）。
+    ///
+    /// 顺序有讲究，别随手调：
+    ///   1. **先纸后墨**——`set_theme` 会按纸的配对墨把墨色一并换掉，所以
+    ///      墨色必须在纸之后写，否则被联动覆盖；
+    ///   2. **进 / 出仿刻本的三件套**由 `set_theme` 自己管（刻本那一档要
+    ///      连带换字体与丝栏），预设不插手；
+    ///   3. 换列数与留白档**只改几何**，但分页会重算，故整段套在
+    ///      `page_anchor` / `restore_anchor` 之间——切一套预设不该让正文跳走。
+    pub fn apply_preset(&mut self, p: &jiandu_core::preset::StylePreset) {
+        let anchor = self.page_anchor();
+        self.set_theme(p.theme);
+        self.set_palette(p.palette);
+        // 观感档（刻本宋体 / 手写楷体）：走 `set_font` 一次做完四件事
+        // （正文 / 预设归位 / 批注字体 / 重算尺寸），别只改 `font_preset`
+        // 那个字段——那样批注字体与行高都留在旧档上，是「半套」。
+        //
+        // 例外：**仿刻本那一档不覆盖字体**。它的「刻本三件套」（齐伋体 /
+        // 古籍句读 / 乌丝栏）刚由 `set_theme` 换好，此时再用观感档把齐伋
+        // 换成文津宋，正是「换了个纸色、字一点没变」——刻本味全没了。
+        if !self.theme.is_keben() {
+            if let Some(fp) = crate::types::FontPreset::ALL.get(p.font_preset).copied() {
+                self.set_font(fp.main_choice());
+            }
+        }
+        self.set_columns_pref(if p.columns_auto { None } else { Some(p.columns) });
+        self.set_banxin_ratio(
+            crate::grid::BANXIN_RATIOS
+                .get(p.margin_tier)
+                .copied()
+                .unwrap_or(crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT]),
+        );
+        if let Some(m) = crate::gloss::PunctMode::ALL.get(p.punct_mode).copied() {
+            self.punct_mode = m;
+        }
+        if let Some(k) = crate::gloss::PunctInk::ALL.get(p.punct_ink).copied() {
+            self.punct_ink = k;
+        }
+        self.show_rare = p.rare;
+        self.han_digits = p.han_digits;
+        self.set_notes_inline(p.notes_inline);
+        if let Some(f) = crate::types::FrameStyle::ALL.get(p.frame_style).copied() {
+            self.frame_style = f;
+        }
+        self.fit_sizes();
+        self.restore_anchor(anchor);
+        // 落盘：全仓没有一处「把界面状态 capture 成 Prefs」的收口，各样式项
+        // 历来是单点自存（`save_punct_prefs` 就是这么来的）。预设是**整套**
+        // 换，故这里照预设值整份写一次——预设怎么写，重开就是什么样。
+        let mut prefs = crate::prefs::Prefs::load();
+        p.apply(&mut prefs);
+        prefs.save();
+        self.notice = format!("样式：{}", p.name);
+        self.persist();
+    }
+
+    /// 设**出图比例档**（版字面板「出图」一行）。
+    ///
+    /// 老存档没有这一项 → 0（随纸面），与升级前观感一致。
+    pub fn set_png_ratio(&mut self, i: usize) {
+        if self.png_ratio == i {
+            return;
+        }
+        self.png_ratio = i;
+        let mut prefs = crate::prefs::Prefs::load();
+        prefs.png_ratio = i;
+        prefs.save();
+        let name = Root::PNG_RATIO_OPTS
+            .iter()
+            .find(|(_, v)| *v == i)
+            .map(|(n, _)| *n)
+            .unwrap_or("随纸面");
+        self.notice = format!("出图：{}", name);
+    }
+
+    /// 设**朗读语速倍率**（连读 / 听书共用）：0.8 慢 / 1.0 常 / 1.25 快。
+    ///
+    /// 只改进程内字段（不落盘，理由见 `tts_rate` 字段注释）。
+    pub fn set_tts_rate(&mut self, r: f32) {
+        self.tts_rate = r;
+        let label = if (r - 1.0).abs() < 1e-3 {
+            "常速".to_string()
+        } else if r < 1.0 {
+            "慢速".to_string()
+        } else {
+            "快速".to_string()
+        };
+        self.notice = format!("语速：{}（{:.2}×）", label, r);
+    }
+
+    /// 把**当前**样式抄进第 `slot` 个用户槽位。
+    pub fn save_preset(&mut self, slot: usize) {
+        let mut prefs = crate::prefs::Prefs::load();
+        let name = jiandu_core::preset::slot_name(slot);
+        let p = jiandu_core::preset::StylePreset::capture(&name, &prefs);
+        if slot < prefs.user_presets.len() {
+            prefs.user_presets[slot] = p;
+        } else {
+            // 只能顺序往下存：空着第壹个直接存第贰个没有意义（名字是位置给的）。
+            prefs.user_presets.push(p);
+        }
+        if prefs.user_presets.len() > jiandu_core::preset::USER_SLOTS {
+            prefs.user_presets.truncate(jiandu_core::preset::USER_SLOTS);
+        }
+        prefs.save();
+        // 面板上那几张牌跟着变（渲染期不读盘，故这里手动同步一次）。
+        self.style_presets = prefs.user_presets;
+        self.notice = format!("已存入「{}」", name);
+    }
+
+    /// 清掉第 `slot` 个用户槽位（后面的往前挪一位，名字随之重排）。
+    pub fn clear_preset(&mut self, slot: usize) {
+        let mut prefs = crate::prefs::Prefs::load();
+        if slot >= prefs.user_presets.len() {
+            self.notice = "这个槽位还是空的".to_string();
+            return;
+        }
+        let name = prefs.user_presets[slot].name.clone();
+        prefs.user_presets.remove(slot);
+        prefs.save();
+        self.style_presets = prefs.user_presets;
+        self.notice = format!("已清掉「{}」", name);
+    }
+
     /// 跳到指定章的首面（目录跳转用）。
     ///
     /// 走 `goto_page` 而不是直接赋值：双面对开时页码必须落在偶数上，
@@ -4907,6 +5049,11 @@ fn anki_push_card(
         let s = if on { AppUIState::None } else { s };
         self.ui_state = s;
         self.show_style = matches!(s, AppUIState::Style);
+        // 开「版字」那张纸时**读一次**用户预设（最多三个，几百字节）。
+        // 渲染时不读盘——帧里读 JSON 是拿磁盘当内存用。
+        if self.show_style {
+            self.style_presets = crate::prefs::Prefs::load().user_presets;
+        }
         self.show_search = matches!(s, AppUIState::Search);
         self.show_help = matches!(s, AppUIState::Help);
         self.show_share_panel = matches!(s, AppUIState::Share);

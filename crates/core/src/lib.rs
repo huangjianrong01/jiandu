@@ -91,6 +91,9 @@ pub mod mem;
 /// 非 Rust 壳子调 `cdylib` 用。见 `README_cross_platform.md`。
 pub mod ffi;
 pub mod prefs;
+/// **样式预设**（v1.9.10）：把一整套版式存成一句话（「灯下」/「雨窗」/
+/// 「仿刻」/「素笺」+ 三个用户槽位）。只管观感，不动字体与字级。
+pub mod preset;
 pub mod ruby;
 /// 章节仓库（`store`）与流式导入（`stream`）：v1.50.0 为百万字丛书加的
 /// 「边解析边落盘、按章取回」通道。

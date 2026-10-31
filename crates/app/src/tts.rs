@@ -75,12 +75,23 @@ mod imp {
         msg1_cstr(cls, sel(b"stringWithUTF8String:\0"), s)
     }
 
+    /// 设置朗读语速（倍率 → 引擎原生值）。
+    ///
+    /// `setRate:` 是**定元**方法、第三参是 `float`——arm64 上 float 走 s0 寄存器，
+    /// 照 `objc_msgSend` 的可变参声明（全走通用寄存器）调必崩。故 transmute 成
+    /// `(*mut c_void, *mut c_void, f32)` 的具体签名再调（与 v1.81.0 修 `msg1_*` 同思路）。
+    unsafe fn set_rate(target: *mut c_void, rate: f32) {
+        let f: extern "C" fn(*mut c_void, *mut c_void, f32) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(target, sel(b"setRate:\0"), rate);
+    }
+
     /// 缓存的合成器对象（裸指针按 usize 存以过 Send/Sync）。
     static SYNTH: OnceLock<usize> = OnceLock::new();
     /// 1 = AVSpeechSynthesizer，2 = NSSpeechSynthesizer。
     static WHICH: AtomicU8 = AtomicU8::new(0);
 
-    pub fn speak(text: &str) -> bool {
+    pub fn speak(text: &str, rate: f32) -> bool {
         let Ok(cstr) = CString::new(text) else {
             return false;
         };
@@ -90,9 +101,9 @@ mod imp {
         // 循环执行（真实 App 里 [听] 一定在主线程触发，这条分支只是兜底保险）。
         unsafe {
             if pthread_main_np() != 0 {
-                speak_on_main(cstr.as_ptr())
+                speak_on_main(cstr.as_ptr(), rate)
             } else {
-                let boxed = Box::into_raw(Box::new(cstr));
+                let boxed = Box::into_raw(Box::new((cstr, rate)));
                 let main_q = std::ptr::addr_of!(_dispatch_main_q) as *mut c_void;
                 dispatch_async_f(main_q, boxed as *mut c_void, speak_trampoline);
                 true // 已抛回主线程，乐观返回；真正发声在主线程完成后发生。
@@ -101,13 +112,18 @@ mod imp {
     }
 
     /// 主线程内的实际合成 + 朗读（调用方保证在主线程）。释放池兜底，任何线程都安全。
-    unsafe fn speak_on_main(cstr: *const c_char) -> bool {
+    ///
+    /// `rate` 是倍率（0.8 / 1.0 / 1.25）——
+    ///   * AVSpeechUtterance 的 `rate` 是 0–1 的相对值（默认 0.5），故 `0.5 * rate`；
+    ///   * NSSpeechSynthesizer 的 `rate` 是每分钟字数（默认 200），故 `200 * rate`。
+    /// 两个引擎各自缩放，调用方只传一个人类可读的倍率。
+    unsafe fn speak_on_main(cstr: *const c_char, rate: f32) -> bool {
         let pool = objc_autoreleasePoolPush();
-        let r = if let Some(p) = try_av(cstr) {
+        let r = if let Some(p) = try_av(cstr, rate) {
             WHICH.store(1, Ordering::Relaxed);
             SYNTH.get_or_init(|| p as usize);
             true
-        } else if let Some(p) = try_ns(cstr) {
+        } else if let Some(p) = try_ns(cstr, rate) {
             WHICH.store(2, Ordering::Relaxed);
             SYNTH.get_or_init(|| p as usize);
             true
@@ -121,13 +137,13 @@ mod imp {
     /// `dispatch_async_f` 的回调：在主线程重建 CString 并朗读，随后释放。
     extern "C" fn speak_trampoline(ctx: *mut c_void) {
         unsafe {
-            let cstr = Box::from_raw(ctx as *mut CString);
-            speak_on_main(cstr.as_ptr());
+            let boxed = Box::from_raw(ctx as *mut (CString, f32));
+            speak_on_main(boxed.0.as_ptr(), boxed.1);
         }
     }
 
     /// AVSpeechSynthesizer 路径（用户点名；若 AVFoundation 未加载则类为 null，返回 None）。
-    unsafe fn try_av(cstr: *const c_char) -> Option<*mut c_void> {
+    unsafe fn try_av(cstr: *const c_char, rate: f32) -> Option<*mut c_void> {
         let cls = objc_getClass(b"AVSpeechSynthesizer\0".as_ptr() as *const c_char);
         if cls.is_null() {
             return None;
@@ -157,13 +173,15 @@ mod imp {
                 msg1_id(utt, sel(b"setVoice:\0"), v);
             }
         }
-        // 语速用系统默认（0.5）。MVP 先求稳；老学者慢速后续再调。
+        // 语速：AVSpeechUtterance 的相对速率默认 0.5，倍率直接乘上去。
+        let av_rate = (0.5 * rate).clamp(0.1, 0.9);
+        set_rate(utt, av_rate);
         let _ = msg1_id(synth, sel(b"speakUtterance:\0"), utt);
         Some(synth)
     }
 
     /// NSSpeechSynthesizer 兜底（AppKit，必在；默认语音可能偏英文，但一定能发声）。
-    unsafe fn try_ns(cstr: *const c_char) -> Option<*mut c_void> {
+    unsafe fn try_ns(cstr: *const c_char, rate: f32) -> Option<*mut c_void> {
         let cls = objc_getClass(b"NSSpeechSynthesizer\0".as_ptr() as *const c_char);
         if cls.is_null() {
             return None;
@@ -179,6 +197,9 @@ mod imp {
         if !v.is_null() {
             msg1_id(synth, sel(b"setVoice:\0"), v);
         }
+        // 语速：NSSpeechSynthesizer 以「每分钟字数」计，默认 200；倍率直乘。
+        let ns_rate = (200.0 * rate).clamp(80.0, 400.0);
+        set_rate(synth, ns_rate);
         let _ = msg1_id(synth, sel(b"startSpeakingString:\0"), ns_str(cstr));
         Some(synth)
     }
@@ -205,7 +226,7 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    pub fn speak(_text: &str) -> bool {
+    pub fn speak(_text: &str, _rate: f32) -> bool {
         false
     }
     pub fn stop() -> bool {
@@ -228,7 +249,7 @@ mod tests {
         // 验证 Rust FFI 在真实 macOS 上能解析 AVSpeechSynthesizer 类、构造
         // utterance、设 zh-CN 语音并调用 speakUtterance 而不崩溃（与 app 内
         // [听] 按钮走的是同一段代码）。
-        let ok = speak("床前明月光，疑是地上霜。举头望明月，低头思故乡。");
+        let ok = speak("床前明月光，疑是地上霜。举头望明月，低头思故乡。", 1.0);
         assert!(ok, "speak() 应返回 true：AVSpeechSynthesizer 路径打通");
         std::thread::sleep(std::time::Duration::from_millis(800));
         let stopped = stop();

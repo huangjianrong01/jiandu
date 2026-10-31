@@ -141,6 +141,19 @@ pub struct Prefs {
     /// 老存档没有这一项 → false（升级后第一次进窄屏会看到）。
     #[serde(default)]
     pub narrow_hint_seen: bool,
+    /// **用户样式预设**（v1.9.10）：最多 [`crate::preset::USER_SLOTS`] 个。
+    ///
+    /// 内建那四套在 `preset::BUILTIN` 里（不落盘、不可改），这里只存用户
+    /// 自己抄下来的。老存档没有这一项 → 空，面板上三张牌都显示「空」。
+    #[serde(default)]
+    pub user_presets: Vec<crate::preset::StylePreset>,
+    /// **出图比例档**（v1.9.10）：0 = 随纸面（本叶真实比例）、1 = 9:16
+    /// （1080×1920，小红书 / 朋友圈竖屏）、2 = 1:1、3 = 3:4。
+    ///
+    /// 只作用于「导出本叶图片」；分享卡恒为 9:16，不受它管。
+    /// 老存档没有这一项 → 0（随纸面），与升级前观感一致。
+    #[serde(default)]
+    pub png_ratio: usize,
 }
 
 impl Default for Prefs {
@@ -183,6 +196,9 @@ impl Default for Prefs {
             frame_style: 0,
             keys: Vec::new(),
             narrow_hint_seen: false,
+            user_presets: Vec::new(),
+            // 出图默认随纸面：本叶真实比例，与升级前一致。
+            png_ratio: 0,
         }
     }
 }

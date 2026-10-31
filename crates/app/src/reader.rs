@@ -542,7 +542,7 @@ fn panel_close(t: Theme) -> Div {
 ///
 /// `on` 时朱砂字、字下压一道 1px 墨线；否则淡墨字、无线。悬停时淡墨转深墨。
 /// 没有任何背景色——点选靠的是「墨色与朱色」的差别，不是色块。
-fn ink_option(label: &'static str, on: bool, t: Theme) -> Div {
+fn ink_option(label: &str, on: bool, t: Theme) -> Div {
     let fg = if on { sheet_zhu(t) } else { t.chrome_text() };
     div()
         .flex()
@@ -552,7 +552,10 @@ fn ink_option(label: &'static str, on: bool, t: Theme) -> Div {
         .cursor_pointer()
         .text_color(rgb(fg))
         .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
-        .child(div().text_size(px(12.0)).child(SharedString::from(label)))
+        // 收 `&str` 而非 `&'static str`：用户预设的名字是运行时字符串，
+        // 为它开一条 `String → &'static str` 的泄漏通道不值得（面板上
+        // 至多十来张牌，一份 SharedString 而已）。
+        .child(div().text_size(px(12.0)).child(SharedString::from(label.to_string())))
         .child(
             div()
                 .h(px(4.0))
@@ -9251,6 +9254,7 @@ impl Root {
         };
         push_btn("查典", &mut items);
         push_btn("听", &mut items);
+        push_btn("连读", &mut items);
         push_btn("朱批", &mut items);
         push_btn("问笺", &mut items);
         push_btn("更多", &mut items);
@@ -9311,10 +9315,31 @@ impl Root {
                 cx.stop_propagation();
                 let t = this.selected_text();
                 if !t.is_empty() {
-                    crate::tts::speak(&t);
+                    crate::tts::speak(&t, this.tts_rate);
                     this.notice = "正在朗读…".to_string();
                 } else {
                     this.notice = "没有可朗读的内容".to_string();
+                }
+                this.more_open = false;
+                this.popup = None;
+                cx.notify();
+            }),
+        );
+        // 连读（P1-5）：把**本叶全部正文**拼成一长串，一次性交给 TTS。
+        //
+        // ⚠️ 安全优先：**不做自动翻页**——自动翻页要后台轮询 `isSpeaking()` 再回主
+        // 线程发翻页信号，保活不当易卡 UI；故「读完自动翻下一叶」留到 V2.0。这里只
+        // 把当前这一叶读透，读完停下，用户手动翻页。倍速走 `tts_rate`，与 [听] 共用。
+        let b_lian = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                let t = this.leaf_text();
+                if !t.is_empty() {
+                    crate::tts::speak(&t, this.tts_rate);
+                    this.notice = "连读本页中…".to_string();
+                } else {
+                    this.notice = "这一叶没有可朗读的正文".to_string();
                 }
                 this.more_open = false;
                 this.popup = None;
@@ -9366,7 +9391,7 @@ impl Root {
             .justify_center()
             .gap(px(gap))
             .child(b_query);
-        for b in [b_ting, b_note, b_ask, b_more] {
+        for b in [b_ting, b_lian, b_note, b_ask, b_more] {
             row = row.child(b);
         }
 
@@ -11010,6 +11035,33 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
     }
 }
 
+/// **出图比例档**（v1.9.10）：`("档名", 档号)`，面板与存档共用这一份。
+///
+/// 0 **随纸面**：本叶真实长宽比，长边 2160（2× 高清）——出图是「把这一叶
+///   拍下来」，比例自然要跟纸一样；
+/// 1 **九比十六**：1080×1920，小红书 / 朋友圈竖屏的原生命；
+/// 2 **方**：1620×1620，方图在信息流里占的面积最大；
+/// 3 **三比四**：1440×1920，微博 / 豆瓣那种竖幅。
+pub(crate) const PNG_RATIO_OPTS: [(&str, usize); 4] = [
+    ("随纸面", 0),
+    ("九比十六", 1),
+    ("方", 2),
+    ("三比四", 3),
+];
+
+/// 固定比例档的出图尺寸；返回 `None` 表示「随纸面」（按纸面真实比例算）。
+///
+/// 抽成自由函数是为了能单测（不牵扯窗口状态）。三档定死的尺寸都按
+/// **短边 ≥1080** 取：再小在手机上就糊了，再大只是白占磁盘。
+pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
+    match ratio {
+        1 => Some((1080.0, 1920.0)),
+        2 => Some((1620.0, 1620.0)),
+        3 => Some((1440.0, 1920.0)),
+        _ => None,
+    }
+}
+
 /// 本叶正文（繁简形态与阅读界面一致）+ 逐字「是否划了朱线」。
     ///
     /// 直接读**当前叶的排版结果**（`page_at`），与屏幕上看到的是同一批字；
@@ -11043,6 +11095,11 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
     /// 本叶出图的像素尺寸：长边拉到 **2160px**（1080 的两倍，即 2× 高清），
     /// 短边按纸面**真实比例**换算——图与屏幕上那一叶是同一个长宽比。
     pub(crate) fn leaf_png_size(&self) -> (f32, f32) {
+        // 选了固定比例档（九比十六 / 方 / 三比四）就按档出图，不再跟着纸面
+        // 走——发小红书要的就是那个比例，纸面多长多宽不重要。
+        if let Some(s) = Self::png_size_for_ratio(self.png_ratio) {
+            return s;
+        }
         let (rw, rh) = match self.page_rect.get() {
             Some((_, _, w, h)) if w.is_finite() && h.is_finite() && w > 1.0 && h > 1.0 => (w, h),
             _ => (self.viewport_w, self.viewport_h),
@@ -11131,7 +11188,69 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
         crate::share_paint::render_png(&l)
     }
 
-    /// 按当前抽屉参数**离屏**渲染 1080×1920 的分享 PNG。
+    /// 渲染**指定页码**的叶（批量出图用）：临时把 `self.page` 指过去、出图、再还原。
+    ///
+    /// 不动排版引擎、不触发翻页锚点——只是借一次 `render_leaf_png`，画完把页码
+    /// 还回去。出图比例（`png_ratio`）沿用当前设置，故批量出的都是同一个比例。
+    pub(crate) fn render_leaf_png_at(&mut self, page: usize) -> Result<Vec<u8>, String> {
+        let old = self.page;
+        self.page = page;
+        let r = self.render_leaf_png();
+        self.page = old;
+        r
+    }
+
+    /// **批量出图**（P1-3）：把**当前章**每一叶按选定比例渲染成 PNG，存进用户
+    /// 选定的目录（文件名 `书名_第NNN叶.png`）。
+    ///
+    /// 为什么只做「当前章」：全书可能上千叶，一次吐几千张图既慢又难管理；一章
+    /// 通常几叶到几十叶，正是「发九张小红书」那种颗粒度。进度与失败都走 `notice`
+    /// 纸签，绝不 panic；个别叶渲染失败（空叶）跳过不计。
+    pub(crate) fn batch_export_png(&mut self, cx: &mut Context<Self>) {
+        let Some(folder) = crate::exporter::pick_folder("选择批量出图保存目录") else {
+            self.notice = "已取消批量出图".to_string();
+            cx.notify();
+            return;
+        };
+        let pages = self.paginate();
+        let cur_chap = pages
+            .get(self.page)
+            .and_then(|gs| gs.iter().find(|g| !g.is_indent()).map(|g| g.chapter));
+        let Some(cur_chap) = cur_chap else {
+            self.notice = "这一叶没有可出图的正文".to_string();
+            cx.notify();
+            return;
+        };
+        let leaves: Vec<usize> = pages
+            .iter()
+            .enumerate()
+            .filter(|(_, gs)| gs.iter().any(|g| !g.is_indent() && g.chapter == cur_chap))
+            .map(|(i, _)| i)
+            .collect();
+        if leaves.is_empty() {
+            self.notice = "本章没有可出图的页面".to_string();
+            cx.notify();
+            return;
+        }
+        let base = self
+            .book
+            .as_ref()
+            .map(|b| crate::exporter::safe_file_stem(&b.title))
+            .unwrap_or_else(|| "笺读".to_string());
+        let mut done = 0usize;
+        for (n, page) in leaves.iter().copied().enumerate() {
+            if let Ok(png) = self.render_leaf_png_at(page) {
+                let name = format!("{}_第{:03}叶.png", base, n + 1);
+                if crate::exporter::write_bytes(&folder.join(name), &png).is_ok() {
+                    done += 1;
+                }
+            }
+        }
+        self.notice = format!("已导出 {} / {} 叶到所选目录", done, leaves.len());
+        cx.notify();
+    }
+
+
     ///
     /// 走 `share_layout::layout` → `share_paint::render_png`：纯 CoreGraphics
     /// 位图，不读屏幕、不要权限、锁屏也能出图（旧 `screencapture` 方案已废）。
@@ -11336,6 +11455,81 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
             )
             .child(head);
 
+        // ---- 样式预设（v1.9.10）：一句记住一整套版式 ----
+        //
+        // 内建四套（灯下 / 雨窗 / 仿刻 / 素笺）+ 三个用户槽位。**空槽点一下
+        // 即存、已存的槽点一下即用**，名字由位置给（「我的壹/贰/叁」）——
+        // 不做命名输入框：命名是负担，三个槽位自己就记得住。
+        //
+        // 预设只管观感：字体与字级、繁简 / 通假这些有主之物一概不碰
+        // （见 `core::preset` 模块文档那三条边界）。
+        let mut preset_row = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(16.0))
+            .flex_wrap();
+        for i in 0..jiandu_core::preset::StylePreset::builtin_count() {
+            let Some(p) = jiandu_core::preset::StylePreset::builtin(i) else {
+                continue;
+            };
+            let name = p.name.clone();
+            preset_row = preset_row.child(
+                ink_option(&name, false, t).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.apply_preset(&p);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        for (slot, p) in self.style_presets.clone().into_iter().enumerate() {
+            let name = p.name.clone();
+            preset_row = preset_row.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(5.0))
+                    .child(
+                        ink_option(&name, false, t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.apply_preset(&p);
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    // 「×」：清掉这个槽位。比再做一张「编辑」面板便宜得多。
+                    .child(
+                        ink_option("×", false, t).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.clear_preset(slot);
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            );
+        }
+        if self.style_presets.len() < jiandu_core::preset::USER_SLOTS {
+            let slot = self.style_presets.len();
+            preset_row = preset_row.child(
+                ink_option("＋ 存当前", false, t).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.save_preset(slot);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+
         // ---- 列数：八行 / 十行 / 十二行 / 十四行 / 自动 ----
         //
         // 唯一数据源 `COLUMN_OPTS`：文案是古称，值是引擎要的
@@ -11362,6 +11556,77 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
                 ),
             );
         }
+        sheet = sheet.child(style_row("样式", preset_row, t));
+
+        // ---- 出图比例（v1.9.10）：发哪儿就出什么比例 ----
+        //
+        // 「随纸面」是本叶真实长宽比（把这一叶拍下来）；其余三档是社交平台
+        // 的版式——九比十六给小红书 / 朋友圈，方图在信息流里占面积最大，
+        // 三比四是微博那种竖幅。
+        let mut ratio_row = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(16.0))
+            .flex_wrap();
+        for (label, want) in Self::PNG_RATIO_OPTS {
+            ratio_row = ratio_row.child(
+                ink_option(label, self.png_ratio == want, t).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_png_ratio(want);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        sheet = sheet.child(style_row("出图", ratio_row, t));
+
+        // ---- 语速（P1-5）：连读 / 听书共用倍率 ----
+        //
+        // 0.8× 慢 / 1.0× 常 / 1.25× 快。只改进程内字段（不落盘）。
+        let mut speed_row = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(16.0))
+            .flex_wrap();
+        for (label, want) in [("0.8×", 0.8f32), ("1.0×", 1.0f32), ("1.25×", 1.25f32)] {
+            speed_row = speed_row.child(
+                ink_option(label, (self.tts_rate - want).abs() < 1e-3, t).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_tts_rate(want);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        sheet = sheet.child(style_row("语速", speed_row, t));
+
+        // ---- 批量出图（P1-3）：当前章每一叶按选定比例渲染 ----
+        //
+        // 走「极简一键」：点一下 → 弹目录框 → 全自动出完。比例用上方「出图」那一行
+        // 选好的（九比十六 / 方 / 三比四 / 随纸面）。
+        let batch_row = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(16.0));
+        let batch_row = batch_row.child(
+            ink_option("批量出图（本章）", false, t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.batch_export_png(cx);
+                    cx.notify();
+                }),
+            ),
+        );
+        sheet = sheet.child(style_row("批量", batch_row, t));
+
         sheet = sheet.child(style_row("列数", cols_row, t));
 
         // ---- 字级：蝇头 / 中楷 / 大字 / 榜书 四档 ----
@@ -12167,7 +12432,7 @@ pub(crate) fn leaf_png_size_of(rw: f32, rh: f32) -> (f32, f32) {
     // ---- 样式条（文本正下方，常驻，像照片说明）与快捷键辅助 ----
 
     /// 选中第 idx 套配色（越界忽略）。
-    fn set_palette(&mut self, idx: usize) {
+    pub(crate) fn set_palette(&mut self, idx: usize) {
         if let Some(p) = InkPalette::ALL.get(idx) {
             self.palette = *p;
             self.persist();
