@@ -655,9 +655,10 @@ pub fn parse_markdown(md: &str) -> Vec<RawChapter> {
         let body = crate::dclean::tcm_clean(
             &crate::dclean::split_dosage_to_gloss(&md_inline(strip_list_marker(t))),
         );
-        // 智能方名升格：极短、以 方 / 湯 / 散 / 丸 / 丹 结尾、无剂量单位、无句读
-        // → 独立成章（榜眼大字）。先把上一章收尾，再升格为章题；药行因带剂量
-        // 单位必落第，绝不误升格。
+        // 智能方名升格（v1.9.17）：无后缀优先 + 铁壁量词排斥——极短（≤10）、
+        // 不含剂量量词（is_dose_unit）、无句读、非用法/炮制提示语 → 独立成章
+        // （榜眼大字）。先把上一章收尾，再升格为章题；药行因带量词必落第，
+        // 无后缀病证名（走馬牙疳/血山崩…）亦能正确升格。
         if crate::dclean::is_fang_title(&body) {
             if !title.is_empty() || !paras.is_empty() {
                 if title.is_empty() {
