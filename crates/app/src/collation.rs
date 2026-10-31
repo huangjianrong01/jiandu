@@ -1349,8 +1349,14 @@ impl Render for CollationWorkspace {
         // 路径上 → 根 div 的 `on_key_down` 能收到 ←/→/Esc；同时编辑器（IME 焦点在
         // `focus`）自然失焦，不再抢方向键去移动光标。预览关闭则焦点还给编辑器，
         // 中文输入照常。
+        // ⚠️ 必须判 is_focused 再 focus：render() 每帧都会走这里，若无条件调
+        //    window.focus()，焦点事件会触发 notify → 重绘 → 再 focus → **无限重绘
+        //    死循环**，主线程被彻底占满（表现为进入预览 / 开样式面板后整个界面卡死，
+        //    点【返回阅读】、按 Esc 全无反应）。两个分支一律先判再设。
         if self.show_preview {
-            window.focus(&self.preview_focus);
+            if !self.preview_focus.is_focused(window) {
+                window.focus(&self.preview_focus);
+            }
         } else if !self.focus.is_focused(window) {
             window.focus(&self.focus);
         }
@@ -1413,6 +1419,7 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
     use core_foundation::url::CFURL;
     use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::CGContext;
+    use core_graphics::geometry::{CGAffineTransform, CGPoint, CGRect, CGSize};
     use core_graphics::sys;
     use foreign_types::ForeignType;
     use std::os::raw::c_void;
@@ -1455,6 +1462,15 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
         fn CGPDFDocumentGetPage(doc: *mut c_void, page_number: usize) -> *mut c_void;
         fn CGPDFPageRetain(page: *mut c_void) -> *mut c_void;
         fn CGPDFPageGetBoxRect(page: *mut c_void, box_: u32) -> CGBox;
+        fn CGPDFPageGetRotationAngle(page: *mut c_void) -> i32;
+        fn CGPDFPageGetDrawingTransform(
+            page: *mut c_void,
+            box_: u32,
+            rect: CGRect,
+            rotate: i32,
+            preserve_aspect_ratio: bool,
+        ) -> CGAffineTransform;
+        fn CGContextConcatCTM(ctx: sys::CGContextRef, t: CGAffineTransform);
         fn CGContextTranslateCTM(ctx: sys::CGContextRef, tx: f64, ty: f64);
         fn CGContextScaleCTM(ctx: sys::CGContextRef, sx: f64, sy: f64);
         fn CGContextDrawPDFPage(ctx: sys::CGContextRef, page: *mut c_void);
@@ -1553,12 +1569,20 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
         ));
     }
     let mut ctx = unsafe { CGContext::from_ptr(raw) };
-    // 把 PDF 页直接绘进位图上下文：PDF 坐标系 y 向上、位图 y 向下，故先翻转 + 缩放，
-    // 使媒体框映射到整张位图（mb.x / mb.y 一般为 0）。
+    // ⚠️ 绝不能再手动 Translate + Scale(1,-1) 翻转：CGContextDrawPDFPage 在位图
+    //    上下文里本就以**正向**落笔，额外的 Y 翻转会把整页画成上下颠倒（沙箱探针
+    //    实测：手动翻转 → 倒置；不翻转 / DrawingTransform → 正向）。
+    //    改用官方 CGPDFPageGetDrawingTransform：把媒体框映射到目标矩形，并自动
+    //    处理页面 /Rotate（0/90/180/270），缩放也一并交给它。
+    let target = CGRect::new(
+        &CGPoint::new(0.0, 0.0),
+        &CGSize::new(w as f64, h as f64),
+    );
+    let rotation = unsafe { CGPDFPageGetRotationAngle(page) };
+    let transform =
+        unsafe { CGPDFPageGetDrawingTransform(page, 0, target, rotation, true) };
     unsafe {
-        CGContextTranslateCTM(ctx.as_ptr(), 0.0, nat_h * scale);
-        CGContextScaleCTM(ctx.as_ptr(), scale, -scale);
-        CGContextTranslateCTM(ctx.as_ptr(), -mb.x, -mb.y);
+        CGContextConcatCTM(ctx.as_ptr(), transform);
         CGContextDrawPDFPage(ctx.as_ptr(), page);
         CGPDFPageRelease(page);
     }
