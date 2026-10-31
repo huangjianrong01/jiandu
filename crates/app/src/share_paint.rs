@@ -224,6 +224,17 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
         // 逐字落笔即可，转 90° 反而把字放倒。这里只把基线镜像到 CG 侧，
         // 字形本身保持正向（CTM 未翻，故无镜像）。
         font.draw_glyphs(&[glyph], &[CGPoint::new(gx, cg_base(gy))], ctx.clone());
+        // **加粗**（Markdown `**…**`）：同字再落两笔极微量偏移，墨迹自然加厚。
+        //
+        // 为什么不换 Bold 字体面：`pick_font` 走的是 PostScript 回退链，系统宋体
+        // 未必有 `Songti SC Bold` 这个名字；一旦一个都取不到，整张卡直接报错——
+        // 为一个视觉细节赔上出图，不划算。半像素级的三次叠印在 1080 宽的卡上
+        // 已经能看出「这一行是重的」，且与底色同一抗锯齿，不会有描边毛刺。
+        if c.bold {
+            let d = 0.45;
+            font.draw_glyphs(&[glyph], &[CGPoint::new(gx + d, cg_base(gy))], ctx.clone());
+            font.draw_glyphs(&[glyph], &[CGPoint::new(gx, cg_base(gy + d))], ctx.clone());
+        }
     }
 
     // ---- 朱印 ----
@@ -318,6 +329,7 @@ mod tests {
         let spec = LayoutSpec {
             body: &body,
             red: &red,
+            md: &[],
             note: "此章言道為萬物之始",
             show_notes: true,
             sign: "道德經 · 第一章",
@@ -370,6 +382,7 @@ mod tests {
         let spec = LayoutSpec {
             body: &body,
             red: &red,
+            md: &[],
             note: "",
             show_notes: false,
             sign: "道德經 · 第一章",
@@ -484,6 +497,7 @@ mod tests {
         let spec = LayoutSpec {
             body: &body,
             red: &red,
+            md: &[],
             note: "此章言道為萬物之始",
             show_notes: true,
             sign: "道德經 · 第一章",

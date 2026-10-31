@@ -35,7 +35,7 @@ use crate::ime::{
 // 竖排预览：复用阅读引擎的「纯数据版式 + CoreGraphics 离屏光栅」链路，与 reader
 // 解耦（本模块绝不 import reader）。这三条都是 crate 内模块，reader 同款用法。
 use crate::share::{ShareBg, ShareFrame, ShareSeal};
-use crate::share_layout::{layout, LayoutSpec, ShareFont};
+use crate::share_layout::{clean_md, layout, LayoutSpec, ShareFont};
 use crate::share_paint::render_png;
 use gpui::prelude::*;
 use gpui::{
@@ -108,8 +108,16 @@ const PREVIEW_TIME_BUDGET_MS: u128 = 2500;
 /// 的**布局反馈环**，会让 GPUI 反复求解尺寸直至卡死。给显式上限即可解耦。
 const PREVIEW_IMG_MAX_H: f32 = 880.0;
 
-/// 右文段 ↔ 原图区域文字的**最低字面对合度**（0.0–1.0）。
+/// 右侧编辑器可载入的**最大字数**（导入 .md / .txt 时生效）。
 ///
+/// 编辑器是「一行一个 GPUI 元素」的自绘文本框，几十万字一次性铺开会让首帧
+/// 布局与滚动全部变慢（不是崩，是拖）。故按字数截断并明确告知——宁可只校对
+/// 前 8 万字，也不让点一下导入就把界面拖住。
+const TEXT_MAX_CHARS: usize = 80_000;
+/// 导入文本的字节上限：超过就不读（读进内存再截断纯属浪费）。
+const TEXT_IMPORT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 右文段 ↔ 原图区域文字的**最低字面对合度**（0.0–1.0）。
 /// 段落索引对齐的前提是「右侧转录 ≈ 原图该区域文字」。用户实测过一类典型误用：
 /// 导入《資治通鑑》却在右侧贴《千字文》——两者毫不相干，索引对齐失去意义，画出的
 /// 框必然是错的。故联动前先做字面校验，低于此值就**绝不画框、绝不滚动**。
@@ -180,6 +188,10 @@ pub struct CollationWorkspace {
     image_note: Option<String>,
     /// 竖排预览（离屏栅格化）各页位图路径（按页序；均为临时 PNG，重生成时清空）。
     preview_paths: Vec<PathBuf>,
+    /// 待删临时 PNG：关闭预览 / 重排时把旧路径挪进来，**下一帧** render 开头统一删盘。
+    ///
+    /// 不当场删是因为本帧的 `img` 可能还在异步读该文件；隔一帧元素树已换，删了安全。
+    temp_gc: Vec<PathBuf>,
     /// 当前预览页码（0-based）；`preview_paths` 为空时无意义。
     preview_page: usize,
     /// 预览栅格化失败信息（红色提示，如系统缺中文字体）。
@@ -213,14 +225,38 @@ pub struct CollationWorkspace {
     match_note: Option<String>,
     /// 排障用帧计数（每 120 帧打一次日志，狂刷 = 存在无限重绘循环）。
     frame_count: usize,
+    /// 原始 PDF 路径（多页翻页的唯一凭据）。`None` = 当前左图不是 PDF（位图原图 /
+    /// 尚未导入），翻页时左侧不动。
+    pdf_path: Option<PathBuf>,
+    /// 左侧 PDF 当前**渲染中 / 已渲染**的页码（1-based）。
+    ///
+    /// 与 `preview_page`（右侧文本预览的页）是**两个独立状态**，`flip_page` 负责
+    /// 让它们一起走——用户按一次 →，左右各进一页，这才是「双屏校对的灵魂」。
+    pdf_page: usize,
+    /// 左侧 PDF 总页数（≤1 时翻页键对左侧无效）。
+    pdf_pages: usize,
+    /// 左图是否正在后台重栅格化（翻页时显示 Loading，不阻塞任何键）。
+    page_busy: bool,
+    /// 左图栅格化的代际令牌：连按方向键时，旧页结果回来即丢弃（绝不闪回）。
+    page_gen: usize,
     /// 原图文本层 / OCR 识别出的文本区域（自然像素坐标）。真实接入时由 PDF 文本层
     /// 或 OCR 引擎填充；MVP 由 `mock_regions()` 提供假数据跑通映射数学。
     regions: Vec<SourceRegion>,
+    /// 右侧参与校对的 **Markdown / 纯文本源码文件**（导入后记录，仅作状态显示）。
+    ///
+    /// ⚠️ 编辑器里显示的是**源码原件**（`#`、`**`、`---` 都在）——用户校的是
+    /// 原文，改的也是原文；把记号偷偷洗掉会让「所见即所改」失真。清洗只发生在
+    /// 竖排预览出图那一刻（`share_layout::clean_md`）。
+    text_file: Option<PathBuf>,
+    /// 文本导入的提示 / 错误（工具栏下方一行；`text_err` 决定红字还是朱字）。
+    text_note: Option<String>,
+    /// `text_note` 是否是错误（红色）。
+    text_err: bool,
 }
 
 impl CollationWorkspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        Self {
+        let me = Self {
             // 示例转录：一段较长的古文（千字文节选），让用户一进来就能看到
             // 编辑器、立即尝试选择/输入，并直接打开「竖排预览」看到多页分页。
             text: "天地玄黄 宇宙洪荒 日月盈昃 辰宿列张 寒来暑往 秋收冬藏 闰余成岁 律吕调阳 云腾致雨 露结为霜 金生丽水 玉出昆冈 剑号巨阙 珠称夜光 果珍李柰 菜重芥姜 海咸河淡 鳞潜羽翔 龙师火帝 鸟官人皇 始制文字 乃服衣裳 推位让国 有虞陶唐 吊民伐罪 周发殷汤 坐朝问道 垂拱平章 爱育黎首 臣伏戎羌 遐迩一体 率宾归王 鸣凤在竹 白驹食场 化被草木 赖及万方\n盖此身发 四大五常 恭惟鞠养 岂敢毁伤 女慕贞洁 男效才良 知过必改 得能莫忘 罔谈彼短 靡恃己长 信使可覆 器欲难量 墨悲丝染 诗赞羔羊 景行维贤 克念作圣 德建名立 形端表正 空谷传声 虚堂习听 祸因恶积 福缘善庆 尺璧非宝 寸阴是竞 资父事君 曰严与敬 孝当竭力 忠则尽命 临深履薄 夙兴温凊 似兰斯馨 如松之盛 川流不息 渊澄取映 容止若思 言辞安定 笃初诚美 慎终宜令 荣业所基 藉甚无竟 学优登仕 摄职从政 存以甘棠 去而益咏"
@@ -240,6 +276,7 @@ impl CollationWorkspace {
             image_error: None,
             image_note: None,
             preview_paths: Vec::new(),
+            temp_gc: Vec::new(),
             preview_page: 0,
             preview_error: None,
             preview_note: None,
@@ -260,7 +297,20 @@ impl CollationWorkspace {
             match_note: None,
             frame_count: 0,
             regions: Self::mock_regions(),
-        }
+            pdf_path: None,
+            pdf_page: 1,
+            pdf_pages: 1,
+            page_busy: false,
+            page_gen: 0,
+            text_file: None,
+            text_note: None,
+            text_err: false,
+        };
+        // 启动即清扫上一进程遗留的临时图（崩溃 / 强退时 `Drop` 跑不到，只能等下次
+        // 启动补扫）。只认本应用自己的命名前缀，且只删「够旧」的，绝不误伤另开的
+        // 一个笺读实例正在用的图。
+        sweep_stale_temp_pngs();
+        me
     }
 
     // ── 选区 / 光标 / 编辑 ───────────────────────────────────────────────
@@ -585,6 +635,14 @@ impl CollationWorkspace {
                             .absolute()
                             .top(px(8.0))
                             .right(px(8.0)),
+                    )
+                    // PDF 多页时浮出页码条（左下角，绝不遮住右上角的【打开文件】）
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom(px(8.0))
+                            .left(px(8.0))
+                            .child(self.render_pdf_pager(cx)),
                     ),
             )
             .child(match self.render_image_status() {
@@ -678,11 +736,11 @@ impl CollationWorkspace {
                 });
             }
 
-            // 2) 最耗时的栅格化（CG 绘制首页 / 读 PNG 尺寸）放到后台 executor，
+            // 2) 最耗时的栅格化（CG 绘制该页 / 读 PNG 尺寸）放到后台 executor，
             //    避免阻塞 UI；完成后回主线程写入 image_path 等字段。
             let bg = app.background_executor().clone();
             let raster_path = path.clone();
-            let result = bg.spawn(async move { rasterize_source(&raster_path) }).await;
+            let result = bg.spawn(async move { rasterize_source(&raster_path, 1) }).await;
 
             if let Some(entity) = this.upgrade() {
                 let _ = entity.update(&mut app, |this, cx| {
@@ -697,6 +755,20 @@ impl CollationWorkspace {
                             // 记录原图自然像素尺寸（PDF 点），供真实坐标映射缩放使用。
                             this.src_nat_w = r.nat_w as f32;
                             this.src_nat_h = r.nat_h as f32;
+                            // 多页翻页的凭据：只有真 PDF 才记路径（位图原图翻不动）。
+                            let is_pdf = path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .map(|s| s.eq_ignore_ascii_case("pdf"))
+                                .unwrap_or(false);
+                            this.pdf_path = if is_pdf { Some(path.clone()) } else { None };
+                            this.pdf_pages = r.total.max(1);
+                            this.pdf_page = r.page;
+                            // 换原图 = 之前联动的段 / 框全部作废（属于旧图坐标）。
+                            this.active_para_idx = None;
+                            this.match_note = None;
+                            this.left_scroll
+                                .set_offset(Point::new(px(0.0), px(0.0)));
                             this.image_error = None;
                             // 若此前因无文本层已设 OCR 提示则保留；否则用栅格化 note。
                             if this.image_note.is_none() {
@@ -713,6 +785,63 @@ impl CollationWorkspace {
             }
         }
         })
+        .detach();
+    }
+
+    /// 导入 Markdown / 纯文本（.md / .markdown / .txt）到右侧编辑器。
+    ///
+    /// **「源码编辑 + 预览解析」策略的前半步**：这里一个字都不清洗——`#`、
+    /// `**`、`---` 原样进编辑器，用户校的是原文、改的也是原文（校对精度靠
+    /// 「所见即所改」保住）。清洗放在竖排预览出图前（`share_layout::clean_md`）。
+    ///
+    /// 不卡死的三道做法：
+    ///  ① rfd 同步对话框**前台直调**（走 background 会静默 None，见 reader.rs 笔记）；
+    ///  ② 读盘 / 解码扔 background executor——8 MB 上限的文件不该压在主线程；
+    ///  ③ 超过 `TEXT_MAX_CHARS` 按字截断并明确提示（编辑器逐行自绘，超长会拖）。
+    fn open_text_picker(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(
+            |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    let picked = rfd::FileDialog::new()
+                        .set_title("选择校对稿（Markdown / 纯文本）")
+                        .add_filter("Markdown / 纯文本", &["md", "markdown", "txt"])
+                        .add_filter("全部文件", &["*"])
+                        .pick_file();
+                    let Some(path) = picked else { return };
+
+                    // 读盘在后台：纯 IO，不碰 UI，也不占主线程。
+                    let bg = app.background_executor().clone();
+                    let rd = path.clone();
+                    let res = bg.spawn(async move { read_text_file(&rd) }).await;
+
+                    if let Some(entity) = this.upgrade() {
+                        let _ = entity.update(&mut app, |this, cx| {
+                            match res {
+                                Ok((body, note)) => {
+                                    this.text = body;
+                                    this.cursor = 0;
+                                    this.selection = None;
+                                    this.marked = None;
+                                    // 联动状态属于旧稿，随新稿一起清空，绝不带着
+                                    // 上一本书的高亮框进下一本。
+                                    this.active_para_idx = None;
+                                    this.match_note = None;
+                                    this.text_file = Some(path.clone());
+                                    this.text_note = Some(note);
+                                    this.text_err = false;
+                                }
+                                Err(e) => {
+                                    this.text_note = Some(e);
+                                    this.text_err = true;
+                                }
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+            },
+        )
         .detach();
     }
 
@@ -745,15 +874,16 @@ impl CollationWorkspace {
         preview_frame: ShareFrame,
     ) -> Result<(Vec<PathBuf>, Option<String>), String> {
         let t0 = std::time::Instant::now();
-        // 预览是一条连续竖排流：去掉编辑器里的换行（段落概念不在简单预览里
-        // 体现），否则 '\n' 会占一格变成竖排里的空白格。
-        let mut body: Vec<char> = text
-            .chars()
-            .filter(|c| *c != '\n' && *c != '\r')
-            .collect();
-        if body.is_empty() {
-            return Ok((Vec::new(), None)); // 空稿：无图，浮层显示占位提示。
+        // **Markdown 清洗**（预览解析）：编辑器里存的是源码（`#`、`**`、`---`
+        // 原样可见），出图前才洗成「干净文字 + 标题/加粗装饰位」。清洗器在
+        // `share_layout`（纯函数、零 macOS API），故本步同样可在后台线程跑。
+        // 它同时吃掉换行与空行：竖排是连续流，`\n` 只会白占一格。
+        let cleaned = clean_md(text);
+        if cleaned.body.is_empty() {
+            return Ok((Vec::new(), None)); // 空稿（或全是标记）：浮层显示占位提示。
         }
+        let mut body = cleaned.body;
+        let mut md = cleaned.md;
 
         // —— 防卡死闸门 ①：字数上限 ——
         let orig_len = body.len();
@@ -764,6 +894,9 @@ impl CollationWorkspace {
                 PREVIEW_MAX_CHARS, orig_len
             ));
             body.truncate(PREVIEW_MAX_CHARS);
+            // 装饰位与正文**必须同步截断**：两边一旦错位，标题放大就会落到
+            // 别的字身上（版式错乱，且极难从成图上看出原因）。
+            md.truncate(PREVIEW_MAX_CHARS);
         }
         let red = vec![false; body.len()];
 
@@ -787,6 +920,8 @@ impl CollationWorkspace {
             let spec = LayoutSpec {
                 body: &body[start..end],
                 red: &red[start..end],
+                // 装饰位随正文同区间切片（与 `body` 严格等长）。
+                md: &md[start..end],
                 note: "",
                 show_notes: false,
                 sign: "",
@@ -857,17 +992,148 @@ impl CollationWorkspace {
     /// ・`preview_gen += 1` → 在途任务的代际立即过期，结果回来即丢弃，绝不回写 UI；
     /// ・`preview_paths.clear()` → `img` 元素随本帧 render 消失，与预览图相关的
     ///   任何解码 / 纹理开销立刻停止。故无论后台排到哪一步，关闭都能当场生效。
-    /// 只清路径、不删文件（避免删掉 img 正异步加载的文件），临时文件交给系统回收。
+    /// 旧页路径挪进 `temp_gc`，**下一帧**才真的删盘（本帧 img 可能还在异步读它，
+    /// 当帧删除会让图片加载报错；隔一帧则元素树已换，删了也无人引用）。
     fn close_preview(&mut self) {
         self.show_preview = false;
         self.preview_gen += 1;
         self.preview_pending = false;
-        self.preview_paths.clear();
+        self.temp_gc.append(&mut self.preview_paths);
         self.preview_page = 0;
     }
 
-    /// 请求重排预览（**绝不阻塞 UI**）：节流 + 代际令牌 + 后台栅格化。
+    /// **翻一页（← / →）——左右双屏同步走。**
     ///
+    /// 校对工具的灵魂就在这里：右侧竖排预览往后翻一页，左侧 PDF 原图也必须
+    /// 翻到下一页。否则用户看着第 5 页的原图，对的却是第 2 页的转录，越校越乱。
+    ///
+    /// 三条纪律：
+    ///  ① **两个状态各自钳在自己的边界内**：预览可能只有 6 页（防卡死闸门），
+    ///    PDF 却有 300 页；任一侧到底了就只停那一侧，绝不把另一侧也拽住。
+    ///  ② **PDF 只有 1 页 / 不是 PDF → 左侧纹丝不动**（`pdf_pages <= 1` 直接跳过），
+    ///    连后台任务都不起。
+    ///  ③ **左边重栅格化走后台 + 代际令牌**：连按 → 不会排队堵住，旧页结果回来
+    ///    时发现代际已过期，连临时文件一起丢掉，绝不「闪回上一页」。
+    fn flip_page(&mut self, dir: i32, cx: &mut Context<Self>) {
+        if dir == 0 {
+            return;
+        }
+        let mut moved = false;
+
+        // —— ① 右侧：竖排预览文本页（仅在浮层打开时才有意义）——
+        if self.show_preview {
+            let n = self.preview_paths.len();
+            if n > 1 {
+                let cur = self.preview_page.min(n - 1);
+                let next = if dir < 0 {
+                    cur.saturating_sub(1)
+                } else {
+                    (cur + 1).min(n - 1)
+                };
+                if next != cur {
+                    self.preview_page = next;
+                    moved = true;
+                }
+            }
+        }
+
+        // —— ② 左侧：PDF 原图页 ——
+        if self.pdf_pages > 1 && self.pdf_path.is_some() {
+            let cur = self.pdf_page.max(1);
+            let next = if dir < 0 {
+                cur.saturating_sub(1).max(1)
+            } else {
+                (cur + 1).min(self.pdf_pages)
+            };
+            if next != cur {
+                self.pdf_page = next;
+                moved = true;
+                self.request_pdf_page(next, cx);
+            }
+        }
+
+        if moved {
+            cx.notify();
+        }
+    }
+
+    /// 后台重栅格化左侧 PDF 的某一页（1-based），成功后换图 + 复位滚动。
+    ///
+    /// 与 `open_image_picker` 里首次导入走同一条 `rasterize_source`，区别只在
+    /// 「页号」与「旧图回收」：翻页必须删掉上一页的临时 PNG，否则长翻几百页
+    /// 会在临时目录里堆出几百张 1080p 图。
+    fn request_pdf_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        let Some(path) = self.pdf_path.clone() else {
+            return;
+        };
+        self.page_busy = true;
+        self.page_gen += 1;
+        let gen = self.page_gen;
+        // 换页即作废旧页的文本层坐标与联动状态：右边的段落还没点，左边不该
+        // 留着上一页的框。
+        self.active_para_idx = None;
+        self.match_note = None;
+
+        cx.spawn(
+            move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    let exec = app.background_executor().clone();
+                    let out = exec
+                        .spawn(async move { rasterize_source(&path, page) })
+                        .await;
+                    if let Some(entity) = this.upgrade() {
+                        let _ = entity.update(&mut app, |this, cx| {
+                            this.page_busy = false;
+                            // 代际过期（用户又翻了几页）→ 丢弃结果与临时图。
+                            if gen != this.page_gen {
+                                if let Ok(r) = &out {
+                                    if let Some(t) = &r.temp {
+                                        let _ = std::fs::remove_file(t);
+                                    }
+                                }
+                                cx.notify();
+                                return;
+                            }
+                            match out {
+                                Ok(r) => {
+                                    if let Some(old) = this.last_temp.take() {
+                                        let _ = std::fs::remove_file(&old);
+                                    }
+                                    this.image_path = Some(r.path);
+                                    this.last_temp = r.temp;
+                                    this.src_nat_w = r.nat_w as f32;
+                                    this.src_nat_h = r.nat_h as f32;
+                                    this.pdf_page = r.page;
+                                    this.pdf_pages = r.total.max(1);
+                                    // 新页的文本层坐标：翻页后仍要能「点右文 → 亮左图」，
+                                    // 若沿用上一页的框，高亮会落到完全不相干的位置。
+                                    let real =
+                                        crate::pdf_text::extract_pdf_text_regions_on(
+                                            this.pdf_path.as_deref().unwrap_or(Path::new("")),
+                                            r.page.saturating_sub(1),
+                                        );
+                                    this.regions = real;
+                                    // 滚动复位：新页从顶上看起（旧的偏移对不上新页）。
+                                    this.left_scroll
+                                        .set_offset(Point::new(px(0.0), px(0.0)));
+                                    this.image_error = None;
+                                    this.image_note = r.note;
+                                }
+                                Err(e) => {
+                                    this.image_error = Some(e);
+                                }
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// 请求重排预览（**绝不阻塞 UI**）：节流 + 代际令牌 + 后台栅格化。    ///
     /// ・**节流**：1s 内不重复起任务；连点只挂 `preview_pending`，当前任务回来后
     ///   自动补跑一次（既不堆积任务，也不会「点了没反应」）。
     /// ・**代际令牌** `preview_gen`：连改样式时旧结果回来即丢弃（含临时文件），
@@ -918,10 +1184,9 @@ impl CollationWorkspace {
                             }
                             match out {
                                 Ok((pages, note)) => {
-                                    // 先清旧页（绝不碰用户原文件）。
-                                    for p in this.preview_paths.drain(..) {
-                                        let _ = std::fs::remove_file(&p);
-                                    }
+                                    // 先清旧页（绝不碰用户原文件）：挪进待删队列，
+                                    // 下一帧 render 统一删盘（见 `temp_gc`）。
+                                    this.temp_gc.append(&mut this.preview_paths);
                                     this.preview_paths = pages;
                                     this.preview_note = note;
                                     this.preview_error = None;
@@ -1047,6 +1312,30 @@ impl CollationWorkspace {
         ]
     }
 
+    /// 文本导入状态条：显示「已载入哪份稿、多少字」或错误原因。
+    ///
+    /// 只占 24px 一行，无提示时不占高度（返回 None 由调用方补零高 div）——
+    /// 校对区一寸版面都不许浪费在常驻标签上。
+    fn render_text_status(&self) -> Option<gpui::Div> {
+        let n = self.text_note.as_ref()?;
+        let (bg, fg) = if self.text_err {
+            (rgba(0xb0342c33), rgb(0xb0342c))
+        } else {
+            (rgba(0x8c2b2210), rgb(0x8c2b22))
+        };
+        Some(
+            div()
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .px(px(PAD))
+                .bg(bg)
+                .text_color(fg)
+                .text_size(px(13.0))
+                .child(SharedString::from(n.clone())),
+        )
+    }
+
     /// 右侧联动状态条：显示当前已联动段对应的原图区域坐标（自然像素）。
     fn render_link_status(&self) -> gpui::Div {
         // 不匹配提示优先（此时 active_para_idx 为 None，否则会显示空条）。
@@ -1134,6 +1423,11 @@ impl CollationWorkspace {
                     .px(px(PAD))
                     .bg(rgb(0xece2c8))
                     .child(div().flex_1())
+                    // 【导入 MD】：把 .md / .txt 的**源码**灌进右侧编辑器。
+                    // 与【打开文件】一样是 rfd 同步对话框，但读盘走后台（见
+                    // `open_text_picker`），点下去界面立刻回来，不会假死。
+                    .child(self.button("导入 MD", |c, _, _, cx| c.open_text_picker(cx), cx)
+                        .mr(px(8.0)))
                     .child(self.button("竖排预览", |c, _, _, cx| {
                         if c.show_preview {
                             c.close_preview();
@@ -1144,6 +1438,10 @@ impl CollationWorkspace {
                         cx.notify();
                     }, cx)),
             )
+            .child(match self.render_text_status() {
+                Some(s) => s,
+                None => div().h(px(0.0)),
+            })
             .child(self.render_link_status())
             .child(editor)
     }
@@ -1400,9 +1698,13 @@ impl CollationWorkspace {
                                 .rounded(px(8.0))
                                 .text_color(rgb(0x2b2620))
                                 .text_size(px(14.0))
-                                .child(SharedString::from(
-                                    "（转录为空：写入文字后点「竖排预览」或「刷新预览」）",
-                                ))
+                                .child(SharedString::from(if self.preview_busy {
+                                    // 排版中（后台还没回）：绝不能说「转录为空」——
+                                    // 用户会以为稿子白写了，其实是还在排。
+                                    "排版中…（请稍候，Esc 可随时关闭）"
+                                } else {
+                                    "（正文为空：写入文字或【导入 MD】后，点「刷新预览」）"
+                                }))
                                 .into_any_element(),
                         }
                     }),
@@ -1517,6 +1819,9 @@ impl CollationWorkspace {
     }
 
     /// 翻页器：多页时显示「← 第 X / Y 页 →」，单页（或无图）时返回空 div。
+    ///
+    /// 三个按钮都走 [`CollationWorkspace::flip_page`]——点箭头与按方向键必须是
+    /// **同一条路**，否则左右双屏迟早会不同步。
     fn preview_pager(&self, cx: &mut Context<Self>) -> gpui::Div {
         let n = self.preview_paths.len();
         if n <= 1 {
@@ -1533,12 +1838,7 @@ impl CollationWorkspace {
             .gap(px(6.0))
             .child(self.button(
                 "←",
-                |c, _, _, cx| {
-                    if c.preview_page > 0 {
-                        c.preview_page -= 1;
-                    }
-                    cx.notify();
-                },
+                |c, _, _, cx| c.flip_page(-1, cx),
                 cx,
             ))
             .child(
@@ -1553,14 +1853,41 @@ impl CollationWorkspace {
             )
             .child(self.button(
                 "→",
-                |c, _, _, cx| {
-                    if c.preview_page + 1 < c.preview_paths.len() {
-                        c.preview_page += 1;
-                    }
-                    cx.notify();
-                },
+                |c, _, _, cx| c.flip_page(1, cx),
                 cx,
             ))
+    }
+
+    /// 左图页码条（浮在左栏底部）：显示 PDF 当前页 / 总页，可点击翻页。
+    ///
+    /// 键盘的 ←/→ 只在预览浮层打开时才归翻页（关着的时候要留给编辑器移光标），
+    /// 而校对时用户常常是「关掉预览、只看原图逐页核」——所以左侧必须有自己的
+    /// 翻页入口，不能只靠键盘。
+    fn render_pdf_pager(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.pdf_pages <= 1 {
+            return div();
+        }
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(6.0))
+            .bg(rgba(0xf4ecd8e0))
+            .child(self.button("‹", |c, _, _, cx| c.flip_page(-1, cx), cx))
+            .child(
+                div()
+                    .text_color(rgb(0x8c2b22))
+                    .text_size(px(13.0))
+                    .child(SharedString::from(if self.page_busy {
+                        format!("第 {} / {} 頁 · 载入中…", self.pdf_page, self.pdf_pages)
+                    } else {
+                        format!("第 {} / {} 頁", self.pdf_page, self.pdf_pages)
+                    })),
+            )
+            .child(self.button("›", |c, _, _, cx| c.flip_page(1, cx), cx))
     }
 
     /// 底部状态条：仅显示预览栅格化错误（红）。多页提示由顶部翻页器承载。
@@ -1599,26 +1926,15 @@ impl EventEmitter<CollationEvent> for CollationWorkspace {}
 impl CollationWorkspace {
     /// 预览浮层的键盘总入口（挂在根 div 上，仅在 `show_preview` 时生效）。
     ///
-    /// ←/→ 翻页（到边界钳制）；Esc 关闭浮层。预览关闭时直接返回，绝不干扰
-    /// 编辑器自身的方向键光标移动。
+    /// ←/→ 翻页（**左右双屏一起翻**，见 [`CollationWorkspace::flip_page`]）；
+    /// Esc 关闭浮层。预览关闭时直接返回，绝不干扰编辑器自身的方向键光标移动。
     fn preview_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         if !self.show_preview {
             return;
         }
-        let pages = self.preview_paths.len();
         match event.keystroke.key.as_str() {
-            "left" => {
-                if self.preview_page > 0 {
-                    self.preview_page -= 1;
-                    cx.notify();
-                }
-            }
-            "right" => {
-                if pages > 0 && self.preview_page + 1 < pages {
-                    self.preview_page += 1;
-                    cx.notify();
-                }
-            }
+            "left" => self.flip_page(-1, cx),
+            "right" => self.flip_page(1, cx),
             "escape" => {
                 self.close_preview();
                 cx.notify();
@@ -1630,6 +1946,11 @@ impl CollationWorkspace {
 
 impl Render for CollationWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 上一帧起就不再显示的临时 PNG，此刻删盘最安全（元素树已换，无人引用）。
+        // 量很小（每轮预览 ≤6 张），同步删几个文件远不到一帧的预算。
+        for p in self.temp_gc.drain(..) {
+            let _ = std::fs::remove_file(&p);
+        }
         let vw = px_f32(window.viewport_size().width);
         let vh = px_f32(window.viewport_size().height);
         // 排障：帧计数。静止时也狂刷 → 说明有无限重绘循环（脏标记漏了）。
@@ -1688,16 +2009,122 @@ impl Render for CollationWorkspace {
 //      内部的 assert（其遇分配失败会直接 panic）；
 //   ③ 多页 PDF：只渲首页，页数>1 时给温和提示，不报错。
 
+// ── 文本导入：rfd 选 .md / .txt → 读成纯文本源码（不清洗）──
+
+/// 读入校对稿，返回 `(源码文本, 给用户看的提示)`。
+///
+/// 三条纪律：
+///  ① **原样读**：不清洗、不转繁简、不删空行——编辑器要显示的就是原文
+///    （`.md` 的 `#` / `**` / `---` 必须看得见，抄校才有依据）；
+///  ② 编码宽松：`from_utf8_lossy` 兜住 GBK 老稿的零星坏字节，绝不为一个
+///    怪字节报错退出（古籍稿常见扫描后转码的残留）；
+///  ③ 超长截断并**说清楚**：编辑器逐行自绘，字数是唯一会拖慢首帧的量。
+fn read_text_file(path: &Path) -> Result<(String, String), String> {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "（未命名）".to_string());
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if len > TEXT_IMPORT_MAX_BYTES {
+        return Err(format!(
+            "「{}」过大（{:.1} MB）：本工作台只载入 {} MB 以内的文本",
+            name,
+            len as f64 / 1048576.0,
+            TEXT_IMPORT_MAX_BYTES / 1024 / 1024
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("读取「{}」失败：{}", name, e))?;
+    // BOM 与 CRLF 归一：否则首字会是个看不见的 U+FEFF，行尾多一个 '\r'。
+    let text = String::from_utf8_lossy(&bytes)
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let total = text.chars().count();
+    if total == 0 {
+        return Err(format!("「{}」是空文件", name));
+    }
+    if total > TEXT_MAX_CHARS {
+        let cut: String = text.chars().take(TEXT_MAX_CHARS).collect();
+        return Ok((
+            cut,
+            format!(
+                "已载入「{}」前 {} 字（原文 {} 字）：编辑器逐行渲染，超长会拖慢界面",
+                name, TEXT_MAX_CHARS, total
+            ),
+        ));
+    }
+    Ok((text, format!("已载入「{}」　{} 字（源码原样显示）", name, total)))
+}
+
 /// 临时 PNG 输出路径（系统 temp 目录，按纳秒时间戳唯一命名，避免缓存串图）。
 fn temp_png_path() -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("jiandu_collation_{}.png", nanos))
+    std::env::temp_dir().join(format!("{}{}.png", TEMP_PNG_PREFIX, nanos))
 }
 
-/// 栅格化结果：显示路径、临时路径、原图自然像素尺寸、温和提示。
+/// 本模块产出的临时 PNG 统一前缀（清扫时只认这个前缀，绝不碰别人的文件）。
+const TEMP_PNG_PREFIX: &str = "jiandu_collation_";
+
+/// 清扫**上一进程**遗留的临时图：只删「文件名合前缀 + 修改时间够旧」的。
+///
+/// 为什么必须有这一刀：预览图 / 翻页栅格化每翻一页产一张临时 PNG，正常路径上
+/// 由「重生成时清旧页」「代际过期丢弃」「`Drop` 收尾」三处回收；但崩溃、强退、
+/// 活动监视器 kill 这些路径一行 `Drop` 都跑不到，临时目录就会一点点堆起来
+/// （实测一次调试积了 61 张）。启动时补扫是唯一不依赖退出路径的兜底。
+///
+/// 只认 1 小时前的文件：另开的一个笺读实例可能正在用它刚生成的图，够旧的才删。
+fn sweep_stale_temp_pngs() {
+    const STALE_AFTER: Duration = Duration::from_secs(3600);
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for e in entries.flatten() {
+        let path = e.path();
+        let is_ours = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(TEMP_PNG_PREFIX) && n.ends_with(".png"))
+            .unwrap_or(false);
+        if !is_ours {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|age| age > STALE_AFTER)
+            .unwrap_or(false);
+        if old {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// 工作台销毁（切走 / 关窗 / 退出）时回收本进程产出的临时图，不留垃圾。
+///
+/// ⚠️ 只删 `preview_paths` 与 `last_temp` —— 这两个字段里**只会**是本模块自己
+/// 栅格化出来的临时 PNG；用户导入的原图路径（`image_path` 可能等于它）绝不在此
+/// 之列，故不存在误删用户文件的风险。
+impl Drop for CollationWorkspace {
+    fn drop(&mut self) {
+        for p in self.preview_paths.drain(..) {
+            let _ = std::fs::remove_file(&p);
+        }
+        for p in self.temp_gc.drain(..) {
+            let _ = std::fs::remove_file(&p);
+        }
+        if let Some(t) = self.last_temp.take() {
+            let _ = std::fs::remove_file(t);
+        }
+    }
+}
+
+/// 栅格化结果：显示路径、临时路径、原图自然像素尺寸、页码信息、温和提示。
 /// `nat_w` / `nat_h` 供真实坐标映射（`source_size`）把 `SourceRegion` 自然像素
 /// 缩放到显示坐标；无原图时回退到区域包围盒。
 struct Rasterized {
@@ -1705,11 +2132,15 @@ struct Rasterized {
     temp: Option<PathBuf>,
     nat_w: f64,
     nat_h: f64,
+    /// 本次渲出的是第几页（1-based；位图原图恒为 1）。
+    page: usize,
+    /// 总共多少页（位图原图恒为 1）。
+    total: usize,
     note: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
-fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
+fn rasterize_source(path: &Path, page_no: usize) -> Result<Rasterized, String> {
     use core_foundation::base::TCFType;
     use core_foundation::url::CFURL;
     use core_graphics::color_space::CGColorSpace;
@@ -1740,6 +2171,8 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
             temp: None,
             nat_w: nw,
             nat_h: nh,
+            page: 1,
+            total: 1,
             note: None,
         });
     }
@@ -1797,7 +2230,9 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
         return Err(format!("无法打开 PDF：{:?}", path));
     }
     let total = unsafe { CGPDFDocumentGetNumberOfPages(doc) };
-    let page = unsafe { CGPDFDocumentGetPage(doc, 1) };
+    // 页号：外部传 1-based；这里钳到 [1, total]（越界绝不 panic，退回末页 / 首页）。
+    let page_no = page_no.clamp(1, total.max(1));
+    let page = unsafe { CGPDFDocumentGetPage(doc, page_no) };
     // ⚠️ 必须先显式 retain 住 page，再释放文档：CGPDFDocumentGetPage **不保证**给
     //    调用方 +1（page 所有权可能仍归文档）。若直接释放文档，page 会随之释放，
     //    后续 CGPDFPageGetBoxRect / CGContextDrawPDFPage 即 use-after-free
@@ -1808,7 +2243,7 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
     }
     unsafe { CGPDFDocumentRelease(doc) };
     if page.is_null() {
-        return Err("PDF 第一页不存在".to_string());
+        return Err(format!("PDF 第 {} 页不存在", page_no));
     }
     // 媒体框（PDF 点）：坐标映射的基准尺寸，与文本层坐标同单位。
     let mb = unsafe { CGPDFPageGetBoxRect(page, 0) }; // kCGPDFMediaBox = 0
@@ -1918,12 +2353,9 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
     image::save_buffer(&out, &rgba, w as u32, h as u32, image::ColorType::Rgba8)
         .map_err(|e| format!("写入 PNG 失败：{}", e))?;
 
-    // ③ 多页提示：首版仅渲染首页，页数 >1 时给温和提示（不报错）。
+    // ③ 多页：现在**能翻**了（见 `flip_page`），不再只渲首页；提示只报页码与总数。
     let note = if total > 1 {
-        Some(format!(
-            "已载入第 1 页（共 {} 页），多页 PDF 当前仅渲染首页",
-            total
-        ))
+        Some(format!("第 {} / {} 頁（← → 可翻页）", page_no, total))
     } else {
         None
     };
@@ -1932,12 +2364,14 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
         temp: Some(out),
         nat_w,
         nat_h,
+        page: page_no,
+        total,
         note,
     })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn rasterize_source(_path: &Path) -> Result<Rasterized, String> {
+fn rasterize_source(_path: &Path, _page_no: usize) -> Result<Rasterized, String> {
     Err("原图导入仅在 macOS 支持".to_string())
 }
 

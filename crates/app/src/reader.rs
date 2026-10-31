@@ -11078,6 +11078,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         let spec = crate::share_layout::LayoutSpec {
             body: &body,
             red: &red,
+            md: &[],
             note: "",
             show_notes: false,
             sign: "",
@@ -11179,6 +11180,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         let spec = crate::share_layout::LayoutSpec {
             body: &body,
             red: &self.share_red,
+            md: &[],
             note: &note,
             show_notes: self.share_show_notes,
             sign: &sign,

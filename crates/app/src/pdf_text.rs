@@ -42,6 +42,15 @@ use objc::{class, msg_send, rc::autoreleasepool, runtime::Object, sel, sel_impl}
 
 #[cfg(target_os = "macos")]
 pub fn extract_pdf_text_regions(path: &Path) -> Vec<SourceRegion> {
+    extract_pdf_text_regions_on(path, 0)
+}
+
+/// 抽取**指定页**（0-based）的文本层坐标；页号越界 / 非 PDF 一律返回空。
+///
+/// 左右双屏翻页同步后，左侧 PDF 会真的翻页，文本层坐标必须跟着换页——
+/// 否则翻到第 5 页仍在用第 1 页的框，高亮会落在完全不相干的地方。
+#[cfg(target_os = "macos")]
+pub fn extract_pdf_text_regions_on(path: &Path, page_index: usize) -> Vec<SourceRegion> {
     // ⚠️ 必须有 autorelease pool：PDFKit / Foundation 创建的对象（NSURL / NSString /
     // PDFDocument / PDFPage）多为 autoreleased，脱离主 runloop 的调用点若没有 pool
     // 承载，对象无处释放会直接崩溃（"导入即闪退"的元凶）。即使本函数被主线
@@ -55,10 +64,10 @@ pub fn extract_pdf_text_regions(path: &Path) -> Vec<SourceRegion> {
             return vec![];
         }
         let count: usize = msg_send![doc, pageCount];
-        if count == 0 {
+        if count == 0 || page_index >= count {
             return vec![];
         }
-        let page: *mut Object = msg_send![doc, pageAtIndex: 0usize];
+        let page: *mut Object = msg_send![doc, pageAtIndex: page_index];
         if page.is_null() {
             return vec![];
         }
@@ -96,6 +105,11 @@ pub fn extract_pdf_text_regions(path: &Path) -> Vec<SourceRegion> {
 
 #[cfg(not(target_os = "macos"))]
 pub fn extract_pdf_text_regions(_path: &Path) -> Vec<SourceRegion> {
+    vec![]
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn extract_pdf_text_regions_on(_path: &Path, _page_index: usize) -> Vec<SourceRegion> {
     vec![]
 }
 
