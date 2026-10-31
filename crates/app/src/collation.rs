@@ -13,6 +13,10 @@
 //! 原生编辑器 + 左图右文联动（骨架阶段：左图 mock 行带 + 右文点击段 → 左图
 //! `ScrollHandle` 滚动到 N*BAND_H 并叠加半透明高亮矩形）。原图预栅格化位图
 //! 真实接入（PDF 文本层 / OCR 坐标匹配）、竖排预览栅格化在后续提交中落地。
+//!
+//! —— 方向①（真实图片）已落地：左侧【打开文件】按钮 → rfd 选 PDF / PNG →
+//! CoreGraphics 把 PDF 首页（或复用 PNG）预栅格化为位图 → `gpui::img` 贴图，
+//! 带超大尺寸 / 空指针 / 多页三道防护（见文件末尾 `rasterize_source`）。
 
 use crate::ime::{
     char_to_utf16, effective_replace_range, utf16_len, utf16_slice, utf16_to_char,
@@ -24,7 +28,7 @@ use gpui::{
     Pixels, Point, ParentElement, Render, ScrollHandle, SharedString, Styled, Window,
 };
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Pixels → f32：gpui 的 `Pixels` 字段在 jiandu crate 不可见，用「除 1px」取数值。
 fn px_f32(p: Pixels) -> f32 {
@@ -85,6 +89,12 @@ pub struct CollationWorkspace {
     show_preview: bool,
     /// 预栅格化的原图位图（PDF 页 / PNG）；None 时左图用 mock 行带占位。
     image_path: Option<PathBuf>,
+    /// 上一张临时栅格化 PNG（PDF 转图产生）；载入新图时删除以免堆积。
+    last_temp: Option<PathBuf>,
+    /// 导入失败信息（红色提示）。
+    image_error: Option<String>,
+    /// 非错误的温和提示（如多页 PDF 仅渲首页）。
+    image_note: Option<String>,
     /// 左图高亮矩形（内容坐标，随原图滚动）。None = 无高亮。
     highlight: Option<Highlight>,
     /// 当前联动的右文段索引（0-based）。None = 尚未联动。
@@ -109,6 +119,9 @@ impl CollationWorkspace {
             dragging: false,
             show_preview: false,
             image_path: None,
+            last_temp: None,
+            image_error: None,
+            image_note: None,
             highlight: None,
             active_para_idx: None,
             active_para_text: String::new(),
@@ -385,42 +398,59 @@ impl CollationWorkspace {
             }, cx))
     }
 
-    /// 左侧 40%：原图区。滚动容器挂 `left_scroll`，内容随窗口伸缩；
-    /// 内容（栅格化位图或 mock 行带）内部用 `relative()` 承载绝对定位的高亮叠加层。
+    /// 左侧 40%：原图区。顶部悬浮【打开文件】按钮；下方滚动容器挂 `left_scroll`，
+    /// 内容（栅格化位图或 mock 行带）内部用 `relative()` 承载绝对定位的高亮叠加层；
+    /// 底部状态条显示导入错误或温和提示（如多页 PDF 仅渲首页）。
     fn render_left(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .w(px(vw * 0.4))
             .h_full()
-            .relative()
+            .flex()
+            .flex_col()
             .bg(rgb(0xddd2b4))
             .child(
                 div()
-                    .id(SharedString::from("collation-left-scroll"))
-                    .w_full()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.left_scroll)
-                    .child(self.render_left_content()),
+                    .relative()
+                    .flex_1()
+                    .child(
+                        div()
+                            .id(SharedString::from("collation-left-scroll"))
+                            .w_full()
+                            .h_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.left_scroll)
+                            .child(self.render_left_content()),
+                    )
+                    .child(
+                        self.button("打开文件", |c, _, _, cx| c.open_image_picker(cx), cx)
+                            .absolute()
+                            .top(px(8.0))
+                            .right(px(8.0)),
+                    ),
             )
-            .child(
-                self.button("导入原图", |c, _, _, cx| c.open_image_picker(cx), cx)
-                    .absolute()
-                    .top(px(8.0))
-                    .right(px(8.0)),
-            )
+            .child(match self.render_image_status() {
+                Some(s) => s,
+                None => div().h(px(0.0)),
+            })
     }
 
-    /// 左图内容：已载入位图则贴 `img`，否则画 mock 行带（每段一行，便于演示联动）。
-    /// 高亮矩形作为绝对定位子节点叠加在 `page` 上，随内容一起滚动。
+    /// 左图内容：已载入位图则贴 `img`（按宽自适应高度，随原图滚动），否则画 mock
+    /// 行带（每段一行，便于演示联动）。高亮矩形作为绝对定位子节点叠加在内容之上，
+    /// 随内容一起滚动。
     fn render_left_content(&self) -> gpui::Div {
-        let h = self.page_height();
-        let mut page = div().relative().w_full().h(px(h)).bg(rgb(0xf1e8cf));
-        if let Some(p) = &self.image_path {
-            page = page.child(img(p.clone()).w_full().h(px(h)));
-        } else {
-            let n = self.line_ranges().len().max(1);
-            for i in 0..n {
-                page = page.child(self.render_band(i));
+        let mut page = div().relative().w_full();
+        match &self.image_path {
+            Some(p) => {
+                // 真实位图：img 自带宽高比，按宽自适应高度，整页随滚动容器滚动。
+                page = page.child(img(p.clone()).w_full());
+            }
+            None => {
+                let h = self.page_height();
+                page = page.h(px(h)).bg(rgb(0xf1e8cf));
+                let n = self.line_ranges().len().max(1);
+                for i in 0..n {
+                    page = page.child(self.render_band(i));
+                }
             }
         }
         if let Some(hl) = &self.highlight {
@@ -473,11 +503,51 @@ impl CollationWorkspace {
         (self.line_ranges().len().max(12)) as f32 * BAND_H
     }
 
-    /// 导入原图（PDF/PNG）：下一步接入 rfd 文件选择 + 预栅格化位图；
-    /// 这里仅占位，避免死按钮。
+    /// 导入原图（PDF / PNG）：弹出系统文件选择框（rfd **前台直调**），
+    /// 选中后在异步块里把 PDF 首页 / PNG 预栅格化为位图路径，存入 `image_path`。
     fn open_image_picker(&mut self, cx: &mut Context<Self>) {
-        // TODO(collation): 用 rfd 打开文件 → 预栅格化 PDF 页为 RenderImage → 存入 image_path。
-        cx.notify();
+        // rfd 同步对话框必须跑在主线程（见 IME 笔记 / reader.rs）：用 cx.spawn 前台
+        // executor，块内同步调用 pick_file；绝不过 background_executor（会静默 None）。
+        cx.spawn(
+            |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+            // AsyncApp 是 Clone：把「借用的上下文」换成「owned 句柄」，
+            // async move 块才能安全持有它跨 await（借用不能进 'static future）。
+            let mut app = app.clone();
+            async move {
+            let picked = rfd::FileDialog::new()
+                .set_title("选择原图（PDF / PNG）")
+                .add_filter("原图 (PDF / PNG)", &["pdf", "png"])
+                .add_filter("全部文件", &["*"])
+                .pick_file();
+            let Some(path) = picked else { return };
+
+            // 栅格化（单页很快，前台即可；如超大 PDF 想更稳可改 background_executor）。
+            let result = rasterize_source(&path);
+
+            if let Some(entity) = this.upgrade() {
+                let _ = entity.update(&mut app, |this, cx| {
+                    match result {
+                        Ok((display, temp, note)) => {
+                            // 删除上一张临时栅格化图（绝不碰用户原文件）。
+                            if let Some(old) = this.last_temp.take() {
+                                let _ = std::fs::remove_file(&old);
+                            }
+                            this.image_path = Some(display);
+                            this.last_temp = temp;
+                            this.image_error = None;
+                            this.image_note = note;
+                        }
+                        Err(e) => {
+                            this.image_error = Some(e);
+                            this.image_note = None;
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        }
+        })
+        .detach();
     }
 
     /// 右文某段 → 左图联动：记录段文本 + 左侧滚动到对应 Y + 高亮。
@@ -514,6 +584,37 @@ impl CollationWorkspace {
                 ))),
             None => div().h(px(0.0)),
         }
+    }
+
+    /// 底部状态条：优先显示导入错误（红），否则显示温和提示（如多页 PDF 仅渲首页）。
+    fn render_image_status(&self) -> Option<gpui::Div> {
+        if let Some(e) = &self.image_error {
+            return Some(
+                div()
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .px(px(PAD))
+                    .bg(rgba(0xb0342c33))
+                    .text_color(rgb(0xb0342c))
+                    .text_size(px(13.0))
+                    .child(SharedString::from(e.clone())),
+            );
+        }
+        if let Some(n) = &self.image_note {
+            return Some(
+                div()
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .px(px(PAD))
+                    .bg(rgba(0x8c2b2210))
+                    .text_color(rgb(0x8c2b22))
+                    .text_size(px(13.0))
+                    .child(SharedString::from(n.clone())),
+            );
+        }
+        None
     }
 
     /// 右侧 60%：竖排预览工具条 + 原生编辑器。
@@ -720,6 +821,184 @@ impl Render for CollationWorkspace {
         }
         root
     }
+}
+
+// ── 原图导入：rfd 选文件 → 预栅格化为位图（PDF 首页 / PNG 直接复用）──
+// 策略（见评估报告）：预栅格化位图 + gpui::img 贴图。PDF 用 CoreGraphics 把首页
+// 绘到 CGBitmapContext，再编码为 PNG 临时文件交给 img 异步解码。
+//
+// 三道安全防线（防超大 / 超长卷轴 OOM 或闪退）：
+//   ① 计算防护：建位图前先算 宽*高*4，超限则按比例缩到 最大边长≤4096 且 ≤64MB；
+//   ② 空指针：直接用 CGBitmapContextCreate 并判空，绕开 create_bitmap_context
+//      内部的 assert（其遇分配失败会直接 panic）；
+//   ③ 多页 PDF：只渲首页，页数>1 时给温和提示，不报错。
+
+/// 临时 PNG 输出路径（系统 temp 目录，按纳秒时间戳唯一命名，避免缓存串图）。
+fn temp_png_path() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("jiandu_collation_{}.png", nanos))
+}
+
+#[cfg(target_os = "macos")]
+fn rasterize_source(path: &Path) -> Result<(PathBuf, Option<PathBuf>, Option<String>), String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::url::CFURL;
+    use core_graphics::color_space::CGColorSpace;
+    use core_graphics::context::CGContext;
+    use core_graphics::geometry::{CGPoint, CGSize, CGRect};
+    use core_graphics::image::CGImage;
+    use core_graphics::sys;
+    use foreign_types::ForeignType;
+    use std::os::raw::c_void;
+    use std::ptr;
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase());
+
+    // PNG / 常见位图：gpui::img 自带解码器，无需预栅格化，直接复用原路径。
+    if matches!(
+        ext.as_deref(),
+        Some("png") | Some("jpg") | Some("jpeg") | Some("tif") | Some("tiff") | Some("bmp")
+            | Some("gif") | Some("webp")
+    ) {
+        return Ok((path.to_path_buf(), None, None));
+    }
+    // 首版仅支持 PDF 栅格化。
+    if ext.as_deref() != Some("pdf") {
+        return Err(format!(
+            "不支持的文件类型：{:?}（首版仅支持 PDF / 常见图片）",
+            path
+        ));
+    }
+
+    extern "C" {
+        fn CGPDFDocumentCreateWithURL(url: core_foundation::url::CFURLRef) -> *mut c_void;
+        fn CGPDFDocumentGetNumberOfPages(doc: *mut c_void) -> usize;
+        fn CGPDFDocumentGetPage(doc: *mut c_void, page_number: usize) -> *mut c_void;
+        fn CGPDFPageCreateImage(page: *mut c_void) -> sys::CGImageRef;
+        fn CGPDFDocumentRelease(doc: *mut c_void);
+        fn CGPDFPageRelease(page: *mut c_void);
+        fn CGBitmapContextCreate(
+            data: *mut c_void,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: *mut c_void,
+            bitmap_info: u32,
+        ) -> sys::CGContextRef;
+    }
+
+    let url = CFURL::from_path(path, false).ok_or_else(|| format!("无法解析路径：{:?}", path))?;
+    let doc = unsafe { CGPDFDocumentCreateWithURL(url.as_concrete_TypeRef()) };
+    if doc.is_null() {
+        return Err(format!("无法打开 PDF：{:?}", path));
+    }
+    let total = unsafe { CGPDFDocumentGetNumberOfPages(doc) };
+    let page = unsafe { CGPDFDocumentGetPage(doc, 1) };
+    unsafe { CGPDFDocumentRelease(doc) }; // 页面已被单独 retain，可立即释放文档
+    if page.is_null() {
+        return Err("PDF 第一页不存在".to_string());
+    }
+    let cgimage_ref = unsafe { CGPDFPageCreateImage(page) };
+    unsafe { CGPDFPageRelease(page) };
+    if cgimage_ref.is_null() {
+        return Err("PDF 页面栅格化失败".to_string());
+    }
+    let cgimage = unsafe { CGImage::from_ptr(cgimage_ref) };
+
+    let nat_w = cgimage.width() as f64;
+    let nat_h = cgimage.height() as f64;
+    if nat_w <= 0.0 || nat_h <= 0.0 {
+        return Err("PDF 页面尺寸为 0".to_string());
+    }
+
+    // ① 计算防护：先把超大尺寸按比例缩小，确保单页栅格化后
+    //    最大边长 ≤ 4096px 且 宽*高*4 ≤ 64MB，避免 CGBitmapContext OOM / 闪退。
+    const MAX_DIM: f64 = 4096.0;
+    const MAX_BYTES: f64 = 64.0 * 1024.0 * 1024.0;
+    let long = nat_w.max(nat_h);
+    let dim_scale = if long > MAX_DIM { MAX_DIM / long } else { 1.0 };
+    let area_scale = {
+        let bytes = nat_w * nat_h * 4.0;
+        if bytes > MAX_BYTES {
+            (MAX_BYTES / bytes).sqrt()
+        } else {
+            1.0
+        }
+    };
+    let scale = dim_scale.min(area_scale);
+    let w = (nat_w * scale).max(1.0) as usize;
+    let h = (nat_h * scale).max(1.0) as usize;
+
+    let space = CGColorSpace::create_device_rgb();
+    let bpr = 4 * w;
+    // ② 空指针处理：直接用 CGBitmapContextCreate 并判空，绕开 create_bitmap_context
+    //    内部的 assert（其遇分配失败会直接 panic）。
+    let raw = unsafe {
+        CGBitmapContextCreate(
+            ptr::null_mut(),
+            w,
+            h,
+            8,
+            bpr,
+            space.as_ptr() as *mut c_void,
+            1, // kCGImageAlphaPremultipliedLast
+        )
+    };
+    if raw.is_null() {
+        return Err(format!(
+            "位图上下文分配失败（原图约 {}×{}，已缩到 {}×{} 仍失败，可能内存不足）",
+            nat_w as u32, nat_h as u32, w, h
+        ));
+    }
+    let mut ctx = unsafe { CGContext::from_ptr(raw) };
+    let rect = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize {
+            width: w as f64,
+            height: h as f64,
+        },
+    };
+    ctx.draw_image(rect, &cgimage);
+
+    // CoreGraphics 位图内存序为 BGRA，转成 img / PNG 需要的 RGBA；并按实际
+    // bytes_per_row 去填充（CG 可能按 16 字节对齐放大行距）。
+    let bpr_actual = ctx.bytes_per_row();
+    let data = ctx.data();
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for row in 0..h {
+        let src = &data[row * bpr_actual..row * bpr_actual + w * 4];
+        for px in src.chunks_exact(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]); // BGRA → RGBA
+        }
+    }
+    drop(ctx);
+
+    let out = temp_png_path();
+    image::save_buffer(&out, &rgba, w as u32, h as u32, image::ColorType::Rgba8)
+        .map_err(|e| format!("写入 PNG 失败：{}", e))?;
+
+    // ③ 多页提示：首版仅渲染首页，页数 >1 时给温和提示（不报错）。
+    let note = if total > 1 {
+        Some(format!(
+            "已载入第 1 页（共 {} 页），多页 PDF 当前仅渲染首页",
+            total
+        ))
+    } else {
+        None
+    };
+    Ok((out.clone(), Some(out), note))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rasterize_source(_path: &Path) -> Result<(PathBuf, Option<PathBuf>, Option<String>), String> {
+    Err("原图导入仅在 macOS 支持".to_string())
 }
 
 // ── 中文输入：复用现有 `ime` 的 UTF-16 约定，绝不叠字 ──────────────────────
