@@ -163,3 +163,74 @@ fn the_offline_dictionary_works_without_network() {
     assert!(jiandu_core::dict::is_common_char('道'));
     assert!(jiandu_core::dict::auto_pinyin('埵').is_some());
 }
+
+// ── 7) 中医方剂 markdown 导入：剂量拆夹注 + 炮制词不丢 + 方书预设 ────────────
+
+/// 把一本书里**所有段的夹注**收出来（只看 `NoteKind::Note`，即双行夹注）。
+fn collect_glosses(book: &jiandu_core::types::Book) -> Vec<String> {
+    let mut out = Vec::new();
+    for ch in &book.chapters {
+        for p in &ch.paragraphs {
+            for n in &p.notes {
+                if n.kind == jiandu_core::types::NoteKind::Note {
+                    out.push(n.text.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn tcm_markdown_splits_dose_into_gloss() {
+    let md = "# 驗方集\n\
+牙痛妙方\n\
+瞿麥壹錢\n\
+甘草川烏各六分\n\
+川芎（炒）二钱\n\
+五靈脂 醋炒 三錢";
+    let book = jiandu_core::importer::book_from_markdown("驗方集", md);
+    let glosses = collect_glosses(&book);
+    assert!(
+        glosses.iter().any(|g| g.contains("壹錢")),
+        "瞿麥壹錢 的剂量应落为夹注，实得 {:?}",
+        glosses
+    );
+    assert!(
+        glosses.iter().any(|g| g.contains("各六分")),
+        "甘草川烏各六分 的剂量应落为夹注，实得 {:?}",
+        glosses
+    );
+    assert!(
+        glosses.iter().any(|g| g.contains("二钱")),
+        "川芎（炒）二钱 的剂量应落为夹注，实得 {:?}",
+        glosses
+    );
+    // 炮制词「炒」绝不能丢：正文里应仍能找到。
+    let all_text: String = book
+        .chapters
+        .iter()
+        .flat_map(|c| c.paragraphs.iter())
+        .map(|p| p.text.clone())
+        .collect();
+    assert!(all_text.contains("炒"), "炮制词「炒」被误删：{}", all_text);
+}
+
+#[test]
+fn tcm_markdown_is_detected_as_fang_like() {
+    let mut md = String::from("# 驗方集\n");
+    for name in ["牙痛妙方", "小兒三朝不飲乳方", "血山崩方", "催生方"] {
+        md.push_str(name);
+        md.push('\n');
+    }
+    // 再喂一批短药行，凑够方书判定阈值（短行占比≥60% 且总行≥20）。
+    for _ in 0..30 {
+        md.push_str("當歸三錢\n");
+        md.push_str("川芎二錢\n");
+    }
+    let book = jiandu_core::importer::book_from_markdown("驗方集", &md);
+    assert!(
+        book.is_fang_like(),
+        "纯方剂短行应判为方书（自动上密排预设）"
+    );
+}

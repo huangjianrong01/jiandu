@@ -649,7 +649,9 @@ pub fn parse_markdown(md: &str) -> Vec<RawChapter> {
         }
         flush_quote(&mut quote, &mut paras);
         // ---- 列表 / 表格：留下文字，丢掉标记 ----
-        let body = md_inline(strip_list_marker(t));
+        // v1.9.15：药名 + 剂量拆成「正文[注]剂量[/注]」（中医方书专用，
+        // 详见 `dclean::split_dosage_to_gloss`）。炮制词（炒 / 炙…）留正文。
+        let body = crate::dclean::split_dosage_to_gloss(&md_inline(strip_list_marker(t)));
         if !body.trim().is_empty() {
             paras.push(body.trim().to_string());
         }

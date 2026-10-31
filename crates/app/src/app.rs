@@ -2322,7 +2322,7 @@ impl Root {
             let mut cols = self.grid.columns;
             for _ in 0..2 {
                 let probe = mode;
-                let next = crate::grid::auto_columns(
+                let auto = crate::grid::auto_columns(
                     |c| {
                         crate::grid::calculate_grid(crate::grid::GridInput {
                             columns: c,
@@ -2354,6 +2354,18 @@ impl Root {
                     },
                     avg,
                 );
+                // v1.9.15：方书（大量短句）直接上最密十四行信笺本，不随
+                // 章均字数退到疏朗本——短句在疏朗本里会撑出大片空白。
+                let next = if self
+                    .book
+                    .as_ref()
+                    .map(|b| b.is_fang_like())
+                    .unwrap_or(false)
+                {
+                    14
+                } else {
+                    auto
+                };
                 if next == cols {
                     break;
                 }

@@ -1179,6 +1179,33 @@ impl Book {
         self.total_chars() / self.chapters.len()
     }
 
+    /// **方书 / 药方判定**（v1.9.15）：正文被大量「极短句」主导时（如每味药
+    /// 独占一行、方名短句），排版引擎应直接上最密的十四行信笺本，避免短句在
+    /// 疏朗本里撑出一整片空白。
+    ///
+    /// 判据：全文总行数 ≥ 20，且其中「≤ 8 字」的短行占比 ≥ 60%。剂量夹注
+    /// 已被 `ingest_inline_notes` 抽离到 `notes`，故这里的行长是药名净长，
+    /// 判定稳。
+    pub fn is_fang_like(&self) -> bool {
+        let mut total = 0usize;
+        let mut short = 0usize;
+        for ch in self.chapters.iter() {
+            for p in ch.paragraphs.iter() {
+                for line in p.text.split('\n') {
+                    let n = line.chars().count();
+                    if n == 0 {
+                        continue;
+                    }
+                    total += 1;
+                    if n <= 8 {
+                        short += 1;
+                    }
+                }
+            }
+        }
+        total >= 20 && short * 10 >= total * 6
+    }
+
     /// 把字键 `(chapter, para, offset)` 换算成**全书统一的字符下标**（charIndex）。
     ///
     /// 与 `to_flow` / `flow_chars_of` 同一口径：自 v1.52.0 起 `to_flow` 不再

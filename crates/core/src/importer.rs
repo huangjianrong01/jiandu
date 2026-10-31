@@ -541,6 +541,10 @@ pub fn book_from_markdown(fallback_title: &str, md: &str) -> Book {
     if book.cover.title.is_empty() {
         book.cover.title = book.title.clone();
     }
+    // v1.9.15：把 markdown 里包好的 `[注]…[/注]`（剂量夹注）落成真正的
+    // 双行夹注——流式导入路径（`import_into` 的 md 分支）结尾不跑
+    // `post_process`，故这里直接落，两条路径都稳。
+    book.ingest_inline_notes();
     book
 }
 
