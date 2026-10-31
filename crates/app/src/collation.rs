@@ -1453,6 +1453,7 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
         fn CGPDFDocumentCreateWithURL(url: core_foundation::url::CFURLRef) -> *mut c_void;
         fn CGPDFDocumentGetNumberOfPages(doc: *mut c_void) -> usize;
         fn CGPDFDocumentGetPage(doc: *mut c_void, page_number: usize) -> *mut c_void;
+        fn CGPDFPageRetain(page: *mut c_void) -> *mut c_void;
         fn CGPDFPageGetBoxRect(page: *mut c_void, box_: u32) -> CGBox;
         fn CGContextTranslateCTM(ctx: sys::CGContextRef, tx: f64, ty: f64);
         fn CGContextScaleCTM(ctx: sys::CGContextRef, sx: f64, sy: f64);
@@ -1486,7 +1487,15 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
     }
     let total = unsafe { CGPDFDocumentGetNumberOfPages(doc) };
     let page = unsafe { CGPDFDocumentGetPage(doc, 1) };
-    unsafe { CGPDFDocumentRelease(doc) }; // 页面已被单独 retain，可立即释放文档
+    // ⚠️ 必须先显式 retain 住 page，再释放文档：CGPDFDocumentGetPage **不保证**给
+    //    调用方 +1（page 所有权可能仍归文档）。若直接释放文档，page 会随之释放，
+    //    后续 CGPDFPageGetBoxRect / CGContextDrawPDFPage 即 use-after-free
+    //    → EXC_BAD_ACCESS 闪退（这正是「导入即闪退」的头号嫌疑）。
+    //    显式 Retain + 末尾一次 Release：在 +0/+1 两种约定下都不会越放，最稳。
+    if !page.is_null() {
+        unsafe { CGPDFPageRetain(page) };
+    }
+    unsafe { CGPDFDocumentRelease(doc) };
     if page.is_null() {
         return Err("PDF 第一页不存在".to_string());
     }
@@ -1514,11 +1523,16 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
         }
     };
     let scale = dim_scale.min(area_scale);
-    let w = (nat_w * scale).max(1.0) as usize;
-    let h = (nat_h * scale).max(1.0) as usize;
+    // MediaBox 宽高是浮点数：一律 ceil() 向上取整，绝不截断——截断会让画布比
+    // 实际内容窄 1px，行尾像素写到缓冲区外面去。
+    let w = (nat_w * scale).max(1.0).ceil() as usize;
+    let h = (nat_h * scale).max(1.0).ceil() as usize;
 
     let space = CGColorSpace::create_device_rgb();
-    let bpr = 4 * w;
+    // 行距严格按 16 字节对齐（CoreGraphics 对位图行距有对齐要求）。若给非对齐值，
+    // CG 会自行放大行距，与我们的换算不一致 → 极易越界。这里主动补齐，再在
+    // 读取时用系统真实值（bytes_per_row）二次校验。
+    let bpr = ((4 * w + 15) / 16) * 16;
     // ② 空指针处理：直接用 CGBitmapContextCreate 并判空，绕开 create_bitmap_context
     //    内部的 assert（其遇分配失败会直接 panic）。
     let raw = unsafe {
@@ -1549,13 +1563,32 @@ fn rasterize_source(path: &Path) -> Result<Rasterized, String> {
         CGPDFPageRelease(page);
     }
 
-    // CoreGraphics 位图内存序为 BGRA，转成 img / PNG 需要的 RGBA；并按实际
-    // bytes_per_row 去填充（CG 可能按 16 字节对齐放大行距）。
+    // CoreGraphics 位图内存序为 BGRA，转成 img / PNG 需要的 RGBA。
+    // ⚠️ 绝不直接下标切片：行距用系统返回的真实值（CGBitmapContextGetBytesPerRow，
+    //    CG 可能按 16 字节对齐放大），区间一律 .get() 取；一旦越界优雅报错返回，
+    //    绝不 panic / 越界写。
     let bpr_actual = ctx.bytes_per_row();
+    let row_bytes = w * 4;
+    if bpr_actual < row_bytes {
+        return Err(format!(
+            "位图行距异常（系统 bytes_per_row={} < 宽×4={}），放弃转换",
+            bpr_actual, row_bytes
+        ));
+    }
     let data = ctx.data();
     let mut rgba = Vec::with_capacity(w * h * 4);
     for row in 0..h {
-        let src = &data[row * bpr_actual..row * bpr_actual + w * 4];
+        let start = row * bpr_actual;
+        let end = start + row_bytes;
+        let Some(src) = data.get(start..end) else {
+            return Err(format!(
+                "位图数据越界（第 {} 行，区间 {}..{}，缓冲区长度 {}）",
+                row,
+                start,
+                end,
+                data.len()
+            ));
+        };
         for px in src.chunks_exact(4) {
             rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]); // BGRA → RGBA
         }
