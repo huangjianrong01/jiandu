@@ -402,6 +402,16 @@ impl Library {
     /// 操作（导入 / 删书 / 翻页写进度）时自然发生——绝不擅自动用户的存档。
     /// 沙盒下容器里根本没有 `~/.jiandu`，读不到就直接返回，也不多要权限。
     fn absorb_legacy_index(&mut self) {
+        // 显式指定了 `JIANDU_HOME`（测试 / 开发态隔离、多档案）就**不并旧索引**：
+        // 调用方已经明确说了「我的书架在别处」，再把真实 `~/.jiandu` 并进来，
+        // 等于把用户存档偷偷灌进临时档案（测试里表现为「空书架不空」，本机
+        // 实测会凭空多出 1 本《道德经》→ 4 条 library/types 测试全红）。
+        if std::env::var("JIANDU_HOME")
+            .map(|p| !p.is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
         let legacy = match std::env::var("HOME") {
             Ok(h) => PathBuf::from(h).join(".jiandu").join("library.json"),
             Err(_) => return,
