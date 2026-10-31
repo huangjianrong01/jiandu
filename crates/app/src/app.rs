@@ -2656,6 +2656,8 @@ impl Root {
         // 开写那一下的 mouseup 会重新命中正文，别让它「点别处自动保存」
         // 把刚开的小框立刻关掉（与浮层笔记框同一个坑）。
         self.note_suppress_commit = true;
+        // IME 万无一失：清掉上一次未提交的中文组字区间（见 start_note_edit_at）。
+        self.note_marked = None;
         self.popup = None;
         self.notice = "眉批：⏎ 存 · Esc 弃".to_string();
     }
@@ -5930,6 +5932,9 @@ fn anki_push_card(
         self.note_editing = true;
         self.note_edit_note = None; // 页眉批注
         self.note_inject_key = None;
+        // IME 万无一失：清掉上一次未提交的中文组字区间，避免输入法误判选区
+        // （上次半途取消 / 失焦残留的标记区间会让新一次组字叠字）。
+        self.note_marked = None;
         self.note_suppress_commit = true; // 忽略「打开这一下」点击的自动提交
         self.popup = None;
     }
@@ -5951,6 +5956,8 @@ fn anki_push_card(
         self.note_editing = true;
         self.note_edit_note = None;
         self.note_inject_key = Some(key);
+        // IME 万无一失：清掉上一次未提交的中文组字区间（见 start_note_edit_at）。
+        self.note_marked = None;
         self.note_suppress_commit = true;
         self.popup = None;
         self.note_zoom = None;
@@ -5994,6 +6001,8 @@ fn anki_push_card(
         self.note_editing = true;
         self.note_edit_note = Some(key);
         self.note_inject_key = None;
+        // IME 万无一失：清掉上一次未提交的中文组字区间（见 start_note_edit_at）。
+        self.note_marked = None;
         self.note_suppress_commit = true;
         self.popup = None;
         self.note_zoom = None;
@@ -6266,6 +6275,8 @@ fn anki_push_card(
         self.note_draft.clear();
         self.note_cursor = 0;
         self.note_pos = None;
+        // 同步清掉中文组字区间，避免残留标记区间影响下一次编辑。
+        self.note_marked = None;
     }
 
     /// 编辑栏键入：可打印字符插入到光标处。

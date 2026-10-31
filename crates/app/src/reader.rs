@@ -7070,10 +7070,10 @@ impl Root {
         // 逐字母横排的 div。
         if let Some(py) = rare_py.as_deref() {
             let rl = crate::ruby::layout(py, fs, cell_w, cell_h);
-            // v1.9.11：拼音颜色恢复为朱砂红（#8C2B22），与批注同源但独立；
-            // 透明 0.8（ruby_glyph 内），退化路径用等价 `rgba(0x8C2B22CC)`。
+            // 回滚到「原来」：拼音颜色重新与批注同源（`palette.note`，朱砂红），
+            // 不再拆成独立灰墨；透明度保留 0.8（ruby_glyph 内）的半透宣纸感，
             // 几何由 `ruby::layout` 硬封顶到字格右缘，绝不越界 / 压句读 / 出界栏。
-            let ruby_ink = 0x8C2B22u32;
+            let ruby_ink = self.palette.note(t);
             if let Some(im) = crate::ruby_glyph::ruby_image(py, rl.fs, ruby_ink) {
                 cell = cell.child(
                     div()
@@ -7106,7 +7106,7 @@ impl Root {
                             .items_center()
                             .justify_center()
                             .text_size(px(rl.fs))
-                            .text_color(rgba(0x8C2B22CC))
+                            .text_color(rgba((ruby_ink << 8) | 0xCC))
                             .child(SharedString::from(ch.to_string())),
                     );
                 }
@@ -9255,12 +9255,17 @@ impl Root {
                     .hover(move |s| s.text_color(rgb(sheet_zhu(t)))),
             );
         };
+        // v1.9.12：统一为**单级**工具栏——七枚动作平铺一排、一步到位（不再有
+        // 「更多」二级菜单）；红框宽由 `items.len()` 反算，按钮增减不露字。
+        // （「连读」已并入「听」；存卡走选区长按，不占这排位。）
         push_btn("查典", &mut items);
         push_btn("听", &mut items);
         // 「连读」已并入「听」：无选区读整叶、有选区读选区，不再单列（见听钮）。
         push_btn("朱批", &mut items);
         push_btn("问笺", &mut items);
-        push_btn("更多", &mut items);
+        push_btn("夹注", &mut items);
+        push_btn("眉批", &mut items);
+        push_btn("拓印", &mut items);
 
         // 外框宽高**由实际按钮数反算**（GPUI 无 fit-content，这是它的等价物）：
         // 按钮增减都不露字，红框永远死死包裹所有钮。
@@ -9293,7 +9298,7 @@ impl Root {
             .map(|n| n.text.clone())
             .unwrap_or_default();
 
-        // ── 逐枚绑上动作（与上面 push 的次序一一对应：查典 / 听 / 朱批 / 问笺 / 更多）──
+        // ── 逐枚绑上动作（与上面 push 的次序一一对应：查典 / 听 / 朱批 / 问笺 / 夹注 / 眉批 / 拓印）──
         let mut items = items.into_iter();
         let b_query = items
             .next()
@@ -9377,16 +9382,44 @@ impl Root {
             }),
         );
         // 更多：切换二级菜单（存卡 / 眉批 / 夹注 / 拓印），**不收起**主工具条。
-        let b_more = items.next().unwrap().on_mouse_down(
+        // 夹注：在宿主字上新建（或改写）一条用户自加夹注——单级工具栏里它和
+        // 朱批平起平坐，点一下直接开编辑框，不再钻两级菜单（v1.9.12 去「更多」）。
+        let b_gloss = items.next().unwrap().on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.more_open = !this.more_open;
+                this.start_note_inject(key, &existing_note, Some(hit_xy));
+                this.popup = None;
+                cx.notify();
+            }),
+        );
+        // 眉批：在天头写一条竖排小字（与夹注同走 `note_editing` 编辑框）。
+        let b_margin = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.start_margin_note();
+                this.popup = None;
+                cx.notify();
+            }),
+        );
+        // 拓印：把本页正文复制到剪贴板（没选区就框选本字所在整页）。
+        let b_copy = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                if !this.has_selection() {
+                    this.sel_anchor = Some(key);
+                    this.sel_focus = Some(key);
+                }
+                this.copy_page_text(cx);
+                this.clear_selection();
+                this.popup = None;
                 cx.notify();
             }),
         );
 
-        // ── 面板本体：横排圆角面板，钮内文字竖排 ──────────────────────
+        // ── 面板本体：横排圆角面板，钮内文字竖排（单级、七枚平铺）────────
         // 极简克制 + 半透明毛玻璃感：底调透（≈0.84），不抢正文视线。
         let paper_washi = rgba((t.paper() << 8) | 0xD8);
         // 钮与钮之间**只用留白**分档（不画线、不加框）：一枚钮就是面板上的
@@ -9398,116 +9431,9 @@ impl Root {
             .justify_center()
             .gap(px(gap))
             .child(b_query);
-        for b in [b_ting, b_note, b_ask, b_more] {
+        for b in [b_ting, b_note, b_ask, b_gloss, b_margin, b_copy] {
             row = row.child(b);
         }
-
-        // ── 二级菜单（更多）：存卡 / 眉批 / 夹注 / 拓印，平时藏起不挡字 ──
-        let m_card = vertical_text("存卡", fs, kai.clone())
-            .w(px(item_w))
-            .text_color(rgb(t.ink()))
-            .cursor_pointer()
-            .hover(move |s| s.text_color(rgb(sheet_zhu(t))))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.save_selection_card(cx);
-                    this.more_open = false;
-                    this.popup = None;
-                    cx.notify();
-                }),
-            );
-        let m_margin = vertical_text("眉批", fs, kai.clone())
-            .w(px(item_w))
-            .text_color(rgb(t.ink()))
-            .cursor_pointer()
-            .hover(move |s| s.text_color(rgb(sheet_zhu(t))))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.start_margin_note();
-                    this.more_open = false;
-                    this.popup = None;
-                    cx.notify();
-                }),
-            );
-        let m_gloss = vertical_text("夹注", fs, kai.clone())
-            .w(px(item_w))
-            .text_color(rgb(t.ink()))
-            .cursor_pointer()
-            .hover(move |s| s.text_color(rgb(sheet_zhu(t))))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.start_note_inject(key, &existing_note, Some(hit_xy));
-                    this.more_open = false;
-                    this.popup = None;
-                    cx.notify();
-                }),
-            );
-        let m_copy = vertical_text("拓印", fs, kai.clone())
-            .w(px(item_w))
-            .text_color(rgb(t.ink()))
-            .cursor_pointer()
-            .hover(move |s| s.text_color(rgb(sheet_zhu(t))))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    if !this.has_selection() {
-                        this.sel_anchor = Some(key);
-                        this.sel_focus = Some(key);
-                    }
-                    this.copy_page_text(cx);
-                    this.more_open = false;
-                    this.clear_selection();
-                    this.popup = None;
-                    cx.notify();
-                }),
-            );
-        let mut more_row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_center()
-            .gap(px(gap));
-        for b in [m_card, m_margin, m_gloss, m_copy] {
-            more_row = more_row.child(b);
-        }
-        let sub_w = pad * 2.0 + item_w * 4.0 + gap * 3.0 + 2.0;
-        // 二级菜单位于主面板下方；若下方出界则翻到上方，绝不压住选中行。
-        let sub_top_rel = if place.top + h + gap + h <= vh {
-            h + gap
-        } else {
-            -(h + gap)
-        };
-        let more_panel = div()
-            .absolute()
-            .left(px(0.0))
-            .top(px(sub_top_rel))
-            .w(px(sub_w))
-            .h(px(h))
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_center()
-            .bg(paper_washi)
-            .border_1()
-            .border_color(rgb(sheet_zhu(t)))
-            .rounded(px(7.0))
-            .shadow_sm()
-            .p(px(pad))
-            .child(more_row)
-            // 二级面板内也不冒泡：点存卡 / 眉批等不触发根容器收起。
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_this, _, _, cx| {
-                    cx.stop_propagation();
-                }),
-            );
 
         div()
             .absolute()
@@ -9526,7 +9452,6 @@ impl Root {
             .shadow_sm()
             .p(px(pad))
             .child(row)
-            .child(if self.more_open { more_panel } else { div() })
             // 面板内不冒泡：否则一点钮，根容器的「点别处收起」就把面板收了。
             .on_mouse_down(
                 MouseButton::Left,
