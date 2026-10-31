@@ -10,19 +10,21 @@
 //!   ④ 竖排预览（下一步）会走「离屏栅格化 + `img` 贴图」，不在每帧重绘朱砂点。
 //!
 //! 本文件是 MVP 的** UI 骨架**：AppMode 切换 + 40/60 分屏 + 可编辑/可选择的
-//! 原生编辑器。原图导入与「选中联动高亮」的精确几何映射、竖排预览栅格化在
-//! 后续提交中落地。
+//! 原生编辑器 + 左图右文联动（骨架阶段：左图 mock 行带 + 右文点击段 → 左图
+//! `ScrollHandle` 滚动到 N*BAND_H 并叠加半透明高亮矩形）。原图预栅格化位图
+//! 真实接入（PDF 文本层 / OCR 坐标匹配）、竖排预览栅格化在后续提交中落地。
 
 use crate::ime::{
     char_to_utf16, effective_replace_range, utf16_len, utf16_slice, utf16_to_char,
 };
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, rgba, Bounds, Context, EntityInputHandler, EventEmitter, FocusHandle,
+    div, img, px, rgb, rgba, Bounds, Context, EntityInputHandler, EventEmitter, FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     Pixels, Point, ParentElement, Render, ScrollHandle, SharedString, Styled, Window,
 };
 use std::ops::Range;
+use std::path::PathBuf;
 
 /// Pixels → f32：gpui 的 `Pixels` 字段在 jiandu crate 不可见，用「除 1px」取数值。
 fn px_f32(p: Pixels) -> f32 {
@@ -49,6 +51,15 @@ const FONT_SIZE: f32 = 17.0;
 const LINE_H: f32 = FONT_SIZE * 1.7;
 /// 近似字宽：原图转录以 CJK 为主，按字号取值做点击定位（精确映射在下一步替换）。
 const CHAR_W: f32 = FONT_SIZE * 0.95;
+/// 左图 mock 行高（骨架阶段：右文第 N 段 → 左图 Y = N * BAND_H）。
+const BAND_H: f32 = 100.0;
+
+/// 左侧高亮矩形（内容坐标系，随原图一起滚动）。
+#[derive(Clone, Copy)]
+struct Highlight {
+    y: f32,
+    h: f32,
+}
 
 /// 笺校工作台视图：拥有自己的编辑缓冲、焦点、滚动柄，**不引用 Reader 任何字段**。
 pub struct CollationWorkspace {
@@ -64,12 +75,22 @@ pub struct CollationWorkspace {
     focus: FocusHandle,
     /// 编辑器滚动柄。
     scroll: ScrollHandle,
+    /// 左侧原图滚动柄（用于右文点击联动滚动）。
+    left_scroll: ScrollHandle,
     /// 鼠标拖拽选择中的锚点（字符下标）。
     anchor: usize,
     /// 是否正在拖拽选择。
     dragging: bool,
     /// 竖排预览开关（骨架阶段只切占位浮层；真实栅格化在下一步）。
     show_preview: bool,
+    /// 预栅格化的原图位图（PDF 页 / PNG）；None 时左图用 mock 行带占位。
+    image_path: Option<PathBuf>,
+    /// 左图高亮矩形（内容坐标，随原图滚动）。None = 无高亮。
+    highlight: Option<Highlight>,
+    /// 当前联动的右文段索引（0-based）。None = 尚未联动。
+    active_para_idx: Option<usize>,
+    /// 当前联动段提取出的纯文本（为后续真实坐标匹配预留）。
+    active_para_text: String,
 }
 
 impl CollationWorkspace {
@@ -83,9 +104,14 @@ impl CollationWorkspace {
             marked: None,
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            left_scroll: ScrollHandle::new(),
             anchor: 0,
             dragging: false,
             show_preview: false,
+            image_path: None,
+            highlight: None,
+            active_para_idx: None,
+            active_para_text: String::new(),
         }
     }
 
@@ -289,8 +315,13 @@ impl CollationWorkspace {
         self.anchor = self.cursor;
         self.dragging = true;
         window.focus(&self.focus);
+        // 落光标即联动：右文点击第 N 段 → 左图滚动 + 高亮。
+        if let Some(li) = self.line_of(self.cursor) {
+            self.link_to_paragraph(li, cx);
+        } else {
+            cx.notify();
+        }
         cx.stop_propagation();
-        cx.notify();
     }
 
     fn extend_selection_from_drag(
@@ -354,34 +385,123 @@ impl CollationWorkspace {
             }, cx))
     }
 
-    /// 左侧 40%：原图区（骨架阶段为占位；下一步接入栅格化位图）。
-    fn render_left(&self, vw: f32) -> gpui::Div {
+    /// 左侧 40%：原图区。滚动容器挂 `left_scroll`，内容随窗口伸缩；
+    /// 内容（栅格化位图或 mock 行带）内部用 `relative()` 承载绝对定位的高亮叠加层。
+    fn render_left(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .w(px(vw * 0.4))
             .h_full()
+            .relative()
+            .bg(rgb(0xddd2b4))
+            .child(
+                div()
+                    .id(SharedString::from("collation-left-scroll"))
+                    .w_full()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.left_scroll)
+                    .child(self.render_left_content()),
+            )
+            .child(
+                self.button("导入原图", |c, _, _, cx| c.open_image_picker(cx), cx)
+                    .absolute()
+                    .top(px(8.0))
+                    .right(px(8.0)),
+            )
+    }
+
+    /// 左图内容：已载入位图则贴 `img`，否则画 mock 行带（每段一行，便于演示联动）。
+    /// 高亮矩形作为绝对定位子节点叠加在 `page` 上，随内容一起滚动。
+    fn render_left_content(&self) -> gpui::Div {
+        let h = self.page_height();
+        let mut page = div().relative().w_full().h(px(h)).bg(rgb(0xf1e8cf));
+        if let Some(p) = &self.image_path {
+            page = page.child(img(p.clone()).w_full().h(px(h)));
+        } else {
+            let n = self.line_ranges().len().max(1);
+            for i in 0..n {
+                page = page.child(self.render_band(i));
+            }
+        }
+        if let Some(hl) = &self.highlight {
+            page = page.child(
+                div()
+                    .absolute()
+                    .top(px(hl.y))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .h(px(hl.h))
+                    .bg(rgba(0x8c2b2244))
+                    .border_1()
+                    .border_color(rgba(0x8c2b22cc)),
+            );
+        }
+        page
+    }
+
+    /// mock 行带：左图第 i 行，标注对应右文第 i 段（演示用）。
+    fn render_band(&self, i: usize) -> gpui::Div {
+        let bg = if i % 2 == 0 { rgb(0xe9dfc4) } else { rgb(0xf1e8cf) };
+        div()
+            .h(px(BAND_H))
+            .w_full()
             .flex()
-            .flex_col()
             .items_center()
-            .justify_center()
-            .bg(rgb(0xe9dfc4))
-            .border_1()
-            .border_color(rgba(0x8c2b2266))
-            .child(
-                div()
-                    .child(SharedString::from("原图（PDF / PNG）"))
-                    .text_color(rgba(0x2b262080)),
-            )
-            .child(
-                div()
-                    .mt(px(12.0))
-                    .px(px(14.0))
-                    .py(px(6.0))
-                    .bg(rgba(0x8c2b221f))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .text_color(rgb(0x8c2b22))
-                    .child(SharedString::from("导入原图")),
-            )
+            .px(px(PAD))
+            .bg(bg)
+            .child(SharedString::from(format!(
+                "左图第 {} 行 · 对应右文第 {} 段",
+                i + 1,
+                i + 1
+            )))
+    }
+
+    /// 左图内容高度（骨架 mock = 段数 * BAND_H，至少 12 行保证可滚动）。
+    fn page_height(&self) -> f32 {
+        (self.line_ranges().len().max(12)) as f32 * BAND_H
+    }
+
+    /// 导入原图（PDF/PNG）：下一步接入 rfd 文件选择 + 预栅格化位图；
+    /// 这里仅占位，避免死按钮。
+    fn open_image_picker(&mut self, cx: &mut Context<Self>) {
+        // TODO(collation): 用 rfd 打开文件 → 预栅格化 PDF 页为 RenderImage → 存入 image_path。
+        cx.notify();
+    }
+
+    /// 右文某段 → 左图联动：记录段文本 + 左侧滚动到对应 Y + 高亮。
+    ///
+    /// 骨架阶段用 mock 映射：右文第 `para_idx` 段 → 左图 Y = para_idx * BAND_H。
+    /// 真实坐标（PDF 文本层 / OCR）在后续提交替换此函数体。
+    fn link_to_paragraph(&mut self, para_idx: usize, cx: &mut Context<Self>) {
+        let y = para_idx as f32 * BAND_H;
+        self.highlight = Some(Highlight { y, h: BAND_H });
+        self.active_para_idx = Some(para_idx);
+        // 提取该段纯文本（为后续真实坐标匹配预留数据）。
+        if let Some(&(s, e)) = self.line_ranges().get(para_idx) {
+            self.active_para_text = self.text.chars().skip(s).take(e.saturating_sub(s)).collect();
+        }
+        // 驱动左侧 ScrollHandle 滚动（向下偏移取负）。
+        self.left_scroll.set_offset(Point::new(px(0.0), px(-y)));
+        cx.notify();
+    }
+
+    /// 右侧联动状态条：显示当前已联动的段与左图目标 Y。
+    fn render_link_status(&self) -> gpui::Div {
+        match self.active_para_idx {
+            Some(idx) => div()
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .px(px(PAD))
+                .bg(rgba(0x8c2b2214))
+                .text_color(rgb(0x8c2b22))
+                .child(SharedString::from(format!(
+                    "已联动：右文第 {} 段 → 左侧 Y={:.0}px 高亮",
+                    idx + 1,
+                    idx as f32 * BAND_H
+                ))),
+            None => div().h(px(0.0)),
+        }
     }
 
     /// 右侧 60%：竖排预览工具条 + 原生编辑器。
@@ -407,6 +527,7 @@ impl CollationWorkspace {
                         cx.notify();
                     }, cx)),
             )
+            .child(self.render_link_status())
             .child(editor)
     }
 
@@ -579,7 +700,7 @@ impl Render for CollationWorkspace {
                     .flex()
                     .flex_row()
                     .flex_1()
-                    .child(self.render_left(vw))
+                    .child(self.render_left(vw, cx))
                     .child(self.render_right(vw, cx)),
             );
         if self.show_preview {
