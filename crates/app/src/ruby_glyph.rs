@@ -27,8 +27,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 const SS: f64 = 3.0;
 
 /// 注音字体候选：拉丁字母 + 声调字符（ā á ǎ à ē ě ū ǚ …）必须齐全。
-/// PingFang 全覆盖；Helvetica 老系统兜底；都缺字形就**不画**（退回逐字母）。
-const FONTS: [&str; 3] = ["PingFangSC", "Helvetica", "Menlo"];
+/// **宋体优先**（Songti SC / STSong），古风铅字感；Helvetica 老系统兜底；
+/// 都缺字形就**不画**（退回逐字母）。
+const FONTS: [&str; 3] = ["Songti SC", "STSong", "Helvetica"];
 
 /// 位图格式：32 位**大端** + **预乘** alpha 在最后。
 ///
@@ -174,7 +175,8 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
     ctx.translate(pad, pad + desc);
 
     let (r, g, b) = rgb_of(color);
-    ctx.set_rgb_fill_color(r, g, b, 1.0);
+    // 注音墨色半透明（0.7）：透出一点纸色，灰墨轻盈不抢正文（v1.9.10）。
+    ctx.set_rgb_fill_color(r, g, b, 0.7);
     let mut x = 0.0f64;
     for i in 0..n {
         // `draw_glyphs` 按值取 context：`clone()` 是 CGContextRetain，随调用
@@ -214,14 +216,16 @@ mod tests {
 
     /// 注音位图必须是**横长条**：宽（串长）明显大于高（字母高）。
     /// 这条同时钉死两件事：位图真的画出来了，且是横排——若哪天又改回
-    /// 「转 90° 竖条」，宽高比会立刻反过来。
+    /// 「转 90° 竖条」，宽高比会立刻反过来（w<h）。阈值取 1.25：宋体（Songti
+    /// SC）的拉丁字身比 PingFang 略高，1.53× 已是稳稳的横条，留足余量仍能
+    /// 一眼识破竖条（竖条 w/h<1）。
     #[test]
     fn ruby_bitmap_is_wider_than_tall() {
         let im = ruby_image("měng", 12.0, 0x8C2B22).expect("注音位图应当渲染成功");
         let s = im.size(0);
         let (w, h) = (s.width.0 as f32, s.height.0 as f32);
         assert!(
-            w > h * 1.6,
+            w > h * 1.25,
             "四个字母横排后应是横长条，实得 {w:.1}×{h:.1}"
         );
     }
@@ -252,32 +256,30 @@ mod tests {
         );
     }
 
-    /// 通道序钉死：给纯红，缓冲里必须是 `B=0,G=0,R=255`（gpui 存 BGRA）。
+    /// 通道序钉死：给纯红，缓冲里字形内部必须是 `B=0,G=0,R=255`（gpui 存 BGRA）。
     /// 这条防的是 `BITMAP_INFO` 写错导致 CG 退回主机序、朱砂注音变蓝。
+    /// 注意：自 v1.9.10 起填充 alpha 降为 0.7，字内像素 `a≈178`（不再等于 255），
+    /// 故这里取「最不透明的字内像素」来验通道序，而非强求 a==255。
     #[cfg(target_os = "macos")]
     #[test]
     fn ruby_ink_keeps_its_channel_order() {
         let (bw, bh, buf) = raster("měng", 20.0, 0xFF0000).expect("位图");
-        // 找一颗完全不透明的像素（字形内部），抗锯齿边缘不算。
-        let mut hit: Option<(u8, u8, u8, u8)> = None;
+        // 找字内最不透明的像素（中心区，抗锯齿边缘不算），验证通道序。
+        let mut best: Option<(u8, u8, u8, u8)> = None;
         for y in 0..bh {
             for x in 0..bw {
                 let i = (y * bw + x) * 4;
                 let (b, g, r, a) = (buf[i], buf[i + 1], buf[i + 2], buf[i + 3]);
-                if a == 255 {
-                    hit = Some((b, g, r, a));
-                    break;
+                if a > 128 && (best.is_none() || a > best.unwrap().3) {
+                    best = Some((b, g, r, a));
                 }
             }
-            if hit.is_some() {
-                break;
-            }
         }
-        let (b, g, r, a) = hit.expect("字形内部应至少有一颗不透明像素");
+        let (b, g, r, a) = best.expect("字形内部应至少有一颗像素");
         assert_eq!(
-            (b, g, r, a),
-            (0, 0, 255, 255),
-            "纯红注音画成了 B={b} G={g} R={r} —— 位图通道序反了"
+            (b, g, r),
+            (0, 0, 255),
+            "纯红注音画成了 B={b} G={g} R={r} A={a} —— 位图通道序反了"
         );
     }
 

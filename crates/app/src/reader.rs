@@ -7061,8 +7061,12 @@ impl Root {
         // 逐字母横排的 div。
         if let Some(py) = rare_py.as_deref() {
             let rl = crate::ruby::layout(py, fs, cell_w, cell_h);
-            let note_ink = self.palette.note(t);
-            if let Some(im) = crate::ruby_glyph::ruby_image(py, rl.fs, note_ink) {
+            // v1.9.10：拼音颜色与批注颜色**拆开**。拼音用极淡灰墨（#888888），
+            // 轻盈不抢正文；主路径 alpha 在 `ruby_glyph` 内已降到 0.7，退
+            // 化路径用等价的 `rgba(0x888888B3)` 对齐同一观感。批注（眉批/夹注）
+            // 仍走 `palette.note(t)`，保持原有朱砂/墨色。
+            let ruby_ink = 0x888888u32;
+            if let Some(im) = crate::ruby_glyph::ruby_image(py, rl.fs, ruby_ink) {
                 cell = cell.child(
                     div()
                         .absolute()
@@ -7094,7 +7098,7 @@ impl Root {
                             .items_center()
                             .justify_center()
                             .text_size(px(rl.fs))
-                            .text_color(rgb(note_ink))
+                            .text_color(rgba(0x888888B3))
                             .child(SharedString::from(ch.to_string())),
                     );
                 }
@@ -10486,6 +10490,8 @@ impl Root {
     fn render_share_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let vw = self.viewport_w;
         let vh = self.viewport_h;
+        // v1.9.10：弹窗整体古风化——文字强制宋体（与正文同源）。
+        let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
         let columns = crate::share::norm_columns(self.grid.columns);
         // v1.64.0：高度不再有滑杆，一档定值（见 `share::card_h_for`）。
         let card_h = crate::share::card_h_for(vh);
@@ -10503,16 +10509,15 @@ impl Root {
             note: &note,
             show_sign: self.share_show_title || self.share_show_author || self.share_show_chapter,
             show_date: self.share_show_date,
-            show_notes: self.share_show_notes,
+            // v1.9.10：展示朱批**固定开启**（移除开关）；详见下方 axes 删除说明。
+            show_notes: true,
             dir: self.share_dir,
             bg: crate::share::ShareBg::ALL
                 .get(self.share_bg)
                 .copied()
                 .unwrap_or(crate::share::ShareBg::Xuan),
-            frame: crate::share::ShareFrame::ALL
-                .get(self.share_frame)
-                .copied()
-                .unwrap_or(crate::share::ShareFrame::Red),
+            // v1.9.10：红线框开关已移除（剔除废功能），导出卡统一「无边框」。
+            frame: crate::share::ShareFrame::None,
             seal: crate::share::ShareSeal::ALL
                 .get(self.share_seal)
                 .copied()
@@ -10552,13 +10557,15 @@ impl Root {
             .child(
                 div()
                     .text_size(px(20.0))
-                    .text_color(rgb(0xF2EAD6))
+                    .font_family(song.clone())
+                    .text_color(rgb(0x33312C))
                     .child(SharedString::from("保 存 图 片")),
             )
             .child(
                 div()
                     .text_size(px(10.5))
-                    .text_color(rgba(0xB9AE9CCC))
+                    .font_family(song.clone())
+                    .text_color(rgba(0x33312C99))
                     .child(SharedString::from("折简相寄，共赏千年墨香")),
             );
 
@@ -10576,11 +10583,12 @@ impl Root {
             .justify_center()
             .rounded(px(14.0))
             .cursor_pointer()
-            .hover(|s| s.bg(rgba(0xF2EAD614)))
+            .hover(|s| s.bg(rgba(0x33312C14)))
             .child(
                 div()
                     .text_size(px(15.0))
-                    .text_color(rgba(0xC9BEABD9))
+                    .font_family(song.clone())
+                    .text_color(rgba(0x33312CB0))
                     .child(SharedString::from("X")),
             )
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
@@ -10599,7 +10607,7 @@ impl Root {
             .relative()
             .bg(rgb(0x0A0908))
             .border_1()
-            .border_color(rgba(0xF2EAD61F))
+            .border_color(rgba(0x33312C1F))
             .rounded(px(26.0))
             .child(
                 div()
@@ -10632,7 +10640,8 @@ impl Root {
             .child(
                 div()
                     .text_size(px(10.0))
-                    .text_color(rgba(0x8A8378CC))
+                    .font_family(song.clone())
+                    .text_color(rgba(0x33312C99))
                     .child(SharedString::from(cap)),
             );
 
@@ -10650,9 +10659,10 @@ impl Root {
                 .rounded(px(12.0))
                 .cursor_pointer()
                 .text_size(px(11.5))
-                .text_color(if on { rgb(0xF2EAD6) } else { rgba(0x8A8378B0) });
+                .font_family(song.clone())
+                .text_color(if on { rgb(0x33312C) } else { rgba(0x33312CB0) });
             if on {
-                d = d.bg(rgba(0xF2EAD61F));
+                d = d.bg(rgba(0xC3272D14));
             }
             d.child(SharedString::from(tab.label())).on_mouse_down(
                 MouseButton::Left,
@@ -10691,11 +10701,12 @@ impl Root {
                         .rounded(px(11.0))
                         .cursor_pointer()
                         .text_size(px(10.5))
-                        .text_color(if on { rgb(0xF2EAD6E6) } else { rgba(0x8A8378A6) });
+                        .font_family(song.clone())
+                        .text_color(if on { rgb(0x33312CE6) } else { rgba(0x33312CA6) });
                     d = if on {
-                        d.bg(rgba(0xF2EAD61A)).border_1().border_color(rgba(0xF2EAD652))
+                        d.bg(rgba(0x33312C12)).border_1().border_color(rgba(0xC3272D66))
                     } else {
-                        d.border_1().border_color(rgba(0xF2EAD62E))
+                        d.border_1().border_color(rgba(0x33312C2E))
                     };
                     d.child(SharedString::from(label)).on_mouse_down(
                         MouseButton::Left,
@@ -10733,7 +10744,7 @@ impl Root {
                 // ② 方向图标：竖排右起（三竖）/ 横排居中（三横）。
                 let dir_icon = |dir: crate::share::ShareDir| -> Stateful<Div> {
                     let on = self.share_dir == dir;
-                    let fg = if on { 0xF2EAD6u32 } else { 0x6E6659u32 };
+                    let fg = if on { 0x33312Cu32 } else { 0x9A9286u32 };
                     let icon = if dir.is_vertical() {
                         div()
                             .flex()
@@ -10762,7 +10773,7 @@ impl Root {
                         .justify_center()
                         .rounded(px(14.0))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgba(0xF2EAD614)))
+                        .hover(|s| s.bg(rgba(0x33312C14)))
                         .child(icon)
                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -10772,10 +10783,9 @@ impl Root {
                         }))
                 };
 
-                // ③ v1.57.0 三轴控件：**背景三档** / **版框三档** / **展示朱批**开关。
-                //
-                // 旧制是「四套模板」捆绑（换底色连带换框），现在三轴各自成轴。
-                // 背景用圆点（圆面即该底色，选中加朱砂环），版框与朱批用 chip。
+                // ③ 背景三档（纸色）：圆面即该底色，选中加朱砂环。
+                // （v1.9.10：原「版框 / 展示朱批」两枚 chip 已移除——
+                //  红线框固定无边框、朱批固定开启，见下方说明。）
                 let mut bg_dots = div().flex().flex_row().items_center().gap(px(12.0));
                 for (i, b) in crate::share::ShareBg::ALL.iter().enumerate() {
                     let on = i == self.share_bg;
@@ -10785,7 +10795,7 @@ impl Root {
                         .rounded(px(9.0))
                         .bg(rgb(crate::share::palette(*b).bg))
                         .border_1()
-                        .border_color(rgba(0xFFFFFF59));
+                        .border_color(rgba(0x33312C3D));
                     let mut dot = div()
                         .id(SharedString::from(format!("share-bg-{i}")))
                         .w(px(26.0))
@@ -10798,7 +10808,7 @@ impl Root {
                     dot = if on {
                         dot.border_1().border_color(rgb(crate::share::CINNABAR))
                     } else {
-                        dot.border_1().border_color(rgba(0xF2EAD63D))
+                        dot.border_1().border_color(rgba(0x33312C3D))
                     };
                     bg_dots = bg_dots.child(dot.child(face).on_mouse_down(
                         MouseButton::Left,
@@ -10809,54 +10819,6 @@ impl Root {
                         }),
                     ));
                 }
-
-                // 版框 / 朱批：两枚 chip，点即切换。
-                let axis_chip = |label: &'static str, on: bool, act: u8| -> Stateful<Div> {
-                    let mut d = div()
-                        .id(SharedString::from(format!("share-axis-{act}")))
-                        .px(px(11.0))
-                        .h(px(22.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(11.0))
-                        .cursor_pointer()
-                        .text_size(px(10.5))
-                        .text_color(if on { rgb(0xF2EAD6E6) } else { rgba(0x8A8378A6) });
-                    d = if on {
-                        d.bg(rgba(0xF2EAD61A)).border_1().border_color(rgba(0xF2EAD652))
-                    } else {
-                        d.border_1().border_color(rgba(0xF2EAD62E))
-                    };
-                    d.child(SharedString::from(label)).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            match act {
-                                // 版框：在「红线框 → 黑线框 → 无边框」间循环。
-                                1 => {
-                                    let n = crate::share::ShareFrame::ALL.len();
-                                    this.share_frame = (this.share_frame + 1) % n;
-                                }
-                                // 展示朱批：把用户写的眉批 / 划线一起画进图里。
-                                _ => this.share_show_notes = !this.share_show_notes,
-                            }
-                            cx.notify();
-                        }),
-                    )
-                };
-                let frame_label = crate::share::ShareFrame::ALL
-                    .get(self.share_frame)
-                    .copied()
-                    .unwrap_or(crate::share::ShareFrame::Red)
-                    .label();
-                let axes = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(axis_chip(frame_label, true, 1))
-                    .child(axis_chip("展示朱批", self.share_show_notes, 2));
 
                 div()
                     .flex()
@@ -10881,7 +10843,6 @@ impl Root {
                             )
                             .child(bg_dots),
                     )
-                    .child(axes)
             }
             crate::share::ShareTab::Font => {
                 // 字体 chips：随阅读字体 / 齐伋 / 文津 / 梦源 / 玄冬楷 / 霞鹜文楷。
@@ -10904,11 +10865,12 @@ impl Root {
                         .rounded(px(12.0))
                         .cursor_pointer()
                         .text_size(px(11.0))
-                        .text_color(if on { rgb(0xF2EAD6E6) } else { rgba(0x8A8378A6) });
+                        .font_family(song.clone())
+                        .text_color(if on { rgb(0x33312CE6) } else { rgba(0x33312CA6) });
                     d = if on {
-                        d.bg(rgba(0xF2EAD61A)).border_1().border_color(rgba(0xF2EAD652))
+                        d.bg(rgba(0x33312C12)).border_1().border_color(rgba(0xC3272D66))
                     } else {
-                        d.border_1().border_color(rgba(0xF2EAD62E))
+                        d.border_1().border_color(rgba(0x33312C2E))
                     };
                     rows = rows.child(d.child(SharedString::from(*label)).on_mouse_down(
                         MouseButton::Left,
@@ -10934,6 +10896,8 @@ impl Root {
         //
         // 两者都走 `share_paint` 的**离屏渲染**（1080×1920），与预览同源、
         // 与屏幕无关——不再截屏。
+        // v1.9.10：极简按钮。主操作「保存到本地」= 圆角朱砂填充；次操作
+        // 「复制到剪贴板」= 白底 + 朱砂细边框幽灵钮（文字亦朱砂）。均用宋体。
         let act_pill = |label: &'static str, primary: bool| -> Stateful<Div> {
             let mut d = div()
                 .id(SharedString::from(format!("share-act-{label}")))
@@ -10944,13 +10908,15 @@ impl Root {
                 .justify_center()
                 .rounded(px(17.0))
                 .cursor_pointer()
-                .text_size(px(12.0));
+                .text_size(px(12.0))
+                .font_family(song.clone());
             d = if primary {
                 d.bg(rgb(crate::share::CINNABAR)).text_color(rgb(0xFFF8EC))
             } else {
-                d.border_1()
-                    .border_color(rgba(0xF2EAD659))
-                    .text_color(rgba(0xF2EAD6CC))
+                d.bg(rgb(0xF5F4EF))
+                    .border_1()
+                    .border_color(rgb(crate::share::CINNABAR))
+                    .text_color(rgb(crate::share::CINNABAR))
             };
             d.child(SharedString::from(label))
         };
@@ -10980,14 +10946,32 @@ impl Root {
             .child(btn_save)
             .child(btn_copy);
 
+        // v1.9.10：宣纸主面板（#F5F4EF + 淡阴影），浮在半透明遮罩之上。
+        let panel = div()
+            .absolute()
+            .top(px(12.0))
+            .left(px(12.0))
+            .w(px(vw - 24.0))
+            .h(px(vh - 24.0))
+            .bg(rgb(0xF5F4EF))
+            .rounded(px(20.0))
+            .shadow(vec![BoxShadow {
+                color: gpui::hsla(0.08, 0.25, 0.18, 0.22),
+                offset: gpui::point(px(0.0), px(6.0)),
+                blur_radius: px(22.0),
+                spread_radius: px(0.0),
+            }]);
+
         div()
             .absolute()
             .top(px(0.0))
             .left(px(0.0))
             .w(px(vw))
             .h(px(vh))
-            // 磨砂深底：GPUI 0.2.2 无 backdrop-filter，用高不透明度近黑压住背景。
-            .bg(rgba(0x0E0D0CF2))
+            // 毛玻璃近似：GPUI 0.2.2 无 backdrop-filter，故用半透明暖色遮罩——
+            // 背后正文可隐约透出（古风比真毛玻璃更耐看）。
+            .bg(rgba(0x14110EC2))
+            .child(panel)
             .child(title)
             .child(close)
             .child(phone)
