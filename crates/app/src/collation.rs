@@ -877,6 +877,12 @@ impl CollationWorkspace {
     }
 
     /// 渲染单行（含选区背景与光标）。
+    ///
+    /// ⚠️ 软折行：长文本（尤其无换行符的连续中文，如「天地玄黄……」）必须能
+    /// 在 60% 宽右栏内折行，否则会撑破右边缘被截断。做法：文本段用
+    /// `flex_1() + min_w(0)` 受行宽约束（破除 flex item 默认 min-width 撑开陷阱），
+    /// 再 `whitespace_normal()` 允许在字符间断行；行容器高度由固定 `h(LINE_H)`
+    /// 改为 `min_h`，折成多行后自然增高。
     fn render_line(&self, line: &str, line_start: usize) -> gpui::Div {
         let line_end = line_start + line.chars().count();
         let caret_here = self.cursor >= line_start && self.cursor <= line_end;
@@ -889,7 +895,21 @@ impl CollationWorkspace {
         let seg_end = line_end.min(e);
         let overlaps = sel_active && seg_end > seg_start;
 
-        let mut row = div().h(px(LINE_H)).flex().flex_row().items_center();
+        // 文本段：受行宽约束 + 软折行（含 CJK 字符间断行）。
+        let text_seg = |seg: String| -> gpui::Div {
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .whitespace_normal()
+                .child(SharedString::from(seg))
+        };
+
+        let mut row = div()
+            .min_h(px(LINE_H))
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center();
         if overlaps {
             let before: String = self
                 .text
@@ -898,7 +918,7 @@ impl CollationWorkspace {
                 .take(seg_start.saturating_sub(line_start))
                 .collect();
             if !before.is_empty() {
-                row = row.child(div().child(SharedString::from(before)));
+                row = row.child(text_seg(before));
             }
             if self.cursor == seg_start {
                 row = row.child(self.caret());
@@ -911,6 +931,9 @@ impl CollationWorkspace {
                 .collect();
             row = row.child(
                 div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .whitespace_normal()
                     .bg(rgba(0x8c2b2238))
                     .px(px(1.0))
                     .child(SharedString::from(mid)),
@@ -925,7 +948,7 @@ impl CollationWorkspace {
                 .take(line_end - seg_end)
                 .collect();
             if !after.is_empty() {
-                row = row.child(div().child(SharedString::from(after)));
+                row = row.child(text_seg(after));
             }
         } else if caret_here {
             let before: String = self
@@ -935,7 +958,7 @@ impl CollationWorkspace {
                 .take(self.cursor.saturating_sub(line_start))
                 .collect();
             if !before.is_empty() {
-                row = row.child(div().child(SharedString::from(before)));
+                row = row.child(text_seg(before));
             }
             row = row.child(self.caret());
             let after: String = self
@@ -945,10 +968,10 @@ impl CollationWorkspace {
                 .take(line_end.saturating_sub(self.cursor))
                 .collect();
             if !after.is_empty() {
-                row = row.child(div().child(SharedString::from(after)));
+                row = row.child(text_seg(after));
             }
         } else {
-            row = row.child(div().child(SharedString::from(line.to_string())));
+            row = row.child(text_seg(line.to_string()));
         }
         row
     }
