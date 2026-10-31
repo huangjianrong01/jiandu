@@ -439,9 +439,21 @@ impl CollationWorkspace {
         page
     }
 
-    /// mock 行带：左图第 i 行，标注对应右文第 i 段（演示用）。
+    /// mock 行带：左图第 i 行，直接显示右侧第 i 段的真实文本（自证式演示联动）。
+    /// 真实接入预栅格化位图后，本行带被 `img` 取代，段文本转为坐标匹配依据。
     fn render_band(&self, i: usize) -> gpui::Div {
         let bg = if i % 2 == 0 { rgb(0xe9dfc4) } else { rgb(0xf1e8cf) };
+        let text = self
+            .line_ranges()
+            .get(i)
+            .map(|&(s, e)| {
+                self.text
+                    .chars()
+                    .skip(s)
+                    .take(e.saturating_sub(s))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
         div()
             .h(px(BAND_H))
             .w_full()
@@ -450,9 +462,9 @@ impl CollationWorkspace {
             .px(px(PAD))
             .bg(bg)
             .child(SharedString::from(format!(
-                "左图第 {} 行 · 对应右文第 {} 段",
+                "左图第 {} 行 ｜ 右文：{}",
                 i + 1,
-                i + 1
+                text
             )))
     }
 
