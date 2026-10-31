@@ -3,6 +3,7 @@
 //! 启动先进「书架」，点书进「封面」，再进「阅读」。
 //! 每本书的阅读档案（第几面、模式、字体、标注开关）会即时写回 library.json。
 
+use crate::collation::{AppMode, CollationWorkspace};
 use crate::fonts;
 use crate::grid::{GridConfig, GridDir, LayoutConfig};
 use crate::library::{Bookmark, Library};
@@ -12,9 +13,9 @@ use crate::types::{
     MarkKind, NoteKind, NoteSource, RuleColor, Script,
 };
 use gpui::{
-    div, px, rgb, AppContext, AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, ScrollHandle, SharedString, Styled,
-    WeakEntity, Window,
+    div, px, rgb, rgba, AppContext, AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
+    Styled, Subscription, WeakEntity, Window,
 };
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -1010,6 +1011,16 @@ pub struct Root {
     /// 收进这一枚菜单——当前页图片 / 当前章 Anki 卡片 / MD，逐条直调
     /// 原生保存对话框。渲染见 `reader::render_reading_toolbar`。
     pub export_menu: bool,
+    /// **笺校工作台**（MVP · 模块三）：顶层模式机。
+    ///
+    /// `Reader` = 正常阅读；`Collation` = 全屏笺校工作台。进入时 `Root::render`
+    /// 直接返回 `Entity<CollationWorkspace>`，根本不构建阅读视图 → 对阅读零影响。
+    pub mode: AppMode,
+    /// 笺校工作台的视图实体：拥有自己的编辑缓冲与焦点，不引用 Reader 任何字段。
+    pub collation: Entity<CollationWorkspace>,
+    /// 「返回阅读」事件的订阅柄：必须持有（`Subscription` Drop 即退订），
+    /// 让工作台「返回阅读」钮能唤回阅读态。
+    pub collation_sub: Subscription,
 }
 
 /// **后台导入任务**（v1.50.0 流式架构）。
@@ -1205,6 +1216,15 @@ impl Root {
             FontChoice::Qiji
         };
         let count = library.books.len();
+        // 笺校工作台实体：开局就建（常驻，进入时才渲染）。与阅读器完全解耦，
+        // 不引用 Reader 任何字段；订阅其「返回阅读」事件切回 Reader 模式。
+        let collation = cx.new(CollationWorkspace::new);
+        let collation_sub = cx.subscribe(&collation, |this, _e, _event, cx| {
+            // 工作台点「返回阅读」→ 切回正常阅读态。
+            this.mode = AppMode::Reader;
+            cx.notify();
+        });
+
         let mut root = Self {
             library,
             screen: Screen::Shelf,
@@ -1452,6 +1472,9 @@ impl Root {
             shelf_batch_confirm: false,
             close_hook_set: false,
             export_menu: false,
+            mode: AppMode::Reader,
+            collation,
+            collation_sub,
             notice: if count == 0 {
                 "书架空空，点「导入书籍」放一本进来".into()
             } else {
@@ -6856,6 +6879,10 @@ impl Render for Root {
         if !self.beta_ok {
             return self.render_beta_gate(window, cx).into_any_element();
         }
+        // 笺校工作台全屏态：直接返回工作台视图，根本不构建阅读界面 → 对阅读零影响。
+        if self.mode == AppMode::Collation {
+            return self.collation.clone().into_any_element();
+        }
         if std::env::var("JIANDU_IME_DEBUG").is_ok() {
             use std::sync::atomic::{AtomicBool, Ordering};
             static PROBED: AtomicBool = AtomicBool::new(false);
@@ -7070,6 +7097,10 @@ impl Render for Root {
         // 被它整块盖住（第一版就是这样，印根本看不见）。印章只在左下角
         // 一小块，压不到居中的浮层。
         root = root.child(screen);
+        // 阅读屏右下角的「笺校工作台」入口（悬浮钮，不占排版流）。
+        if self.screen == Screen::Reading && !self.focus_mode {
+            root = root.child(self.render_collation_entry(cx));
+        }
         // 「雕版刻印中… 34%」：盖在最上层，导入期间挡住操作，免得重复点导入。
         let import_ui = self
             .import_job
@@ -7114,6 +7145,33 @@ impl Render for Root {
             root = root.child(self.render_license_sheet(cx));
         }
         root.into_any_element()
+    }
+}
+
+impl Root {
+    /// 阅读屏右下角的「笺校工作台」入口（悬浮钮，不占排版流）。
+    ///
+    /// 点一下把顶层模式机切到 `Collation`，`Root::render` 下一帧就直接返回
+    /// 工作台视图——对阅读界面零影响（见 `collation.rs` 文件头）。
+    fn render_collation_entry(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .absolute()
+            .right(px(14.0))
+            .bottom(px(72.0))
+            .px(px(14.0))
+            .py(px(8.0))
+            .bg(rgba(0x8c2b22ff))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .text_color(rgb(0xf4ecd8))
+            .child(SharedString::from("笺校工作台"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.mode = AppMode::Collation;
+                    cx.notify();
+                }),
+            )
     }
 }
 

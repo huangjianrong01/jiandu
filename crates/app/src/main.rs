@@ -26,6 +26,10 @@
 /// `Root` 里会带着整棵阅读树重绘。落盘（密钥 / 服务商）见 `jiandu_core::ai`。
 mod ai;
 mod app;
+/// **笺校工作台**（MVP · 模块三）：与阅读器完全解耦的全屏模态视图。
+/// 顶层状态机 `AppMode` 在此；进入时 `Root::render` 直接返回它的视图实体，
+/// 根本不构建阅读界面（见 `collation.rs` 文件头）。
+mod collation;
 /// **内测闸门**（v1.0.0-beta）：启动时那张「箋讀 + 邀請碼」的纸。
 /// 纯逻辑（码表 / 归一 / 凭据）在 `jiandu_core::gate`。
 mod beta;
