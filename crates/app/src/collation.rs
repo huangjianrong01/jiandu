@@ -192,6 +192,8 @@ pub struct CollationWorkspace {
     ///
     /// 不当场删是因为本帧的 `img` 可能还在异步读该文件；隔一帧元素树已换，删了安全。
     temp_gc: Vec<PathBuf>,
+    /// 当前这批预览图对应的版式指纹（`preview_sig`）；相同请求直接跳过不重排。
+    preview_sig: Option<(u64, usize, u8, u8)>,
     /// 当前预览页码（0-based）；`preview_paths` 为空时无意义。
     preview_page: usize,
     /// 预览栅格化失败信息（红色提示，如系统缺中文字体）。
@@ -277,6 +279,7 @@ impl CollationWorkspace {
             image_note: None,
             preview_paths: Vec::new(),
             temp_gc: Vec::new(),
+            preview_sig: None,
             preview_page: 0,
             preview_error: None,
             preview_note: None,
@@ -999,6 +1002,7 @@ impl CollationWorkspace {
         self.preview_gen += 1;
         self.preview_pending = false;
         self.temp_gc.append(&mut self.preview_paths);
+        self.preview_sig = None;
         self.preview_page = 0;
     }
 
@@ -1133,7 +1137,23 @@ impl CollationWorkspace {
         .detach();
     }
 
-    /// 请求重排预览（**绝不阻塞 UI**）：节流 + 代际令牌 + 后台栅格化。    ///
+    /// 版式指纹（内容 / 列数 / 底色 / 版框）。四个输入完全相同 → 排出来的图必然一模一样。
+    ///
+    /// 用 `DefaultHasher` 而不是存整份文本：比对比拷贝快，且不受文本长度影响。
+    fn preview_sig(
+        text: &str,
+        columns: usize,
+        bg: ShareBg,
+        frame: ShareFrame,
+    ) -> (u64, usize, u8, u8) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        (h.finish(), columns, bg as u8, frame as u8)
+    }
+
+    /// 请求重排预览（**绝不阻塞 UI**）：节流 + 代际令牌 + 后台栅格化。
+    ///
     /// ・**节流**：1s 内不重复起任务；连点只挂 `preview_pending`，当前任务回来后
     ///   自动补跑一次（既不堆积任务，也不会「点了没反应」）。
     /// ・**代际令牌** `preview_gen`：连改样式时旧结果回来即丢弃（含临时文件），
@@ -1142,7 +1162,33 @@ impl CollationWorkspace {
     ///   扔到 background_executor，主线程只管 UI。
     /// ・**关闭优先**：结果回来时若预览已关闭，直接丢弃结果 —— 关闭 / Esc 因此
     ///   永远畅通，不受任何后台排版任务影响。
+    /// 强制重排（【刷新预览】专用）：先作废指纹与节流窗口，再照常走后台。
+    ///
+    /// 与 `request_preview` 的唯一区别就是「不许被版式指纹短路」——其余纪律
+    /// （节流、代际令牌、关闭优先）全部照旧，故刷一下也不会卡死。
+    fn refresh_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview_sig = None;
+        self.preview_last_req = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(std::time::Instant::now);
+        self.request_preview(cx);
+    }
+
     fn request_preview(&mut self, cx: &mut Context<Self>) {
+        // —— 版式指纹：内容 / 列数 / 底色 / 版框都没变就不重排 ——
+        //
+        // 真机日志实测：同一版式 `[preview] chars=398 pages=4` 成对连打（每次
+        // 80–110ms），全是白烧——点样式面板、连点刷新、连按翻页都会重复请求同
+        // 一张图。竖排排一次 4 页就要一百毫秒，白烧几十次就是白白占据后台线程、
+        // 拖慢其它操作。何况预览图已经渲好，重排只会产出**像素级相同**的新文件。
+        //
+        // 只在「已经有一批可用的预览图」时短路：预览关掉后 `preview_paths` 为空，
+        // 再次打开必须重排（旧文件已进 `temp_gc`）。
+        let key = Self::preview_sig(&self.text, self.preview_columns, self.preview_bg, self.preview_frame);
+        if !self.preview_paths.is_empty() && self.preview_sig == Some(key) {
+            self.preview_pending = false;
+            return;
+        }
         if self.preview_busy || self.preview_last_req.elapsed() < Duration::from_millis(1000) {
             self.preview_pending = true;
             return;
@@ -1151,6 +1197,7 @@ impl CollationWorkspace {
         self.preview_busy = true;
         self.preview_gen += 1;
         let gen = self.preview_gen;
+        let key_at_start = key;
         // 进后台前先把输入快照出来（绝不把 self 带进后台任务）。
         let text = self.text.clone();
         let columns = self.preview_columns;
@@ -1190,6 +1237,8 @@ impl CollationWorkspace {
                                     this.preview_paths = pages;
                                     this.preview_note = note;
                                     this.preview_error = None;
+                                    // 记住这批图对应的版式指纹：同一请求再来直接跳过。
+                                    this.preview_sig = Some(key_at_start);
                                     // 列数 / 样式变动可能改变页数，钳制当前页到有效范围。
                                     let max_idx = this.preview_paths.len().saturating_sub(1);
                                     if this.preview_page > max_idx {
@@ -1641,7 +1690,10 @@ impl CollationWorkspace {
                     .child(self.button(
                         "刷新预览",
                         |c, _, _, cx| {
-                            c.request_preview(cx);
+                            // 强制重排：清掉版式指纹，绕过「同版式直接跳过」那道短路。
+                            // （用户点刷新就是「我怀疑这图不对，再排一遍」，绝不能说
+                            //   什么都没发生——那是他明确讨厌过的「点了没反应」。）
+                            c.refresh_preview(cx);
                             cx.notify();
                         },
                         cx,
