@@ -7097,8 +7097,10 @@ impl Render for Root {
         // 被它整块盖住（第一版就是这样，印根本看不见）。印章只在左下角
         // 一小块，压不到居中的浮层。
         root = root.child(screen);
-        // 阅读屏右下角的「笺校工作台」入口（悬浮钮，不占排版流）。
-        if self.screen == Screen::Reading && !self.focus_mode {
+        // 笺校工作台入口：书架与阅读屏都显示（工作台本就是空白转录台，
+        // 与「是否已打开一本书」无关，无需先进阅读界面）。专注模式不显示，
+        // 避免遮挡正文。
+        if (self.screen == Screen::Reading || self.screen == Screen::Shelf) && !self.focus_mode {
             root = root.child(self.render_collation_entry(cx));
         }
         // 「雕版刻印中… 34%」：盖在最上层，导入期间挡住操作，免得重复点导入。
