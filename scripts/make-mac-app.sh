@@ -22,7 +22,7 @@ ROOT="$(pwd)"
 APP_NAME="笺读"
 BUNDLE_ID="com.jiandu.app"
 VERSION="1.9.9"
-BUILD_NUM="220"
+BUILD_NUM="221"
 MIN_MACOS="12.0"
 ARCH="${ARCH:-native}"
 

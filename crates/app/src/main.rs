@@ -161,6 +161,24 @@ fn main() {
     // 命令行模式：`jiandu --convert 输入 --out 输出`
     //   epub -> json / txt / md 的批量转换，不开窗口。
     let args: Vec<String> = std::env::args().collect();
+
+    // 真机 TTS 验证（v1.9.9 紧急热修用，不影响正常 GUI）：`jiandu --tts-probe "文字"`
+    // 从 main()（**主线程**）直接调用 crate::tts::speak，打印是否成功、是否闪退，然后退出。
+    // 用于确认 AVFoundation FFI 在主线程能安全发声、不再 EXC_BAD_ACCESS。
+    if let Some(pos) = args.iter().position(|a| a == "--tts-probe") {
+        let text = args
+            .get(pos + 1)
+            .cloned()
+            .unwrap_or_else(|| "床前明月光，疑是地上霜。举头望明月，低头思故乡。".to_string());
+        eprintln!("[tts-probe] running on main thread (main())");
+        let ok = crate::tts::speak(&text, 1.0);
+        eprintln!("[tts-probe] speak() returned {}", ok);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let stopped = crate::tts::stop();
+        eprintln!("[tts-probe] stop() returned {}; survived, exiting", stopped);
+        std::process::exit(if ok { 0 } else { 2 });
+    }
+
     // `jiandu --zen`：直接打开原生 GPUI 竖笺演示窗口（天头地脚非对称 + Canvas 网格
     // + 三 Tab 设置 + 右侧热区 spring 抽屉），不开书架，便于单独验证排版与交互。
     // 演示模式下跳过 CLI 分支，直接进开窗流程。

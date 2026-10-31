@@ -117,18 +117,35 @@ mod imp {
     ///   * AVSpeechUtterance 的 `rate` 是 0–1 的相对值（默认 0.5），故 `0.5 * rate`；
     ///   * NSSpeechSynthesizer 的 `rate` 是每分钟字数（默认 200），故 `200 * rate`。
     /// 两个引擎各自缩放，调用方只传一个人类可读的倍率。
+    ///
+    /// 合成器只建一次（存进 `SYNTH` 后复用），既防止每次点击都泄漏一个
+    /// Objective-C 对象，也避免旧合成器还在播就被反复新建带来的状态混乱。
     unsafe fn speak_on_main(cstr: *const c_char, rate: f32) -> bool {
         let pool = objc_autoreleasePoolPush();
-        let r = if let Some(p) = try_av(cstr, rate) {
-            WHICH.store(1, Ordering::Relaxed);
-            SYNTH.get_or_init(|| p as usize);
-            true
-        } else if let Some(p) = try_ns(cstr, rate) {
-            WHICH.store(2, Ordering::Relaxed);
-            SYNTH.get_or_init(|| p as usize);
-            true
-        } else {
-            false
+        // 已选定引擎：复用已建好的合成器，只新建 utterance 朗读。
+        let r = match WHICH.load(Ordering::Relaxed) {
+            1 => match SYNTH.get() {
+                Some(p) => speak_av(*p as *mut c_void, cstr, rate),
+                None => false,
+            },
+            2 => match SYNTH.get() {
+                Some(p) => speak_ns(*p as *mut c_void, cstr, rate),
+                None => false,
+            },
+            _ => {
+                // 首次：优先 AV，取不到回退 NS。
+                if let Some(s) = try_av(cstr, rate) {
+                    WHICH.store(1, Ordering::Relaxed);
+                    SYNTH.get_or_init(|| s as usize);
+                    true
+                } else if let Some(s) = try_ns(cstr, rate) {
+                    WHICH.store(2, Ordering::Relaxed);
+                    SYNTH.get_or_init(|| s as usize);
+                    true
+                } else {
+                    false
+                }
+            }
         };
         objc_autoreleasePoolPop(pool);
         r
@@ -143,6 +160,10 @@ mod imp {
     }
 
     /// AVSpeechSynthesizer 路径（用户点名；若 AVFoundation 未加载则类为 null，返回 None）。
+    ///
+    /// 这里**只建合成器**（首次调用），朗读交给 `speak_av`。合成器建好后由
+    /// `SYNTH` 长期持有（裸指针 leaked，语音播完前绝不被释放——解决「播完前被
+    /// Drop 导致回调访问悬垂指针」这一类崩溃）。
     unsafe fn try_av(cstr: *const c_char, rate: f32) -> Option<*mut c_void> {
         let cls = objc_getClass(b"AVSpeechSynthesizer\0".as_ptr() as *const c_char);
         if cls.is_null() {
@@ -152,23 +173,29 @@ mod imp {
         if synth.is_null() {
             return None;
         }
+        speak_av(synth, cstr, rate);
+        Some(synth)
+    }
+
+    /// 在已建好的 AVSpeechSynthesizer 上朗读一段文字（每次点击都新建 utterance）。
+    unsafe fn speak_av(synth: *mut c_void, cstr: *const c_char, rate: f32) -> bool {
         let ucls = objc_getClass(b"AVSpeechUtterance\0".as_ptr() as *const c_char);
         if ucls.is_null() {
-            return None;
+            return false;
         }
         let ustr = ns_str(cstr);
         let utt = msg1_id(msg0(ucls, sel(b"alloc\0")), sel(b"initWithString:\0"), ustr);
         if utt.is_null() {
-            return None;
+            return false;
         }
         // 中文语音：优先普通话（大陆 Ting-Ting / 台湾 Mei-Jia 皆可），取不到用默认。
+        // ⚠️ `voiceWithLanguage:` 收的是 **NSString\***，绝不是 C 字符串——
+        // 把裸 C 字符串指针当对象传进去，框架会把它当成 NSString 发消息 → 立刻
+        // EXC_BAD_ACCESS 闪退（v1.9.9 热修前就是这个 bug）。必须用 `ns_str` 包一层。
         let vcls = objc_getClass(b"AVSpeechSynthesisVoice\0".as_ptr() as *const c_char);
         if !vcls.is_null() {
-            let v = msg1_cstr(
-                vcls,
-                sel(b"voiceWithLanguage:\0"),
-                b"zh-CN\0".as_ptr() as *const c_char,
-            );
+            let lang = ns_str(b"zh-CN\0".as_ptr() as *const c_char);
+            let v = msg1_id(vcls, sel(b"voiceWithLanguage:\0"), lang);
             if !v.is_null() {
                 msg1_id(utt, sel(b"setVoice:\0"), v);
             }
@@ -177,10 +204,11 @@ mod imp {
         let av_rate = (0.5 * rate).clamp(0.1, 0.9);
         set_rate(utt, av_rate);
         let _ = msg1_id(synth, sel(b"speakUtterance:\0"), utt);
-        Some(synth)
+        true
     }
 
     /// NSSpeechSynthesizer 兜底（AppKit，必在；默认语音可能偏英文，但一定能发声）。
+    /// 同样只建合成器，朗读交给 `speak_ns`。
     unsafe fn try_ns(cstr: *const c_char, rate: f32) -> Option<*mut c_void> {
         let cls = objc_getClass(b"NSSpeechSynthesizer\0".as_ptr() as *const c_char);
         if cls.is_null() {
@@ -190,6 +218,12 @@ mod imp {
         if synth.is_null() {
             return None;
         }
+        speak_ns(synth, cstr, rate);
+        Some(synth)
+    }
+
+    /// 在已建好的 NSSpeechSynthesizer 上朗读一段文字。
+    unsafe fn speak_ns(synth: *mut c_void, cstr: *const c_char, rate: f32) -> bool {
         // 尝试设中文语音；不同系统 identifier 不同，失败就沿用默认语音。
         let v = ns_str(
             b"com.apple.speech.synthesis.voice.Ting-Ting\0".as_ptr() as *const c_char,
@@ -201,7 +235,7 @@ mod imp {
         let ns_rate = (200.0 * rate).clamp(80.0, 400.0);
         set_rate(synth, ns_rate);
         let _ = msg1_id(synth, sel(b"startSpeakingString:\0"), ns_str(cstr));
-        Some(synth)
+        true
     }
 
     pub fn stop() -> bool {
