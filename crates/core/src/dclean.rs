@@ -1237,13 +1237,17 @@ fn wrap_vague_doses(text: &str) -> String {
             }
         }
         // 「如X大」象形剂量：如 雞子大 / 梧桐子大 / 彈子大 ……通配到下一个「大」。
+        // ⚠️ `j` 是 `大` 的**起始**字节，`大` 本身占 3 字节——`seg` 必须含到
+        // `大` 的**末尾**（`j + 大.len_utf8()`），否则 `[..=j]` 会落进 `大` 中间
+        // 触发「not a char boundary」panic，整条 md 导入崩成「解析器崩溃」。
         if rest.starts_with('如') {
             if let Some(j) = rest.find('大') {
-                let seg = &rest[..=j];
+                let end = j + '大'.len_utf8();
+                let seg = &rest[..end];
                 out.push_str("[注]");
                 out.push_str(seg);
                 out.push_str("[/注]");
-                rest = &rest[j + '大'.len_utf8()..];
+                rest = &rest[end..];
                 continue 'outer;
             }
         }
@@ -1964,6 +1968,25 @@ mod tests {
         assert_eq!(split_dosage_to_gloss("合欢皮三钱"), "合欢皮[注]三钱[/注]");
         // 生薑片：片 不在单位集（冰片/梅片 是药名），绝不被误切。
         assert_eq!(split_dosage_to_gloss("生薑片三錢"), "生薑片[注]三錢[/注]");
+    }
+
+    #[test]
+    fn wrap_vague_doses_ru_da_never_panics() {
+        // v1.9.17 回归：『如X大』支路原写 `&rest[..=j]`，把切片落进 `大`
+        // （3 字节）的**中间** → 「not a char boundary」panic，含 如雞子大 /
+        // 如梧桐子大 / 如彈子大 的方剂 MD 整条导入崩溃。
+        // 全部象形剂量短语必须安全包裹，绝不越界。
+        assert_eq!(wrap_vague_doses("如雞子大"), "[注]如雞子大[/注]");
+        assert_eq!(
+            wrap_vague_doses("如梧桐子大，不拘多少"),
+            "[注]如梧桐子大[/注]，[注]不拘多少[/注]"
+        );
+        assert_eq!(wrap_vague_doses("煉蜜如彈子大"), "煉蜜[注]如彈子大[/注]");
+        // 多字节边界：`大` 前是 3 字节汉字时绝不能 panic。
+        assert_eq!(wrap_vague_doses("如龍眼大"), "[注]如龍眼大[/注]");
+        // 走完整拆分链路也不能崩。
+        let full = split_dosage_to_gloss("生地三錢 如雞子大");
+        assert!(full.contains("[注]如雞子大[/注]"));
     }
 
     // ---------- v1.9.16：剥括号 + 标点古籍化 + 清废标点 ----------

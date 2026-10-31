@@ -2927,7 +2927,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jiandu"
-version = "1.9.17"
+version = "1.9.18"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2956,7 +2956,7 @@ dependencies = [
 
 [[package]]
 name = "jiandu-core"
-version = "1.9.17"
+version = "1.9.18"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
