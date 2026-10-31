@@ -1114,7 +1114,7 @@ impl CollationWorkspace {
     /// 高度自适应，比例保持竖排书页）+ 样式面板（底色 / 版框 / 列数，点按即重栅格
     /// 化）+ 底部状态条（仅栅格化错误，如缺中文字体）。长文自动按页切块，用顶部
     /// 「← 第 X / Y 页 →」翻页（见 [`regenerate_preview`]）。
-    fn render_preview_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_preview_overlay(&self, vh: f32, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .absolute()
             .top(px(HEADER_H))
@@ -1176,20 +1176,26 @@ impl CollationWorkspace {
                     .child({
                         let idx = self.preview_page.min(self.preview_paths.len().saturating_sub(1));
                         match self.preview_paths.get(idx) {
-                            Some(p) => div()
-                                // ⚠️ 绝不用 h_full()：父容器是 overflow_y_scroll
-                                // （高度由内容定），h_full 会形成「容器高↔内容高」
-                                // 的布局反馈环 → GPUI 反复求解尺寸直至卡死。显式
-                                // 限高解耦，超高则由滚动容器接管。
-                                .child(img(p.clone()).max_h(px(PREVIEW_IMG_MAX_H)))
-                                // 翻页淡入：动画 id 含页下标，翻到新页 id 变 → 重播，
-                                // 同页重绘（hover 等）id 不变 → 停在 opacity 1 不闪。
-                                .with_animation(
-                                    SharedString::from(format!("preview-page-{}", idx)),
-                                    Animation::new(Duration::from_millis(180)),
-                                    |page, delta| page.opacity(delta),
-                                )
-                                .into_any_element(),
+                            Some(p) => {
+                                // 显式宽高等比缩放：预览位图恒为 1080×1920（9:16），
+                                // 不显式给尺寸时 img 会按原始像素铺开 → 被容器裁切
+                                // （表现为「文字被切掉 / 版面错乱」）；而 h_full()
+                                // 又会让「容器高↔内容高」循环依赖 → GPUI 反复求解
+                                // 尺寸直至卡死。故按视口算一个确定的等比尺寸。
+                                let img_h = (vh - HEADER_H * 2.0 - 64.0)
+                                    .clamp(240.0, PREVIEW_IMG_MAX_H);
+                                let img_w = img_h * (1080.0 / 1920.0);
+                                div()
+                                    .child(img(p.clone()).w(px(img_w)).h(px(img_h)))
+                                    // 翻页淡入：动画 id 含页下标，翻到新页 id 变 → 重播，
+                                    // 同页重绘（hover 等）id 不变 → 停在 opacity 1 不闪。
+                                    .with_animation(
+                                        SharedString::from(format!("preview-page-{}", idx)),
+                                        Animation::new(Duration::from_millis(180)),
+                                        |page, delta| page.opacity(delta),
+                                    )
+                                    .into_any_element()
+                            }
                             None => div()
                                 .px(px(20.0))
                                 .py(px(16.0))
@@ -1428,6 +1434,7 @@ impl CollationWorkspace {
 impl Render for CollationWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let vw = px_f32(window.viewport_size().width);
+        let vh = px_f32(window.viewport_size().height);
         // 焦点归属：预览开启时把焦点引到 `preview_focus`，使其落在「根元素」派发
         // 路径上 → 根 div 的 `on_key_down` 能收到 ←/→/Esc；同时编辑器（IME 焦点在
         // `focus`）自然失焦，不再抢方向键去移动光标。预览关闭则焦点还给编辑器，
@@ -1460,7 +1467,7 @@ impl Render for CollationWorkspace {
                     .child(self.render_right(vw, cx)),
             );
         if self.show_preview {
-            root = root.child(self.render_preview_overlay(cx));
+            root = root.child(self.render_preview_overlay(vh, cx));
         }
         root
     }
