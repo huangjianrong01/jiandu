@@ -175,8 +175,8 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
     ctx.translate(pad, pad + desc);
 
     let (r, g, b) = rgb_of(color);
-    // 注音墨色半透明（0.7）：透出一点纸色，灰墨轻盈不抢正文（v1.9.10）。
-    ctx.set_rgb_fill_color(r, g, b, 0.7);
+    // 注音墨色半透明（0.8）：透出一点纸色，朱砂轻盈不抢正文（v1.9.11）。
+    ctx.set_rgb_fill_color(r, g, b, 0.8);
     let mut x = 0.0f64;
     for i in 0..n {
         // `draw_glyphs` 按值取 context：`clone()` 是 CGContextRetain，随调用
@@ -258,7 +258,7 @@ mod tests {
 
     /// 通道序钉死：给纯红，缓冲里字形内部必须是 `B=0,G=0,R=255`（gpui 存 BGRA）。
     /// 这条防的是 `BITMAP_INFO` 写错导致 CG 退回主机序、朱砂注音变蓝。
-    /// 注意：自 v1.9.10 起填充 alpha 降为 0.7，字内像素 `a≈178`（不再等于 255），
+    /// 注意：自 v1.9.11 起填充 alpha 为 0.8，字内像素 `a≈204`（不再等于 255），
     /// 故这里取「最不透明的字内像素」来验通道序，而非强求 a==255。
     #[cfg(target_os = "macos")]
     #[test]

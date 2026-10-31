@@ -67,30 +67,30 @@ pub struct RubyLayout {
 /// * `cell_w` / `cell_h`：字格宽高。
 pub fn layout(pinyin: &str, body_fs: f32, cell_w: f32, cell_h: f32) -> RubyLayout {
     let letters = pinyin.chars().count().max(1) as f32;
-    // 呼吸：字与注音之间、注音与下一列字形之间各留一点。随格宽缩，但至少 1px。
     let inset = (cell_w * 0.03).clamp(1.0, 3.0);
-    // 汉字居中 → 汉字右缘到下一列汉字左缘这段空白 = 列宽 − 字号。
-    let avail = (cell_w - body_fs - inset * 2.0).max(4.0);
-
-    let mut fs = body_fs * RUBY_SCALE;
-    let mut tight = false;
-    if letters * fs * RUBY_ADVANCE > avail {
-        fs = avail / (letters * RUBY_ADVANCE);
-        if fs < body_fs * RUBY_SCALE_MIN {
-            fs = body_fs * RUBY_SCALE_MIN;
-            tight = true;
-        }
+    // 汉字在字格居中 → 右缘 = (cell_w + body_fs)/2。
+    let char_right = (cell_w + body_fs) * 0.5;
+    // 字格内、汉字右缘到字格右缘的空白（让开 inset 呼吸）= 注音可用宽硬上限。
+    // 注音整串绝对不许越过字格右缘——既不挤占左列句读，也不溢出右界栏（用户铁律）。
+    let room = ((cell_w - body_fs) * 0.5 - inset).max(2.0);
+    // 目标字号 40%；受可用宽约束，放不下就按宽反算、下限 22%。
+    let mut fs = (body_fs * RUBY_SCALE).min(room / (letters * RUBY_ADVANCE));
+    fs = fs.max(3.0);
+    if fs < body_fs * RUBY_SCALE_MIN {
+        fs = body_fs * RUBY_SCALE_MIN;
     }
-    let fs = fs.max(3.0).min(body_fs * RUBY_SCALE);
-    let block_w = letters * fs * RUBY_ADVANCE;
+    let fs = fs.min(body_fs * RUBY_SCALE).max(3.0);
+    // 宽度硬封顶到可用宽：长拼音宁可略挤，也绝不越界（用户铁律）。
+    let block_w = (letters * fs * RUBY_ADVANCE).min(room);
     let block_h = fs * RUBY_CAP;
     RubyLayout {
         fs,
         block_w,
         block_h,
-        left: (cell_w + body_fs) * 0.5 + inset,
+        left: char_right + inset,
         top: ((cell_h - block_h) * 0.5).max(0.0),
-        tight,
+        // 宽度已被 `room` 死死封顶，不会再溢出，故 `tight` 恒 false。
+        tight: false,
     }
 }
 
@@ -151,14 +151,17 @@ mod tests {
         let (cw, chh, fs) = cell(14);
         let l = layout("měng", fs, cw, chh);
         assert!(
-            l.block_w > l.block_h * 1.6,
+            l.block_w > l.block_h * 1.25,
             "注音不是横排（宽 {:.2} / 高 {:.2}）",
             l.block_w,
             l.block_h
         );
+        // 宽度 = 字母数 × 步进，且被可用宽封顶（绝不越界）；故 ≤ 自然宽 + ε。
         assert!(
-            (l.block_w - 4.0 * l.fs * RUBY_ADVANCE).abs() < 1e-3,
-            "横排宽度不是按字距累加的"
+            l.block_w <= 4.0 * l.fs * RUBY_ADVANCE + 1e-3,
+            "注音宽越过自然宽（实得 {:.3} > {:.3}）",
+            l.block_w,
+            4.0 * l.fs * RUBY_ADVANCE
         );
     }
 

@@ -4605,18 +4605,27 @@ impl Root {
         // id 永不变，动画只跑过一次就被钉死在起点）。
         let shown = self.bar_shown;
         // 2px 余量：收起时连那道 1px 的顶边也不留，彻底「无栏」。
-        let bar = bar.with_animation(
-            SharedString::from(if shown {
-                "reading-bar-in"
-            } else {
-                "reading-bar-out"
-            }),
-            Animation::new(Duration::from_millis(220)),
-            move |bar, delta| {
-                let v = if shown { delta } else { 1.0 - delta };
-                bar.top(px(-(BAR_H + 2.0) * (1.0 - v))).opacity(v)
-            },
-        );
+        let bar = bar
+            // v1.9.11：**拦住工具栏区域的点击**——点栏内任何一处（含钮间空隙）
+            // 都不冒泡到阅读根容器，绝不穿透触发底层眉批 / 三红线；只有点工具栏
+            // 之外的空白处，才会落到根处理器去收栏或翻页。各钮自身已 stop_propagation，
+            // 这里再兜一层栏容器，堵死空隙穿透。放在 `with_animation` 之前（AnimationElement
+            // 不再暴露 on_mouse_down），动画会保留这一处理器。
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }))
+            .with_animation(
+                SharedString::from(if shown {
+                    "reading-bar-in"
+                } else {
+                    "reading-bar-out"
+                }),
+                Animation::new(Duration::from_millis(220)),
+                move |bar, delta| {
+                    let v = if shown { delta } else { 1.0 - delta };
+                    bar.top(px(-(BAR_H + 2.0) * (1.0 - v))).opacity(v)
+                },
+            );
 
         let _ = total;
         bar.into_any_element()
@@ -7061,11 +7070,10 @@ impl Root {
         // 逐字母横排的 div。
         if let Some(py) = rare_py.as_deref() {
             let rl = crate::ruby::layout(py, fs, cell_w, cell_h);
-            // v1.9.10：拼音颜色与批注颜色**拆开**。拼音用极淡灰墨（#888888），
-            // 轻盈不抢正文；主路径 alpha 在 `ruby_glyph` 内已降到 0.7，退
-            // 化路径用等价的 `rgba(0x888888B3)` 对齐同一观感。批注（眉批/夹注）
-            // 仍走 `palette.note(t)`，保持原有朱砂/墨色。
-            let ruby_ink = 0x888888u32;
+            // v1.9.11：拼音颜色恢复为朱砂红（#8C2B22），与批注同源但独立；
+            // 透明 0.8（ruby_glyph 内），退化路径用等价 `rgba(0x8C2B22CC)`。
+            // 几何由 `ruby::layout` 硬封顶到字格右缘，绝不越界 / 压句读 / 出界栏。
+            let ruby_ink = 0x8C2B22u32;
             if let Some(im) = crate::ruby_glyph::ruby_image(py, rl.fs, ruby_ink) {
                 cell = cell.child(
                     div()
@@ -7098,7 +7106,7 @@ impl Root {
                             .items_center()
                             .justify_center()
                             .text_size(px(rl.fs))
-                            .text_color(rgba(0x888888B3))
+                            .text_color(rgba(0x8C2B22CC))
                             .child(SharedString::from(ch.to_string())),
                     );
                 }
@@ -9218,27 +9226,18 @@ impl Root {
         let anchor_rect = Some((anchor.x, anchor.y, anchor.w, anchor.h));
         let hit_xy = (hit.x, hit.y);
 
-        // ── 尺寸：一条横排圆角面板（钮内文字竖排）────────────────────
+        // ── 尺寸常量：一条横排圆角面板（钮内文字竖排）──────────────────
         let fs = 14.5f32;
         let item_w = fs * 1.5;
         let item_h = fs * 2.5; // 两字一钮（竖排）
         let gap = 8.0; // 钮间距
-        let pad = 6.0;
         // v1.95.0（feature/tts-voice 极简重构）：**克制**——
-        //   高频外露 4 枚：查典 / 听(TTS) / 朱批 / 问笺；低频 4 枚（存卡 / 眉批 /
-        //   夹注 / 拓印）收进「更多」二级菜单，绝不堆满一排挡字。
-        let n: f32 = 5.0; // 查典 / 听 / 朱批 / 问笺 / 更多
-        let w = pad * 2.0 + item_w * n + gap * (n - 1.0) + 2.0;
-        let h = pad * 2.0 + item_h + 2.0;
-        let place = crate::hit::place_card(
-            &anchor,
-            w,
-            h,
-            vw,
-            vh,
-            crate::hit::CARD_PAD,
-            crate::hit::CARD_GAP,
-        );
+        //   外露 5 枚主钮：查典 / 听 / 朱批 / 问笺 / 更多（「更多」展开二级菜单）；
+        //   低频 4 枚（存卡 / 眉批 / 夹注 / 拓印）收进二级菜单，绝不堆满一排挡字。
+        // 左右内边距放宽到 10，让最左（查典）/ 最右（更多）两枚与朱框之间留出
+        // 均匀呼吸；外框宽度**不再写死 n**，改由下方「实际按钮数」反算（GPUI 无
+        // fit-content，这是它的等价物）——按钮增减时红框永远死死包裹、绝不露字。
+        let pad = 10.0;
 
         // 楷体：毛笔质感，比黑体更像写在签上的字。
         let kai = crate::fonts::family_for_role(crate::fonts::FontRole::Note);
@@ -9258,10 +9257,25 @@ impl Root {
         };
         push_btn("查典", &mut items);
         push_btn("听", &mut items);
-        push_btn("连读", &mut items);
+        // 「连读」已并入「听」：无选区读整叶、有选区读选区，不再单列（见听钮）。
         push_btn("朱批", &mut items);
         push_btn("问笺", &mut items);
         push_btn("更多", &mut items);
+
+        // 外框宽高**由实际按钮数反算**（GPUI 无 fit-content，这是它的等价物）：
+        // 按钮增减都不露字，红框永远死死包裹所有钮。
+        let n = items.len() as f32;
+        let w = pad * 2.0 + item_w * n + gap * (n - 1.0) + 2.0;
+        let h = pad * 2.0 + item_h + 2.0;
+        let place = crate::hit::place_card(
+            &anchor,
+            w,
+            h,
+            vw,
+            vh,
+            crate::hit::CARD_PAD,
+            crate::hit::CARD_GAP,
+        );
 
         // 夹注：先看看这个字上有没有旧注，有就预填（算改写）。
         let existing_note = self
@@ -9313,35 +9327,24 @@ impl Root {
             );
         // 听（feature/tts-voice MVP）：把选中的这句交给系统语音合成朗读。
         // 放在「查典」之后最顺手的位置——划词后先查再听是最高频组合。
+        // 听：无选区读整叶、有选区读选区（原「连读」已并入此处）。
         let b_ting = items.next().unwrap().on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                let t = this.selected_text();
-                if !t.is_empty() {
-                    crate::tts::speak(&t, this.tts_rate);
-                    this.notice = "正在朗读…".to_string();
+                let sel = this.selected_text();
+                let (t, reading_whole) = if !sel.is_empty() {
+                    (sel, false)
                 } else {
-                    this.notice = "没有可朗读的内容".to_string();
-                }
-                this.more_open = false;
-                this.popup = None;
-                cx.notify();
-            }),
-        );
-        // 连读（P1-5）：把**本叶全部正文**拼成一长串，一次性交给 TTS。
-        //
-        // ⚠️ 安全优先：**不做自动翻页**——自动翻页要后台轮询 `isSpeaking()` 再回主
-        // 线程发翻页信号，保活不当易卡 UI；故「读完自动翻下一叶」留到 V2.0。这里只
-        // 把当前这一叶读透，读完停下，用户手动翻页。倍速走 `tts_rate`，与 [听] 共用。
-        let b_lian = items.next().unwrap().on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                let t = this.leaf_text();
+                    (this.leaf_text(), true)
+                };
                 if !t.is_empty() {
                     crate::tts::speak(&t, this.tts_rate);
-                    this.notice = "连读本页中…".to_string();
+                    this.notice = if reading_whole {
+                        "连读本页中…".to_string()
+                    } else {
+                        "正在朗读…".to_string()
+                    };
                 } else {
                     this.notice = "这一叶没有可朗读的正文".to_string();
                 }
@@ -9395,7 +9398,7 @@ impl Root {
             .justify_center()
             .gap(px(gap))
             .child(b_query);
-        for b in [b_ting, b_lian, b_note, b_ask, b_more] {
+        for b in [b_ting, b_note, b_ask, b_more] {
             row = row.child(b);
         }
 
@@ -10572,23 +10575,24 @@ impl Root {
         // 右上角关闭：**X**（v1.64.0 用户点名）——旧文案「收」不够直白。
         // 用 ASCII 大写 X：拉丁区符号（✕ U+2715 之类）在部分字体里零宽消失，
         // 曾有过「按钮在、字不见」的实拍，这里不再冒险。
+        // 关闭：移入宣纸面板内部（距顶/右各 28，留出均匀呼吸），极简浅灰小图标。
         let close = div()
             .absolute()
-            .top(px(16.0))
-            .right(px(18.0))
-            .w(px(28.0))
-            .h(px(28.0))
+            .top(px(28.0))
+            .right(px(28.0))
+            .w(px(26.0))
+            .h(px(26.0))
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(14.0))
+            .rounded(px(13.0))
             .cursor_pointer()
-            .hover(|s| s.bg(rgba(0x33312C14)))
+            .hover(|s| s.bg(rgba(0x33312C12)))
             .child(
                 div()
-                    .text_size(px(15.0))
+                    .text_size(px(14.0))
                     .font_family(song.clone())
-                    .text_color(rgba(0x33312CB0))
+                    .text_color(rgba(0x9A958CB0))
                     .child(SharedString::from("X")),
             )
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
@@ -10598,6 +10602,8 @@ impl Root {
             }));
 
         // ---- 手机框 + 卡片 ----
+        // v1.9.11：去掉黑色手机框（用户点名「黑色粗外边框」）——预览卡直接浮在
+        // 宣纸面板上，只留卡片自身的阴影（shadow_lg），不再套黑壳。
         let phone = div()
             .absolute()
             .left(px(phone_left))
@@ -10605,10 +10611,8 @@ impl Root {
             .w(px(phone_w))
             .h(px(phone_h))
             .relative()
-            .bg(rgb(0x0A0908))
-            .border_1()
-            .border_color(rgba(0x33312C1F))
-            .rounded(px(26.0))
+            .bg(rgb(0xF5F4EF))
+            .rounded(px(10.0))
             .child(
                 div()
                     .absolute()
@@ -10898,25 +10902,24 @@ impl Root {
         // 与屏幕无关——不再截屏。
         // v1.9.10：极简按钮。主操作「保存到本地」= 圆角朱砂填充；次操作
         // 「复制到剪贴板」= 白底 + 朱砂细边框幽灵钮（文字亦朱砂）。均用宋体。
+        // v1.9.11：极简宋体按钮——主操作「保存到本地」朱砂填充，次操作
+        // 「复制到剪贴板」浅灰底 + 墨字，成「一红一灰」；均微圆角、去块状感。
         let act_pill = |label: &'static str, primary: bool| -> Stateful<Div> {
             let mut d = div()
                 .id(SharedString::from(format!("share-act-{label}")))
-                .px(px(18.0))
-                .h(px(34.0))
+                .px(px(20.0))
+                .h(px(36.0))
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(17.0))
+                .rounded(px(9.0))
                 .cursor_pointer()
-                .text_size(px(12.0))
+                .text_size(px(12.5))
                 .font_family(song.clone());
             d = if primary {
                 d.bg(rgb(crate::share::CINNABAR)).text_color(rgb(0xFFF8EC))
             } else {
-                d.bg(rgb(0xF5F4EF))
-                    .border_1()
-                    .border_color(rgb(crate::share::CINNABAR))
-                    .text_color(rgb(crate::share::CINNABAR))
+                d.bg(rgb(0xE7E2D9)).text_color(rgb(0x33312C))
             };
             d.child(SharedString::from(label))
         };
