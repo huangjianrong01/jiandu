@@ -585,8 +585,34 @@ impl CollationWorkspace {
                 .pick_file();
             let Some(path) = picked else { return };
 
-            // 栅格化（单页很快，前台即可；如超大 PDF 想更稳可改 background_executor）。
-            let result = rasterize_source(&path);
+            // 1) 文本层坐标抽取：**主线程同步执行**。PDFKit / Foundation 的 objc 调用
+            //    必须在主线程（且 autorelease pool 已在本函数内部包裹，见 pdf_text.rs）。
+            //    与栅格化解耦：先点亮左侧真实区域框，不阻塞 UI。
+            if let Some(entity) = this.upgrade() {
+                let _ = entity.update(&mut app, |this, cx| {
+                    // 真实坐标映射：带文本层的 PDF 用 PDFKit 抽出的文本层坐标替换 Mock；
+                    // 无文本层（扫描图 / 位图）extract 返回空 → 清空 Mock，避免高亮落
+                    // 在错误位置，由状态栏提示需 OCR。
+                    let real = crate::pdf_text::extract_pdf_text_regions(&path);
+                    if !real.is_empty() {
+                        this.regions = real;
+                        this.image_error = None;
+                        this.image_note = None;
+                    } else {
+                        this.regions.clear();
+                        this.image_note = Some(
+                            "该原图无文本层（扫描图），无法坐标映射，需 OCR".to_string(),
+                        );
+                    }
+                    cx.notify();
+                });
+            }
+
+            // 2) 最耗时的栅格化（CG 绘制首页 / 读 PNG 尺寸）放到后台 executor，
+            //    避免阻塞 UI；完成后回主线程写入 image_path 等字段。
+            let bg = app.background_executor().clone();
+            let raster_path = path.clone();
+            let result = bg.spawn(async move { rasterize_source(&raster_path) }).await;
 
             if let Some(entity) = this.upgrade() {
                 let _ = entity.update(&mut app, |this, cx| {
@@ -602,18 +628,9 @@ impl CollationWorkspace {
                             this.src_nat_w = r.nat_w as f32;
                             this.src_nat_h = r.nat_h as f32;
                             this.image_error = None;
-                            this.image_note = r.note;
-                            // 真实坐标映射：带文本层的 PDF 用 PDFKit 抽出的文本层
-                            // 坐标替换 Mock；无文本层（扫描图 / 位图）extract 返回空
-                            // → 清空 Mock，避免高亮落在错误位置，由状态栏提示需 OCR。
-                            let real = crate::pdf_text::extract_pdf_text_regions(&path);
-                            if !real.is_empty() {
-                                this.regions = real;
-                            } else {
-                                this.regions.clear();
-                                this.image_note = Some(
-                                    "该原图无文本层（扫描图），无法坐标映射，需 OCR".to_string(),
-                                );
+                            // 若此前因无文本层已设 OCR 提示则保留；否则用栅格化 note。
+                            if this.image_note.is_none() {
+                                this.image_note = r.note;
                             }
                         }
                         Err(e) => {

@@ -38,11 +38,15 @@ pub struct SourceRegion {
 extern "C" {}
 
 #[cfg(target_os = "macos")]
-use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+use objc::{class, msg_send, rc::autoreleasepool, runtime::Object, sel, sel_impl};
 
 #[cfg(target_os = "macos")]
 pub fn extract_pdf_text_regions(path: &Path) -> Vec<SourceRegion> {
-    unsafe {
+    // ⚠️ 必须有 autorelease pool：PDFKit / Foundation 创建的对象（NSURL / NSString /
+    // PDFDocument / PDFPage）多为 autoreleased，脱离主 runloop 的调用点若没有 pool
+    // 承载，对象无处释放会直接崩溃（"导入即闪退"的元凶）。即使本函数被主线
+    // 程调用，foreground 异步轮询未必有 runloop pool，故显式包裹最稳。
+    autoreleasepool(|| unsafe {
         let nspath = ns_string(path);
         let url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: nspath];
         let doc: *mut Object = msg_send![class!(PDFDocument), alloc];
@@ -87,7 +91,7 @@ pub fn extract_pdf_text_regions(path: &Path) -> Vec<SourceRegion> {
             i += 1;
         }
         cluster(chars, page_h)
-    }
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
