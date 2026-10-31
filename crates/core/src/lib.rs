@@ -100,6 +100,10 @@ pub mod ruby;
 pub mod store;
 pub mod stream;
 pub mod trad;
+/// **中医方剂本地化规则字典**（v1.9.19）：剂量量词 / 数量单位 / 异体 OCR 别名 /
+/// 炮制短语全部外置到 `src/data/tcm_rules.json`（编译期 `include_str!` 嵌入），
+/// 解析器只委托、不硬编码。详见 `tcm_rules.rs`。
+pub mod tcm_rules;
 pub mod theme;
 pub mod types;
 pub mod vclean;

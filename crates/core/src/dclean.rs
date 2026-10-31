@@ -1187,26 +1187,21 @@ pub fn attach_footnotes(text: &str, notes: &HashMap<i64, String>) -> String {
 /// 凡含此集中字符者必是「药行 / 剂量说明」，绝不可能是方名标题——原书每一行
 /// 药味都带量词，这是判别方名的**铁壁**（见 `is_fang_title`）。
 ///
-/// 集合：核心重量 / 古量 / 丸劑（錢 钱 分 兩 两 両 克 斤 寸 升 斗 合 匕 撮 丸 劑 剂）
-/// + 真本扫描件实测计数器（綫 線 = 錢俗写 `三綫`=三錢；厘 釐；條 条 葱白四條；枚 粒
-/// 巴豆一粒；杯 盃 匙 羹 支 梔水二支；燋 艾火灸各三燋）。
+/// **v1.9.19 起委托字典**：本函数不再硬编码字符集，改为转发 `tcm_rules::is_dose_unit`
+/// （重量 ∪ 数量，含繁简异体全收 + `蠹→釐` 等 OCR 别名归一）。字典见
+/// `src/data/tcm_rules.json`，是旧硬编码集的**超集**，行为不退化。
 ///
-/// ⚠️ **繁简 + 异体同收**（用户 v1.9.17 硬要求）：`錢/钱` `兩/两/両` `劑/剂` `綫/線`
-/// `條/条` `杯/盃` `厘/釐` 全部入集，否则传统方剂（`麝香五釐`）的量词漏网 → 整行被误升格。
+/// ⚠️ **数量与重量互斥**：`個/个` 只进 `count_units`、**不进** `weight_units`
+/// （保「一個人」零误包），但两者都进方名升格「铁壁」。
 ///
-/// ⚠️ **两处故意不放**：① `個`——保「一個人」零误包；② `片`——冰片 / 梅片 / 大片
-/// 等药名即含「片」，若当单位会把「大梅片叁分」误切。剂量靠紧随其后的「分」落地。
+/// ⚠️ **两处故意不放**：`片`——冰片 / 梅片 / 大片等药名即含「片」，若当单位会把
+/// 「大梅片叁分」误切。剂量靠紧随其后的「分」落地（`片` 在字典两端都不收）。
 ///
-/// ⚠️ **兼类词保护**：`合 升 寸 支` 虽在单位集，但**必须与前后的数字配对**才当剂量
+/// ⚠️ **兼类词保护**：`合 升 寸 支` 虽在重量集，但**必须与前后的数字配对**才当剂量
 /// （见拆分函数的「数+单位」双要件）——`合欢皮` `升麻` `寸冬` `支子` 里它们前后无数字，
 /// 不会被包，安然留在药名里。
 pub fn is_dose_unit(c: char) -> bool {
-    matches!(
-        c,
-        '錢' | '钱' | '分' | '兩' | '两' | '両' | '克' | '斤' | '寸' | '升' | '斗' | '合'
-            | '匕' | '撮' | '丸' | '劑' | '剂' | '綫' | '線' | '厘' | '釐' | '條' | '条'
-            | '枚' | '粒' | '杯' | '盃' | '匙' | '羹' | '支' | '燋'
-    )
+    crate::tcm_rules::is_dose_unit(c)
 }
 
 /// 古籍方剂里的**模糊 / 非标准剂量短语**（无精确数字，照样是剂量的一部分，要跟着药名）。
@@ -1304,11 +1299,20 @@ pub fn split_dosage_to_gloss(text: &str) -> String {
                 i += 1;
             }
             let seg: String = cs[start..i].iter().collect();
-            let has_unit = seg.chars().any(is_dose_unit);
-            let has_num = seg.chars().any(is_num);
+            let seg_chars: Vec<char> = seg.chars().collect();
+            let has_unit = seg_chars.iter().any(|&c| is_dose_unit(c));
+            let has_num = seg_chars.iter().any(|&c| is_num(c));
             // 「分」作**分数分母**（如 `三分之二`）时，整段不当剂量。
             let is_fraction = seg.ends_with('分') && i < n && cs[i] == '之';
-            if has_unit && has_num && !is_fraction {
+            // 「一個人」防护（v1.9.19 用户硬规矩）：数量单位 `個/个` 前为数字
+            // （一/二/两/三…）、后为「人」、且整段极短（≤2 字，即「一個」两字）
+            // → 是「一个人」短语，**绝不当量词包**，否则会把「人」从「一個」里劈离。
+            let is_person_count = i < n
+                && cs[i] == '人'
+                && seg_chars.len() <= 2
+                && matches!(seg_chars.last(), Some('個') | Some('个'))
+                && seg_chars.first().map(|&c| is_num(c)).unwrap_or(false);
+            if has_unit && has_num && !is_fraction && !is_person_count {
                 out.push_str("[注]");
                 out.push_str(&seg);
                 out.push_str("[/注]");
@@ -1430,7 +1434,11 @@ const FANG_METHOD_WORDS: &[&str] = &[
 ///   那些短行虽无量词也无标点，本质是用方说明而非方名。
 ///
 /// ⚠️ 量词集**故意不含** 方/湯/散/丸/丹 自身——它们是方名后缀，可能在方名里出现
-/// （`六味丸`），不能当剂量排掉；也**故意不含** `個` `片`（保「一個人」、药名「冰片」）。
+/// （`六味丸`），不能当剂量排掉；也**故意不含** `片`（冰片 / 梅片 / 大片等药名即含
+/// 「片」，若当单位会把「大梅片叁分」误切）。`個/个` 虽已收为**数量单位**
+/// （见 `tcm_rules` 的 `count_units`），同样参与本铁壁（含 `個` 必非方名）；
+/// 但「一個人」短语的误包防护改在 `split_dosage_to_gloss` 的 `is_person_count`
+/// 分支里做（按「前数 + 后『人』」识别），不再靠把它踢出量词集。
 pub fn is_fang_title(s: &str) -> bool {
     let t: Vec<char> = s.trim().chars().filter(|c| !c.is_whitespace()).collect();
     if t.is_empty() || t.len() > 10 {
@@ -1451,8 +1459,12 @@ pub fn is_fang_title(s: &str) -> bool {
         return false;
     }
     // 用法 / 炮制提示语（水煎服 / 右咀 / 為末 …）不是方名。
+    // v1.9.19：叠加字典里的炮制短语（`去頭足 / 炙 / 炒 / 去皮尖 / 研末` …），
+    // 经 `tcm_rules::is_processing_phrase` 归一（繁简 / OCR 别名）后匹配，覆盖更广。
     let joined: String = t.iter().collect();
-    if FANG_METHOD_WORDS.iter().any(|w| joined.contains(w)) {
+    if FANG_METHOD_WORDS.iter().any(|w| joined.contains(w))
+        || crate::tcm_rules::is_processing_phrase(&joined)
+    {
         return false;
     }
     true
@@ -2070,5 +2082,51 @@ mod tests {
         assert!(!is_fang_title("米飲下"));
         assert!(!is_fang_title("溫酒下"));
         assert!(!is_fang_title("忌食生冷"));
+    }
+
+    // ---------- v1.9.19：本地化规则字典重构后的关键断言 ----------
+
+    /// **数量单位 ≠ 重量**：`個/个` 当归数量、绝不升格为重量。
+    /// `斑蝥去頭足十個` —— `個` 是数量（不是重量），且整行含单位必是药行，
+    /// 绝不该被当成方名（大字）升格。
+    #[test]
+    fn tcm_count_unit_is_not_weight_and_not_fang_title() {
+        // `十` 不在数集（杀「十分 / 百分」），故 `十個` 不会被拆进夹注；
+        // 但 `個` 已是数量单位，整行含它 → 铁壁判为药行，不升格。
+        assert_eq!(split_dosage_to_gloss("斑蝥去頭足十個"), "斑蝥去頭足十個");
+        assert!(!is_fang_title("斑蝥去頭足十個"), "含数量单位的药行绝不升格");
+        // `三個` 前为数字 → 正常当剂量包裹（数量单位正确识别）。
+        assert_eq!(split_dosage_to_gloss("斑蝥三個"), "斑蝥[注]三個[/注]");
+    }
+
+    /// **OCR 别名归一**：`蠹`（蛀虫，扫描件误识）→ `釐`（厘），故 `麝香五蠹`
+    /// 的 `蠹` 被识别为剂量单位并包进夹注。
+    #[test]
+    fn tcm_ocr_alias_does_not_break_dose() {
+        assert_eq!(split_dosage_to_gloss("麝香五蠹"), "麝香[注]五蠹[/注]");
+        assert!(!is_fang_title("麝香五蠹"), "含重量单位的药行绝不升格");
+    }
+
+    /// **一個人 防护**：`個/个` 前为数字、后为「人」→ 是「一个人」短语，
+    /// 绝不包进夹注把「人」劈离。
+    #[test]
+    fn tcm_one_person_phrase_is_not_dose() {
+        assert_eq!(split_dosage_to_gloss("一個人"), "一個人");
+        assert_eq!(split_dosage_to_gloss("二個人"), "二個人");
+        // 普通正文里的「一个人」短语无恙。
+        assert_eq!(split_dosage_to_gloss("這一個人走得太急"), "這一個人走得太急");
+    }
+
+    /// **病证名（大字）正确、用法语（普通行）正确**：方名升格与炮制提示互斥。
+    #[test]
+    fn tcm_disease_title_promotes_but_method_lines_dont() {
+        // 病证名（无后缀、无量词、无标点、非炮制）→ 升格为大字。
+        assert!(is_fang_title("走馬牙疳"));
+        assert!(is_fang_title("血山崩"));
+        // 用法 / 炮制提示语（含字典新收的 `去頭足 / 研末`）→ 普通行，不升格。
+        assert!(!is_fang_title("水煎服"));
+        assert!(!is_fang_title("為末"));
+        assert!(!is_fang_title("斑蝥去頭足"));
+        assert!(!is_fang_title("雄黃研末"));
     }
 }
