@@ -34,11 +34,13 @@ use crate::share_layout::{layout, LayoutSpec, ShareFont};
 use crate::share_paint::render_png;
 use gpui::prelude::*;
 use gpui::{
-    div, img, px, rgb, rgba, Bounds, Context, EntityInputHandler, EventEmitter, FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    Pixels, Point, ParentElement, Render, ScrollHandle, SharedString, Styled, Window,
+    div, img, px, rgb, rgba, Animation, AnimationExt, Bounds, Context,
+    EntityInputHandler, EventEmitter, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ParentElement, Render,
+    ScrollHandle, SharedString, Styled, Window,
 };
 use std::ops::Range;
+use std::time::Duration;
 use std::path::{Path, PathBuf};
 
 /// Pixels → f32：gpui 的 `Pixels` 字段在 jiandu crate 不可见，用「除 1px」取数值。
@@ -102,6 +104,11 @@ pub struct CollationWorkspace {
     marked: Option<Range<usize>>,
     /// 编辑器焦点句柄：输入框靠它把中文送回 `EntityInputHandler`。
     focus: FocusHandle,
+    /// 预览浮层焦点句柄：预览开启时焦点引到它，使根 div 上的 `on_key_down`
+    /// 能收到 ←/→/Esc（GPUI 0.2.2 只派发「焦点节点→根」路径上的键）。
+    preview_focus: FocusHandle,
+    /// 预览浮层焦点句柄：预览开启时焦点引到它，使根 div 上的 `on_key_down`
+    /// 能收到 ←/→/Esc（GPUI 0.2.2 只派发「焦点节点→根」路径上的键）。
     /// 编辑器滚动柄。
     scroll: ScrollHandle,
     /// 左侧原图滚动柄（用于右文点击联动滚动）。
@@ -153,6 +160,7 @@ impl CollationWorkspace {
             selection: None,
             marked: None,
             focus: cx.focus_handle(),
+            preview_focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             left_scroll: ScrollHandle::new(),
             anchor: 0,
@@ -1012,7 +1020,16 @@ impl CollationWorkspace {
                     .child({
                         let idx = self.preview_page.min(self.preview_paths.len().saturating_sub(1));
                         match self.preview_paths.get(idx) {
-                            Some(p) => div().child(img(p.clone()).h_full()),
+                            Some(p) => div()
+                                .child(img(p.clone()).h_full())
+                                // 翻页淡入：动画 id 含页下标，翻到新页 id 变 → 重播，
+                                // 同页重绘（hover 等）id 不变 → 停在 opacity 1 不闪。
+                                .with_animation(
+                                    SharedString::from(format!("preview-page-{}", idx)),
+                                    Animation::new(Duration::from_millis(180)),
+                                    |page, delta| page.opacity(delta),
+                                )
+                                .into_any_element(),
                             None => div()
                                 .px(px(20.0))
                                 .py(px(16.0))
@@ -1022,7 +1039,8 @@ impl CollationWorkspace {
                                 .text_size(px(14.0))
                                 .child(SharedString::from(
                                     "（转录为空：写入文字后点「竖排预览」或「刷新预览」）",
-                                )),
+                                ))
+                                .into_any_element(),
                         }
                     }),
             )
@@ -1139,7 +1157,11 @@ impl CollationWorkspace {
     fn preview_pager(&self, cx: &mut Context<Self>) -> gpui::Div {
         let n = self.preview_paths.len();
         if n <= 1 {
-            return div();
+            // 单页也给出键盘提示：Esc 关闭浮层（←/→ 多页时才翻得动）。
+            return div()
+                .text_color(rgba(0xf4ecd8aa))
+                .text_size(px(12.0))
+                .child(SharedString::from("← → 翻页 · Esc 关闭"));
         }
         div()
             .flex()
@@ -1197,14 +1219,57 @@ impl CollationWorkspace {
 
 impl EventEmitter<CollationEvent> for CollationWorkspace {}
 
+impl CollationWorkspace {
+    /// 预览浮层的键盘总入口（挂在根 div 上，仅在 `show_preview` 时生效）。
+    ///
+    /// ←/→ 翻页（到边界钳制）；Esc 关闭浮层。预览关闭时直接返回，绝不干扰
+    /// 编辑器自身的方向键光标移动。
+    fn preview_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if !self.show_preview {
+            return;
+        }
+        let pages = self.preview_paths.len();
+        match event.keystroke.key.as_str() {
+            "left" => {
+                if self.preview_page > 0 {
+                    self.preview_page -= 1;
+                    cx.notify();
+                }
+            }
+            "right" => {
+                if pages > 0 && self.preview_page + 1 < pages {
+                    self.preview_page += 1;
+                    cx.notify();
+                }
+            }
+            "escape" => {
+                self.show_preview = false;
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Render for CollationWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let vw = px_f32(window.viewport_size().width);
+        // 焦点归属：预览开启时把焦点引到 `preview_focus`，使其落在「根元素」派发
+        // 路径上 → 根 div 的 `on_key_down` 能收到 ←/→/Esc；同时编辑器（IME 焦点在
+        // `focus`）自然失焦，不再抢方向键去移动光标。预览关闭则焦点还给编辑器，
+        // 中文输入照常。
+        if self.show_preview {
+            window.focus(&self.preview_focus);
+        } else if !self.focus.is_focused(window) {
+            window.focus(&self.focus);
+        }
         let mut root = div()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(0xf4ecd8))
+            .track_focus(&self.preview_focus)
+            .on_key_down(cx.listener(|c, event, _window, cx| c.preview_key(event, cx)))
             .child(self.render_header(cx))
             .child(
                 div()
