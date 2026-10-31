@@ -89,6 +89,25 @@ fn preview_page_cap(columns: usize) -> usize {
     }
 }
 
+/// 预览栅格化的**防卡死三重上限**（见 `regenerate_preview`）。
+///
+/// 栅格化是主线程同步的 CG 离屏绘制（1080×1920）+ PNG 编码，单页百毫秒级。稿件
+/// 一长、页数一多就会把主线程堵死——表现为点「竖排预览」后鼠标转圈、关闭按钮与
+/// Esc 全部无反应（不是渲染慢，是主线程根本没有机会处理事件）。三重闸门把最坏
+/// 耗时封死在秒级，宁可少预览几页，也绝不让 UI 失去响应。
+/// ① 字数上限：超过就截断，只预览前 N 字。
+const PREVIEW_MAX_CHARS: usize = 900;
+/// ② 页数上限：达到即停止分页（哪怕还有余稿）。
+const PREVIEW_MAX_PAGES: usize = 6;
+/// ③ 时间预算（毫秒）：累计渲染耗时超预算立即停手，留最后一张给 UI。
+const PREVIEW_TIME_BUDGET_MS: u128 = 2500;
+/// 预览图在滚动容器里的最大显示高度（px）。
+///
+/// ⚠️ 绝不能用 `h_full()`：`h_full` = 100% 父容器高，而这里父容器是
+/// `overflow_y_scroll()`（高度由内容决定）→ 「容器高依赖内容、内容高依赖容器」
+/// 的**布局反馈环**，会让 GPUI 反复求解尺寸直至卡死。给显式上限即可解耦。
+const PREVIEW_IMG_MAX_H: f32 = 880.0;
+
 /// 文本区域结构定义在 `pdf_text::SourceRegion`（PDF 文本层抽取的数据源）。
 ///
 /// 真实接入时由带文本层的 PDF 填充（每个识别片段一条）；无文本层（扫描图）时
@@ -138,6 +157,8 @@ pub struct CollationWorkspace {
     preview_page: usize,
     /// 预览栅格化失败信息（红色提示，如系统缺中文字体）。
     preview_error: Option<String>,
+    /// 预览的温和提示（非错误）：如「长稿仅预览前 900 字 / 前 6 页」。
+    preview_note: Option<String>,
     /// 竖排预览样式：底色（宣纸黄 / 暗金黑 / 极简白 / 仿刻本）。
     preview_bg: ShareBg,
     /// 竖排预览样式：版框（红线框 / 黑线框 / 无边框 / 双边）。
@@ -182,6 +203,7 @@ impl CollationWorkspace {
             preview_paths: Vec::new(),
             preview_page: 0,
             preview_error: None,
+            preview_note: None,
             preview_bg: ShareBg::Xuan,
             preview_frame: ShareFrame::Red,
             preview_columns: 12,
@@ -663,15 +685,17 @@ impl CollationWorkspace {
     /// 当页边界推进——零猜测、绝不丢字，列数 / 底色 / 版框怎么变都安全。
     /// 任意一页失败则整体报错并清空已有页（绝不留下半截图）。
     fn regenerate_preview(&mut self) {
+        let t0 = std::time::Instant::now();
         // 先清旧页（绝不碰用户原文件）。
         for p in self.preview_paths.drain(..) {
             let _ = std::fs::remove_file(&p);
         }
         self.preview_error = None;
+        self.preview_note = None;
 
         // 预览是一条连续竖排流：去掉编辑器里的换行（段落概念不在简单预览里
         // 体现），否则 '\n' 会占一格变成竖排里的空白格。
-        let body: Vec<char> = self
+        let mut body: Vec<char> = self
             .text
             .chars()
             .filter(|c| *c != '\n' && *c != '\r')
@@ -680,13 +704,38 @@ impl CollationWorkspace {
             self.preview_page = 0;
             return; // 空稿：无图，浮层显示占位提示。
         }
+
+        // —— 防卡死闸门 ①：字数上限 ——
+        // 栅格化是主线程同步的 CG 绘制 + PNG 编码，不做上限时长稿会把主线程堵死
+        // （鼠标转圈、关闭/Esc 全无响应）。宁可只预览前 N 字，也要保住 UI 响应。
+        let orig_len = body.len();
+        let mut note: Option<String> = None;
+        if body.len() > PREVIEW_MAX_CHARS {
+            note = Some(format!(
+                "长稿仅预览前 {} 字（共 {} 字）",
+                PREVIEW_MAX_CHARS, orig_len
+            ));
+            body.truncate(PREVIEW_MAX_CHARS);
+        }
         let red = vec![false; body.len()];
 
         // 按当前列数取整页容量，喂入 ≤ 此值保证不缩字；再用实际落字数推进。
         let cap = preview_page_cap(self.preview_columns);
         let mut pages: Vec<PathBuf> = Vec::new();
         let mut start = 0usize;
+        let mut cut = false; // 是否被闸门 ②/③ 截断
         while start < body.len() {
+            // —— 防卡死闸门 ②：页数上限 ——
+            if pages.len() >= PREVIEW_MAX_PAGES {
+                cut = true;
+                break;
+            }
+            // —— 防卡死闸门 ③：时间预算 ——
+            // 每页开渲前先看累计耗时，超预算立即收手（已渲的页照常显示）。
+            if t0.elapsed().as_millis() > PREVIEW_TIME_BUDGET_MS {
+                cut = true;
+                break;
+            }
             let end = (start + cap).min(body.len());
             let spec = LayoutSpec {
                 body: &body[start..end],
@@ -737,12 +786,28 @@ impl CollationWorkspace {
             start += laid;
         }
 
+        if cut {
+            note = Some(format!(
+                "长稿仅预览前 {} 页（共 {} 字，余稿未渲以防界面卡死）",
+                pages.len(),
+                orig_len
+            ));
+        }
         self.preview_paths = pages;
         // 列数 / 样式变动可能改变页数，钳制当前页到有效范围。
         let max_idx = self.preview_paths.len().saturating_sub(1);
         if self.preview_page > max_idx {
             self.preview_page = max_idx;
         }
+        self.preview_note = note;
+        // 防卡死排障日志：字数 / 页数 / 耗时一目了然，便于真机判断是否还需要收紧。
+        eprintln!(
+            "[preview] chars={}/{} pages={} elapsed={}ms",
+            body.len(),
+            orig_len,
+            self.preview_paths.len(),
+            t0.elapsed().as_millis()
+        );
     }
 
     /// 右文某段 → 左图联动：记录段索引 + 左侧滚动到对应区域。
@@ -1112,7 +1177,11 @@ impl CollationWorkspace {
                         let idx = self.preview_page.min(self.preview_paths.len().saturating_sub(1));
                         match self.preview_paths.get(idx) {
                             Some(p) => div()
-                                .child(img(p.clone()).h_full())
+                                // ⚠️ 绝不用 h_full()：父容器是 overflow_y_scroll
+                                // （高度由内容定），h_full 会形成「容器高↔内容高」
+                                // 的布局反馈环 → GPUI 反复求解尺寸直至卡死。显式
+                                // 限高解耦，超高则由滚动容器接管。
+                                .child(img(p.clone()).max_h(px(PREVIEW_IMG_MAX_H)))
                                 // 翻页淡入：动画 id 含页下标，翻到新页 id 变 → 重播，
                                 // 同页重绘（hover 等）id 不变 → 停在 opacity 1 不闪。
                                 .with_animation(
@@ -1293,17 +1362,31 @@ impl CollationWorkspace {
 
     /// 底部状态条：仅显示预览栅格化错误（红）。多页提示由顶部翻页器承载。
     fn render_preview_status(&self) -> Option<gpui::Div> {
-        let e = self.preview_error.as_ref()?;
+        if let Some(e) = self.preview_error.as_ref() {
+            return Some(
+                div()
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .px(px(PAD))
+                    .bg(rgba(0xb0342c33))
+                    .text_color(rgb(0xb0342c))
+                    .text_size(px(13.0))
+                    .child(SharedString::from(e.clone())),
+            );
+        }
+        // 非错误提示：长稿被防卡死闸门截断（字数 / 页数 / 时间预算）。
+        let n = self.preview_note.as_ref()?;
         Some(
             div()
                 .h(px(24.0))
                 .flex()
                 .items_center()
                 .px(px(PAD))
-                .bg(rgba(0xb0342c33))
-                .text_color(rgb(0xb0342c))
+                .bg(rgba(0x8c2b2218))
+                .text_color(rgb(0x8c2b22))
                 .text_size(px(13.0))
-                .child(SharedString::from(e.clone())),
+                .child(SharedString::from(n.clone())),
         )
     }
 }
