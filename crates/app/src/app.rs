@@ -809,6 +809,13 @@ pub struct Root {
     /// 自动档每帧重算；想锁死就在「版式」面板点具体列数（那会把这里置 false），
     /// 点回「自动」再放开。
     pub columns_auto: bool,
+    /// **自适应列数重算缓存**（v1.9.19 Auto-Fit）：上次决策时的视口宽 / 高。
+    /// 初始 -1 表示「尚未决策，首次必行」；之后只有视口越过
+    /// `grid::FIT_RESIZE_THRESHOLD` 才重算，避免拖动窗口时每帧整本重排。
+    pub fit_vw: f32,
+    pub fit_vh: f32,
+    /// 上次决策时的「内容签名」（章均字数）——换书 / 内容体量变化即重算。
+    pub fit_avg: usize,
     /// 窄屏小字提示是否已弹过（避免 `fit_sizes` 每帧重设 `notice` 把提示刷没）。
     ///
     /// 窄屏硬选 14 列时字号会跌破 `GRID_FS_MIN`（12px）——引擎已自动把它
@@ -1372,6 +1379,10 @@ impl Root {
             auto_duplex: true,
             // 列数默认自动：按书的内容与可用宽算，不写死某一档。
             columns_auto: true,
+            // 自适应重算缓存：初始 -1 → 首次必算（见 `fit_vw` 字段注释）。
+            fit_vw: -1.0,
+            fit_vh: -1.0,
+            fit_avg: usize::MAX,
             pending_anchor: None,
             min_font_noticed: false,
             viewport_w: 1280.0,
@@ -2314,46 +2325,37 @@ impl Root {
         // 最终渲染同一口径——不会出现「算出来 12 列、排出来却是另一码事」。
         // 铺法取决于列数、列数又取决于铺法给的可用宽，故至多两轮收敛。
         if self.columns_auto {
+            // 响应式重算阈值（v1.9.19 Auto-Fit）：视口相对上次决策变化未越过
+            // `FIT_RESIZE_THRESHOLD`、且内容体量（`avg`）未变时**跳过**重算——
+            // 只在越过阈值或换了书时才跳一次，避免拖动窗口时每帧都整本重排
+            // （换档 = 重排 + 页码全变，极贵）。
+            // ⚠️ 这些计算只在 Entity 的布局 / 更新函数里跑、**不在 paint 循环里重复算**；
+            // 缓存即为此——把「最后一次决策用的视口 / 内容签名」存下来比对。
             let avg = self
                 .book
                 .as_ref()
                 .map(|b| b.avg_chapter_chars())
                 .unwrap_or(0);
+            let moved = self.fit_vw < 0.0
+                || self.fit_avg != avg
+                || (self.viewport_w - self.fit_vw).abs() > crate::grid::FIT_RESIZE_THRESHOLD
+                || (self.viewport_h - self.fit_vh).abs() > crate::grid::FIT_RESIZE_THRESHOLD;
+            if moved {
             let mut cols = self.grid.columns;
             for _ in 0..2 {
-                let probe = mode;
-                let auto = crate::grid::auto_columns(
-                    |c| {
-                        crate::grid::calculate_grid(crate::grid::GridInput {
-                            columns: c,
-                            mode: probe,
-                            content_w,
-                            content_h,
-                            zoom,
-                            edge,
-                            head,
-                            foot,
-                            margin,
-                            line_scale,
-                            // 试算每一档时按**该档的行款**取比例：八行本字大
-                            // 行宽、十四行信笺字小行密——打分才判得准。
-                            fs_ratio: crate::grid::LayoutConfig::by_columns(c)
-                                .map(|x| x.fs_ratio)
-                                .unwrap_or(crate::grid::GRID_FS_RATIO),
-                            line_ratio: crate::grid::LayoutConfig::by_columns(c)
-                                .map(|x| x.line_ratio)
-                                .unwrap_or(0.0),
-                            // 留白档照当前偏好走：自动选列数不该把用户选的
-                            // 版心率甩在一边（试算与终版同口径）。
-                            banxin_ratio: self.banxin_ratio,
-                            dir,
-                            fs_max,
-                        })
-                        .m
-                        .fs
-                    },
-                    avg,
-                );
+                // v1.9.19：自适应列数匹配引擎——视口 + 内容长度双驱动，真实网格
+                // 试算，与渲染同源。取代旧的 `auto_columns`（仅内容驱动 + 字号兜底）。
+                let mut fit = crate::grid::ColumnFitInput::new(content_w, content_h, avg);
+                fit.zoom = zoom;
+                fit.margin = margin;
+                fit.banxin_ratio = self.banxin_ratio;
+                fit.edge = edge;
+                fit.head = head;
+                fit.foot = foot;
+                fit.line_scale = line_scale;
+                fit.dir = dir;
+                fit.fs_max = fs_max;
+                let auto = crate::grid::calculate_best_column_layout(fit).columns;
                 // v1.9.15：方书（大量短句）直接上最密十四行信笺本，不随
                 // 章均字数退到疏朗本——短句在疏朗本里会撑出大片空白。
                 let next = if self
@@ -2391,6 +2393,18 @@ impl Root {
                 if let Some(c) = crate::grid::LAYOUT_CONFIGS.iter().find(|c| c.columns == cols) {
                     self.layout_key = c.key;
                 }
+            }
+                // 记下本次决策的视口与内容签名，下次未越过阈值 / 未换书就跳过重算。
+                self.fit_vw = self.viewport_w;
+                self.fit_vh = self.viewport_h;
+                self.fit_avg = avg;
+            }
+            // 确保版式键与当前列数一致（自动档下版式键应跟随列数）。
+            if let Some(c) = crate::grid::LAYOUT_CONFIGS
+                .iter()
+                .find(|c| c.columns == self.grid.columns)
+            {
+                self.layout_key = c.key;
             }
         }
         self.layout_mode = mode;

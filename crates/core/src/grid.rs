@@ -554,6 +554,223 @@ pub fn auto_columns(fs_of: impl Fn(usize) -> f32, avg_chapter_chars: usize) -> u
     cols
 }
 
+// ── 自适应列数匹配引擎（Auto-Fit Column Engine, v1.9.19）──────────────────
+/// **视觉最饱满**的判据：黄金分割比。一面被文字填到约 61.8% 时，既不空旷
+/// （稀疏电线杆）也不拥挤（逼到翻页），最符合古籍版面的呼吸感。
+pub const GOLDEN_FILL: f32 = 0.618;
+/// 纯函数几何默认值里的「版框 + 内边距双边预留」——与 app 层 `ANCIENT_EDGE=50` 同源。
+pub const FIT_EDGE_DEFAULT: f32 = 50.0;
+/// **响应式重算阈值**（px）：窗口尺寸相对上次决策变化超过此值，才重新挑列数。
+/// 防「拖动窗口时每帧都整本重排」的抖动——只在越过阈值时跳一次（见 app 层）。
+pub const FIT_RESIZE_THRESHOLD: f32 = 24.0;
+
+/// **自适应列数匹配引擎**的输入。
+///
+/// 三个必填字段（`available_width` / `available_height` / `total_chars`）是用户
+/// 指定的决策依据；其余几何参数都有与渲染层 [`compute_grid`] 同源的默认值，调用方
+/// （GPUI 壳）可覆盖成真实视口扣减后的数值，做到「算出来几列、排出来就几列」，
+/// 不漂移。
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnFitInput {
+    /// 可用内容区宽（已扣工具栏 / 状态栏 / 四边留白）。
+    pub available_width: f32,
+    /// 可用内容区高。
+    pub available_height: f32,
+    /// 待排文本的总字数（用于防稀疏与溢出评估）。
+    pub total_chars: usize,
+    /// 字级倍率。
+    pub zoom: f32,
+    /// 四周留白比例（相对内容区）。
+    pub margin: f32,
+    /// 版心率（留白档）。
+    pub banxin_ratio: f32,
+    /// 版框 + 内边距双边预留。
+    pub edge: f32,
+    /// 天头预留。
+    pub head: f32,
+    /// 地脚预留。
+    pub foot: f32,
+    /// 行高缩放（随正文字体）。
+    pub line_scale: f32,
+    /// 排版方向。
+    pub dir: GridDir,
+    /// 字号上限（px）。
+    pub fs_max: f32,
+}
+
+impl Default for ColumnFitInput {
+    fn default() -> Self {
+        ColumnFitInput {
+            available_width: 800.0,
+            available_height: 1000.0,
+            total_chars: 0,
+            zoom: 1.0,
+            margin: 0.04,
+            banxin_ratio: BANXIN_RATIOS[BANXIN_TIER_DEFAULT],
+            edge: FIT_EDGE_DEFAULT,
+            head: 0.0,
+            foot: 0.0,
+            line_scale: 1.0,
+            dir: GridDir::Vertical,
+            fs_max: GRID_FS_MAX,
+        }
+    }
+}
+
+impl ColumnFitInput {
+    /// 用户指定的三参数构造；其余取同源默认值。
+    pub fn new(available_width: f32, available_height: f32, total_chars: usize) -> Self {
+        let mut s = Self::default();
+        s.available_width = available_width;
+        s.available_height = available_height;
+        s.total_chars = total_chars;
+        s
+    }
+}
+
+/// **自适应列数匹配引擎**的结果（不止列数，附度量供调试 / 状态栏）。
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnFitResult {
+    /// **最终选定的列数**（四档之一：8 / 10 / 12 / 14）。
+    pub columns: usize,
+    /// 该列数下的字格宽（列宽）。
+    pub column_width: f32,
+    /// 该列数下的正文实际字号。
+    pub font_size: f32,
+    /// 每列实际行数（= 每列能排的字数）。
+    pub rows_per_column: usize,
+    /// 该列数下一面（一叶）的总容量（列数 × 每列字数）。
+    pub total_capacity: usize,
+    /// 排下全部文本需要的页数（>1 即溢出到下一页）。
+    pub pages: usize,
+    /// 单面填充率（`total_chars / total_capacity`，截到 1.0）。
+    pub fill_ratio: f32,
+    /// 综合打分（越接近黄金填充越满越赏心）。
+    pub score: f32,
+}
+
+/// **自适应列数匹配引擎（Auto-Fit Column Engine）**——纯函数，不碰 GPUI。
+///
+/// 输入当前窗口可用大小与文本总字数，从 [`GRID_COLUMN_CHOICES`]（[14, 12, 10, 8]，
+/// 优先尝试更密集）里挑出最完美的一档。四步淘汰 / 匹配，与 [`compute_grid`]
+/// **共用同一套几何**（每档都拿真实网格试算，绝不两套公式各写一遍）：
+///
+/// 1. **物理宽度底线**：`column_width` 与 `font_size` 经 [`compute_grid`] 反算。
+///    若窗口太小、这档连「满行款的最小字号」都撑不住——引擎被迫锁最小字号、
+///    一列排不满（`min_font_hit`）→ 淘汰该档，退到更疏的档，让整行款在可读字号
+///    下排得下（绝不靠单页滚动硬塞）。
+/// 2. **内容密度（防稀疏）**：文本太少却用密列，会像「稀疏的电线杆」。用
+///    [`content_columns`] 把「内容长度 → 列数上限」定成天花板——比内容体量更密的档
+///    一律淘汰（如 15 字的小药方 → 天花板 8 列，14/12 列直接出局，自动落到 8 列
+///    疏朗大字，像一张刻意开的处方签，而非半空的海报）。
+/// 3. **溢出评估**：若按该档排总高超出 `available_height`（= `pages > 1`），**不淘汰**
+///    ——读者本就该翻页；但「能在一面内排下」会小幅加分（见第 4 步），鼓励不翻页的饱满。
+/// 4. **寻找最优解**：在 1–3 都合法的候选里，选 `fill_ratio` 最接近 [`GOLDEN_FILL`]
+///    （约 61.8%）的一档——即「视觉最饱满」：内容该密就密、该疏就疏，不空旷也不拥挤。
+///
+/// 返回 [`ColumnFitResult`]，其中 `columns` 即最终列数；长文溢出时各候选 `fill_ratio`
+/// 触顶同分，规则退化为「天花板内最密档」，与 [`content_columns`] 的疏散梯度一致。
+pub fn calculate_best_column_layout(input: ColumnFitInput) -> ColumnFitResult {
+    // 内容长度决定的「密度天花板」：比它更密的档一律视作稀疏，淘汰。
+    let density_ceiling = content_columns(input.total_chars);
+    let mut best: Option<ColumnFitResult> = None;
+
+    // 优先尝试更密集的列数（[14, 12, 10, 8]）。
+    for &n in GRID_COLUMN_CHOICES.iter().rev() {
+        let cfg = match LayoutConfig::by_columns(n) {
+            Some(c) => c,
+            None => continue,
+        };
+        // 该档在真实视口下的铺法（对开 / 单叶），与渲染同源。
+        let mode = if should_face(input.available_width, input.available_height, n, input.zoom) {
+            LayoutMode::Facing
+        } else {
+            LayoutMode::Single
+        };
+        let m = calculate_grid(GridInput {
+            columns: n,
+            mode,
+            content_w: input.available_width,
+            content_h: input.available_height,
+            zoom: input.zoom,
+            edge: input.edge,
+            head: input.head,
+            foot: input.foot,
+            margin: input.margin,
+            line_scale: input.line_scale,
+            fs_ratio: cfg.fs_ratio,
+            line_ratio: cfg.line_ratio,
+            banxin_ratio: input.banxin_ratio,
+            dir: input.dir,
+            fs_max: input.fs_max,
+        })
+        .m;
+
+        // 每列实际字数（行数）；一面总容量 = 列数 × 每列字数。
+        let per_col = m.chars_per_col.max(1);
+        let capacity = n * per_col;
+        // 需要多少列才排得下（竖排每列 per_col 字）。
+        let filled_cols = ((input.total_chars as f32 / per_col as f32).ceil()).max(1.0) as usize;
+        let pages = ((filled_cols as f32 / n as f32).ceil()).max(1.0) as usize;
+        let fill_ratio = if capacity > 0 {
+            (input.total_chars as f32 / capacity as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // ── RULE 1：物理宽度底线 ──
+        // 窗口太小，这档连「满行款的最小字号」都撑不住（引擎被迫锁最小字号、
+        // 一列排不满 → 单页滚动）。退到更疏的档，让整行款在可读字号下排得下。
+        if m.min_font_hit {
+            continue;
+        }
+
+        // ── RULE 2：内容密度（防稀疏）天花板 ──
+        if n > density_ceiling {
+            continue;
+        }
+
+        // ── RULE 4：视觉最饱满（越接近黄金填充越赏心）；一面能排下略加权 ──
+        let mut score = 1.0 - (fill_ratio - GOLDEN_FILL).abs();
+        if pages <= 1 {
+            score += 0.05;
+        }
+
+        let cand = ColumnFitResult {
+            columns: n,
+            column_width: m.col_w,
+            font_size: m.fs,
+            rows_per_column: m.rows,
+            total_capacity: capacity,
+            pages,
+            fill_ratio,
+            score,
+        };
+        // 取最高分（= 天花板内最密且填充最接近黄金的档）；严格大于保证同分时
+        // 保留先遇到的更密档（触顶溢出时退化为最密合法档）。
+        if best.is_none() || score > best.unwrap().score {
+            best = Some(cand);
+        }
+    }
+
+    best.unwrap_or_else(|| ColumnFitResult {
+        columns: GRID_COLUMN_CHOICES[0],
+        column_width: 0.0,
+        font_size: GRID_FS_MIN,
+        rows_per_column: 1,
+        total_capacity: GRID_COLUMN_CHOICES[0],
+        pages: 1,
+        fill_ratio: 0.0,
+        score: 0.0,
+    })
+}
+
+/// 便捷封装：只需用户指定的三参数，返回最终列数。
+pub fn best_column_count(available_width: f32, available_height: f32, total_chars: usize) -> usize {
+    calculate_best_column_layout(ColumnFitInput::new(available_width, available_height, total_chars))
+        .columns
+}
+
 /// 网格度量：由 [`compute_grid`] 算出，渲染与分页共用，不再写死任何像素。
 #[derive(Clone, Copy, Debug)]
 pub struct GridMetrics {
@@ -1458,6 +1675,83 @@ mod tests {
         assert!(m.col_w >= m.fs - 0.01, "col_w 须 ≥ fs，否则字超格");
         // 行款兜底：锁字号后一列排不满 26 字（渲染层开滚动 + 状态栏提示）。
         assert!(m.chars_per_col < m.target_chars, "兜底时行款应排不满");
+    }
+
+    // ── 自适应列数匹配引擎（Auto-Fit Column Engine）──
+
+    /// 常规大视口：引擎与 `content_columns` 梯度一致——短章疏朗、长篇章回密集。
+    #[test]
+    fn auto_fit_follows_content_gradient_on_wide_viewport() {
+        let (cw, ch) = (1400.0, 1000.0);
+        // 15 字的小药方 → 天花板 8 列（疏朗大字，绝不稀疏电线杆）。
+        assert_eq!(best_column_count(cw, ch, 15), 8);
+        // 中等篇幅（200 字）→ 10 列。
+        assert_eq!(best_column_count(cw, ch, 200), 10);
+        // 长篇（5000 字）→ 14 列。
+        assert_eq!(best_column_count(cw, ch, 5000), 14);
+    }
+
+    /// RULE 2（防稀疏）：极短文本绝不上密列，固定落到 8 列。
+    #[test]
+    fn auto_fit_never_picks_dense_for_sparse_text() {
+        let (cw, ch) = (1400.0, 1000.0);
+        for n in [1usize, 5, 15, 40, 80] {
+            let r = calculate_best_column_layout(ColumnFitInput::new(cw, ch, n));
+            assert_eq!(r.columns, 8, "{n} 字不该上密列");
+        }
+    }
+
+    /// RULE 1（物理宽度底线）：窄到字破格 / 字过小时，逐级退到能排下的列数。
+    #[test]
+    fn auto_fit_retreats_when_columns_get_too_small_to_read() {
+        // 极窄内容区：14 列必然字破格，引擎应退到更疏的档；绝不返回 >12。
+        let r = calculate_best_column_layout(ColumnFitInput::new(220.0, 400.0, 5000));
+        assert!(r.columns <= 12, "窄屏 14 列必退：得到 {}", r.columns);
+        assert!(r.font_size >= GRID_FS_MIN - 0.01, "字号守下限");
+        assert!(r.column_width >= r.font_size - 0.01, "列宽守字格下限");
+    }
+
+    /// RULE 3（溢出不淘汰）：长文溢出到多页时，引擎仍选天花板内最密档（不崩、不降级）。
+    #[test]
+    fn auto_fit_keeps_dense_when_overflowing() {
+        let r = calculate_best_column_layout(ColumnFitInput::new(1400.0, 1000.0, 5000));
+        assert_eq!(r.columns, 14);
+        assert!(r.pages > 1, "长文应多页：{} 页", r.pages);
+        assert!(r.fill_ratio >= 0.99, "溢出时填充率触顶");
+    }
+
+    /// 引擎与渲染层 `compute_grid` 同源：挑出的列数确实能在给定视口下可读地排下。
+    #[test]
+    fn auto_fit_column_is_renderable_at_chosen_size() {
+        let (cw, ch) = (1200.0, 900.0);
+        let n = best_column_count(cw, ch, 300);
+        let cfg = LayoutConfig::by_columns(n).unwrap();
+        let m = calculate_grid(
+            GridInput {
+                columns: n,
+                mode: if should_face(cw, ch, n, 1.0) {
+                    LayoutMode::Facing
+                } else {
+                    LayoutMode::Single
+                },
+                content_w: cw,
+                content_h: ch,
+                zoom: 1.0,
+                edge: FIT_EDGE_DEFAULT,
+                head: 0.0,
+                foot: 0.0,
+                margin: 0.04,
+                line_scale: 1.0,
+                fs_ratio: cfg.fs_ratio,
+                line_ratio: cfg.line_ratio,
+                banxin_ratio: BANXIN_RATIOS[BANXIN_TIER_DEFAULT],
+                dir: GridDir::Vertical,
+                fs_max: GRID_FS_MAX,
+            },
+        )
+        .m;
+        assert!(m.fs >= GRID_FS_MIN - 0.01, "挑出的列数必须可读：{} 列 fs={}", n, m.fs);
+        assert!(m.col_w >= m.fs - 0.01, "挑出的列数字不破格：{} 列 col_w={}", n, m.col_w);
     }
 
     #[test]
