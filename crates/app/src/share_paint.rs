@@ -143,6 +143,35 @@ pub const SPREAD_FOLD_W: f32 = 1.4;
 /// 中缝线的不透明度（取版框墨色的这一档，比版框淡一档，不抢版面）。
 const SPREAD_FOLD_ALPHA: f32 = 0.70;
 
+// ---- 页级裁剪（v1.9.21）----------------------------------------------------
+//
+// 拼版是「两页并一张纸」：两页共用一块画布 / 一个 PDF 页。排版本该严格自律
+// （每页的字只落在自己那半张纸上），可一旦哪个算式兜底失效，越界的字**不会
+// 被任何东西挡住**——它会直接画到隔壁那页上，中文古籍里就是「左页最右一列
+// 压在中缝鱼尾上」那种事故（用户 2026-11-01 真机截图）。
+//
+// 排版侧已经收紧（`grid::compute_grid` 第 9 条：一叶绝不许宽过半张纸），这里
+// 是**第二道保险**：落每一页之前先 clip 到它的整页矩形，谁越界谁被裁掉。
+// `core-graphics` 0.24 没包 `CGContextSave/RestoreGState`，就地声明。
+extern "C" {
+    fn CGContextSaveGState(ctx: core_graphics::sys::CGContextRef);
+    fn CGContextRestoreGState(ctx: core_graphics::sys::CGContextRef);
+}
+
+/// 在**一页自己的矩形**里落笔：进出各一次 gstate，越界墨迹一律裁掉。
+fn with_page_clip(
+    ctx: &CGContext,
+    rect: CGRect,
+    draw: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    use foreign_types::ForeignType;
+    unsafe { CGContextSaveGState(ctx.as_ptr()) };
+    ctx.clip_to_rect(rect);
+    let r = draw();
+    unsafe { CGContextRestoreGState(ctx.as_ptr()) };
+    r
+}
+
 /// 版框在**屏幕坐标**（左上原点）里的纵向范围，以及它的墨色。
 ///
 /// 中缝线只画到版框的上下边，绝不贯穿整张纸——贯穿就成了裁切线，不像书。
@@ -208,9 +237,16 @@ pub fn render_spread_png(
     ));
 
     // 两页按装订模式落到各自的半边（右开本奇左偶右，左开本反之）。
+    // 每页在自己的矩形里落笔并裁剪 —— 一页的字绝不许画到另一页上（见
+    // `with_page_clip` 的说明）。
     let slots = spread_slots(sheet_w, first.w, binding);
     for (i, p) in pages.iter().take(2).enumerate() {
-        draw_card(p, &ctx, h as f64, slots[i] as f64, 0.0)?;
+        let ox = slots[i] as f64;
+        let box_ = CGRect::new(
+            &CGPoint::new(ox, 0.0),
+            &CGSize::new(p.w as f64, h as f64),
+        );
+        with_page_clip(&ctx, box_, || draw_card(p, &ctx, h as f64, ox, 0.0))?;
     }
     // 正中一条中缝线：让「一张纸对折、左右各一页」一眼可辨。
     draw_fold(&ctx, h as f64, sheet_w, first);
@@ -378,12 +414,17 @@ fn pdf_write(
             let Some(page) = pages.get(*idx) else { continue };
             // 每页自带底色，先铺满它自己那块（单页拼版时与整纸同色，多铺一次无害）。
             let (pr, pg, pb) = rgb(page.bg);
-            ctx.set_rgb_fill_color(pr, pg, pb, 1.0);
-            ctx.fill_rect(CGRect::new(
+            let box_ = CGRect::new(
                 &CGPoint::new(*dx, sheet_h - page.h as f64 - *dy),
                 &CGSize::new(page.w as f64, page.h as f64),
-            ));
-            if let Err(e) = draw_card(page, &ctx, sheet_h, *dx, *dy) {
+            );
+            ctx.set_rgb_fill_color(pr, pg, pb, 1.0);
+            ctx.fill_rect(box_);
+            // 落笔前 clip 到本页矩形：越界的字被裁掉，绝不写进隔壁那半张纸。
+            let drew = with_page_clip(&ctx, box_, || {
+                draw_card(page, &ctx, sheet_h, *dx, *dy)
+            });
+            if let Err(e) = drew {
                 failed = Some(e);
                 break;
             }

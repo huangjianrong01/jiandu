@@ -878,12 +878,12 @@ pub fn compute_grid(
     // 6) 行高 = 可用高 / 每列目标字数（行款值）；字号 = 行高 × 0.85 × 字级
     //    倍率，再按上下限夹住（专注模式传 INFINITY 豁免上限）。
     let row_h_std = inner_h / target;
-    let fs = (row_h_std * FS_OF_ROW * zoom).clamp(GRID_FS_MIN, cap);
+    let mut fs = (row_h_std * FS_OF_ROW * zoom).clamp(GRID_FS_MIN, cap);
     // 7) 窗口过小：按公式算出的字号跌破下限 → **锁定最小字号**，行高反被
     //    抬大 → 一列排不下 `target` 字（`rows < target`）。此时渲染层开
     //    单页滚动、状态栏提示「无法展示完整的 X 行 Y 字」——绝不拆行款，
     //    绝不把字压成一团黑疙瘩。
-    let min_hit = row_h_std * FS_OF_ROW * zoom < GRID_FS_MIN;
+    let mut min_hit = row_h_std * FS_OF_ROW * zoom < GRID_FS_MIN;
     // **行高 = max(行款基准, 字号 / FS_OF_ROW)**（v1.84.1 修复「字号最大时字
     // 叠在一起」）：这是 `fs = row_h × FS_OF_ROW` 的逆运算——一旦 zoom / 专注
     // 模式把 fs 顶过 `row_h_std × FS_OF_ROW`，行高立即用 fs 反推撑开（= 字号
@@ -919,14 +919,36 @@ pub fn compute_grid(
         .max(0.0);
     let inner_w = (per_leaf - edge - 2.0 * mw).max(40.0);
     let want = (banxin_w - edge) / n; // 版心率反推的列宽
-    let col_w = if want >= fs * COL_W_MIN_OF_FS {
+    let mut col_w = if want >= fs * COL_W_MIN_OF_FS {
         want.clamp(fs * COL_W_MIN_OF_FS, row_h * COL_W_MAX_OF_ROW)
     } else {
         // 窄屏（手机 12/14 列）或放大字号后：可用宽放不下「字号 × 下限」的字，
-        // 退回可用宽均分——版心占比超标 → 横向滚动，但列宽仍强制 ≥ 1.1× 字号，
+        // 退回可用宽均分——版心占比超标，但列宽仍强制 ≥ 1.1× 字号，
         // 字绝不破格、绝不挤进邻列。
         (inner_w / n).clamp(fs * COL_W_MIN_OF_FS, row_h * COL_W_MAX_OF_ROW)
     };
+
+    // 9) **一叶绝不许宽过它的半张纸**（v1.9.21，真机双页样张的事故收口）。
+    //
+    // 上面两条分支里，`col_w` 的下限是「字号 × 1.1」。窄叶 + 多列 + 放大字号
+    // 三者撞在一起时，这个下限会比 `inner_w / n`（一叶真正给得起的一列）还
+    // 大——`n × col_w` 于是超出内宽，整片网格从叶的左缘往右多长出一截：
+    // 双页时正好**顶进中缝、压在两枚鱼尾上**，右半叶则直接**穿出外侧版框**
+    // （用户 2026-11-01 截图：「斯不善已」那一列与版心重合甚至出血）。
+    //
+    // 旧的「横向滚动兜底」只在**单叶**成立（`facing == false`，外层是 scroll
+    // 容器，多出来就让人往右滑）；**双叶是 flex_row 并排，没有滚动出口**，
+    // 多出来的宽度只会糊到隔壁叶上。故只在 `facing` 时无条件兜底：
+    // 先把列宽压回 `inner_w / n`（网格恰好填满版心，一像素不越界），再按同一
+    // 比例把字号降到 `col_w / COL_W_MIN_OF_FS`——「字不破格」与「字不出叶」
+    // 两条铁律同时成立，只是字小了一号。此时置 `min_font_hit`，由状态栏提示
+    // 「窗口太窄，装不下这一版」，把选择权（加宽窗口 / 减列数）交还用户。
+    let fit_w = (inner_w / n).max(1.0);
+    if facing && col_w > fit_w + 1e-3 {
+        col_w = fit_w;
+        fs = (col_w / COL_W_MIN_OF_FS).clamp(1.0, cap);
+        min_hit = true;
+    }
 
     let grid_w = (cfg.columns as f32 + extra_cols) * col_w;
     let grid_h = rows as f32 * row_h;
@@ -1281,6 +1303,52 @@ mod tests {
                 assert_eq!(p.m.chars_per_col, p.m.target_chars);
             }
         }
+    }
+
+    /// **一叶不许宽过它的半张纸**（v1.9.21）。
+    ///
+    /// 真机双页样张的事故：左半叶最右一列（「斯不善已」那一列）压到中缝上、
+    /// 甚至穿出外框。根因不在渲染，在**列宽兜底**——`inner_w / n` 小于
+    /// 「字号 × 1.1」时，`col_w` 被下限顶上去，`n × col_w` 于是大于版心宽，
+    /// 整片网格右移出叶，字就压进中缝、越过版框。
+    ///
+    /// 这条扫全档位：对开时 `outer_w`（一叶的纸宽）必须 ≤ 单叶可用宽，
+    /// 且两叶 + 中缝必须塞得进内容区。
+    #[test]
+    fn a_leaf_never_widens_past_its_half() {
+        let mut bad: Vec<String> = Vec::new();
+        for cw in [860.0f32, 1024.0, 1276.0, 1440.0, 1680.0, 2048.0, 2560.0] {
+            for ch in [640.0f32, 758.0, 900.0, 1100.0] {
+                for columns in [8usize, 10, 12, 14] {
+                    for (tier, ratio) in BANXIN_RATIOS.iter().enumerate() {
+                        for zoom in [1.0f32, 1.3, 1.6] {
+                            let mut inp = input(LayoutMode::Facing, columns, cw, ch);
+                            inp.banxin_ratio = *ratio;
+                            inp.zoom = zoom;
+                            let p = calculate_grid(inp);
+                            let g = gutter_w(cw, columns, inp.edge, inp.margin);
+                            let per_leaf = (cw - g) / 2.0;
+                            if p.m.outer_w > per_leaf + 0.5 {
+                                bad.push(format!(
+                                    "cw={cw} ch={ch} cols={columns} tier={tier} zoom={zoom}: \
+                                     outer_w={:.1} > per_leaf={:.1}（溢出 {:.1}px = {:.2} 列）",
+                                    p.m.outer_w,
+                                    per_leaf,
+                                    p.m.outer_w - per_leaf,
+                                    (p.m.outer_w - per_leaf) / p.m.col_w
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "有 {} 组参数会把一叶撑出半张纸（字压中缝 / 穿外框）：\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
     }
 
     #[test]

@@ -1012,6 +1012,19 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
         // 且是句读，就**不占格**，改挂到网格右缘之外的悬挂沟里（X 轴偏移），
         // 正文照旧顶格——绝不为让标点而把后面的字往下挤。
         let head_punct = row == 0 && is_punct(ch);
+        // 悬挂沟里**真正空着**的那一段（从 `HANG_GAP` 起，到预留的沟底为止）。
+        //
+        // v1.9.21 修「句读出框」：旧代码把悬挂字当成一整格宽（`cell`）去落，
+        // 位置却在 `block_w + HANG_GAP·cell`——于是它的右缘跑到
+        // `block_w + (HANG_GAP+1)·cell`，比预留的 `HANG_GUTTER`(=0.62) 多出
+        // 0.46 格，**正好越出版框**（A3 8 列实测：字盒 783.9..804.9，框右 796，
+        // 出血 8.9pt）。现在字盒就是沟里空着的那一段，句读墨迹本来就比格小
+        // （`PUNCT_FS_RATIO`），缩进窄盒里一个像素都不丢，右缘恰好压在沟底。
+        let hang_box = if head_punct {
+            (cell * (HANG_GUTTER - HANG_GAP)).max(cell * 0.15)
+        } else {
+            cell
+        };
         let x = if head_punct {
             x0 + block_w + cell * HANG_GAP
         } else {
@@ -1061,7 +1074,8 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
             ch,
             x,
             y,
-            cell,
+            // 悬挂的句读落进沟里那段窄盒（见 `hang_box` 的说明），正文恒为整格。
+            cell: hang_box,
             fs: ch_fs,
             color,
             punct: is_punct(ch),
@@ -1928,5 +1942,67 @@ mod tests {
             short_l > full_l + g.w * 0.25,
             "末页的余白没落在左侧：满页左缘 {full_l:.1} / 末页左缘 {short_l:.1}"
         );
+    }
+
+    /// **字一格都不许出框**（v1.9.21，真机「版心重合 / 出血」的收口）。
+    ///
+    /// 双页样张上，左页最右一列要顶进中缝、右页则可能穿出外侧版框——只要
+    /// 任何一个 `PlacedChar` 的横向盒子越过版框内缘，就会发生。这条把版框
+    /// 矩形真的解出来（`rects` 里面积最大的那个描边矩形），逐字核 x 区间：
+    /// 排版结果必须**全部**落在 [框左, 框右] 里，含列首悬挂的句读。
+    ///
+    /// 三种情况都排：满页、末页（右起不顶格）、以及「句读落在列首」这种
+    /// 会走悬挂沟的极端稿子。
+    #[test]
+    fn no_glyph_ever_leaves_the_frame() {
+        for paper in [Paper::A3, Paper::A4, Paper::Card] {
+            for imp in [Imposition::Single, Imposition::Spread] {
+                let g = paper.page_pdf_geom(imp);
+                for columns in [8usize, 12, 14] {
+                    for template in [
+                        // 满页正文
+                        "天地玄黃宇宙洪荒日月盈昃辰宿列張寒來暑往秋收冬藏",
+                        // 列首全是句读（悬挂沟那条路）
+                        "，。、天地，玄黃。宇宙、洪荒",
+                        // 短稿（末页右起顶格）
+                        "天地玄黃",
+                    ] {
+                        let body: Vec<char> = template.chars().cycle().take(400).collect();
+                        let red = vec![false; body.len()];
+                        let mut sp = spec(&body, &red);
+                        sp.show_sign = false;
+                        sp.show_date = false;
+                        sp.show_notes = false;
+                        sp.columns = columns;
+                        sp.w = g.w;
+                        sp.h = g.h;
+                        let l = layout(&sp);
+                        // 版框 = 面积最大的描边矩形（与 `share_paint::frame_span` 同源）。
+                        let frame = l
+                            .rects
+                            .iter()
+                            .filter(|r| r.stroke.is_some())
+                            .max_by(|a, b| {
+                                (a.w * a.h)
+                                    .partial_cmp(&(b.w * b.h))
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .expect("版框矩形必须存在");
+                        let (fl, fr) = (frame.x, frame.x + frame.w);
+                        for c in &l.chars {
+                            assert!(
+                                c.x >= fl - 0.5 && c.x + c.cell <= fr + 0.5,
+                                "{paper:?}/{imp:?}/{columns} 列：字 '{}' 出框了 \
+                                 （x∈[{:.1}, {:.1}]，框∈[{fl:.1}, {fr:.1}]，悬挂={}）",
+                                c.ch,
+                                c.x,
+                                c.x + c.cell,
+                                c.hung
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
