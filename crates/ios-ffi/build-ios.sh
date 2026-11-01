@@ -8,8 +8,8 @@
 #   ./crates/ios-ffi/build-ios.sh
 #
 # 产物：
-#   bindings/JianDuCore.swift + module.modulemap   （Swift 绑定）
-#   JianDuCore.xcframework                          （喂给 Xcode，device+sim 双 slice）
+#   bindings/jiandu_ios_ffi.swift + module.modulemap   （Swift 绑定，拖进 Xcode 作源码）
+#   JianDuCore.xcframework                            （喂给 Xcode，device+sim 双 slice）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,6 +42,10 @@ xcodebuild -create-xcframework \
   -output JianDuCore.xcframework
 
 echo "==> [5/5] 校验：XCFramework 内含两份真静态库"
-find JianDuCore.xcframework -name '*.a' | tee /dev/stderr | grep -q . && \
-  echo "✅ JianDuCore.xcframework 已生成（含 device + simulator 切片）" || \
-  echo "❌ 未找到静态库切片"
+count=$(find JianDuCore.xcframework -name '*.a' | wc -l | tr -d ' ')
+if [ "$count" -ge 2 ]; then
+  echo "✅ JianDuCore.xcframework 已生成（含 $count 份静态库切片：device + simulator）"
+else
+  echo "❌ 未找到足够的静态库切片（找到 $count 份）"
+  exit 1
+fi
