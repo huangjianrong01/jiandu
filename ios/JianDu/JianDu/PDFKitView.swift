@@ -10,6 +10,10 @@ import UIKit
 final class PDFViewHolder: ObservableObject {
     @Published var pdfView: PDFView?
     @Published var scrollNonce: Int = 0
+    /// 反向联动：PDFView 上的点击 / Apple Pencil 落点（PDFView 本地坐标），
+    /// 由父视图设置，用于把触摸坐标换回页坐标、反向选中右侧文本。
+    /// 用 UIKit 手势（cancelsTouchesInView=false）挂载，绝不抢占 PDFKit 自身的缩放/平移。
+    var onTap: ((CGPoint) -> Void)?
 }
 
 /// 把 iOS 原生 PDFKit 的 `PDFView` 包成 SwiftUI 视图。
@@ -35,6 +39,13 @@ struct PDFKitView: UIViewRepresentable {
         view.document = PDFDocument(url: url)
         // 把 PDFView 实例交给 holder，供父视图做坐标换算 / 居中 / 反向命中。
         holder.pdfView = view
+        // 反向联动：挂一个「不拦截」的单击手势到 PDFView 自身，
+        // cancelsTouchesInView=false 保证双指缩放 / 单指平移等原生手势照常工作，
+        // 仅把落点（PDFView 本地坐标）回调给父视图做反向命中。
+        let tap = UITapGestureRecognizer(target: context.coordinator,
+                                         action: #selector(Coordinator.handleTap(_:)))
+        tap.cancelsTouchesInView = false
+        view.addGestureRecognizer(tap)
         return view
     }
 
@@ -67,6 +78,12 @@ struct PDFKitView: UIViewRepresentable {
         deinit {
             observedView?.removeObserver(self, forKeyPath: "bounds")
             observedView?.removeObserver(self, forKeyPath: "scaleFactor")
+        }
+
+        /// 反向联动：落点已是 PDFView 本地坐标，直接回调父视图做页坐标换换算 + 命中。
+        @objc func handleTap(_ recognizer: UITapGestureRecognizer) {
+            let loc = recognizer.location(in: recognizer.view)
+            holder.onTap?(loc)
         }
 
         override func observeValue(forKeyPath keyPath: String?,

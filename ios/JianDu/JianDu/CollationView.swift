@@ -82,9 +82,12 @@ struct CollationView: View {
                     // .id(scrollNonce) 让 PDF 滚动/缩放时重绘，高亮始终贴合页面。
                     highlightOverlay
                         .allowsHitTesting(false)
-                    // 反向联动层：捕获手指 / Apple Pencil 点击（DragGesture 取坐标），
-                    // 把视图坐标换回页坐标命中分段，反向选中右侧文本。放在最上层。
-                    reverseTapLayer
+                }
+                .onAppear {
+                    // 反向联动：PDFView 落点（本地坐标）回传，不挡 PDFKit 原生手势。
+                    holder.onTap = { [weak self] point in
+                        self?.reverseHitTest(at: point)
+                    }
                 }
             } else {
                 ContentUnavailableView("选择 PDF 以载入原图", systemImage: "doc.fill")
@@ -199,17 +202,6 @@ struct CollationView: View {
             .border(Color.gray.opacity(0.3))
         }
         .padding(8)
-    }
-
-    /// 反向联动层：透明、覆盖整页，捕获手指 / Apple Pencil 点击坐标。
-    private var reverseTapLayer: some View {
-        Color.clear
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0).onEnded { v in
-                    reverseHitTest(at: v.location)
-                }
-            )
     }
 
     // ── 后台提取 PDF 文本层 + 整本原文（不阻塞主线程）──
