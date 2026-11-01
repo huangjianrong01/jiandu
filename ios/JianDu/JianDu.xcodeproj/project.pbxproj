@@ -9,9 +9,9 @@
 /* Begin PBXBuildFile section */
 		AA00000000000000000000B01 /* JianDuApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F01 /* JianDuApp.swift */; };
 		AA00000000000000000000B09 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F09 /* Assets.xcassets */; };
-		AA00000000000000000000B12 /* JianDuCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F13 /* JianDuCore.xcframework */; };
-		AA00000000000000000000B13 /* JianDuCore.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F13 /* JianDuCore.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		AA00000000000000000000B10 /* ProbeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F10 /* ProbeView.swift */; };
+		AA00000000000000000000B12 /* ../../../crates/ios-ffi/JianDuCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F13 /* ../../../crates/ios-ffi/JianDuCore.xcframework */; };
+		AA00000000000000000000B13 /* ../../../crates/ios-ffi/JianDuCore.xcframework in CopyFiles */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F13 /* ../../../crates/ios-ffi/JianDuCore.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		AA00000000000000000000B14 /* jiandu_ios_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F14 /* jiandu_ios_ffi.swift */; };
 		AA00000000000000000000B15 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F15 /* CoreGraphics.framework */; };
 		AA00000000000000000000B16 /* CoreText.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F16 /* CoreText.framework */; };
@@ -24,11 +24,25 @@
 		AA00000000000000000000B24 /* PdfTextExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F24 /* PdfTextExtractor.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		AA00000000000000000000E01 /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				AA00000000000000000000B13 /* ../../../crates/ios-ffi/JianDuCore.xcframework in CopyFiles */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		AA00000000000000000000F01 /* JianDuApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JianDuApp.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F09 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		AA00000000000000000000F13 /* JianDuCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = "../../../crates/ios-ffi/JianDuCore.xcframework"; sourceTree = "<group>"; };
 		AA00000000000000000000F10 /* ProbeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProbeView.swift; sourceTree = "<group>"; };
+		AA00000000000000000000F11 /* JianDu.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JianDu.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA00000000000000000000F13 /* ../../../crates/ios-ffi/JianDuCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = "../../../crates/ios-ffi/JianDuCore.xcframework"; sourceTree = "<group>"; };
 		AA00000000000000000000F14 /* jiandu_ios_ffi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = jiandu_ios_ffi.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F15 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		AA00000000000000000000F16 /* CoreText.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreText.framework; path = System/Library/Frameworks/CoreText.framework; sourceTree = SDKROOT; };
@@ -39,7 +53,6 @@
 		AA00000000000000000000F22 /* PDFKitView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFKitView.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F23 /* CollationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CollationView.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F24 /* PdfTextExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PdfTextExtractor.swift; sourceTree = "<group>"; };
-		AA00000000000000000000F11 /* JianDu.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JianDu.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -47,7 +60,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AA00000000000000000000B12 /* JianDuCore.xcframework in Frameworks */,
+				AA00000000000000000000B12 /* ../../../crates/ios-ffi/JianDuCore.xcframework in Frameworks */,
 				AA00000000000000000000B15 /* CoreGraphics.framework in Frameworks */,
 				AA00000000000000000000B16 /* CoreText.framework in Frameworks */,
 				AA00000000000000000000B17 /* CoreFoundation.framework in Frameworks */,
@@ -55,19 +68,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
-
-/* Begin PBXCopyFilesBuildPhase section */
-		AA00000000000000000000E01 /* Embed Frameworks */ = {
-			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
-			dstPath = "";
-			dstSubfolderSpec = 10;
-			files = (
-				AA00000000000000000000B13 /* JianDuCore.xcframework in Embed Frameworks */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXGroup section */
 		AA00000000000000000000G01 = {
@@ -90,7 +90,7 @@
 				AA00000000000000000000F23 /* CollationView.swift */,
 				AA00000000000000000000F24 /* PdfTextExtractor.swift */,
 				AA00000000000000000000F09 /* Assets.xcassets */,
-				AA00000000000000000000F13 /* JianDuCore.xcframework */,
+				AA00000000000000000000F13 /* ../../../crates/ios-ffi/JianDuCore.xcframework */,
 				AA00000000000000000000F14 /* jiandu_ios_ffi.swift */,
 				AA00000000000000000000F15 /* CoreGraphics.framework */,
 				AA00000000000000000000F16 /* CoreText.framework */,
@@ -116,7 +116,7 @@
 			buildPhases = (
 				AA00000000000000000000S01 /* Sources */,
 				AA00000000000000000000F20 /* Frameworks */,
-				AA00000000000000000000E01 /* Embed Frameworks */,
+				AA00000000000000000000E01 /* CopyFiles */,
 				AA00000000000000000000R01 /* Resources */,
 			);
 			buildRules = (
@@ -326,7 +326,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = WA4X6RU786;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "笺读";
@@ -340,12 +340,9 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.4.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.jiandu.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = com.huangjianrong.jiandu;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SUPPORTED_PLATFORMS = (
-					iphoneos,
-					iphonesimulator,
-				);
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
@@ -361,7 +358,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = WA4X6RU786;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "笺读";
@@ -375,12 +372,9 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.4.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.jiandu.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = com.huangjianrong.jiandu;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SUPPORTED_PLATFORMS = (
-					iphoneos,
-					iphonesimulator,
-				);
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
