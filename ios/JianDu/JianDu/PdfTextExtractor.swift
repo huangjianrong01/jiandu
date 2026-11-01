@@ -38,7 +38,10 @@ enum PdfTextExtractor {
                 let t = (line.string ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !t.isEmpty else { continue }
-                let r = line.bounds(for: .mediaBox)   // 左下原点、y 向上
+                // PDFSelection.bounds(for:) 接收的是「页对象」（不是 box），
+                // 返回「页内容坐标系（左下原点、y 向上）」包围盒，与 mediaBox 同系；
+                // 翻转成左上原点（与 Rust 同系）。
+                let r = line.bounds(for: page)   // 左下原点、y 向上
                 // 翻转成左上原点（与 Rust 同系）
                 let rTL = CGRect(x: r.origin.x,
                                  y: pageH - r.origin.y - r.height,
