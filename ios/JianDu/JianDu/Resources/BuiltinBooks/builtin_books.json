@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "books": [
+    {
+      "key": "daodejing",
+      "title": "道德经",
+      "author": "〔春秋〕老子",
+      "intro": "道家经典，五千言分道经与德经，论道法自然、无为而治。",
+      "resource": "daodejing.pdf",
+      "cover": "builtin_daodejing_cover.png",
+      "kind": "pdf"
+    },
+    {
+      "key": "qianziwen",
+      "title": "千字文",
+      "author": "〔南朝〕周兴嗣",
+      "intro": "四字韵文一千字，识字蒙学经典，天地人文无所不包。",
+      "resource": "qianziwen.pdf",
+      "cover": "builtin_qianziwen_cover.png",
+      "kind": "pdf"
+    },
+    {
+      "key": "lunyu",
+      "title": "论语",
+      "author": "〔先秦〕孔子弟子及再传弟子",
+      "intro": "儒门语录，记孔子与门人言行，立仁礼之教，垂范两千载。",
+      "resource": "lunyu.pdf",
+      "cover": "builtin_lunyu_cover.png",
+      "kind": "pdf"
+    }
+  ]
+}

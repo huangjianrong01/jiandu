@@ -1,5 +1,9 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import UIKit
+
+/// 朱砂红（与 Mac 端 / 笺校高亮同源），用于「内置」标签等点缀。
+private let zhuSha = Color(red: 176 / 255, green: 52 / 255, blue: 44 / 255)
 
 /// 书架首页：极简列表 + 原生 fileImporter 导入 PDF/PNG。
 /// 点列表项 → 推进 ReaderView（阅读器）。右上角保留「排版探针」入口，
@@ -75,20 +79,7 @@ struct ShelfView: View {
         List {
             ForEach(store.documents) { doc in
                 NavigationLink(value: doc) {
-                    HStack(spacing: 12) {
-                        Image(systemName: doc.kind.systemImage)
-                            .font(.title2)
-                            .foregroundStyle(.secondary)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(doc.name)
-                                .font(.headline)
-                            Text(doc.addedAt.formatted(date: .abbreviated, time: .shortened))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                    }
-                    .padding(.vertical, 4)
+                    BookRow(item: doc)
                 }
             }
             .onDelete { idx in
@@ -110,5 +101,64 @@ struct ShelfView: View {
                 .font(.caption)
                 .foregroundStyle(.tertiary)
         }
+    }
+}
+
+/// 书架单行：内置书显示封面缩略图 + 朱砂「内置」标签 + 作者/简介；
+/// 用户导入书沿用原系统图标 + 导入时间。
+private struct BookRow: View {
+    let item: DocumentItem
+    @EnvironmentObject var store: BookStore
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if let cover = store.builtinCover(for: item) {
+                Image(uiImage: cover)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 46, height: 64)
+                    .cornerRadius(4)
+                    .clipped()
+            } else {
+                Image(systemName: item.kind.systemImage)
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 46, height: 64)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(item.name)
+                        .font(.headline)
+                    if item.isBuiltin {
+                        Text("内置")
+                            .font(.caption2)
+                            .fontWeight(.medium)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(zhuSha.opacity(0.12))
+                            .foregroundStyle(zhuSha)
+                            .cornerRadius(4)
+                    }
+                }
+                if let author = store.builtinAuthor(for: item) {
+                    Text(author)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(item.addedAt.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let intro = store.builtinIntro(for: item) {
+                    Text(intro)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer()
+        }
+        .padding(.vertical, 4)
     }
 }

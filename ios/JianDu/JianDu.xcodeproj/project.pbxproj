@@ -22,6 +22,14 @@
 		AA00000000000000000000B21 /* PDFKitView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F22 /* PDFKitView.swift */; };
 		AA00000000000000000000B22 /* CollationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F23 /* CollationView.swift */; };
 		AA00000000000000000000B24 /* PdfTextExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F24 /* PdfTextExtractor.swift */; };
+		AA00000000000000000000B25 /* BuiltinBooks.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F25 /* BuiltinBooks.swift */; };
+		AA00000000000000000000B26 /* builtin_books.json in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F26 /* builtin_books.json */; };
+		AA00000000000000000000B27 /* daodejing.pdf in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F27 /* daodejing.pdf */; };
+		AA00000000000000000000B28 /* qianziwen.pdf in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F28 /* qianziwen.pdf */; };
+		AA00000000000000000000B29 /* lunyu.pdf in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F29 /* lunyu.pdf */; };
+		AA00000000000000000000B30 /* builtin_daodejing_cover.png in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F30 /* builtin_daodejing_cover.png */; };
+		AA00000000000000000000B31 /* builtin_qianziwen_cover.png in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F31 /* builtin_qianziwen_cover.png */; };
+		AA00000000000000000000B32 /* builtin_lunyu_cover.png in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F32 /* builtin_lunyu_cover.png */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -53,6 +61,14 @@
 		AA00000000000000000000F22 /* PDFKitView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFKitView.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F23 /* CollationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CollationView.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F24 /* PdfTextExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PdfTextExtractor.swift; sourceTree = "<group>"; };
+		AA00000000000000000000F25 /* BuiltinBooks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuiltinBooks.swift; sourceTree = "<group>"; };
+		AA00000000000000000000F26 /* builtin_books.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "Resources/BuiltinBooks/builtin_books.json"; sourceTree = "<group>"; };
+		AA00000000000000000000F27 /* daodejing.pdf */ = {isa = PBXFileReference; lastKnownFileType = "com.adobe.pdf"; path = "Resources/BuiltinBooks/daodejing.pdf"; sourceTree = "<group>"; };
+		AA00000000000000000000F28 /* qianziwen.pdf */ = {isa = PBXFileReference; lastKnownFileType = "com.adobe.pdf"; path = "Resources/BuiltinBooks/qianziwen.pdf"; sourceTree = "<group>"; };
+		AA00000000000000000000F29 /* lunyu.pdf */ = {isa = PBXFileReference; lastKnownFileType = "com.adobe.pdf"; path = "Resources/BuiltinBooks/lunyu.pdf"; sourceTree = "<group>"; };
+		AA00000000000000000000F30 /* builtin_daodejing_cover.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Resources/BuiltinBooks/builtin_daodejing_cover.png"; sourceTree = "<group>"; };
+		AA00000000000000000000F31 /* builtin_qianziwen_cover.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Resources/BuiltinBooks/builtin_qianziwen_cover.png"; sourceTree = "<group>"; };
+		AA00000000000000000000F32 /* builtin_lunyu_cover.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Resources/BuiltinBooks/builtin_lunyu_cover.png"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -89,6 +105,14 @@
 				AA00000000000000000000F22 /* PDFKitView.swift */,
 				AA00000000000000000000F23 /* CollationView.swift */,
 				AA00000000000000000000F24 /* PdfTextExtractor.swift */,
+				AA00000000000000000000F25 /* BuiltinBooks.swift */,
+				AA00000000000000000000F26 /* builtin_books.json */,
+				AA00000000000000000000F27 /* daodejing.pdf */,
+				AA00000000000000000000F28 /* qianziwen.pdf */,
+				AA00000000000000000000F29 /* lunyu.pdf */,
+				AA00000000000000000000F30 /* builtin_daodejing_cover.png */,
+				AA00000000000000000000F31 /* builtin_qianziwen_cover.png */,
+				AA00000000000000000000F32 /* builtin_lunyu_cover.png */,
 				AA00000000000000000000F09 /* Assets.xcassets */,
 				AA00000000000000000000F13 /* ../../../crates/ios-ffi/JianDuCore.xcframework */,
 				AA00000000000000000000F14 /* jiandu_ios_ffi.swift */,
@@ -168,6 +192,13 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA00000000000000000000B09 /* Assets.xcassets in Resources */,
+				AA00000000000000000000B26 /* builtin_books.json in Resources */,
+				AA00000000000000000000B27 /* daodejing.pdf in Resources */,
+				AA00000000000000000000B28 /* qianziwen.pdf in Resources */,
+				AA00000000000000000000B29 /* lunyu.pdf in Resources */,
+				AA00000000000000000000B30 /* builtin_daodejing_cover.png in Resources */,
+				AA00000000000000000000B31 /* builtin_qianziwen_cover.png in Resources */,
+				AA00000000000000000000B32 /* builtin_lunyu_cover.png in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -186,6 +217,7 @@
 				AA00000000000000000000B21 /* PDFKitView.swift in Sources */,
 				AA00000000000000000000B22 /* CollationView.swift in Sources */,
 				AA00000000000000000000B24 /* PdfTextExtractor.swift in Sources */,
+				AA00000000000000000000B25 /* BuiltinBooks.swift in Sources */,
 				AA00000000000000000000B14 /* jiandu_ios_ffi.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
