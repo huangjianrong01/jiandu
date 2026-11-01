@@ -64,6 +64,14 @@ final class BookStore: ObservableObject {
         storeDir.appendingPathComponent(item.fileName)
     }
 
+    /// 导出笺读 PDF 的落盘路径：Documents/jiandu/exports/<书名>_笺读.pdf，
+    /// 并确保 exports 目录存在。
+    func exportURL(for item: DocumentItem) -> URL {
+        let dir = storeDir.appendingPathComponent("exports", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("\(item.name)_笺读.pdf")
+    }
+
     /// 导入：把用户选中的文件拷贝进沙盒，并登记索引。
     /// 文件拷贝放在后台线程，避免大 PDF 阻塞主线程；写完后回主线程更新列表。
     func importFile(from sourceURL: URL) {

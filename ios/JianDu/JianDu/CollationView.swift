@@ -1,5 +1,6 @@
 import SwiftUI
 import PDFKit
+import UIKit
 
 /// 笺校工作台（核心业务闭环）。
 ///
@@ -24,6 +25,9 @@ struct CollationView: View {
     @State private var status: String = "从书架选一本 PDF，开始笺校"
     /// 整本原文（逐页 page.string 提取，带页码分隔），自动填入右侧编辑区，可直接校改。
     @State private var sourceText: String = ""
+    /// 导出笺读 PDF 的落盘 URL（成功后弹出系统分享面板用）。
+    @State private var shareURL: URL?
+    @State private var showShare: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -35,6 +39,11 @@ struct CollationView: View {
                 rightPane.frame(maxWidth: .infinity)
             }
         }
+        .sheet(isPresented: $showShare) {
+            if let url = shareURL {
+                ShareSheet(items: [url])
+            }
+        }
     }
 
     private var header: some View {
@@ -42,6 +51,8 @@ struct CollationView: View {
             Text("笺校工作台").font(.headline)
             Spacer()
             docPicker
+            Button("导出笺读") { exportLayout() }
+                .disabled(selectedDocID == nil || sourceText.isEmpty)
             Text(status).font(.caption).foregroundStyle(.secondary)
         }
         .padding(.horizontal).padding(.vertical, 8)
@@ -266,4 +277,50 @@ struct CollationView: View {
             await MainActor.run { rustBoxes = boxes }
         }
     }
+
+    // ── 导出笺读 PDF（纯血 Rust 排版引擎，后台线程写盘，不阻塞主线程）──
+    private func exportLayout() {
+        guard let id = selectedDocID,
+              let doc = store.documents.first(where: { $0.id == id }) else {
+            status = "请先选择 PDF"
+            return
+        }
+        // 去掉「——— 第 N 页 ———」页码分隔标记（避免被当成正文排版），保留纯原文。
+        let cleaned = sourceText
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("———") }
+            .joined(separator: "\n")
+        guard !cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            status = "无原文可导出"
+            return
+        }
+        let outURL = store.exportURL(for: doc)
+        status = "正在导出笺读 PDF…"
+        Task.detached(priority: .userInitiated) {
+            do {
+                // exportLayoutToPdf(outPath:text:columns:) 由 Rust core 排版并写盘；
+                // columns=1 与右侧「笺读 Rust 重排」预览同口径（竖排单栏示意）。
+                try exportLayoutToPdf(outPath: outURL.path, text: cleaned, columns: 1)
+                await MainActor.run {
+                    shareURL = outURL
+                    showShare = true
+                    status = "已导出：\(outURL.lastPathComponent)"
+                }
+            } catch {
+                await MainActor.run {
+                    status = "导出失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+}
+
+/// 系统分享面板（AirDrop / 存储到文件 / 打印…），把导出的笺读 PDF 交给用户。
+/// 用 UIViewControllerRepresentable 包 UIActivityViewController，标准 SwiftUI 桥接。
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
