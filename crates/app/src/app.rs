@@ -2907,11 +2907,6 @@ impl Root {
         self.set_layout(key);
     }
 
-    /// 设四周留白比例（0..1，近似四边同留白）。
-    pub fn set_margin(&mut self, m: f32) {
-        self.grid.margin = m.clamp(0.0, 0.2);
-    }
-
     /// 设**留白档**（v1.33.0）：版心宽 ÷ 单叶可用宽。
     ///
     /// 三档（[`crate::grid::BANXIN_RATIOS`]）：0.60 宽（复古）/ 0.75 中

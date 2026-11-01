@@ -556,19 +556,17 @@ fn ink_option(label: &str, on: bool, t: Theme) -> Div {
         // 为它开一条 `String → &'static str` 的泄漏通道不值得（面板上
         // 至多十来张牌，一份 SharedString 而已）。
         .child(div().text_size(px(12.0)).child(SharedString::from(label.to_string())))
+        // 写匠风：选中只压一道**微弱朱砂红线**，不描框、不填底——像在书眉
+        // 上圈了一个字，而不是按下一枚控制台按钮。
         .child(
             div()
-                .h(px(4.0))
+                .h(px(3.0))
                 .flex()
                 .justify_center()
                 .child(if on {
-                    div()
-                        .w(px(4.0))
-                        .h(px(4.0))
-                        .rounded_full()
-                        .bg(rgb(sheet_zhu(t)))
+                    div().w(px(16.0)).h(px(1.0)).bg(rgb(sheet_zhu(t)))
                 } else {
-                    div().w(px(4.0)).h(px(4.0))
+                    div().w(px(16.0)).h(px(2.0))
                 }),
         )
 }
@@ -10834,7 +10832,7 @@ impl Root {
 
 
 
-    /// **「版字」面板**：列数 · 字级 · 字体 · 批注 · 留白 · 纸边 · 页面 ·
+    /// **「版字」面板**：列数 · 字级 · 字体 · 批注 · 留白 · 页面 ·
     /// 纸色 · 墨色 · 丝栏 · 标注——**一张纸、一页**，没有第二处入口。
     ///
     /// v1.35.0 终局合并：原先「版式」浮层（8/10/12/14 四档）、版字面板的
@@ -10846,7 +10844,7 @@ impl Root {
     ///   字体 → `FontChoice::CLASSIC` → `Root::set_font`（正文 + 批注 +
     ///          行高一次换完，见 `set_font` 的注释）；
     ///   批注 → `FontChoice::NOTE` → `set_note_font`（字体行的二次微调）；
-    ///   留白 → `banxin_ratio`；纸边 → `grid.margin`；页面 → `LayoutMode`；
+    ///   留白 → `banxin_ratio`；页面 → `LayoutMode`；
     ///   纸色 → `theme::PAPER_THEMES`；墨色 → `InkPalette::ALL`；
     ///   丝栏 → `RuleColor::ALL`；标注 → `StyleAct`。
     fn render_share_sheet(&mut self, cx: &mut Context<Self>) -> Div {
@@ -11721,7 +11719,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         cx.notify();
     }
 
-    /// **「版字」面板**：列数 · 字级 · 字体 · 批注 · 留白 · 纸边 · 页面 ·
+    /// **「版字」面板**：列数 · 字级 · 字体 · 批注 · 留白 · 页面 ·
     /// 纸色 · 墨色 · 丝栏 · 标注——**一张纸、一页**，没有第二处入口。
     ///
     /// v1.35.0 终局合并：原先「版式」浮层（8/10/12/14 四档）、版字面板的
@@ -11733,7 +11731,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
     ///   字体 → `FontChoice::CLASSIC` → `Root::set_font`（正文 + 批注 +
     ///          行高一次换完，见 `set_font` 的注释）；
     ///   批注 → `FontChoice::NOTE` → `set_note_font`（字体行的二次微调）；
-    ///   留白 → `banxin_ratio`；纸边 → `grid.margin`；页面 → `LayoutMode`；
+    ///   留白 → `banxin_ratio`；页面 → `LayoutMode`；
     ///   纸色 → `theme::PAPER_THEMES`；墨色 → `InkPalette::ALL`；
     ///   丝栏 → `RuleColor::ALL`；标注 → `StyleAct`。
     fn render_style_sheet(&mut self, cx: &mut Context<Self>) -> Div {
@@ -11904,7 +11902,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 ),
             );
         }
-        sheet = sheet.child(style_row("样式", preset_row, t));
+        sheet = sheet.child(style_row("式", preset_row, t));
 
         // ---- 出图比例（v1.9.10）：发哪儿就出什么比例 ----
         //
@@ -11929,7 +11927,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 ),
             );
         }
-        sheet = sheet.child(style_row("出图", ratio_row, t));
+        sheet = sheet.child(style_row("图", ratio_row, t));
 
         // ---- 语速（P1-5）：连读 / 听书共用倍率 ----
         //
@@ -11952,7 +11950,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 ),
             );
         }
-        sheet = sheet.child(style_row("语速", speed_row, t));
+        sheet = sheet.child(style_row("速", speed_row, t));
 
         // ---- 批量出图（P1-3）：当前章每一叶按选定比例渲染 ----
         //
@@ -11973,9 +11971,9 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 }),
             ),
         );
-        sheet = sheet.child(style_row("批量", batch_row, t));
+        sheet = sheet.child(style_row("批", batch_row, t));
 
-        sheet = sheet.child(style_row("列数", cols_row, t));
+        sheet = sheet.child(style_row("列", cols_row, t));
 
         // ---- 字级：蝇头 / 中楷 / 大字 / 榜书 四档 ----
         //
@@ -12008,7 +12006,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                             .flex()
                             .justify_center()
                             .child(if on {
-                                hairline(26.0, t.ink())
+                                hairline(26.0, sheet_zhu(t))
                             } else {
                                 div().w(px(0.0)).h(px(1.0))
                             }),
@@ -12023,18 +12021,18 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     ),
             );
         }
-        sheet = sheet.child(style_row("字级", seg, t));
+        sheet = sheet.child(style_row("字", seg, t));
 
         // ---- 字体：竖排字牌，一牌一款 ----
         //
         // v1.35.0：原先「排版字体」（预设对）与「字体」（单换正文）两行写同一
         // 个 `font_ancient`，各写各的。现在只留这一行，选一款即走
         // `set_font`——正文 + 批注 + 行高缩放 + 重算尺寸一次做完。
-        sheet = sheet.child(style_row("字体", self.font_choices_row(cx), t));
+        sheet = sheet.child(style_row("体", self.font_choices_row(cx), t));
         // 批注字体：楷体二选一，与正文宋体分开——
         // 正文匠体、注文手写体，正是刻本的层次。字体行定完对子后，
         // 这里还能单独挑一款批注。
-        sheet = sheet.child(style_row("批注", self.note_font_row(cx), t));
+        sheet = sheet.child(style_row("注", self.note_font_row(cx), t));
 
         // ---- 留白（左右）：版心宽 ÷ 单叶可用宽，三档 ----
         //
@@ -12062,26 +12060,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 ),
             );
         }
-        sheet = sheet.child(style_row("留白", bx_row, t));
-
-        // ---- 纸边：纸面四周留白（窄 / 中 / 宽）----
-        let margin = self.grid.margin;
-        let mut m_row = div().flex().flex_row().items_start().gap(px(16.0)).flex_wrap();
-        for (label, val) in [("窄", 0.02f32), ("中", 0.06), ("宽", 0.12)] {
-            let on = (margin - val).abs() < 0.005;
-            m_row = m_row.child(
-                ink_option(label, on, t).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.set_margin(val);
-                        this.fit_sizes();
-                        cx.notify();
-                    }),
-                ),
-            );
-        }
-        sheet = sheet.child(style_row("纸边", m_row, t));
+        sheet = sheet.child(style_row("白", bx_row, t));
 
         // ---- 页面：对开 / 单叶 / 整页（三模式）+ 「自动」开关 ----
         //
@@ -12121,7 +12100,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 }),
             ),
         );
-        sheet = sheet.child(style_row("页面", modes, t));
+        sheet = sheet.child(style_row("面", modes, t));
 
         // ---- 纸色：**遍历主题配置表自动生成**——新增一套配色只需在
         // `PAPER_THEMES` 加一行，此处零改动 ----
@@ -12177,10 +12156,10 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     ),
             );
         }
-        sheet = sheet.child(style_row("纸色", themes_row, t));
+        sheet = sheet.child(style_row("纸", themes_row, t));
 
         // ---- 墨色：五套正文 / 小字注色（两枚小色点 + 一行墨字）----
-        sheet = sheet.child(style_row("墨色", self.palette_chips(cx), t));
+        sheet = sheet.child(style_row("墨", self.palette_chips(cx), t));
 
         // ---- 版框：四周双边 / 左右双边 / 四周单边（v1.85.0）----
         //
@@ -12261,7 +12240,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     ),
             );
         }
-        sheet = sheet.child(style_row("版框", frames_row, t));
+        sheet = sheet.child(style_row("框", frames_row, t));
 
         // ---- 丝栏：乌 / 金 / 朱 三色界行（竖排列间那道细线）----
         // 色块里立三道竖线，直接预览界行颜色与粗细。
@@ -12310,7 +12289,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     ),
             );
         }
-        sheet = sheet.child(style_row("丝栏", rules, t));
+        sheet = sheet.child(style_row("栏", rules, t));
 
         // ---- 标注：通假 / 标点 / 生僻字 / 数字汉字 / 注释 / 繁体 ----
         //
@@ -12326,7 +12305,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             ],
             cx,
         );
-        sheet = sheet.child(style_row("标注", marks, t));
+        sheet = sheet.child(style_row("标", marks, t));
 
         // ---- 繁简：原文 / 简体 / 繁体（v1.81.0）----
         //
@@ -12341,7 +12320,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 .collect(),
             cx,
         );
-        sheet = sheet.child(style_row("繁简", trad_chips, t));
+        sheet = sheet.child(style_row("简", trad_chips, t));
 
         // ---- 句读：形制（现代标点 / 古籍句读）+ 点画（墨 / 朱砂 / 回锋）----
         //
@@ -12364,7 +12343,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             ],
             cx,
         );
-        sheet = sheet.child(style_row("句读", mode_chips, t));
+        sheet = sheet.child(style_row("读", mode_chips, t));
 
         // 点画只在**古籍句读**下有意义（现代标点那套是「印刷体」的形，
         // 没有回锋这回事），故跟着模式显隐——省一行高度，也不误导。
@@ -12387,7 +12366,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 ("回锋", self.punct_hook, StyleAct::Hook),
             ];
             let ink_chips = self.style_chips(items, cx);
-            sheet = sheet.child(style_row("点画", ink_chips, t));
+            sheet = sheet.child(style_row("画", ink_chips, t));
         }
 
         // ---- 实时反馈：引擎当下算出的列数 / 版心 / 列宽 / 字号 / 每面行款 ----
@@ -12697,17 +12676,13 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     .child(div().text_size(px(13.0)).child(SharedString::from(label)))
                     .child(
                         div()
-                            .h(px(4.0))
+                            .h(px(3.0))
                             .flex()
                             .justify_center()
                             .child(if on {
-                                div()
-                                    .w(px(4.0))
-                                    .h(px(4.0))
-                                    .rounded_full()
-                                    .bg(rgb(sheet_zhu(t)))
+                                div().w(px(16.0)).h(px(1.0)).bg(rgb(sheet_zhu(t)))
                             } else {
-                                div().w(px(4.0)).h(px(4.0))
+                                div().w(px(16.0)).h(px(2.0))
                             }),
                     )
                     .on_mouse_down(
@@ -13031,9 +13006,9 @@ fn style_row(label: &'static str, chips: Div, t: Theme) -> Div {
         .gap(px(14.0))
         .child(
             div()
-                .w(px(52.0))
+                .w(px(26.0))
                 .pt(px(2.0))
-                .text_size(px(10.0))
+                .text_size(px(11.0))
                 .text_color(rgb(t.ink_soft()))
                 .child(SharedString::from(label)),
         )
