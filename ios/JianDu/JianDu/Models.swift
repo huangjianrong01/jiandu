@@ -35,6 +35,14 @@ struct DocumentItem: Identifiable, Codable, Hashable {
     var addedAt: Date
 }
 
+/// 一本书的校对档案：用户校改过的原文 + 上次选中的文本片段。
+/// 与文件本体分离，单独存于 Documents/jiandu/collation/<书ID>.json，关 App 不丢。
+struct CollationRecord: Codable {
+    var sourceText: String
+    var selectedID: Int?
+    var updatedAt: Date
+}
+
 /// 书架数据层（ObservableObject）。
 /// 职责：落盘导入的文件 + 维护 JSON 索引 + 给 UI 提供 `@Published` 列表。
 /// ⚠️ 纯 SwiftUI 数据层，不触碰 core（Rust）任何逻辑；core 只通过 FFI 在
@@ -50,12 +58,16 @@ final class BookStore: ObservableObject {
     private let storeDir: URL
     /// 索引文件：Documents/jiandu/index.json
     private let indexURL: URL
+    /// 校对档案目录：Documents/jiandu/collation/
+    private let collationDir: URL
 
     init() {
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
         storeDir = docs.appendingPathComponent("jiandu", isDirectory: true)
         indexURL = storeDir.appendingPathComponent("index.json")
+        collationDir = storeDir.appendingPathComponent("collation", isDirectory: true)
         try? fm.createDirectory(at: storeDir, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: collationDir, withIntermediateDirectories: true)
         load()
     }
 
@@ -70,6 +82,33 @@ final class BookStore: ObservableObject {
         let dir = storeDir.appendingPathComponent("exports", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("\(item.name)_笺读.pdf")
+    }
+
+    /// 某书的校对档案路径：Documents/jiandu/collation/<书ID>.json
+    func collationURL(for item: DocumentItem) -> URL {
+        collationDir.appendingPathComponent("\(item.id.uuidString).json")
+    }
+
+    /// 读取已存的校对档案（校改稿 + 选中行）；无则返回 nil（首读需从 PDF 现提）。
+    func loadCollation(for item: DocumentItem) -> CollationRecord? {
+        guard let data = try? Data(contentsOf: collationURL(for: item)) else { return nil }
+        return try? JSONDecoder().decode(CollationRecord.self, from: data)
+    }
+
+    /// 异步落盘校对档案（后台写文件，不阻塞主线程；写盘失败仅记日志）。
+    func saveCollation(_ record: CollationRecord, for item: DocumentItem) {
+        let url = collationURL(for: item)
+        let dir = collationDir   // 按值捕获，避免在非隔离的 detached 闭包里引用 self
+        Task.detached(priority: .background) {
+            do {
+                try FileManager.default.createDirectory(at: dir,
+                                                       withIntermediateDirectories: true)
+                let data = try JSONEncoder().encode(record)
+                try data.write(to: url, options: .atomic)
+            } catch {
+                await MainActor.run { self.lastError = "校改存档失败：\(error.localizedDescription)" }
+            }
+        }
     }
 
     /// 导入：把用户选中的文件拷贝进沙盒，并登记索引。

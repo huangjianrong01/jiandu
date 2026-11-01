@@ -25,6 +25,10 @@ struct CollationView: View {
     @State private var status: String = "从书架选一本 PDF，开始笺校"
     /// 整本原文（逐页 page.string 提取，带页码分隔），自动填入右侧编辑区，可直接校改。
     @State private var sourceText: String = ""
+    /// 当前已载入（其状态在内存中）的书 ID；切换前先存旧书，避免校改丢失。
+    @State private var loadedDocID: DocumentItem.ID?
+    /// 防抖落盘任务句柄。
+    @State private var saveTask: Task<Void, Never>?
     /// 导出笺读 PDF 的落盘 URL（成功后弹出系统分享面板用）。
     @State private var shareURL: URL?
     @State private var showShare: Bool = false
@@ -39,6 +43,8 @@ struct CollationView: View {
                 rightPane.frame(maxWidth: .infinity)
             }
         }
+        // 原文编辑（校改）防抖落盘：关 App、切书都不丢。
+        .onChange(of: sourceText) { _ in scheduleSave() }
         .sheet(isPresented: $showShare) {
             if let url = shareURL {
                 ShareSheet(items: [url])
@@ -162,6 +168,8 @@ struct CollationView: View {
             if let seg = segments.first(where: { $0.id == selectedID }) {
                 runRust(seg.text)
             }
+            // ③ 记忆上次选中行（持久化）
+            scheduleSave()
         }
     }
 
@@ -208,12 +216,17 @@ struct CollationView: View {
 
     // ── 后台提取 PDF 文本层 + 整本原文（不阻塞主线程）──
     private func loadDocument() {
+        // 切换前，先把当前已载入书的校改落盘，避免一切换就丢。
+        if let prev = loadedDocID, prev != selectedDocID {
+            saveCurrentCollation(for: prev)
+        }
         guard let id = selectedDocID,
               let doc = store.documents.first(where: { $0.id == id }),
               doc.kind == .pdf else {
             segments = []
             selectedID = nil
             sourceText = ""
+            loadedDocID = nil
             status = "请选择 PDF 文档"
             return
         }
@@ -224,10 +237,41 @@ struct CollationView: View {
             let (segs, full) = PdfTextExtractor.extractAll(from: url)
             await MainActor.run {
                 segments = segs
-                selectedID = segs.first?.id
-                sourceText = full
-                status = "已提取 \(segs.count) 片段 · 原文 \(full.count) 字"
+                // 优先用已存校改稿；无则取新鲜提取并立即落盘建档。
+                if let rec = store.loadCollation(for: doc) {
+                    sourceText = rec.sourceText
+                    selectedID = rec.selectedID
+                    status = "已载入校改稿 · \(segs.count) 片段"
+                } else {
+                    sourceText = full
+                    selectedID = segs.first?.id
+                    store.saveCollation(CollationRecord(sourceText: full,
+                                                       selectedID: segs.first?.id,
+                                                       updatedAt: Date()), for: doc)
+                    status = "已提取 \(segs.count) 片段 · 原文 \(full.count) 字"
+                }
+                loadedDocID = id
             }
+        }
+    }
+
+    /// 把当前内存里的校改（原文 + 选中行）落盘到指定书。
+    private func saveCurrentCollation(for docID: DocumentItem.ID) {
+        guard let doc = store.documents.first(where: { $0.id == docID }) else { return }
+        store.saveCollation(CollationRecord(sourceText: sourceText,
+                                            selectedID: selectedID,
+                                            updatedAt: Date()), for: doc)
+    }
+
+    /// 编辑原文 / 切换选中后防抖落盘（避免每次击键都写盘）。
+    private func scheduleSave() {
+        saveTask?.cancel()
+        let docID = loadedDocID
+        guard docID != nil else { return }
+        saveTask = Task {
+            try? await Task.sleep(nanoseconds: 500_000_000)   // 0.5s 防抖
+            guard !Task.isCancelled, let docID = docID else { return }
+            await MainActor.run { saveCurrentCollation(for: docID) }
         }
     }
 
