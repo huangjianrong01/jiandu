@@ -16,15 +16,8 @@ struct JianDuApp: App {
 
     @ViewBuilder
     private var root: some View {
-        if store.current == nil {
-            ShelfView()
-                .transition(.opacity)
-        } else if !store.reading {
-            CoverView()
-                .transition(.move(edge: .trailing))
-        } else {
-            ReaderView()
-                .transition(.move(edge: .trailing))
-        }
+        // PoC 临时入口：直出探针页，验证 Rust 桥接与排版。
+        // 还原原 App：git checkout -- ios/JianDu/JianDu/JianDuApp.swift
+        ProbeView()
     }
 }
