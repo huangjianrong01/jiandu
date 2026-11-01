@@ -1,3 +1,6 @@
 # 构建产物（由 build-ios.sh 重新生成，不进版本库）
 /target
 /JianDuCore.xcframework
+
+# 构建脚本生成的临时头文件目录（xcframework 打包用，脚本末尾已清理）
+/ffi-headers/

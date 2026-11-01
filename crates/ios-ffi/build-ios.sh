@@ -48,6 +48,9 @@ xcodebuild -create-xcframework \
   -library "$SIM_A"   -headers ffi-headers \
   -output JianDuCore.xcframework
 
+# 清理临时头文件目录（构建产物，不应留在源码树）
+rm -rf ffi-headers
+
 echo "==> [5/5] 校验：XCFramework 内含两份真静态库"
 count=$(find JianDuCore.xcframework -name '*.a' | wc -l | tr -d ' ')
 if [ "$count" -ge 2 ]; then
