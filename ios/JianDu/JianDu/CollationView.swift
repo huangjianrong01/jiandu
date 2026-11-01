@@ -85,8 +85,10 @@ struct CollationView: View {
                 }
                 .onAppear {
                     // 反向联动：PDFView 落点（本地坐标）回传，不挡 PDFKit 原生手势。
-                    holder.onTap = { [weak self] point in
-                        self?.reverseHitTest(at: point)
+                    // CollationView 是 struct（值类型），不可 weak；直接捕获 self 即可
+                    // （值类型不产生引用循环，且本视图在 TabView 中长期存活，无泄漏风险）。
+                    holder.onTap = { point in
+                        self.reverseHitTest(at: point)
                     }
                 }
             } else {
