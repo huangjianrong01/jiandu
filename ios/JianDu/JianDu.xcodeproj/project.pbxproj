@@ -16,6 +16,7 @@
 		AA00000000000000000000B15 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F15 /* CoreGraphics.framework */; };
 		AA00000000000000000000B16 /* CoreText.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F16 /* CoreText.framework */; };
 		AA00000000000000000000B17 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F17 /* CoreFoundation.framework */; };
+		AA00000000000000000000B18 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F18 /* Models.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -27,6 +28,7 @@
 		AA00000000000000000000F15 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		AA00000000000000000000F16 /* CoreText.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreText.framework; path = System/Library/Frameworks/CoreText.framework; sourceTree = SDKROOT; };
 		AA00000000000000000000F17 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
+		AA00000000000000000000F18 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F11 /* JianDu.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JianDu.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -71,6 +73,7 @@
 			children = (
 				AA00000000000000000000F01 /* JianDuApp.swift */,
 				AA00000000000000000000F10 /* ProbeView.swift */,
+				AA00000000000000000000F18 /* Models.swift */,
 				AA00000000000000000000F09 /* Assets.xcassets */,
 				AA00000000000000000000F13 /* JianDuCore.xcframework */,
 				AA00000000000000000000F14 /* jiandu_ios_ffi.swift */,
@@ -162,6 +165,7 @@
 			files = (
 				AA00000000000000000000B01 /* JianDuApp.swift in Sources */,
 				AA00000000000000000000B10 /* ProbeView.swift in Sources */,
+				AA00000000000000000000B18 /* Models.swift in Sources */,
 				AA00000000000000000000B14 /* jiandu_ios_ffi.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
