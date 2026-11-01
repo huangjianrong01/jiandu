@@ -1,0 +1,4 @@
+module jiandu_ios_ffiFFI {
+    header "jiandu_ios_ffiFFI.h"
+    export *
+}

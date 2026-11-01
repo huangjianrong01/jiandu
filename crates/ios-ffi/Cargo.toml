@@ -1,0 +1,39 @@
+# 笺读 · iOS FFI 层（uniffi 桥接 + iOS 专属 PDF 导出）。
+#
+# 为什么独立成 crate（而不是塞进 crates/core）：
+#   core 有铁律——零平台依赖、严禁出现 cfg(target_os)（见 scripts/check_core_purity.sh）。
+#   所有 iOS 专属代码（含 #[cfg(target_os = "ios")]）只在本 crate 内，绝不下沉到 core。
+#   这样 core 的纯度守卫依然成立，macOS 端（collation.rs 等）零影响。
+#
+# 为什么是独立 workspace 根（空 [workspace]）：
+#   与 jiandu-tauri 同构——避免被根 workspace 收编（根 workspace 的 905 项测试 /
+#    macOS 构建不被本 crate 的 uniffi / iOS target 污染）。core 经 path 依赖引入，
+#   其 version.workspace 等继承字段会解析到根 workspace，已验证可行。
+
+[package]
+name = "jiandu-ios-ffi"
+version = "1.9.25"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# 独立 workspace 根（排除出根 workspace）。
+[workspace]
+
+[lib]
+# iOS 要静态库（.a）喂给 Xcode；lib 供本 crate 单测 / 绑定生成。
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+jiandu-core = { path = "../core" }
+# uniffi：proc-macro 模式（0.25+ 不再需要 setup_scaffolding!）。
+uniffi = { version = "0.28", features = ["cli"] }
+
+# iOS 专属 PDF 导出走 raw CoreGraphics / CoreText C FFI（见 src/pdf_export.rs），
+# 不引任何额外 crate——framework 链接由源码里的 #[link(kind="framework")] 完成。
+[target.'cfg(target_os = "ios")'.dependencies]
+
+# uniffi-bindgen CLI：用于从编译产物生成 Swift 绑定（见 build-ios.sh）。
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
