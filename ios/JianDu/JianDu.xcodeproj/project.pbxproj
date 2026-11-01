@@ -8,16 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		AA00000000000000000000B01 /* JianDuApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F01 /* JianDuApp.swift */; };
-		AA00000000000000000000B02 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F02 /* Models.swift */; };
-		AA00000000000000000000B03 /* BookStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F03 /* BookStore.swift */; };
-		AA00000000000000000000B04 /* PaperStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F04 /* PaperStyle.swift */; };
-		AA00000000000000000000B05 /* Trad.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F05 /* Trad.swift */; };
-		AA00000000000000000000B06 /* ShelfView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F06 /* ShelfView.swift */; };
-		AA00000000000000000000B07 /* CoverView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F07 /* CoverView.swift */; };
-		AA00000000000000000000B08 /* ReaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F08 /* ReaderView.swift */; };
 		AA00000000000000000000B09 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F09 /* Assets.xcassets */; };
-		AA00000000000000000000B10 /* daodejing.json in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F10 /* daodejing.json */; };
-		AA00000000000000000000B11 /* guhanyu.json in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F12 /* guhanyu.json */; };
 		AA00000000000000000000B12 /* JianDuCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F13 /* JianDuCore.xcframework */; };
 		AA00000000000000000000B13 /* JianDuCore.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F13 /* JianDuCore.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		AA00000000000000000000B14 /* jiandu_ios_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F14 /* jiandu_ios_ffi.swift */; };
@@ -28,16 +19,7 @@
 
 /* Begin PBXFileReference section */
 		AA00000000000000000000F01 /* JianDuApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JianDuApp.swift; sourceTree = "<group>"; };
-		AA00000000000000000000F02 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
-		AA00000000000000000000F03 /* BookStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BookStore.swift; sourceTree = "<group>"; };
-		AA00000000000000000000F04 /* PaperStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PaperStyle.swift; sourceTree = "<group>"; };
-		AA00000000000000000000F05 /* Trad.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Trad.swift; sourceTree = "<group>"; };
-		AA00000000000000000000F06 /* ShelfView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShelfView.swift; sourceTree = "<group>"; };
-		AA00000000000000000000F07 /* CoverView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoverView.swift; sourceTree = "<group>"; };
-		AA00000000000000000000F08 /* ReaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReaderView.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F09 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		AA00000000000000000000F10 /* daodejing.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = daodejing.json; sourceTree = "<group>"; };
-		AA00000000000000000000F12 /* guhanyu.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = guhanyu.json; sourceTree = "<group>"; };
 		AA00000000000000000000F13 /* JianDuCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = "../../../crates/ios-ffi/JianDuCore.xcframework"; sourceTree = "<group>"; };
 		AA00000000000000000000F14 /* jiandu_ios_ffi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = jiandu_ios_ffi.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F15 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
@@ -86,14 +68,7 @@
 			isa = PBXGroup;
 			children = (
 				AA00000000000000000000F01 /* JianDuApp.swift */,
-				AA00000000000000000000F02 /* Models.swift */,
-				AA00000000000000000000F03 /* BookStore.swift */,
-				AA00000000000000000000F04 /* PaperStyle.swift */,
-				AA00000000000000000000F05 /* Trad.swift */,
-				AA00000000000000000000G03 /* Views */,
 				AA00000000000000000000F09 /* Assets.xcassets */,
-				AA00000000000000000000F10 /* daodejing.json */,
-				AA00000000000000000000F12 /* guhanyu.json */,
 				AA00000000000000000000F13 /* JianDuCore.xcframework */,
 				AA00000000000000000000F14 /* jiandu_ios_ffi.swift */,
 				AA00000000000000000000F15 /* CoreGraphics.framework */,
@@ -101,16 +76,6 @@
 				AA00000000000000000000F17 /* CoreFoundation.framework */,
 			);
 			path = JianDu;
-			sourceTree = "<group>";
-		};
-		AA00000000000000000000G03 /* Views */ = {
-			isa = PBXGroup;
-			children = (
-				AA00000000000000000000F06 /* ShelfView.swift */,
-				AA00000000000000000000F07 /* CoverView.swift */,
-				AA00000000000000000000F08 /* ReaderView.swift */,
-			);
-			path = Views;
 			sourceTree = "<group>";
 		};
 		AA00000000000000000000G04 /* Products */ = {
@@ -182,8 +147,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA00000000000000000000B09 /* Assets.xcassets in Resources */,
-				AA00000000000000000000B10 /* daodejing.json in Resources */,
-				AA00000000000000000000B11 /* guhanyu.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -195,13 +158,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA00000000000000000000B01 /* JianDuApp.swift in Sources */,
-				AA00000000000000000000B02 /* Models.swift in Sources */,
-				AA00000000000000000000B03 /* BookStore.swift in Sources */,
-				AA00000000000000000000B04 /* PaperStyle.swift in Sources */,
-				AA00000000000000000000B05 /* Trad.swift in Sources */,
-				AA00000000000000000000B06 /* ShelfView.swift in Sources */,
-				AA00000000000000000000B07 /* CoverView.swift in Sources */,
-				AA00000000000000000000B08 /* ReaderView.swift in Sources */,
 				AA00000000000000000000B14 /* jiandu_ios_ffi.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

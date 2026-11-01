@@ -1,23 +1,14 @@
-// 笺读 · iPhone 端
-// 书架（书封墙）→ 封面页 → 正文（古文竖笺 / 现代横笺）。
+// 笺读 · iPadOS PoC 入口
+// 仅用于验证 uniffi 桥接 + Rust 真实排版（calculate_grid）+ iOS 构建全链路。
+// 后续接回原 App（书架 / 封面 / 正文竖笺）时，在此恢复导航逻辑。
 
 import SwiftUI
 
 @main
 struct JianDuApp: App {
-    @StateObject private var store = BookStore()
-
     var body: some Scene {
         WindowGroup {
-            root
-                .environmentObject(store)
+            ProbeView()
         }
-    }
-
-    @ViewBuilder
-    private var root: some View {
-        // PoC 临时入口：直出探针页，验证 Rust 桥接与排版。
-        // 还原原 App：git checkout -- ios/JianDu/JianDu/JianDuApp.swift
-        ProbeView()
     }
 }
