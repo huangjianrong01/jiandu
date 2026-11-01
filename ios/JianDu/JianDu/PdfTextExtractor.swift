@@ -17,24 +17,35 @@ struct PdfSegment: Identifiable, Hashable {
 }
 
 enum PdfTextExtractor {
-    /// 提取整本文档文本层：按页、按视觉行切分，返回 (文本, 左上原点包围盒)。
+    /// 一次性提取整本文档：
+    /// - `segments`：文本层按视觉行切分的分段（含左上原点包围盒，高亮联动用）。
+    /// - `fullText`：逐页 `page.string` 拼接的整本原文（带页码分隔标记，笺校编辑区用）。
+    ///
+    /// 同一本 PDF 只打开一次，避免重复读盘；坐标统一翻为左上原点，与 Rust core 同系。
     ///
     /// 设计说明（架构对齐）：
     /// - iOS 上 Rust core 不具备 PDF 文本层解析能力（core 零 PDF 解析依赖，
     ///   Mac 端文本层提取同样依赖 PDFKit），故此处用 iOS 原生 PDFKit 读真实原图坐标。
     /// - 提取出的坐标立即翻转为左手上原点，与 Rust calculate_grid 输出的 GlyphBoxFfi
     ///   坐标系一致；纯血 Rust 引擎负责「重排」，保证 Mac / iPad 排版结果 100% 一致。
-    static func extract(from url: URL) -> [PdfSegment] {
-        guard let doc = PDFDocument(url: url) else { return [] }
-        var out: [PdfSegment] = []
+    static func extractAll(from url: URL) -> (segments: [PdfSegment], fullText: String) {
+        guard let doc = PDFDocument(url: url) else { return ([], "") }
+        var segs: [PdfSegment] = []
         var sid = 0
+        var full: [String] = []
         for i in 0..<doc.pageCount {
             guard let page = doc.page(at: i) else { continue }
+            // —— 整本原文（笺校编辑区）——
+            // 逐页提取 page.string，页间加分隔标记，便于笺校定位页码。
+            let pageText = (page.string ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            full.append("——— 第 \(i + 1) 页 ———\n" + pageText)
+            // —— 文本层分段（高亮联动）—— 复用既有逻辑。
             let mb = page.bounds(for: .mediaBox)
             let pageH = mb.height
-            guard let full = page.selection(for: mb) else { continue }
+            guard let sel = page.selection(for: mb) else { continue }
             // 按视觉行切分；竖排 PDF 也会被聚成视觉行，足以驱动首版高亮联动。
-            for line in full.selectionsByLine() {
+            for line in sel.selectionsByLine() {
                 let t = (line.string ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !t.isEmpty else { continue }
@@ -46,12 +57,12 @@ enum PdfTextExtractor {
                 let rTL = CGRect(x: r.origin.x,
                                  y: pageH - r.origin.y - r.height,
                                  width: r.width, height: r.height)
-                out.append(PdfSegment(id: sid, text: t,
-                                      rect: rTL, pageIndex: i,
-                                      pageHeight: pageH))
+                segs.append(PdfSegment(id: sid, text: t,
+                                       rect: rTL, pageIndex: i,
+                                       pageHeight: pageH))
                 sid += 1
             }
         }
-        return out
+        return (segs, full.joined(separator: "\n\n"))
     }
 }

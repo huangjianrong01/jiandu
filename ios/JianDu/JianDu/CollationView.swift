@@ -22,6 +22,8 @@ struct CollationView: View {
     /// 用于右侧「笺读 Rust 重排」预览——保证 Mac/iPad 排版与坐标 100% 一致。
     @State private var rustBoxes: [GlyphBoxFfi] = []
     @State private var status: String = "从书架选一本 PDF，开始笺校"
+    /// 整本原文（逐页 page.string 提取，带页码分隔），自动填入右侧编辑区，可直接校改。
+    @State private var sourceText: String = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -97,9 +99,30 @@ struct CollationView: View {
         .id(holder.scrollNonce)
     }
 
-    // ── 右：文本层分段列表 + Rust 重排预览 ──
+    // ── 右：原文编辑区（可校） + 文本层片段列表 + Rust 重排预览 ──
     private var rightPane: some View {
         VStack(spacing: 0) {
+            // 原文编辑区：加载 PDF 后自动填入整本原文（逐页提取、带页码分隔），可直接校改。
+            VStack(alignment: .leading, spacing: 4) {
+                Text("原文（已自动提取 · 可校）")
+                    .font(.caption2).foregroundStyle(.secondary)
+                TextEditor(text: $sourceText)
+                    .font(.system(size: 13))
+                    .overlay(alignment: .topLeading) {
+                        if sourceText.isEmpty {
+                            Text("加载 PDF 后自动填入原文…")
+                                .foregroundStyle(.tertiary)
+                                .padding(6)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .border(Color.gray.opacity(0.3), width: 1)
+            }
+            .padding(8)
+            .frame(maxHeight: .infinity)
+
+            Divider()
+            // 文本层片段（点击 → PDF 红框高亮 + 自动居中 + Rust 重排）
             List(selection: $selectedID) {
                 ForEach(segments) { seg in
                     Text(seg.text)
@@ -107,6 +130,7 @@ struct CollationView: View {
                         .tag(seg.id as PdfSegment.ID?)
                 }
             }
+            .frame(height: 170)
             .overlay {
                 if segments.isEmpty {
                     Text("暂无文本片段").foregroundStyle(.tertiary)
@@ -177,24 +201,27 @@ struct CollationView: View {
             )
     }
 
-    // ── 后台提取 PDF 文本层（不阻塞主线程）──
+    // ── 后台提取 PDF 文本层 + 整本原文（不阻塞主线程）──
     private func loadDocument() {
         guard let id = selectedDocID,
               let doc = store.documents.first(where: { $0.id == id }),
               doc.kind == .pdf else {
             segments = []
             selectedID = nil
+            sourceText = ""
             status = "请选择 PDF 文档"
             return
         }
         let url = store.url(for: doc)
         status = "提取 PDF 文本层…"
         Task.detached(priority: .userInitiated) {
-            let segs = PdfTextExtractor.extract(from: url)
+            // 同一本 PDF 只开一次：分段（高亮联动）与整本原文（编辑区）一起拿到。
+            let (segs, full) = PdfTextExtractor.extractAll(from: url)
             await MainActor.run {
                 segments = segs
                 selectedID = segs.first?.id
-                status = "已提取 \(segs.count) 个文本片段"
+                sourceText = full
+                status = "已提取 \(segs.count) 片段 · 原文 \(full.count) 字"
             }
         }
     }
