@@ -33,6 +33,12 @@ pub struct SourceRegion {
     pub text: String,
 }
 
+/// 单页最多扫描多少字（见 `extract_pdf_text_regions_on` 里的封顶说明）。
+///
+/// 主线程同步调用无法中断，唯一可行的是**把工作量钉死在上限内**：6000 字的
+/// objc 逐字往返在 M 系列上约十几毫秒，属于「点一下几乎无感」的量级。
+const MAX_GLYPH_SCAN: usize = 6000;
+
 #[cfg(target_os = "macos")]
 #[link(name = "PDFKit", kind = "framework")]
 extern "C" {}
@@ -82,6 +88,15 @@ pub fn extract_pdf_text_regions_on(path: &Path, page_index: usize) -> Vec<Source
         if len == 0 {
             return vec![];
         }
+        // 逐字一次 objc 往返（`characterBoundsAtIndex`），单页正文正常在 3000 字
+        // 以内，几毫秒；极端排版（整页缩印 / 一页当两页用）能到上万字，几十毫秒
+        // 的同步开销就足以让「导入」这一下肉眼可见地顿。
+        //
+        // ⚠️ 本函数**必须**在主线程跑（PDFKit），没法改成后台，所以只能封顶工作
+        //    量：超过 MAX_GLYPH_SCAN 字只取前这么多字做坐标聚类。代价是超长页的
+        //    后几列没有框（点了不高亮），收益是界面绝不为一张扫描页冻住——宁可少
+        //    框几行，也绝不卡半个卡秒。古籍影印本单页几乎不可能破这条线。
+        let len = len.min(MAX_GLYPH_SCAN);
 
         // 逐字取包围盒 + 码点（含 UTF-16 代理对合并）。
         let mut chars: Vec<(f64, f64, f64, f64, u32)> = Vec::with_capacity(len);

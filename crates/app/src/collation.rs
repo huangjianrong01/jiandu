@@ -120,8 +120,17 @@ const PREVIEW_IMG_MAX_H: f32 = 880.0;
 /// 布局与滚动全部变慢（不是崩，是拖）。故按字数截断并明确告知——宁可只校对
 /// 前 8 万字，也不让点一下导入就把界面拖住。
 const TEXT_MAX_CHARS: usize = 80_000;
-/// 导入文本的字节上限：超过就不读（读进内存再截断纯属浪费）。
-const TEXT_IMPORT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// 导入文本的**硬上限**：超过直接拒绝，绝不把用户内存撑爆。
+///
+/// 产品边界（用户 2026-11-01 定）：
+/// ・**不做「大于 8MB 就不让进」**——大部头古籍扫描件转出来的纯文本动辄十几
+///   MB，一刀切拒绝等于「我的书导入不了」。8MB 只是**经验上的提示量级**，真正的
+///   判据是字数：超过 [`TEXT_MAX_CHARS`] 就截断，并明确告诉用户「只载入了前 N 字」。
+/// ・真正的闸门放在这里：64MB。再大就不是「一本书」了（多半是选错了文件，
+///   或者是数据库 / 日志），读进来只会把内存和界面一起拖死。
+/// ・读盘按 `take(HARD + 1)` **流式**读，绝不先信 `metadata` 再整读——网络盘 /
+///   iCloud 的 size 可能是 0 或说谎，信它就会一次性 read 出一个 2GB 的 Buffer。
+const TEXT_IMPORT_HARD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 右文段 ↔ 原图区域文字的**最低字面对合度**（0.0–1.0）。
 /// 段落索引对齐的前提是「右侧转录 ≈ 原图该区域文字」。用户实测过一类典型误用：
@@ -834,6 +843,13 @@ impl CollationWorkspace {
                     // 真实坐标映射：带文本层的 PDF 用 PDFKit 抽出的文本层坐标替换 Mock；
                     // 无文本层（扫描图 / 位图）extract 返回空 → 清空 Mock，避免高亮落
                     // 在错误位置，由状态栏提示需 OCR。
+                    //
+                    // ⚠️ 产品边界（用户 2026-11-01 定）：扫描版 PDF **只渲染、不报错、
+                    //    不崩溃**。这里走的就是这条路——`regions` 清空（没有任何坐标），
+                    //    `image_error` 显式置 None（**不是**错误），底部状态栏挂一条
+                    //    「需 OCR」的提示（见 `image_note` 的渲染处），底图照常栅格化
+                    //    显示、照常翻页、照常导出。用户看到的是「这本书能看，只是没法
+                    //    自动定位」，而不是一个红叉。
                     let real = crate::pdf_text::extract_pdf_text_regions(&path);
                     if !real.is_empty() {
                         this.regions = real;
@@ -841,8 +857,10 @@ impl CollationWorkspace {
                         this.image_note = None;
                     } else {
                         this.regions.clear();
+                        this.image_error = None; // 绝不把「无文本层」当错误报
                         this.image_note = Some(
-                            "该原图无文本层（扫描图），无法坐标映射，需 OCR".to_string(),
+                            "该原图无文本层（扫描图），只作底图显示，无法坐标映射——需 OCR"
+                                .to_string(),
                         );
                     }
                     cx.notify();
@@ -911,7 +929,7 @@ impl CollationWorkspace {
     ///
     /// 不卡死的三道做法：
     ///  ① rfd 同步对话框**前台直调**（走 background 会静默 None，见 reader.rs 笔记）；
-    ///  ② 读盘 / 解码扔 background executor——8 MB 上限的文件不该压在主线程；
+    ///  ② 读盘 / 解码扔 background executor——再大的稿子也不压在主线程；
     ///  ③ 超过 `TEXT_MAX_CHARS` 按字截断并明确提示（编辑器逐行自绘，超长会拖）。
     fn open_text_picker(&mut self, cx: &mut Context<Self>) {
         cx.spawn(
@@ -1743,7 +1761,14 @@ impl CollationWorkspace {
         // 无对应区域（段落数 ≠ 区域数 / 原图无文本层）→ 不高亮、不滚动、不标记。
         let Some(r) = self.regions.get(para_idx) else {
             self.active_para_idx = None;
-            self.match_note = None;
+            // 一条区域都没有 = 扫描版（无文本层）。这类原图**只渲染、不报错**，但也
+            // 确实没有坐标可映射——必须把「点了为什么没反应」当面讲清楚（产品边界 ①）。
+            self.match_note = if self.regions.is_empty() && self.image_path.is_some() {
+                Some("该原图无文本层（扫描图）：无法定位到原图，需先 OCR 出文本层".to_string())
+            } else {
+                None
+            };
+            cx.notify();
             return;
         };
         // —— 兜底容错：文本对合度校验 ——
@@ -2773,9 +2798,52 @@ impl Render for CollationWorkspace {
 //   ① 计算防护：建位图前先算 宽*高*4，超限则按比例缩到 最大边长≤4096 且 ≤64MB；
 //   ② 空指针：直接用 CGBitmapContextCreate 并判空，绕开 create_bitmap_context
 //      内部的 assert（其遇分配失败会直接 panic）；
-//   ③ 多页 PDF：只渲首页，页数>1 时给温和提示，不报错。
+//   ③ 多页 PDF：不整本入内存，**每次只渲调用方点名的那一页**，页数>1 时给温和
+//      提示，不报错。
+//
+// ④ 大文件走后台（产品边界，用户 2026-11-01 定）：本文件的栅格化恒在
+//    `bg.spawn(...)` 里跑（见 `open_image_picker` / `flip_page`），主线程只负责
+//    「换个路径给 img」。所以 500 页的扫描件不会在导入时把界面冻住——它压根没被
+//    整本渲染过，只有当前页落成一张 PNG；翻页时才渲下一页，进度由状态栏页码承担
+//    （「第 3 / 500 頁（← → 翻页）」）。这正是 8 MB / 8 万字那条线在**原图侧**的
+//    等价做法：不设「只渲前 N 页」的硬截断，因为逐页渲染本身就等价于「只渲 1 页」。
+//    竖排预览（`render_preview_pages`）才是「一次出多页」的那条路，它另有
+//    `PREVIEW_MAX_PAGES` / 时间预算两道闸门，并明确提示「仅预览前 N 页」。
 
 // ── 文本导入：rfd 选 .md / .txt → 读成纯文本源码（不清洗）──
+
+/// 文件名（给用户看的）：取不到就用占位，绝不 `unwrap`（无文件名 = 路径以 `..` 结尾）。
+fn file_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "（未命名）".to_string())
+}
+
+/// 流式读盘 + 硬上限：最多读 `hard + 1` 字节，多读的那一字节就是「越界」的证据。
+///
+/// 为什么不用 `std::fs::read`：它按 `metadata().len()` 一次性预分配。网络盘 /
+/// iCloud 占位文件 / 正在被别的进程写入的文件，size 可能是 0 也可能是几 GB，
+/// 信它就会一次性 read 出一个 2 GB 的 Buffer——用户内存当场爆掉。`Read::take`
+/// 在**读取侧**截断，内存占用恒定封顶在 `hard`，判据只看「多读到一个字节没有」。
+///
+/// `hard` 是参数而非常量，纯为了可测：单测拿 1 KB 当闸门去撞一个 6 KB 的文件，
+/// 不必真造一个 64 MB 的样本。
+fn read_bytes_capped(path: &Path, name: &str, hard: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let mut bytes: Vec<u8> = Vec::new();
+    let f = std::fs::File::open(path).map_err(|e| format!("读取「{}」失败：{}", name, e))?;
+    f.take(hard + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("读取「{}」失败：{}", name, e))?;
+    if bytes.len() as u64 > hard {
+        return Err(format!(
+            "「{}」过大（超过 {} MB）：请先拆分，或改用 EPUB / 按章导入",
+            name,
+            hard / 1024 / 1024
+        ));
+    }
+    Ok(bytes)
+}
 
 /// 读入校对稿，返回 `(源码文本, 给用户看的提示)`。
 ///
@@ -2784,22 +2852,14 @@ impl Render for CollationWorkspace {
 ///    （`.md` 的 `#` / `**` / `---` 必须看得见，抄校才有依据）；
 ///  ② 编码宽松：`from_utf8_lossy` 兜住 GBK 老稿的零星坏字节，绝不为一个
 ///    怪字节报错退出（古籍稿常见扫描后转码的残留）；
-///  ③ 超长截断并**说清楚**：编辑器逐行自绘，字数是唯一会拖慢首帧的量。
+///  ③ 超长截断并**说清楚**：编辑器逐行自绘，字数是唯一会拖慢首帧的量；
+///  ④ **本函数恒在后台 executor 上跑**（调用点见 `open_text_picker` 的
+///    `bg.spawn`）——读盘 + 解码 + 数字数三步都是 IO/CPU，一步都不许压主线程。
+///    产品边界（用户 2026-11-01 定）：>8 MB / >8 万字的稿子照样能进来，只是
+///    读盘在后台、超出 8 万字的部分按字截断并在状态栏挑明「只载入了前 N 字」。
 fn read_text_file(path: &Path) -> Result<(String, String), String> {
-    let name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "（未命名）".to_string());
-    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if len > TEXT_IMPORT_MAX_BYTES {
-        return Err(format!(
-            "「{}」过大（{:.1} MB）：本工作台只载入 {} MB 以内的文本",
-            name,
-            len as f64 / 1048576.0,
-            TEXT_IMPORT_MAX_BYTES / 1024 / 1024
-        ));
-    }
-    let bytes = std::fs::read(path).map_err(|e| format!("读取「{}」失败：{}", name, e))?;
+    let name = file_display_name(path);
+    let bytes = read_bytes_capped(path, &name, TEXT_IMPORT_HARD_BYTES)?;
     // BOM 与 CRLF 归一：否则首字会是个看不见的 U+FEFF，行尾多一个 '\r'。
     let text = String::from_utf8_lossy(&bytes)
         .trim_start_matches('\u{feff}')
@@ -3120,8 +3180,12 @@ fn rasterize_source(path: &Path, page_no: usize) -> Result<Rasterized, String> {
         .map_err(|e| format!("写入 PNG 失败：{}", e))?;
 
     // ③ 多页：现在**能翻**了（见 `flip_page`），不再只渲首页；提示只报页码与总数。
+    //    文案里明说「仅渲当前页」——大文件的页数由翻页承担，不整本进内存。
     let note = if total > 1 {
-        Some(format!("第 {} / {} 頁（← → 可翻页）", page_no, total))
+        Some(format!(
+            "第 {} / {} 頁（← → 翻页；仅渲当前页，不占整本内存）",
+            page_no, total
+        ))
     } else {
         None
     };
@@ -3299,8 +3363,51 @@ mod tests {
         // 标点不同 / PDF 无标点也不该扣分（比对前统一滤标点）。
         assert!(bigram_overlap("資治通鑑卷第一周紀一起著雍攝提格", region) > 0.95);
     }
-    // ── 纸张口径：容量从版式实测，绝不写第二张魔数表 ─────────────────────
 
+    // ── 产品边界：大文件不许撑爆内存，也不许糊里糊涂被拒 ──────────────────
+
+    /// 硬上限是**读取侧**的闸门：先整读再判大小正是撑爆内存的写法。这里拿 1 KB
+    /// 当闸门去撞一个 6 KB 的中文文件——必须当场报「过大」，而不是读完之后才说。
+    #[test]
+    fn oversized_text_file_is_rejected_at_the_read_side() {
+        let dir = std::env::temp_dir().join(format!(
+            "jiandu_cap_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("大部頭.txt");
+        std::fs::write(&p, "甲".repeat(2000)).unwrap(); // 3 字节/字 = 6000 字节
+        let name = file_display_name(&p);
+        assert_eq!(name, "大部頭.txt");
+
+        let err = read_bytes_capped(&p, &name, 1024).unwrap_err();
+        assert!(err.contains("过大"), "越界必须明确报「过大」：{}", err);
+        assert!(err.contains("大部頭.txt"), "提示里要带文件名：{}", err);
+
+        // 闸门放到 64 KB：同一个文件必须原样读完（证明不是「一律拒绝」）。
+        let ok = read_bytes_capped(&p, &name, 64 * 1024).unwrap();
+        assert_eq!(ok.len(), 6000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两条线各自的位置钉死：**64 MB 硬闸门**（不是 8 MB 一刀切）+ 8 万字截断线。
+    ///
+    /// 8 万字按汉字 3 字节算只有 240 KB，硬闸门必须远高于截断线——否则十几 MB 的
+    /// 大部头连「截断到 8 万字」的机会都没有就被拒了，等于「我的书导入不了」。
+    #[test]
+    fn product_limits_are_the_agreed_ones() {
+        assert_eq!(TEXT_IMPORT_HARD_BYTES, 64 * 1024 * 1024);
+        assert_eq!(TEXT_MAX_CHARS, 80_000);
+        assert!(
+            TEXT_IMPORT_HARD_BYTES > (TEXT_MAX_CHARS as u64) * 3 * 10,
+            "硬闸门必须远高于截断线，否则截断逻辑永远跑不到"
+        );
+    }
+    // ── 纸张口径：容量从版式实测，绝不写第二张魔数表 ─────────────────────
     /// 换纸必须换容量；`預覽卡` 的老经验表一个字都不许变。
     #[test]
     fn page_capacity_follows_the_paper() {
