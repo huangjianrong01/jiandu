@@ -147,6 +147,45 @@ const TEXT_IMPORT_HARD_BYTES: u64 = 64 * 1024 * 1024;
 // 「有没有一段连续 6 个字对得上」，不问「百分比够不够」。`bigram_overlap` 作为
 // 校对的**诊断量**保留，但不再参与放行决策。
 
+/// **康熙部首 → 通用汉字** 折叠表（214 字，按 `U+2F00` 起的码点顺序逐位对齐）。
+///
+/// ## 为什么需要它
+///
+/// PDF 文本层里经常混进**康熙部首**而不是正体汉字：真机抓到的那一页 PDFKit 抽出来
+/// 的是 `⾐`（U+2F90）、`⼥`（U+2F25）、`⼰`（U+2F70），而右文写的是 `衣` `女` `己`
+/// （U+8863 / U+5973 / U+5DF1）。两个码点长得一模一样，`==` 却为假——于是**字面
+/// 完全相同的两句话，判成不匹配**，高亮自然出不来。
+///
+/// 成因是字体子集反查：这批 PDF 没有 ToUnicode，PDFKit 只能拿字形反查字体 cmap，
+/// 反查表里同一枚字形对应多个码点时，它可能撞上部首码点。
+///
+/// 表来自 Unicode 的兼容分解（`NFKC` 会把 U+2F00–U+2FD5 逐个映射到对应汉字），
+/// 生成方式是脚本而不是手抄，故与标准逐字一致；这里只存结果，**不引依赖**。
+const KANGXI_RADICALS: &str = "一丨丶丿乙亅二亠人儿入八冂冖冫几凵刀力勹匕匚匸十卜卩厂厶又口囗土士夂夊夕大女子宀寸小尢尸屮山巛工己巾干幺广廴廾弋弓彐彡彳心戈戶手支攴文斗斤方无日曰月木欠止歹殳毋比毛氏气水火爪父爻爿片牙牛犬玄玉瓜瓦甘生用田疋疒癶白皮皿目矛矢石示禸禾穴立竹米糸缶网羊羽老而耒耳聿肉臣自至臼舌舛舟艮色艸虍虫血行衣襾見角言谷豆豕豸貝赤走足身車辛辰辵邑酉釆里金長門阜隶隹雨靑非面革韋韭音頁風飛食首香馬骨高髟鬥鬯鬲鬼魚鳥鹵鹿麥麻黃黍黑黹黽鼎鼓鼠鼻齊齒龍龜龠";
+
+/// 表按码点顺序排，取下标用。
+static KANGXI_FOLD: once_cell::sync::Lazy<Vec<char>> =
+    once_cell::sync::Lazy::new(|| KANGXI_RADICALS.chars().collect());
+
+/// 把一个可能是**康熙部首**的字折叠成通用汉字；其余字符原样返回。
+///
+/// `U+2E80–U+2EFF`（CJK 部首补充）里只有两个字有标准兼容分解，一并收进来；
+/// 折叠是幂等的（结果都是通用汉字），所以两边都折一遍也不会出错。
+fn fold_radicals(c: char) -> char {
+    let cp = c as u32;
+    if (0x2F00..=0x2FD5).contains(&cp) {
+        return KANGXI_FOLD
+            .get((cp - 0x2F00) as usize)
+            .copied()
+            .unwrap_or(c);
+    }
+    match cp {
+        0x2E9F => '母', // ⺟ → 母
+        0x2EF3 => '龟', // ⻳ → 龟
+        _ => c,
+    }
+}
+
 /// 计算右文段落在原图区域文字里的**连续二字对覆盖率**（0.0–1.0）。
 ///
 /// 不用单字重合：中文常见字（之 / 不 / 而）单字命中率虚高，会把不相干的文本判定
@@ -162,10 +201,13 @@ const TEXT_IMPORT_HARD_BYTES: u64 = 64 * 1024 * 1024;
 /// 用的是**同一套**清洗，绝不让「预览里干净、匹配时装了记号」两套标准并存）；
 /// ② 再滤掉标点 / 空白 / 符号 —— PDF 文本层常常没有标点，OCR 也常错标点，
 /// 留着它们只会制造假阴性。汉字本身就是 `is_alphanumeric()`，故 CJK 全保留。
+///
+/// 比对用的「净文本」：洗 Markdown 记号、折康熙部首、只留汉字/字母/数字。
 fn match_text(raw: &str) -> String {
     crate::share_layout::clean_md(raw)
         .text()
         .chars()
+        .map(fold_radicals)
         .filter(|c| c.is_alphanumeric())
         .collect()
 }
@@ -2176,18 +2218,15 @@ impl CollationWorkspace {
             Some((ri, n)) => {
                 // 覆盖率只作**诊断**报给用户看（「这段对得有多齐」），不参与放行：
                 // 放行判据是上面那句「连续 ≥ LCS_MIN 字重合」。
-                let cover = self
-                    .regions
-                    .get(ri)
-                    .map(|r| bigram_overlap(&text, &r.text))
-                    .unwrap_or(0.0);
                 self.active_para_idx = Some(ri);
+                // 只报「连续几字重合」。**不报覆盖率**：右文一行常常对不上原图
+                // 一列（一行 130 字 ↔ 一列 16 字），覆盖率天然只有个位数，摆出来
+                // 只会让人以为没对上——数字在这里是噪声，不是信息。
                 self.match_note = Some(format!(
-                    "已匹配：第 {} 行 → 原图第 {} 处（连续 {} 字重合，覆盖率 {:.0}%）",
+                    "已匹配：第 {} 行 → 原图第 {} 处（连续 {} 字重合）",
                     line_idx + 1,
                     ri + 1,
-                    n,
-                    cover * 100.0
+                    n
                 ));
                 self.scroll_region_to_center(ri, vw, vh);
             }
@@ -4173,5 +4212,146 @@ mod tests {
         assert!(CollationWorkspace::preview_result_stale(false, 7, 7));
         // 关掉又重开、但代际已变 → 旧的那批仍然必须丢（绝不「闪回上一版」）。
         assert!(CollationWorkspace::preview_result_stale(true, 7, 8));
+    }
+}
+
+
+#[cfg(test)]
+mod radical_fold_tests {
+    use super::*;
+
+    /// 折叠表必须是**标准 214 字**，且逐个落在通用汉字区（不是自己瞎编的）。
+    #[test]
+    fn kangxi_table_is_the_standard_214() {
+        assert_eq!(KANGXI_RADICALS.chars().count(), 214);
+        assert_eq!(KANGXI_FOLD.len(), 214);
+        for c in KANGXI_FOLD.iter() {
+            let cp = *c as u32;
+            assert!(
+                (0x4E00..=0x9FFF).contains(&cp),
+                "{:?} (U+{:04X}) 不是通用汉字",
+                c,
+                cp
+            );
+        }
+        // 首尾对齐：U+2F00 一、U+2FD5 龠。
+        assert_eq!(fold_radicals('\u{2F00}'), '一');
+        assert_eq!(fold_radicals('\u{2FD5}'), '龠');
+    }
+
+    /// 真机抓到的那三个字：⾐(U+2F90) ⼥(U+2F25) ⼰(U+2F30) 必须折成 衣 女 己。
+    #[test]
+    fn observed_radicals_fold_to_their_hanzi() {
+        assert_eq!(fold_radicals('\u{2F90}'), '衣');
+        assert_eq!(fold_radicals('\u{2F25}'), '女');
+        assert_eq!(fold_radicals('\u{2F30}'), '己');
+        assert_eq!(fold_radicals('\u{2E9F}'), '母');
+        assert_eq!(fold_radicals('\u{2EF3}'), '龟');
+        // 本来就是汉字的、标点的、拉丁的，一律原样。
+        for c in ['衣', '女', '己', '一', '，', 'a', '龠'] {
+            assert_eq!(fold_radicals(c), c);
+        }
+    }
+
+    /// 两侧文本一个用部首、一个用汉字，`match_text` 之后必须**一模一样**。
+    #[test]
+    fn match_text_folds_both_sides() {
+        assert_eq!(match_text("乃服⾐裳"), match_text("乃服衣裳"));
+        assert_eq!(match_text("⼥慕贞洁"), match_text("女慕贞洁"));
+        // 幂等：已经是汉字再折一次不变。
+        let once = match_text("衣裳");
+        assert_eq!(match_text(&once), once);
+    }
+
+    /// 原图区域整条都是部首字形时，右文（正常汉字）仍然要能定位到它。
+    #[test]
+    fn locate_region_survives_kangxi_region_text() {
+        let regions = vec![
+            SourceRegion {
+                x: 0.0,
+                y: 0.0,
+                w: 24.0,
+                h: 400.0,
+                text: "⼥慕贞洁男效才良知过必改得能莫忘".to_string(),
+            },
+            SourceRegion {
+                x: 30.0,
+                y: 0.0,
+                w: 24.0,
+                h: 400.0,
+                text: "罔谈彼短靡恃⼰长信使可覆器欲难量".to_string(),
+            },
+        ];
+        let (ri, n) = locate_region("靡恃己长，信使可覆", &regions).expect("应当命中部首字形");
+        assert_eq!(ri, 1, "该落在第二列");
+        assert!(n >= 6, "连续重合 {n} 字");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod vector_pdf_regression {
+    //! **端到端回归**：我们自己导出的矢量 PDF → 文本层 → 「点哪高亮哪」。
+    //!
+    //! 这条是用户明确要求的「拿真实样张跑一遍」。它同时钉住三件事：
+    //! ① 自产 PDF 的文本层能抽全（`PDFSelection` 路径，不是半页空矩形）；
+    //! ② 抽出来的框是**一列字**（细长），不是 6×6 的退化小方块；
+    //! ③ 右文一行能在这些区域里被 `locate_region` 找到，且找到的那一列
+    //!    确实是这一行的一部分（框不会落在不相干的字上）。
+
+    use super::*;
+
+    /// 千字文一段，单段不换行——避免一列跨两段、「子串」判据失真。
+    const SAMPLE: &str = "天地玄黄 宇宙洪荒 日月盈昃 辰宿列张 寒来暑往 秋收冬藏 闰余成岁 律吕调阳 云腾致雨 露结为霜 金生丽水 玉出昆冈 剑号巨阙 珠称夜光 果珍李柰 菜重芥姜 海咸河淡 鳞潜羽翔 龙师火帝 鸟官人皇 始制文字 乃服衣裳 推位让国 有虞陶唐";
+
+    fn sample_pdf() -> Vec<SourceRegion> {
+        let path = std::env::temp_dir().join("jiandu_collation_roundtrip.pdf");
+        CollationWorkspace::render_pdf_blocking(
+            SAMPLE,
+            12,
+            ShareBg::Xuan,
+            ShareFrame::Red,
+            Paper::A4,
+            Imposition::Single,
+            Binding::Right,
+            &path,
+        )
+        .expect("样张 PDF 生成失败");
+        let regions = crate::pdf_text::extract_pdf_text_regions(&path);
+        let _ = std::fs::remove_file(&path);
+        regions
+    }
+
+    #[test]
+    fn own_vector_pdf_yields_column_shaped_regions() {
+        let regions = sample_pdf();
+        assert!(!regions.is_empty(), "自产矢量 PDF 必须抽得出文本层");
+        // 一列至少十几个字 → 高度几十上百点；宽度 ≈ 一个字。
+        let tall = regions.iter().filter(|r| r.h > 40.0).count();
+        assert!(
+            tall >= 2,
+            "抽出 {} 个区域，其中只有 {} 个是「一列」（其余可能是退化小方块）",
+            regions.len(),
+            tall
+        );
+        for r in regions.iter().filter(|r| r.h > 40.0) {
+            assert!(r.w < 60.0, "列宽 {} 太胖：把相邻两列并进来了", r.w);
+        }
+    }
+
+    #[test]
+    fn own_vector_pdf_can_be_highlighted_by_right_text() {
+        let regions = sample_pdf();
+        // 右文第一段的开头（正常汉字，不带标点）。
+        let line = "天地玄黄宇宙洪荒日月盈昃辰宿列张";
+        let (ri, n) = locate_region(line, &regions).expect("在我们自己的 PDF 上应当定位得到");
+        assert!(n >= 6, "连续重合 {n} 字，太少（判据是 ≥ {LCS_MIN}）");
+        let hay = match_text(&regions[ri].text);
+        let needle = match_text(line);
+        assert!(!hay.is_empty(), "命中的区域文本为空");
+        assert!(
+            needle.contains(&hay),
+            "命中的那一列 {:?} 不是这一行的子串——框会落在不相干的字上",
+            hay
+        );
     }
 }
