@@ -25,7 +25,8 @@ struct PDFKitView: UIViewRepresentable {
     /// 默认空 holder，保证既有的 ReaderView（PDFKitView(url:)）无需改动仍可编译。
     var holder: PDFViewHolder = PDFViewHolder()
     var displayMode: PDFDisplayMode = .singlePageContinuous
-    var backgroundColor: UIColor = .systemBackground
+    /// 暖色纸底（与右栏宣纸黄呼应），去掉 PDFView 默认生硬白底。
+    var backgroundColor: UIColor = UIColor(red: 0xEF / 255, green: 0xE4 / 255, blue: 0xCC / 255, alpha: 1)
 
     func makeCoordinator() -> Coordinator { Coordinator(holder: holder) }
 
@@ -35,6 +36,8 @@ struct PDFKitView: UIViewRepresentable {
         view.displayMode = displayMode
         view.displayDirection = .vertical
         view.backgroundColor = backgroundColor
+        view.pageShadowsEnabled = false      // 去掉页面硬阴影，视觉更干净
+        view.interpolationQuality = .high    // 原图更细腻
         view.usePageViewController(false, withViewOptions: nil)
         view.document = PDFDocument(url: url)
         // 把 PDFView 实例交给 holder，供父视图做坐标换算 / 居中 / 反向命中。
