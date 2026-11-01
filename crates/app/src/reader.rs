@@ -10547,7 +10547,7 @@ impl Root {
         list = list.child(help_row("笔记框", "⏎ 保存 · Esc 取消 · ← → 移光标 · ⌘V 粘贴", t));
         // 卡片匣（v1.74.0）：跨书摘录。与朱批不同——朱批长在书里，卡片汇在匣里。
         list = list.child(help_row("浮签「存卡」", "框选正文后入匣（跨书汇集，书删了卡片还在）", t));
-        list = list.child(help_row("顶栏「卡片」", "跨书摘录卡（书删了卡片还在）", t));
+        list = list.child(help_row("⌘K 卡片匣", "跨书摘录卡（书删了卡片还在）", t));
         list = list.child(help_row("左侧栏", "三页：目录（当前章标红）/ 书签 / 批注", t));
         // 问小笺（v1.76.0 · V2.0 模块二）：框一句原文问他。
         list = list.child(help_sec("问小笺", t));
@@ -10575,10 +10575,18 @@ impl Root {
         list = list.child(help_row("点面板外空白", "收起左侧栏 / 卡片匣 / 帮助 / 导出菜单", t));
 
         list = list.child(help_sec("导出", t));
-        list = list.child(help_row("顶栏「导出」", "本叶图片 · 当前章卡片 · MD", t));
-        // v1.81.0：印制成了一等公民，给了两个键。
-        list = list.child(help_row("⌘⌥P", "印制：本叶 PDF", t));
-        list = list.child(help_row("⌘⌥⇧P", "印制：本章 PDF", t));
+        // v1.9.22：顶栏那枚已不是「导出」——按上面的口径一分为二：常用的
+        // 【印製】做了一级钮，其余全收进【更多】的三类书签里。
+        list = list.child(help_row(
+            "顶栏「印製」",
+            "本叶 PDF（与 ⌘⌥P 同一个动作）",
+            t,
+        ));
+        list = list.child(help_row(
+            "顶栏「更多」",
+            "出（图片 / 三种 PDF / 分享）· 卡（Anki / Obsidian / 批注）· 工（分析 / MD）",
+            t,
+        ));
         // v1.71.0：本叶图片改离屏重绘后口径变了，写进帮助里——
         // 用户最关心「要不要权限」「清晰度由什么定」「提示怎么收」。
         list = list.child(help_row("导出当前页图片", "存本叶高清 PNG（长边 2160，离屏重绘）", t));
