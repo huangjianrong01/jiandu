@@ -18,6 +18,9 @@ struct CollationView: View {
     @State private var selectedDocID: DocumentItem.ID?
     @State private var segments: [PdfSegment] = []
     @State private var selectedID: PdfSegment.ID?
+    /// Rust core（calculate_grid / layoutProbe）对选中行文本的重排结果，
+    /// 用于右侧「笺读 Rust 重排」预览——保证 Mac/iPad 排版与坐标 100% 一致。
+    @State private var rustBoxes: [GlyphBoxFfi] = []
     @State private var status: String = "从书架选一本 PDF，开始笺校"
 
     var body: some View {
@@ -66,6 +69,9 @@ struct CollationView: View {
                     // .id(scrollNonce) 让 PDF 滚动/缩放时重绘，高亮始终贴合页面。
                     highlightOverlay
                         .allowsHitTesting(false)
+                    // 反向联动层：捕获手指 / Apple Pencil 点击（DragGesture 取坐标），
+                    // 把视图坐标换回页坐标命中分段，反向选中右侧文本。放在最上层。
+                    reverseTapLayer
                 }
             } else {
                 ContentUnavailableView("选择 PDF 以载入原图", systemImage: "doc.fill")
@@ -91,25 +97,84 @@ struct CollationView: View {
         .id(holder.scrollNonce)
     }
 
-    // ── 右：文本层分段列表 ──
+    // ── 右：文本层分段列表 + Rust 重排预览 ──
     private var rightPane: some View {
-        List(selection: $selectedID) {
-            ForEach(segments) { seg in
-                Text(seg.text)
-                    .font(.system(size: 14))
-                    .tag(seg.id as PdfSegment.ID?)
+        VStack(spacing: 0) {
+            List(selection: $selectedID) {
+                ForEach(segments) { seg in
+                    Text(seg.text)
+                        .font(.system(size: 14))
+                        .tag(seg.id as PdfSegment.ID?)
+                }
             }
-        }
-        .overlay {
-            if segments.isEmpty {
-                Text("暂无文本片段").foregroundStyle(.tertiary)
+            .overlay {
+                if segments.isEmpty {
+                    Text("暂无文本片段").foregroundStyle(.tertiary)
+                }
             }
+            Divider()
+            rustPanel
         }
         .onChange(of: selectedID) { _ in
-            // C3：选中分段 → 高亮叠加（由 selectedID 驱动 Canvas）+ 自动滚动居中；
-            // C4 将在此接入 Rust 重排预览。
+            // 选中分段：① 高亮叠加 + 自动居中（selectedID 驱动 Canvas，centerOnSelected 居中）
             centerOnSelected()
+            // ② 把选中行文本喂给纯血 Rust 引擎（calculate_grid / layoutProbe）重排预览
+            if let seg = segments.first(where: { $0.id == selectedID }) {
+                runRust(seg.text)
+            }
         }
+    }
+
+    /// 底部「笺读 Rust 重排」预览：把选中文段交给 core.calculate_grid，
+    /// 用 Rust 真实排版坐标画字格，证明 Mac/iPad 排版与坐标 100% 一致。
+    private var rustPanel: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("笺读 Rust 重排（calculate_grid · 左上原点）")
+                .font(.caption2).foregroundStyle(.secondary)
+            GeometryReader { _ in
+                Canvas { ctx, size in
+                    ctx.fill(Path(CGRect(origin: .zero, size: size)),
+                             with: .color(.gray.opacity(0.10)))
+                    guard !rustBoxes.isEmpty else { return }
+                    let minX = rustBoxes.map { CGFloat($0.x) }.min()!
+                    let minY = rustBoxes.map { CGFloat($0.y) }.min()!
+                    let maxX = rustBoxes.map { CGFloat($0.x + $0.w) }.max()!
+                    let maxY = rustBoxes.map { CGFloat($0.y + $0.h) }.max()!
+                    let contentW = max(maxX - minX, 1)
+                    let contentH = max(maxY - minY, 1)
+                    let scale = min(size.width / contentW, size.height / contentH) * 0.92
+                    let offX = (size.width - contentW * scale) / 2
+                    let offY = (size.height - contentH * scale) / 2
+                    for b in rustBoxes {
+                        let rx = offX + (CGFloat(b.x) - minX) * scale
+                        let ry = offY + (CGFloat(b.y) - minY) * scale
+                        let rw = CGFloat(b.w) * scale
+                        let rh = CGFloat(b.h) * scale
+                        ctx.stroke(Path(roundedRect: CGRect(x: rx, y: ry,
+                                                            width: rw, height: rh),
+                                        cornerRadius: 1),
+                                   with: .color(.red), lineWidth: 0.5)
+                        ctx.draw(Text(b.ch).font(.system(size: min(rw, rh) * 0.8)),
+                                 at: CGPoint(x: rx + rw / 2, y: ry + rh / 2),
+                                 anchor: .center)
+                    }
+                }
+            }
+            .frame(height: 150)
+            .border(Color.gray.opacity(0.3))
+        }
+        .padding(8)
+    }
+
+    /// 反向联动层：透明、覆盖整页，捕获手指 / Apple Pencil 点击坐标。
+    private var reverseTapLayer: some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0).onEnded { v in
+                    reverseHitTest(at: v.location)
+                }
+            )
     }
 
     // ── 后台提取 PDF 文本层（不阻塞主线程）──
@@ -147,5 +212,31 @@ struct CollationView: View {
                                   at: CGPoint(x: rYUp.midX, y: rYUp.midY))
         pv.go(to: dest)
         pv.layoutDocumentView()
+    }
+
+    // ── 反向联动：PDF 上点击 / Pencil → 命中右侧分段 ──
+    private func reverseHitTest(at point: CGPoint) {
+        guard let pv = holder.pdfView,
+              let page = pv.currentPage,
+              let doc = pv.document else { return }
+        let pageIndex = doc.index(for: page)
+        // 视图坐标 → PDFKit 左下原点页坐标 → 翻回左上原点（与模型同系）。
+        let pagePtYUp = pv.convert(point, to: page)
+        let mb = page.bounds(for: .mediaBox)
+        let pagePtTL = CGPoint(x: pagePtYUp.x, y: mb.height - pagePtYUp.y)
+        if let hit = segments.first(where: {
+            $0.pageIndex == pageIndex && $0.rect.contains(pagePtTL)
+        }) {
+            selectedID = hit.id
+        }
+    }
+
+    // ── 调用纯血 Rust 引擎重排选中行（后台线程，主线程不卡死）──
+    private func runRust(_ text: String) {
+        Task.detached(priority: .userInitiated) {
+            // layoutProbe 即 core.calculate_grid；单段以 1 列竖排示意。
+            let boxes = layoutProbe(text: text, columns: 1)
+            await MainActor.run { rustBoxes = boxes }
+        }
     }
 }
