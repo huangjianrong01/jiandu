@@ -127,10 +127,125 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
     // ---- 位图上下文（Drop → CGContextRelease；ColorSpace 同理）----
     let space = CGColorSpace::create_device_rgb();
     let mut ctx = CGContext::create_bitmap_context(None, w, h, 8, w * 4, &space, BITMAP_INFO);
+    draw_card(l, &ctx, h as f64)?;
+
+    // ---- 取像素 → PNG ----
+    // `bytes_per_row` 可能带对齐填充，故逐行拷贝，绝不按 `w*4` 直接切片。
+    let stride = ctx.bytes_per_row();
+    let data = ctx.data();
+    let mut buf: Vec<u8> = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        let base = y * stride;
+        for x in 0..w {
+            let i = base + x * 4;
+            buf.push(data[i]);
+            buf.push(data[i + 1]);
+            buf.push(data[i + 2]);
+            buf.push(255);
+        }
+    }
+    let img = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(w as u32, h as u32, buf)
+        .ok_or_else(|| "位图缓冲尺寸不符".to_string())?;
+    let mut png: Vec<u8> = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| format!("PNG 编码失败：{e}"))?;
+    Ok(png)
+}
+
+// ── PDF：同一套版式，矢量落盘（A4 / A3）───────────────────────────────
+//
+// 「Markdown 与 A3 导出的翻译层」的最后一环：版式层只认 `w / h`，所以 A3 不需要
+// 另一条绘制链——同一份 `CardLayout` 画进位图是 PNG，画进 PDF 上下文就是矢量页。
+// 这里只补 CoreGraphics 里 core-graphics 0.24 没包的四个入口。
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn CGPDFContextCreateWithURL(
+        url: core_foundation::url::CFURLRef,
+        media_box: *const CGRect,
+        auxiliary_info: core_foundation::base::CFTypeRef,
+    ) -> core_graphics::sys::CGContextRef;
+    fn CGPDFContextBeginPage(
+        ctx: core_graphics::sys::CGContextRef,
+        page_info: core_foundation::base::CFTypeRef,
+    );
+    fn CGPDFContextEndPage(ctx: core_graphics::sys::CGContextRef);
+    fn CGPDFContextClose(ctx: core_graphics::sys::CGContextRef);
+}
+
+/// 把若干页版式写成一份**矢量 PDF**（一页一页流式落盘），返回写出的页数。
+///
+/// 页面尺寸**完全由 `pages[0].w / .h` 决定**：本函数不认识 A3、也不认识 A4，
+/// 只认版式交给它的两个数。调用方用 `Paper::pdf_geom()`（72dpi＝pt）排版，
+/// 于是 A3 = 841.89×1190.55pt，字级直接就是磅值，缩放交给阅读器插值。
+///
+/// 失败一律返回可读原因，绝不 panic——导出路径最怕崩在半路。
+#[cfg(target_os = "macos")]
+pub fn render_pdf(path: &std::path::Path, pages: &[CardLayout]) -> Result<usize, String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::url::CFURL;
+    use foreign_types::ForeignType;
+
+    let first = pages
+        .first()
+        .ok_or_else(|| "没有可导出的页面".to_string())?;
+    let url = CFURL::from_path(path, false)
+        .ok_or_else(|| format!("路径无法转成文件 URL：{}", path.display()))?;
+    let media = CGRect::new(
+        &CGPoint::new(0.0, 0.0),
+        &CGSize::new(first.w as f64, first.h as f64),
+    );
+    let raw = unsafe { CGPDFContextCreateWithURL(url.as_concrete_TypeRef(), &media, std::ptr::null()) };
+    if raw.is_null() {
+        return Err("无法创建 PDF 画布（CoreGraphics 返回空）".to_string());
+    }
+    // `from_ptr` 接管所有权：Drop 时 `CGContextRelease`；`Close` 在末尾显式调。
+    let ctx = unsafe { CGContext::from_ptr(raw) };
+    ctx.set_allows_antialiasing(true);
+    ctx.set_should_antialias(true);
+
+    let mut n = 0usize;
+    for page in pages {
+        // ⚠️ **必须先 BeginPage 再落笔**：BeginPage 之前收到的绘制会被丢掉，
+        //    整页只剩一个空内容流（控制台报 "No content stream"）。纸色同理。
+        unsafe { CGPDFContextBeginPage(raw, std::ptr::null()) };
+        let (br, bg, bb) = rgb(page.bg);
+        ctx.set_rgb_fill_color(br, bg, bb, 1.0);
+        ctx.fill_rect(CGRect::new(
+            &CGPoint::new(0.0, 0.0),
+            &CGSize::new(page.w as f64, page.h as f64),
+        ));
+        if let Err(e) = draw_card(page, &ctx, page.h as f64) {
+            // 半路失败也要把这一页收尾再关文件，绝不落一个坏 PDF。
+            unsafe { CGPDFContextEndPage(raw) };
+            unsafe { CGPDFContextClose(raw) };
+            return Err(e);
+        }
+        unsafe { CGPDFContextEndPage(raw) };
+        // 催 CG 把刚收的这一页写下去（不等 Close 时一次性吐），内存与页数无关。
+        ctx.flush();
+        n += 1;
+    }
+    unsafe { CGPDFContextClose(raw) };
+    Ok(n)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn render_pdf(_path: &std::path::Path, _pages: &[CardLayout]) -> Result<usize, String> {
+    Err("PDF 导出仅在 macOS 支持".to_string())
+}
+
+/// **把一张版式画进任意 CG 上下文**（位图上下文与 PDF 上下文共用）。
+///
+/// `hf` 是画布高度（CG 坐标原点在**左下**，而版式数据是屏幕坐标原点在**左上**）。
+///
+/// 两处上下文的行为相同：`CGBitmapContext` 与 `CGPDFContext` 都是 CG 坐标、
+/// 都是 y 向上，故同一套「只把每个元素的 y 镜像一次」的换算完全通用——
+/// **两边都不许翻 CTM**（翻了字会被镜像，v1.58 的坑）。
+fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64) -> Result<(), String> {
     // 防雷 ①：**不翻 CTM**。整幅坐标仍走 CG 原生（原点左下、y 向上），
     // 每个元素落笔前用 `cg_*` 把屏幕坐标（左上原点）换算过来。
     // 位图缓冲的第 0 行是图像**顶行**，故「屏幕 y」与「缓冲行号」同序。
-    let hf = h as f64;
     // 矩形顶边（屏幕 y）→ CG 底边 y：矩形整体镜像到下半平面。
     let cg_top = move |y_top: f64, hgt: f64| hf - y_top - hgt;
     // 基线（屏幕 y）→ CG 基线：**只做镜像，不做缩放**，字形因此保持正向。
@@ -143,7 +258,7 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
     ctx.set_rgb_fill_color(br, bg, bb, 1.0);
     ctx.fill_rect(CGRect::new(
         &CGPoint::new(0.0, 0.0),
-        &CGSize::new(w as f64, h as f64),
+        &CGSize::new(l.w as f64, l.h as f64),
     ));
 
     // ---- 矩形：高亮底（填充）/ 界框（描边）----
@@ -242,27 +357,7 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
         paint_seal(&ctx, s, l.bg, hf);
     }
 
-    // ---- 取像素 → PNG ----
-    // `bytes_per_row` 可能带对齐填充，故逐行拷贝，绝不按 `w*4` 直接切片。
-    let stride = ctx.bytes_per_row();
-    let data = ctx.data();
-    let mut buf: Vec<u8> = Vec::with_capacity(w * h * 4);
-    for y in 0..h {
-        let base = y * stride;
-        for x in 0..w {
-            let i = base + x * 4;
-            buf.push(data[i]);
-            buf.push(data[i + 1]);
-            buf.push(data[i + 2]);
-            buf.push(255);
-        }
-    }
-    let img = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(w as u32, h as u32, buf)
-        .ok_or_else(|| "位图缓冲尺寸不符".to_string())?;
-    let mut png: Vec<u8> = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .map_err(|e| format!("PNG 编码失败：{e}"))?;
-    Ok(png)
+    Ok(())
 }
 
 /// 朱砂方章：**纯色红方块 + 黑色「笺读」二字**（横排居中）。
@@ -671,5 +766,55 @@ mod tests {
                 println!("已出图：{}", dest.display());
             }
         }
+    }
+    /// **A3 矢量 PDF**：媒体框必须真是 A3（842×1191pt），文件头是 %PDF。
+    ///
+    /// 这条测试盯的是「物理尺寸参数化」的最后一毫米：版式层只吃了两个数
+    /// （`w/h`），PDF 的纸幅必须原样等于这两个数——不是把 A4 画布放大。
+    #[test]
+    fn renders_an_a3_pdf_whose_media_box_is_really_a3() {
+        use crate::share_layout::Paper;
+
+        let body: Vec<char> = "天地玄黃宇宙洪荒日月盈昃辰宿列張".chars().collect();
+        let red = vec![false; body.len()];
+        let g = Paper::A3.pdf_geom();
+        let spec = LayoutSpec {
+            body: &body,
+            red: &red,
+            md: &[],
+            note: "",
+            show_notes: false,
+            sign: "",
+            show_sign: false,
+            date: "",
+            show_date: false,
+            columns: 12,
+            bg: ShareBg::Xuan,
+            frame: ShareFrame::Red,
+            seal: ShareSeal::Twin,
+            seal_text: "笺校",
+            font: ShareFont::Song,
+            stamp: "",
+            w: g.w,
+            h: g.h,
+        };
+        let card = layout(&spec);
+        let out = std::env::temp_dir().join("jiandu_a3_pdf_test.pdf");
+        let n = render_pdf(&out, &[card]).expect("A3 PDF 应能写出");
+        assert_eq!(n, 1, "页数不对");
+
+        let bytes = std::fs::read(&out).expect("PDF 应已落盘");
+        assert!(bytes.starts_with(b"%PDF"), "不是 PDF 文件");
+        assert!(bytes.len() > 2000, "PDF 过小，多半是空内容流：{}", bytes.len());
+        // 媒体框：CG 会把 842 / 1191 写成 "842 1191"（或带小数），两者都认。
+        let hay = String::from_utf8_lossy(&bytes);
+        assert!(hay.contains("MediaBox"), "PDF 里找不到 MediaBox");
+        let near = hay.find("MediaBox").map(|i| &hay[i..(i + 60).min(hay.len())]);
+        let near = near.unwrap_or("");
+        assert!(
+            near.contains("842") || near.contains("841.8"),
+            "媒体框不是 A3 宽度：{near}"
+        );
+        let _ = std::fs::remove_file(&out);
     }
 }

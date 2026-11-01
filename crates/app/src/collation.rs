@@ -35,8 +35,8 @@ use crate::ime::{
 // 竖排预览：复用阅读引擎的「纯数据版式 + CoreGraphics 离屏光栅」链路，与 reader
 // 解耦（本模块绝不 import reader）。这三条都是 crate 内模块，reader 同款用法。
 use crate::share::{ShareBg, ShareFrame, ShareSeal};
-use crate::share_layout::{clean_md, layout, LayoutSpec, ShareFont};
-use crate::share_paint::render_png;
+use crate::share_layout::{clean_md, layout, LayoutSpec, Paper, ShareFont};
+use crate::share_paint::{render_pdf, render_png};
 use gpui::prelude::*;
 use gpui::{
     div, img, px, rgb, rgba, Bounds, Context,
@@ -99,6 +99,10 @@ fn preview_page_cap(columns: usize) -> usize {
 const PREVIEW_MAX_CHARS: usize = 900;
 /// ② 页数上限：达到即停止分页（哪怕还有余稿）。
 const PREVIEW_MAX_PAGES: usize = 6;
+/// **PDF 导出的页数上限**（后台任务，故比预览宽松得多）。
+///
+/// 与预览的 6 页不是一回事：导出是「整本印出来」，只防手滑把整部丛书一次排进去。
+const EXPORT_MAX_PAGES: usize = 300;
 /// ③ 时间预算（毫秒）：累计渲染耗时超预算立即停手，留最后一张给 UI。
 const PREVIEW_TIME_BUDGET_MS: u128 = 2500;
 /// 预览图在滚动容器里的最大显示高度（px）。
@@ -212,7 +216,7 @@ pub struct CollationWorkspace {
     /// 不当场删是因为本帧的 `img` 可能还在异步读该文件；隔一帧元素树已换，删了安全。
     temp_gc: Vec<PathBuf>,
     /// 当前这批预览图对应的版式指纹（`preview_sig`）；相同请求直接跳过不重排。
-    preview_sig: Option<(u64, usize, u8, u8)>,
+    preview_sig: Option<(u64, usize, u8, u8, u8)>,
     /// 当前预览页码（0-based）；`preview_paths` 为空时无意义。
     preview_page: usize,
     /// 预览栅格化失败信息（红色提示，如系统缺中文字体）。
@@ -233,6 +237,15 @@ pub struct CollationWorkspace {
     preview_frame: ShareFrame,
     /// 竖排预览样式：列数（8 / 10 / 12 / 14，经 norm_columns 锁定）。
     preview_columns: usize,
+    /// **纸张口径**（v1.21.0）：预览与 PDF 导出共用同一个选择。
+    ///
+    /// `Card` = 9:16 的屏幕取景卡（沿用老观感，不可导出）；`A4 / A3` 是真实纸张，
+    /// 尺寸一律经 `Paper::geom()` 由毫米算出——本文件里不写任何画布魔数。
+    preview_paper: Paper,
+    /// PDF 导出是否在途（后台排版 + 矢量落盘，禁止重入）。
+    export_busy: bool,
+    /// 导出结果 / 错误（浮层底部状态条，与预览状态条同一套视觉语言）。
+    export_note: Option<String>,
     /// 样式选择面板是否展开。
     show_style_panel: bool,
     /// 当前联动的右文段索引（0-based）。None = 尚未联动。右文第 i 段 ↔
@@ -308,6 +321,9 @@ impl CollationWorkspace {
             preview_paths: Vec::new(),
             temp_gc: Vec::new(),
             preview_sig: None,
+            preview_paper: Paper::Card,
+            export_busy: false,
+            export_note: None,
             preview_page: 0,
             preview_error: None,
             preview_note: None,
@@ -544,7 +560,9 @@ impl CollationWorkspace {
         self.selection = None;
         self.anchor = self.cursor;
         self.dragging = true;
-        window.focus(&self.focus);
+        // 点进编辑器 = 用户想打字。这里走硬重建（而不是裸 focus）：原生对话框
+        // 关掉后平台侧可能已经丢了输入上下文，而 GPUI 仍以为聚焦（见 hard_refocus）。
+        Self::hard_refocus(window, &self.focus);
         // 落光标即联动：右文点击第 N 段 → 左图滚动 + 高亮。
         if let Some(li) = self.line_of(self.cursor) {
             self.link_to_paragraph(li, vw, cx);
@@ -572,6 +590,25 @@ impl CollationWorkspace {
     }
 
     // ── 渲染 ─────────────────────────────────────────────────────────────
+
+    /// **强制重建输入焦点**——原生模态（rfd 文件对话框 / 菜单）返回后的唯一解法。
+    ///
+    /// 为什么必须是「blur + focus」而不是只 focus：`Window::focus()` 头一句是
+    /// `if self.focus == Some(handle.id) { return }`，它以为还聚焦着就直接返回；
+    /// 而平台侧的 first responder / 输入法上下文早被 NSOpenPanel 收走了。
+    /// 于是「看着在编辑器里，一个字都打不进去」。先 blur 把焦点 id 清空，
+    /// 再 focus 一次，平台才会重新把输入上下文交回来。
+    ///
+    /// `activate_window()` 兜住另一种情况：对话框关掉后本进程未必是 key window，
+    /// 若无 key 状态，键盘事件根本不会进到 GPUI。
+    fn hard_refocus(window: &mut Window, focus: &FocusHandle) {
+        if std::env::var("JIANDU_IME_DEBUG").is_ok() {
+            eprintln!("[collation] hard_refocus（重建输入上下文）");
+        }
+        window.activate_window();
+        window.blur();
+        window.focus(focus);
+    }
 
     /// 通用小按钮：承载 `on_click`（点下即触发 + 阻止冒泡）。
     fn button(
@@ -903,12 +940,190 @@ impl CollationWorkspace {
     /// 可在后台线程安全执行：`share_layout` / `share_paint` 只依赖 CoreGraphics +
     /// CoreText，不涉及 AppKit / 主线程 API。返回 (各页临时 PNG 路径, 温和提示)。
     /// 三重防卡死闸门（字数 / 页数 / 时间预算）依旧生效，但在后台里它们只限制
+    /// **一页能装多少字**——分页的唯一口径。
+    ///
+    /// * `Card`：沿用 v1.9.x 的经验表（[`preview_page_cap`]）。它是「一屏一页」
+    ///   的取景卡、不是真实纸张，换算法会让已验证过的观感整体走样，故不动。
+    /// * `A4 / A3`：**问版式自己**——拿 `pdf_geom` 尺寸排一个字，把「列数 × 行数」
+    ///   原样问出来（`CardLayout::capacity`）。绝不手写第二张表：纸张一改、
+    ///   列数一改，容量自己就跟着变。
+    fn page_cap(paper: Paper, columns: usize, bg: ShareBg, frame: ShareFrame) -> usize {
+        if paper == Paper::Card {
+            return preview_page_cap(columns);
+        }
+        let g = paper.pdf_geom();
+        let body = ['道'];
+        let red = [false];
+        let spec = LayoutSpec {
+            body: &body,
+            red: &red,
+            md: &[],
+            note: "",
+            show_notes: false,
+            sign: "",
+            show_sign: false,
+            date: "",
+            show_date: false,
+            columns,
+            bg,
+            frame,
+            seal: ShareSeal::Twin,
+            seal_text: "",
+            font: ShareFont::Song,
+            stamp: "",
+            w: g.w,
+            h: g.h,
+        };
+        layout(&spec).capacity().max(1)
+    }
+
+    /// **导出 PDF 的纯计算核心**（关联函数，可安全跑在后台线程）。
+    ///
+    /// 与预览共用同一套「清洗 → 分页 → 排版」，区别只有两点：尺寸用
+    /// `Paper::pdf_geom()`（72dpi＝pt，矢量），产物是 PDF 而不是 PNG。
+    /// 返回 `(页数, 落字数, 是否被页数闸门截断)`。
+    fn render_pdf_blocking(
+        text: &str,
+        columns: usize,
+        bg: ShareBg,
+        frame: ShareFrame,
+        paper: Paper,
+        path: &Path,
+    ) -> Result<(usize, usize, bool), String> {
+        let cleaned = clean_md(text);
+        if cleaned.body.is_empty() {
+            return Err("正文为空（清洗后一个字都没有）".to_string());
+        }
+        let body = cleaned.body;
+        let md = cleaned.md;
+        let cap = Self::page_cap(paper, columns, bg, frame);
+        let g = paper.pdf_geom();
+        let red = vec![false; body.len()];
+        let mut sheets = Vec::new();
+        let mut start = 0usize;
+        while start < body.len() {
+            if sheets.len() >= EXPORT_MAX_PAGES {
+                break;
+            }
+            let end = (start + cap).min(body.len());
+            let spec = LayoutSpec {
+                body: &body[start..end],
+                red: &red[start..end],
+                md: &md[start..end],
+                note: "",
+                show_notes: false,
+                sign: "",
+                show_sign: false,
+                date: "",
+                show_date: false,
+                columns,
+                bg,
+                frame,
+                seal: ShareSeal::Twin,
+                seal_text: "笺校",
+                font: ShareFont::Song,
+                stamp: "",
+                w: g.w,
+                h: g.h,
+            };
+            let card = layout(&spec);
+            let laid = card.chars.len();
+            if laid == 0 {
+                break;
+            }
+            start += laid;
+            sheets.push(card);
+        }
+        if sheets.is_empty() {
+            return Err("没有可导出的页面".to_string());
+        }
+        let chars: usize = sheets.iter().map(|c| c.chars.len()).sum();
+        let n = render_pdf(path, &sheets)?;
+        Ok((n, chars, start < body.len()))
+    }
+
+    /// 【导出 PDF】：选保存位置 → 后台排版 → 矢量落盘。
+    ///
+    /// 三条纪律与预览一致：① rfd 同步对话框必须**前台直调**（包进 background
+    /// 会静默返回 None）；② 排版 / 落盘全在 background executor，主线程只更新
+    /// 状态文字；③ `export_busy` 防重入，连点不会写坏同一个文件。
+    fn export_pdf(&mut self, cx: &mut Context<Self>) {
+        if self.export_busy {
+            return;
+        }
+        let paper = self.preview_paper;
+        if paper == Paper::Card {
+            self.export_note =
+                Some("「預覽卡」是屏幕取景、不是印刷幅面：请先选 A4 或 A3".to_string());
+            cx.notify();
+            return;
+        }
+        if self.text.trim().is_empty() {
+            self.export_note = Some("正文为空，没有可导出的内容".to_string());
+            cx.notify();
+            return;
+        }
+        let default_name = format!("笺校-{}.pdf", paper.label());
+        let picked = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("PDF", &["pdf"])
+            .save_file();
+        let Some(path) = picked else { return }; // 用户取消：静默返回，不留提示。
+        self.export_busy = true;
+        self.export_note = Some(format!("正在排版 {}（矢量 PDF）…", paper.label()));
+        cx.notify();
+
+        let text = self.text.clone();
+        let columns = self.preview_columns;
+        let bg = self.preview_bg;
+        let frame = self.preview_frame;
+        let path_bg = path.clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    let exec = app.background_executor().clone();
+                    let out = exec
+                        .spawn(async move {
+                            CollationWorkspace::render_pdf_blocking(
+                                &text, columns, bg, frame, paper, &path_bg,
+                            )
+                        })
+                        .await;
+                    if let Some(entity) = this.upgrade() {
+                        let _ = entity.update(&mut app, |this, cx| {
+                            this.export_busy = false;
+                            this.export_note = Some(match out {
+                                Ok((n, chars, cut)) => {
+                                    let tail = if cut {
+                                        format!("；已到 {} 页上限，余稿未导出", EXPORT_MAX_PAGES)
+                                    } else {
+                                        String::new()
+                                    };
+                                    format!(
+                                        "已导出 {n} 页 / {chars} 字（{}）→ {}{tail}",
+                                        paper.label(),
+                                        path.display()
+                                    )
+                                }
+                                Err(e) => format!("导出失败：{e}"),
+                            });
+                            cx.notify();
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
     /// 单批任务时长，不再阻塞 UI 一分一毫。
     fn render_preview_pages(
         text: &str,
         preview_columns: usize,
         preview_bg: ShareBg,
         preview_frame: ShareFrame,
+        paper: Paper,
     ) -> Result<(Vec<PathBuf>, Option<String>), String> {
         let t0 = std::time::Instant::now();
         // **Markdown 清洗**（预览解析）：编辑器里存的是源码（`#`、`**`、`---`
@@ -937,8 +1152,12 @@ impl CollationWorkspace {
         }
         let red = vec![false; body.len()];
 
-        // 按当前列数取整页容量，喂入 ≤ 此值保证不缩字；再用实际落字数推进。
-        let cap = preview_page_cap(preview_columns);
+        // 按当前**纸张**取整页容量，喂入 ≤ 此值保证不缩字；再用实际落字数推进。
+        // 容量是版式实测出来的（见 `page_cap`），不是手写经验表——A4/A3 因此
+        // 天然各有一套正确容量，代码里没有第二张魔数表。
+        let cap = Self::page_cap(paper, preview_columns, preview_bg, preview_frame);
+        // 屏幕取景尺寸：保纸的宽高比、长边封顶 1280（A3 绝不按 300dpi 贴图）。
+        let geom = paper.preview_geom();
         let mut pages: Vec<PathBuf> = Vec::new();
         let mut start = 0usize;
         let mut cut = false; // 是否被闸门 ②/③ 截断
@@ -972,10 +1191,10 @@ impl CollationWorkspace {
                 seal_text: "笺校",
                 font: ShareFont::Song,
                 stamp: "",
-                // 画布降到 720×1280（仍 9:16）：PNG 体积与 img 解码 / 纹理开销
-                // 约为 1080×1920 的 1/2.2，显著减轻预览图对主线程的呈现压力。
-                w: 720.0,
-                h: 1280.0,
+                // 尺寸一律来自 `Paper`：`Card` 仍是 720×1280（老观感，PNG 体积
+                // 小、贴图压力低），A4/A3 按比例取样但同一张纸的形状。
+                w: geom.w,
+                h: geom.h,
             };
             // 让 layout 自己按整页容量落字；取实际落字数当页边界（双保险，绝不丢字）。
             let card = layout(&spec);
@@ -1179,11 +1398,12 @@ impl CollationWorkspace {
         columns: usize,
         bg: ShareBg,
         frame: ShareFrame,
-    ) -> (u64, usize, u8, u8) {
+        paper: Paper,
+    ) -> (u64, usize, u8, u8, u8) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut h);
-        (h.finish(), columns, bg as u8, frame as u8)
+        (h.finish(), columns, bg as u8, frame as u8, paper as u8)
     }
 
     /// 请求重排预览（**绝不阻塞 UI**）：节流 + 代际令牌 + 后台栅格化。
@@ -1218,7 +1438,13 @@ impl CollationWorkspace {
         //
         // 只在「已经有一批可用的预览图」时短路：预览关掉后 `preview_paths` 为空，
         // 再次打开必须重排（旧文件已进 `temp_gc`）。
-        let key = Self::preview_sig(&self.text, self.preview_columns, self.preview_bg, self.preview_frame);
+        let key = Self::preview_sig(
+            &self.text,
+            self.preview_columns,
+            self.preview_bg,
+            self.preview_frame,
+            self.preview_paper,
+        );
         if !self.preview_paths.is_empty() && self.preview_sig == Some(key) {
             self.preview_pending = false;
             return;
@@ -1237,9 +1463,10 @@ impl CollationWorkspace {
         let columns = self.preview_columns;
         let bg = self.preview_bg;
         let frame = self.preview_frame;
+        let paper = self.preview_paper;
 
         cx.spawn(
-            // ⚠️ 必须 move：把快照（text/columns/bg/frame/gen）的所有权交给异步块，
+            // ⚠️ 必须 move：把快照（text/columns/bg/frame/paper/gen）的所有权交给异步块，
             // 否则 async move 捕获的是对局部变量的借用，过不了 'static。
             move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
                 let mut app = app.clone();
@@ -1247,7 +1474,9 @@ impl CollationWorkspace {
                     let exec = app.background_executor().clone();
                     let out = exec
                         .spawn(async move {
-                            CollationWorkspace::render_preview_pages(&text, columns, bg, frame)
+                            CollationWorkspace::render_preview_pages(
+                                &text, columns, bg, frame, paper,
+                            )
                         })
                         .await;
                     if let Some(entity) = this.upgrade() {
@@ -1716,7 +1945,15 @@ impl CollationWorkspace {
                         div()
                             .text_color(rgb(0xf4ecd8))
                             .text_size(px(15.0))
-                            .child(SharedString::from("竖排预览")),
+                            .child(SharedString::from(match self.preview_paper.mm() {
+                                Some((w, h)) => format!(
+                                    "竖排预览 · {} {}×{}mm",
+                                    self.preview_paper.label(),
+                                    w as u32,
+                                    h as u32
+                                ),
+                                None => "竖排预览 · 預覽卡（9:16 取景）".to_string(),
+                            })),
                     )
                     .child(div().flex_1())
                     // Loading：后台排版期间给出明确反馈（用户点了不会「没反应」）。
@@ -1730,6 +1967,12 @@ impl CollationWorkspace {
                         div()
                     })
                     .child(self.preview_pager(cx))
+                    .child(self.paper_selector(cx))
+                    .child(self.button(
+                        "导出 PDF",
+                        |c, _, _, cx| c.export_pdf(cx),
+                        cx,
+                    ))
                     .child(self.button(
                         "刷新预览",
                         |c, _, _, cx| {
@@ -1778,7 +2021,10 @@ impl CollationWorkspace {
                                 // 尺寸直至卡死。故按视口算一个确定的等比尺寸。
                                 let img_h = (vh - HEADER_H * 2.0 - 64.0)
                                     .clamp(240.0, PREVIEW_IMG_MAX_H);
-                                let img_w = img_h * (1080.0 / 1920.0);
+                                // 宽高比来自当前纸张：`Card` 仍是 0.5625（9:16，
+                                // 与 1080×1920 的老取景逐像素一致），A4/A3 是 1:√2。
+                                let img_w =
+                                    img_h * self.preview_paper.preview_geom().aspect();
                                 // ⚠️ 不要给 img 套 with_animation：动画期间每帧重绘，
                                 // 1080×1920 级的位图反复解码 / 重上传会把主线程拖垮。
                                 // 翻页已由「← 第 X / Y 頁 →」明确指示，不需要淡入。
@@ -1808,6 +2054,10 @@ impl CollationWorkspace {
             )
             .child(self.render_style_panel(cx))
             .child(match self.render_preview_status() {
+                Some(s) => s,
+                None => div().h(px(0.0)),
+            })
+            .child(match self.render_export_status() {
                 Some(s) => s,
                 None => div().h(px(0.0)),
             })
@@ -1988,6 +2238,71 @@ impl CollationWorkspace {
     }
 
     /// 底部状态条：仅显示预览栅格化错误（红）。多页提示由顶部翻页器承载。
+    /// 纸张选择胶囊（浮层顶部）：`預覽卡 / A4 / A3`。
+    ///
+    /// 换纸 = 换版式的物理尺寸，**不是**换个滤镜：预览的分页容量、字号、天头
+    /// 地脚、以及「导出 PDF」出来的纸幅，全由这一个选择决定（版式层只认 `w/h`）。
+    fn paper_selector(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut row = div().flex().flex_row().items_center().mr(px(6.0));
+        for paper in Paper::ALL {
+            let selected = self.preview_paper == paper;
+            row = row.child(
+                div()
+                    .px(px(9.0))
+                    .py(px(3.0))
+                    .mr(px(4.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .text_size(px(12.5))
+                    .bg(if selected {
+                        rgb(0xd8c9a8)
+                    } else {
+                        rgba(0xffffff1a)
+                    })
+                    .text_color(if selected {
+                        rgb(0x2b2620)
+                    } else {
+                        rgb(0xd8c9a8)
+                    })
+                    .child(SharedString::from(paper.label()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |c, _, _, cx| {
+                            if c.preview_paper != paper {
+                                c.preview_paper = paper;
+                                // 指纹里含纸张 → 换纸必然重排；这里走 request 而非
+                                // refresh，连点时仍受 1s 节流保护。
+                                c.request_preview(cx);
+                            }
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        row
+    }
+
+    /// 导出状态条：**在途 / 成功 / 失败**三态都用一行字说清（绝不静默）。
+    fn render_export_status(&self) -> Option<gpui::Div> {
+        let note = self.export_note.as_ref()?;
+        let busy = self.export_busy;
+        Some(
+            div()
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .px(px(PAD))
+                .bg(rgba(0x2b262099))
+                .text_color(if busy {
+                    rgb(0xd8c9a8)
+                } else {
+                    rgb(0xf4ecd8)
+                })
+                .text_size(px(13.0))
+                .child(SharedString::from(note.clone())),
+        )
+    }
+
     fn render_preview_status(&self) -> Option<gpui::Div> {
         if let Some(e) = self.preview_error.as_ref() {
             return Some(
@@ -2054,8 +2369,7 @@ impl Render for CollationWorkspace {
         // 不这么做，导入完的文件在右侧「看得见、打不进字」（只读假象）。
         if self.refocus {
             self.refocus = false;
-            window.blur();
-            window.focus(&self.focus);
+            Self::hard_refocus(window, &self.focus);
         }
         let vw = px_f32(window.viewport_size().width);
         let vh = px_f32(window.viewport_size().height);
@@ -2638,5 +2952,74 @@ mod tests {
         assert!(bigram_overlap("資治通鑑卷第一，周紀一，起著雍攝提格", region) > 0.95);
         // 标点不同 / PDF 无标点也不该扣分（比对前统一滤标点）。
         assert!(bigram_overlap("資治通鑑卷第一周紀一起著雍攝提格", region) > 0.95);
+    }
+    // ── 纸张口径：容量从版式实测，绝不写第二张魔数表 ─────────────────────
+
+    /// 换纸必须换容量；`預覽卡` 的老经验表一个字都不许变。
+    #[test]
+    fn page_capacity_follows_the_paper() {
+        // 取景卡沿用 v1.9.x 的经验表（12 列 → 110 字）。
+        assert_eq!(
+            CollationWorkspace::page_cap(Paper::Card, 12, ShareBg::Xuan, ShareFrame::Red),
+            110
+        );
+        // 真实纸张问版式自己。A4 / A3 同比例（1:√2），故同列数下容量应当接近
+        // ——只差像素取整带来的±1 行（A4 的相对留白比 A3 略多一点点）。
+        let a4 = CollationWorkspace::page_cap(Paper::A4, 12, ShareBg::Xuan, ShareFrame::Red);
+        let a3 = CollationWorkspace::page_cap(Paper::A3, 12, ShareBg::Xuan, ShareFrame::Red);
+        let diff = (a4 as f32 - a3 as f32).abs() / a3 as f32;
+        assert!(diff < 0.10, "同比例纸张容量差太多：A4={a4} A3={a3}");
+        assert!(a3 > 120, "A4/A3 一页只装得下 {a3} 字，明显不对");
+    }
+
+    /// 生成一份 A3 样张（人工目检用，默认跳过）。
+    ///
+    /// 跑法：`JIANDU_GEN_A3_SAMPLE=1 cargo test -p jiandu --bins collation -- --ignored`。
+    /// 产物路径写在日志里，用「预览」或 `sips` 打开即可看版式（标题 / 正文 / 版框）。
+    #[test]
+    #[ignore]
+    fn dump_a3_sample_pdf() {
+        if std::env::var("JIANDU_GEN_A3_SAMPLE").is_err() {
+            return;
+        }
+        let text = "# 千字文\n\n**天地玄黃**，宇宙洪荒。日月盈昃，辰宿列張。寒來暑往，秋收冬藏。\n\n                    ## 第一節 四時\n\n閏餘成歲，律呂調陽。雲騰致雨，露結為霜。金生麗水，玉出崑岡。";
+        let out = std::env::temp_dir().join("jiandu_a3_sample.pdf");
+        let (n, chars, _) = CollationWorkspace::render_pdf_blocking(
+            text,
+            12,
+            ShareBg::Xuan,
+            ShareFrame::Red,
+            Paper::A3,
+            &out,
+        )
+        .expect("样张生成失败");
+        eprintln!("[a3-sample] {n} 页 / {chars} 字 → {}", out.display());
+    }
+
+    /// **端到端**：Markdown 源码 → 清洗 → A3 排版 → 矢量 PDF 落盘。
+    ///
+    /// 这是三件事缝在一起的验收：① 源码里的 `#` / `**` 不进纸面；
+    /// ② 排的是 A3（尺寸由 `Paper` 算）；③ 产物是真 PDF。
+    #[test]
+    fn markdown_goes_all_the_way_to_an_a3_pdf() {
+        let text = "# 千字文\n\n**天地玄黃**，宇宙洪荒。日月盈昃，辰宿列張。";
+        let out = std::env::temp_dir().join("jiandu_collation_export_test.pdf");
+        let r = CollationWorkspace::render_pdf_blocking(
+            text,
+            12,
+            ShareBg::Xuan,
+            ShareFrame::Red,
+            Paper::A3,
+            &out,
+        );
+        let (pages, chars, cut) = r.expect("MD → A3 PDF 应能跑通");
+        assert_eq!(pages, 1, "这么短的稿子不该分成多页");
+        assert!(!cut, "一页的稿子不该被页数闸门截断");
+        assert!(chars >= 16, "落字太少（清洗把正文吃掉了？）：{chars}");
+
+        let bytes = std::fs::read(&out).expect("PDF 应已落盘");
+        assert!(bytes.starts_with(b"%PDF"), "产物不是 PDF");
+        assert!(bytes.len() > 2000, "PDF 过小：{}", bytes.len());
+        let _ = std::fs::remove_file(&out);
     }
 }

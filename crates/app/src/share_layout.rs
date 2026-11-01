@@ -135,6 +135,20 @@ pub struct CardLayout {
     pub lines: Vec<PlacedLine>,
     pub chars: Vec<PlacedChar>,
     pub seal: Option<PlacedSeal>,
+    /// 本幅**能装多少字**（＝网格列数 × 行数，与本次喂进来的字数无关）。
+    ///
+    /// v1.21.0：分页要用它。原来「一页能装多少字」是调用方按 720×1280 手写的
+    /// 经验表（8→50 / 12→110…），换个幅面（A4 / A3）整张表就作废。现在版式
+    /// 自己把实测容量交出来，任何幅面都能一步问出「这页能放多少字」。
+    pub cols_cap: usize,
+    pub rows_cap: usize,
+}
+
+impl CardLayout {
+    /// 整幅容量（字）。`0` ＝ 还没排过（`Default`）。
+    pub fn capacity(&self) -> usize {
+        self.cols_cap.saturating_mul(self.rows_cap)
+    }
 }
 
 /// 版式输入（调用方快照，渲染期只读）。
@@ -268,6 +282,118 @@ pub fn punct_box(p: &PlacedChar) -> (f32, f32, f32) {
     } else {
         // 竖排古籍的句读挂在字的右上方，不占整格——正文仍按整格推进。
         (p.x + p.cell * 0.42, p.y + p.cell * 0.04, p.fs * 0.62)
+    }
+}
+
+// ----------------------------------------------------------------------
+// 纸张口径（v1.21.0）——「排版物理尺寸参数化」的唯一换算口
+//
+// 版式层从头到尾只吃两个数：`LayoutSpec.w / .h`。所以支持 A3 **不需要**第二套
+// 排版代码，只需要有人回答「A3 是多少像素」。本段就是那个唯一答案：
+//     mm --(dpi)--> px        `geom()`      出图（PDF 走 72dpi＝pt）
+//     mm --(比例)--> px        `preview_geom()`  屏幕取景（长边封顶）
+// 调用方一律经这里取尺寸，代码里再不许出现「1080×1920」「720×1280」这类魔数。
+//
+// 为什么 PDF 用 72dpi：PDF 是矢量，坐标单位是 pt（1/72 英寸）。A3 = 297×420mm
+// 恰好 = 841.89×1190.55pt。用 72dpi 排出来的「像素」与 pt 一一对应，字级直接
+// 就是磅值，缩放由阅读器无限插值——绝不靠 300dpi 位图去凑清晰度。
+// ----------------------------------------------------------------------
+
+/// 一张纸的规格（竖放，宽 < 高，与竖排版式的方向一致）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Paper {
+    /// 屏幕预览小卡：9:16 取景，**不是**真实纸张（沿用 v1.9.x 的观感基准）。
+    #[default]
+    Card,
+    /// A4（210 × 297 mm）。
+    A4,
+    /// A3（297 × 420 mm）——影印 / 印厂常用的两张 A4 拼版。
+    A3,
+}
+
+/// 纸张的像素尺寸（＝版式层的 `w / h`）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageGeom {
+    pub w: f32,
+    pub h: f32,
+}
+
+impl PageGeom {
+    /// 宽高比（宽 / 高）。竖放纸恒 < 1；预览据此等比贴图，绝不被容器裁切。
+    pub fn aspect(self) -> f32 {
+        if self.h.abs() < 1e-6 {
+            1.0
+        } else {
+            self.w / self.h
+        }
+    }
+}
+
+/// 预览光栅的**长边上限**（像素）：A3 只按比例取样，绝不按 300dpi 全尺寸贴图。
+///
+/// A3@300dpi 是 3508×4961（位图约 70 MB），解码 / 上纹理足以把主线程压死；
+/// 预览只需「看出纸形」，真分辨率留给出图那一刻（见 [`Paper::geom`]）。
+pub const PREVIEW_LONG_EDGE: f32 = 1280.0;
+
+impl Paper {
+    /// 三档，UI 按此顺序排列。
+    pub const ALL: [Paper; 3] = [Paper::Card, Paper::A4, Paper::A3];
+
+    /// 面板上的显示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Paper::Card => "預覽卡",
+            Paper::A4 => "A4",
+            Paper::A3 => "A3",
+        }
+    }
+
+    /// 毫米尺寸；[`Paper::Card`] 不是真实纸张，返回 `None`。
+    pub fn mm(self) -> Option<(f32, f32)> {
+        match self {
+            Paper::Card => None,
+            Paper::A4 => Some((210.0, 297.0)),
+            Paper::A3 => Some((297.0, 420.0)),
+        }
+    }
+
+    /// **排版物理尺寸**：`dpi` 下这张纸有多少像素。
+    ///
+    /// * `Card` 不吃 DPI（屏幕取景与分辨率无关），恒 720×1280；
+    /// * `A4 / A3` 按 `mm / 25.4 * dpi` 取整——四舍五入到整像素，避免半像素
+    ///   边框在 PDF 里被抗锯齿糊成两行灰边。
+    pub fn geom(self, dpi: f32) -> PageGeom {
+        match self.mm() {
+            None => PageGeom {
+                w: 720.0,
+                h: 1280.0,
+            },
+            Some((mw, mh)) => {
+                let k = dpi.max(1.0) / 25.4;
+                PageGeom {
+                    w: (mw * k).round(),
+                    h: (mh * k).round(),
+                }
+            }
+        }
+    }
+
+    /// PDF 的**矢量口径**：72dpi 下的尺寸＝磅值（pt），直接当媒体框。
+    pub fn pdf_geom(self) -> PageGeom {
+        self.geom(72.0)
+    }
+
+    /// **屏幕预览**尺寸：保住纸的宽高比，长边封顶到 [`PREVIEW_LONG_EDGE`]。
+    ///
+    /// `Card` 恰好等于 720×1280（长边已是上限），故既有观感逐像素不变。
+    pub fn preview_geom(self) -> PageGeom {
+        let g = self.geom(72.0);
+        let long = g.w.max(g.h).max(1.0);
+        let k = PREVIEW_LONG_EDGE / long;
+        PageGeom {
+            w: (g.w * k).round().max(1.0),
+            h: (g.h * k).round().max(1.0),
+        }
     }
 }
 
@@ -497,8 +623,15 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
     // 缩放：所有线宽 / 气口都以 1080 宽为基准，小卡同步收细，绝不糊成粗杠。
     let scale = (w / 1080.0).clamp(0.5, 2.0);
     // 版框外缘留白：左右按宽、上下按高各取一次（竖长卡的天头地脚要更从容）。
-    let pad_x = (w * 0.075).clamp(18.0, 46.0);
-    let pad_y = (h * 0.035).clamp(18.0, 72.0);
+    //
+    // v1.21.0：上限**随幅面线性放宽**。原来上限钉死 46/72px——那在 1080 卡上
+    // 是对的，但 A3@300dpi（3508px 宽）会算出「纸上只有 3.9mm 白边」，印出来
+    // 是笑话。现在 `cap × (w/1080)`：1080 及以下**一位小数都不变**（cap 仍是
+    // 46/72），A3 则自然放大到 ≈12.6mm 的天头地脚，是正常刻本的版框留白。
+    let pad_cap_x = 46.0 * (w / 1080.0).max(1.0);
+    let pad_cap_y = 72.0 * (h / 1920.0).max(1.0);
+    let pad_x = (w * 0.075).clamp(18.0, pad_cap_x);
+    let pad_y = (h * 0.035).clamp(18.0, pad_cap_y);
     let fw = FRAME_W * scale;
 
     let mut out = CardLayout {
@@ -591,6 +724,9 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
     // 容量上限：字太多（超长选区）就按能装下的量截断——绝不为了塞满而把
     // 行数撑爆、把列首顶出纸外（`rows_used` 因此永不超过 `rows`）。
     let cap = cols_max * rows.max(1.0) as usize;
+    // 把实测容量交给调用方（分页 / A4·A3 导出的唯一口径，见 `capacity()`）。
+    out.cols_cap = cols_max;
+    out.rows_cap = rows.max(1.0) as usize;
     let shown = n.min(cap);
     let cols_used = if shown == 0 {
         0
@@ -1252,5 +1388,64 @@ mod tests {
             4,
             "加粗旗子没带到落位结果里"
         );
+    }
+    // ── 纸张口径（v1.21.0）：A3 只是「同一套版式的另一组 w/h」 ──────────────
+
+    /// 单字 spec（只为问容量 / 字号，不求排满）。
+    fn one_char(w: f32, h: f32) -> CardLayout {
+        let body = ['道'];
+        let red = [false];
+        let mut s = spec(&body, &red);
+        s.show_sign = false;
+        s.show_date = false;
+        s.w = w;
+        s.h = h;
+        layout(&s)
+    }
+
+    /// A3 / A4 的像素尺寸必须是**毫米算出来的**，不是手写魔数。
+    #[test]
+    fn paper_sizes_come_from_millimetres() {
+        // 300dpi：A4 = 2480×3508，A3 = 3508×4961（印刷业标准像素数）。
+        let a4 = Paper::A4.geom(300.0);
+        assert_eq!((a4.w as u32, a4.h as u32), (2480, 3508));
+        let a3 = Paper::A3.geom(300.0);
+        assert_eq!((a3.w as u32, a3.h as u32), (3508, 4961));
+        // PDF 走 72dpi＝pt：A3 = 842×1191pt（297×420mm）。
+        let pdf = Paper::A3.pdf_geom();
+        assert_eq!((pdf.w as u32, pdf.h as u32), (842, 1191));
+        // 预览只取样、不按 300dpi 贴图：长边恒 1280，比例不变。
+        let pv = Paper::A3.preview_geom();
+        assert_eq!(pv.h as u32, 1280);
+        assert!((pv.aspect() - 297.0 / 420.0).abs() < 0.01, "预览丢了纸的比例");
+        // 预览卡是 9:16 的老取景，与纸张无关。
+        let card = Paper::Card.preview_geom();
+        assert_eq!((card.w as u32, card.h as u32), (720, 1280));
+    }
+
+    /// 同一份正文，A3 的字必须比 A4 大——「物理尺寸参数化」的肉眼证据。
+    #[test]
+    fn a3_sets_bigger_type_than_a4() {
+        let a4 = one_char(Paper::A4.pdf_geom().w, Paper::A4.pdf_geom().h);
+        let a3 = one_char(Paper::A3.pdf_geom().w, Paper::A3.pdf_geom().h);
+        let fs4 = a4.chars[0].fs;
+        let fs3 = a3.chars[0].fs;
+        assert!(fs3 > fs4 * 1.3, "A3 字号没跟上幅面：A4={fs4} A3={fs3}");
+        // 容量是真排出来的，不是写死的常数表。
+        assert!(a3.capacity() > 120, "A3 一页装不下 120 字：{}", a3.capacity());
+    }
+
+    /// 大纸的版框留白必须按幅面放宽：A3@300dpi 绝不能只有 3.9mm 的白边。
+    #[test]
+    fn big_paper_gets_proportional_margins() {
+        let g = Paper::A3.geom(300.0);
+        let big = one_char(g.w, g.h);
+        // rects[0] 是版框外框，x 就是左侧留白。
+        let pad = big.rects[0].x;
+        let mm = pad / 300.0 * 25.4;
+        assert!(mm > 9.0, "A3 天头地脚只有 {mm:.1}mm，印厂会笑");
+        // 1080 卡的留白一位小数都不许变（v1.9.x 基准）。
+        let card = one_char(1080.0, 1920.0);
+        assert!((card.rects[0].x - 46.0).abs() < 0.01, "1080 卡留白被改动");
     }
 }
