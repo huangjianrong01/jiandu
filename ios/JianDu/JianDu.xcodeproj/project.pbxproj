@@ -11,6 +11,7 @@
 		AA00000000000000000000B09 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F09 /* Assets.xcassets */; };
 		AA00000000000000000000B12 /* JianDuCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F13 /* JianDuCore.xcframework */; };
 		AA00000000000000000000B13 /* JianDuCore.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F13 /* JianDuCore.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		AA00000000000000000000B10 /* ProbeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F10 /* ProbeView.swift */; };
 		AA00000000000000000000B14 /* jiandu_ios_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F14 /* jiandu_ios_ffi.swift */; };
 		AA00000000000000000000B15 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F15 /* CoreGraphics.framework */; };
 		AA00000000000000000000B16 /* CoreText.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F16 /* CoreText.framework */; };
@@ -21,6 +22,7 @@
 		AA00000000000000000000F01 /* JianDuApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JianDuApp.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F09 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		AA00000000000000000000F13 /* JianDuCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = "../../../crates/ios-ffi/JianDuCore.xcframework"; sourceTree = "<group>"; };
+		AA00000000000000000000F10 /* ProbeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProbeView.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F14 /* jiandu_ios_ffi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = jiandu_ios_ffi.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F15 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		AA00000000000000000000F16 /* CoreText.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreText.framework; path = System/Library/Frameworks/CoreText.framework; sourceTree = SDKROOT; };
@@ -68,6 +70,7 @@
 			isa = PBXGroup;
 			children = (
 				AA00000000000000000000F01 /* JianDuApp.swift */,
+				AA00000000000000000000F10 /* ProbeView.swift */,
 				AA00000000000000000000F09 /* Assets.xcassets */,
 				AA00000000000000000000F13 /* JianDuCore.xcframework */,
 				AA00000000000000000000F14 /* jiandu_ios_ffi.swift */,
@@ -158,6 +161,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA00000000000000000000B01 /* JianDuApp.swift in Sources */,
+				AA00000000000000000000B10 /* ProbeView.swift in Sources */,
 				AA00000000000000000000B14 /* jiandu_ios_ffi.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
