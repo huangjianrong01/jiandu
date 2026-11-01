@@ -1056,6 +1056,51 @@ pub(crate) const COLUMN_OPTS: [(&str, Option<usize>); 5] = [
     ("自动", None),
 ];
 
+/// **「更多」菜单里的一件活**（v1.9.21 分组折叠后的派发表）。
+///
+/// 分组只是**界面**上的折叠：真正要干的活儿还是原来那十几件。把它们收敛成
+/// 一枚枚举之后，渲染层只管把 label 摆出来，点击一律交回
+/// [`Root::run_more`]——好处有二：
+///   ① 十一个 `catch_unwind` 只写一遍，不再每加一项就复制一段；
+///   ② 菜单怎么分组、怎么挪动，都不会漏接调用（编不过，而不是点了没反应）。
+///
+/// 商店版不挂 [`MoreAct::License`]（App Review 2.4.5(vi) 见 `run_more` 处注），
+/// 故整个枚举在那边有变体不被构造，`allow(dead_code)` 兜住。
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MoreAct {
+    /// 导出当前页 PNG：截原屏，带纸面、界栏与朱批。
+    PngLeaf,
+    /// 循环「出图时间」三档（古风 → 公历 → 关）。
+    StampCycle,
+    /// 导出本叶 PDF：A4 矢量、真字，双行夹注照排。
+    PdfLeaf,
+    /// 导出本章 PDF：一章一册。
+    PdfChapter,
+    /// 导出整本 PDF：一本书一册，逐叶按各自章节落篇题。
+    PdfBook,
+    /// 分享所选为图片：走 `share_layout` 重排版的竖排分享卡。
+    ShareSel,
+    /// 导出当前章为 Anki 卡片（逐段 Front/Back）。
+    AnkiChapter,
+    /// 导出选中文字为**一张** Anki 卡片。
+    AnkiSel,
+    /// 卡片匣 → Anki：整匣一份 CSV。
+    AnkiCards,
+    /// 卡片匣 → Obsidian：一卡一 md。
+    Obsidian,
+    /// 导出全书批注（朱批录 Markdown）。
+    MarginNotes,
+    /// 文本分析抽屉：字词 / 句读 / 文风。
+    Analysis,
+    /// 导出 MD：全书正文 + `[^n]` 脚注。
+    Md,
+    /// 說明页。
+    Help,
+    /// 激活 / 已激活回执（商店版不挂）。
+    License,
+}
+
 impl Root {
     // ------------------------------------------------------------------
     // 阅读视图
@@ -4132,14 +4177,17 @@ impl Root {
     /// 「触天头才出、读完即退」那套自动隐藏整块撤掉。只有专注模式会在渲染
     /// 层把它整块撤下，把整幅纸面还给正文。
     ///
-    /// **六枚**（v1.80.0）：书阁 · 目录 ｜ 版字 ｜ 检索 · 问笺 · 更多
+    /// **七枚**（v1.9.21）：书阁 · 目录 ｜ 版字 ｜ 检索 · 问笺 ｜ 印製 · 更多
     /// （v1.78.0 由 10 枚减到 9 枚；v1.79.0 减到 8 枚——「书签」「朱批」收进
     /// 左侧栏；v1.80.0 再减到 6 枚——「专注」并入「版字」那张阅读设置纸，
-    /// 「导出 / 帮助」与卡片匣一并收进「更多」下拉）。
+    /// 「导出 / 帮助」与卡片匣一并收进「更多」下拉；v1.9.21 又添回一枚
+    /// 「印製」——它是**一年点几百次**的那一件，不该住进三级菜单）。
     ///
     /// 减到六枚的道理：顶栏每多一枚，天头就多一道视线落点，读古籍时那道落点
     /// 一直在提醒「你正在用软件」。天天点的只有「翻哪一卷 / 字多大 / 找一句 /
-    /// 问一句」；导出与说明一年点几次，该住进下拉里。
+    /// 问一句」；导出与说明一年点几次，该住进下拉里。**但「印製」是例外**：
+    /// 把整叶排好的书印成 PDF，是这个应用最终交出去的那张纸，用户一天要它
+    /// 好几回——它配得上一级。
     ///
     /// v1.37.0「UI 瘦身」撤掉了「封面」一枚：书衣看点在书架点书那一刻，
     /// 读着读着没人想回封面，它只是白占天头一条横向空间。
@@ -4157,27 +4205,36 @@ impl Root {
 
         // 一枚纯文字：无底、无框、无图标。悬停转朱砂；`on`（面板开着）时
         // 常驻朱砂——这是「此门已开」的唯一提示，不另加下划线或色块。
-        // GPUI 0.2.2 无 letter-spacing，字距只能靠 12px 的内边距撑开。
+        // GPUI 0.2.2 无 letter-spacing，字距只能靠内边距撑开。
+        //
+        // v1.9.21：内边距 12 → **14**。十二枚挤在一行时，每枚只隔 12px，字
+        // 与字之间没有一口气；加到 14 之后整行「松」了一档，天头才像天头。
+        // （GPUI 0.2.2 没有 `gap`，一行里的间距只能由各项自身的内边距做。）
         let item = |label: &'static str, on: bool| -> Div {
             let fg = if on { zhu } else { t.ink() };
             div()
                 .h(px(BAR_H))
                 .flex()
                 .items_center()
-                .px(px(12.0))
+                .px(px(14.0))
                 .cursor_pointer()
                 .text_size(px(13.0))
                 .text_color(rgb(fg))
                 .hover(move |s| s.text_color(rgb(zhu)))
                 .child(SharedString::from(label))
         };
+        // 「检索 · 问笺」是一对：找一句、问一句，动作连着来，故两枚之间收紧到
+        // 9px，读起来是**一组**；与左右邻居之间靠 `sep` 的大留白分开。
+        // （用户口径：这两枚「排布更紧凑」，而整行的间距要「拉大」——同一行里
+        // 的两种密度，只能这样分：对内紧、对外松。）
+        let tight = |label: &'static str, on: bool| -> Div { item(label, on).px(px(9.0)) };
         // 组间竖线：13px 高的一道极细界，不贯通到顶底（贯通就成了表格）。
         let sep = || -> Div {
             div()
                 .w(px(1.0))
                 .h(px(13.0))
-                .ml(px(17.0))
-                .mr(px(17.0))
+                .ml(px(22.0))
+                .mr(px(22.0))
                 .bg(rgba(sep_ink))
         };
 
@@ -4224,9 +4281,12 @@ impl Root {
         ));
         mid = mid.child(sep());
 
-        // ---- 右组：检索 / 笔记 / 问笺 / 导出 / 帮助（最右那枚降权）----
+        // ---- 右组：检索 / 问笺 ｜ 印製 ｜ 更多 ----
+        //
+        // v1.9.21：`检索` 与 `问笺` 改走 `tight`（9px 内边距），两枚自成一组；
+        // 最常用的出活入口 `印製` 从「更多」里提上来，做了顶栏一级的一枚小印。
         let mut right = div().h(px(BAR_H)).flex().items_center();
-        right = right.child(item("检索", self.show_search).on_mouse_down(
+        right = right.child(tight("检索", self.show_search).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
@@ -4240,7 +4300,7 @@ impl Root {
             }),
         ));
         // 问小笺（v1.76.0 · V2.0 模块二）：框一句原文问他，或在此直接发问。
-        right = right.child(item("问笺", self.show_ai).on_mouse_down(
+        right = right.child(tight("问笺", self.show_ai).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
@@ -4273,284 +4333,314 @@ impl Root {
         // `stop_propagation` 才是这条链上唯一可靠的接线。
         // 每枚都给 `.id()`（Stateful<Div>，与目录竹简条同一形态），
         // 命中测试与派发都走标准路径。
-        let mitem = |id: &'static str, label: &str| -> Stateful<Div> {
+        // ════════════════════════════════════════════════════════════════
+        // 「更多」＝**三类书签**（v1.9.21 重构）
+        //
+        // 旧版把十一条功能平铺成一列：分享 / 图片 / 出图时间 / 三种 PDF / 三种
+        // 卡片 / 批注 / MD / 分析 / 激活 / 說明。一列扫下来全叫「导出××」，
+        // 眼睛没有落点，天头也就没了呼吸感。现在按「出活 → 归档 → 案头」分三类
+        // 折叠：一级只露三个分类（各带一枚方印标记），鼠标悬停才展开该类的子
+        // 菜单。最常用的那一件（导出本叶 PDF）另提到顶栏一级，不进菜单。
+        //
+        // 形态：宣纸色底 + 1px 墨线 + 2px 圆角 + 一道朱砂书签头——像夹在书里的
+        // 签条，而不是系统白下拉框。
+        // ════════════════════════════════════════════════════════════════
+        //
+        // 菜单纸色 / 边线 / 悬停底：
+        // ・底色取**不透明纸色**（不是 veil）：书签是实打实的一张纸，半透明会
+        //   让底下的字透出来，反而脏；
+        // ・边线 30% 墨（极细黑边，用户口径），圆角 2px——刻本没有圆角，但
+        //   屏幕上零圆角会割手，2px 是「看着是直角」的上限；
+        // ・悬停底 8% 朱砂：比灰底有温度，也不抢字。
+        let menu_paper = t.paper();
+        let menu_edge = ((t.ink() & 0xFFFFFF) << 8) | 0x4D;
+        let menu_hover = ((zhu & 0xFFFFFF) << 8) | 0x14;
+        let menu_zhu_edge = ((zhu & 0xFFFFFF) << 8) | 0x99;
+        // 菜单字体**统一宋体**（用户口径：宋体或仿宋）。取正文那支宋体的回退
+        // 链（文津宋体 → 思源宋体 → Songti SC → serif），不跟随「正文用楷体」
+        // 的选择——天头与签条是**界面**，界面在刻本里从来是宋体，不是楷书。
+        let menu_family = crate::fonts::family_for(FontChoice::WenJinMincho, Script::Ancient);
+
+        // 子菜单里的一条：按下即走、走完即收。
+        //
+        // 为什么用 `on_mouse_down` 而不是 `on_click`（v1.52.3 的老坑）：
+        // 阅读根 div 上挂着「点纸面收菜单」的 `on_mouse_down`，若用 on_click，
+        // 「按下」会先被根处理器收走菜单（`more_menu = false` → 整棵子树卸载），
+        // 「抬起」时 hitbox 已不在新帧里，click 永远不触发。
+        let aitem = |cx: &mut Context<Self>,
+                     id: &'static str,
+                     label: &str,
+                     act: MoreAct|
+         -> Stateful<Div> {
             div()
                 .id(SharedString::from(id))
                 .w_full()
-                .h(px(24.0))
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .px(px(11.0))
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(zhu)))
+                .child(SharedString::from(label.to_string()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.more_menu = false;
+                        this.more_group = None;
+                        this.run_more(act, window, cx);
+                    }),
+                )
+        };
+
+        // 分类行：一枚方印（单字）+ 类名 + 右端一个细箭头。
+        //
+        // 「图标」在古籍里没有现代那套线条图标可用——硬画一套反而出戏。
+        // 这里取**印章式方块字**（出 / 卡 / 工）：一枚 1px 方框 + 一个字，
+        // 既是图标也是书口题字，和版框、界行是同一套语言。
+        let grow = |id: &'static str,
+                    mark: &'static str,
+                    label: &'static str,
+                    hot: bool|
+         -> Stateful<Div> {
+            let mut row = div()
+                .id(SharedString::from(id))
+                .w_full()
+                .h(px(28.0))
                 .flex()
                 .items_center()
                 .px(px(10.0))
                 .cursor_pointer()
-                .hover(|s| s.text_color(rgb(zhu)))
-                .child(SharedString::from(label.to_string()))
+                .text_color(rgb(if hot { zhu } else { t.ink() }));
+            if hot {
+                row = row.bg(rgba(menu_hover));
+            }
+            row.child(
+                div()
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_1()
+                    .border_color(rgba(if hot { menu_zhu_edge } else { menu_edge }))
+                    .text_size(px(10.0))
+                    .text_color(rgb(if hot { zhu } else { t.ink_soft() }))
+                    .child(SharedString::from(mark)),
+            )
+            .child(
+                div()
+                    .ml(px(9.0))
+                    .text_size(px(12.0))
+                    .child(SharedString::from(label)),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from("›")),
+            )
         };
+
+        // 三个分类：(元素 id, 方印字, 类名)
+        let groups: [(&'static str, &'static str, &'static str); 3] = [
+            ("more-g-export", "出", "导出"),
+            ("more-g-cards", "卡", "卡片与联动"),
+            ("more-g-tools", "工", "工具"),
+        ];
+
         let mut menu = div()
             .absolute()
             .top(px(BAR_H + 4.0))
-            // v1.86.0：菜单挂在「更多」钮那一层 `relative` 里，故这里的 right
-            // 以钮的右缘为基准（负值 = 往右探出一点），整张纸签正好垂在钮下。
+            // 菜单挂在「更多」钮那一层 `relative` 里，故这里的 right 以钮的
+            // 右缘为基准（负值 = 往右探出一点），整张书签正好垂在钮下。
             .right(px(-6.0))
-            .w(px(136.0))
-            .bg(rgba(veil))
+            .w(px(134.0))
+            .bg(rgb(menu_paper))
             .border_1()
-            .border_color(rgba(sep_ink))
-            .rounded(px(3.0))
+            .border_color(rgba(menu_edge))
+            .rounded(px(2.0))
             .shadow_sm()
             .flex()
             .flex_col()
-            .py(px(3.0))
+            .py(px(4.0))
             .text_size(px(12.0))
+            .font_family(menu_family.clone())
             .text_color(rgb(t.ink()))
-            // 同理：命中栈在此截断，点菜单绝不会漏到纸面上翻页。
+            // 命中栈在此截断，点菜单绝不会漏到纸面上翻页。
             .occlude();
-        // ⓪ **分享所选为图片**（v1.64.0）：选中正文 → 就这儿出竖排分享卡。
-        //    与「导出当前页图片」（截原屏）不是一回事：这条走 `share_layout`
-        //    重排版，1080×1920、带界行边栏、朱批可随正文一起走。
-        //    没选区时自动退化为本叶——但入口放在选中之后才自然。
+        // 朱砂书签头：制签时压在签条顶端那道朱线，一眼看出「这是夹在书里的」。
         menu = menu.child(
-            mitem("export-share-sel", "分享所选为图片").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.more_menu = false;
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        this.open_share_panel(cx);
-                    }));
-                    if let Err(e) = r {
-                        this.report_export_panic(e, cx);
-                    }
-                }),
-            ),
+            div()
+                .mx(px(8.0))
+                .h(px(1.5))
+                .bg(rgba(menu_zhu_edge)),
         );
-        // ① 导出当前页图片：收菜单 → 直调 `export_page_png`（两段式：先收
-        //    面板画一帧干净纸面，再以真实窗口句柄截屏 → 弹保存框落盘 PNG）。
-        menu = menu.child(mitem("export-png", "导出当前页图片").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| {
-                cx.stop_propagation();
-                this.more_menu = false;
-                // 外层 `catch_unwind`：事件处理器 panic 会撞上 GPUI↔ObjC 的
-                // FFI 边界被 `panic_cannot_unwind` 强杀，故在此拦一道，降级为提示。
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    this.export_page_png(window, cx);
-                }));
-                if let Err(e) = r {
-                    this.report_export_panic(e, cx);
-                }
-            }),
-        ));
-        // ①·a **出图时间**（v1.82.0）：本叶 PNG 右下角那一行极简落款。
-        //      三档循环（古风 → 公历 → 关），就摆在「导出当前页图片」下面——
-        //      它是那一项的**设置**，离得远了没人找得着。
-        let stamp_label = format!("出图時間 · {}", self.stamp_style.label());
-        menu = menu.child(mitem("more-stamp", &stamp_label).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                let next = this.stamp_style.next();
-                this.stamp_style = next;
-                this.notice = match next {
-                    crate::share::StampStyle::Off => "出图不再落時間".to_string(),
-                    crate::share::StampStyle::Plain => "出圖時間：公歷（2026.10.28）".to_string(),
-                    crate::share::StampStyle::Classic => {
-                        "出圖時間：古風（丙午年季秋下浣）".to_string()
-                    }
-                };
-                cx.notify();
-            }),
-        ));
-        // ①·b **导出本叶 PDF**（v1.80.0）：A4 矢量、一叶一页。
-        //     与「导出当前页图片」不是一回事——那条出位图 PNG（发朋友圈），
-        //     这条出**真字**的 PDF（打印 / 转发 / 归档）。双行夹注照排。
-        menu = menu.child(mitem("export-pdf-leaf", "导出本叶PDF").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.more_menu = false;
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    this.export_pdf(crate::app::PdfScope::Leaf, cx);
-                }));
-                if let Err(e) = r {
-                    this.report_export_panic(e, cx);
-                }
-            }),
-        ));
-        // ①·c **导出本章 PDF**（v1.80.0）：整章一册，叶序照旧。
-        menu = menu.child(mitem("export-pdf-chapter", "导出本章PDF").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.more_menu = false;
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    this.export_pdf(crate::app::PdfScope::Chapter, cx);
-                }));
-                if let Err(e) = r {
-                    this.report_export_panic(e, cx);
-                }
-            }),
-        ));
-        // ①·d **导出整本 PDF**（v1.85.4）：一本书一册，逐叶按各自章节落篇题
-        // 与卷首题署；仍走流式落盘，整部《资治通鉴》也不爆内存。
-        menu = menu.child(mitem("export-pdf-book", "导出整本PDF").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.more_menu = false;
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    this.export_pdf(crate::app::PdfScope::Book, cx);
-                }));
-                if let Err(e) = r {
-                    this.report_export_panic(e, cx);
-                }
-            }),
-        ));
-        // ② 导出当前章为 Anki 卡片：逐段生成 Front/Back 的 CSV，弹保存框落盘。
-        menu = menu.child(mitem("export-anki", "导出当前章为卡片").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.more_menu = false;
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    this.export_anki_chapter(cx);
-                }));
-                if let Err(e) = r {
-                    this.report_export_panic(e, cx);
-                }
-            }),
-        ));
-        // ②·b 导出**选中**文字为**一张** Anki 卡片（v1.63.0）：极简 CSV，
-        //      正面 = 选区原文，背面 = 书名·章名 + 朱批 / 眉批。没选区就提示，
-        //      不静默出空卡。
-        menu = menu.child(
-            mitem("export-anki-sel", "导出选中为卡片").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.more_menu = false;
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        this.export_anki_selection(cx);
-                    }));
-                    if let Err(e) = r {
-                        this.report_export_panic(e, cx);
-                    }
-                }),
-            ),
-        );
-        // ③·b 导出**全书批注**（朱批录，v1.63.0）：全部 MarginNote 按章节
-        //      顺序排成 Markdown——章节名 + 原文摘录 + 批语。
-        menu = menu.child(
-            mitem("export-annotations", "导出全书批注").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.more_menu = false;
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        this.export_margin_notes(cx);
-                    }));
-                    if let Err(e) = r {
-                        this.report_export_panic(e, cx);
-                    }
-                }),
-            ),
-        );
-        // ③ 导出 MD：直调 `export_markdown_file`（全书正文 + `[^n]` 脚注）。
-        menu = menu.child(mitem("export-md", "导出MD").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.more_menu = false;
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    this.export_markdown_file(cx);
-                }));
-                if let Err(e) = r {
-                    this.report_export_panic(e, cx);
-                }
-            }),
-        ));
-        // ③·d **卡片匣 → Obsidian**（v1.81.0 · 模块六）：一卡一 md，选目录。
-        menu = menu.child(mitem("export-obsidian", "卡片匣→Obsidian").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.more_menu = false;
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    this.export_obsidian_cards(cx);
-                }));
-                if let Err(e) = r {
-                    this.report_export_panic(e, cx);
-                }
-            }),
-        ));
-        // ③·e **卡片匣 → Anki**（v1.81.0 · 模块六）：整匣一份 CSV，卡面由
-        //      左栏「批」页那三枚小印（挖空 / 问答 / 释义）决定，默认挖空。
-        menu = menu.child(mitem("export-anki-cards", "卡片匣→Anki").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.more_menu = false;
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    this.export_anki_cards(cx);
-                }));
-                if let Err(e) = r {
-                    this.report_export_panic(e, cx);
-                }
-            }),
-        ));
-        // ③·c **文本分析**（v1.81.0 · 模块五）：字词 / 句读 / 文风三栏抽屉。
-        //      排在导出之后、說明之前——它是「读完了想想」的活儿，不是出活的。
-        menu = menu.child(mitem("more-analysis", "文本分析").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.more_menu = false;
-                let scope = if this.has_selection() {
-                    crate::app::AnalysisScope::Selection
-                } else {
-                    crate::app::AnalysisScope::Chapter
-                };
-                this.open_analysis(scope, cx);
-            }),
-        ));
-        // ③·f **激活**（v1.81.0 · 模块六）：未激活时导出与印制是锁着的，
-        //      菜单上必须有一处能走到那张纸——否则用户撞见「未激活」提示后
-        //      找不到门。已激活也留着这一项：点了是回执（凭据 + 不绑机说明）。
-        //
-        //      v1.9.9：商店版**不挂这一项**。App Review 2.4.5(vi) 禁止
-        //      licence screen 与 licence key，菜单上留个「激活」等于给审核
-        //      递把柄；商店版的解锁由 StoreKit 收据决定，用户侧没有可点的门。
-        #[cfg(not(feature = "appstore"))]
-        {
-            let lic_label = if self.licensed() { "已激活" } else { "激活" };
-            menu = menu.child(mitem("more-license", lic_label).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.more_menu = false;
-                    this.open_license(cx);
-                }),
-            ));
-        }
-        // ④ **說明**（v1.80.0）：原先顶栏最右那枚「帮助」钮搬进下拉。
-        //    一年点几次的东西不该占天头一格——它在这里，且排在导出之后。
-        menu = menu.child(mitem("more-help", "說明").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.more_menu = false;
-                this.set_ui_state(AppUIState::Help, cx);
-                cx.notify();
-            }),
-        ));
+        menu = menu.child(div().h(px(3.0)));
 
-        // 「更多」+ 下拉：包一层 `relative` 当定位基准（见函数里「更多」那段
-        // 注释）。菜单绝对定位、挂在钮的正下方——钮居中到哪，菜单就跟到哪。
+        // ---- 三道分类行：悬停即展开，移开不收（换行才换内容）----
+        for (i, (id, mark, label)) in groups.iter().enumerate() {
+            let hot = self.more_group == Some(i);
+            let idx = i;
+            menu = menu.child(grow(id, mark, label, hot).on_mouse_move(cx.listener(
+                move |this, _ev: &MouseMoveEvent, _window, cx| {
+                    // 每帧 mouse_move 都会来，没变就绝不 notify——否则菜单自己
+                    // 会把整棵树重绘到天荒地老。
+                    if this.more_group != Some(idx) {
+                        this.more_group = Some(idx);
+                        cx.notify();
+                    }
+                },
+            )));
+        }
+
+        // ---- 子菜单：垂在当前分类行的左侧（菜单贴右缘，只能往左长）----
+        if let Some(g) = self.more_group {
+            let mut sub = div()
+                .absolute()
+                .right(px(134.0 + 4.0))
+                // 子菜单的第一条要与**正被悬停的那一行分类**齐平：
+                // 分类行中心 = 分类菜单的 py(4) + 书签头(1.5) + 气口(3) + 行高/2
+                //           = 8.5 + 14 = 22.5；
+                // 子菜单第一条中心 = 子菜单 top + 自己的 py(4) + 书签头(1.5)
+                //                   + 气口(3) + 行高/2 = top + 21.5。
+                // 故 top = 22.5 − 21.5 + 28×序号 = **1 + 28×序号**。
+                // （先算过一遍才敢写死：凭感觉给个 7.5，子菜单整整低了一行半。）
+                .top(px(1.0 + g as f32 * 28.0))
+                .w(px(142.0))
+                .bg(rgb(menu_paper))
+                .border_1()
+                .border_color(rgba(menu_edge))
+                .rounded(px(2.0))
+                .shadow_sm()
+                .flex()
+                .flex_col()
+                .py(px(4.0))
+                .text_size(px(12.0))
+                .font_family(menu_family.clone())
+                .text_color(rgb(t.ink()))
+                .occlude();
+            sub = sub.child(
+                div()
+                    .mx(px(8.0))
+                    .h(px(1.5))
+                    .bg(rgba(menu_zhu_edge)),
+            );
+            sub = sub.child(div().h(px(3.0)));
+            match g {
+                // ① 出活：一切「变成文件」的东西
+                0 => {
+                    let stamp_label = format!("出圖時間 · {}", self.stamp_style.label());
+                    sub = sub
+                        .child(aitem(cx, "export-png", "导出当前页图片", MoreAct::PngLeaf))
+                        .child(aitem(cx, "more-stamp", &stamp_label, MoreAct::StampCycle))
+                        .child(aitem(cx, "export-pdf-leaf", "当前页 PDF", MoreAct::PdfLeaf))
+                        .child(aitem(cx, "export-pdf-chapter", "本章 PDF", MoreAct::PdfChapter))
+                        .child(aitem(cx, "export-pdf-book", "整本 PDF", MoreAct::PdfBook))
+                        .child(aitem(
+                            cx,
+                            "export-share-sel",
+                            "分享所选为图片",
+                            MoreAct::ShareSel,
+                        ));
+                }
+                // ② 归档：出卡 / 进别人的生态（Obsidian、Anki）
+                1 => {
+                    sub = sub
+                        .child(aitem(
+                            cx,
+                            "export-anki",
+                            "导出本章为卡片",
+                            MoreAct::AnkiChapter,
+                        ))
+                        .child(aitem(
+                            cx,
+                            "export-anki-sel",
+                            "导出选中为卡片",
+                            MoreAct::AnkiSel,
+                        ))
+                        .child(aitem(cx, "export-anki-cards", "卡片匣 → Anki", MoreAct::AnkiCards))
+                        .child(aitem(
+                            cx,
+                            "export-obsidian",
+                            "卡片匣 → Obsidian",
+                            MoreAct::Obsidian,
+                        ))
+                        .child(aitem(
+                            cx,
+                            "export-annotations",
+                            "导出全书批注",
+                            MoreAct::MarginNotes,
+                        ));
+                }
+                // ③ 案头：读完了想想的活儿 + 冷门入口
+                _ => {
+                    sub = sub
+                        .child(aitem(cx, "more-analysis", "文本分析", MoreAct::Analysis))
+                        .child(aitem(cx, "export-md", "导出 MD", MoreAct::Md))
+                        .child(aitem(cx, "more-help", "說明", MoreAct::Help));
+                    // 商店版不挂「激活」：App Review 2.4.5(vi) 禁止 licence
+                    // screen / licence key，菜单上留个门等于给审核递把柄。
+                    #[cfg(not(feature = "appstore"))]
+                    {
+                        let lic_label = if self.licensed() { "已激活" } else { "激活" };
+                        sub = sub.child(aitem(cx, "more-license", lic_label, MoreAct::License));
+                    }
+                }
+            }
+            menu = menu.child(sub);
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        // **高频前置：印製**（v1.9.21）
+        //
+        // 原先「导出本叶 PDF」藏在「更多 → 导出 → 当前页 PDF」三级之下：一年
+        // 点几百次的那一件，走的是最深的一条路。现在提上来做顶栏一级。
+        //
+        // 为什么是一枚**方印**而不是又一个纯文字：顶栏其余六枚都是「字即按钮」，
+        // 唯独这一枚要**一眼看出是按钮**——它是唯一带「出活」性质的动作，也该是
+        // 整条天头上唯一一处朱砂。1px 朱砂界框 + 「印製」二字，与菜单里那三枚
+        // 方印（出 / 卡 / 工）、与版框界行是同一套语言，不另引图标体系。
+        right = right.child(sep());
+        right = right.child(
+            div()
+                .id("bar-print")
+                .ml(px(2.0))
+                .h(px(22.0))
+                .px(px(9.0))
+                .flex()
+                .items_center()
+                .border_1()
+                .border_color(rgba(menu_zhu_edge))
+                .rounded(px(2.0))
+                .text_size(px(11.0))
+                .font_family(menu_family.clone())
+                .text_color(rgb(zhu))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(menu_hover)))
+                .child(SharedString::from("印製"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        // 与菜单里那一项走同一条路（同一道 `catch_unwind`）。
+                        this.run_more(MoreAct::PdfLeaf, window, cx);
+                    }),
+                ),
+        );
+
+        // 「更多」+ 下拉：包一层 `relative` 当定位基准——菜单绝对定位、挂在钮
+        // 的正下方，钮居中到哪，菜单就跟到哪。
         let mut more_wrap = div().relative().h(px(BAR_H)).flex().items_center();
         more_wrap = more_wrap.child(item("更多", self.more_menu).on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.more_menu = !this.more_menu;
+                // 每次开合都把分组复位：下一次点开永远先看到三个分类，
+                // 不会停在上次悬停的那一类里（那会让人以为菜单换了内容）。
+                this.more_group = None;
                 cx.notify();
             }),
         ));
@@ -4558,6 +4648,7 @@ impl Root {
             more_wrap = more_wrap.child(menu);
         }
         right = right.child(more_wrap);
+
 
         // v1.52.1 排障：常驻顶栏曾不显示，两因叠加——① `.absolute()` 与
         // `.relative()` 并存（relative 覆盖 absolute，掉出绝对定位、被 flex_1
@@ -4629,6 +4720,80 @@ impl Root {
 
         let _ = total;
         bar.into_any_element()
+    }
+
+    /// **「更多」菜单的唯一派发入口**（v1.9.21）。
+    ///
+    /// 原先十一条菜单项各自内联一段 `catch_unwind` + 一次调用，分组重排时极易
+    /// 漏搬一条（而且编还编得过，只是点了没反应）。现在点击只带一枚
+    /// [`MoreAct`] 进来，这里按枚举派发——加一项就补一个 match 分支，漏了
+    /// 编译器会报。
+    ///
+    /// **为什么每条都套 `catch_unwind`**：事件处理器从 AppKit(ObjC) 事件循环
+    /// 经 GPUI 回调进 Rust，一旦 panic，展开无法越过这条 FFI 边界，运行时直接
+    /// `panic_cannot_unwind` 强杀进程（表现为「点一下导出就整个退出、什么都没
+    /// 留下」）。故每条导出路径的最外层都拦一道，把 panic 降级成一条可读提示。
+    fn run_more(&mut self, act: MoreAct, window: &mut Window, cx: &mut Context<Self>) {
+        // 统一兜底：`$body` 是一段闭包；panic 转成提示（并清掉半途残留的
+        // 导出作业），而不是让进程死掉。
+        macro_rules! guarded {
+            ($body:expr) => {{
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe($body));
+                if let Err(e) = r {
+                    self.report_export_panic(e, cx);
+                }
+            }};
+        }
+        match act {
+            // ---- 出活：一切「变成文件」的东西 ----
+            MoreAct::PngLeaf => guarded!(|| self.export_page_png(window, cx)),
+            MoreAct::PdfLeaf => {
+                guarded!(|| self.export_pdf(crate::app::PdfScope::Leaf, cx))
+            }
+            MoreAct::PdfChapter => {
+                guarded!(|| self.export_pdf(crate::app::PdfScope::Chapter, cx))
+            }
+            MoreAct::PdfBook => {
+                guarded!(|| self.export_pdf(crate::app::PdfScope::Book, cx))
+            }
+            MoreAct::ShareSel => guarded!(|| self.open_share_panel(cx)),
+            // 出图时间是「导出当前页图片」的一项设置，点了当场换一档并回执。
+            MoreAct::StampCycle => {
+                let next = self.stamp_style.next();
+                self.stamp_style = next;
+                self.notice = match next {
+                    crate::share::StampStyle::Off => "出图不再落時間".to_string(),
+                    crate::share::StampStyle::Plain => "出圖時間：公歷（2026.10.28）".to_string(),
+                    crate::share::StampStyle::Classic => {
+                        "出圖時間：古風（丙午年季秋下浣）".to_string()
+                    }
+                };
+                cx.notify();
+            }
+
+            // ---- 归档：出卡 / 进别人的生态（Anki、Obsidian）----
+            MoreAct::AnkiChapter => guarded!(|| self.export_anki_chapter(cx)),
+            MoreAct::AnkiSel => guarded!(|| self.export_anki_selection(cx)),
+            MoreAct::AnkiCards => guarded!(|| self.export_anki_cards(cx)),
+            MoreAct::Obsidian => guarded!(|| self.export_obsidian_cards(cx)),
+            MoreAct::MarginNotes => guarded!(|| self.export_margin_notes(cx)),
+
+            // ---- 案头：读完了想想的活儿 + 冷门入口 ----
+            MoreAct::Analysis => {
+                let scope = if self.has_selection() {
+                    crate::app::AnalysisScope::Selection
+                } else {
+                    crate::app::AnalysisScope::Chapter
+                };
+                self.open_analysis(scope, cx);
+            }
+            MoreAct::Md => guarded!(|| self.export_markdown_file(cx)),
+            MoreAct::Help => {
+                self.set_ui_state(AppUIState::Help, cx);
+                cx.notify();
+            }
+            MoreAct::License => self.open_license(cx),
+        }
     }
 
     /// 导出点击处理器被 `catch_unwind` 兜住后的统一收尾：把 panic 转成界面提示，

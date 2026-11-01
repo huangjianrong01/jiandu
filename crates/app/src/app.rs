@@ -523,6 +523,13 @@ pub struct Root {
     /// **「更多」下拉**（v1.80.0）：顶栏第六枚。导出六条 + 说明都收在这里；
     /// 与「导出」那枚旧菜单是同一形态，只是名字更中性——里头不只有导出。
     pub more_menu: bool,
+    /// 「更多」里**鼠标正悬停的分组**（v1.9.21 分组折叠）。
+    ///
+    /// 0 = 导出、1 = 卡片与联动、2 = 工具；`None` = 只列出三个分类。
+    /// 用悬停而非点击展开：古籍的「书签条」是一目十行的东西，点两下才见
+    /// 内容太慢；悬停即展开、移开不收回（收回到别的分组 / 关菜单时才变），
+    /// 免得鼠标穿行时子菜单一闪一闪。
+    pub more_group: Option<usize>,
     /// 匣中卡片（开栏时从库里读一次，增删后重读；不每帧查询）。
     pub cards: Vec<jiandu_core::cards::Card>,
     /// **问小笺侧栏**（v1.76.0 · V2.0 模块二）：AI 伴读。
@@ -1302,6 +1309,7 @@ impl Root {
             dict_tab: DictTab::default(),
             notes: std::collections::HashMap::new(),
             more_menu: false,
+            more_group: None,
             note_editing: false,
             note_edit_note: None,
             note_inject_key: None,
@@ -1579,8 +1587,14 @@ impl Root {
         }
         // 「更多」下拉（v1.82.0 调试口子）：必须在 `JIANDU_AUTO_READ` **之后**
         // 再置一次——打开一本书会 `close_transient_ui()`，把前面设好的浮层清掉。
-        if std::env::var("JIANDU_PANEL").map(|v| v == "more").unwrap_or(false) {
-            root.more_menu = true;
+        if let Ok(v) = std::env::var("JIANDU_PANEL") {
+            if v == "more" || v.starts_with("more:") {
+                root.more_menu = true;
+                // 开发用：`JIANDU_PANEL=more:1` 同时展开第 1 组子菜单（截图核对）。
+                if let Some(g) = v.split_once(':').and_then(|(_, n)| n.parse::<usize>().ok()) {
+                    root.more_group = Some(g);
+                }
+            }
         }
         // 开发用：JIANDU_COLUMNS=n 指定初始列数（8/10/12/14），便于逐列截图核对。
         if let Ok(v) = std::env::var("JIANDU_COLUMNS") {
