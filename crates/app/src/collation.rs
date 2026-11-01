@@ -41,7 +41,7 @@ use crate::share_layout::{
 use crate::share_paint::{render_pdf, render_pdf_spread, render_png, render_spread_png};
 use gpui::prelude::*;
 use gpui::{
-    div, img, px, rgb, rgba, Bounds, Context,
+    div, img, px, rgb, rgba, Bounds, BoxShadow, Context,
     EntityInputHandler, EventEmitter, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ParentElement, Render,
     ScrollHandle, SharedString, Styled, Window,
@@ -72,16 +72,34 @@ pub enum CollationEvent {
 const HEADER_H: f32 = 44.0;
 const PAD: f32 = 14.0;
 const FONT_SIZE: f32 = 17.0;
-const LINE_H: f32 = FONT_SIZE * 1.7;
-/// **右侧编辑区的内边距**（v1.9.22）：28px。
+/// 行高（v1.9.24）：17 × 1.8 ≈ 30.6。
 ///
-/// 原先与顶栏共用 `PAD`(14)——那点边距只够「不贴边」，不够「像一张稿纸」。
-/// 稿纸的规矩是：起首空两格、四边留白比行距宽。28 是 17px 字的两倍不到一点，
-/// 眼睛扫过去会觉得字是「摆」在纸上的，而不是被框住的。
-const ED_PAD: f32 = 28.0;
+/// 1.7 时四行字还是一块「面」，1.8 才散成一列「行」。这是纯样式的量，
+/// 但有一个**隐性耦合**必须记住：`caret_from_point` / `render_line` 的
+/// 选区带与光标高度全部由它推导，改这一个数，三处一起变——这正是要的。
+const LINE_H: f32 = FONT_SIZE * 1.8;
+/// **右侧编辑区的内边距**（v1.9.24）：28 → **40**。
+///
+/// 用户口径：「四周 Padding 至少 32」。取 40 是有原因的——它同时是
+/// `editor_origin()` 里的横纵原点偏移，字摆得越靠里，「点哪落哪」的余量
+/// 越大；而上下留白一旦宽过行距，一整屏文字才真正像「铺在纸上」。
+/// ⚠️ 两处用的是**同一个常量**，所以改这里不需要再去改 `editor_origin`。
+const ED_PAD: f32 = 40.0;
 /// 近似字宽：原图转录以 CJK 为主，按字号取值做编辑器内点击定位（仅用于右文
 /// 落光标 / 选区估算，不影响左图高亮精度——左图高亮走 `SourceRegion` 真实映射）。
 const CHAR_W: f32 = FONT_SIZE * 0.95;
+
+// ── 「一张木桌，两张纸」（v1.9.24 视觉定稿）─────────────────────────
+//
+// 分屏不靠线，靠**明度差 + 一道柔影**：左纸（原图）压深一档，右纸（稿纸）最亮，
+// 右纸左缘再挂一片极柔的外阴影——于是它看起来是**叠在**左纸上面的一张纸，
+// 而不是被一条黑线劈开的两个窗格。三个色值只写在这里，别在别处再抄。
+/// 右纸：极淡暖纸，正文的底。
+const PAPER_R: u32 = 0xF7F0DC;
+/// 左纸：同族压深一档。只用来和右纸拉开层次，不做任何装饰。
+const PAPER_L: u32 = 0xDDD2B4;
+/// 顶栏：与右纸同色但**不带边框**，靠一道 6% 墨的发丝线落地。
+const CHROME: u32 = 0xF3EBD4;
 /// 竖排预览各列数档位下的整页容量（由 `share_layout` 版式几何精算得出，
 /// 预览固定 720×1280、不落款不批注：8→50 / 10→79 / 12→110 / 14→152）。
 /// 每页喂入 ≤ 此值可保证 `layout` 不触发自动缩字号（share_layout.rs:346 的
@@ -909,10 +927,11 @@ impl CollationWorkspace {
             )
     }
 
-    /// **主按钮**（v1.9.22）：实底朱砂 + 圆角，一条工具条上只该有一枚。
+    /// **主按钮**（v1.9.24）：实底朱砂 + **全圆角胶囊**，一条工具条上只该有一枚。
     ///
-    /// 原先三个按钮同款浅朱底，视线没有落点；现在【竖排预览】是这张桌上唯一的
-    /// 「主要动作」，其余降为文字链/次级底。
+    /// v1.9.22 的 6px 圆角读起来还是「一个按钮」；`rounded_full()` 之后它变成
+    /// 一枚**印章边**——朱砂底色 + 胶囊轮廓，是这张桌上唯一的实心色块，
+    /// 视线天然落在这里。左右内边距也给足（16），不然胶囊会被文字顶扁。
     fn primary_button(
         &self,
         label: &'static str,
@@ -920,14 +939,15 @@ impl CollationWorkspace {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         div()
-            .px(px(14.0))
-            .py(px(5.0))
+            .px(px(16.0))
+            .py(px(6.0))
             .bg(rgb(0x8c2b22))
-            .rounded(px(6.0))
+            .rounded_full()
             .cursor_pointer()
             .text_size(px(12.0))
-            .text_color(rgb(0xf4ecd8))
+            .text_color(rgb(0xf7f0dc))
             .shadow_sm()
+            .hover(|s| s.bg(rgb(0x7a2419)))
             .child(SharedString::from(label))
             .on_mouse_down(
                 MouseButton::Left,
@@ -935,9 +955,11 @@ impl CollationWorkspace {
             )
     }
 
-    /// **次级按钮**（v1.9.22）：无底无框，只在悬停时浮出一层极浅的纸色。
+    /// **次级按钮**（v1.9.24）：无边框，只留一层几乎看不见的纸灰底。
     ///
     /// 给【打开文件】【导入 MD】这类「入口」用——它们是渠道，不是动作的高潮。
+    /// 底色的 alpha 只有 4%，灰到几乎等于没有；悬停抬到 10%，**动的是底、不是线**，
+    /// 所以永远不会出现「便利贴」那种硬边。
     fn ghost_button(
         &self,
         label: &'static str,
@@ -945,13 +967,14 @@ impl CollationWorkspace {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         div()
-            .px(px(10.0))
+            .px(px(11.0))
             .py(px(5.0))
-            .rounded(px(5.0))
+            .rounded(px(6.0))
             .cursor_pointer()
             .text_size(px(12.0))
             .text_color(rgb(0x4a4335))
-            .hover(|s| s.bg(rgba(0x2b262010)))
+            .bg(rgba(0x2B26200A))
+            .hover(|s| s.bg(rgba(0x2B26201A)))
             .child(SharedString::from(label))
             .on_mouse_down(
                 MouseButton::Left,
@@ -971,13 +994,13 @@ impl CollationWorkspace {
             .flex()
             .flex_row()
             .items_center()
-            // **毛玻璃悬浮条**（v1.9.22）：纸色 88% 上浮 + 一道 10% 墨的下分割线。
-            // GPUI 0.2.2 没有 `backdrop-filter`，只能靠「高 alpha 纸色」近似；
-            // 关键是那条**极淡的分割线**——有了它，工具条才是「浮在纸上的另一张
-            // 纸」，没有它就只是一条色块。
-            .bg(rgba(0xECE2C8E0))
+            // **去边框化**（v1.9.24）：顶栏底色只比稿纸深半个色阶，下沿那道线压到
+            // 6% 墨——它已经不像「一条分割线」，而像两张纸叠在一起时的那道缝。
+            // 工具条上三枚控件的边界全部由**自身底色**给出，不再由线给出；这也是
+            // GPUI 0.2.2 没有 `backdrop-filter` 时的正解：别假装毛玻璃，把线撤掉。
+            .bg(rgb(CHROME))
             .border_b_1()
-            .border_color(rgba(0x2B26201A))
+            .border_color(rgba(0x2B26200F))
             .px(px(18.0))
             .child(
                 div()
@@ -1015,16 +1038,18 @@ impl CollationWorkspace {
                 cx,
             ))
             .child(div().w(px(6.0)))
-            // 【返回阅读】弱化到最右：无底无框、软墨色，鼠标上去才转朱砂。
+            // 【返回阅读】弱化到最右：小字 + 左箭头，无底无框，鼠标上去才转朱砂。
+            // 字号从 12 压到 11.5、墨色压到 55%——它是「退路」，不该和【竖排预览】
+            // 争同一档视觉重量。
             .child(
                 div()
                     .px(px(8.0))
                     .py(px(5.0))
-                    .rounded(px(5.0))
+                    .rounded(px(6.0))
                     .cursor_pointer()
-                    .text_size(px(12.0))
+                    .text_size(px(11.5))
                     .font_family(song)
-                    .text_color(rgba(0x2B262099))
+                    .text_color(rgba(0x2B26208C))
                     .hover(|s| s.text_color(rgb(0x8c2b22)))
                     .child(SharedString::from("← 返回阅读"))
                     .on_mouse_down(
@@ -1065,7 +1090,7 @@ impl CollationWorkspace {
             .flex()
             .flex_col()
             // 左「纸」压深一档：两张纸摆在一张桌上，靠明度差分开，不靠硬线。
-            .bg(rgb(0xddd2b4))
+            .bg(rgb(PAPER_L))
             .child(
                 div()
                     .relative()
@@ -1086,27 +1111,36 @@ impl CollationWorkspace {
             })
     }
 
-    /// **左栏空状态**（v1.9.22）：一张没有内容的纸。
+    /// **左栏空状态**（v1.9.24 定稿）：一张还没有贴原图的纸。
     ///
-    /// 三条设计纪律，都是为了让它是「空状态」而不是「错误提示」：
-    ///   ① **没有实线框**——GPUI 0.2.2 画不了虚线，于是改用「浅色纸底 + 无边框」，
-    ///      比任何一圈线都安静；
-    ///   ② 文字只给两行：一句「在等什么」，一句「怎么开始」；
-    ///   ③ 朱砂只用在这一枚小方印上，且压到 40% 透明——空的时候不该抢眼。
-    /// **左栏空状态**（v1.9.22，v1.9.24 补强文案与轮廓）。
-    ///
-    /// 四条设计纪律，都是为了让它是「空状态」而不是「错误提示」：
-    ///   ① **没有实线框**——GPUI 0.2.2 画不了虚线，于是用「极淡的轮廓 + 浅纸底」，
-    ///      比任何一圈硬线都安静，但比纯色块更像"一个待填的格子"；
-    ///   ② 文字只给三行：一句「在等什么」、一句「点哪里开始」、一句「支持什么」；
-    ///   ③ 朱砂只用在这一枚小方印上，且压到 40% 透明——空的时候不该抢眼；
-    ///   ④ 提示必须**指向具体的按钮位置**（左上角「打开文件」）。只说「请导入原图」
-    ///      等于把找路的活儿又丢回给用户。
+    /// 五条设计纪律，都是为了让它是「空状态」而不是「错误提示」：
+    ///   ① **框要极轻**——一圈 4% 纸灰的发丝边 + 16px 大圆角 + 比左纸亮半档的底，
+    ///      读起来是「一张待填的纸」，不是「一个灰色的占位方块」。
+    ///      （GPUI 0.2.2 没有 `dashed`，真虚线要靠一串 1px 短横拼，那是结构改动；
+    ///        本轮口径是「只改样式」，故用**灰度**换**虚线感**：4% 的线在任何
+    ///        屏幕上都已经「虚线化」了。）
+    ///   ② 图标是**线稿**不是字形：一本线装书，全是 1px 直边——不用放大镜那种
+    ///      斜柄图形，因为 GPUI 0.2.2 的元素不能旋转，斜线只能靠多边形硬画。
+    ///   ③ 字号三层递进：15 / 11.5 / 11，含一次**字体切换**（宋体 → 黑体），
+    ///      第三行是「格式说明」，用无衬线更轻、更像注脚。
+    ///   ④ 朱砂**一处都不用**。空的时候不该有任何"喊人"的颜色。
+    ///   ⑤ 提示必须**指向具体的按钮位置**（左上角「打开文件」）。只说「请导入
+    ///      原图」等于把找路的活儿又丢回给用户。
     fn render_left_empty(&self) -> gpui::Div {
         let song = crate::fonts::family_for(
             crate::types::FontChoice::WenJinMincho,
             crate::types::Script::Ancient,
         );
+        // 第三行用无衬线：它讲的是「支持什么格式」，是注脚不是正文。
+        let sans = crate::fonts::family_for(
+            crate::types::FontChoice::SourceHanSans,
+            crate::types::Script::Modern,
+        );
+        // 线稿的墨色分三档：外框最实（40%）、书脊次之（30%）、栏线最淡（12%）。
+        // 同一张图里三档灰度，是「线稿」而不是「几个灰方块」的关键。
+        let line_strong = rgba(0x2B262040);
+        let line_mid = rgba(0x2B262033);
+        let line_faint = rgba(0x2B26201A);
         div()
             .size_full()
             .flex()
@@ -1115,58 +1149,106 @@ impl CollationWorkspace {
             .justify_center()
             .child(
                 div()
-                    .w(px(300.0))
+                    .w(px(330.0))
                     .flex()
                     .flex_col()
                     .items_center()
-                    .py(px(38.0))
-                    .px(px(24.0))
-                    .bg(rgba(0xF3EBD5D9))
-                    // 淡墨轮廓（不是虚线，是「弱一档的线」）：给这块留白一个边界，
-                    // 让它读起来像一张待填的表格，而不是一片没画完的背景。
+                    .py(px(46.0))
+                    .px(px(30.0))
+                    // 比左纸亮半档的暖白：像一张**压在上面**的干净稿纸。
+                    .bg(rgba(0xFBF6E6D9))
                     .border_1()
-                    .border_color(rgba(0x8C2B221F))
-                    .rounded(px(10.0))
-                    // 一枚极淡的方印：认门，不喊人。
+                    .border_color(rgba(0x2B262014))
+                    .rounded(px(16.0))
                     .child(
+                        // ── 线稿：一本摊开的线装书 ──
                         div()
-                            .w(px(34.0))
-                            .h(px(34.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
+                            .relative()
+                            .w(px(54.0))
+                            .h(px(42.0))
                             .border_1()
-                            .border_color(rgba(0x8C2B2240))
-                            .rounded(px(2.0))
-                            .text_size(px(15.0))
-                            .font_family(song.clone())
-                            .text_color(rgba(0x8C2B22AA))
-                            .child(SharedString::from("原")),
+                            .border_color(line_strong)
+                            .rounded(px(3.0))
+                            // 书脊折线
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(5.0))
+                                    .left(px(13.0))
+                                    .w(px(1.0))
+                                    .h(px(32.0))
+                                    .bg(line_mid),
+                            )
+                            // 三针缝线（穿书脊的短横）——线装书的记号
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(8.0))
+                                    .left(px(8.0))
+                                    .w(px(11.0))
+                                    .h(px(1.0))
+                                    .bg(line_strong),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(20.0))
+                                    .left(px(8.0))
+                                    .w(px(11.0))
+                                    .h(px(1.0))
+                                    .bg(line_strong),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(32.0))
+                                    .left(px(8.0))
+                                    .w(px(11.0))
+                                    .h(px(1.0))
+                                    .bg(line_strong),
+                            )
+                            // 右侧两道栏线：示意「版面上有字」，压到几乎看不见
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(9.0))
+                                    .left(px(25.0))
+                                    .w(px(1.0))
+                                    .h(px(24.0))
+                                    .bg(line_faint),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(9.0))
+                                    .left(px(36.0))
+                                    .w(px(1.0))
+                                    .h(px(24.0))
+                                    .bg(line_faint),
+                            ),
                     )
-                    .child(div().h(px(14.0)))
+                    .child(div().h(px(20.0)))
                     .child(
                         div()
                             .font_family(song.clone())
-                            .text_size(px(13.0))
-                            .text_color(rgb(0x5a5346))
+                            .text_size(px(15.0))
+                            .text_color(rgb(0x4B453A))
                             .child(SharedString::from("等待导入古籍原图")),
                     )
-                    .child(div().h(px(8.0)))
-                    .child(
-                        div()
-                            .font_family(song.clone())
-                            .text_size(px(11.5))
-                            .text_color(rgba(0x5A5346CC))
-                            .child(SharedString::from(
-                                "请点左上角「打开文件」导入原图",
-                            )),
-                    )
-                    .child(div().h(px(4.0)))
+                    .child(div().h(px(7.0)))
                     .child(
                         div()
                             .font_family(song)
+                            .text_size(px(11.5))
+                            .text_color(rgba(0x5A5346B5))
+                            .child(SharedString::from("请点左上角「打开文件」导入")),
+                    )
+                    .child(div().h(px(5.0)))
+                    .child(
+                        div()
+                            .font_family(sans)
                             .text_size(px(11.0))
-                            .text_color(rgba(0x5A534699))
+                            .text_color(rgba(0x7E7666C0))
                             .child(SharedString::from("支持 PDF / PNG · PDF 需带文本层")),
                     ),
             )
@@ -2322,7 +2404,9 @@ impl CollationWorkspace {
                 .h(px(24.0))
                 .flex()
                 .items_center()
-                .px(px(PAD))
+                // 与编辑区同一左基线（`ED_PAD`）：状态条的文字和正文首列对齐，
+                // 眼睛才不会在换行处「错一次位」。
+                .px(px(ED_PAD))
                 .bg(bg)
                 .text_color(fg)
                 .text_size(px(13.0))
@@ -2338,7 +2422,7 @@ impl CollationWorkspace {
                 .h(px(26.0))
                 .flex()
                 .items_center()
-                .px(px(PAD))
+                .px(px(ED_PAD))
                 .bg(rgba(0xb0342c1f))
                 .text_color(rgb(0xb0342c))
                 .text_size(px(13.0))
@@ -2355,7 +2439,7 @@ impl CollationWorkspace {
                     .h(px(26.0))
                     .flex()
                     .items_center()
-                    .px(px(PAD))
+                    .px(px(ED_PAD))
                     .bg(rgba(0x8c2b2214))
                     .text_color(rgb(0x8c2b22))
                     .child(SharedString::from(format!(
@@ -2410,7 +2494,17 @@ impl CollationWorkspace {
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(0xf4ecd8))
+            // 稿纸：最亮的一张纸。
+            .bg(rgb(PAPER_R))
+            // **柔影向左**（v1.9.24）：右纸压左纸，靠这片外阴影。偏移取负 x，
+            // 影子就落到左侧那张纸上，而不是落到自己身上（那样只会脏了稿纸边）。
+            // 18px 模糊 + 10% 黑，刚够看出「这里叠了一层」，绝不至于变成一条暗带。
+            .shadow(vec![BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.10),
+                offset: gpui::point(px(-4.0), px(0.0)),
+                blur_radius: px(18.0),
+                spread_radius: px(-2.0),
+            }])
             .child(match self.render_text_status() {
                 Some(s) => s,
                 None => div().h(px(0.0)),
@@ -2577,12 +2671,14 @@ impl CollationWorkspace {
                 // 与平台侧「点谁谁成为 first responder」同一时刻发生，不依赖任何
                 // 手写补偿。两条路并存，任一条通就能打字。
                 .track_focus(&self.focus)
-                .bg(rgb(0xf4ecd8))
-                // 内边距 14 → **28**：起首空两格、四边留白比行距宽，字才是
-                // 「摆」在纸上，而不是被框住。
+                .bg(rgb(PAPER_R))
+                // 内边距 14 → 28 → **40**：起首空两格、四边留白宽过行距，字才是
+                // 「摆」在纸上，而不是被框住。40 同时是 `editor_origin()` 的
+                // 原点偏移——同一个常量，改一处即两处同变。
                 .px(px(ED_PAD))
                 .py(px(ED_PAD))
                 .text_size(px(FONT_SIZE))
+                // #333 而不是纯黑：亮纸上纯黑会「刺」，深灰才像墨晕开的样子。
                 .text_color(rgb(0x333333))
                 .font_family(song)
                 .line_height(px(LINE_H))
@@ -3235,15 +3331,15 @@ impl Render for CollationWorkspace {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0xf4ecd8))
+            .bg(rgb(PAPER_R))
             .track_focus(&self.preview_focus)
             .on_key_down(cx.listener(|c, event, _window, cx| c.preview_key(event, cx)))
             .child(self.render_header(cx))
             .child(
-                // **视觉分割**（v1.9.22）：不用硬切。
-                // 做法是「明度差 + 一道极细的分割线」：左纸本就深一档，再在
-                // 40/60 处压一根 1px 的 12% 墨线——像两张纸交界处的阴影，
-                // 而不是一条把屏幕劈开的框。
+                // **视觉分割**（v1.9.24）：一条黑线都不要。
+                // 现在是「柔影（右纸的 shadow，见 render_right）+ 一根 5% 墨的
+                // 发丝线」：影子负责体积，发丝线只负责在 1x 屏上兜底——
+                // 没有那道线时，两块同族浅色在低对比屏上会糊成一片。
                 // 用绝对定位画线（不占布局），两栏仍是 40/60，不会因为多出
                 // 这 1px 而把右栏挤出去。
                 div()
@@ -3260,7 +3356,7 @@ impl Render for CollationWorkspace {
                             .bottom(px(0.0))
                             .left(px(vw * 0.4))
                             .w(px(1.0))
-                            .bg(rgba(0x2B26201F)),
+                            .bg(rgba(0x2B26200D)),
                     ),
             );
         if self.show_preview {
