@@ -20,7 +20,9 @@
 //!    字体按字号缓存复用，几百字的卡片只建两三台字体对象。
 
 use crate::share::CINNABAR;
-use crate::share_layout::{CardLayout, PlacedChar, PlacedSeal, ShareFont, punct_box};
+use crate::share_layout::{
+    Binding, CardLayout, PlacedChar, PlacedSeal, ShareFont, punct_box, spread_slots,
+};
 
 use core_graphics::color_space::CGColorSpace;
 use core_graphics::context::CGContext;
@@ -127,10 +129,46 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
     // ---- 位图上下文（Drop → CGContextRelease；ColorSpace 同理）----
     let space = CGColorSpace::create_device_rgb();
     let mut ctx = CGContext::create_bitmap_context(None, w, h, 8, w * 4, &space, BITMAP_INFO);
-    draw_card(l, &ctx, h as f64)?;
+    draw_card(l, &ctx, h as f64, 0.0, 0.0)?;
+    encode_png(&mut ctx, w, h)
+}
 
-    // ---- 取像素 → PNG ----
-    // `bytes_per_row` 可能带对齐填充，故逐行拷贝，绝不按 `w*4` 直接切片。
+/// **双页拼版的一张纸**：把两个单页并排画进一块 `sheet` 大小的位图（预览用）。
+///
+/// 与 PDF 拼版共用 [`spread_slots`] 与同一份 `CardLayout`，所以屏幕上看的就是
+/// 印出来的：右半前一页、左半后一页，中间一条中缝。
+///
+/// 只有一页时（末张单页）另一侧留整片纸色——书末页背面本来就是空的。
+pub fn render_spread_png(
+    pages: &[CardLayout],
+    sheet_w: f32,
+    sheet_h: f32,
+    binding: Binding,
+) -> Result<Vec<u8>, String> {
+    let first = pages.first().ok_or_else(|| "没有可拼版的页面".to_string())?;
+    let w = sheet_w.round().max(1.0) as usize;
+    let h = sheet_h.round().max(1.0) as usize;
+    let space = CGColorSpace::create_device_rgb();
+    let mut ctx = CGContext::create_bitmap_context(None, w, h, 8, w * 4, &space, BITMAP_INFO);
+
+    // 整张纸先铺底色（中缝 / 空白半页都靠它，绝不透出黑色）。
+    let (br, bg, bb) = rgb(first.bg);
+    ctx.set_rgb_fill_color(br, bg, bb, 1.0);
+    ctx.fill_rect(CGRect::new(
+        &CGPoint::new(0.0, 0.0),
+        &CGSize::new(w as f64, h as f64),
+    ));
+
+    // 两页按装订模式落到各自的半边（右开本奇左偶右，左开本反之）。
+    let slots = spread_slots(sheet_w, first.w, binding);
+    for (i, p) in pages.iter().take(2).enumerate() {
+        draw_card(p, &ctx, h as f64, slots[i] as f64, 0.0)?;
+    }
+    encode_png(&mut ctx, w, h)
+}
+
+/// 把位图上下文里的像素抄成 PNG（`bytes_per_row` 可能带对齐填充，逐行拷贝）。
+fn encode_png(ctx: &mut CGContext, w: usize, h: usize) -> Result<Vec<u8>, String> {
     let stride = ctx.bytes_per_row();
     let data = ctx.data();
     let mut buf: Vec<u8> = Vec::with_capacity(w * h * 4);
@@ -176,24 +214,87 @@ extern "C" {
 /// 把若干页版式写成一份**矢量 PDF**（一页一页流式落盘），返回写出的页数。
 ///
 /// 页面尺寸**完全由 `pages[0].w / .h` 决定**：本函数不认识 A3、也不认识 A4，
-/// 只认版式交给它的两个数。调用方用 `Paper::pdf_geom()`（72dpi＝pt）排版，
-/// 于是 A3 = 841.89×1190.55pt，字级直接就是磅值，缩放交给阅读器插值。
+/// 只认版式交给它的两个数。调用方用 `Paper::page_pdf_geom()`（72dpi＝pt）排版，
+/// 于是单页 A3 = 841.89×1190.55pt，字级直接就是磅值，缩放交给阅读器插值。
+///
+/// 这是**单页拼版**（一版一页）。双页折页见 [`render_pdf_spread`]。
 ///
 /// 失败一律返回可读原因，绝不 panic——导出路径最怕崩在半路。
 #[cfg(target_os = "macos")]
 pub fn render_pdf(path: &std::path::Path, pages: &[CardLayout]) -> Result<usize, String> {
+    let first = pages
+        .first()
+        .ok_or_else(|| "没有可导出的页面".to_string())?;
+    let plan: Vec<Vec<(f64, f64, usize)>> =
+        (0..pages.len()).map(|i| vec![(0.0, 0.0, i)]).collect();
+    pdf_write(path, first.w as f64, first.h as f64, pages, &plan)
+}
+
+/// **双页拼版（书籍折页）**：一张横放的大纸上并排两个单页。
+///
+/// ```text
+///   右開本（古籍，默认）            左開本（現代）
+///   ┌──────────┬─┬──────────┐      ┌──────────┬─┬──────────┐
+///   │  第 1 页 │中│  第 2 页 │      │  第 2 页 │中│  第 1 页 │
+///   │  （奇）  │縫│  （偶）  │      │  （偶）  │縫│  （奇）  │
+///   └──────────┴─┴──────────┘      └──────────┴─┴──────────┘
+/// ```
+///
+/// * 媒体框只认 `sheet_w × sheet_h`（横的；A3 = 1190.55×841.89pt）；
+/// * 每张纸放 **2 个单页**，落点由 [`spread_slots`] 给（与屏幕拼版预览同源）；
+///   两页各自在自己那半边居中，中间是中缝——**绝不拉宽铺满整张纸**；
+/// * 末张只剩一页时，另一侧留白——书末页背面本来就是空的。
+///
+/// 返回写出的**纸张数**（不是单页数）。
+#[cfg(target_os = "macos")]
+pub fn render_pdf_spread(
+    path: &std::path::Path,
+    pages: &[CardLayout],
+    sheet_w: f32,
+    sheet_h: f32,
+    binding: Binding,
+) -> Result<usize, String> {
+    let first = pages
+        .first()
+        .ok_or_else(|| "没有可导出的页面".to_string())?;
+    // `slots[0]` = 奇数页的落点、`slots[1]` = 偶数页的落点（页序，不是左右）。
+    // `pages` 的下标 0 就是第 1 页（奇数），故两块一批正好对上。
+    let slots = spread_slots(sheet_w, first.w, binding);
+    let plan: Vec<Vec<(f64, f64, usize)>> = pages
+        .chunks(2)
+        .enumerate()
+        .map(|(k, chunk)| {
+            let mut one = vec![(slots[0] as f64, 0.0, k * 2)];
+            if chunk.len() > 1 {
+                one.push((slots[1] as f64, 0.0, k * 2 + 1));
+            }
+            one
+        })
+        .collect();
+    pdf_write(path, sheet_w as f64, sheet_h as f64, pages, &plan)
+}
+
+/// PDF 落盘的**唯一实现**：`plan` 里每一项是一张纸，`(dx, dy, 页下标)` 是这页在
+/// 该纸上的屏幕坐标偏移。
+///
+/// 单页拼版 = 每张纸一个 `(0,0,i)`；双页拼版 = 每两个页下标并到一张纸。
+#[cfg(target_os = "macos")]
+fn pdf_write(
+    path: &std::path::Path,
+    sheet_w: f64,
+    sheet_h: f64,
+    pages: &[CardLayout],
+    plan: &[Vec<(f64, f64, usize)>],
+) -> Result<usize, String> {
     use core_foundation::base::TCFType;
     use core_foundation::url::CFURL;
     use foreign_types::ForeignType;
 
-    let first = pages
-        .first()
-        .ok_or_else(|| "没有可导出的页面".to_string())?;
     let url = CFURL::from_path(path, false)
         .ok_or_else(|| format!("路径无法转成文件 URL：{}", path.display()))?;
     let media = CGRect::new(
         &CGPoint::new(0.0, 0.0),
-        &CGSize::new(first.w as f64, first.h as f64),
+        &CGSize::new(sheet_w, sheet_h),
     );
     let raw = unsafe { CGPDFContextCreateWithURL(url.as_concrete_TypeRef(), &media, std::ptr::null()) };
     if raw.is_null() {
@@ -204,18 +305,39 @@ pub fn render_pdf(path: &std::path::Path, pages: &[CardLayout]) -> Result<usize,
     ctx.set_allows_antialiasing(true);
     ctx.set_should_antialias(true);
 
+    // 纸色：取第一页的底色（同一批导出必然是同一套样式）。
+    let base = pages
+        .first()
+        .map(|p| p.bg)
+        .ok_or_else(|| "没有可导出的页面".to_string())?;
+    let (br, bg, bb) = rgb(base);
+
     let mut n = 0usize;
-    for page in pages {
+    for slots in plan {
         // ⚠️ **必须先 BeginPage 再落笔**：BeginPage 之前收到的绘制会被丢掉，
         //    整页只剩一个空内容流（控制台报 "No content stream"）。纸色同理。
         unsafe { CGPDFContextBeginPage(raw, std::ptr::null()) };
-        let (br, bg, bb) = rgb(page.bg);
         ctx.set_rgb_fill_color(br, bg, bb, 1.0);
         ctx.fill_rect(CGRect::new(
             &CGPoint::new(0.0, 0.0),
-            &CGSize::new(page.w as f64, page.h as f64),
+            &CGSize::new(sheet_w, sheet_h),
         ));
-        if let Err(e) = draw_card(page, &ctx, page.h as f64) {
+        let mut failed: Option<String> = None;
+        for (dx, dy, idx) in slots {
+            let Some(page) = pages.get(*idx) else { continue };
+            // 每页自带底色，先铺满它自己那块（单页拼版时与整纸同色，多铺一次无害）。
+            let (pr, pg, pb) = rgb(page.bg);
+            ctx.set_rgb_fill_color(pr, pg, pb, 1.0);
+            ctx.fill_rect(CGRect::new(
+                &CGPoint::new(*dx, sheet_h - page.h as f64 - *dy),
+                &CGSize::new(page.w as f64, page.h as f64),
+            ));
+            if let Err(e) = draw_card(page, &ctx, sheet_h, *dx, *dy) {
+                failed = Some(e);
+                break;
+            }
+        }
+        if let Some(e) = failed {
             // 半路失败也要把这一页收尾再关文件，绝不落一个坏 PDF。
             unsafe { CGPDFContextEndPage(raw) };
             unsafe { CGPDFContextClose(raw) };
@@ -235,21 +357,35 @@ pub fn render_pdf(_path: &std::path::Path, _pages: &[CardLayout]) -> Result<usiz
     Err("PDF 导出仅在 macOS 支持".to_string())
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn render_pdf_spread(
+    _path: &std::path::Path,
+    _pages: &[CardLayout],
+    _sheet_w: f32,
+    _sheet_h: f32,
+    _binding: Binding,
+) -> Result<usize, String> {
+    Err("PDF 导出仅在 macOS 支持".to_string())
+}
+
 /// **把一张版式画进任意 CG 上下文**（位图上下文与 PDF 上下文共用）。
 ///
 /// `hf` 是画布高度（CG 坐标原点在**左下**，而版式数据是屏幕坐标原点在**左上**）。
+/// `(ox, oy)` 是这一页在画布上的**屏幕坐标偏移**——双页拼版靠它把后一页推到
+/// 纸的左半边；单页拼版恒 `(0, 0)`，与 v1.9.x 逐像素一致。
 ///
 /// 两处上下文的行为相同：`CGBitmapContext` 与 `CGPDFContext` 都是 CG 坐标、
 /// 都是 y 向上，故同一套「只把每个元素的 y 镜像一次」的换算完全通用——
 /// **两边都不许翻 CTM**（翻了字会被镜像，v1.58 的坑）。
-fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64) -> Result<(), String> {
+fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64, ox: f64, oy: f64) -> Result<(), String> {
     // 防雷 ①：**不翻 CTM**。整幅坐标仍走 CG 原生（原点左下、y 向上），
     // 每个元素落笔前用 `cg_*` 把屏幕坐标（左上原点）换算过来。
     // 位图缓冲的第 0 行是图像**顶行**，故「屏幕 y」与「缓冲行号」同序。
-    // 矩形顶边（屏幕 y）→ CG 底边 y：矩形整体镜像到下半平面。
-    let cg_top = move |y_top: f64, hgt: f64| hf - y_top - hgt;
-    // 基线（屏幕 y）→ CG 基线：**只做镜像，不做缩放**，字形因此保持正向。
-    let cg_base = move |y: f64| hf - y;
+    // 矩形顶边（屏幕 y + 偏移）→ CG 底边 y：矩形整体镜像到下半平面。
+    let cg_top = move |y_top: f64, hgt: f64| hf - oy - y_top - hgt;
+    // 基线（屏幕 y + 偏移）→ CG 基线：**只做镜像，不做缩放**，字形因此保持正向。
+    let cg_base = move |y: f64| hf - oy - y;
+    let sx = move |x: f64| x + ox;
     ctx.set_allows_antialiasing(true);
     ctx.set_should_antialias(true);
 
@@ -257,7 +393,7 @@ fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64) -> Result<(), String> {
     let (br, bg, bb) = rgb(l.bg);
     ctx.set_rgb_fill_color(br, bg, bb, 1.0);
     ctx.fill_rect(CGRect::new(
-        &CGPoint::new(0.0, 0.0),
+        &CGPoint::new(ox, hf - oy - l.h as f64),
         &CGSize::new(l.w as f64, l.h as f64),
     ));
 
@@ -265,7 +401,7 @@ fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64) -> Result<(), String> {
     for r in &l.rects {
         let (cr, cg, cb, ca) = rgba(r.color);
         let rect = CGRect::new(
-            &CGPoint::new(r.x as f64, cg_top(r.y as f64, r.h as f64)),
+            &CGPoint::new(sx(r.x as f64), cg_top(r.y as f64, r.h as f64)),
             &CGSize::new(r.w as f64, r.h as f64),
         );
         match r.stroke {
@@ -290,7 +426,7 @@ fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64) -> Result<(), String> {
         let (cr, cg, cb, ca) = rgba(r.color);
         ctx.set_rgb_stroke_color(cr, cg, cb, ca);
         ctx.set_line_width(r.width as f64);
-        let x = (r.x1 as f64).round() + 0.5;
+        let x = (sx(r.x1 as f64)).floor() + 0.5;
         ctx.begin_path();
         ctx.move_to_point(x, cg_base(r.y1 as f64));
         ctx.add_line_to_point(x, cg_base(r.y2 as f64));
@@ -303,8 +439,8 @@ fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64) -> Result<(), String> {
         ctx.set_rgb_stroke_color(r, g, b, a);
         ctx.set_line_width(ln.width as f64);
         ctx.begin_path();
-        ctx.move_to_point(ln.x1 as f64, cg_base(ln.y1 as f64));
-        ctx.add_line_to_point(ln.x2 as f64, cg_base(ln.y2 as f64));
+        ctx.move_to_point(sx(ln.x1 as f64), cg_base(ln.y1 as f64));
+        ctx.add_line_to_point(sx(ln.x2 as f64), cg_base(ln.y2 as f64));
         ctx.stroke_path();
     }
 
@@ -338,7 +474,7 @@ fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64) -> Result<(), String> {
         // ⚠️ 竖排**不旋转字形**：方块汉字竖排靠「纵向依次排列」实现，
         // 逐字落笔即可，转 90° 反而把字放倒。这里只把基线镜像到 CG 侧，
         // 字形本身保持正向（CTM 未翻，故无镜像）。
-        font.draw_glyphs(&[glyph], &[CGPoint::new(gx, cg_base(gy))], ctx.clone());
+        font.draw_glyphs(&[glyph], &[CGPoint::new(sx(gx), cg_base(gy))], ctx.clone());
         // **加粗**（Markdown `**…**`）：同字再落两笔极微量偏移，墨迹自然加厚。
         //
         // 为什么不换 Bold 字体面：`pick_font` 走的是 PostScript 回退链，系统宋体
@@ -347,14 +483,22 @@ fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64) -> Result<(), String> {
         // 已经能看出「这一行是重的」，且与底色同一抗锯齿，不会有描边毛刺。
         if c.bold {
             let d = 0.45;
-            font.draw_glyphs(&[glyph], &[CGPoint::new(gx + d, cg_base(gy))], ctx.clone());
-            font.draw_glyphs(&[glyph], &[CGPoint::new(gx, cg_base(gy + d))], ctx.clone());
+            font.draw_glyphs(
+                &[glyph],
+                &[CGPoint::new(sx(gx) + d, cg_base(gy))],
+                ctx.clone(),
+            );
+            font.draw_glyphs(
+                &[glyph],
+                &[CGPoint::new(sx(gx), cg_base(gy + d))],
+                ctx.clone(),
+            );
         }
     }
 
     // ---- 朱印 ----
     if let Some(s) = &l.seal {
-        paint_seal(&ctx, s, l.bg, hf);
+        paint_seal(&ctx, s, l.bg, hf, ox, oy);
     }
 
     Ok(())
@@ -363,14 +507,14 @@ fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64) -> Result<(), String> {
 /// 朱砂方章：**纯色红方块 + 黑色「笺读」二字**（横排居中）。
 ///
 /// 先跑通闭环：不画鱼尾、不刻书名——印就是一枚朱砂底、墨字落款的方章。
-fn paint_seal(ctx: &CGContext, s: &PlacedSeal, _paper: u32, h: f64) {
+fn paint_seal(ctx: &CGContext, s: &PlacedSeal, _paper: u32, h: f64, ox: f64, oy: f64) {
     let (r, g, b) = rgb(CINNABAR);
     let sz = s.size as f64;
     ctx.set_rgb_fill_color(r, g, b, 1.0);
     // 方章是实心块，顶边镜像即可（对称图形，翻不翻看不出——但坐标必须换，
     // 否则它会跑到画布上端去）。
     ctx.fill_rect(CGRect::new(
-        &CGPoint::new(s.x as f64, h - s.y as f64 - sz),
+        &CGPoint::new(s.x as f64 + ox, h - oy - s.y as f64 - sz),
         &CGSize::new(sz, sz),
     ));
 
@@ -382,7 +526,7 @@ fn paint_seal(ctx: &CGContext, s: &PlacedSeal, _paper: u32, h: f64) {
     };
     // 印文基线：字形顶边贴住「方块内居中位」，再镜像到 CG 侧。
     let asc = baseline_drop(fs, &font);
-    let baseline = h - (s.y as f64 + sz * 0.5 - fs * 0.5 + asc);
+    let baseline = h - oy - (s.y as f64 + sz * 0.5 - fs * 0.5 + asc);
     // 印文取版式层给的 `seal_text`（默认「笺讀」），不再写死二字——
     // 写死会让「书名印」永远刻成「笺讀」。
     let text: Vec<char> = if s.text.is_empty() {
@@ -398,7 +542,7 @@ fn paint_seal(ctx: &CGContext, s: &PlacedSeal, _paper: u32, h: f64) {
         if !ok {
             continue;
         }
-        let x = s.x as f64 + sz * 0.08 + i as f64 * fs;
+        let x = s.x as f64 + ox + sz * 0.08 + i as f64 * fs;
         ctx.set_rgb_fill_color(0.06, 0.06, 0.06, 1.0);
         font.draw_glyphs(&[glyph], &[CGPoint::new(x, baseline)], ctx.clone());
     }
@@ -767,6 +911,80 @@ mod tests {
             }
         }
     }
+    /// **拼版预览**（`render_spread_png`）：横放的纸上真有左右两版，中间空一条。
+    ///
+    /// 这是屏幕那一路的验收——预览与 PDF 共用同一份 `CardLayout` 与同一个
+    /// `spread_slots`，所以「屏幕上看到的」必须就是「印出来的」。
+    #[test]
+    fn spread_preview_png_has_two_pages_and_a_gutter() {
+        use crate::share_layout::{Binding, Imposition, Paper};
+
+        let page = Paper::A3.preview_page_geom(Imposition::Spread);
+        let sheet = Paper::A3.preview_sheet_geom(Imposition::Spread);
+        let a_text: Vec<char> = "天地玄黃宇宙洪荒日月盈昃辰宿列張".chars().collect();
+        let b_text: Vec<char> = "寒來暑往秋收冬藏閏餘成歲律呂調陽".chars().collect();
+        let mut cards = Vec::new();
+        for body in [&a_text, &b_text] {
+            let red = vec![false; body.len()];
+            let spec = LayoutSpec {
+                body,
+                red: &red,
+                md: &[],
+                note: "",
+                show_notes: false,
+                sign: "",
+                show_sign: false,
+                date: "",
+                show_date: false,
+                columns: 8,
+                bg: ShareBg::Xuan,
+                frame: ShareFrame::Red,
+                seal: ShareSeal::Twin,
+                seal_text: "笺校",
+                font: ShareFont::Song,
+                stamp: "",
+                w: page.w,
+                h: page.h,
+            };
+            cards.push(layout(&spec));
+        }
+        let png = render_spread_png(&cards, sheet.w, sheet.h, Binding::Right)
+            .unwrap_or_else(|e| panic!("拼版预览出图失败：{e}"));
+        let img = image::load_from_memory(&png).expect("PNG 读不回来").to_rgb8();
+        assert_eq!((img.width(), img.height()), (sheet.w as u32, sheet.h as u32));
+
+        // 与底色不同的像素 = 有东西（文字 / 版框 / 界行）。
+        let bg = cards[0].bg;
+        let (br, bgc, bb) = (
+            ((bg >> 16) & 0xFF) as i32,
+            ((bg >> 8) & 0xFF) as i32,
+            (bg & 0xFF) as i32,
+        );
+        let ink = |x: u32, y: u32| -> bool {
+            let p = img.get_pixel(x, y);
+            (p[0] as i32 - br).abs() + (p[1] as i32 - bgc).abs() + (p[2] as i32 - bb).abs() > 40
+        };
+        let half = img.width() / 2;
+        let count = |x0: u32, x1: u32| -> u32 {
+            let mut n = 0;
+            for y in 0..img.height() {
+                for x in x0..x1 {
+                    if ink(x, y) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let left = count(0, half);
+        let right = count(half, img.width());
+        assert!(left > 500, "左半张没画上东西：{left} 个墨点");
+        assert!(right > 500, "右半张没画上东西：{right} 个墨点");
+        // 中缝：纸正中那一条竖带必须是空的（两页各自成版，绝不连成一片）。
+        let gutter = count(half - 10, half + 10);
+        assert_eq!(gutter, 0, "中缝里有墨：{gutter} 个墨点（两页粘连了）");
+    }
+
     /// **A3 矢量 PDF**：媒体框必须真是 A3（842×1191pt），文件头是 %PDF。
     ///
     /// 这条测试盯的是「物理尺寸参数化」的最后一毫米：版式层只吃了两个数

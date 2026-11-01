@@ -286,20 +286,26 @@ pub fn punct_box(p: &PlacedChar) -> (f32, f32, f32) {
 }
 
 // ----------------------------------------------------------------------
-// 纸张口径（v1.21.0）——「排版物理尺寸参数化」的唯一换算口
+// 纸张口径（v1.21.0，v1.22.0 加拼版）——「排版物理尺寸参数化」的唯一换算口
 //
 // 版式层从头到尾只吃两个数：`LayoutSpec.w / .h`。所以支持 A3 **不需要**第二套
-// 排版代码，只需要有人回答「A3 是多少像素」。本段就是那个唯一答案：
-//     mm --(dpi)--> px        `geom()`      出图（PDF 走 72dpi＝pt）
-//     mm --(比例)--> px        `preview_geom()`  屏幕取景（长边封顶）
+// 排版代码，只需要有人回答「这一页是多少像素」。本段就是那个唯一答案：
+//     mm --(dpi)--> px        `page_geom()`      排版 / 出图（PDF 走 72dpi＝pt）
+//     mm --(比例)--> px        `preview_*_geom()` 屏幕取景（长边封顶）
 // 调用方一律经这里取尺寸，代码里再不许出现「1080×1920」「720×1280」这类魔数。
 //
-// 为什么 PDF 用 72dpi：PDF 是矢量，坐标单位是 pt（1/72 英寸）。A3 = 297×420mm
-// 恰好 = 841.89×1190.55pt。用 72dpi 排出来的「像素」与 pt 一一对应，字级直接
-// 就是磅值，缩放由阅读器无限插值——绝不靠 300dpi 位图去凑清晰度。
+// ⚠️ v1.22.0 起**两个尺寸分家**，绝不能混用：
+//     page_*  单页尺寸 —— 喂 `layout` 的 `w/h`，决定列数、字号、切字块；
+//     sheet_* 整张纸   —— PDF 媒体框 / 拼版画布，双页拼版时是横的、宽一倍。
+// 混用一次就是「整张 A3 排一页」的大字海报（v1.21.0 的原罪）。
+//
+// 为什么 PDF 用 72dpi：PDF 是矢量，坐标单位是 pt（1/72 英寸）。A3 单页 = 297×420mm
+// 恰好 = 841.89×1190.55pt；双页拼版整张 = 420×297mm = 1190.55×841.89pt。
+// 用 72dpi 排出来的「像素」与 pt 一一对应，字级直接就是磅值，缩放由阅读器
+// 无限插值——绝不靠 300dpi 位图去凑清晰度。
 // ----------------------------------------------------------------------
 
-/// 一张纸的规格（竖放，宽 < 高，与竖排版式的方向一致）。
+/// 一张纸的规格（`mm()` 返回**竖放**的单页口径，宽 < 高，与竖排版式同向）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Paper {
     /// 屏幕预览小卡：9:16 取景，**不是**真实纸张（沿用 v1.9.x 的观感基准）。
@@ -307,8 +313,136 @@ pub enum Paper {
     Card,
     /// A4（210 × 297 mm）。
     A4,
-    /// A3（297 × 420 mm）——影印 / 印厂常用的两张 A4 拼版。
+    /// A3（297 × 420 mm）——印厂常用的两张 A4 拼版大纸。
     A3,
+}
+
+/// **拼版方式**（v1.22.0）：一件印刷品怎么摊在纸上。
+///
+/// 这是 v1.21.0 留下的那个问题的正解。那一版把 A3 当成「更大的单页」，
+/// 结果是**把一页正文放大铺满整张 A3**——大字海报，不是书。真正的书是
+/// 折页的：一张大纸上并排两个单页，沿中缝一折就是左右两页。
+///
+/// ```text
+///   Single（單頁）              Spread（雙頁拼版 · 右開本）
+///   ┌──────────┐               ┌──────────┬───┬──────────┐
+///   │          │               │  第 1 頁 │中 │  第 2 頁 │
+///   │  一 頁   │               │  （奇）  │縫 │  （偶）  │
+///   │          │               │          │   │          │
+///   └──────────┘               └──────────┴───┴──────────┘
+///      210×297                    420×297（横）
+/// ```
+///
+/// 关键纪律有两条，缺一条就不是书：
+/// 1. **排版引擎只吃「半页」的宽高**（`Paper::page_mm`），绝不能拿整张 A3 的
+///    宽度去算列数——那正是海报的来路；
+/// 2. **两个单页各自在属于自己的半边上居中**（`spread_slots`），中间留中缝，
+///    绝不把一页拉宽去铺满整张纸。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Imposition {
+    /// 一页一张纸（A4 就是 A4，A3 就是竖放的大页）。
+    #[default]
+    Single,
+    /// 双页拼版：整张纸**横放**，左右各一个单页，中间留中缝（书籍折页）。
+    Spread,
+}
+
+impl Imposition {
+    /// 两档，UI 按此顺序排列。
+    pub const ALL: [Imposition; 2] = [Imposition::Single, Imposition::Spread];
+
+    /// 面板上的显示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Imposition::Single => "單頁",
+            Imposition::Spread => "雙頁拼版",
+        }
+    }
+
+    /// 是否双页拼版（预览 / 导出处处要判这一句）。
+    pub fn is_spread(self) -> bool {
+        matches!(self, Imposition::Spread)
+    }
+}
+
+/// 折页**中缝**的宽度（mm）——用户 2026-11-01 硬指令：**至少 30pt**。
+///
+/// A3 横向 1191pt，左右两个半区各 595.5pt，两个半区之间必须空出一条中缝，
+/// 且左右内容绝不能越界重叠。30pt = 30 × 25.4 / 72 ≈ 10.583mm。
+///
+/// 它从整张纸的宽度里**先扣掉**，剩下的才平分给两个单页：
+///
+/// ```text
+///   1191pt = 580.3 + 30 + 580.3        （420mm 纸）
+///            └左页┘  中缝  └右页┘
+/// ```
+///
+/// 所以中缝不是「事后在两页之间画的一条缝」——它压根不算进任何一页的
+/// 排版宽度。两页版框之外各自还有留白，纸面正中那道白因此比 30pt 还宽，
+/// 这正是刻本版心之间的常态（「黑口 / 白口」本来就是空的）。
+pub const SPREAD_GUTTER_MM: f32 = 30.0 * 25.4 / 72.0;
+
+/// 中缝的磅值下限（pt）——排版与测试都只认这一个数。
+pub const SPREAD_GUTTER_PT: f32 = 30.0;
+
+/// **装订模式**（v1.22.0）：折页后书脊在哪边，决定奇偶两页谁在左谁在右。
+///
+/// 用户明令（2026-11-01）：
+/// * **右开本**（古籍线装 / 竖排，默认）——**奇左偶右**：第 1 页在左，第 2 页在右；
+/// * **左开本**（现代横排西书）——**偶左奇右**：第 2 页在左，第 1 页在右。
+///
+/// 别拿「竖排从右往左读」去反推：那是**行内**的读序；折页成册后哪一页在左，
+/// 由装订线在哪边定，与行序是两件事。故这里独立成档，不跟版式方向绑定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Binding {
+    /// 右开本（古籍 / 线装）：奇数页在左半边，偶数页在右半边。
+    #[default]
+    Right,
+    /// 左开本（现代 / 横排）：偶数页在左半边，奇数页在右半边。
+    Left,
+}
+
+impl Binding {
+    /// 两档，UI 按此顺序排列。
+    pub const ALL: [Binding; 2] = [Binding::Right, Binding::Left];
+
+    /// 面板上的显示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Binding::Right => "右開本",
+            Binding::Left => "左開本",
+        }
+    }
+
+    /// 补一句人话（浮层标题里用），把「奇偶怎么摆」说清，避免用户猜。
+    pub fn hint(self) -> &'static str {
+        match self {
+            Binding::Right => "古籍 · 奇左偶右",
+            Binding::Left => "現代 · 偶左奇右",
+        }
+    }
+}
+
+/// 双页拼版时两个单页在纸上的**横向落点**（左缘 x，单位同 `page_w`）。
+///
+/// 返回 `[奇数页的 x, 偶数页的 x]`——顺序是**页序**，不是左右；谁在左由
+/// `binding` 定。落法极简：两页各贴纸的一侧，中间剩下的**全部**是中缝。
+///
+/// ```text
+///   右開本：[0, sheet − page]      左页第 1 页 · 右页第 2 页
+///   左開本：[sheet − page, 0]      左页第 2 页 · 右页第 1 页
+/// ```
+///
+/// 于是中缝宽度恒等于 `sheet − 2 × page`（＝ [`SPREAD_GUTTER_PT`]），两页
+/// **绝不可能重叠**、也绝不越出纸外——不需要任何额外钳制。
+pub fn spread_slots(sheet_w: f32, page_w: f32, binding: Binding) -> [f32; 2] {
+    let right = (sheet_w - page_w).max(page_w);
+    match binding {
+        // 奇左偶右
+        Binding::Right => [0.0, right],
+        // 偶左奇右
+        Binding::Left => [right, 0.0],
+    }
 }
 
 /// 纸张的像素尺寸（＝版式层的 `w / h`）。
@@ -335,6 +469,33 @@ impl PageGeom {
 /// 预览只需「看出纸形」，真分辨率留给出图那一刻（见 [`Paper::geom`]）。
 pub const PREVIEW_LONG_EDGE: f32 = 1280.0;
 
+/// 毫米 → 像素（`dpi` 下的取整值）。`None`（不是真实纸张）走「取景卡」720×1280。
+fn geom_of_mm(mm: Option<(f32, f32)>, dpi: f32) -> PageGeom {
+    match mm {
+        None => PageGeom {
+            w: 720.0,
+            h: 1280.0,
+        },
+        Some((mw, mh)) => {
+            let k = dpi.max(1.0) / 25.4;
+            PageGeom {
+                w: (mw * k).round(),
+                h: (mh * k).round(),
+            }
+        }
+    }
+}
+
+/// 屏幕预览尺寸：保住纸的宽高比，长边封顶到 [`PREVIEW_LONG_EDGE`]。
+fn preview_of(g: PageGeom) -> PageGeom {
+    let long = g.w.max(g.h).max(1.0);
+    let k = PREVIEW_LONG_EDGE / long;
+    PageGeom {
+        w: (g.w * k).round().max(1.0),
+        h: (g.h * k).round().max(1.0),
+    }
+}
+
 impl Paper {
     /// 三档，UI 按此顺序排列。
     pub const ALL: [Paper; 3] = [Paper::Card, Paper::A4, Paper::A3];
@@ -348,7 +509,7 @@ impl Paper {
         }
     }
 
-    /// 毫米尺寸；[`Paper::Card`] 不是真实纸张，返回 `None`。
+    /// **单页拼版**的纸幅（竖放）；[`Paper::Card`] 不是真实纸张，返回 `None`。
     pub fn mm(self) -> Option<(f32, f32)> {
         match self {
             Paper::Card => None,
@@ -357,43 +518,107 @@ impl Paper {
         }
     }
 
-    /// **排版物理尺寸**：`dpi` 下这张纸有多少像素。
+    /// **双页拼版**的整张纸：把单页纸幅**横过来**（宽 > 高）。
+    ///
+    /// A3 = 420×297mm。用户明令「A3 应该是横向的」——纵向摊两个竖排单页，
+    /// 纸只能是横的。
+    pub fn spread_sheet_mm(self) -> Option<(f32, f32)> {
+        self.mm().map(|(w, h)| (h, w))
+    }
+
+    /// **双页拼版里单个页面**的排版尺寸（竖放）。
+    ///
+    /// ＝ (整宽 − [`SPREAD_GUTTER_MM`]) ÷ 2，高不变。
+    ///
+    /// A3：整宽 420mm、中缝 10.583mm → 单页 204.71mm × 297mm
+    /// ＝ **580.3pt × 842pt**（半区 595.3pt 减去中缝的一半）。版心网格、
+    /// 列数、切字块**只准认这一组数**，绝不能用整张 A3 的宽度去算（那是海报）。
+    ///
+    /// 两页 + 一条中缝正好铺满整张纸：`580.3 × 2 + 30 = 1190.6pt`。
+    pub fn spread_page_mm(self) -> Option<(f32, f32)> {
+        self.spread_sheet_mm()
+            .map(|(sw, h)| (((sw - SPREAD_GUTTER_MM).max(40.0)) * 0.5, h))
+    }
+
+    /// 当前拼版下**整张纸**的毫米尺寸（PDF 媒体框只认它）。
+    pub fn sheet_mm(self, imp: Imposition) -> Option<(f32, f32)> {
+        match imp {
+            Imposition::Single => self.mm(),
+            Imposition::Spread => self.spread_sheet_mm(),
+        }
+    }
+
+    /// 当前拼版下**单个页面**的毫米尺寸（版心网格只认它）。
+    pub fn page_mm(self, imp: Imposition) -> Option<(f32, f32)> {
+        match imp {
+            Imposition::Single => self.mm(),
+            Imposition::Spread => self.spread_page_mm(),
+        }
+    }
+
+    /// **排版物理尺寸**（单页拼版口径，保留给老调用点）：`dpi` 下这张纸有多少像素。
     ///
     /// * `Card` 不吃 DPI（屏幕取景与分辨率无关），恒 720×1280；
     /// * `A4 / A3` 按 `mm / 25.4 * dpi` 取整——四舍五入到整像素，避免半像素
     ///   边框在 PDF 里被抗锯齿糊成两行灰边。
     pub fn geom(self, dpi: f32) -> PageGeom {
-        match self.mm() {
-            None => PageGeom {
-                w: 720.0,
-                h: 1280.0,
-            },
-            Some((mw, mh)) => {
-                let k = dpi.max(1.0) / 25.4;
+        geom_of_mm(self.mm(), dpi)
+    }
+
+    /// 当前拼版下**单页**的像素尺寸——喂给 `layout` 的 `w / h` 就是它。
+    pub fn page_geom(self, imp: Imposition, dpi: f32) -> PageGeom {
+        geom_of_mm(self.page_mm(imp), dpi)
+    }
+
+    /// 当前拼版下**整张纸**的像素尺寸——PDF 画布 / 拼版位图的外框。
+    pub fn sheet_geom(self, imp: Imposition, dpi: f32) -> PageGeom {
+        geom_of_mm(self.sheet_mm(imp), dpi)
+    }
+
+    /// PDF 的**矢量口径**（单页拼版）：72dpi 下的尺寸＝磅值（pt）。
+    pub fn pdf_geom(self) -> PageGeom {
+        self.geom(72.0)
+    }
+
+    /// PDF 矢量口径的单页尺寸（排版用）。
+    pub fn page_pdf_geom(self, imp: Imposition) -> PageGeom {
+        self.page_geom(imp, 72.0)
+    }
+
+    /// PDF 矢量口径的整张纸尺寸（写媒体框用）。
+    pub fn sheet_pdf_geom(self, imp: Imposition) -> PageGeom {
+        self.sheet_geom(imp, 72.0)
+    }
+
+    /// **屏幕预览**尺寸（单页拼版口径，保留给老调用点）。
+    pub fn preview_geom(self) -> PageGeom {
+        preview_of(self.geom(72.0))
+    }
+
+    /// 屏幕预览里**单页**的尺寸（竖放）。
+    ///
+    /// ⚠️ 拼版时它**不能**各按长边封顶：单页的长边是「高」，整张纸的长边是
+    /// 「宽」，各封一次就得到两套比例尺——页面相对纸偏大，摆上去必然互相压叠。
+    /// 故 Spread 走「与整张纸同一把尺子」：按纸宽的毫米比例取宽，高直接跟纸。
+    pub fn preview_page_geom(self, imp: Imposition) -> PageGeom {
+        match imp {
+            Imposition::Single => preview_of(self.page_geom(imp, 72.0)),
+            Imposition::Spread => {
+                let sheet = self.preview_sheet_geom(imp);
+                let (sw, _) = self.sheet_mm(imp).unwrap_or((1.0, 1.0));
+                let (pw, _) = self.page_mm(imp).unwrap_or((sw * 0.5, 1.0));
+                let k = if sw > 1e-6 { pw / sw } else { 0.5 };
                 PageGeom {
-                    w: (mw * k).round(),
-                    h: (mh * k).round(),
+                    w: (sheet.w * k).round().max(1.0),
+                    h: sheet.h,
                 }
             }
         }
     }
 
-    /// PDF 的**矢量口径**：72dpi 下的尺寸＝磅值（pt），直接当媒体框。
-    pub fn pdf_geom(self) -> PageGeom {
-        self.geom(72.0)
-    }
-
-    /// **屏幕预览**尺寸：保住纸的宽高比，长边封顶到 [`PREVIEW_LONG_EDGE`]。
-    ///
-    /// `Card` 恰好等于 720×1280（长边已是上限），故既有观感逐像素不变。
-    pub fn preview_geom(self) -> PageGeom {
-        let g = self.geom(72.0);
-        let long = g.w.max(g.h).max(1.0);
-        let k = PREVIEW_LONG_EDGE / long;
-        PageGeom {
-            w: (g.w * k).round().max(1.0),
-            h: (g.h * k).round().max(1.0),
-        }
+    /// 屏幕预览里**整张纸**的尺寸（双页拼版时是横的）。
+    pub fn preview_sheet_geom(self, imp: Imposition) -> PageGeom {
+        preview_of(self.sheet_geom(imp, 72.0))
     }
 }
 
@@ -739,9 +964,18 @@ pub fn layout(s: &LayoutSpec) -> CardLayout {
         (shown as f32 / cols_used as f32).ceil() as usize
     };
     let block_w = cols_used as f32 * cell;
-    // 居中：批注列留在正文块的左侧，右侧再让出悬挂沟，三者一并居中。
+    // **右起顶格**（v1.22.0）：列块贴版心**右缘**（再让出悬挂沟），不足的余白
+    // 全部落在**左侧**。
+    //
+    // 原来是居中的，真机 A3 双页样张上立刻露馅：满页（12 列）贴右，末页只剩
+    // 7 列时却被推到版心正中，x∈[141.5, 414.3]（左余 141 / 右余 166），
+    // 字悬在纸当中、右边空出一条 —— 既不合古法（竖排书末页永远是「右排满、
+    // 左留白」），也和同一本书满页的版口对不上。
+    //
+    // 满页时 `avail_w - span ≈ 0`，此式与居中**逐像素等价**，故既有观感不变；
+    // 只有「不满一页」才会露出差别（正是要修的那种页）。
     let span = note_cols as f32 * cell + block_w + HANG_GUTTER * cell;
-    let x0 = grid_l + ((avail_w - span) * 0.5).max(0.0) + note_cols as f32 * cell;
+    let x0 = grid_l + (avail_w - span).max(0.0) + note_cols as f32 * cell;
     // 铁律 1 + 版框联动：列首 y 恒等于 y0 —— 每列都从这里起笔，绝不因列长而
     // 错动；y0 本身紧贴**版框内缘**（`top_baseline` 是它的唯一口径），故第一
     // 个字的最高点正好卡在框线下方的起点上：不压线、也不留天头空档。
@@ -1310,6 +1544,26 @@ mod tests {
         assert!(!c.md[0].bold, "标题不该被当成加粗");
     }
 
+    /// ①b **绝不从 UTF-8 中间切字**：多字节 CJK 走 `char` 迭代，一个字都不许丢。
+    ///
+    /// 用户 2026-11-01 点名要查这条。清洗器全程 `Vec<char>`，没有任何字节下标
+    /// 切片碰过正文（只碰过 ASCII 的 `#` / 数字前缀），故长度与内容必须严格相等。
+    #[test]
+    fn clean_md_never_splits_a_cjk_char() {
+        let base = "壹貳參肆伍陸柒捌玖拾";
+        let src = format!("{}\n\n# 題\n\n**粗**體", base.repeat(50));
+        let c = clean_md(&src);
+        // 正文 500 字 + 标题「題」1 字 + 加粗「粗體」2 字 = 503 字，一字不丢。
+        let want = base.chars().count() * 50 + 1 + 2;
+        assert_eq!(
+            c.body.len(),
+            want,
+            "字数对不上（有字被切掉了）：{}",
+            c.text()
+        );
+        assert_eq!(c.text(), format!("{}題粗體", base.repeat(50)));
+    }
+
     /// ② 链接只留文字、斜体只去记号、行内代码去反引号、HTML 标签整段丢。
     #[test]
     fn md_cleaner_keeps_only_the_words() {
@@ -1447,5 +1701,232 @@ mod tests {
         // 1080 卡的留白一位小数都不许变（v1.9.x 基准）。
         let card = one_char(1080.0, 1920.0);
         assert!((card.rects[0].x - 46.0).abs() < 0.01, "1080 卡留白被改动");
+    }
+
+    // ── 双页拼版（v1.22.0）：A3 横放、两个单页并排 ────────────────────────
+
+    /// **A3 拼版是横的**，且它的半边就是 A4 那一档大小。
+    ///
+    /// 这条钉的是用户的原话：「A3 应该是横向的（宽 > 高）」「把 A3 的宽度除以 2，
+    /// 得到单页宽度（大概是 A4 的大小）」。任何一处退回竖放 / 整宽排版都必崩。
+    #[test]
+    fn a3_spread_is_a_landscape_sheet_of_two_a4_sized_pages() {
+        let sheet = Paper::A3.sheet_pdf_geom(Imposition::Spread);
+        assert!(
+            sheet.w > sheet.h,
+            "拼版整张纸必须是横的：{}×{}",
+            sheet.w,
+            sheet.h
+        );
+        // 420×297mm @72dpi = 1190.55×841.89pt
+        assert_eq!((sheet.w as u32, sheet.h as u32), (1191, 842));
+
+        let page = Paper::A3.page_pdf_geom(Imposition::Spread);
+        let a4 = Paper::A4.page_pdf_geom(Imposition::Single);
+        // 单页 ≈ A4（两侧各让半个中缝），高完全等于 A4。
+        assert_eq!(page.h as u32, a4.h as u32, "拼版单页的纸高应等于 A4");
+        assert!(
+            (page.w - a4.w).abs() < 0.05 * a4.w,
+            "拼版单页宽度不是 A4 那一档：{} vs {}",
+            page.w,
+            a4.w
+        );
+        // 两页 + 中缝 = 整张纸，一分不差（否则拼出来会偏出纸外）。
+        let gutter = Paper::A3.sheet_pdf_geom(Imposition::Spread).w - page.w * 2.0;
+        // 取整会多给半个点到一个点，故只要求「不低于下限、且不多出 2pt」。
+        assert!(
+            gutter >= SPREAD_GUTTER_PT - 0.01 && gutter <= SPREAD_GUTTER_PT + 2.0,
+            "中缝必须 ≥ {SPREAD_GUTTER_PT}pt，实为 {gutter:.2}pt"
+        );
+        // 半区宽度：1191 ÷ 2 = 595.5，单页是「半区 − 半个中缝」。
+        let half = Paper::A3.sheet_pdf_geom(Imposition::Spread).w / 2.0;
+        assert!(
+            (half - 595.5).abs() < 1.0,
+            "半区应约 595.5pt，实为 {half:.2}pt"
+        );
+        assert!(
+            (half - page.w - SPREAD_GUTTER_PT / 2.0).abs() < 1.0,
+            "单页宽度不是「半区 − 半个中缝」：{} vs {}",
+            page.w,
+            half - SPREAD_GUTTER_PT / 2.0
+        );
+
+        // 单页拼版照旧竖放（老口径一个字都不许动）。
+        let single = Paper::A3.page_pdf_geom(Imposition::Single);
+        assert!(single.h > single.w, "單頁 A3 不该被横过来");
+        assert_eq!((single.w as u32, single.h as u32), (842, 1191));
+    }
+
+    /// **装订模式**：右开本奇左偶右，左开本偶左奇右；两页各自在半边居中。
+    ///
+    /// 用户 2026-11-01 的原话：「左边放置奇数页（第1页），右边放置偶数页（第2页）」
+    /// 「奇偶两页分别在这两半边居中排版，中间留出中缝间距，不要直接拉伸铺满」。
+    #[test]
+    fn binding_decides_which_side_the_odd_page_takes() {
+        let sheet = 1191.0; // A3 拼版整张纸（pt）
+        let page = 580.3; // 单页（pt）＝ (1191 − 30) / 2
+        // 右开本（默认）：第 1 页（奇）在左，第 2 页（偶）在右。
+        let [odd, even] = spread_slots(sheet, page, Binding::Right);
+        assert_eq!(odd, 0.0, "右开本的第 1 页应贴住纸的左缘");
+        assert!(even > odd, "右开本应奇左偶右：{odd} / {even}");
+        assert_eq!(Binding::default(), Binding::Right, "默认必须是右开本");
+        // 左开本：反过来。
+        let [odd2, even2] = spread_slots(sheet, page, Binding::Left);
+        assert!(odd2 > even2, "左开本应偶左奇右：{odd2} / {even2}");
+
+        // 中缝：两页之间的空隙，必须 ≥ 30pt 且落在纸的正中。
+        let gutter = even - (odd + page);
+        assert!(
+            gutter >= SPREAD_GUTTER_PT - 0.5,
+            "中缝只有 {gutter:.2}pt，低于 {SPREAD_GUTTER_PT}pt"
+        );
+        assert!(
+            (odd + page + gutter * 0.5 - sheet * 0.5).abs() < 0.01,
+            "中缝没落在纸的正中（折不准）"
+        );
+        // 绝不越界、绝不重叠。
+        assert!(odd >= 0.0 && even + page <= sheet + 0.01, "页子跑出纸外");
+        assert!(gutter > 0.0, "两页重叠了");
+        // 左开本同样是「贴外缘 + 中间一条缝」。
+        let g2 = odd2 - (even2 + page);
+        assert!(g2 >= SPREAD_GUTTER_PT - 0.5, "左开本中缝不足：{g2:.2}pt");
+    }
+
+    /// **一列只该排一页的字数，绝不是 44 个**：右起、列满换行、逐列向左。
+    ///
+    /// 用户 2026-11-01 的原话：「最右侧第一列排满（比如 15 个字），再往左排
+    /// 第二列。绝对不能把 44 个字强行塞进一列！」44 字一列是**窄页**的症状
+    /// （页宽被算小了，字格跟着变小、一列就拉得老长），这条把它挡住。
+    #[test]
+    fn a_column_holds_a_page_worth_of_chars_not_forty_four() {
+        let g = Paper::A3.page_pdf_geom(Imposition::Spread);
+        let body: Vec<char> = "天地玄黃宇宙洪荒日月盈昃辰宿列張寒來暑往秋收冬藏".chars().cycle().take(300).collect();
+        let red = vec![false; body.len()];
+        let mut sp = spec(&body, &red);
+        sp.show_sign = false;
+        sp.show_date = false;
+        sp.columns = 12;
+        sp.w = g.w;
+        sp.h = g.h;
+        let l = layout(&sp);
+
+        // 正文字（滤掉落款小字 / 戳），按字格 x 归列。
+        let body_fs = l.chars.iter().map(|c| c.fs).fold(0.0f32, f32::max);
+        let mut cols: std::collections::BTreeMap<i64, (f32, usize)> = std::collections::BTreeMap::new();
+        for c in l.chars.iter().filter(|c| (c.fs - body_fs).abs() < 0.01) {
+            let key = (c.x * 4.0).round() as i64;
+            let e = cols.entry(key).or_insert((c.x, 0));
+            e.1 += 1;
+        }
+        assert!(cols.len() >= 3, "应排出多列，实为 {} 列", cols.len());
+        let per_col: Vec<usize> = cols.values().map(|(_, n)| *n).collect();
+        let max = *per_col.iter().max().unwrap_or(&0);
+        assert!(
+            max <= 30,
+            "一列塞了 {max} 个字（每列应在 10–30 之间）：{per_col:?}"
+        );
+        assert!(max >= 8, "一列只有 {max} 个字，字格过大：{per_col:?}");
+        // 右起：x 最大的那一列必须是**第一列**（钱最多的那列在右）。
+        let (rightmost_x, _) = cols.values().next_back().copied().unwrap_or((0.0, 0));
+        let first_char = &l.chars[0];
+        assert!(
+            (first_char.x - rightmost_x).abs() < 0.01,
+            "正文没有从最右列起排：首字 x={} 最右列 x={rightmost_x}",
+            first_char.x
+        );
+        // 读序逐列向左：按「最右 → 最左」取 x，必须严格递减。
+        let xs: Vec<f32> = cols.values().map(|(x, _)| *x).rev().collect();
+        for w in xs.windows(2) {
+            assert!(w[0] > w[1], "列的 x 没往左走：{xs:?}");
+        }
+    }
+
+    /// 拼版单页排出来的字**必须比单页 A3 小**——这就是「书」与「海报」的分界。
+    #[test]
+    fn spread_page_sets_book_type_not_poster_type() {
+        let poster = Paper::A3.page_pdf_geom(Imposition::Single);
+        let book = Paper::A3.page_pdf_geom(Imposition::Spread);
+        let a = one_char(poster.w, poster.h);
+        let b = one_char(book.w, book.h);
+        assert!(
+            b.chars[0].fs < a.chars[0].fs * 0.75,
+            "拼版单页的字还是海报尺寸：拼版 {} / 海报 {}",
+            b.chars[0].fs,
+            a.chars[0].fs
+        );
+        // 版心绝不越出自己那半边：越界就是「一页拉宽铺满整纸」的海报。
+        for c in &b.chars {
+            assert!(
+                c.x + c.cell <= book.w + 0.01,
+                "字越出单页边界：{} > {}",
+                c.x + c.cell,
+                book.w
+            );
+        }
+        let sheet = Paper::A3.sheet_pdf_geom(Imposition::Spread);
+        assert!(
+            book.w * 2.0 < sheet.w,
+            "两页加中缝应当小于整张纸：{} vs {}",
+            book.w * 2.0,
+            sheet.w
+        );
+    }
+
+    /// **末页不满时，列块必须右起顶格，绝不居中。**
+    ///
+    /// v1.22.0 真机 A3 双页样张抓出的真 bug：满页（12 列）贴右，只剩 7 列的
+    /// 末页却被推到版心正中（x∈[141.5, 414.3]，左余 141 / 右余 166），字悬在
+    /// 纸当中、右边空出一条，同一本书的两页版口对不上。
+    ///
+    /// 竖排古法：右排满、左留白。故判据只有一条——**满页与末页的右余必须
+    /// 相等**（同一版心、同一悬挂沟），余白全部落在左侧。
+    #[test]
+    fn a_short_last_page_hangs_from_the_right_not_the_centre() {
+        let g = Paper::A3.page_pdf_geom(Imposition::Spread);
+        let page = |n: usize| {
+            let body: Vec<char> = "天地玄黃宇宙洪荒日月盈昃辰宿列張寒來暑往秋收冬藏"
+                .chars()
+                .cycle()
+                .take(n)
+                .collect();
+            let red = vec![false; body.len()];
+            let mut sp = spec(&body, &red);
+            sp.show_sign = false;
+            sp.show_date = false;
+            sp.columns = 12;
+            sp.w = g.w;
+            sp.h = g.h;
+            layout(&sp)
+        };
+        // 只量正文字：落款 / 朱印的小字另有字号，不参与版口对齐。
+        let body_chars = |l: &crate::share_layout::CardLayout| -> (f32, f32) {
+            let fs = l.chars.iter().map(|c| c.fs).fold(0.0f32, f32::max);
+            let mut left = f32::MAX;
+            let mut right = 0.0f32;
+            for c in l.chars.iter().filter(|c| (c.fs - fs).abs() < 0.01) {
+                left = left.min(c.x);
+                right = right.max(c.x + c.cell);
+            }
+            (left, right)
+        };
+
+        let full = page(240); // 满页：12 列 × 20 行
+        let short = page(100); // 末页：只剩 5 列
+        assert!(full.chars.len() > short.chars.len(), "两页字数应当不同");
+
+        let (full_l, full_r) = body_chars(&full);
+        let (short_l, short_r) = body_chars(&short);
+        let full_gap = g.w - full_r;
+        let short_gap = g.w - short_r;
+
+        assert!(
+            (full_gap - short_gap).abs() < 0.5,
+            "末页没有右起顶格（居中了吧）：满页右余 {full_gap:.1} / 末页右余 {short_gap:.1}"
+        );
+        // 余白必须全部落在左侧，且相当可观（末页只用了半页宽）。
+        assert!(
+            short_l > full_l + g.w * 0.25,
+            "末页的余白没落在左侧：满页左缘 {full_l:.1} / 末页左缘 {short_l:.1}"
+        );
     }
 }

@@ -35,8 +35,10 @@ use crate::ime::{
 // 竖排预览：复用阅读引擎的「纯数据版式 + CoreGraphics 离屏光栅」链路，与 reader
 // 解耦（本模块绝不 import reader）。这三条都是 crate 内模块，reader 同款用法。
 use crate::share::{ShareBg, ShareFrame, ShareSeal};
-use crate::share_layout::{clean_md, layout, LayoutSpec, Paper, ShareFont};
-use crate::share_paint::{render_pdf, render_png};
+use crate::share_layout::{
+    clean_md, layout, Binding, Imposition, LayoutSpec, Paper, ShareFont,
+};
+use crate::share_paint::{render_pdf, render_pdf_spread, render_png, render_spread_png};
 use gpui::prelude::*;
 use gpui::{
     div, img, px, rgb, rgba, Bounds, Context,
@@ -216,7 +218,7 @@ pub struct CollationWorkspace {
     /// 不当场删是因为本帧的 `img` 可能还在异步读该文件；隔一帧元素树已换，删了安全。
     temp_gc: Vec<PathBuf>,
     /// 当前这批预览图对应的版式指纹（`preview_sig`）；相同请求直接跳过不重排。
-    preview_sig: Option<(u64, usize, u8, u8, u8)>,
+    preview_sig: Option<(u64, usize, u8, u8, u8, u8, u8)>,
     /// 当前预览页码（0-based）；`preview_paths` 为空时无意义。
     preview_page: usize,
     /// 预览栅格化失败信息（红色提示，如系统缺中文字体）。
@@ -242,6 +244,17 @@ pub struct CollationWorkspace {
     /// `Card` = 9:16 的屏幕取景卡（沿用老观感，不可导出）；`A4 / A3` 是真实纸张，
     /// 尺寸一律经 `Paper::geom()` 由毫米算出——本文件里不写任何画布魔数。
     preview_paper: Paper,
+    /// **拼版方式**（v1.22.0）：`Single` 一页一张纸；`Spread` 双页拼版（书籍折页）。
+    ///
+    /// 与 `preview_paper` 是两个正交的旋钮：纸张说的是「用多大的纸」，拼版说的
+    /// 是「这张纸上摊几页」。A3 + Spread 才是印厂要的折页；A3 + Single 是放大
+    /// 单页（用户点名的「大字海报」，只在明确要单页大图时才用）。
+    imposition: Imposition,
+    /// **装订模式**（v1.22.0）：右开本（古籍 · 奇左偶右）/ 左开本（現代 · 偶左奇右）。
+    ///
+    /// 只在双页拼版时起作用：决定奇数页落在左半边还是右半边。默认右开本
+    /// （用户 2026-11-01 明令，古籍是右开本）。
+    binding: Binding,
     /// PDF 导出是否在途（后台排版 + 矢量落盘，禁止重入）。
     export_busy: bool,
     /// 导出结果 / 错误（浮层底部状态条，与预览状态条同一套视觉语言）。
@@ -322,6 +335,8 @@ impl CollationWorkspace {
             temp_gc: Vec::new(),
             preview_sig: None,
             preview_paper: Paper::Card,
+            imposition: Imposition::Single,
+            binding: Binding::Right,
             export_busy: false,
             export_note: None,
             preview_page: 0,
@@ -944,14 +959,23 @@ impl CollationWorkspace {
     ///
     /// * `Card`：沿用 v1.9.x 的经验表（[`preview_page_cap`]）。它是「一屏一页」
     ///   的取景卡、不是真实纸张，换算法会让已验证过的观感整体走样，故不动。
-    /// * `A4 / A3`：**问版式自己**——拿 `pdf_geom` 尺寸排一个字，把「列数 × 行数」
+    /// * `A4 / A3`：**问版式自己**——拿 `page_pdf_geom` 尺寸排一个字，把「列数 × 行数」
     ///   原样问出来（`CardLayout::capacity`）。绝不手写第二张表：纸张一改、
     ///   列数一改，容量自己就跟着变。
-    fn page_cap(paper: Paper, columns: usize, bg: ShareBg, frame: ShareFrame) -> usize {
+    ///
+    /// ⚠️ 尺寸取的是**单页**（`page_pdf_geom`），不是整张纸。双页拼版的 A3
+    /// 必须按「半边」算——用整宽算出来的就是那 300 字一页的大字海报。
+    fn page_cap(
+        paper: Paper,
+        imp: Imposition,
+        columns: usize,
+        bg: ShareBg,
+        frame: ShareFrame,
+    ) -> usize {
         if paper == Paper::Card {
             return preview_page_cap(columns);
         }
-        let g = paper.pdf_geom();
+        let g = paper.page_pdf_geom(imp);
         let body = ['道'];
         let red = [false];
         let spec = LayoutSpec {
@@ -980,14 +1004,23 @@ impl CollationWorkspace {
     /// **导出 PDF 的纯计算核心**（关联函数，可安全跑在后台线程）。
     ///
     /// 与预览共用同一套「清洗 → 分页 → 排版」，区别只有两点：尺寸用
-    /// `Paper::pdf_geom()`（72dpi＝pt，矢量），产物是 PDF 而不是 PNG。
-    /// 返回 `(页数, 落字数, 是否被页数闸门截断)`。
+    /// `Paper::page_pdf_geom()`（72dpi＝pt，矢量），产物是 PDF 而不是 PNG。
+    ///
+    /// 拼版（v1.22.0）在这里分叉：
+    /// * `Single` → 一版一页，媒体框 = 单页（`render_pdf`）；
+    /// * `Spread` → 每两个单页并到一张**横放的大纸**上（`render_pdf_spread`），
+    ///   媒体框 = 整张纸。**单页尺寸仍是半边**，绝不因为要拼版就去拿整宽排版。
+    ///
+    /// 返回 `(写出的张数, 落字数, 是否被页数闸门截断)`——`Spread` 时「张数」
+    /// 是纸数，一纸两页。
     fn render_pdf_blocking(
         text: &str,
         columns: usize,
         bg: ShareBg,
         frame: ShareFrame,
         paper: Paper,
+        imp: Imposition,
+        binding: Binding,
         path: &Path,
     ) -> Result<(usize, usize, bool), String> {
         let cleaned = clean_md(text);
@@ -996,8 +1029,8 @@ impl CollationWorkspace {
         }
         let body = cleaned.body;
         let md = cleaned.md;
-        let cap = Self::page_cap(paper, columns, bg, frame);
-        let g = paper.pdf_geom();
+        let cap = Self::page_cap(paper, imp, columns, bg, frame);
+        let g = paper.page_pdf_geom(imp);
         let red = vec![false; body.len()];
         let mut sheets = Vec::new();
         let mut start = 0usize;
@@ -1038,7 +1071,13 @@ impl CollationWorkspace {
             return Err("没有可导出的页面".to_string());
         }
         let chars: usize = sheets.iter().map(|c| c.chars.len()).sum();
-        let n = render_pdf(path, &sheets)?;
+        let n = if imp.is_spread() {
+            // 一纸两页：媒体框是**整张纸**（横的），单页只是其中的一半。
+            let sheet = paper.sheet_pdf_geom(imp);
+            render_pdf_spread(path, &sheets, sheet.w, sheet.h, binding)?
+        } else {
+            render_pdf(path, &sheets)?
+        };
         Ok((n, chars, start < body.len()))
     }
 
@@ -1052,6 +1091,8 @@ impl CollationWorkspace {
             return;
         }
         let paper = self.preview_paper;
+        let imp = self.eff_imposition();
+        let binding = self.binding;
         if paper == Paper::Card {
             self.export_note =
                 Some("「預覽卡」是屏幕取景、不是印刷幅面：请先选 A4 或 A3".to_string());
@@ -1063,30 +1104,69 @@ impl CollationWorkspace {
             cx.notify();
             return;
         }
-        let default_name = format!("笺校-{}.pdf", paper.label());
-        let picked = rfd::FileDialog::new()
-            .set_file_name(&default_name)
-            .add_filter("PDF", &["pdf"])
-            .save_file();
-        let Some(path) = picked else { return }; // 用户取消：静默返回，不留提示。
+        let default_name = if imp.is_spread() {
+            format!("笺校-{}-雙頁.pdf", paper.label())
+        } else {
+            format!("笺校-{}.pdf", paper.label())
+        };
+        // 闸门先落下：面板还没弹出来就再点一次，也不会起两份排版任务。
         self.export_busy = true;
-        self.export_note = Some(format!("正在排版 {}（矢量 PDF）…", paper.label()));
+        self.export_note = Some(format!("选择保存位置…（{} {}）", paper.label(), imp.label()));
         cx.notify();
 
         let text = self.text.clone();
         let columns = self.preview_columns;
         let bg = self.preview_bg;
         let frame = self.preview_frame;
-        let path_bg = path.clone();
+
         cx.spawn(
             move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
                 let mut app = app.clone();
                 async move {
+                    // ① **原生保存面板必须在这里调**（`cx.spawn` 的前台任务），
+                    //    绝不能像早先那样在点击回调里直接 `save_file()`：
+                    //    鼠标回调跑在 `update_entity` 里，App 的 RefCell 正被
+                    //    借出；rfd 的模态会转起 NSApp runloop，期间键盘布局通知
+                    //    再进 `App::new_app` 取一次 borrow_mut → 「RefCell already
+                    //    borrowed」直接 abort（真机点两次就崩，栈见 2026-11-01）。
+                    //    放到 spawn 里，调用点已脱离借用，面板才弹得出来。
+                    let picked = rfd::FileDialog::new()
+                        .set_file_name(&default_name)
+                        .add_filter("PDF", &["pdf"])
+                        .save_file();
+                    let Some(path) = picked else {
+                        // 取消：复位闸门 + 清提示（绝不留下「选择保存位置…」的残影）。
+                        if let Some(entity) = this.upgrade() {
+                            let _ = entity.update(&mut app, |this, cx| {
+                                this.export_busy = false;
+                                this.export_note = None;
+                                cx.notify();
+                            });
+                        }
+                        return;
+                    };
+
+                    // ② 排版 / 落盘全在 background executor，主线程只更新状态文字。
+                    if let Some(entity) = this.upgrade() {
+                        let _ = entity.update(&mut app, |this, cx| {
+                            this.export_note = Some(if imp.is_spread() {
+                                format!(
+                                    "正在双页拼版 {}（{}，矢量 PDF）…",
+                                    paper.label(),
+                                    imp.label()
+                                )
+                            } else {
+                                format!("正在排版 {}（矢量 PDF）…", paper.label())
+                            });
+                            cx.notify();
+                        });
+                    }
                     let exec = app.background_executor().clone();
+                    let path_bg = path.clone();
                     let out = exec
                         .spawn(async move {
                             CollationWorkspace::render_pdf_blocking(
-                                &text, columns, bg, frame, paper, &path_bg,
+                                &text, columns, bg, frame, paper, imp, binding, &path_bg,
                             )
                         })
                         .await;
@@ -1100,8 +1180,15 @@ impl CollationWorkspace {
                                     } else {
                                         String::new()
                                     };
+                                    // 拼版时 `n` 是**纸数**（一纸两页），必须说清，
+                                    // 否则用户数页数会发现少了一半。
+                                    let unit = if imp.is_spread() {
+                                        format!("{n} 张（{} 頁，雙頁拼版）", n * 2)
+                                    } else {
+                                        format!("{n} 页")
+                                    };
                                     format!(
-                                        "已导出 {n} 页 / {chars} 字（{}）→ {}{tail}",
+                                        "已导出 {unit} / {chars} 字（{}）→ {}{tail}",
                                         paper.label(),
                                         path.display()
                                     )
@@ -1124,6 +1211,8 @@ impl CollationWorkspace {
         preview_bg: ShareBg,
         preview_frame: ShareFrame,
         paper: Paper,
+        imp: Imposition,
+        binding: Binding,
     ) -> Result<(Vec<PathBuf>, Option<String>), String> {
         let t0 = std::time::Instant::now();
         // **Markdown 清洗**（预览解析）：编辑器里存的是源码（`#`、`**`、`---`
@@ -1152,18 +1241,26 @@ impl CollationWorkspace {
         }
         let red = vec![false; body.len()];
 
-        // 按当前**纸张**取整页容量，喂入 ≤ 此值保证不缩字；再用实际落字数推进。
+        // 按当前**纸张 + 拼版**取整页容量，喂入 ≤ 此值保证不缩字；再用实际落字数推进。
         // 容量是版式实测出来的（见 `page_cap`），不是手写经验表——A4/A3 因此
-        // 天然各有一套正确容量，代码里没有第二张魔数表。
-        let cap = Self::page_cap(paper, preview_columns, preview_bg, preview_frame);
-        // 屏幕取景尺寸：保纸的宽高比、长边封顶 1280（A3 绝不按 300dpi 贴图）。
-        let geom = paper.preview_geom();
-        let mut pages: Vec<PathBuf> = Vec::new();
+        // 天然各有一套正确容量，代码里没有第二张魔数表。双页拼版取的也是
+        // **半边**的容量：两张 A4 大小的单页，不是一张 A3 的海报。
+        let cap = Self::page_cap(paper, imp, preview_columns, preview_bg, preview_frame);
+        // 屏幕取景尺寸：单页保竖排形状；整张纸（拼版）是横的。
+        // 长边一律封顶 1280（A3 绝不按 300dpi 贴图）。
+        let page_geom = paper.preview_page_geom(imp);
+        let sheet_geom = paper.preview_sheet_geom(imp);
+
+        // —— 第一步：只排版，攒 CardLayout（不落盘）——
+        //
+        // 拼版要「两页并一张纸」，所以必须先有整批页面才能决定怎么出图。
+        // 一版一张 `CardLayout` 只是几千个坐标，攒 6 张也不占什么内存。
+        let mut cards: Vec<_> = Vec::new();
         let mut start = 0usize;
         let mut cut = false; // 是否被闸门 ②/③ 截断
         while start < body.len() {
-            // —— 防卡死闸门 ②：页数上限 ——
-            if pages.len() >= PREVIEW_MAX_PAGES {
+            // —— 防卡死闸门 ②：页数上限（数的是**单页**，不是纸）——
+            if cards.len() >= PREVIEW_MAX_PAGES {
                 cut = true;
                 break;
             }
@@ -1193,8 +1290,8 @@ impl CollationWorkspace {
                 stamp: "",
                 // 尺寸一律来自 `Paper`：`Card` 仍是 720×1280（老观感，PNG 体积
                 // 小、贴图压力低），A4/A3 按比例取样但同一张纸的形状。
-                w: geom.w,
-                h: geom.h,
+                w: page_geom.w,
+                h: page_geom.h,
             };
             // 让 layout 自己按整页容量落字；取实际落字数当页边界（双保险，绝不丢字）。
             let card = layout(&spec);
@@ -1202,41 +1299,80 @@ impl CollationWorkspace {
             if laid == 0 {
                 break; // 异常：一字未落，避免死循环。
             }
-            match render_png(&card) {
-                Ok(png) => {
-                    let out = temp_png_path(); // 纳秒唯一命名，绕开 img 缓存。
-                    if std::fs::write(&out, &png).is_ok() {
-                        pages.push(out);
-                    } else {
-                        for p in pages.drain(..) {
-                            let _ = std::fs::remove_file(&p);
-                        }
-                        return Err("预览图写入临时文件失败".to_string());
-                    }
-                }
-                Err(e) => {
-                    for p in pages.drain(..) {
-                        let _ = std::fs::remove_file(&p);
-                    }
-                    return Err(e);
-                }
-            }
+            cards.push(card);
             start += laid;
         }
 
-        if cut {
-            note = Some(format!(
-                "长稿仅预览前 {} 页（共 {} 字，余稿未渲以防界面卡死）",
-                pages.len(),
-                orig_len
-            ));
+        // —— 第二步：出图 ——
+        //
+        // 单页拼版：一版一张 PNG；双页拼版：两张并一张**横的** PNG（与 PDF 同源：
+        // 同一份 `CardLayout`、同一个 `spread_slots` 落点）。屏幕上看的就是印出来的。
+        let mut pages: Vec<PathBuf> = Vec::new();
+        let write_one = |blob: Result<Vec<u8>, String>,
+                             pages: &mut Vec<PathBuf>|
+         -> Result<(), String> {
+            let png = blob?;
+            let out = temp_png_path(); // 纳秒唯一命名，绕开 img 缓存。
+            if std::fs::write(&out, &png).is_ok() {
+                pages.push(out);
+                Ok(())
+            } else {
+                Err("预览图写入临时文件失败".to_string())
+            }
+        };
+        let rendered: Result<(), String> = if imp.is_spread() {
+            let mut r = Ok(());
+            for pair in cards.chunks(2) {
+                r = write_one(
+                    render_spread_png(pair, sheet_geom.w, sheet_geom.h, binding),
+                    &mut pages,
+                );
+                if r.is_err() {
+                    break;
+                }
+            }
+            r
+        } else {
+            let mut r = Ok(());
+            for card in &cards {
+                r = write_one(render_png(card), &mut pages);
+                if r.is_err() {
+                    break;
+                }
+            }
+            r
+        };
+        if let Err(e) = rendered {
+            for p in pages.drain(..) {
+                let _ = std::fs::remove_file(&p);
+            }
+            return Err(e);
         }
-        // 防卡死排障日志：字数 / 页数 / 耗时一目了然。
+
+        if cut {
+            note = Some(if imp.is_spread() {
+                format!(
+                    "长稿仅预览前 {} 张（{} 頁，共 {} 字；余稿未渲以防界面卡死）",
+                    pages.len(),
+                    cards.len(),
+                    orig_len
+                )
+            } else {
+                format!(
+                    "长稿仅预览前 {} 页（共 {} 字，余稿未渲以防界面卡死）",
+                    pages.len(),
+                    orig_len
+                )
+            });
+        }
+        // 防卡死排障日志：字数 / 单页数 / 出图数 / 耗时一目了然。
         eprintln!(
-            "[preview] chars={}/{} pages={} elapsed={}ms",
+            "[preview] chars={}/{} pages={} sheets={} imp={:?} elapsed={}ms",
             body.len(),
             orig_len,
+            cards.len(),
             pages.len(),
+            imp,
             t0.elapsed().as_millis()
         );
         Ok((pages, note))
@@ -1258,6 +1394,20 @@ impl CollationWorkspace {
         self.preview_sig = None;
         self.preview_page = 0;
     }
+
+    /// 后台结果回来时，是否已经**过期**（预览已关 / 又发起了新的一批）。
+    ///
+    /// 这就是「关闭按钮随时能点」的全部机制：`close_preview` 只做几件 O(1) 的
+    /// 状态赋值（不碰磁盘、不等后台），并把 `preview_gen` 加一；在途任务回来
+    /// 时用本函数一判，必然 `true` → 结果连临时文件一起丢掉，绝不回写 UI。
+    /// 主线程因此从不被后台排版阻塞，无论它排到第几页。
+    ///
+    /// 抽成纯函数只为能被单测钉死——「关掉以后会不会又闪回来」是用户
+    /// 2026-11-01 明确点名要保证的事。
+    fn preview_result_stale(show_preview: bool, gen_at_start: usize, gen_now: usize) -> bool {
+        !show_preview || gen_at_start != gen_now
+    }
+
 
     /// **翻一页（← / →）——左右双屏同步走。**
     ///
@@ -1399,11 +1549,14 @@ impl CollationWorkspace {
         bg: ShareBg,
         frame: ShareFrame,
         paper: Paper,
-    ) -> (u64, usize, u8, u8, u8) {
+        imp: Imposition,
+        binding: Binding,
+    ) -> (u64, usize, u8, u8, u8, u8, u8) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut h);
-        (h.finish(), columns, bg as u8, frame as u8, paper as u8)
+        // 拼版 / 装订也进指纹：换拼版就是换版式，绝不能拿旧图充数。
+        (h.finish(), columns, bg as u8, frame as u8, paper as u8, imp as u8, binding as u8)
     }
 
     /// 请求重排预览（**绝不阻塞 UI**）：节流 + 代际令牌 + 后台栅格化。
@@ -1444,6 +1597,8 @@ impl CollationWorkspace {
             self.preview_bg,
             self.preview_frame,
             self.preview_paper,
+            self.eff_imposition(),
+            self.binding,
         );
         if !self.preview_paths.is_empty() && self.preview_sig == Some(key) {
             self.preview_pending = false;
@@ -1464,6 +1619,8 @@ impl CollationWorkspace {
         let bg = self.preview_bg;
         let frame = self.preview_frame;
         let paper = self.preview_paper;
+        let imp = self.eff_imposition();
+        let binding = self.binding;
 
         cx.spawn(
             // ⚠️ 必须 move：把快照（text/columns/bg/frame/paper/gen）的所有权交给异步块，
@@ -1475,7 +1632,7 @@ impl CollationWorkspace {
                     let out = exec
                         .spawn(async move {
                             CollationWorkspace::render_preview_pages(
-                                &text, columns, bg, frame, paper,
+                                &text, columns, bg, frame, paper, imp, binding,
                             )
                         })
                         .await;
@@ -1488,7 +1645,11 @@ impl CollationWorkspace {
                             // 函数末尾，一旦 return 就把排队中的请求一起吞了 —— 表现是
                             // 「后台明明排好了 6 页，浮层却一直显示『正文为空』」，而且
                             // 再点刷新也没用（那一批图刚被删干净）。真机就踩了这个坑。
-                            let stale = !this.show_preview || gen != this.preview_gen;
+                            let stale = Self::preview_result_stale(
+                                this.show_preview,
+                                gen,
+                                this.preview_gen,
+                            );
                             if stale {
                                 if let Ok((pages, _)) = &out {
                                     for p in pages {
@@ -1942,20 +2103,16 @@ impl CollationWorkspace {
                     .px(px(PAD))
                     .bg(rgb(0x2b2620))
                     .child(
+                        // 标题独占「按钮以外的全部宽度」，且**允许裁切**：工具栏
+                        // 现在有纸张 / 拼版 / 装订三组胶囊 + 四颗钮，窄窗口下
+                        // 若让标题按内容撑开，右边那排按钮会被挤出可视区。
                         div()
+                            .flex_1()
+                            .overflow_hidden()
                             .text_color(rgb(0xf4ecd8))
                             .text_size(px(15.0))
-                            .child(SharedString::from(match self.preview_paper.mm() {
-                                Some((w, h)) => format!(
-                                    "竖排预览 · {} {}×{}mm",
-                                    self.preview_paper.label(),
-                                    w as u32,
-                                    h as u32
-                                ),
-                                None => "竖排预览 · 預覽卡（9:16 取景）".to_string(),
-                            })),
+                            .child(SharedString::from(self.preview_title())),
                     )
-                    .child(div().flex_1())
                     // Loading：后台排版期间给出明确反馈（用户点了不会「没反应」）。
                     .child(if self.preview_busy {
                         div()
@@ -1968,6 +2125,8 @@ impl CollationWorkspace {
                     })
                     .child(self.preview_pager(cx))
                     .child(self.paper_selector(cx))
+                    .child(self.imposition_selector(cx))
+                    .child(self.binding_selector(cx))
                     .child(self.button(
                         "导出 PDF",
                         |c, _, _, cx| c.export_pdf(cx),
@@ -2023,8 +2182,13 @@ impl CollationWorkspace {
                                     .clamp(240.0, PREVIEW_IMG_MAX_H);
                                 // 宽高比来自当前纸张：`Card` 仍是 0.5625（9:16，
                                 // 与 1080×1920 的老取景逐像素一致），A4/A3 是 1:√2。
-                                let img_w =
-                                    img_h * self.preview_paper.preview_geom().aspect();
+                                // 拼版时预览图是**整张纸**（横的），故宽高比也取整张纸；
+                                // 单页拼版取单页。两者都只是同一条版式数据的贴图。
+                                let img_w = img_h
+                                    * self
+                                        .preview_paper
+                                        .preview_sheet_geom(self.eff_imposition())
+                                        .aspect();
                                 // ⚠️ 不要给 img 套 with_animation：动画期间每帧重绘，
                                 // 1080×1920 级的位图反复解码 / 重上传会把主线程拖垮。
                                 // 翻页已由「← 第 X / Y 頁 →」明确指示，不需要淡入。
@@ -2270,6 +2434,11 @@ impl CollationWorkspace {
                         cx.listener(move |c, _, _, cx| {
                             if c.preview_paper != paper {
                                 c.preview_paper = paper;
+                                // 預覽卡不是纸：拼版对它无意义，切回去就复位成单页，
+                                // 免得留下「一张 9:16 卡上并排两半」的怪相。
+                                if paper == Paper::Card {
+                                    c.imposition = Imposition::Single;
+                                }
                                 // 指纹里含纸张 → 换纸必然重排；这里走 request 而非
                                 // refresh，连点时仍受 1s 节流保护。
                                 c.request_preview(cx);
@@ -2280,6 +2449,137 @@ impl CollationWorkspace {
             );
         }
         row
+    }
+
+    /// 工具栏胶囊（纸张 / 拼版 / 装订三处共用同一套视觉）。
+    ///
+    /// 只负责「长什么样」，点按行为由调用方挂 `on_mouse_down`——三处的回调
+    /// 语义不同（换纸要重算容量、换拼版要重排），视觉却必须一致。
+    fn chip(&self, label: impl Into<SharedString>, selected: bool) -> gpui::Div {
+        div()
+            .px(px(9.0))
+            .py(px(3.0))
+            .mr(px(4.0))
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .text_size(px(12.5))
+            .bg(if selected {
+                rgb(0xd8c9a8)
+            } else {
+                rgba(0xffffff1a)
+            })
+            .text_color(if selected {
+                rgb(0x2b2620)
+            } else {
+                rgb(0xd8c9a8)
+            })
+            .child(label.into())
+    }
+
+    /// **拼版选择胶囊**：`單頁 / 雙頁拼版`（v1.22.0）。
+    ///
+    /// 这是「大字海报」与「书」的那个开关：`單頁` 一版一张纸；`雙頁拼版` 把
+    /// 两个 A4 大小的单页并到一张横放的大纸上（书籍折页）。`預覽卡` 不是真实
+    /// 纸张，没有拼版可言，故那时整组不显示。
+    fn imposition_selector(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.preview_paper.mm().is_none() {
+            return div();
+        }
+        let mut row = div().flex().flex_row().items_center().mr(px(6.0));
+        for imp in Imposition::ALL {
+            let selected = self.imposition == imp;
+            row = row.child(self.chip(imp.label(), selected).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |c, _, _, cx| {
+                    if c.imposition != imp {
+                        c.imposition = imp;
+                        // 指纹里含拼版 → 换拼版必然重排；走 request 而非 refresh，
+                        // 连点时仍受 1s 节流保护。
+                        c.request_preview(cx);
+                    }
+                    cx.notify();
+                }),
+            ));
+        }
+        row
+    }
+
+    /// **装订模式胶囊**：`右開本 / 左開本`（v1.22.0）。
+    ///
+    /// 只在双页拼版时才有意义（单页拼版没有「谁在左」这回事），故其余时候整组
+    /// 不显示——工具栏上少两颗无用的钮，比多两颗更清楚。
+    fn binding_selector(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if !self.imposition.is_spread() || self.preview_paper.mm().is_none() {
+            return div();
+        }
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .mr(px(6.0))
+            // 把「奇偶怎么摆」直说在胶囊旁边：这是最容易搞反的一条，
+            // 光靠「右開本」三个字不够，得让用户一眼看到 奇左偶右。
+            .child(
+                div()
+                    .mr(px(5.0))
+                    .text_size(px(11.5))
+                    .text_color(rgb(0x8a8272))
+                    .child(SharedString::from(self.binding.hint())),
+            );
+        for b in Binding::ALL {
+            let selected = self.binding == b;
+            row = row.child(self.chip(b.label(), selected).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |c, _, _, cx| {
+                    if c.binding != b {
+                        c.binding = b;
+                        c.request_preview(cx);
+                    }
+                    cx.notify();
+                }),
+            ));
+        }
+        row
+    }
+
+    /// **当前真正生效的拼版**：`預覽卡` 不是纸张，一律按单页取景。
+    ///
+    /// 所有「读」拼版的地方都走这里，别直接读 `self.imposition`——那是个可能
+    /// 与当前纸张不匹配的残留值（用户先选 A3 拼版、再切回取景卡）。
+    fn eff_imposition(&self) -> Imposition {
+        if self.preview_paper == Paper::Card {
+            Imposition::Single
+        } else {
+            self.imposition
+        }
+    }
+
+    /// 浮层标题：把「多大的纸 / 怎么拼 / 单页多大 / 奇偶怎么摆」一次说清。
+    ///
+    /// 这几个数是印厂对话的全部内容（420×297 是上机尺寸，202×297 是排版尺寸），
+    /// 少一个用户就得回来问一遍。所以宁可字小一点，也要都摆出来。
+    fn preview_title(&self) -> String {
+        let Some(_) = self.preview_paper.mm() else {
+            return "竖排预览 · 預覽卡（9:16 取景）".to_string();
+        };
+        let imp = self.eff_imposition();
+        let sheet = self.preview_paper.sheet_mm(imp).unwrap_or((0.0, 0.0));
+        let base = format!(
+            "竖排预览 · {} {} {}×{}mm",
+            self.preview_paper.label(),
+            imp.label(),
+            sheet.0.round() as i32,
+            sheet.1.round() as i32
+        );
+        if !imp.is_spread() {
+            return base;
+        }
+        let page = self.preview_paper.page_mm(imp).unwrap_or((0.0, 0.0));
+        format!(
+            "{base} · 單頁 {}×{}mm",
+            page.0.round() as i32,
+            page.1.round() as i32
+        )
     }
 
     /// 导出状态条：**在途 / 成功 / 失败**三态都用一行字说清（绝不静默）。
@@ -2960,40 +3260,182 @@ mod tests {
     fn page_capacity_follows_the_paper() {
         // 取景卡沿用 v1.9.x 的经验表（12 列 → 110 字）。
         assert_eq!(
-            CollationWorkspace::page_cap(Paper::Card, 12, ShareBg::Xuan, ShareFrame::Red),
+            CollationWorkspace::page_cap(
+                Paper::Card,
+                Imposition::Single,
+                12,
+                ShareBg::Xuan,
+                ShareFrame::Red
+            ),
             110
         );
         // 真实纸张问版式自己。A4 / A3 同比例（1:√2），故同列数下容量应当接近
         // ——只差像素取整带来的±1 行（A4 的相对留白比 A3 略多一点点）。
-        let a4 = CollationWorkspace::page_cap(Paper::A4, 12, ShareBg::Xuan, ShareFrame::Red);
-        let a3 = CollationWorkspace::page_cap(Paper::A3, 12, ShareBg::Xuan, ShareFrame::Red);
+        let a4 = CollationWorkspace::page_cap(
+            Paper::A4,
+            Imposition::Single,
+            12,
+            ShareBg::Xuan,
+            ShareFrame::Red,
+        );
+        let a3 = CollationWorkspace::page_cap(
+            Paper::A3,
+            Imposition::Single,
+            12,
+            ShareBg::Xuan,
+            ShareFrame::Red,
+        );
         let diff = (a4 as f32 - a3 as f32).abs() / a3 as f32;
         assert!(diff < 0.10, "同比例纸张容量差太多：A4={a4} A3={a3}");
         assert!(a3 > 120, "A4/A3 一页只装得下 {a3} 字，明显不对");
     }
 
-    /// 生成一份 A3 样张（人工目检用，默认跳过）。
+    /// **拼版单页 = A4 那一档**：A3 雙頁的每页容量必须与 A4 单页几乎一样。
+    ///
+    /// 这就是「书」与「大字海报」的分界在容量上的体现：拼版单页排的是
+    /// 202×297mm（≈A4）的版心，绝不能用整张 A3 的宽度去算列数。
+    #[test]
+    fn spread_page_holds_a4_worth_of_text_not_a3_worth() {
+        let a4 = CollationWorkspace::page_cap(
+            Paper::A4,
+            Imposition::Single,
+            12,
+            ShareBg::Xuan,
+            ShareFrame::Red,
+        );
+        let book = CollationWorkspace::page_cap(
+            Paper::A3,
+            Imposition::Spread,
+            12,
+            ShareBg::Xuan,
+            ShareFrame::Red,
+        );
+        let diff = (a4 as f32 - book as f32).abs() / a4 as f32;
+        assert!(
+            diff < 0.12,
+            "拼版单页的容量没回到 A4 档：A4={a4} 拼版单页={book}"
+        );
+        // 取景卡不受拼版影响（它不是纸）。
+        assert_eq!(
+            CollationWorkspace::page_cap(
+                Paper::Card,
+                Imposition::Spread,
+                12,
+                ShareBg::Xuan,
+                ShareFrame::Red
+            ),
+            110
+        );
+    }
+
+    /// 从 PDF 字节里读**媒体框**（宽, 高）——纸张方向唯一的硬证据。
+    fn media_box(bytes: &[u8]) -> (f32, f32) {
+        let hay = String::from_utf8_lossy(bytes);
+        let i = hay.find("MediaBox").expect("PDF 里找不到 MediaBox");
+        let seg = &hay[i..(i + 90).min(hay.len())];
+        let nums: Vec<f32> = seg
+            .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+            .filter_map(|t| t.parse::<f32>().ok())
+            .collect();
+        assert!(nums.len() >= 4, "MediaBox 解不出四个数：{seg}");
+        (nums[2] - nums[0], nums[3] - nums[1])
+    }
+
+    /// **双页拼版落盘**：媒体框是横的，张数 = 单页数 ÷ 2 上取整。
+    ///
+    /// 这条把三件事一次钉死：① 纸是横的（不是那版竖着放大铺满的 A3）；
+    /// ② 一张纸装两页；③ 单页拼版照旧一页一张纸（老出口没被改动）。
+    #[test]
+    fn spread_export_makes_landscape_sheets_of_two_pages() {
+        // 约 5 页的字量：足够排满两张纸，又还能验证「末张单页」这条边界。
+        let text = "天地玄黃宇宙洪荒日月盈昃辰宿列張寒來暑往秋收冬藏閏餘成歲律呂調陽".repeat(8);
+        let dir = std::env::temp_dir();
+        let single_out = dir.join("jiandu_pdf_single.pdf");
+        let spread_out = dir.join("jiandu_pdf_spread.pdf");
+
+        let (one_per_sheet, _, _) = CollationWorkspace::render_pdf_blocking(
+            &text,
+            12,
+            ShareBg::Xuan,
+            ShareFrame::Red,
+            Paper::A3,
+            Imposition::Single,
+            Binding::Right,
+            &single_out,
+        )
+        .expect("单页导出应能跑通");
+        let (sheets, chars, _) = CollationWorkspace::render_pdf_blocking(
+            &text,
+            12,
+            ShareBg::Xuan,
+            ShareFrame::Red,
+            Paper::A3,
+            Imposition::Spread,
+            Binding::Right,
+            &spread_out,
+        )
+        .expect("双页拼版导出应能跑通");
+
+        assert!(one_per_sheet >= 2, "样张字量不够：{one_per_sheet} 页");
+        // 一个字都不许丢：落字数必须等于清洗后的字数（切字 / 丢字都会露馅）。
+        assert_eq!(chars, 256, "拼版导出掉字了（应为 256 字）：{chars}");
+        assert_eq!(
+            sheets,
+            (one_per_sheet + 1) / 2,
+            "拼版张数应为单页数的一半个（上取整）：{sheets} vs {one_per_sheet}"
+        );
+        assert!(chars > 0);
+
+        let single_bytes = std::fs::read(&single_out).expect("单页 PDF 应已落盘");
+        let spread_bytes = std::fs::read(&spread_out).expect("拼版 PDF 应已落盘");
+        let (sw, sh) = media_box(&spread_bytes);
+        assert!(
+            sw > sh,
+            "拼版媒体框必须是横的（宽 > 高）：{sw}×{sh}"
+        );
+        assert!(
+            (sw - Paper::A3.sheet_pdf_geom(Imposition::Spread).w).abs() < 2.0,
+            "拼版媒体框宽度不是整张 A3：{sw}"
+        );
+        let (pw, ph) = media_box(&single_bytes);
+        assert!(ph > pw, "單頁 A3 仍是竖放：{pw}×{ph}");
+
+        let _ = std::fs::remove_file(&single_out);
+        let _ = std::fs::remove_file(&spread_out);
+    }
+
+    /// 生成 A3 样张（人工目检用，默认跳过）：单页与拼版各一份。
     ///
     /// 跑法：`JIANDU_GEN_A3_SAMPLE=1 cargo test -p jiandu --bins collation -- --ignored`。
-    /// 产物路径写在日志里，用「预览」或 `sips` 打开即可看版式（标题 / 正文 / 版框）。
+    /// 产物路径写在日志里，用「预览」或 `sips` 打开即可看版式（标题 / 正文 / 版框 /
+    /// 中缝）。**拼版那份要亲眼确认**：奇左偶右、两页各自成版、中间中缝。
     #[test]
     #[ignore]
     fn dump_a3_sample_pdf() {
         if std::env::var("JIANDU_GEN_A3_SAMPLE").is_err() {
             return;
         }
-        let text = "# 千字文\n\n**天地玄黃**，宇宙洪荒。日月盈昃，辰宿列張。寒來暑往，秋收冬藏。\n\n                    ## 第一節 四時\n\n閏餘成歲，律呂調陽。雲騰致雨，露結為霜。金生麗水，玉出崑岡。";
-        let out = std::env::temp_dir().join("jiandu_a3_sample.pdf");
-        let (n, chars, _) = CollationWorkspace::render_pdf_blocking(
-            text,
-            12,
-            ShareBg::Xuan,
-            ShareFrame::Red,
-            Paper::A3,
-            &out,
-        )
-        .expect("样张生成失败");
-        eprintln!("[a3-sample] {n} 页 / {chars} 字 → {}", out.display());
+        // 字数要够排满两页，才能看出「两页并一张纸」与中缝。
+        let body = "# 千字文\n\n**天地玄黃**，宇宙洪荒。日月盈昃，辰宿列張。寒來暑往，秋收冬藏。\n\n## 第一節 四時\n\n閏餘成歲，律呂調陽。雲騰致雨，露結為霜。金生麗水，玉出崑岡。劍號巨闕，珠稱夜光。果珍李柰，菜重芥薑。海鹹河淡，鱗潛羽翔。龍師火帝，鳥官人皇。始制文字，乃服衣裳。推位讓國，有虞陶唐。弔民伐罪，周發殷湯。坐朝問道，垂拱平章。愛育黎首，臣伏戎羌。遐邇一體，率賓歸王。鳴鳳在竹，白駒食場。化被草木，賴及萬方。";
+        let text = format!("{body}\n\n{body}");
+        for (imp, name) in [
+            (Imposition::Single, "jiandu_a3_sample.pdf"),
+            (Imposition::Spread, "jiandu_a3_spread.pdf"),
+        ] {
+            let out = std::env::temp_dir().join(name);
+            let (n, chars, _) = CollationWorkspace::render_pdf_blocking(
+                &text,
+                12,
+                ShareBg::Xuan,
+                ShareFrame::Red,
+                Paper::A3,
+                imp,
+                Binding::Right,
+                &out,
+            )
+            .expect("样张生成失败");
+            eprintln!("[a3-sample/{imp:?}] {n} 张 / {chars} 字 → {}", out.display());
+        }
     }
 
     /// **端到端**：Markdown 源码 → 清洗 → A3 排版 → 矢量 PDF 落盘。
@@ -3010,6 +3452,8 @@ mod tests {
             ShareBg::Xuan,
             ShareFrame::Red,
             Paper::A3,
+            Imposition::Single,
+            Binding::Right,
             &out,
         );
         let (pages, chars, cut) = r.expect("MD → A3 PDF 应能跑通");
@@ -3021,5 +3465,24 @@ mod tests {
         assert!(bytes.starts_with(b"%PDF"), "产物不是 PDF");
         assert!(bytes.len() > 2000, "PDF 过小：{}", bytes.len());
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// **关闭优先**：预览关掉以后，在途的后台排版结果一律丢弃，绝不回写。
+    ///
+    /// 用户 2026-11-01 第 5 条：「先把 UI 卡死问题解决，确保【关闭】按钮随时
+    /// 能点」。机制就三件事，这条钉住最关键的一件——
+    /// ・排版全在 `background_executor`（主线程只 set 状态文字）；
+    /// ・`close_preview` 是几个 O(1) 赋值（不删盘、不等后台）；
+    /// ・结果回来先过本判据，过期即连临时文件一起丢。
+    #[test]
+    fn closing_the_preview_always_discards_in_flight_results() {
+        // 在途任务代际 7、预览开着 → 结果是有效的。
+        assert!(!CollationWorkspace::preview_result_stale(true, 7, 7));
+        // 用户按了关闭：show_preview=false 且 gen 7→8 → 必丢。
+        assert!(CollationWorkspace::preview_result_stale(false, 7, 8));
+        // 只关不加代际也必须丢（口径不依赖 gen 是否变）。
+        assert!(CollationWorkspace::preview_result_stale(false, 7, 7));
+        // 关掉又重开、但代际已变 → 旧的那批仍然必须丢（绝不「闪回上一版」）。
+        assert!(CollationWorkspace::preview_result_stale(true, 7, 8));
     }
 }
