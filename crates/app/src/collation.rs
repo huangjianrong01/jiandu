@@ -138,11 +138,14 @@ const TEXT_MAX_CHARS: usize = 80_000;
 ///   iCloud 的 size 可能是 0 或说谎，信它就会一次性 read 出一个 2GB 的 Buffer。
 const TEXT_IMPORT_HARD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// 右文段 ↔ 原图区域文字的**最低字面对合度**（0.0–1.0）。
-/// 段落索引对齐的前提是「右侧转录 ≈ 原图该区域文字」。用户实测过一类典型误用：
-/// 导入《資治通鑑》却在右侧贴《千字文》——两者毫不相干，索引对齐失去意义，画出的
-/// 框必然是错的。故联动前先做字面校验，低于此值就**绝不画框、绝不滚动**。
-const MATCH_MIN_SIM: f32 = 0.5;
+// 历史记录：这里曾定过一个「最低字面对合度」阈值（覆盖率 0.5），低于它就不画框
+// 不滚动。真机上它造成的是最坏的一种失败——「右文和影印件明明是同一段话，却提示
+// 不匹配，一个字的高亮都不出来」：覆盖率量的是「右文有多少被左文包含」，而 PDF
+// 文本层常把一句话切成几截、OCR 又常漏字，比值天然偏低。
+//
+// v1.9.23 起改成「最长公共子串 ≥ LCS_MIN」判定（见 `locate_region`）：只问
+// 「有没有一段连续 6 个字对得上」，不问「百分比够不够」。`bigram_overlap` 作为
+// 校对的**诊断量**保留，但不再参与放行决策。
 
 /// 计算右文段落在原图区域文字里的**连续二字对覆盖率**（0.0–1.0）。
 ///
@@ -182,6 +185,76 @@ fn bigram_overlap(seg: &str, region: &str) -> f32 {
     }
     hit as f32 / (s.len() - 1) as f32
 }
+
+/// 判定「这段右文就是原图那一处」所需的最短**连续重合字数**。
+///
+/// 为什么不用覆盖率阈值：OCR / 文本层会把一段话切成若干短行，右文一行可能只
+/// 对应某区域的前半句。覆盖率（`bigram_overlap`）在这种「包含但不相等」的情形
+/// 下天然偏低，于是同一段话被判成不匹配——正是真机反馈的「明明一模一样却高亮
+/// 不出来」。改成「最长公共子串 ≥ 6 字」：既承认包含关系，又不会因为「之乎者
+/// 也」这类高频字偶然连上两三个字就误判。
+const LCS_MIN: usize = 6;
+
+/// 求最长公共子串时的字符上限（一页文本层正常几百字；封顶防 O(n·m) 退化）。
+const LCS_CAP: usize = 600;
+
+/// 最长公共**子串**（连续）长度——经典 DP，两行滚动，不分配 n×m 矩阵。
+///
+/// ⚠️ 这里要的是**子串**不是**子序列**。子序列允许跳字，`甲乙丙` 三字若散落在
+/// 一整页里就算「连续重合 3 字」，判据立刻失效（中文页面上「之乎者也」之类的
+/// 高频字散落重合太容易了）。故递推式在不等时**归零**：
+///
+/// ```text
+/// cur[j+1] = if a[i] == b[j] { prev[j] + 1 } else { 0 }
+/// ```
+///
+/// 真正的定位需要「原图里也有一段一模一样连着的字」，归零才是这个意思。
+fn lcs_len(a: &[char], b: &[char]) -> usize {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let mut prev = vec![0usize; b.len() + 1];
+    let mut cur = vec![0usize; b.len() + 1];
+    let mut best = 0usize;
+    for &ca in a {
+        for (j, &cb) in b.iter().enumerate() {
+            cur[j + 1] = if ca == cb { prev[j] + 1 } else { 0 };
+            best = best.max(cur[j + 1]);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    best
+}
+
+/// 在 `regions` 里找与本行文字**最像**的那一处。返回 `(区域下标, 连续重合字数)`。
+///
+/// 这是「点哪高亮哪」的地基，**不再假设索引对齐**。原先按 `regions[行号]` 取框，
+/// 隐含前提是「原图文本层切出来的段数 ≈ 右文行数」——真实 PDF 一页几十行、
+/// 右文几百行，这个前提从第一页起就不成立：取不到 → 点了毫无反应；偶尔取到
+/// 也是错位的一处 → 框落在不相干的字上（真机反馈的「高亮框飘了」）。
+///
+/// 改成按文字找之后，段数多少、顺序如何都不影响；跨页找不到时由调用方给话。
+fn locate_region(line_text: &str, regions: &[SourceRegion]) -> Option<(usize, usize)> {
+    let needle: Vec<char> = match_text(line_text).chars().take(LCS_CAP).collect();
+    // 一个字（或纯标点）没法定位：这不是「未匹配」，是「这行没内容」，
+    // 由调用方区分，免得空行点一下就弹一条红字。
+    if needle.len() < 2 {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for (i, r) in regions.iter().enumerate() {
+        let hay: Vec<char> = match_text(&r.text).chars().take(LCS_CAP).collect();
+        if hay.is_empty() {
+            continue;
+        }
+        let n = lcs_len(&needle, &hay);
+        if best.map(|(_, b)| n > b).unwrap_or(true) {
+            best = Some((i, n));
+        }
+    }
+    best.filter(|&(_, n)| n >= LCS_MIN)
+}
+
 
 /// 文本区域结构定义在 `pdf_text::SourceRegion`（PDF 文本层抽取的数据源）。
 ///
@@ -274,8 +347,17 @@ pub struct CollationWorkspace {
     export_note: Option<String>,
     /// 样式选择面板是否展开。
     show_style_panel: bool,
-    /// 当前联动的右文段索引（0-based）。None = 尚未联动。右文第 i 段 ↔
-    /// `regions[i]`（转录逐行对齐原图行）。
+    /// 当前联动的**右文行号**（0-based，行 = `text` 里 `\n` 分隔的第几行）。
+    ///
+    /// 与下面的 `active_para_idx` 是一对「源 → 靶」：这里是**用户点的哪一行**，
+    /// 那里是**左图命中的哪一处区域**。分开记的原因：命中不了时（跨页 / 扫描版 /
+    /// 稿子对不上）仍需如实显示「你点的是第几行」，否则用户点了没反应，连
+    /// 「系统知道我在点哪」都无从判断。
+    active_line: Option<usize>,
+    /// 当前联动命中的原图区域下标（0-based）。`None` = 这一行没命中。
+    ///
+    /// ⚠️ 它**不再等于行号**（v1.9.23）：由 `locate_region` 按文字查出来，故右文
+    /// 行数与原图文本层段数不同、顺序不同都无所谓。
     active_para_idx: Option<usize>,
     /// 左图原图自然像素宽（由栅格化结果填充；无原图时由区域包围盒推导）。
     src_nat_w: f32,
@@ -325,7 +407,7 @@ pub struct CollationWorkspace {
 
 impl CollationWorkspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let me = Self {
+        let mut me = Self {
             // 示例转录：一段较长的古文（千字文节选），让用户一进来就能看到
             // 编辑器、立即尝试选择/输入，并直接打开「竖排预览」看到多页分页。
             text: "天地玄黄 宇宙洪荒 日月盈昃 辰宿列张 寒来暑往 秋收冬藏 闰余成岁 律吕调阳 云腾致雨 露结为霜 金生丽水 玉出昆冈 剑号巨阙 珠称夜光 果珍李柰 菜重芥姜 海咸河淡 鳞潜羽翔 龙师火帝 鸟官人皇 始制文字 乃服衣裳 推位让国 有虞陶唐 吊民伐罪 周发殷汤 坐朝问道 垂拱平章 爱育黎首 臣伏戎羌 遐迩一体 率宾归王 鸣凤在竹 白驹食场 化被草木 赖及万方\n盖此身发 四大五常 恭惟鞠养 岂敢毁伤 女慕贞洁 男效才良 知过必改 得能莫忘 罔谈彼短 靡恃己长 信使可覆 器欲难量 墨悲丝染 诗赞羔羊 景行维贤 克念作圣 德建名立 形端表正 空谷传声 虚堂习听 祸因恶积 福缘善庆 尺璧非宝 寸阴是竞 资父事君 曰严与敬 孝当竭力 忠则尽命 临深履薄 夙兴温凊 似兰斯馨 如松之盛 川流不息 渊澄取映 容止若思 言辞安定 笃初诚美 慎终宜令 荣业所基 藉甚无竟 学优登仕 摄职从政 存以甘棠 去而益咏"
@@ -362,12 +444,17 @@ impl CollationWorkspace {
             preview_frame: ShareFrame::Red,
             preview_columns: 12,
             show_style_panel: false,
+            active_line: None,
             active_para_idx: None,
             src_nat_w: 0.0,
             src_nat_h: 0.0,
             match_note: None,
             frame_count: 0,
-            regions: Self::mock_regions(),
+            // 启动时**没有任何原图**，故区域表为空：绝不用假坐标占位。
+            // 没有图就没有框、也不做任何匹配（`link_to_paragraph` 会先说
+            // 「未加载原图」），这样「点了弹出重合度 4%」这类莫名其妙的
+            // 内部指标再也不会出现。
+            regions: Vec::new(),
             pdf_path: None,
             pdf_page: 1,
             pdf_pages: 1,
@@ -553,15 +640,43 @@ impl CollationWorkspace {
         }
     }
 
+    /// 右侧编辑器的**内容原点**（正文第一行第一字的窗口坐标）。
+    ///
+    /// 四个必须一起算的量，漏任何一个都会让「点第 N 行」落到别的行上：
+    ///  ① 全局工具条 `HEADER_H`；
+    ///  ② 编辑区上面那两条状态条（文本导入提示 24 / 联动提示 26，没有就是 0）；
+    ///  ③ 编辑器自身的 `ED_PAD`；
+    ///  ④ 滚动偏移（`scroll.offset().y`，向下滚为**负**）。
+    ///
+    /// 真机「点哪高亮哪失效」的第二层死因就在这儿：上一版只减了 `HEADER_H + PAD`，
+    /// 既没算两条状态条也没算滚动，于是点第 10 行常被算成第 8 行，滚过一屏之后
+    /// 更是整段错位——拿错的**行号**去查原图区域，自然一处都对不上。
+    ///
+    /// ⚠️ 行内点击已**不再依赖**这个估算：`render_line` 给每一行挂了直达
+    /// `link_to_paragraph(行号)` 的点击（见 [`Self::click_line`]），行号由结构给出、
+    /// 不是量出来的。这里只服务「点在正文之外的空白处」这一种兜底情形。
+    fn editor_origin(&self, vw: f32) -> (f32, f32) {
+        let status_h = if self.text_note.is_some() { 24.0 } else { 0.0 };
+        let link_h = if self.match_note.is_some() || self.active_para_idx.is_some() {
+            26.0
+        } else {
+            0.0
+        };
+        let scroll_y = px_f32(self.scroll.offset().y);
+        (
+            vw * 0.4 + ED_PAD,
+            HEADER_H + status_h + link_h + ED_PAD + scroll_y,
+        )
+    }
+
     /// 由点击/拖拽位置（窗口坐标）近似推出字符下标。
     ///
-    /// 右文编辑器内用固定布局常量 + 平均字宽估算（仅用于编辑器内落光标 / 选区）；
+    /// 右文编辑器内用「固定行高 + 平均字宽」估算（仅用于编辑器内落光标 / 选区）；
     /// 左图高亮坐标则来自 `SourceRegion` 的真实自然像素映射，二者互不影响。
     fn caret_from_point(&self, x: f32, y: f32, vw: f32) -> usize {
-        let editor_left = vw * 0.4 + PAD;
-        let editor_top = HEADER_H + PAD;
-        let local_x = (x - editor_left).max(0.0);
-        let local_y = (y - editor_top).max(0.0);
+        let (origin_x, origin_y) = self.editor_origin(vw);
+        let local_x = (x - origin_x).max(0.0);
+        let local_y = (y - origin_y).max(0.0);
         let line_idx = (local_y / LINE_H).floor() as usize;
         let ranges = self.line_ranges();
         let idx = line_idx.min(ranges.len().saturating_sub(1));
@@ -573,6 +688,42 @@ impl CollationWorkspace {
         s + in_line.min(e - s)
     }
 
+    /// 右文**某一行的行身**被点中：落光标 + 直连左图联动。
+    ///
+    /// 这是「点哪高亮哪」的**主路径**（v1.9.23）。上一版全靠父容器
+    /// `place_caret_from_click` 用「鼠标 y ÷ 行高」反推行号，那是个估算：状态条、
+    /// 内边距、滚动偏移任何一项变动都会让它错位，而错一行就意味着**查错了原图
+    /// 区域**——表现就是「点了没反应」或「框落在别处」。现在行号由
+    /// `render_line` 在渲染时就捕获好传进来，量都不用量。
+    ///
+    /// 同一个事件里把三件事做完，**不做任何节流**（用户明确要求：点击必须立刻
+    /// 触发坐标搜索）：
+    ///  ① 落光标 / 清选区（并请求焦点，让随后的中文能直接打进来）；
+    ///  ② 按这一行的文字去原图找区域（`link_to_paragraph`）；
+    ///  ③ `stop_propagation`，免得父容器的估算路径再算一遍、把行号覆盖成估算值。
+    fn click_line(
+        &mut self,
+        li: usize,
+        line_start: usize,
+        line_len: usize,
+        x: f32,
+        vw: f32,
+        vh: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 行内列位：仍按平均字宽估（中文等宽，误差 < 1 字），但**行号不估**。
+        let (origin_x, _) = self.editor_origin(vw);
+        let col = ((x - origin_x).max(0.0) / CHAR_W).round() as usize;
+        self.cursor = line_start + col.min(line_len);
+        self.selection = None;
+        self.anchor = self.cursor;
+        self.dragging = true;
+        Self::hard_refocus(window, &self.focus);
+        self.link_to_paragraph(li, vw, vh, cx);
+        cx.stop_propagation();
+    }
+
     fn place_caret_from_click(
         &mut self,
         event: &MouseDownEvent,
@@ -580,6 +731,7 @@ impl CollationWorkspace {
         cx: &mut Context<Self>,
     ) {
         let vw = px_f32(window.viewport_size().width);
+        let vh = px_f32(window.viewport_size().height);
         self.cursor = self.caret_from_point(px_f32(event.position.x), px_f32(event.position.y), vw);
         self.selection = None;
         self.anchor = self.cursor;
@@ -587,9 +739,10 @@ impl CollationWorkspace {
         // 点进编辑器 = 用户想打字。这里走硬重建（而不是裸 focus）：原生对话框
         // 关掉后平台侧可能已经丢了输入上下文，而 GPUI 仍以为聚焦（见 hard_refocus）。
         Self::hard_refocus(window, &self.focus);
-        // 落光标即联动：右文点击第 N 段 → 左图滚动 + 高亮。
+        // 兜底路径：没落在任何一行上（点的是正文下方的空白）时，仍按估算行号联动，
+        // 绝不让「点了没反应」出现。
         if let Some(li) = self.line_of(self.cursor) {
-            self.link_to_paragraph(li, vw, cx);
+            self.link_to_paragraph(li, vw, vh, cx);
         } else {
             cx.notify();
         }
@@ -898,6 +1051,15 @@ impl CollationWorkspace {
     ///      比任何一圈线都安静；
     ///   ② 文字只给两行：一句「在等什么」，一句「怎么开始」；
     ///   ③ 朱砂只用在这一枚小方印上，且压到 40% 透明——空的时候不该抢眼。
+    /// **左栏空状态**（v1.9.22，v1.9.24 补强文案与轮廓）。
+    ///
+    /// 四条设计纪律，都是为了让它是「空状态」而不是「错误提示」：
+    ///   ① **没有实线框**——GPUI 0.2.2 画不了虚线，于是用「极淡的轮廓 + 浅纸底」，
+    ///      比任何一圈硬线都安静，但比纯色块更像"一个待填的格子"；
+    ///   ② 文字只给三行：一句「在等什么」、一句「点哪里开始」、一句「支持什么」；
+    ///   ③ 朱砂只用在这一枚小方印上，且压到 40% 透明——空的时候不该抢眼；
+    ///   ④ 提示必须**指向具体的按钮位置**（左上角「打开文件」）。只说「请导入原图」
+    ///      等于把找路的活儿又丢回给用户。
     fn render_left_empty(&self) -> gpui::Div {
         let song = crate::fonts::family_for(
             crate::types::FontChoice::WenJinMincho,
@@ -911,13 +1073,17 @@ impl CollationWorkspace {
             .justify_center()
             .child(
                 div()
-                    .w(px(296.0))
+                    .w(px(300.0))
                     .flex()
                     .flex_col()
                     .items_center()
-                    .py(px(40.0))
-                    .px(px(26.0))
+                    .py(px(38.0))
+                    .px(px(24.0))
                     .bg(rgba(0xF3EBD5D9))
+                    // 淡墨轮廓（不是虚线，是「弱一档的线」）：给这块留白一个边界，
+                    // 让它读起来像一张待填的表格，而不是一片没画完的背景。
+                    .border_1()
+                    .border_color(rgba(0x8C2B221F))
                     .rounded(px(10.0))
                     // 一枚极淡的方印：认门，不喊人。
                     .child(
@@ -935,7 +1101,7 @@ impl CollationWorkspace {
                             .text_color(rgba(0x8C2B22AA))
                             .child(SharedString::from("原")),
                     )
-                    .child(div().h(px(16.0)))
+                    .child(div().h(px(14.0)))
                     .child(
                         div()
                             .font_family(song.clone())
@@ -943,13 +1109,23 @@ impl CollationWorkspace {
                             .text_color(rgb(0x5a5346))
                             .child(SharedString::from("等待导入古籍原图")),
                     )
-                    .child(div().h(px(7.0)))
+                    .child(div().h(px(8.0)))
+                    .child(
+                        div()
+                            .font_family(song.clone())
+                            .text_size(px(11.5))
+                            .text_color(rgba(0x5A5346CC))
+                            .child(SharedString::from(
+                                "请点左上角「打开文件」导入原图",
+                            )),
+                    )
+                    .child(div().h(px(4.0)))
                     .child(
                         div()
                             .font_family(song)
                             .text_size(px(11.0))
-                            .text_color(rgba(0x5A5346B3))
-                            .child(SharedString::from("支持 PDF / PNG · 点上方「打开文件」")),
+                            .text_color(rgba(0x5A534699))
+                            .child(SharedString::from("支持 PDF / PNG · PDF 需带文本层")),
                     ),
             )
     }
@@ -959,9 +1135,10 @@ impl CollationWorkspace {
     /// 当前联动段的高亮矩形——高亮坐标全部来自 `SourceRegion` 的真实 (x,y,w,h)
     /// 自然像素，按 `src_nat` 缩放后落到显示坐标（彻底告别 N*BAND_H Mock）。
     fn render_left_content(&self, vw: f32) -> gpui::Div {
-        let (nw, nh) = self.source_size();
-        let disp_w = vw * 0.4;
-        let scale = if nw > 0.0 { disp_w / nw } else { 1.0 };
+        let (_nw, nh) = self.source_size();
+        // 缩放比与 `scroll_region_to_center` **同源**（都走 `left_scale`）。
+        // 一旦两处各算各的，框就会整体偏移几十像素——「框飘了」的经典死因。
+        let scale = self.left_scale(vw);
         let disp_h = nh * scale;
         let mut page = div().relative().w_full().h(px(disp_h)).bg(rgb(0xf1e8cf));
 
@@ -1078,6 +1255,7 @@ impl CollationWorkspace {
                             this.pdf_page = r.page;
                             // 换原图 = 之前联动的段 / 框全部作废（属于旧图坐标）。
                             this.active_para_idx = None;
+                            this.active_line = None;
                             this.match_note = None;
                             this.left_scroll
                                 .set_offset(Point::new(px(0.0), px(0.0)));
@@ -1140,7 +1318,16 @@ impl CollationWorkspace {
                                     // 联动状态属于旧稿，随新稿一起清空，绝不带着
                                     // 上一本书的高亮框进下一本。
                                     this.active_para_idx = None;
+                                    this.active_line = None;
                                     this.match_note = None;
+                                    // **换稿即清场**（v1.9.24）：竖排预览的版式指纹、
+                                    // 旧页图、当前页码全部作废。不清就会「上一份稿的
+                                    // 竖排版式还挂在新稿上」——用户看到的正是那种
+                                    // 「右侧排版乱套了」的假象：新稿横排、旧预览竖排
+                                    // 叠在一起。旧 PNG 挪进待删队列，下一帧统一删盘。
+                                    this.preview_sig = None;
+                                    this.preview_page = 0;
+                                    this.temp_gc.append(&mut this.preview_paths);
                                     this.text_file = Some(path.clone());
                                     this.text_note = Some(note);
                                     this.text_err = false;
@@ -1706,6 +1893,7 @@ impl CollationWorkspace {
         // 换页即作废旧页的文本层坐标与联动状态：右边的段落还没点，左边不该
         // 留着上一页的框。
         self.active_para_idx = None;
+        self.active_line = None;
         self.match_note = None;
 
         cx.spawn(
@@ -1932,51 +2120,126 @@ impl CollationWorkspace {
         .detach();
     }
 
-    /// 右文某段 → 左图联动：记录段索引 + 左侧滚动到对应区域。
+    /// 右文某一行 → 左图联动：**按文字找**对应区域，高亮 + 滚动居中。
     ///
-    /// 真实坐标映射（替换 N*BAND_H Mock）：右文第 `para_idx` 段 ↔ `regions[para_idx]`
-    /// （转录逐行对齐原图行）。区域 (x,y,w,h) 为原图自然像素，按 `src_nat` 缩放后
-    /// 既是高亮矩形（由 `render_left_content` 渲染）也是滚动目标。无对应区域
-    /// （段落数 ≠ 区域数）则不高亮也不滚动。
-    fn link_to_paragraph(&mut self, para_idx: usize, vw: f32, cx: &mut Context<Self>) {
-        // 无对应区域（段落数 ≠ 区域数 / 原图无文本层）→ 不高亮、不滚动、不标记。
-        let Some(r) = self.regions.get(para_idx) else {
+    /// v1.9.23 重写。上一版按 `regions[行号]` 取区域，隐含「原图文本层切出的
+    /// 段数 ≈ 右文行数」这个前提——真实 PDF 一页几十处、右文几百行，前提从第一
+    /// 页起就不成立，于是：取不到 → 点了毫无反应；偶尔取到也是错位那一处 →
+    /// 高亮框落在不相干的字上。现在改为 [`locate_region`] 按最长公共子串找，
+    /// 段数 / 顺序都不再重要。
+    ///
+    /// 三种结局都要有可见的交代（绝不「点了没反应」）：
+    ///   * 找到 → 画框 + 滚动居中 + 状态条报「第几段 → 第几处，连续重合几字」；
+    ///   * 没找到 → 状态条明写「未匹配到原图区域」；
+    ///   * 无文本层 → 状态条明写需 OCR（扫描版的正常形态，不是错误）。
+    fn link_to_paragraph(&mut self, line_idx: usize, vw: f32, vh: f32, cx: &mut Context<Self>) {
+        self.active_line = Some(line_idx);
+
+        // ① **前置判断：左侧到底有没有原图**（用户 2026-11-01 明确要求）。
+        //
+        //    顺序绝不能颠倒。上一版先看 `regions` 空不空，而没有把「压根没导入原图」
+        //    挡在最前面 —— 于是左侧明明是空的时，程序照样拿右文去和占位数据算一遍
+        //    重合度，再把「重合度 4% < 50%」这种**内部指标**甩给用户看。既答非所问，
+        //    又像是程序在报错。这里改成三级判断，每一级只说人话：
+        //    没图 → 「未加载原图」；有图无文本层 → 「需 OCR」；有文本层 → 才去比对。
+        if self.image_path.is_none() {
             self.active_para_idx = None;
-            // 一条区域都没有 = 扫描版（无文本层）。这类原图**只渲染、不报错**，但也
-            // 确实没有坐标可映射——必须把「点了为什么没反应」当面讲清楚（产品边界 ①）。
-            self.match_note = if self.regions.is_empty() && self.image_path.is_some() {
-                Some("该原图无文本层（扫描图）：无法定位到原图，需先 OCR 出文本层".to_string())
-            } else {
-                None
-            };
-            cx.notify();
-            return;
-        };
-        // —— 兜底容错：文本对合度校验 ——
-        // 索引对齐只在「右侧转录 ≈ 原图该区域文字」时才有意义。内容不相干（如导入
-        // 《資治通鑑》却贴《千字文》）时，按索引取到的区域必然对不上，画框只会误导
-        // 校对。故先校验字面重合，过低就跳过定位（不高亮、不滚动），并明确提示。
-        let sim = bigram_overlap(&self.paragraph_text(para_idx), &r.text);
-        if sim < MATCH_MIN_SIM {
-            self.active_para_idx = None;
-            self.match_note = Some(format!(
-                "该段与原图此处文字不匹配（字对重合 {:.0}% < {}%），已跳过定位",
-                sim * 100.0,
-                (MATCH_MIN_SIM * 100.0) as u32
-            ));
+            self.match_note = Some(
+                "未加载原图：请先点左上角「打开文件」导入 PDF / 图片，再点右文定位"
+                    .to_string(),
+            );
             cx.notify();
             return;
         }
-        self.active_para_idx = Some(para_idx);
-        self.match_note = None;
-        let (nw, _nh) = self.source_size();
-        let disp_w = vw * 0.4;
-        let scale = if nw > 0.0 { disp_w / nw } else { 1.0 };
-        // 滚动使区域顶部进入视野（向下偏移取负）。
-        self.left_scroll
-            .set_offset(Point::new(px(0.0), px(-(r.y * scale))));
+        if self.regions.is_empty() {
+            self.active_para_idx = None;
+            self.match_note = Some(
+                "该原图无文本层（扫描图），需先 OCR 才能自动定位——现在只作底图显示"
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+
+        // ② 这一行没字（空行 / 只有一个标点）：静默清掉上一次的联动，
+        //    不弹红字——空行点一下就报「未匹配」是噪声，不是信息。
+        let text = self.paragraph_text(line_idx);
+        if match_text(&text).chars().count() < 2 {
+            self.active_para_idx = None;
+            self.match_note = None;
+            cx.notify();
+            return;
+        }
+
+        // ③ 按文字找。
+        match locate_region(&text, &self.regions) {
+            Some((ri, n)) => {
+                // 覆盖率只作**诊断**报给用户看（「这段对得有多齐」），不参与放行：
+                // 放行判据是上面那句「连续 ≥ LCS_MIN 字重合」。
+                let cover = self
+                    .regions
+                    .get(ri)
+                    .map(|r| bigram_overlap(&text, &r.text))
+                    .unwrap_or(0.0);
+                self.active_para_idx = Some(ri);
+                self.match_note = Some(format!(
+                    "已匹配：第 {} 行 → 原图第 {} 处（连续 {} 字重合，覆盖率 {:.0}%）",
+                    line_idx + 1,
+                    ri + 1,
+                    n,
+                    cover * 100.0
+                ));
+                self.scroll_region_to_center(ri, vw, vh);
+            }
+            None => {
+                self.active_para_idx = None;
+                self.match_note = Some(
+                    "未匹配到原图区域：本行文字在当前页的文本层里找不到——可翻页再试，\
+                     或核对稿件与影印件是否为同一段"
+                        .to_string(),
+                );
+            }
+        }
         cx.notify();
     }
+
+    /// 把 `regions[ri]` 滚到左侧视野**正中**。
+    ///
+    /// 上一次是「顶部对齐」（`-(r.y*scale)`）：短区域会贴到屏幕上沿，长区域
+    /// 一半落在视野外，看着像「框没对准」。居中之后，无论区域多高，它都在
+    /// 视线中央。
+    ///
+    /// ⚠️ 缩放比必须与 `render_left_content` **同源**：左栏宽 `vw*0.4`、
+    /// 原图自然宽 `source_size().0`。两处一旦分叉，框就会整体偏移——这正是
+    /// 「框飘了」的经典死因，所以这里只写一次公式、两边都调它。
+    fn scroll_region_to_center(&mut self, ri: usize, vw: f32, vh: f32) {
+        let Some(r) = self.regions.get(ri) else {
+            return;
+        };
+        let scale = self.left_scale(vw);
+        let top = r.y * scale;
+        let h = r.h * scale;
+        // 左侧可视高度：视口减去全局天头与底部状态条（有状态条时会矮一截，
+        // 这里按最常见的一条 24px 估；偏几像素不影响「居中」这件事）。
+        let view_h = (vh - HEADER_H - 24.0).max(160.0);
+        let target = (top + h * 0.5 - view_h * 0.5).max(0.0);
+        self.left_scroll
+            .set_offset(Point::new(px(0.0), px(-target)));
+    }
+
+    /// 左栏「原图自然坐标 → 屏幕像素」的唯一缩放比。
+    ///
+    /// 高亮矩形的绘制（`render_left_content`）与滚动定位（上一函数）都调它。
+    /// 分开算过一次，两处差一个 `vw*0.4` 的取整就会让框整体偏几十像素。
+    fn left_scale(&self, vw: f32) -> f32 {
+        let (nw, _nh) = self.source_size();
+        if nw > 0.0 {
+            (vw * 0.4) / nw
+        } else {
+            1.0
+        }
+    }
+
 
     /// 取右文第 `idx` 段的纯文本（用于与原图区域文字做字面相似度校验）。
     fn paragraph_text(&self, idx: usize) -> String {
@@ -1992,44 +2255,16 @@ impl CollationWorkspace {
             .unwrap_or_default()
     }
 
-    /// 左图原图自然像素尺寸：已载入原图用栅格化得到的真实尺寸；无原图时由
-    /// `regions` 包围盒推导（Mock 演示用，保证占位页能框住全部区域）。
+    /// 左图原图自然尺寸（PDF 点 / 位图像素）。**只认真实尺寸**。
+    ///
+    /// 未载入原图时返回一个中性占位（800×1100）：左栏那会儿显示的是空状态卡片，
+    /// 这个数字根本不会被用来画框——绝不拿 `regions` 的包围盒倒推一个「假页面」，
+    /// 那会在空状态里凭空画出一页纸和几枚空框（真机反馈「两个灰框太突兀」）。
     fn source_size(&self) -> (f32, f32) {
         if self.src_nat_w > 0.0 && self.src_nat_h > 0.0 {
             return (self.src_nat_w, self.src_nat_h);
         }
-        let mut max_x: f32 = 800.0;
-        let mut max_y: f32 = 1100.0;
-        for r in &self.regions {
-            max_x = max_x.max(r.x + r.w);
-            max_y = max_y.max(r.y + r.h);
-        }
-        (max_x, max_y)
-    }
-
-    /// Mock 坐标数组：替代被删除的 N*BAND_H 行带，提供一套假的原图文本层坐标，
-    /// 用于在无真实扫描件时跑通「右文段落 → 左图真实 X/Y 高亮 + 滚动」的底层数学。
-    /// 每个 `SourceRegion` 对应右文一段（按索引对齐），坐标为假设原图 900×1300
-    /// 自然像素空间；真实接入时整段替换为 PDF 文本层 / OCR 输出即可（结构不变）。
-    fn mock_regions() -> Vec<SourceRegion> {
-        // 与 `new()` 中的示例转录两段对应：第 1 段落在原图上方偏左，第 2 段落在
-        // 下方偏右——两个框的 x/y/w/h 都不同，便于直观验证映射同时用到了四项坐标。
-        vec![
-            SourceRegion {
-                x: 90.0,
-                y: 120.0,
-                w: 720.0,
-                h: 480.0,
-                text: "天地玄黄 宇宙洪荒 …（示例转录第一段）".to_string(),
-            },
-            SourceRegion {
-                x: 300.0,
-                y: 700.0,
-                w: 500.0,
-                h: 460.0,
-                text: "盖此身发 四大五常 …（示例转录第二段）".to_string(),
-            },
-        ]
+        (800.0, 1100.0)
     }
 
     /// 文本导入状态条：显示「已载入哪份稿、多少字」或错误原因。
@@ -2145,102 +2380,107 @@ impl CollationWorkspace {
             .child(editor)
     }
 
-    /// 渲染单行（含选区背景与光标）。
+    /// 渲染单行（**一个文本节点 + 两层绝对定位覆盖物**）。
     ///
-    /// ⚠️ 软折行：长文本（尤其无换行符的连续中文，如「天地玄黄……」）必须能
-    /// 在 60% 宽右栏内折行，否则会撑破右边缘被截断。做法：文本段用
-    /// `flex_1() + min_w(0)` 受行宽约束（破除 flex item 默认 min-width 撑开陷阱），
-    /// 再 `whitespace_normal()` 允许在字符间断行；行容器高度由固定 `h(LINE_H)`
-    /// 改为 `min_h`，折成多行后自然增高。
-    fn render_line(&self, line: &str, line_start: usize) -> gpui::Div {
-        let line_end = line_start + line.chars().count();
-        let caret_here = self.cursor >= line_start && self.cursor <= line_end;
-        let (s, e) = match self.selection.as_ref() {
-            Some(r) => (r.start.min(r.end), r.end.max(r.end)),
-            None => (self.cursor, self.cursor),
-        };
-        let sel_active = self.selection.as_ref().map_or(false, |r| r.start != r.end);
-        let seg_start = line_start.max(s);
-        let seg_end = line_end.min(e);
-        let overlaps = sel_active && seg_end > seg_start;
+    /// v1.9.24 重写。上一版把一行**按光标切成 before / caret / after 三段**，各段都是
+    /// 一个 `flex_1()` 的 flex item —— 这在 GPUI 里必然出事：`flex: 1` 让首段撑满整行
+    /// 剩余宽度，于是「光标之后那半句」被推到行尾，一行字在一屏里被撕成两处；一旦
+    /// 有选区，更是变成三个深浅不一的色块并排。真机反馈的「前几行横排、中间孤立方块、
+    /// 下面多栏」正是这个：**行内被拆成多个 flex item**，读起来就像多栏。
+    ///
+    /// 现在的做法把三者彻底分开，谁也不参与谁的布局：
+    ///  ① **文本**：整行一个 `SharedString` 节点，`w_full + whitespace_normal()`，
+    ///     单列、自上而下、超宽自动软换行 —— 这是唯一的「流」；
+    ///  ② **选区底色**：绝对定位的一条带子，画在字**下面**（先 add）；
+    ///  ③ **光标**：绝对定位的一根 2px 竖线，画在字**上面**（最后 add）。
+    ///
+    /// 覆盖物只吃「列号 × 字宽」这一个估算量，**绝不向文本流插入任何元素**，所以
+    /// 无论有没有光标、有没有选区，文字的排版结果都完全一样。
+    fn render_line(
+        &self,
+        line: &str,
+        line_start: usize,
+        li: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let line_len = line.chars().count();
+        let line_end = line_start + line_len;
 
-        // 文本段：受行宽约束 + 软折行（含 CJK 字符间断行）。
-        let text_seg = |seg: String| -> gpui::Div {
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .whitespace_normal()
-                .child(SharedString::from(seg))
+        // 选区在本行内的列区间 `[a, b)`（列号从行首算）。
+        let (sel_a, sel_b) = match self.selection.as_ref() {
+            Some(r) if r.start != r.end => {
+                let a = r.start.max(line_start).min(line_end) - line_start;
+                let b = r.end.max(line_start).min(line_end) - line_start;
+                (a.min(b), a.max(b))
+            }
+            _ => (0, 0),
+        };
+        // 光标是否落在本行（含行尾）。
+        let caret_col = if self.cursor >= line_start && self.cursor <= line_end {
+            Some(self.cursor - line_start)
+        } else {
+            None
         };
 
         let mut row = div()
+            .relative()
             .min_h(px(LINE_H))
             .w_full()
-            .flex()
-            .flex_row()
-            .items_center();
-        if overlaps {
-            let before: String = self
-                .text
-                .chars()
-                .skip(line_start)
-                .take(seg_start.saturating_sub(line_start))
-                .collect();
-            if !before.is_empty() {
-                row = row.child(text_seg(before));
-            }
-            if self.cursor == seg_start {
-                row = row.child(self.caret());
-            }
-            let mid: String = self
-                .text
-                .chars()
-                .skip(seg_start)
-                .take(seg_end - seg_start)
-                .collect();
+            .min_w(px(0.0))
+            // 行身点击直达联动（v1.9.23）：行号在渲染时就绑好，
+            // 不再靠「鼠标 y ÷ 行高」反推——那正是「点哪高亮哪」错行的死因。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |c, event: &MouseDownEvent, window, cx| {
+                    let vw = px_f32(window.viewport_size().width);
+                    let vh = px_f32(window.viewport_size().height);
+                    c.click_line(
+                        li,
+                        line_start,
+                        line_len,
+                        px_f32(event.position.x),
+                        vw,
+                        vh,
+                        window,
+                        cx,
+                    );
+                }),
+            );
+
+        // ② 选区底色：绝对定位，**在文本之前** add（GPUI 按子元素顺序作画，
+        //    后加的盖在上面），因此永远压在字下面，不遮墨色。
+        if sel_b > sel_a {
             row = row.child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .whitespace_normal()
-                    .bg(rgba(0x8c2b2238))
-                    .px(px(1.0))
-                    .child(SharedString::from(mid)),
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(sel_a as f32 * CHAR_W))
+                    .w(px((sel_b - sel_a) as f32 * CHAR_W))
+                    .h(px(LINE_H))
+                    .bg(rgba(0x8c2b2233)),
             );
-            if self.cursor == seg_end {
-                row = row.child(self.caret());
-            }
-            let after: String = self
-                .text
-                .chars()
-                .skip(seg_end)
-                .take(line_end - seg_end)
-                .collect();
-            if !after.is_empty() {
-                row = row.child(text_seg(after));
-            }
-        } else if caret_here {
-            let before: String = self
-                .text
-                .chars()
-                .skip(line_start)
-                .take(self.cursor.saturating_sub(line_start))
-                .collect();
-            if !before.is_empty() {
-                row = row.child(text_seg(before));
-            }
-            row = row.child(self.caret());
-            let after: String = self
-                .text
-                .chars()
-                .skip(self.cursor)
-                .take(line_end.saturating_sub(self.cursor))
-                .collect();
-            if !after.is_empty() {
-                row = row.child(text_seg(after));
-            }
-        } else {
-            row = row.child(text_seg(line.to_string()));
+        }
+
+        // ① 文本：整行一个节点。单列、软换行，不受任何覆盖物影响。
+        row = row.child(
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .whitespace_normal()
+                .child(SharedString::from(line.to_string())),
+        );
+
+        // ③ 光标：最后一根竖线，绝对定位压在字上。
+        if let Some(col) = caret_col {
+            row = row.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(col as f32 * CHAR_W))
+                    .w(px(2.0))
+                    .h(px(LINE_H))
+                    .bg(rgb(0x8c2b22)),
+            );
         }
         row
     }
@@ -2260,11 +2500,24 @@ impl CollationWorkspace {
             crate::types::FontChoice::WenJinMincho,
             crate::types::Script::Ancient,
         );
-        let mut content = div().flex().flex_col();
+        // 右侧是**纯文本流式布局**：一列、自上而下、超宽自动软换行。
+        //
+        // 三条硬约束（用户 2026-11-01 明确要求：这里不许出现任何分栏 / 网格 /
+        // 竖排计算）：
+        //  ① `content` 撑满宽度（`w_full`）：不撑满时子元素的 `w_full` 会退化成
+        //     「按最长一行撑宽」，于是长行不折行、短行各自成块——真机上看起来
+        //     就像「孤立方块 + 忽宽忽窄」；
+        //  ② 每一行 `w_full + min_w(0)`：既占满整行宽，又允许被压缩到比内容更窄，
+        //     从而把超长中文交给 `whitespace_normal()` 折行；
+        //  ③ 文本段 `flex_1 + min_w(0)`：flex item 默认 `min-width:auto` 会拒绝
+        //     收缩，是「中文长行不肯折、直接冲出右边」的经典死因。
+        let mut content = div().w_full().flex().flex_col();
         let mut char_start = 0usize;
-        for line in self.text.split('\n') {
+        // 行号 `li` 在渲染时就绑给每一行（见 `render_line` 的点击闭包），
+        // 这样「点第几行」是结构事实，不再靠鼠标坐标反推。
+        for (li, line) in self.text.split('\n').enumerate() {
             let lc = line.chars().count();
-            content = content.child(self.render_line(line, char_start));
+            content = content.child(self.render_line(line, char_start, li, cx));
             char_start += lc + 1;
         }
         // 用 `InputField` 包裹，使其在获得焦点时把 IME 回传中文接住。
@@ -2272,6 +2525,8 @@ impl CollationWorkspace {
             div()
                 .id(SharedString::from("collation-editor-scroll"))
                 .flex_1()
+                .min_w(px(0.0))
+                .w_full()
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll)
                 // **GPUI 原生「点一下就聚焦」**（v1.22.1）。
@@ -2311,7 +2566,7 @@ impl CollationWorkspace {
             self.focus.clone(),
             cx.entity(),
         );
-        div().flex_1().child(editor)
+        div().flex_1().min_w(px(0.0)).w_full().child(editor)
     }
 
     /// 竖排预览浮层：把转录文本离屏栅格化成「笺读风」竖排书页，`gpui::img` 贴图。
@@ -3548,6 +3803,73 @@ mod tests {
         assert!(bigram_overlap("資治通鑑卷第一，周紀一，起著雍攝提格", region) > 0.95);
         // 标点不同 / PDF 无标点也不该扣分（比对前统一滤标点）。
         assert!(bigram_overlap("資治通鑑卷第一周紀一起著雍攝提格", region) > 0.95);
+    }
+
+    // ── 「点哪高亮哪」的定位器（v1.9.23）───────────────────────────────
+
+    fn region(text: &str, y: f32) -> SourceRegion {
+        SourceRegion {
+            x: 72.0,
+            y,
+            w: 360.0,
+            h: 24.0,
+            text: text.to_string(),
+        }
+    }
+
+    /// 最长公共子串的 DP 得数要对（这是定位器的度量本体）。
+    #[test]
+    fn lcs_len_measures_the_longest_run_not_the_overlap() {
+        let a: Vec<char> = "甲乙丙丁戊".chars().collect();
+        let b: Vec<char> = "子丑甲乙丙丁寅卯".chars().collect();
+        assert_eq!(lcs_len(&a, &b), 4, "「甲乙丙丁」是连续 4 字");
+        // 交错重合**不算**：单字都出现过，但没有连续段（最长只到 1 字）。
+        let c: Vec<char> = "甲子乙丑丙寅".chars().collect();
+        assert_eq!(lcs_len(&c, &a), 1, "交错出现的单字不构成连续重合");
+        // 空侧不 panic。
+        assert_eq!(lcs_len(&[], &b), 0);
+        assert_eq!(lcs_len(&a, &[]), 0);
+    }
+
+    /// **顺序无关**：右文某一段必须命中「最像的那一处」，而不是「第几行就配第几处」。
+    ///
+    /// 这就是真机「高亮框飘了」的回归——原先按 `regions[行号]` 取，段数一错就全错。
+    #[test]
+    fn locate_region_finds_the_text_wherever_it_sits() {
+        let regions = vec![
+            region("天地玄黃，宇宙洪荒。", 100.0),
+            region("寒來暑往，秋收冬藏。閏餘成歲，律呂調陽。", 200.0),
+            region("金生麗水，玉出崑岡。", 300.0),
+        ];
+        // 右文第 0 行对应的其实是**第 3 处**。
+        let hit = locate_region("金生麗水，玉出崑岡。", &regions).expect("应命中第 3 处");
+        assert_eq!(hit.0, 2, "必须命中下标 2，而不是按行号取到的 0");
+        assert!(hit.1 >= 6, "连续重合字数应 ≥ LCS_MIN：{}", hit.1);
+    }
+
+    /// Markdown 记号 + 标点 + 空格全部忽略，只比纯中文（用户第 2 条要求）。
+    #[test]
+    fn locate_region_ignores_markdown_punctuation_and_spaces() {
+        let regions = vec![
+            region("第一節 四時寒來暑往秋收冬藏", 100.0),
+            region("閏餘成歲律呂調陽", 200.0),
+        ];
+        // `##`、`**`、全角标点、半角空格一个不少 —— 仍须稳准命中第 1 处。
+        let hit = locate_region("## 第一節 四時\n\n**寒來暑往**，秋收冬藏。", &regions)
+            .expect("洗掉记号后应命中");
+        assert_eq!(hit.0, 0);
+    }
+
+    /// 不相干的稿子**必须拒绝**：宁可报「未匹配」，也绝不把框画到随机一处。
+    #[test]
+    fn locate_region_refuses_unrelated_text() {
+        let regions = vec![region("資治通鑑卷第一 周紀一 起著雍攝提格", 100.0)];
+        assert!(
+            locate_region("天地玄黃，宇宙洪荒。", &regions).is_none(),
+            "两段话毫不相干，不许硬凑出一个「最像」的区域"
+        );
+        // 只有一两个字相同时也不行（`LCS_MIN` 的那道坎）。
+        assert!(locate_region("之", &regions).is_none(), "单字不构成定位");
     }
 
     // ── 产品边界：大文件不许撑爆内存，也不许糊里糊涂被拒 ──────────────────
