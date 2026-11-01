@@ -3603,37 +3603,6 @@ impl Root {
         .detach();
     }
 
-    /// 弹出系统**文件夹**选择器，整批导入一个目录里的书（v1.77.0）。
-    ///
-    /// 选完先点检（毫秒级，书立刻以真书名上架占位），再后台一本一本地刻。
-    /// 子目录也一并收（选「我的电子书」这种大目录是常态）。
-    pub fn import_folder_dialog(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                // 与导出保存框同一条修复：rfd 的同步对话框必须**前台直调**。
-                let picked = rfd::FileDialog::new()
-                    .set_title("整批导入：选一个放书的文件夹")
-                    .pick_folders();
-                let Some(dirs) = picked else { return };
-                let mut paths: Vec<PathBuf> = Vec::new();
-                for d in dirs {
-                    paths.extend(jiandu_core::batch::collect(&d, true));
-                }
-                this.update(&mut cx, |this, cx| {
-                    if paths.is_empty() {
-                        this.notice = "这个文件夹里没有可导入的书".into();
-                    } else {
-                        this.start_batch(paths);
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
-    }
-
     // ------------------------------------------------------------------
     // 导出：印制笺卡（PNG） / 导出纯文本（MD）
     // ------------------------------------------------------------------
@@ -7097,10 +7066,13 @@ impl Render for Root {
         // 被它整块盖住（第一版就是这样，印根本看不见）。印章只在左下角
         // 一小块，压不到居中的浮层。
         root = root.child(screen);
-        // 笺校工作台入口：书架与阅读屏都显示（工作台本就是空白转录台，
-        // 与「是否已打开一本书」无关，无需先进阅读界面）。专注模式不显示，
-        // 避免遮挡正文。
-        if (self.screen == Screen::Reading || self.screen == Screen::Shelf) && !self.focus_mode {
+        // 笺校工作台入口：**只在书架显示**（用户 2026-11-01 定）。
+        //
+        // 原来阅读屏也挂了一枚，两处入口做同一件事，纯属重复；而且阅读屏右下
+        // 那枚正好压在正文/藏书印旁边，读着书突然冒出一个悬浮钮，很碍事。
+        // 书架是「选书 + 导入 + 进工具」的那一屏，入口放这里就够了。
+        // 专注模式仍然不显示。
+        if self.screen == Screen::Shelf && !self.focus_mode {
             root = root.child(self.render_collation_entry(cx));
         }
         // 「雕版刻印中… 34%」：盖在最上层，导入期间挡住操作，免得重复点导入。

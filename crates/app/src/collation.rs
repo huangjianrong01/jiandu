@@ -231,8 +231,6 @@ pub struct CollationWorkspace {
     preview_pending: bool,
     /// 预览代际令牌：每次发起请求 +1，旧代际的结果回来即丢弃（含临时文件）。
     preview_gen: usize,
-    /// 上次发起预览请求的时间（节流窗口 1s 的基准）。
-    preview_last_req: std::time::Instant,
     /// 竖排预览样式：底色（宣纸黄 / 暗金黑 / 极简白 / 仿刻本）。
     preview_bg: ShareBg,
     /// 竖排预览样式：版框（红线框 / 黑线框 / 无边框 / 双边）。
@@ -345,10 +343,6 @@ impl CollationWorkspace {
             preview_busy: false,
             preview_pending: false,
             preview_gen: 0,
-            // 初始化成「很久以前」，保证首次请求不被节流窗口拦下。
-            preview_last_req: std::time::Instant::now()
-                .checked_sub(Duration::from_secs(10))
-                .unwrap_or_else(std::time::Instant::now),
             preview_bg: ShareBg::Xuan,
             preview_frame: ShareFrame::Red,
             preview_columns: 12,
@@ -623,6 +617,41 @@ impl CollationWorkspace {
         window.activate_window();
         window.blur();
         window.focus(focus);
+    }
+
+    /// 原生对话框关掉之后，**分几次**把输入焦点重新交回编辑器。
+    ///
+    /// 只补一次是不够的。`activate_window()` 在 macOS 上是**异步投递**的
+    /// （`makeKeyAndOrderFront` 走平台 executor），紧跟其后同步执行的
+    /// `blur + focus` 很有可能发生在「本窗口还不是 key window」的那一瞬间：
+    /// 此时 `window.focus()` 只改了 GPUI 自己的账本，平台侧的 first responder
+    /// 与输入法上下文并没有真的交回来 —— 表现就是「文字看得见、光标不给、
+    /// 一个字打不进」（用户 2026-11-01 真机第二次复现）。
+    ///
+    /// 故按 80 / 240 / 520ms 补三次：窗口成为 key 是个几十毫秒级的过场，
+    /// 三次里总有一次落在它之后。补焦只是几个状态赋值 + 一次重绘，代价可忽略。
+    fn schedule_refocus(&mut self, cx: &mut Context<Self>) {
+        self.refocus = true;
+        let exec = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    for ms in [80u64, 240, 520] {
+                        exec.timer(Duration::from_millis(ms)).await;
+                        let Some(entity) = this.upgrade() else { return };
+                        // 预览浮层开着时不抢：那会儿焦点该在 `preview_focus` 上。
+                        let _ = entity.update(&mut app, |this, cx| {
+                            if !this.show_preview {
+                                this.refocus = true;
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
     }
 
     /// 通用小按钮：承载 `on_click`（点下即触发 + 阻止冒泡）。
@@ -916,9 +945,8 @@ impl CollationWorkspace {
                                     this.text_file = Some(path.clone());
                                     this.text_note = Some(note);
                                     this.text_err = false;
-                                    // 原生对话框刚关 → 下一帧强制重建输入焦点，
-                                    // 否则「导入完就能看、打不进字」（见 `refocus`）。
-                                    this.refocus = true;
+                                    // 原生对话框刚关 → **分几次**把焦点交回来。
+                                    this.schedule_refocus(cx);
                                 }
                                 Err(e) => {
                                     this.text_note = Some(e);
@@ -1569,15 +1597,12 @@ impl CollationWorkspace {
     ///   扔到 background_executor，主线程只管 UI。
     /// ・**关闭优先**：结果回来时若预览已关闭，直接丢弃结果 —— 关闭 / Esc 因此
     ///   永远畅通，不受任何后台排版任务影响。
-    /// 强制重排（【刷新预览】专用）：先作废指纹与节流窗口，再照常走后台。
+    /// 强制重排（【刷新预览】专用）：先作废版式指纹，再照常走后台。
     ///
     /// 与 `request_preview` 的唯一区别就是「不许被版式指纹短路」——其余纪律
-    /// （节流、代际令牌、关闭优先）全部照旧，故刷一下也不会卡死。
+    /// （在途合并、代际令牌、关闭优先）全部照旧，故刷一下也不会卡死。
     fn refresh_preview(&mut self, cx: &mut Context<Self>) {
         self.preview_sig = None;
-        self.preview_last_req = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(10))
-            .unwrap_or_else(std::time::Instant::now);
         self.request_preview(cx);
     }
 
@@ -1604,11 +1629,22 @@ impl CollationWorkspace {
             self.preview_pending = false;
             return;
         }
-        if self.preview_busy || self.preview_last_req.elapsed() < Duration::from_millis(1000) {
+        // ⚠️ `pending` 只能在**真有任务在飞**时置位。
+        //
+        // 补跑的唯一触发点是「在途任务回来」的那一刻（见下方回调末尾），所以
+        // 一旦在没有任务时把 pending 立起来，就再没人来接它 —— 表现是
+        // 「预览区一直写着『正文为空』，正文明明有 4928 字」（真机 2026-11-01
+        // 截图抓到的就是这个）。
+        //
+        // 原来这里还叠了一道「1 秒内不重排」的时间节流，正好制造这种死角：
+        // 关掉预览（paths 清空、无任务）→ 立刻重开 → 落进时间窗口 → pending
+        // 立起来 → 永远没人补跑。而它本来要治的「同一版式成对连打」，上一行
+        // 的版式指纹短路已经治好了（同 sig + 有图 → 直接返回），故这个时间
+        // 节流纯属多余，删掉。
+        if self.preview_busy {
             self.preview_pending = true;
             return;
         }
-        self.preview_last_req = std::time::Instant::now();
         self.preview_busy = true;
         self.preview_gen += 1;
         let gen = self.preview_gen;
@@ -1686,10 +1722,6 @@ impl CollationWorkspace {
                             if this.preview_pending {
                                 this.preview_pending = false;
                                 if this.show_preview {
-                                    // 清掉节流窗口，保证补跑不被再次拦下。
-                                    this.preview_last_req = std::time::Instant::now()
-                                        .checked_sub(Duration::from_secs(10))
-                                        .unwrap_or_else(std::time::Instant::now);
                                     this.request_preview(cx);
                                 }
                             }
@@ -2051,6 +2083,15 @@ impl CollationWorkspace {
                 .flex_1()
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll)
+                // **GPUI 原生「点一下就聚焦」**（v1.22.1）。
+                //
+                // 真机反馈：导入 MD 之后点进右侧编辑器，连光标都不给，更别说打字。
+                // 手写的 `hard_refocus`（blur + focus）在「窗口还不是 key window」
+                // 时只会改 GPUI 的内部账本，平台侧 first responder 根本没交回来。
+                // `track_focus` 走的是 GPUI 自己的鼠标派发：命中即 `window.focus()`，
+                // 与平台侧「点谁谁成为 first responder」同一时刻发生，不依赖任何
+                // 手写补偿。两条路并存，任一条通就能打字。
+                .track_focus(&self.focus)
                 .bg(rgb(0xf4ecd8))
                 .px(px(PAD))
                 .py(px(PAD))
@@ -2208,6 +2249,11 @@ impl CollationWorkspace {
                                     // 排版中（后台还没回）：绝不能说「转录为空」——
                                     // 用户会以为稿子白写了，其实是还在排。
                                     "排版中…（请稍候，Esc 可随时关闭）"
+                                } else if !self.text.trim().is_empty() {
+                                    // 有字、没图、也没在排：只可能是还没排过（刚打开
+                                    // 浮层 / 刚清过临时图）。绝不说「正文为空」——
+                                    // 真机上正文明明有 4928 字，写「为空」等于冤枉用户。
+                                    "尚未生成预览，点「刷新预览」可重新排版"
                                 } else {
                                     "（正文为空：写入文字或【导入 MD】后，点「刷新预览」）"
                                 }))
@@ -3435,6 +3481,34 @@ mod tests {
             )
             .expect("样张生成失败");
             eprintln!("[a3-sample/{imp:?}] {n} 张 / {chars} 字 → {}", out.display());
+        }
+    }
+
+    /// 【样张】把 **UI 预览那条路**（`render_preview_pages`）真跑一遍并出图。
+    ///
+    /// 与 `dump_a3_sample_pdf` 互补：那条验 PDF，这条验屏幕。两者共用
+    /// `draw_card` / `spread_slots`，所以这条同时也是「预览会不会和印出来
+    /// 不一样」的回归。开关：`JIANDU_GEN_PREVIEW_SAMPLE=1 … -- --ignored`。
+    #[test]
+    fn dump_spread_preview_png() {
+        if std::env::var("JIANDU_GEN_PREVIEW_SAMPLE").is_err() {
+            return;
+        }
+        let body = "# 千字文\n\n**天地玄黃**，宇宙洪荒。日月盈昃，辰宿列張。寒來暑往，秋收冬藏。\n\n## 第一節 四時\n\n閏餘成歲，律呂調陽。雲騰致雨，露結為霜。金生麗水，玉出崑岡。劍號巨闕，珠稱夜光。果珍李柰，菜重芥薑。海鹹河淡，鱗潛羽翔。龍師火帝，鳥官人皇。始制文字，乃服衣裳。推位讓國，有虞陶唐。弔民伐罪，周發殷湯。坐朝問道，垂拱平章。愛育黎首，臣伏戎羌。遐邇一體，率賓歸王。鳴鳳在竹，白駒食場。化被草木，賴及萬方。";
+        let text = format!("{body}\n\n{body}");
+        let (pages, note) = CollationWorkspace::render_preview_pages(
+            &text,
+            12,
+            ShareBg::Xuan,
+            ShareFrame::Red,
+            Paper::A3,
+            Imposition::Spread,
+            Binding::Right,
+        )
+        .expect("预览出图失败");
+        eprintln!("[preview-sample] {} 张 {note:?}", pages.len());
+        for p in pages {
+            eprintln!("  {}", p.display());
         }
     }
 

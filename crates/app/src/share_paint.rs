@@ -133,6 +133,54 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
     encode_png(&mut ctx, w, h)
 }
 
+/// 拼版**中缝线**的线宽（pt，随纸宽等比缩放）。
+///
+/// 用户 2026-11-01 真机反馈：「留了 30pt 间距，但视觉上完全不像古籍折页」。
+/// 光靠空白，读者只会觉得「两页靠得比较近」；画一条贯穿版框高的竖线，才
+/// 一眼看得出这是**一张纸对折、左边一页右边一页**。
+pub const SPREAD_FOLD_W: f32 = 1.4;
+
+/// 中缝线的不透明度（取版框墨色的这一档，比版框淡一档，不抢版面）。
+const SPREAD_FOLD_ALPHA: f32 = 0.70;
+
+/// 版框在**屏幕坐标**（左上原点）里的纵向范围，以及它的墨色。
+///
+/// 中缝线只画到版框的上下边，绝不贯穿整张纸——贯穿就成了裁切线，不像书。
+fn frame_span(l: &CardLayout) -> (f32, f32, u32) {
+    let f = l
+        .rects
+        .iter()
+        .filter(|r| r.stroke.is_some())
+        .max_by(|a, b| {
+            (a.w * a.h)
+                .partial_cmp(&(b.w * b.h))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    match f {
+        Some(r) => (r.y, r.y + r.h, r.color),
+        None => (0.0, l.h, 0x2b2620FF),
+    }
+}
+
+/// 在一张拼版纸的**正中**画那条中缝线（PDF 与位图共用）。
+///
+/// `hf` 是画布高（CG 原点在左下），故 `cg = hf − y`：与 [`draw_card`] 同一套
+/// 换算，绝不翻 CTM。
+fn draw_fold(ctx: &CGContext, hf: f64, sheet_w: f32, page: &CardLayout) {
+    let (top, bottom, color) = frame_span(page);
+    let (r, g, b, a) = rgba(color);
+    // 线宽随纸宽缩放：预览位图（1280px）与 PDF（1191pt）看着一样粗细。
+    let scale = (sheet_w / 1191.0).max(0.5);
+    ctx.set_rgb_stroke_color(r, g, b, (a as f32 * SPREAD_FOLD_ALPHA) as f64);
+    ctx.set_line_width((SPREAD_FOLD_W * scale) as f64);
+    let x = (sheet_w * 0.5) as f64;
+    // core-graphics 0.24 没包 `CGContextStrokeLine`，用等价的多段线接口。
+    ctx.stroke_line_segments(&[
+        CGPoint::new(x, hf - bottom as f64),
+        CGPoint::new(x, hf - top as f64),
+    ]);
+}
+
 /// **双页拼版的一张纸**：把两个单页并排画进一块 `sheet` 大小的位图（预览用）。
 ///
 /// 与 PDF 拼版共用 [`spread_slots`] 与同一份 `CardLayout`，所以屏幕上看的就是
@@ -164,6 +212,8 @@ pub fn render_spread_png(
     for (i, p) in pages.iter().take(2).enumerate() {
         draw_card(p, &ctx, h as f64, slots[i] as f64, 0.0)?;
     }
+    // 正中一条中缝线：让「一张纸对折、左右各一页」一眼可辨。
+    draw_fold(&ctx, h as f64, sheet_w, first);
     encode_png(&mut ctx, w, h)
 }
 
@@ -227,7 +277,7 @@ pub fn render_pdf(path: &std::path::Path, pages: &[CardLayout]) -> Result<usize,
         .ok_or_else(|| "没有可导出的页面".to_string())?;
     let plan: Vec<Vec<(f64, f64, usize)>> =
         (0..pages.len()).map(|i| vec![(0.0, 0.0, i)]).collect();
-    pdf_write(path, first.w as f64, first.h as f64, pages, &plan)
+    pdf_write(path, first.w as f64, first.h as f64, pages, &plan, false)
 }
 
 /// **双页拼版（书籍折页）**：一张横放的大纸上并排两个单页。
@@ -271,7 +321,7 @@ pub fn render_pdf_spread(
             one
         })
         .collect();
-    pdf_write(path, sheet_w as f64, sheet_h as f64, pages, &plan)
+    pdf_write(path, sheet_w as f64, sheet_h as f64, pages, &plan, true)
 }
 
 /// PDF 落盘的**唯一实现**：`plan` 里每一项是一张纸，`(dx, dy, 页下标)` 是这页在
@@ -285,6 +335,7 @@ fn pdf_write(
     sheet_h: f64,
     pages: &[CardLayout],
     plan: &[Vec<(f64, f64, usize)>],
+    fold: bool,
 ) -> Result<usize, String> {
     use core_foundation::base::TCFType;
     use core_foundation::url::CFURL;
@@ -335,6 +386,12 @@ fn pdf_write(
             if let Err(e) = draw_card(page, &ctx, sheet_h, *dx, *dy) {
                 failed = Some(e);
                 break;
+            }
+        }
+        // 双页拼版：整纸正中画一条中缝线（两页都落完笔才画，压在最上层）。
+        if fold && failed.is_none() {
+            if let Some(page) = slots.first().and_then(|s| pages.get(s.2)) {
+                draw_fold(&ctx, sheet_h, sheet_w as f32, page);
             }
         }
         if let Some(e) = failed {
@@ -980,9 +1037,17 @@ mod tests {
         let right = count(half, img.width());
         assert!(left > 500, "左半张没画上东西：{left} 个墨点");
         assert!(right > 500, "右半张没画上东西：{right} 个墨点");
-        // 中缝：纸正中那一条竖带必须是空的（两页各自成版，绝不连成一片）。
-        let gutter = count(half - 10, half + 10);
-        assert_eq!(gutter, 0, "中缝里有墨：{gutter} 个墨点（两页粘连了）");
+        // 中缝：纸正中有一条**中缝线**，线两侧各留一条空白带。
+        //
+        // 用户 2026-11-01 真机反馈「不像古籍折页」，故正中现在画一条竖线：
+        // ・线本身必须有墨（否则就是又回到「两页挨着、看不出折页」）；
+        // ・线两侧 8px 内必须干净（有墨就是两页粘连 / 线画歪了）。
+        let line = count(half - 2, half + 2);
+        assert!(line > 0, "中缝线没画出来（正中 4px 无墨）");
+        let near_l = count(half - 10, half - 3);
+        let near_r = count(half + 3, half + 10);
+        assert_eq!(near_l, 0, "中缝线左边有墨：{near_l}（两页粘连了）");
+        assert_eq!(near_r, 0, "中缝线右边有墨：{near_r}（两页粘连了）");
     }
 
     /// **A3 矢量 PDF**：媒体框必须真是 A3（842×1191pt），文件头是 %PDF。

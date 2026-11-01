@@ -788,24 +788,6 @@ impl Root {
                 }),
             );
 
-        // 「整批导入」（v1.77.0）：选一个文件夹，里头的书挨个点检、后台
-        // 一本一本地刻。与「导入」并排——一个是挑几本，一个是整批搬进来。
-        let batch_btn = div()
-            .font_family(song.clone())
-            .text_size(px(12.0))
-            .text_color(rgb(INK_SOFT))
-            .cursor_pointer()
-            .hover(|s| s.text_color(rgb(CINNABAR)))
-            .child(SharedString::from("整批导入"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.import_folder_dialog(cx);
-                    cx.notify();
-                }),
-            );
-
         let mut bar = div()
             .flex()
             .flex_row()
@@ -826,9 +808,12 @@ impl Root {
             bar = bar.child(self.render_shelf_search(cx));
         }
         bar = bar.child(div().flex_1());
-        // 右侧四件：**导入**、**整批导入**、**放大镜**、**编辑**。
+        // 右侧三件：**导入**、**放大镜**、**编辑**。
+        //
+        // 「整批导入」按钮已并入「导入」（用户 2026-11-01）：文件选择器本来
+        // 就开着多选，选一本是单本、选十本自动走 `start_batch` 逐本上架，
+        // 两个按钮做的是同一件事，只是入口分了两处。
         bar = bar.child(import_btn);
-        bar = bar.child(batch_btn);
         bar = bar.child(self.render_search_icon(searching, cx));
         bar = bar.child(edit);
 
