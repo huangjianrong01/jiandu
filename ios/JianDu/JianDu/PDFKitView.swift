@@ -42,33 +42,38 @@ struct PDFKitView: UIViewRepresentable {
         if uiView.document?.documentURL != url {
             uiView.document = PDFDocument(url: url)
         }
-        // PDFView 的 scrollView 在首次加入视图层级后才就绪，这里稳妥挂 KVO。
-        // 用 KVO 监听 contentOffset（不抢占 PDFView 自身 delegate），滚动/缩放时
-        // 让叠加层重绘，高亮框始终对齐页面。
-        if context.coordinator.scrollView == nil,
-           let sv = uiView.enclosingScrollView {
-            context.coordinator.scrollView = sv
-            sv.addObserver(context.coordinator,
-                           forKeyPath: "contentOffset",
-                           options: [], context: nil)
+        // iOS 17 之前 PDFView 包裹 UIScrollView，可经 enclosingScrollView 监听
+        // contentOffset；但 iOS 26/27 SDK 已移除 enclosingScrollView（PDFView 重构，
+        // 不再包裹 UIScrollView）。改为监听 PDFView 自身的 bounds 与 scaleFactor：
+        // 滚动使 bounds.origin 变化、缩放使 bounds.size 与 scaleFactor 变化，KVO
+        // 即驱动高亮层重绘，且绝不抢占 PDFView 自身 delegate。
+        if context.coordinator.observedView == nil {
+            context.coordinator.observedView = uiView
+            uiView.addObserver(context.coordinator,
+                               forKeyPath: "bounds",
+                               options: [], context: nil)
+            uiView.addObserver(context.coordinator,
+                               forKeyPath: "scaleFactor",
+                               options: [], context: nil)
         }
     }
 
     final class Coordinator: NSObject {
         let holder: PDFViewHolder
-        weak var scrollView: UIScrollView?
+        weak var observedView: PDFView?
 
         init(holder: PDFViewHolder) { self.holder = holder }
 
         deinit {
-            scrollView?.removeObserver(self, forKeyPath: "contentOffset")
+            observedView?.removeObserver(self, forKeyPath: "bounds")
+            observedView?.removeObserver(self, forKeyPath: "scaleFactor")
         }
 
         override func observeValue(forKeyPath keyPath: String?,
                                    of object: Any?,
                                    change: [NSKeyValueChangeKey: Any]?,
                                    context: UnsafeMutableRawPointer?) {
-            if keyPath == "contentOffset" {
+            if keyPath == "bounds" || keyPath == "scaleFactor" {
                 holder.scrollNonce += 1
             } else {
                 super.observeValue(forKeyPath: keyPath,
