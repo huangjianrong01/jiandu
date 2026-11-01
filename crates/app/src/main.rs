@@ -98,6 +98,9 @@ mod share_paint;
 mod shelf;
 mod sound;
 mod storekit;
+/// **解锁纸**（v1.9.23）：商店版内购的前台。官网版构建里这个模块仍然编进来
+/// （「更多」里不挂入口），免得 `#[cfg]` 把整条链路切成两半、改一处忘一处。
+mod unlock;
 mod tts;
 mod zen_kit;
 
@@ -210,6 +213,11 @@ fn main() {
         .run(move |cx: &mut App| {
         // 注册随包字体（存在才生效），找不到则沿回退链使用系统字体。
         fonts::register_bundled_fonts(cx);
+
+        // **内购链路开机**（v1.9.23）：必须在建窗之前调——`SKPaymentQueue`
+        // 的观察者越早挂上，越能接住上次买到一半被杀掉的那笔交易（StoreKit
+        // 会重投未 finish 的交易）。官网页构建里这一步是空实现。
+        storekit::prepare();
 
         // 窗口尺寸：JIANDU_WIN=宽x高（开发用，便于截图核对横屏对开 / 竖屏单页）。
         let (mut win_w, mut win_h) = (1320.0_f32, 880.0_f32);

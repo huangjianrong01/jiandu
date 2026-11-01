@@ -102,6 +102,20 @@ else
     echo "· 无随包字体（将回退到系统宋体 / 思源，可在 crates/core/resources/fonts/ 放入 .otf 后重新打包）"
 fi
 
+# ---- 4.2) 随包许可：OFL 与第三方组件声明（**合规必备**，缺了就是违约） ----
+# 齐伋体是以 `include_bytes!` 编进二进制的，Resources 里并没有那个 ttf；
+# 但 OFL 1.1 第 2 条要求「每一份都带着上述版权声明与本许可」，且要求这些
+# 字段「easily viewed by the user」——编进二进制里看不见，所以许可文本必须
+# 作为**文件**跟着包走。删掉这一段不会导致任何功能异常，只会导致违约。
+mkdir -p "$APP/Contents/Resources/LICENSES"
+cp "$ROOT/crates/app/assets/fonts/OFL.txt" "$APP/Contents/Resources/LICENSES/OFL-QIJI.txt" 2>/dev/null || true
+cp "$ROOT/crates/app/assets/fonts/NOTICE.md" "$APP/Contents/Resources/LICENSES/第三方组件与许可.md" 2>/dev/null || true
+if [ -f "$APP/Contents/Resources/LICENSES/OFL-QIJI.txt" ]; then
+    echo "✓ 已随包许可文本（LICENSES/）"
+else
+    echo "⚠️ 许可文本缺失——齐伋体是 OFL 字体，不带 OFL.txt 随包即违反其第 2 条"
+fi
+
 # ---- 4.5) 随包资源：内置书目（运行时读 Resources/books，方便热更新） ----
 if [ -d "$ROOT/crates/core/resources/books" ] && ls "$ROOT/crates/core/resources/books"/*.json >/dev/null 2>&1; then
     mkdir -p "$APP/Contents/Resources/books"

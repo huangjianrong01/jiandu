@@ -1099,6 +1099,8 @@ pub(crate) enum MoreAct {
     Help,
     /// 激活 / 已激活回执（商店版不挂）。
     License,
+    /// **解锁全部功能**（商店版）：打开内购那张纸。
+    Unlock,
 }
 
 impl Root {
@@ -1891,6 +1893,12 @@ impl Root {
         if self.show_about {
             root = root.child(self.render_about_sheet(cx));
         }
+        // 解锁纸（v1.9.23 · 商店版内购）：与「关于」同一层，画在它之后。
+        // 官网版不画（`open_unlock` 只在 appstore 分支被调用），但模块照样编
+        // 进来，免得整条链路被 cfg 切成两半。
+        if self.show_unlock {
+            root = root.child(self.render_unlock_sheet(cx));
+        }
         // 快捷键面板（v1.81.0）：改键。叠在帮助之上——从帮助里点进来。
         if self.show_keys {
             root = root.child(self.render_keys_sheet(cx));
@@ -1911,6 +1919,9 @@ impl Root {
         // 与避让，不影响正常交互（只在 `bubble` 为空时生效一次）。
         self.dev_lookup_once();
         self.dev_menu_once();
+        // 内购相位轮询（v1.9.23）：StoreKit 的回调在别的栈里落，UI 每帧看一眼
+        // 原子量有没有变；变了才 notify，不变什么都不做（否则自激）。
+        self.poll_unlock(cx);
 
         // 长按正文弹出的「字义浮签」（释义 / charIndex / 选中文本 / 在线查阅）。
         if self.bubble.is_some() {
@@ -4679,6 +4690,18 @@ impl Root {
                         let lic_label = if self.licensed() { "已激活" } else { "激活" };
                         sub = sub.child(aitem(cx, "more-license", lic_label, MoreAct::License));
                     }
+                    // 商店版反过来：**只**挂内购这一条。原先这里是空的，
+                    // 于是「未解锁」的提示把用户指向一个不存在的门（export_begin
+                    // 里那条 TODO 说的正是这件事）。
+                    #[cfg(feature = "appstore")]
+                    {
+                        let label = if self.licensed() {
+                            "已解鎖 · 恢復購買"
+                        } else {
+                            "解鎖全部功能"
+                        };
+                        sub = sub.child(aitem(cx, "more-unlock", label, MoreAct::Unlock));
+                    }
                 }
             }
             menu = menu.child(sub);
@@ -4885,6 +4908,10 @@ impl Root {
                 cx.notify();
             }
             MoreAct::License => self.open_license(cx),
+            // 商店版的内购入口。官网版也能点（菜单里不挂，但 dev 钩子可能开），
+            // 那边 `storekit::purchase()` 是空实现，纸上会显示「此版本不经
+            // App Store 购买」——比「点了没反应」诚实。
+            MoreAct::Unlock => self.open_unlock(cx),
         }
     }
 
@@ -10460,9 +10487,29 @@ impl Root {
             .child(
                 div()
                     .text_size(px(12.0))
-                    .font_family(song)
+                    .font_family(song.clone())
                     .text_color(rgb(zhu))
                     .child(SharedString::from("一方砚台，半卷残书")),
+            )
+            // 第三方署名（v1.9.23 · 版权合规）：齐伋体是 OFL 1.1 字体、說文数据
+            // 是 Apache-2.0，两份许可都要求「让人看得见版权声明」。许可全文另
+            // 随包放在 `Contents/Resources/LICENSES/`，这里只放认人的那一行——
+            // 关于页是「认门」的地方，不该变成一张法务清单。
+            .child(div().h(px(22.0)))
+            .child(
+                // 三行分开写，不用 `\n`：GPUI 0.2.2 的 `SharedString` 不解析换行，
+                // 塞进去只会得到一个方块。
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(1.0))
+                    .text_size(px(8.5))
+                    .font_family(song.clone())
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from("齐伋体 OFL 1.1 © 2020 Lingdong Huang"))
+                    .child(SharedString::from("說文數據 Apache-2.0 © 2019 Shuowen.org"))
+                    .child(SharedString::from("许可全文见包内 Resources/LICENSES")),
             )
             .child(div().h(px(24.0)))
             .child(small_button("合", false, t).on_mouse_down(

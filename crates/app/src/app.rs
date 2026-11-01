@@ -896,6 +896,15 @@ pub struct Root {
     /// 激活纸（居中浮层）开没开。与 `show_analysis` 同款：不进 `AppUIState`
     /// 那套互斥状态机，开合不牵动别处的动画状态。
     pub show_license: bool,
+    /// **解锁纸**（v1.9.23 · 商店版内购）。官网版的对应物是上面的激活纸；
+    /// 商店版没有 key 这回事，只有「买断 / 恢复购买」。
+    ///
+    /// 与激活纸**同一个位置层级**（居中浮层），二者互斥——由
+    /// `unlock::open_unlock` / `license::open_license` 各自置对方为 false。
+    pub show_unlock: bool,
+    /// 上一次看到的购买相位码（`storekit::phase_id()`）。`poll_unlock`
+    /// 靠它判断「变了没有」，避免每帧都 `notify` 自激成死循环。
+    pub unlock_phase: u8,
     /// key 草稿与光标（字符下标）。
     pub license_code: String,
     pub license_cursor: usize,
@@ -1435,6 +1444,8 @@ impl Root {
             beta_err: false,
             license_ok: jiandu_core::license::activated(),
             show_license: false,
+            show_unlock: false,
+            unlock_phase: crate::storekit::phase_id(),
             license_code: String::new(),
             license_cursor: 0,
             license_focus: cx.focus_handle(),
@@ -1533,6 +1544,12 @@ impl Root {
                 "help" => root.show_help = true,
                 // 「关于」卡片（v1.9.22）：同 `help`，脚本点不到菜单栏时用。
                 "about" => root.show_about = true,
+                // 解锁纸（v1.9.23）：内购前台，脚本点不到「更多 → 工具」时用。
+                "unlock" => {
+                    root.open_book(0);
+                    root.screen = Screen::Reading;
+                    root.open_unlock(cx);
+                }
                 // 笺校工作台（v1.9.22）：整屏换模态，脚本点不到书架右下那枚钮。
                 "collate" => {
                     root.open_book(0);
@@ -3680,7 +3697,11 @@ impl Root {
             // 否则这里的提示说了去处却没有门可走。
             #[cfg(feature = "appstore")]
             {
-                self.notice = "导出与印制需先解锁（App Store 内购）".to_string();
+                // v1.9.23：不再只回一句「需先解锁」——那等于把人指到一扇不
+                // 存在的门（上一版的 TODO 正是这条）。直接把解锁那张纸摊开，
+                // 价格、购买、恢复购买三件事都在那儿。
+                self.open_unlock(cx);
+                return false;
             }
             #[cfg(not(feature = "appstore"))]
             {

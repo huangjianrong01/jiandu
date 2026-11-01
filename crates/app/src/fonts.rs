@@ -484,13 +484,21 @@ pub fn ancient_chain(choice: FontChoice) -> Vec<&'static str> {
         ],
         // **清刻本匠体**（v1.83.0）：实测 name 表 family / full =
         // `FZQingKeBenYueSongS-R-GB`、PostScript = `FZQKBYSJW--GB1-0`。
-        // 版权字库不随包，用户自备放进 fonts/ 即注册；没装则落到宋体。
+        // 版权字库不随包，用户自备放进 fonts/ 即注册。
+        //
+        // v1.9.23 · 版权合规：方正那几枚之后**先退齐伋体**，再退系统宋体。
+        // 方正是商业字库（厂里定稿用的就是它，装了的人一切照旧），但装了的人
+        // 未必有你——没装时原本直接掉到 `Songti SC`，出厂观感就交给系统默认
+        // 宋体了。中间插一枚**随包、OFL、明刻本活字**的齐伋体，既守住「仿
+        // 刻本」这一路气质，又不把产品观感绑在一个买不到授权的字上。
         FontChoice::FZQingKeBen => vec![
             "FZQingKeBenYueSongS-R-GB",
             "FZQingKeBenYueSongS",
             "FZQKBYSJW--GB1-0",
             "方正清刻本悦宋简体",
             "方正清刻本悦宋",
+            "QIJI",
+            "Qiji",
             "Songti SC",
             "STSong",
             "serif",
