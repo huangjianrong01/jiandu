@@ -20,6 +20,7 @@
 		AA00000000000000000000B19 /* ShelfView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F19 /* ShelfView.swift */; };
 		AA00000000000000000000B20 /* ReaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F21 /* ReaderView.swift */; };
 		AA00000000000000000000B21 /* PDFKitView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F22 /* PDFKitView.swift */; };
+		AA00000000000000000000B22 /* CollationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F23 /* CollationView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -35,6 +36,7 @@
 		AA00000000000000000000F19 /* ShelfView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShelfView.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F21 /* ReaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReaderView.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F22 /* PDFKitView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFKitView.swift; sourceTree = "<group>"; };
+		AA00000000000000000000F23 /* CollationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CollationView.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F11 /* JianDu.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JianDu.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -83,6 +85,7 @@
 				AA00000000000000000000F19 /* ShelfView.swift */,
 				AA00000000000000000000F21 /* ReaderView.swift */,
 				AA00000000000000000000F22 /* PDFKitView.swift */,
+				AA00000000000000000000F23 /* CollationView.swift */,
 				AA00000000000000000000F09 /* Assets.xcassets */,
 				AA00000000000000000000F13 /* JianDuCore.xcframework */,
 				AA00000000000000000000F14 /* jiandu_ios_ffi.swift */,
@@ -178,6 +181,7 @@
 				AA00000000000000000000B19 /* ShelfView.swift in Sources */,
 				AA00000000000000000000B20 /* ReaderView.swift in Sources */,
 				AA00000000000000000000B21 /* PDFKitView.swift in Sources */,
+				AA00000000000000000000B22 /* CollationView.swift in Sources */,
 				AA00000000000000000000B14 /* jiandu_ios_ffi.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -331,7 +335,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.jiandu.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = (
@@ -366,7 +370,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.jiandu.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = (

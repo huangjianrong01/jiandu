@@ -1,6 +1,7 @@
 // 笺读 · iPadOS App 入口
-// 第 2 步起：根视图切换为「书架」(ShelfView)，由 BookStore 提供数据。
-// （PoC 探针页已改为书架右上角「调试」入口，可随时回看 Rust 引擎坐标。）
+// 正式工程骨架：TabView 组合「书架」(ShelfView) 与「笺校」(CollationView)，
+// BookStore 作为 environmentObject 注入，两个标签页及其下钻视图共享同一份数据。
+// （PoC 探针页保留在书架右上角「调试」入口，可随时回看 Rust 引擎坐标。）
 
 import SwiftUI
 
@@ -10,8 +11,14 @@ struct JianDuApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ShelfView()
-                .environmentObject(store)
+            TabView {
+                ShelfView()
+                    .tabItem { Label("书架", systemImage: "books.vertical") }
+
+                CollationView()
+                    .tabItem { Label("笺校", systemImage: "rectangle.split.2x2") }
+            }
+            .environmentObject(store)
         }
     }
 }
