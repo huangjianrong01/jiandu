@@ -69,11 +69,33 @@ pub enum Action {
     // ── 印制 ──────────────────────────────────────────────
     ExportLeaf,
     ExportChapter,
+    // ── 印制（v1.9.22 补齐：原来只有「本叶 / 本章」两条有键）───────
+    /// 印制：**整本** PDF（一本书一册）。
+    ExportBook,
+    /// 导出：当前页**图片**（长边 2160 的离屏 PNG）。
+    ExportImage,
+    /// 出图时间三档循环（古风 → 公历 → 关）。
+    StampCycle,
+    /// 分享所选为图片（重排版的竖排分享卡）。
+    ShareSelection,
+    /// 导出：全书正文 MD。
+    ExportMd,
+    // ── 卡片（v1.9.22 补齐）───────────────────────────────
+    /// 导出本章为卡片（逐段 Front/Back）。
+    ExportAnkiChapter,
+    /// 导出选中为**一张**卡片。
+    ExportAnkiSelection,
+    /// 卡片匣 → Anki（整匣一份 CSV）。
+    AnkiCards,
+    /// 卡片匣 → Obsidian（一卡一 md）。
+    ObsidianCards,
+    /// 导出全书批注（朱批录 Markdown）。
+    MarginNotes,
 }
 
 impl Action {
     /// 面板渲染顺序 = 这份数组的顺序（分组靠 [`Action::section`] 相邻聚拢）。
-    pub const ALL: [Action; 30] = [
+    pub const ALL: [Action; 40] = [
         Action::Search,
         Action::SearchNext,
         Action::SearchPrev,
@@ -104,6 +126,16 @@ impl Action {
         Action::AskAi,
         Action::ExportLeaf,
         Action::ExportChapter,
+        Action::ExportBook,
+        Action::ExportImage,
+        Action::StampCycle,
+        Action::ShareSelection,
+        Action::ExportMd,
+        Action::ExportAnkiChapter,
+        Action::ExportAnkiSelection,
+        Action::AnkiCards,
+        Action::ObsidianCards,
+        Action::MarginNotes,
     ];
 
     /// 持久化 id：**永久不变**。
@@ -139,6 +171,16 @@ impl Action {
             Action::AskAi => "ask_ai",
             Action::ExportLeaf => "export_leaf",
             Action::ExportChapter => "export_chapter",
+            Action::ExportBook => "export_book",
+            Action::ExportImage => "export_image",
+            Action::StampCycle => "stamp_cycle",
+            Action::ShareSelection => "share_selection",
+            Action::ExportMd => "export_md",
+            Action::ExportAnkiChapter => "anki_chapter",
+            Action::ExportAnkiSelection => "anki_selection",
+            Action::AnkiCards => "anki_cards",
+            Action::ObsidianCards => "obsidian_cards",
+            Action::MarginNotes => "margin_notes",
         }
     }
 
@@ -181,6 +223,16 @@ impl Action {
             Action::AskAi => "问小笺（有选区带原文）",
             Action::ExportLeaf => "印制：本叶 PDF",
             Action::ExportChapter => "印制：本章 PDF",
+            Action::ExportBook => "印制：整本 PDF",
+            Action::ExportImage => "导出：当前页图片（PNG）",
+            Action::StampCycle => "出图时间（古风 / 公历 / 关）",
+            Action::ShareSelection => "分享所选为图片",
+            Action::ExportMd => "导出：全书 MD",
+            Action::ExportAnkiChapter => "导出：本章为卡片",
+            Action::ExportAnkiSelection => "导出：选中为卡片",
+            Action::AnkiCards => "卡片匣 → Anki",
+            Action::ObsidianCards => "卡片匣 → Obsidian",
+            Action::MarginNotes => "导出：全书批注（朱批录）",
         }
     }
 
@@ -215,7 +267,18 @@ impl Action {
             | Action::Palette5
             | Action::Palette6 => "墨色",
             Action::AskAi => "问小笺",
-            Action::ExportLeaf | Action::ExportChapter => "印制",
+            Action::ExportLeaf
+            | Action::ExportChapter
+            | Action::ExportBook
+            | Action::ExportImage
+            | Action::StampCycle
+            | Action::ShareSelection
+            | Action::ExportMd => "印制",
+            Action::ExportAnkiChapter
+            | Action::ExportAnkiSelection
+            | Action::AnkiCards
+            | Action::ObsidianCards
+            | Action::MarginNotes => "卡片",
         }
     }
 
@@ -259,6 +322,19 @@ impl Action {
             Action::AskAi => "cmd+shift+a",
             Action::ExportLeaf => "cmd+alt+p",
             Action::ExportChapter => "cmd+alt+shift+p",
+            // v1.9.22 补的十条，全部落在 **⌘⌥** 这一族上：它比 ⌘⇧ 空得多，
+            // 且与已有的 ⌘⌥P / ⌘⌥⇧P 同门——记一个修饰键就够。
+            // 刻意避开系统占用的 ⌘⌥D（程序坞）、⌘⌥H（隐藏其他）。
+            Action::ExportBook => "cmd+alt+b",
+            Action::ExportImage => "cmd+alt+i",
+            Action::StampCycle => "cmd+alt+t",
+            Action::ShareSelection => "cmd+alt+s",
+            Action::ExportMd => "cmd+alt+e",
+            Action::ExportAnkiChapter => "cmd+alt+k",
+            Action::ExportAnkiSelection => "cmd+alt+shift+k",
+            Action::AnkiCards => "cmd+alt+a",
+            Action::ObsidianCards => "cmd+alt+o",
+            Action::MarginNotes => "cmd+alt+m",
         }
     }
 }

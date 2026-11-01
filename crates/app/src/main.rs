@@ -113,12 +113,19 @@ pub use jiandu_core::{
 use app::Root;
 use anyhow::Result;
 use gpui::{
-    prelude::*, px, size, App, Application, AssetSource, Bounds, SharedString,
-    TitlebarOptions, WindowBounds, WindowOptions,
+    prelude::*, px, size, App, Application, AssetSource, Bounds, KeyBinding, Menu, MenuItem,
+    SharedString, TitlebarOptions, WindowBounds, WindowOptions,
 };
 use jiandu_core::library::Library;
 use std::borrow::Cow;
 use std::path::PathBuf;
+
+/// **应用级动作**（v1.9.22）：原生菜单栏里的那两条。
+///
+/// 为什么要 Action 而不是直接调函数：GPUI 0.2.2 的菜单项必须携带一枚
+/// `Action`，点了之后由 `cx.on_action` 派发；没有 action 的菜单项在 AppKit
+/// 里是灰的（点了没反应）。命名空间 `jiandu` 只用于调试打印。
+gpui::actions!(jiandu, [ShowAbout, QuitApp]);
 
 /// 应用资源源：从书架主目录（`~/.jiandu`，可用 `JIANDU_HOME` 覆盖）加载资源，
 /// 目前用于目录浮层的「鱼尾纹」SVG。注册后 `svg().path(...)` 才能读到文件。
@@ -238,8 +245,45 @@ fn main() {
             })
             .expect("failed to open window");
         } else {
-            cx.open_window(zen_window_options(bounds), |_window, cx| cx.new(Root::new))
-            .expect("failed to open window");
+            // 先把 Root 建出来（而不是在 open_window 的闭包里建）：菜单里的
+            // 「关于」要拿到这个实体才能把卡片摊开，句柄必须活到 App 那层。
+            let root = cx.new(Root::new);
+
+            // ── 原生菜单栏（v1.9.22）────────────────────────────────
+            //
+            // 只放两条：**关于笺读** 与 **退出**。
+            // ・前者是用户点名的入口（左侧栏底下还有一枚小印，两条路同一张纸）；
+            // ・后者顺手把 **⌘Q** 接回来——GPUI 从 `set_menus` 之外不给菜单栏，
+            //   没有菜单项就没有 responder，⌘Q 一直是哑的（老版本里的暗坑）。
+            //
+            // ⚠️ `set_menus` 会**整条替换** NSApp.mainMenu（platform.rs:921
+            //    `app.setMainMenu_`），所以这里给出的就是全部——别指望系统
+            //    再帮你补「编辑」菜单。
+            let about_root = root.clone();
+            cx.on_action(move |_: &ShowAbout, cx: &mut App| {
+                about_root.update(cx, |this, cx| this.open_about(cx));
+            });
+            cx.on_action(|_: &QuitApp, cx: &mut App| cx.shutdown());
+            cx.bind_keys([KeyBinding::new("cmd-q", QuitApp, None)]);
+            cx.set_menus(vec![Menu {
+                name: "笺读".into(),
+                items: vec![
+                    MenuItem::Action {
+                        name: "关于笺读".into(),
+                        action: Box::new(ShowAbout),
+                        os_action: None,
+                    },
+                    MenuItem::separator(),
+                    MenuItem::Action {
+                        name: "退出笺读".into(),
+                        action: Box::new(QuitApp),
+                        os_action: None,
+                    },
+                ],
+            }]);
+
+            cx.open_window(zen_window_options(bounds), move |_window, _cx| root.clone())
+                .expect("failed to open window");
         }
 
         cx.activate(true);

@@ -73,6 +73,12 @@ const HEADER_H: f32 = 44.0;
 const PAD: f32 = 14.0;
 const FONT_SIZE: f32 = 17.0;
 const LINE_H: f32 = FONT_SIZE * 1.7;
+/// **右侧编辑区的内边距**（v1.9.22）：28px。
+///
+/// 原先与顶栏共用 `PAD`(14)——那点边距只够「不贴边」，不够「像一张稿纸」。
+/// 稿纸的规矩是：起首空两格、四边留白比行距宽。28 是 17px 字的两倍不到一点，
+/// 眼睛扫过去会觉得字是「摆」在纸上的，而不是被框住的。
+const ED_PAD: f32 = 28.0;
 /// 近似字宽：原图转录以 CJK 为主，按字号取值做编辑器内点击定位（仅用于右文
 /// 落光标 / 选区估算，不影响左图高亮精度——左图高亮走 `SourceRegion` 真实映射）。
 const CHAR_W: f32 = FONT_SIZE * 0.95;
@@ -708,57 +714,169 @@ impl CollationWorkspace {
             )
     }
 
+    /// **主按钮**（v1.9.22）：实底朱砂 + 圆角，一条工具条上只该有一枚。
+    ///
+    /// 原先三个按钮同款浅朱底，视线没有落点；现在【竖排预览】是这张桌上唯一的
+    /// 「主要动作」，其余降为文字链/次级底。
+    fn primary_button(
+        &self,
+        label: &'static str,
+        on_click: impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .px(px(14.0))
+            .py(px(5.0))
+            .bg(rgb(0x8c2b22))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(0xf4ecd8))
+            .shadow_sm()
+            .child(SharedString::from(label))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |c, event, window, cx| on_click(c, event, window, cx)),
+            )
+    }
+
+    /// **次级按钮**（v1.9.22）：无底无框，只在悬停时浮出一层极浅的纸色。
+    ///
+    /// 给【打开文件】【导入 MD】这类「入口」用——它们是渠道，不是动作的高潮。
+    fn ghost_button(
+        &self,
+        label: &'static str,
+        on_click: impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(0x4a4335))
+            .hover(|s| s.bg(rgba(0x2b262010)))
+            .child(SharedString::from(label))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |c, event, window, cx| on_click(c, event, window, cx)),
+            )
+    }
+
     /// 顶部返回栏。
     fn render_header(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
         div()
             .h(px(HEADER_H))
             .w_full()
             .flex()
             .flex_row()
             .items_center()
-            .bg(rgb(0xece2c8))
-            .px(px(PAD))
+            // **毛玻璃悬浮条**（v1.9.22）：纸色 88% 上浮 + 一道 10% 墨的下分割线。
+            // GPUI 0.2.2 没有 `backdrop-filter`，只能靠「高 alpha 纸色」近似；
+            // 关键是那条**极淡的分割线**——有了它，工具条才是「浮在纸上的另一张
+            // 纸」，没有它就只是一条色块。
+            .bg(rgba(0xECE2C8E0))
+            .border_b_1()
+            .border_color(rgba(0x2B26201A))
+            .px(px(18.0))
             .child(
                 div()
-                    .text_color(rgb(0x2b2620))
-                    .child(SharedString::from("笺校工作台")),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    // 一枚「笺」小印：这一屏的名字。压到 18px，只当标点用。
+                    .child(crate::shelf::seal_chip("笺", 18.0))
+                    .child(
+                        div()
+                            .font_family(song.clone())
+                            .text_size(px(13.5))
+                            .text_color(rgb(0x2b2620))
+                            .child(SharedString::from("笺校工作台")),
+                    ),
             )
+            .child(div().w(px(18.0)))
+            // 两个「渠道」并排在最左（用户口径：打开文件与导入 MD 合并到左侧）。
+            .child(self.ghost_button("打开文件", |c, _, _, cx| c.open_image_picker(cx), cx))
+            .child(self.ghost_button("导入 MD", |c, _, _, cx| c.open_text_picker(cx), cx))
             .child(div().flex_1())
-            .child(self.button("返回阅读", |_c, _, _, cx| {
-                cx.emit(CollationEvent::Exit);
-            }, cx))
+            // 唯一的实底主按钮。
+            .child(self.primary_button(
+                "竖排预览",
+                |c, _, _, cx| {
+                    if c.show_preview {
+                        c.close_preview();
+                    } else {
+                        c.show_preview = true;
+                        c.request_preview(cx);
+                    }
+                    cx.notify();
+                },
+                cx,
+            ))
+            .child(div().w(px(6.0)))
+            // 【返回阅读】弱化到最右：无底无框、软墨色，鼠标上去才转朱砂。
+            .child(
+                div()
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .font_family(song)
+                    .text_color(rgba(0x2B262099))
+                    .hover(|s| s.text_color(rgb(0x8c2b22)))
+                    .child(SharedString::from("← 返回阅读"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_c, _, _, cx| {
+                            cx.emit(CollationEvent::Exit);
+                        }),
+                    ),
+            )
     }
 
     /// 左侧 40%：原图区。顶部悬浮【打开文件】按钮；下方滚动容器挂 `left_scroll`，
     /// 内容（栅格化位图或 mock 行带）内部用 `relative()` 承载绝对定位的高亮叠加层；
     /// 底部状态条显示导入错误或温和提示（如多页 PDF 仅渲首页）。
     fn render_left(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
+        // **空状态**（v1.9.22）：一张原图都没有时，绝不把「占位页 + 假区域框」
+        // 摆出来——那看起来像一个渲染 Bug（真机反馈原话：「两个灰色线框太突兀」）。
+        // 改成一张安静的空纸 + 一句提示，它是「还没开始」，不是「坏了」。
+        let empty = self.image_path.is_none();
+        let body = if empty {
+            self.render_left_empty()
+        } else {
+            // 外面这层 `div` 只为把 `Stateful<Div>`（滚动容器带 id）拉回普通
+            // `Div`，好与空状态同型（两种分支同一个返回类型）。
+            div().size_full().child(
+                div()
+                    .id(SharedString::from("collation-left-scroll"))
+                    .w_full()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.left_scroll)
+                    .child(self.render_left_content(vw)),
+            )
+        };
         div()
             .w(px(vw * 0.4))
             .h_full()
             .flex()
             .flex_col()
+            // 左「纸」压深一档：两张纸摆在一张桌上，靠明度差分开，不靠硬线。
             .bg(rgb(0xddd2b4))
             .child(
                 div()
                     .relative()
                     .flex_1()
-                    .child(
-                        div()
-                            .id(SharedString::from("collation-left-scroll"))
-                            .w_full()
-                            .h_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.left_scroll)
-                            .child(self.render_left_content(vw)),
-                    )
-                    .child(
-                        self.button("打开文件", |c, _, _, cx| c.open_image_picker(cx), cx)
-                            .absolute()
-                            .top(px(8.0))
-                            .right(px(8.0)),
-                    )
-                    // PDF 多页时浮出页码条（左下角，绝不遮住右上角的【打开文件】）
+                    .child(body)
+                    // PDF 多页时浮出页码条（左下角）。
                     .child(
                         div()
                             .absolute()
@@ -771,6 +889,69 @@ impl CollationWorkspace {
                 Some(s) => s,
                 None => div().h(px(0.0)),
             })
+    }
+
+    /// **左栏空状态**（v1.9.22）：一张没有内容的纸。
+    ///
+    /// 三条设计纪律，都是为了让它是「空状态」而不是「错误提示」：
+    ///   ① **没有实线框**——GPUI 0.2.2 画不了虚线，于是改用「浅色纸底 + 无边框」，
+    ///      比任何一圈线都安静；
+    ///   ② 文字只给两行：一句「在等什么」，一句「怎么开始」；
+    ///   ③ 朱砂只用在这一枚小方印上，且压到 40% 透明——空的时候不该抢眼。
+    fn render_left_empty(&self) -> gpui::Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(296.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .py(px(40.0))
+                    .px(px(26.0))
+                    .bg(rgba(0xF3EBD5D9))
+                    .rounded(px(10.0))
+                    // 一枚极淡的方印：认门，不喊人。
+                    .child(
+                        div()
+                            .w(px(34.0))
+                            .h(px(34.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .border_1()
+                            .border_color(rgba(0x8C2B2240))
+                            .rounded(px(2.0))
+                            .text_size(px(15.0))
+                            .font_family(song.clone())
+                            .text_color(rgba(0x8C2B22AA))
+                            .child(SharedString::from("原")),
+                    )
+                    .child(div().h(px(16.0)))
+                    .child(
+                        div()
+                            .font_family(song.clone())
+                            .text_size(px(13.0))
+                            .text_color(rgb(0x5a5346))
+                            .child(SharedString::from("等待导入古籍原图")),
+                    )
+                    .child(div().h(px(7.0)))
+                    .child(
+                        div()
+                            .font_family(song)
+                            .text_size(px(11.0))
+                            .text_color(rgba(0x5A5346B3))
+                            .child(SharedString::from("支持 PDF / PNG · 点上方「打开文件」")),
+                    ),
+            )
     }
 
     /// 左图内容：已载入原图则贴 `img`（按宽自适应高度），否则画占位页（按
@@ -1947,36 +2128,15 @@ impl CollationWorkspace {
     /// 右侧 60%：竖排预览工具条 + 原生编辑器。
     fn render_right(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
         let editor = self.render_editor(cx);
+        // 原先这里还有一条**自己的**小工具条（导入 MD / 竖排预览）。v1.9.22
+        // 把它并进全局那条——两栏各顶一条色带，看起来像两套软件拼在一起。
+        // 现在整屏只有一条工具条，右栏从第一行字就是稿纸。
         div()
             .w(px(vw * 0.6))
             .h_full()
             .flex()
             .flex_col()
             .bg(rgb(0xf4ecd8))
-            .child(
-                div()
-                    .h(px(HEADER_H))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .px(px(PAD))
-                    .bg(rgb(0xece2c8))
-                    .child(div().flex_1())
-                    // 【导入 MD】：把 .md / .txt 的**源码**灌进右侧编辑器。
-                    // 与【打开文件】一样是 rfd 同步对话框，但读盘走后台（见
-                    // `open_text_picker`），点下去界面立刻回来，不会假死。
-                    .child(self.button("导入 MD", |c, _, _, cx| c.open_text_picker(cx), cx)
-                        .mr(px(8.0)))
-                    .child(self.button("竖排预览", |c, _, _, cx| {
-                        if c.show_preview {
-                            c.close_preview();
-                        } else {
-                            c.show_preview = true;
-                            c.request_preview(cx);
-                        }
-                        cx.notify();
-                    }, cx)),
-            )
             .child(match self.render_text_status() {
                 Some(s) => s,
                 None => div().h(px(0.0)),
@@ -2094,6 +2254,12 @@ impl CollationWorkspace {
     /// 注：GPUI 0.2.2 无内置 Editor，这里用自绘文本 + `crate::ime::InputField`
     /// 注册焦点，中文输入经 `EntityInputHandler` 落回 `self.text`。
     fn render_editor(&self, cx: &mut Context<Self>) -> gpui::Div {
+        // 稿纸的三件套（v1.9.22）：**宋体**、**#333 的墨**、**1.7 倍行距**。
+        // 纯黑（0x000/0x2b2620）在亮纸上是刺的，深灰（#333）才像墨晕开的样子。
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
         let mut content = div().flex().flex_col();
         let mut char_start = 0usize;
         for line in self.text.split('\n') {
@@ -2118,10 +2284,14 @@ impl CollationWorkspace {
                 // 手写补偿。两条路并存，任一条通就能打字。
                 .track_focus(&self.focus)
                 .bg(rgb(0xf4ecd8))
-                .px(px(PAD))
-                .py(px(PAD))
+                // 内边距 14 → **28**：起首空两格、四边留白比行距宽，字才是
+                // 「摆」在纸上，而不是被框住。
+                .px(px(ED_PAD))
+                .py(px(ED_PAD))
                 .text_size(px(FONT_SIZE))
-                .text_color(rgb(0x2b2620))
+                .text_color(rgb(0x333333))
+                .font_family(song)
+                .line_height(px(LINE_H))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|c, event, window, cx| c.place_caret_from_click(event, window, cx)),
@@ -2776,12 +2946,28 @@ impl Render for CollationWorkspace {
             .on_key_down(cx.listener(|c, event, _window, cx| c.preview_key(event, cx)))
             .child(self.render_header(cx))
             .child(
+                // **视觉分割**（v1.9.22）：不用硬切。
+                // 做法是「明度差 + 一道极细的分割线」：左纸本就深一档，再在
+                // 40/60 处压一根 1px 的 12% 墨线——像两张纸交界处的阴影，
+                // 而不是一条把屏幕劈开的框。
+                // 用绝对定位画线（不占布局），两栏仍是 40/60，不会因为多出
+                // 这 1px 而把右栏挤出去。
                 div()
+                    .relative()
                     .flex()
                     .flex_row()
                     .flex_1()
                     .child(self.render_left(vw, cx))
-                    .child(self.render_right(vw, cx)),
+                    .child(self.render_right(vw, cx))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(0.0))
+                            .bottom(px(0.0))
+                            .left(px(vw * 0.4))
+                            .w(px(1.0))
+                            .bg(rgba(0x2B26201F)),
+                    ),
             );
         if self.show_preview {
             root = root.child(self.render_preview_overlay(vh, cx));

@@ -644,6 +644,10 @@ pub struct Root {
     pub delete_confirm: Option<usize>,
     /// 帮助面板是否展开（快捷键一览）。
     pub show_help: bool,
+    /// **关于**卡片是否展开（v1.9.22）：极简一张纸——印、书名、版本、一句
+    /// slogan。入口两处：macOS 原生菜单栏（⌘ 菜单里的「关于笺读」）与左侧栏
+    /// 底下那枚小印。它不是「帮助」的一个分段：帮助是查键位，关于是认门。
+    pub show_about: bool,
     /// 已划线的字：(chapter, para, offset)。
     pub underlines: std::collections::HashSet<(usize, usize, usize)>,
     /// 分享卡片浮层是否展开。
@@ -1338,6 +1342,7 @@ impl Root {
             rename_marked: None,
             delete_confirm: None,
             show_help: false,
+            show_about: false,
             underlines: std::collections::HashSet::new(),
             show_share_panel: false,
             share_show_title: true,
@@ -1526,6 +1531,14 @@ impl Root {
                     root.side_slide = 1.0;
                 }
                 "help" => root.show_help = true,
+                // 「关于」卡片（v1.9.22）：同 `help`，脚本点不到菜单栏时用。
+                "about" => root.show_about = true,
+                // 笺校工作台（v1.9.22）：整屏换模态，脚本点不到书架右下那枚钮。
+                "collate" => {
+                    root.open_book(0);
+                    root.screen = Screen::Reading;
+                    root.mode = AppMode::Collation;
+                }
                 // 快捷键面板（v1.81.0）：同 `help`，脚本点不到顶栏时用。
                 "keys" => root.show_keys = true,
                 // 检索侧栏（v1.81.0）：核对 IME 落点 / 版式，脚本点不到顶栏。
@@ -5140,6 +5153,8 @@ fn anki_push_card(
             || self.show_side
             || self.show_search
             || self.show_help
+            // v1.9.22：「关于」也是浮层——摊着时点纸面不该翻页。
+            || self.show_about
             || self.show_share_panel
             || self.show_ai
             // v1.81.0：文本分析抽屉（与「改键」面板同款，独立浮层）。

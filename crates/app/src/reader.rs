@@ -1887,6 +1887,10 @@ impl Root {
         if self.show_help {
             root = root.child(self.render_help_sheet(cx));
         }
+        // 「关于」：一张极简的纸（v1.9.22）。画在帮助之后——它是最上面那一层。
+        if self.show_about {
+            root = root.child(self.render_about_sheet(cx));
+        }
         // 快捷键面板（v1.81.0）：改键。叠在帮助之上——从帮助里点进来。
         if self.show_keys {
             root = root.child(self.render_keys_sheet(cx));
@@ -2447,8 +2451,22 @@ impl Root {
                     self.toggle_ai(window, cx);
                 }
             }
-            A::ExportLeaf => self.export_pdf(crate::app::PdfScope::Leaf, cx),
-            A::ExportChapter => self.export_pdf(crate::app::PdfScope::Chapter, cx),
+            // ── 印制 / 卡片（v1.9.22）─────────────────────────────
+            // 一律绕回 `run_more`：那条路上有一道 `catch_unwind`，键按下去
+            // 与从菜单点下去必须走同一条命（否则快捷键会绕过兜底，一 panic
+            // 就是整个进程被 FFI 边界强杀）。加一条新键 = 这里加一行。
+            A::ExportLeaf => self.run_more(MoreAct::PdfLeaf, window, cx),
+            A::ExportChapter => self.run_more(MoreAct::PdfChapter, window, cx),
+            A::ExportBook => self.run_more(MoreAct::PdfBook, window, cx),
+            A::ExportImage => self.run_more(MoreAct::PngLeaf, window, cx),
+            A::StampCycle => self.run_more(MoreAct::StampCycle, window, cx),
+            A::ShareSelection => self.run_more(MoreAct::ShareSel, window, cx),
+            A::ExportMd => self.run_more(MoreAct::Md, window, cx),
+            A::ExportAnkiChapter => self.run_more(MoreAct::AnkiChapter, window, cx),
+            A::ExportAnkiSelection => self.run_more(MoreAct::AnkiSel, window, cx),
+            A::AnkiCards => self.run_more(MoreAct::AnkiCards, window, cx),
+            A::ObsidianCards => self.run_more(MoreAct::Obsidian, window, cx),
+            A::MarginNotes => self.run_more(MoreAct::MarginNotes, window, cx),
         }
         cx.notify();
     }
@@ -3506,6 +3524,55 @@ impl Root {
             SideTab::Note => self.render_side_note_list(cx),
         };
 
+        // ── 栏脚：一枚「笺校」小印 → 关于（v1.9.22）────────────────
+        //
+        // 为什么是一枚印而不是「关于本软件」一行字：这一栏通篇是书目与批注，
+        // 底下忽然冒出一行现代管理文字，整栏的气质就散了。印只认门，不解释
+        // ——与栏右那三枚「錄 / 籤 / 批」是同一套标记法。
+        let about_foot = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(rgba(sept))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgba(((t.ink() & 0xFFFFFF) << 8) | 0x0A)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.close_side();
+                    this.open_about(cx);
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(crate::shelf::seal_chip("笺校", 22.0))
+                    .child(
+                        div()
+                            .font_family(song.clone())
+                            .text_size(px(10.5))
+                            .text_color(rgb(t.ink_soft()))
+                            .child(SharedString::from("关于笺读")),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from(format!(
+                        "v{}",
+                        env!("CARGO_PKG_VERSION")
+                    ))),
+            );
+
         let drawer = div()
             .absolute()
             .top(px(BAR_H))
@@ -3545,7 +3612,8 @@ impl Root {
                     .flex()
                     .flex_col()
                     .child(head)
-                    .child(body),
+                    .child(body)
+                    .child(about_foot),
             )
             .child(seals);
 
@@ -4347,12 +4415,14 @@ impl Root {
         // ════════════════════════════════════════════════════════════════
         //
         // 菜单纸色 / 边线 / 悬停底：
-        // ・底色取**不透明纸色**（不是 veil）：书签是实打实的一张纸，半透明会
-        //   让底下的字透出来，反而脏；
+        // ・底色取**极轻的宣纸雾面**（纸色 95% 不透明）：底下那行正文仍能透出
+        //   一丝纸影，却不至于让字迹串到菜单上来——GPUI 0.2.2 没有
+        //   `backdrop-filter`，「毛玻璃」只能靠这个 alpha 值近似；
         // ・边线 30% 墨（极细黑边，用户口径），圆角 2px——刻本没有圆角，但
         //   屏幕上零圆角会割手，2px 是「看着是直角」的上限；
         // ・悬停底 8% 朱砂：比灰底有温度，也不抢字。
         let menu_paper = t.paper();
+        let menu_fill = ((menu_paper & 0xFFFFFF) << 8) | 0xF2;
         let menu_edge = ((t.ink() & 0xFFFFFF) << 8) | 0x4D;
         let menu_hover = ((zhu & 0xFFFFFF) << 8) | 0x14;
         let menu_zhu_edge = ((zhu & 0xFFFFFF) << 8) | 0x99;
@@ -4375,7 +4445,9 @@ impl Root {
             div()
                 .id(SharedString::from(id))
                 .w_full()
-                .h(px(26.0))
+                // 行高 26 → **28**：12px 的字挤在 26px 的行里，两行之间只剩
+                // 一口气；加两片之后文字才真正「坐」在行里，而不是被行夹住。
+                .h(px(28.0))
                 .flex()
                 .items_center()
                 .px(px(11.0))
@@ -4406,7 +4478,7 @@ impl Root {
             let mut row = div()
                 .id(SharedString::from(id))
                 .w_full()
-                .h(px(28.0))
+                .h(px(30.0))
                 .flex()
                 .items_center()
                 .px(px(10.0))
@@ -4457,11 +4529,12 @@ impl Root {
             // 右缘为基准（负值 = 往右探出一点），整张书签正好垂在钮下。
             .right(px(-6.0))
             .w(px(134.0))
-            .bg(rgb(menu_paper))
+            .bg(rgba(menu_fill))
             .border_1()
             .border_color(rgba(menu_edge))
             .rounded(px(2.0))
-            .shadow_sm()
+            // 影比边重一档（`shadow_lg`）：纸片浮在纸面上，靠的就是这圈柔影。
+            .shadow_lg()
             .flex()
             .flex_col()
             .py(px(4.0))
@@ -4495,25 +4568,44 @@ impl Root {
             )));
         }
 
-        // ---- 子菜单：垂在当前分类行的左侧（菜单贴右缘，只能往左长）----
+        // ---- 子菜单：**往右弹**，翻边的余量先算 ----
+        //
+        // 现代 OS 的级联规矩是往**右**弹、首条与被悬停那一行齐平。但「更多」
+        // 钮离窗右缘只隔一截，窗口一窄就弹到窗外——看不见的菜单比弹错方向更
+        // 糟。故先估一遍天头总宽、算出右缘余量：够就往右（默认），不够才翻到
+        // 左（与 macOS 自己的菜单翻边行为一致）。
+        //
+        // 估宽：一字 ≈ 字号宽（CJK 全角），印製 11px 二字另加 1px 双边。
+        let est = |chars: f32, fs: f32, pad: f32| chars * fs + pad * 2.0;
+        let bar_w = est(2.0, 13.0, 14.0) * 3.0  // 书阁 / 目录 / 版字
+            + est(2.0, 13.0, 9.0) * 2.0         // 检索 / 问笺
+            + est(2.0, 11.0, 9.0) + 2.0         // 印製
+            + est(2.0, 13.0, 14.0)              // 更多
+            + 3.0 * (1.0 + 44.0);               // 三道界行（1px + 左右各 22）
+        let room_right = (self.viewport_w - bar_w) * 0.5 - 6.0;
+        let to_right = room_right >= 134.0 + 4.0 + 142.0 + 6.0;
+
         if let Some(g) = self.more_group {
             let mut sub = div()
                 .absolute()
-                .right(px(134.0 + 4.0))
-                // 子菜单的第一条要与**正被悬停的那一行分类**齐平：
-                // 分类行中心 = 分类菜单的 py(4) + 书签头(1.5) + 气口(3) + 行高/2
-                //           = 8.5 + 14 = 22.5；
-                // 子菜单第一条中心 = 子菜单 top + 自己的 py(4) + 书签头(1.5)
-                //                   + 气口(3) + 行高/2 = top + 21.5。
-                // 故 top = 22.5 − 21.5 + 28×序号 = **1 + 28×序号**。
-                // （先算过一遍才敢写死：凭感觉给个 7.5，子菜单整整低了一行半。）
-                .top(px(1.0 + g as f32 * 28.0))
-                .w(px(142.0))
-                .bg(rgb(menu_paper))
+                // 首条与**被悬停的那一行分类**齐平（用户要的「一点点向下的
+                // 偏移对齐」就是这几像素，不能凭感觉）：
+                //   分类行中心     = py(4) + 书签头(1.5) + 气口(3) + 30/2 = 23.5
+                //   子菜单首条中心 = top + py(4) + 1.5 + 3 + 28/2     = top + 22.5
+                //   → top = **1 + 30×序号**
+                .top(px(1.0 + g as f32 * 30.0))
+                .w(px(142.0));
+            sub = if to_right {
+                sub.left(px(134.0 + 4.0))
+            } else {
+                sub.right(px(134.0 + 4.0))
+            };
+            sub = sub
+                .bg(rgba(menu_fill))
                 .border_1()
                 .border_color(rgba(menu_edge))
                 .rounded(px(2.0))
-                .shadow_sm()
+                .shadow_lg()
                 .flex()
                 .flex_col()
                 .py(px(4.0))
@@ -10288,6 +10380,117 @@ impl Root {
     /// 「点模板时阅读界面不变」：面板全部读快照字段（`share_body` 等），
     /// 控件只写 `share_*` 态；阅读视图的页 / 列 / 字体一个都不碰。
     /// 帮助面板：快捷键与操作说明一览（点工具栏「帮助」或按 ⌘/ 打开）。
+    /// **呼出「关于」**（v1.9.22）：极简一张纸。
+    ///
+    /// 两个入口：macOS 原生菜单栏的「关于笺读」（`main.rs` 里那颗
+    /// `ShowAbout` action）与左侧栏底下那枚小印。两处都走这一个函数，
+    /// 不各写一套开关——否则「从菜单进」和「从栏里进」迟早长得不一样。
+    pub fn open_about(&mut self, cx: &mut Context<Self>) {
+        // 互斥：先收起其它顶层浮层，免得两张纸叠在一起。
+        self.show_style = false;
+        self.show_search = false;
+        self.show_help = false;
+        self.show_keys = false;
+        self.show_analysis = false;
+        self.show_share_panel = false;
+        self.show_ai = false;
+        self.show_license = false;
+        self.more_menu = false;
+        self.more_group = None;
+        self.ui_state = AppUIState::None;
+        self.close_transient_ui();
+        self.show_about = true;
+        cx.notify();
+    }
+
+    /// **关于**：一张极简的纸（v1.9.22）。
+    ///
+    /// 刻意只有四件东西：那枚朱砂「笺校」小印、书名、版本号、一句 slogan。
+    /// 不放「检查更新 / 访问官网 / 评分」这类按钮——第一次打开时它们只让人
+    /// 多犹豫一下，而这张纸要说的只有「这是什么」。
+    fn render_about_sheet(&mut self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme;
+        let vw = self.viewport_w;
+        let vh = self.viewport_h;
+        let zhu = sheet_zhu(t);
+        // 版本号取编译期的包版本（`Cargo.toml` 的 workspace.package.version），
+        // 不手写——手写的版本号迟早与打包脚本里那个 VERSION 不一致。
+        let version = env!("CARGO_PKG_VERSION");
+        let song = crate::fonts::family_for(FontChoice::WenJinMincho, Script::Ancient);
+
+        let card = div()
+            .w(px(320.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .py(px(32.0))
+            .px(px(28.0))
+            .bg(rgb(t.paper()))
+            .border_1()
+            .border_color(rgb(t.frame()))
+            .rounded(px(10.0))
+            .shadow_lg()
+            // 顶端一道朱砂书签头：与「更多」那张签条同源，认得出是一家的纸。
+            .child(
+                div()
+                    .w(px(56.0))
+                    .h(px(1.5))
+                    .bg(rgba(((zhu & 0xFFFFFF) << 8) | 0x99)),
+            )
+            .child(div().h(px(26.0)))
+            // 那枚「笺校」小印：书包上的印，认门用。
+            .child(crate::shelf::seal_chip("笺校", 46.0))
+            .child(div().h(px(18.0)))
+            .child(
+                div()
+                    .text_size(px(40.0))
+                    .font_family(self.main_family())
+                    .text_color(rgb(t.ink()))
+                    .child(SharedString::from("笺 讀")),
+            )
+            .child(div().h(px(10.0)))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_family(song.clone())
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from(format!("版本 {version}"))),
+            )
+            .child(div().h(px(20.0)))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_family(song)
+                    .text_color(rgb(zhu))
+                    .child(SharedString::from("一方砚台，半卷残书")),
+            )
+            .child(div().h(px(24.0)))
+            .child(small_button("合", false, t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.show_about = false;
+                    cx.notify();
+                }),
+            ));
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w(px(vw))
+            .h(px(vh))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x14100ACC))
+            .child(card)
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.show_about = false;
+                cx.notify();
+            }))
+    }
+
     fn render_help_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let vw = self.viewport_w;
@@ -10309,30 +10512,31 @@ impl Root {
         list = list.child(help_row("→ / ↓ / 点屏幕右半", "下一页", t));
         list = list.child(help_row("← / ↑ / 点屏幕左半", "上一页", t));
 
-        list = list.child(help_sec("阅读", t));
-        list = list.child(help_row("⌘T", "简体 / 繁体互转", t));
-        list = list.child(help_row("⌘1 – ⌘6", "墨色（朱 / 墨 / 纸 / 青 / 黛 / 暗金）", t));
-        // v1.75.0 把 ⌘F 从「切字体」改到「全库检索」——帮助面板一直没跟上，
-        // 这次连带修掉（说明与代码两处不一致，比没说明更糟）。
-        list = list.child(help_row("⌘F", "全库检索", t));
-        // 全文检索（v1.75.0）：三字以上走 FTS5 索引，首次搜某本书会先建索引。
-        list = list.child(help_row("顶栏「检索」", "输词后 ⏎ 开搜 · 三字以上走索引（首次会先建）", t));
-        list = list.child(help_row("⌘P", "切换纸色", t));
-        list = list.child(help_row("⌘N", "注释显隐", t));
-        // v1.81.0：⌘J 让给「现代标点 / 古籍句读」，通假挪到 ⌘Y。
-        list = list.child(help_row("⌘J", "现代标点 / 古籍句读", t));
-        list = list.child(help_row("⌘Y", "通假显隐", t));
-        list = list.child(help_row("⌘B", "句读显隐", t));
-        list = list.child(help_row("⌘R", "生僻字显隐", t));
-        list = list.child(help_row("⌘⇧A", "问小笺（有选区带原文问）", t));
-
-        list = list.child(help_sec("视图", t));
-        list = list.child(help_row("⌘E", "版字面板", t));
-        list = list.child(help_row("⌘L", "左侧栏（目录 / 书签 / 批注）", t));
-        list = list.child(help_row("⌘Z", "专注模式（Esc 退出）", t));
-        list = list.child(help_row("⌘K", "卡片匣", t));
-        list = list.child(help_row("⌘/", "帮助（本面板）", t));
-        list = list.child(help_row("Esc", "退出专注 / 收起浮层 / 收起导出提示条", t));
+        // ── 快捷键：**照键位表生成**（v1.9.22）─────────────────────
+        //
+        // 这段原先是一张手抄的清单：改一个键要改两处（`Action::default_chord`
+        // 与这里），漏一处就成了「说明里写着 ⌘F、按下没反应」。现在直接遍历
+        // `Action::ALL`、键位取 `keymap.chord(..)`——与「改键」面板、与真正
+        // 派发共用同一份表，绝不可能再对不上。用户改过的键也照新键显示。
+        let mut last_sec: &'static str = "";
+        for a in jiandu_core::keys::Action::ALL {
+            let sec = a.section();
+            if sec != last_sec {
+                list = list.child(help_sec(sec, t));
+                last_sec = sec;
+            }
+            let key = self.keymap.chord(a).display();
+            list = list.child(help_row(&key, a.label(), t));
+        }
+        // 表里没有、但按得出来的：Esc 是全局退出口，不进键位表（它不是
+        // 可改键的动作，改了反而会把人锁在浮层里）。
+        list = list.child(help_row("Esc", "退出专注 / 收起浮层 / 收起提示条", t));
+        // v1.75.0：⌘F 已归「全库检索」，顶栏那枚是同一个入口的另一种开法。
+        list = list.child(help_row(
+            "顶栏「检索」",
+            "输词后 ⏎ 开搜 · 三字以上走索引（首次会先建）",
+            t,
+        ));
 
         list = list.child(help_sec("文字", t));
         // v1.37.0：天头（版框上方那段留白）点一下就能写朱砂小字。
