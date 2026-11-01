@@ -26,6 +26,9 @@ pub mod banxin;
 pub mod analysis;
 /// **批量导入**（v1.77.0）：点检 → 串行刻印 → 可取消 → 错误日志。
 pub mod batch;
+/// **批量识别队列**（v1.9.25）：一次选中的多个 PDF / 图片排队等 OCR。
+/// 纯队列状态机，零引擎依赖——接 API 时只写消费循环，UI 不动。
+pub mod ocr;
 /// **问小笺**（v1.76.0 · V2.0 模块二）：AI 伴读的纯逻辑层——服务商预设 /
 /// 提示词组装 / SSE 增量解析。零网络依赖（HTTP 在 UI 层 `src/ai.rs`）。
 pub mod ai;

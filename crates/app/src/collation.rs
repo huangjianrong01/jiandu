@@ -70,6 +70,12 @@ pub enum CollationEvent {
 
 // ── 视觉常量（骨架阶段，先写死；接入主题系统前不改）──
 const HEADER_H: f32 = 44.0;
+/// **快捷标点栏**的高度（v1.9.25）。
+///
+/// 它是**布局常量**不是视觉常量：标点栏夹在状态条与正文之间，所以
+/// `editor_origin()` 的纵向原点必须把它算进去——少算 44px，「点哪落哪」
+/// 就整体上移一行。改这个数，两处（本行、`editor_origin`）自动同变。
+const PUNCT_BAR_H: f32 = 44.0;
 const PAD: f32 = 14.0;
 const FONT_SIZE: f32 = 17.0;
 /// 行高（v1.9.24）：17 × 1.8 ≈ 30.6。
@@ -463,6 +469,67 @@ pub struct CollationWorkspace {
     text_note: Option<String>,
     /// `text_note` 是否是错误（红色）。
     text_err: bool,
+    /// **批量识别队列**（v1.9.25）：一次选中的多个 PDF / 图片。
+    ///
+    /// 只排队、不消费——产品目前不内置 OCR（带文本层的 PDF 走 `pdf_text`
+    /// 直接抽坐标，扫描件要等外部识别）。`jiandu_core::ocr::OcrQueue` 是纯
+    /// 状态机，接 API 时写一个消费循环即可，这块 UI 一行都不用改。
+    ocr_queue: jiandu_core::ocr::OcrQueue,
+    /// 队列面板是否展开（队列为空时恒不画）。
+    ocr_panel: bool,
+    /// 队列的一次性提示（如「3 件已入队 · 2 件不支持，已跳过」）。
+    ocr_note: Option<String>,
+}
+
+/// **快捷标点栏**的一枚动作（v1.9.25）。
+///
+/// 做成枚举而不是 `String`，是为了让「插一个字符」与「包住选区」这两件事
+/// **在类型上就分开**——否则每个按钮回调里都要自己判一次「有没有选区」，
+/// 八处逻辑八种写法，迟早有一处忘了处理选区。
+#[derive(Clone, Copy)]
+enum PunctKey {
+    /// 光标处插入（已有选区则替换）。
+    Plain(&'static str),
+    /// 用一对符号包裹选区；无选区时插一对并把光标放中间。
+    Wrap(&'static str, &'static str),
+    Backspace,
+    Newline,
+}
+
+/// **包裹的纯计算**：给定正文 / 选区 / 光标，算出包裹后的新正文与新光标位。
+///
+/// 抽成自由函数只有一个理由——**可单测**。这段逻辑一旦写进
+/// `wrap_selection(&mut self)`，就只能开窗口点鼠标才验得了；而它恰恰是最容易
+/// 出错的地方（选区越界、CJK 字节边界、光标落在闭合符号外）。
+///
+/// 返回 `(新正文, 新光标)`。光标规则见 [`CollationWorkspace::wrap_selection`]。
+fn wrap_text(
+    text: &str,
+    sel: Option<Range<usize>>,
+    cursor: usize,
+    open: &str,
+    close: &str,
+) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    let cursor = cursor.min(total);
+    let (a, b) = match sel {
+        // 空选区（start == end）按「无选区」处理。
+        Some(r) if r.start != r.end => (r.start.min(r.end).min(total), r.end.max(r.start).min(total)),
+        _ => (cursor, cursor),
+    };
+    let inner: String = chars[a..b].iter().collect();
+    let open_n = open.chars().count();
+    let inner_n = inner.chars().count();
+    let close_n = close.chars().count();
+    let mut out = chars;
+    out.splice(a..b, format!("{open}{inner}{close}").chars());
+    let cursor = if a == b {
+        a + open_n
+    } else {
+        a + open_n + inner_n + close_n
+    };
+    (out.into_iter().collect(), cursor)
 }
 
 impl CollationWorkspace {
@@ -524,6 +591,9 @@ impl CollationWorkspace {
             text_file: None,
             text_note: None,
             text_err: false,
+            ocr_queue: jiandu_core::ocr::OcrQueue::new(),
+            ocr_panel: false,
+            ocr_note: None,
         };
         // 启动即清扫上一进程遗留的临时图（崩溃 / 强退时 `Drop` 跑不到，只能等下次
         // 启动补扫）。只认本应用自己的命名前缀，且只删「够旧」的，绝不误伤另开的
@@ -678,6 +748,35 @@ impl CollationWorkspace {
         cx.notify();
     }
 
+    /// **用一对符号包裹选区**（快捷标点栏的「夹注括号」「方括号」两枚）。
+    ///
+    /// 两条分支，光标落点**故意不同**：
+    ///   ① 有选区 → 包裹后光标停在**闭合符号之后**（一口气把这段注完，接着往下写）；
+    ///   ② 无选区 → 插入一对空符号，光标落在**两个符号中间**（下一步就是写注文，
+    ///      不是跳过它）。「（）」插完把光标丢到括号外面，等于每次都要再按一次
+    ///      ←，校对时那一秒最恼人。
+    fn wrap_selection(&mut self, open: &str, close: &str, cx: &mut Context<Self>) {
+        let (text, cursor) = wrap_text(&self.text, self.selection.clone(), self.cursor, open, close);
+        self.text = text;
+        self.cursor = cursor;
+        self.selection = None;
+        cx.notify();
+    }
+
+    /// 快捷标点栏落子：三类动作统一走这里，**只有一处**决定「插还是包」。
+    fn punct_apply(&mut self, key: PunctKey, cx: &mut Context<Self>) {
+        // 组字中（拼音还没上屏）不许插：此时选区与光标都还是旧的，插进去会叠字。
+        if self.marked.is_some() {
+            return;
+        }
+        match key {
+            PunctKey::Plain(s) => self.insert_text(s, cx),
+            PunctKey::Wrap(open, close) => self.wrap_selection(open, close, cx),
+            PunctKey::Backspace => self.delete_char(false, cx),
+            PunctKey::Newline => self.insert_text("\n", cx),
+        }
+    }
+
     fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         if self.marked.is_some() {
             // 组字中：交给输入法，回填由 `EntityInputHandler` 负责。
@@ -705,6 +804,7 @@ impl CollationWorkspace {
     /// 四个必须一起算的量，漏任何一个都会让「点第 N 行」落到别的行上：
     ///  ① 全局工具条 `HEADER_H`；
     ///  ② 编辑区上面那两条状态条（文本导入提示 24 / 联动提示 26，没有就是 0）；
+    ///  ②′ 快捷标点栏 `PUNCT_BAR_H`（v1.9.25 起夹在状态条与正文之间）；
     ///  ③ 编辑器自身的 `ED_PAD`；
     ///  ④ 滚动偏移（`scroll.offset().y`，向下滚为**负**）。
     ///
@@ -725,7 +825,7 @@ impl CollationWorkspace {
         let scroll_y = px_f32(self.scroll.offset().y);
         (
             vw * 0.4 + ED_PAD,
-            HEADER_H + status_h + link_h + ED_PAD + scroll_y,
+            HEADER_H + status_h + link_h + PUNCT_BAR_H + ED_PAD + scroll_y,
         )
     }
 
@@ -982,6 +1082,114 @@ impl CollationWorkspace {
             )
     }
 
+    /// **快捷标点栏的一枚小方块**（v1.9.25）。
+    ///
+    /// 刻意不做成「灰色按钮」：28×28 的薄片、7px 圆角、4% 墨的底，悬停才浮到
+    /// 10%——它得看起来像**贴在纸上的一枚小签**，而不是工具栏里的一颗控件。
+    /// 朱砂一个都不用：这条栏是笔，不是印章，抢了色就会跟右上的【竖排预览】打架。
+    fn punct_chip(
+        &self,
+        label: &'static str,
+        fs: f32,
+        w: f32,
+        opt: (f32, f32),
+        key: PunctKey,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        // `opt` = **(视觉居中的光学位移)**，只给 `、` 与 `。` 用。
+        //
+        // 这两个字的墨迹长在全角字身的**左下角**（这是 CJK 标点的规矩，不是
+        // 字体缺陷）：几何居中之后，读者看到的是一个「沉在方块左下角的小点」，
+        // 真机放大到 4 倍时我一度以为它根本没画出来。位移量按 28px 方块 / 19px
+        // 字身算出（字身左下 → 方块正中约 +6.5 / −5），写死在这里，别处别抄。
+        let glyph = if opt == (0.0, 0.0) {
+            div().child(SharedString::from(label))
+        } else {
+            div()
+                .absolute()
+                .left(px((w - fs) / 2.0 + opt.0))
+                .top(px((28.0 - fs) / 2.0 + opt.1))
+                .child(SharedString::from(label))
+        };
+        div()
+            .relative()
+            .w(px(w))
+            .h(px(28.0))
+            .mr(px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(7.0))
+            .bg(rgba(0x2B26200D))
+            .hover(|s| s.bg(rgba(0x2B26201F)))
+            .cursor_pointer()
+            .text_size(px(fs))
+            .text_color(rgb(0x4A4335))
+            .child(glyph)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |c, _e: &MouseDownEvent, window, cx| {
+                    c.punct_apply(key, cx);
+                    // **点完必须把焦点还给编辑器**：GPUI 里点击一个非 focusable
+                    // 的 div 不会自动转移焦点，而原生对话框 / 工具栏点击之后
+                    // first responder 已经不在输入框上——不还焦点，接下来打的
+                    // 中文一个都进不去（正是「点了符号再打字就没反应」的死因）。
+                    Self::hard_refocus(window, &c.focus);
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// **古籍校对快捷标点栏**（v1.9.25）。
+    ///
+    /// 挂在编辑器**上方**（状态条之下）。注意它是**布局件**：`editor_origin()`
+    /// 的纵向原点已经把 `PUNCT_BAR_H` 算进去了——这一条少不得，否则「点哪落哪」
+    /// 会整体上移一整条栏的高度。下边距取 0、内外留白靠 `px(ED_PAD)`，
+    /// 让七枚小方块和正文首字**同一条左基线**。
+    fn render_punct_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        // **标点符号走黑体链**（v1.9.25 真机结论）：`、`(U+3001) 与 `。`(U+3002)
+        // 在正文那款宋体里根本不出墨——不是太淡，是**一个字都没画**（真机放大
+        // 到 4 倍看是纯空的）。同一枚方块里换成无衬线就正常显示，所以这条栏
+        // 整体切到 `SourceHanSans → PingFang`：它是**控件**不是正文，不受
+        // 「正文必用宋体」那条规矩约束，而标点认不出就等于这条栏白做。
+        let chip_font = crate::fonts::family_for(
+            crate::types::FontChoice::SourceHanSans,
+            crate::types::Script::Modern,
+        );
+        div()
+            .w_full()
+            .h(px(PUNCT_BAR_H))
+            .flex()
+            .flex_row()
+            .items_center()
+            .px(px(ED_PAD))
+            .bg(rgb(PAPER_R))
+            .font_family(chip_font)
+            // 一道 5% 的发丝线：它是「纸上的另一行」，不是一条分割线。
+            .border_b_1()
+            .border_color(rgba(0x2B26200D))
+            // 五枚符号 + 两枚动作。
+            //
+            // 字号是**逐枚定的**，不是随手写的：`、` `。` 的墨迹只占全角字身
+            // 左下角的一小块，13px 时落成 2px 的点，在浅底上等于没画——所以
+            // 这两枚压到 19px；括号与方括号是成对的窄笔画，14px 刚好撑住；
+            // 圈号本身接近全角，15px 就够。
+            //
+            // `⌫` / `⏎` 这两个符号宋体里没有码位（真机上渲染成豆腐块），
+            // 所以退格与换行改用**汉字**——这不是妥协，标签比符号更好认。
+            .child(self.punct_chip("、", 19.0, 28.0, (9.0, -11.0), PunctKey::Plain("、"), cx))
+            .child(self.punct_chip("。", 19.0, 28.0, (9.0, -11.0), PunctKey::Plain("。"), cx))
+            // 古籍句读的空心圈：朱砂是渲染层画的，这里只负责把 **○** 这个
+            // 字符送进正文（U+25CB，与 `gloss::jodu_of` 认的圈同形）。
+            .child(self.punct_chip("○", 15.0, 28.0, (0.0, 0.0), PunctKey::Plain("○"), cx))
+            .child(self.punct_chip("（）", 14.0, 34.0, (0.0, 0.0), PunctKey::Wrap("（", "）"), cx))
+            .child(self.punct_chip("[]", 14.0, 30.0, (0.0, 0.0), PunctKey::Wrap("[", "]"), cx))
+            // 退格 / 换行与编辑键同源，走 `delete_char(false)` / 插 `\n`，
+            // 不另写一套删除逻辑（另写必与键盘删字符的行为分岔）。
+            .child(self.punct_chip("退格", 10.5, 36.0, (0.0, 0.0), PunctKey::Backspace, cx))
+            .child(self.punct_chip("换行", 10.5, 36.0, (0.0, 0.0), PunctKey::Newline, cx))
+    }
+
     /// 顶部返回栏。
     fn render_header(&self, cx: &mut Context<Self>) -> gpui::Div {
         let song = crate::fonts::family_for(
@@ -1022,6 +1230,10 @@ impl CollationWorkspace {
             // 两个「渠道」并排在最左（用户口径：打开文件与导入 MD 合并到左侧）。
             .child(self.ghost_button("打开文件", |c, _, _, cx| c.open_image_picker(cx), cx))
             .child(self.ghost_button("导入 MD", |c, _, _, cx| c.open_text_picker(cx), cx))
+            // **批量导入**（v1.9.25）：一次选多个 PDF / 图片，排进识别队列。
+            // 与「打开文件」的区别不是选几份，而是**选完不立刻渲染**——它只是
+            // 把活接下来，等 OCR 接入后由队列消费（见 `OcrQueue`）。
+            .child(self.ghost_button("批量导入", |c, _, _, cx| c.open_batch_picker(cx), cx))
             .child(div().flex_1())
             // 唯一的实底主按钮。
             .child(self.primary_button(
@@ -1207,23 +1419,34 @@ impl CollationWorkspace {
                                     .h(px(1.0))
                                     .bg(line_strong),
                             )
-                            // 右侧两道栏线：示意「版面上有字」，压到几乎看不见
+                            // 右侧三道**横**栏线：示意「页面上有字」。
+                            // 早先这里画的是两道竖线，真机上读成了「表格的两列」——
+                            // 横线才是「书页有字」的通用符号，竖线只在版心语义下成立。
                             .child(
                                 div()
                                     .absolute()
-                                    .top(px(9.0))
-                                    .left(px(25.0))
-                                    .w(px(1.0))
-                                    .h(px(24.0))
+                                    .top(px(12.0))
+                                    .left(px(24.0))
+                                    .w(px(20.0))
+                                    .h(px(1.0))
                                     .bg(line_faint),
                             )
                             .child(
                                 div()
                                     .absolute()
-                                    .top(px(9.0))
-                                    .left(px(36.0))
-                                    .w(px(1.0))
-                                    .h(px(24.0))
+                                    .top(px(21.0))
+                                    .left(px(24.0))
+                                    .w(px(20.0))
+                                    .h(px(1.0))
+                                    .bg(line_faint),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(30.0))
+                                    .left(px(24.0))
+                                    .w(px(14.0))
+                                    .h(px(1.0))
                                     .bg(line_faint),
                             ),
                     )
@@ -2490,6 +2713,7 @@ impl CollationWorkspace {
         // 把它并进全局那条——两栏各顶一条色带，看起来像两套软件拼在一起。
         // 现在整屏只有一条工具条，右栏从第一行字就是稿纸。
         div()
+            .relative()
             .w(px(vw * 0.6))
             .h_full()
             .flex()
@@ -2510,7 +2734,217 @@ impl CollationWorkspace {
                 None => div().h(px(0.0)),
             })
             .child(self.render_link_status())
+            // 快捷标点栏：夹在状态条与正文之间（用户口径「挂在编辑器上方」）。
+            .child(self.render_punct_bar(cx))
             .child(editor)
+            // 识别队列浮层：有活才浮出来，压在标点栏上方，不占任何布局。
+            .child(if self.ocr_panel && !self.ocr_queue.is_empty() {
+                self.render_ocr_panel(cx)
+            } else {
+                div()
+            })
+    }
+
+    /// **批量导入**（v1.9.25）：一次选多个 PDF / 图片，全部排进识别队列。
+    ///
+    /// 与 `open_image_picker` 的分工：那个是「打开一份来校」，选完立刻栅格化、
+    /// 立刻可点可联动；这个是「先把活接下来」——本版没有 OCR 引擎，选中即入队，
+    /// 由 `OcrQueue` 记住待识别件数。接 API 后只需在后台起一个消费循环
+    /// （`take_next` → 外呼 → `mark_done/mark_failed`），这个入口一个字不用改。
+    fn open_batch_picker(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(
+            |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    // rfd 同步对话框必须在主线程前台直调（见 IME / reader 的笔记）。
+                    let picked = rfd::FileDialog::new()
+                        .set_title("批量导入原图（PDF / 图片，可多选）")
+                        .add_filter(
+                            "PDF / 图片",
+                            &["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "heic"],
+                        )
+                        .add_filter("全部文件", &["*"])
+                        .pick_files();
+                    let Some(paths) = picked else { return };
+
+                    if let Some(entity) = this.upgrade() {
+                        let _ = entity.update(&mut app, |this, cx| {
+                            let (ok, bad) = this.ocr_queue.push_many(paths);
+                            this.ocr_panel = true;
+                            this.ocr_note = Some(if ok == 0 {
+                                "没接到可识别的文件（只收 PDF / PNG / JPG / TIFF）".to_string()
+                            } else if bad == 0 {
+                                format!("已入队 {ok} 件 · 待识别（本版未内置 OCR）")
+                            } else {
+                                format!("已入队 {ok} 件 · {bad} 件不支持或重复，已跳过")
+                            });
+                            cx.notify();
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// **识别队列浮层**（v1.9.25）：右下角一张小纸，列出队首几件与状态。
+    ///
+    /// 三条克制：① 最多显示 4 行，多的折成一行「另有 N 件」（校对时不该被
+    /// 一长串文件名压住正文）；② 状态用**文字**不用色块，朱砂只留给「失败」
+    /// 一档；③ 底部诚实写明「未内置 OCR」——用户点了批量导入，必须知道现在
+    /// 只是排队，不是已经在识别。
+    fn render_ocr_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
+        let jobs = self.ocr_queue.jobs();
+        const SHOW: usize = 4;
+        let shown = jobs.len().min(SHOW);
+        let mut card = div()
+            .absolute()
+            .right(px(ED_PAD))
+            .bottom(px(56.0))
+            .w(px(300.0))
+            .flex()
+            .flex_col()
+            .p(px(14.0))
+            .rounded(px(12.0))
+            .bg(rgba(0xFBF6E6F5))
+            .border_1()
+            .border_color(rgba(0x2B262014))
+            .shadow_md()
+            // 抬头：标题 + 计数 + 一枚关闭。
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_family(song.clone())
+                            .text_size(px(12.5))
+                            .text_color(rgb(0x4B453A))
+                            .child(SharedString::from(format!(
+                                "识别队列 · {} 件",
+                                jobs.len()
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(rgba(0x2B26208C))
+                            .hover(|s| s.text_color(rgb(0x8c2b22)))
+                            .child(SharedString::from("收起"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|c, _, _, cx| {
+                                    c.ocr_panel = false;
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            )
+            .child(div().h(px(8.0)));
+        for j in jobs.iter().take(shown) {
+            let (fg, tag) = match j.state {
+                jiandu_core::ocr::OcrState::Failed => (rgb(0xb0342c), "失败"),
+                jiandu_core::ocr::OcrState::Done => (rgba(0x4A4335AA), "完成"),
+                _ => (rgb(0x4A4335), j.state.label()),
+            };
+            card = card.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .mb(px(5.0))
+                    // 类型小签：PDF / 图
+                    .child(
+                        div()
+                            .w(px(26.0))
+                            .mr(px(6.0))
+                            .text_size(px(10.5))
+                            .text_color(rgba(0x8C2B22AA))
+                            .child(SharedString::from(j.kind.label())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_size(px(11.5))
+                            .text_color(rgb(0x4A4335))
+                            .child(SharedString::from(j.name.clone())),
+                    )
+                    .child(
+                        div()
+                            .ml(px(6.0))
+                            .text_size(px(10.5))
+                            .text_color(fg)
+                            .child(SharedString::from(tag)),
+                    ),
+            );
+        }
+        if jobs.len() > shown {
+            card = card.child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgba(0x7E7666C0))
+                    .mb(px(4.0))
+                    .child(SharedString::from(format!(
+                        "另有 {} 件在队列中",
+                        jobs.len() - shown
+                    ))),
+            );
+        }
+        card.child(div().h(px(6.0)))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(10.5))
+                            .text_color(rgba(0x7E7666C0))
+                            .child(SharedString::from(
+                                self.ocr_note
+                                    .clone()
+                                    .unwrap_or_else(|| "本版未内置 OCR · 队列已暂存".to_string()),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .ml(px(8.0))
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .text_color(rgba(0x2B26208C))
+                            .hover(|s| s.text_color(rgb(0x8c2b22)))
+                            .child(SharedString::from("清空"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|c, _, _, cx| {
+                                    c.ocr_queue.clear();
+                                    c.ocr_panel = false;
+                                    c.ocr_note = None;
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            )
     }
 
     /// 渲染单行（**一个文本节点 + 两层绝对定位覆盖物**）。
@@ -4312,6 +4746,63 @@ mod tests {
 }
 
 
+/// **快捷标点栏**的纯计算单测（v1.9.25）。
+///
+/// 这些用例把「点一枚符号到底改了什么」钉死成可执行的断言——没有它们，
+/// 这套交互只能靠开窗口点鼠标验，而**光标落点差一格**正是用户当场就会骂的
+/// 那种缺陷。三条分支各覆盖：无选区、有选区、越界与 CJK 边界。
+#[cfg(test)]
+mod punct_bar_tests {
+    use super::*;
+
+    #[test]
+    fn wrap_without_selection_puts_caret_between_symbols() {
+        // 「甲乙」光标在 1（甲 | 乙）→ 插一对空括号，光标落在括号中间。
+        let (text, cursor) = wrap_text("甲乙", None, 1, "（", "）");
+        assert_eq!(text, "甲（）乙");
+        assert_eq!(cursor, 2, "光标必须落在两个符号之间，下一步才写得了注文");
+    }
+
+    #[test]
+    fn wrap_with_selection_puts_caret_after_closing_symbol() {
+        // 选中「乙丙」，用方括号包住 → 光标停在 `]` 之后。
+        let (text, cursor) = wrap_text("甲乙丙丁", Some(1..3), 3, "[", "]");
+        assert_eq!(text, "甲[乙丙]丁");
+        assert_eq!(cursor, 5, "包裹后光标应落在闭合符号之后");
+    }
+
+    #[test]
+    fn wrap_ignores_empty_or_reversed_selection() {
+        // 空选区（start == end）等同无选区：插一对，光标在中间。
+        let (text, cursor) = wrap_text("甲乙", Some(1..1), 1, "（", "）");
+        assert_eq!(text, "甲（）乙");
+        assert_eq!(cursor, 2);
+        // 反向拖拽（start > end）也必须正确包裹，不能 panic。
+        let (text, cursor) = wrap_text("甲乙丙", Some(2..0), 2, "[", "]");
+        assert_eq!(text, "[甲乙]丙");
+        assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn wrap_clamps_out_of_range_cursor() {
+        // 光标越界（滚动 / 删字后残留的旧下标）不许 panic，按文末处理。
+        let (text, cursor) = wrap_text("甲乙", None, 99, "（", "）");
+        assert_eq!(text, "甲乙（）");
+        assert_eq!(cursor, 3);
+    }
+
+    #[test]
+    fn wrap_selection_counts_cjk_by_char_not_byte() {
+        // 「天地玄黃」四字 12 字节：按下标 1..3 必须切出「地玄」两个字，
+        // 而不是切进某个字的第 2 个字节（v1.9.18 那次 panic 的同款坑）。
+        let (text, cursor) = wrap_text("天地玄黃", Some(1..3), 3, "（", "）");
+        assert_eq!(text, "天（地玄）黃");
+        assert_eq!(cursor, 5);
+        assert_eq!(text.chars().count(), 6);
+    }
+}
+
+/// **康熙部首折叠**的回归（v1.9.23）。
 #[cfg(test)]
 mod radical_fold_tests {
     use super::*;
