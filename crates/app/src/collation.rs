@@ -596,7 +596,7 @@ fn wrap_text(
 
 impl CollationWorkspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let mut me = Self {
+        let me = Self {
             // 示例转录：一段较长的古文（千字文节选），让用户一进来就能看到
             // 编辑器、立即尝试选择/输入，并直接打开「竖排预览」看到多页分页。
             text: "天地玄黄 宇宙洪荒 日月盈昃 辰宿列张 寒来暑往 秋收冬藏 闰余成岁 律吕调阳 云腾致雨 露结为霜 金生丽水 玉出昆冈 剑号巨阙 珠称夜光 果珍李柰 菜重芥姜 海咸河淡 鳞潜羽翔 龙师火帝 鸟官人皇 始制文字 乃服衣裳 推位让国 有虞陶唐 吊民伐罪 周发殷汤 坐朝问道 垂拱平章 爱育黎首 臣伏戎羌 遐迩一体 率宾归王 鸣凤在竹 白驹食场 化被草木 赖及万方\n盖此身发 四大五常 恭惟鞠养 岂敢毁伤 女慕贞洁 男效才良 知过必改 得能莫忘 罔谈彼短 靡恃己长 信使可覆 器欲难量 墨悲丝染 诗赞羔羊 景行维贤 克念作圣 德建名立 形端表正 空谷传声 虚堂习听 祸因恶积 福缘善庆 尺璧非宝 寸阴是竞 资父事君 曰严与敬 孝当竭力 忠则尽命 临深履薄 夙兴温凊 似兰斯馨 如松之盛 川流不息 渊澄取映 容止若思 言辞安定 笃初诚美 慎终宜令 荣业所基 藉甚无竟 学优登仕 摄职从政 存以甘棠 去而益咏"
@@ -5660,17 +5660,22 @@ mod raster_color_tests {
     use core_foundation::url::CFURL;
     use core_graphics::context::CGContext;
     use core_graphics::geometry::{CGPoint, CGRect, CGSize};
-    use std::os::raw::c_void;
 
     extern "C" {
+        // ⚠️ 签名必须与 `share_paint.rs` 里那四条**逐字一致**：同一枚 C 符号
+        // 在两处写成两套类型，编译器会报「redeclared with a different
+        // signature」，链接器却照旧按一个符号走——真出事是最难查的那种账。
         fn CGPDFContextCreateWithURL(
-            url: *const c_void,
+            url: core_foundation::url::CFURLRef,
             media: *const CGRect,
-            aux: *const c_void,
-        ) -> *mut c_void;
-        fn CGPDFContextBeginPage(ctx: *mut c_void, info: *const c_void);
-        fn CGPDFContextEndPage(ctx: *mut c_void);
-        fn CGPDFContextClose(ctx: *mut c_void);
+            aux: core_foundation::base::CFTypeRef,
+        ) -> core_graphics::sys::CGContextRef;
+        fn CGPDFContextBeginPage(
+            ctx: core_graphics::sys::CGContextRef,
+            info: core_foundation::base::CFTypeRef,
+        );
+        fn CGPDFContextEndPage(ctx: core_graphics::sys::CGContextRef);
+        fn CGPDFContextClose(ctx: core_graphics::sys::CGContextRef);
     }
 
     /// 纯红整页 → 栅格化后第一个像素必须是 (255, 0, 0, 255)。
@@ -5681,14 +5686,10 @@ mod raster_color_tests {
         let url = CFURL::from_path(&path, false).expect("路径");
         let media = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(200.0, 200.0));
         let raw = unsafe {
-            CGPDFContextCreateWithURL(
-                url.as_concrete_TypeRef() as *const c_void,
-                &media,
-                std::ptr::null(),
-            )
+            CGPDFContextCreateWithURL(url.as_concrete_TypeRef(), &media, std::ptr::null())
         };
         assert!(!raw.is_null(), "建 PDF 上下文失败");
-        let ctx = unsafe { CGContext::from_existing_context_ptr(raw as *mut _) };
+        let ctx = unsafe { CGContext::from_existing_context_ptr(raw) };
         unsafe { CGPDFContextBeginPage(raw, std::ptr::null()) };
         ctx.set_rgb_fill_color(1.0, 0.0, 0.0, 1.0);
         ctx.fill_rect(CGRect::new(

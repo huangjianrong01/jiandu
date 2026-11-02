@@ -48,6 +48,11 @@ const HAIR: u32 = 0xC9BDA6;
 const INK_SOFT: u32 = 0x6B6357;
 /// 三级墨（本数等旁注小字）。
 const INK_FAINT: u32 = 0x9A9184;
+/// 「今日 … 叶」那个数目：赭红，比朱砂（`CINNABAR`）沉一档。
+///
+/// 为什么不用朱砂：页签里「全部」是朱砂实底，旁边再来一个同样亮的红数，
+/// 两块红会互相抢；赭石落在这张米黄桌上更像旧账上的一笔记号。
+const TALLY_INK: u32 = 0xA83A2C;
 
 // ---- 书衣几何 ----
 /// 书衣（一张卡片）的宽 × 高。
@@ -726,6 +731,10 @@ impl Root {
     /// 顶栏与页签**固定在顶部**：它们是 `flex_col` 里独立的兄弟节点，
     /// 只有下面那层网格会滚，滚多远天头都不动。
     fn render_shelf_top(&mut self, cx: &mut Context<Self>) -> Div {
+        // 今日读叶账：跨零点就换账（半分钟看一眼时钟，不必每帧问）。
+        if self.read_stats_stale() {
+            self.refresh_read_stats();
+        }
         let song = crate::fonts::family_for(
             crate::types::FontChoice::SongTi,
             crate::types::Script::Ancient,
@@ -801,6 +810,15 @@ impl Root {
             .pb(px(12.0))
             .bg(rgb(SHELF_BG))
             .child(title)
+            // 「今日 … 叶」紧跟在「书架」之后、**每日一句之前**（用户定稿）：
+            // 这三样从左到右是「这是哪儿 → 我今天读了多少 → 今日一句」，
+            // 先给数目、再给意思，顺序才对。
+            .child(self.render_read_tally())
+            .child(
+                // 一道极细的竖界栏，把回执与每日一句分开——不然三簇字挤成一排，
+                // 读起来像一句没断句的话。
+                div().w(px(1.0)).h(px(11.0)).bg(rgb(HAIR)),
+            )
             .child(quote);
 
         // 搜索：未点开时只是一枚放大镜；点开后原地展开下划线输入框。
@@ -826,6 +844,85 @@ impl Root {
             .child(self.render_shelf_tabs(cx));
 
         div().flex().flex_col().child(bar).child(tabs)
+    }
+
+    /// 顶栏第一行那行小字：**今日读了几叶**（v1.9.38）。紧跟在「书架」
+    /// 之后、每日一句之前。
+    ///
+    /// 这是一封给读书人的小回执，不是仪表盘：没有图表、没有进度环、没有
+    /// 鼓掌动画，只有一行「今日 三十八 叶」。数目用汉字写（`numcn`），与
+    /// 叶码、落款同一套笔法。
+    ///
+    /// 「连续七日」那半句才是真要留住人的地方——今天读到哪儿是给今天的
+    /// 交代，连了几天是给明天的理由。
+    ///
+    /// 今日尚未开卷时**不摆一个冷冰冰的「0」**：写「尚待开卷」，读着像
+    /// 一句提醒，不像一条考核。
+    ///
+    /// ⚠️ 只读内存里算好的两个数（`read_today` / `read_streak`），本函数
+    /// 不查时钟、不扫账本、不碰磁盘——书架每帧都会调它。
+    fn render_read_tally(&self) -> Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::SongTi,
+            crate::types::Script::Ancient,
+        );
+        let n = self.read_today;
+        let days = self.read_streak;
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .font_family(song);
+        if n == 0 {
+            row = row
+                .text_size(px(11.0))
+                .text_color(rgb(INK_FAINT))
+                .child(SharedString::from("今日 尚待开卷"));
+        } else {
+            row = row
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(INK_FAINT))
+                        .child(SharedString::from("今日")),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(rgb(TALLY_INK))
+                        .child(SharedString::from(jiandu_core::numcn::num_to_cn(
+                            n as u64,
+                        ))),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(INK_SOFT))
+                        .child(SharedString::from("叶")),
+                );
+        }
+        // 「连续一日」不必说（今天这一叶本身就是第一天）；两日以上才值得
+        // 提一句。
+        if days >= 2 {
+            row = row
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(HAIR))
+                        .child(SharedString::from("·")),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(INK_FAINT))
+                        .child(SharedString::from(format!(
+                            "连续{}日",
+                            jiandu_core::numcn::num_to_cn(days as u64)
+                        ))),
+                );
+        }
+        row
     }
     /// 放大镜（搜索）：GPUI 0.2.2 没有图标集，这枚是 canvas 画的——
     /// 一圈细边 + 一根斜柄，16px，淡墨、悬停朱砂。

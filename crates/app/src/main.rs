@@ -26,6 +26,9 @@
 /// `Root` 里会带着整棵阅读树重绘。落盘（密钥 / 服务商）见 `jiandu_core::ai`。
 mod ai;
 mod app;
+/// **本地日历日**（v1.9.38）：书架「今日读叶」与落款日期的唯一真源。
+/// 时区只有平台知道，故 `localtime_r` 落在这里；core 只管纯日期算术。
+mod clock;
 /// **笺校工作台**（MVP · 模块三）：与阅读器完全解耦的全屏模态视图。
 /// 顶层状态机 `AppMode` 在此；进入时 `Root::render` 直接返回它的视图实体，
 /// 根本不构建阅读界面（见 `collation.rs` 文件头）。
@@ -135,11 +138,14 @@ use jiandu_core::library::Library;
 use std::borrow::Cow;
 use std::path::PathBuf;
 
-/// **应用级动作**（v1.9.22）：原生菜单栏里的那两条。
-///
-/// 为什么要 Action 而不是直接调函数：GPUI 0.2.2 的菜单项必须携带一枚
-/// `Action`，点了之后由 `cx.on_action` 派发；没有 action 的菜单项在 AppKit
-/// 里是灰的（点了没反应）。命名空间 `jiandu` 只用于调试打印。
+// **应用级动作**（v1.9.22）：原生菜单栏里的那两条。
+//
+// 为什么要 Action 而不是直接调函数：GPUI 0.2.2 的菜单项必须携带一枚
+// `Action`，点了之后由 `cx.on_action` 派发；没有 action 的菜单项在 AppKit
+// 里是灰的（点了没反应）。命名空间 `jiandu` 只用于调试打印。
+//
+// ⚠️ 只能用 `//` 不能写 `///`：`actions!` 展开成一组 item，挂在宏上的
+// 文档注释会被丢掉（`unused_doc_comments`）。
 gpui::actions!(jiandu, [ShowAbout, QuitApp]);
 
 /// 应用资源源：从书架主目录（`~/.jiandu`，可用 `JIANDU_HOME` 覆盖）加载资源，

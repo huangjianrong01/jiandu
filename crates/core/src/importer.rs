@@ -1701,7 +1701,7 @@ pub fn import_txt_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book> 
         if acc + para_chars >= MAX_CHAPTER_CHARS {
             if !para_buf.is_empty() {
                 paras.push(crate::pipeline::paragraph_of(&para_buf));
-                acc += para_chars;
+                // 不必 `acc += para_chars`：下一行就把 acc 归零了。
                 para_buf.clear();
                 para_chars = 0;
             }

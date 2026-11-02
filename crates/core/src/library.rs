@@ -267,11 +267,85 @@ pub fn ellipsis(s: &str, max: usize) -> String {
     out
 }
 
+/// 一日读叶账：书架首页那行「今日 … 叶」的唯一数据源。
+///
+/// 按**本地日期键**分桶（`YYYY-MM-DD`），不是「拿上次阅读时间戳现推」——
+/// 跨零点还在读的时候，那一叶算今天还是昨天，只有按下笔那一刻的日期分桶
+/// 才说得清；也正因为分了桶，连续天数才数得出来。
+///
+/// 落在 `library.json` 顶层：那个文件在 `touch()` 里本来就要整份重写，
+/// 多带一行数组不多花一次 I/O（**不为它单开库、单开事务**）。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadDay {
+    /// 本地日期键，`YYYY-MM-DD`。
+    pub day: String,
+    /// 当日读过的叶数（同一叶只算一次，去重在 `Root::count_leaf`）。
+    pub leaves: usize,
+}
+
+/// 读叶账留多少天：一年有余。够数「连续」，也够将来做「近来」的曲线；
+/// 再长就是白占地方（一天一条，400 条不过几 KB）。
+const READ_DAYS_KEEP: usize = 400;
+
 /// 书架索引。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Library {
     #[serde(default)]
     pub books: Vec<ShelfEntry>,
+    /// 按日分桶的读叶账（v1.9.38）。老存档没有这一项 → 空，自动兼容。
+    #[serde(default)]
+    pub read_days: Vec<ReadDay>,
+}
+
+/// `YYYY-MM-DD` → epoch 天（1970-01-01 为 0）。解析失败返回 `None`。
+///
+/// 只认这**一种**格式：日期键是我们自己写的，不猜、不容错——猜错的下场是
+/// 「连续」乱跳。
+pub fn day_epoch(day: &str) -> Option<i64> {
+    let b = day.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y: i64 = day.get(0..4)?.parse().ok()?;
+    let m: u32 = day.get(5..7)?.parse().ok()?;
+    let d: u32 = day.get(8..10)?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+/// epoch 天 → `YYYY-MM-DD`。
+pub fn day_key_of(z: i64) -> String {
+    let (y, m, d) = civil_from_days(z);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// 公历 → epoch 天。Howard Hinnant 的 `days_from_civil`：纯整数、无查表，
+/// 与 `share::civil_from_days` 互逆（那边只做反方向，重复的十几行不值得为它
+/// 让 core 依赖 UI 层）。
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (if m > 2 { m - 3 } else { m + 9 }) as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// epoch 天 → 公历（与 `days_from_civil` 互逆，单测也靠它闭环）。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// 书封主色候选（宣纸 / 黛青 / 赭石 / 松烟…）。
@@ -445,6 +519,69 @@ impl Library {
         if let Ok(s) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(Self::index_path(), s);
         }
+    }
+
+    /// 记「今日读了几叶」（v1.9.38）。
+    ///
+    /// `day` 是本地日期键（`YYYY-MM-DD`），由壳子按系统时区算出后传进来——
+    /// core 不碰时区（那要平台能力），只做账。
+    ///
+    /// **只加不写库**：真的落盘交给同一条路上的 `touch()` / `save()`，
+    /// 翻一叶就多一次 `fsync` 是绝不允许的。
+    pub fn bump_read(&mut self, day: &str, leaves: usize) {
+        if leaves == 0 || day_epoch(day).is_none() {
+            return;
+        }
+        if let Some(r) = self.read_days.iter_mut().find(|r| r.day == day) {
+            r.leaves = r.leaves.saturating_add(leaves);
+            return;
+        }
+        self.read_days.push(ReadDay {
+            day: day.to_string(),
+            leaves,
+        });
+        // 按日期升序（新的一天追加在末尾是常态，这里只在跨日 / 系统时间倒拨
+        // 之后才真的动一次），再削掉最老的。
+        self.read_days
+            .sort_by_key(|r| day_epoch(&r.day).unwrap_or(i64::MIN));
+        if self.read_days.len() > READ_DAYS_KEEP {
+            let cut = self.read_days.len() - READ_DAYS_KEEP;
+            self.read_days.drain(..cut);
+        }
+    }
+
+    /// 某一天读了几叶（`0` = 那天没读 / 没记账）。
+    pub fn read_on(&self, day: &str) -> usize {
+        self.read_days
+            .iter()
+            .find(|r| r.day == day)
+            .map(|r| r.leaves)
+            .unwrap_or(0)
+    }
+
+    /// 连续阅读天数（含今天）。
+    ///
+    /// 今天还没读时**从昨天往前数**——「今天才刚起床」不该把攒了半个月的
+    /// 连击清零，那会让人扫兴；一旦昨天也没读，连击才真断。
+    pub fn streak(&self, today: &str) -> usize {
+        let Some(mut z) = day_epoch(today) else {
+            return 0;
+        };
+        let read = |z: i64| {
+            self.read_days
+                .iter()
+                .any(|r| r.leaves > 0 && day_epoch(&r.day) == Some(z))
+        };
+        if !read(z) {
+            z -= 1;
+        }
+        let mut n = 0usize;
+        // 上界取账本长度：账本里最多 READ_DAYS_KEEP 天，一轮就到底。
+        while n < self.read_days.len() + 1 && read(z) {
+            n += 1;
+            z -= 1;
+        }
+        n
     }
 
     /// 更新一本书的阅读档案（同时记下最近阅读时间，「正在阅读」用）。
@@ -961,5 +1098,99 @@ pub(crate) mod tests {
         );
         std::env::remove_var("JIANDU_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ---- 读叶账（v1.9.38）----
+
+    /// **日期键 ↔ epoch 天**必须严格互逆，闰年也不例外——「连续」全靠它。
+    #[test]
+    fn day_key_round_trips_across_leap_years() {
+        for (z, k) in [
+            (0, "1970-01-01"),
+            (days_from_civil(2000, 2, 29), "2000-02-29"),
+            (days_from_civil(2024, 2, 29), "2024-02-29"),
+            (days_from_civil(2026, 11, 2), "2026-11-02"),
+            (days_from_civil(2100, 3, 1), "2100-03-01"),
+        ] {
+            assert_eq!(day_key_of(z), k, "epoch {z} 应落 {k}");
+            assert_eq!(day_epoch(k), Some(z), "{k} 应回 {z}");
+        }
+        // 相邻两天恰好差 1（跨月、跨年、跨闰日都要成立）。
+        for (a, b) in [
+            ("2026-11-01", "2026-11-02"),
+            ("2026-12-31", "2027-01-01"),
+            ("2024-02-28", "2024-02-29"),
+        ] {
+            assert_eq!(day_epoch(b).unwrap() - day_epoch(a).unwrap(), 1, "{a}→{b}");
+        }
+        // 坏键一律不认：宁可那天不记账，也不许把连击数歪。
+        for bad in ["2026-11", "2026-13-01", "2026-00-10", "2026/11/02", "", "abc"] {
+            assert_eq!(day_epoch(bad), None, "{bad} 不该被接受");
+        }
+    }
+
+    /// 记账：同一天累加、不同天分桶，且**能原样存进 library.json 再读回来**
+    /// （这是「今日」跨重启仍在的唯一保证）。
+    #[test]
+    fn read_log_buckets_by_day_and_survives_a_round_trip() {
+        let mut lib = Library::default();
+        lib.bump_read("2026-11-02", 3);
+        lib.bump_read("2026-11-02", 5);
+        lib.bump_read("2026-11-01", 40);
+        assert_eq!(lib.read_on("2026-11-02"), 8, "同日累加");
+        assert_eq!(lib.read_on("2026-11-01"), 40, "他日分桶");
+        assert_eq!(lib.read_on("2026-10-31"), 0, "没读就是 0");
+        // 0 叶不建桶（否则「从没读过」也会留一行空账）。
+        lib.bump_read("2026-10-31", 0);
+        assert!(lib.read_days.iter().all(|r| r.day != "2026-10-31"));
+        // 坏日期键不收。
+        lib.bump_read("2026-02-30 上午", 9);
+        assert_eq!(lib.read_days.len(), 2);
+        // 落档再读回来，账本一字不差。
+        let json = serde_json::to_string(&lib).unwrap();
+        let back: Library = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.read_on("2026-11-02"), 8);
+        assert_eq!(back.read_days, lib.read_days);
+        // 老存档（没有 read_days 这个键）也能读，不炸。
+        let old: Library = serde_json::from_str(r#"{"books":[]}"#).unwrap();
+        assert!(old.read_days.is_empty());
+        assert_eq!(old.streak("2026-11-02"), 0);
+    }
+
+    /// 连续天数：今天未读**不清零**（从昨天往前数）；断一天就真断。
+    #[test]
+    fn streak_forgives_an_unread_morning_but_breaks_on_a_real_gap() {
+        let mut lib = Library::default();
+        for (d, n) in [
+            ("2026-10-28", 5),
+            ("2026-10-29", 6),
+            ("2026-10-30", 0), // 那天翻了两下没读成，不记（或记 0）都算断
+            ("2026-10-31", 9),
+            ("2026-11-01", 12),
+        ] {
+            lib.bump_read(d, n);
+        }
+        // 今天（11-02）还没读：连的是 10-31、11-01 两天。
+        assert_eq!(lib.streak("2026-11-02"), 2);
+        lib.bump_read("2026-11-02", 1);
+        assert_eq!(lib.streak("2026-11-02"), 3, "今日一读就接上");
+        // 隔天没读，再往后就连不上了。
+        assert_eq!(lib.streak("2026-11-03"), 3, "今天没读仍从昨天数");
+        assert_eq!(lib.streak("2026-11-04"), 0, "昨天也没读，连击归零");
+    }
+
+    /// 账本有上限：攒满一年也只在文件里留 400 条（翻页不该把 json 越写越大）。
+    #[test]
+    fn read_log_is_pruned_to_the_keep_window() {
+        let mut lib = Library::default();
+        let base = day_epoch("2026-01-01").unwrap();
+        for i in 0..(READ_DAYS_KEEP + 20) {
+            lib.bump_read(&day_key_of(base + i as i64), 1);
+        }
+        assert_eq!(lib.read_days.len(), READ_DAYS_KEEP);
+        // 削的是最老的，最新那天一定还在。
+        let last = day_key_of(base + (READ_DAYS_KEEP + 19) as i64);
+        assert_eq!(lib.read_on(&last), 1);
+        assert!(lib.read_days.windows(2).all(|w| w[0].day < w[1].day), "按日期升序");
     }
 }

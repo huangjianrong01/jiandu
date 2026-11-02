@@ -320,6 +320,24 @@ pub struct EntityCard {
 
 pub struct Root {
     pub library: Library,
+    /// **今日读叶数**（v1.9.38）：书架首页那行「今日 … 叶」。
+    ///
+    /// 不从账本现算：书架每帧都读它，而「连续」要逐日比对。这里只放**算好的
+    /// 结果**，由 [`Root::refresh_read_stats`] 在「进书架 / 翻一叶 / 隔一会儿」
+    /// 三个时机刷新（见 `shelf::render_shelf_top`）。
+    pub read_today: usize,
+    /// 连续阅读天数（含今日；今日未读则从昨日往前数）。
+    pub read_streak: usize,
+    /// 今天已经数过叶的 `(书序号, 叶序号)`。
+    ///
+    /// 翻回去查一行资料、再翻回来，账上不该多出两叶。**只在内存**：换日即
+    /// 清，重启后最多重数几叶，不值得为它写盘。
+    read_seen: std::collections::HashSet<(usize, usize)>,
+    /// 上面那张表属于哪一天（本地日期键 `YYYY-MM-DD`）。
+    read_day: String,
+    /// 上次刷新读叶账的时刻：书架每帧都刷一次 `localtime_r` 太浪费，
+    /// 半分钟一次足够（跨零点最多晚半分钟换账）。
+    read_stats_at: Option<std::time::Instant>,
     pub screen: Screen,
     /// 当前书在书架中的下标。
     pub current: usize,
@@ -1273,6 +1291,12 @@ impl Root {
 
         let mut root = Self {
             library,
+            // 今日读叶账（v1.9.38）：开局先按账本算一遍，书架第一帧就有数。
+            read_today: 0,
+            read_streak: 0,
+            read_seen: std::collections::HashSet::new(),
+            read_day: String::new(),
+            read_stats_at: None,
             screen: Screen::Shelf,
             current: 0,
             book: None,
@@ -1539,6 +1563,9 @@ impl Root {
         // 行高缩放随**当前正文字体**定：默认「刻本宋体」（文津宋体）取 1.05。
         // 不设的话是中性值 1.0，切一次排版字体后行高会突然变——一开局就对齐。
         root.grid.line_scale = crate::fonts::preset_line_scale(root.font_preset);
+        // v1.9.38：开局先把「今日读了几叶 / 连续几日」按账本算好，
+        // 书架第一帧就有数，不必等第一次翻页。
+        root.refresh_read_stats();
         // 开发用：JIANDU_SHELF=list 以书脊列表开局、JIANDU_SHELF_Q=词 预填搜索、
         // JIANDU_SHELF_CAT=史 预选分类，便于逐态截图核对书架。
         if let Ok(v) = std::env::var("JIANDU_SHELF") {
@@ -3142,10 +3169,86 @@ impl Root {
                 self.toast = None;
                 // 恢复进度后立刻对齐当前章，目录朱砂红点才不会错位。
                 self.sync_current_chapter();
+                // v1.9.38：开卷即在读——这一叶也算今日读过的（同一叶一天
+                // 只记一次，所以反复开关同一本书不会把账刷上去）。
+                // 旧进度若比现有页数大（换过字号 / 版式），一叶不记。
+                if self.page_count() > 0 && self.page <= self.max_page() {
+                    self.count_leaf(self.page);
+                }
+                self.persist();
             }
             Err(e) => {
                 self.notice = format!("打开失败：{e}");
             }
+        }
+    }
+
+    /// 一次翻页**落在哪几叶**上（纯函数，单测锁死）。
+    ///
+    /// 单面翻一叶、对开一次走两叶（右页 `new` 与左页 `new + 1` 同时在眼前，
+    /// 两叶都算读过）；末叶之后不许越界记账。`last` 是最后一叶的下标。
+    ///
+    /// 抽成纯函数是为了让「对开记两叶、末叶不越界」这条规矩能被断言，
+    /// 而不必去构造一个带 gpui 上下文的 `Root`（那玩意儿造不出来）。
+    pub(crate) fn landed_leaf_range(
+        new: usize,
+        span: usize,
+        last: usize,
+    ) -> std::ops::Range<usize> {
+        let end = new.saturating_add(span).min(last.saturating_add(1));
+        new..end
+    }
+
+    /// **记一叶入「今日读叶账」**（v1.9.38）。
+    ///
+    /// 调用点只有两处：`step()`（真翻页）与 `open_book()`（开卷即读了这一叶）。
+    /// 目录跳章、恢复进度、换字号重排都**不算读**——那些一叶没读，记上去
+    /// 是虚报。
+    ///
+    /// 只记账、不落盘：调用点紧接着就 `persist()`，账随同一次 `save()` 落到
+    /// `library.json`，**不为它多一次 `fsync`**。
+    ///
+    /// 同一叶同一天只记一次（`read_seen`）：翻回去查一行、再翻回来，账上
+    /// 不该多出两叶。去重表在内存里，一叶一次哈希，没有 I/O。
+    pub fn count_leaf(&mut self, page: usize) {
+        let today = crate::clock::today_key();
+        if self.read_day != today {
+            // 跨零点了：账换新的一页，昨天的叶不往今天算。
+            self.read_day = today;
+            self.read_seen.clear();
+        }
+        let key = (self.current, page);
+        // 上限纯属兜底：一天两万叶是不可能的。真到那儿就不再查重、只涨不卡
+        // ——宁可数字虚一点，也不让一个 `HashSet` 无限长下去。
+        if self.read_seen.len() < 20_000 && !self.read_seen.insert(key) {
+            return;
+        }
+        self.library.bump_read(&self.read_day, 1);
+        self.read_today = self.library.read_on(&self.read_day);
+        self.read_streak = self.library.streak(&self.read_day);
+    }
+
+    /// 从账本重算「今日 / 连续」两个数（开局、进书架、跨日各刷一次）。
+    pub fn refresh_read_stats(&mut self) {
+        let today = crate::clock::today_key();
+        if self.read_day != today {
+            self.read_day = today;
+            self.read_seen.clear();
+        }
+        self.read_today = self.library.read_on(&self.read_day);
+        self.read_streak = self.library.streak(&self.read_day);
+        self.read_stats_at = Some(std::time::Instant::now());
+    }
+
+    /// 读叶账要不要重算。
+    ///
+    /// 书架每帧都会问这一句，故**不能每帧都去问系统时钟**（`localtime_r` +
+    /// 一次格式化，60Hz 下纯属白烧）：距上次刷新满 30 秒才重算一次。
+    /// 代价是零点后的头半分钟里，数字还算着「昨天」——肉眼看不出来。
+    pub fn read_stats_stale(&self) -> bool {
+        match self.read_stats_at {
+            Some(t) => t.elapsed().as_secs() >= 30,
+            None => true,
         }
     }
 
@@ -3173,6 +3276,8 @@ impl Root {
     /// 回到书架。
     pub fn back_to_shelf(&mut self) {
         self.persist();
+        // v1.9.38：书架那行「今日 … 叶」按刚合上的账本重算（读完回来即见涨）。
+        self.refresh_read_stats();
         self.screen = Screen::Shelf;
         self.book = None;
         // 回书架时收起书的临时态；搜索词与视图/排序保留（用户偏好）。
@@ -4176,7 +4281,8 @@ impl Root {
             Bytes(Vec<u8>),
             Temp(PathBuf),
         }
-        let mut n_leaf: usize = 0;
+        // 两条路（整本流式 / 单叶批量）都会先落值再读它，故不预置 0。
+        let n_leaf: usize;
         let render = if matches!(scope, PdfScope::Book) {
             match self.render_book_streaming(&book, &flow, &ruby, &geo, &author, reserve, notes_inline, west_mode) {
                 Ok((n, tmp)) => {
@@ -4239,7 +4345,7 @@ impl Root {
             let leaves: Vec<crate::pdf::PdfLeaf> = picked
                 .iter()
                 .enumerate()
-                .map(|(k, &pi)| crate::pdf::PdfLeaf {
+                .map(|(_, &pi)| crate::pdf::PdfLeaf {
                     page: &pages[pi],
                     title: &title,
                     chapter: ci,
@@ -6069,6 +6175,15 @@ fn anki_push_card(
         self.toast = None;
         // 窄屏引导也跟着走：用户已经在读书了，不用再教（v1.52.3）。
         self.narrow_hint = false;
+        // v1.9.38：先把这一叶记进「今日」账，再一次性落盘——顺序不能反，
+        // 反了这叶就得等下一叶才写进 json。
+        //
+        // 对开一次走两叶（右页 `new`、左页 `new + 1` 同时在眼前）：两叶都算
+        // 读过，超出末叶的那一份不记。
+        let span = if self.duplex == Duplex::Facing { 2 } else { 1 };
+        for p in Self::landed_leaf_range(new, span, last) {
+            self.count_leaf(p);
+        }
         self.persist();
         cx.notify();
     }
@@ -7348,6 +7463,37 @@ mod tests {
     // 单测验的是「算式本身」，直接调 `compute_grid` 绕开 `calculate_grid`
     // 的三模式分派（非测试代码一律走 `calculate_grid` 这个唯一入口）。
     use crate::grid::compute_grid;
+
+    /// **今日读叶**的记账规矩（v1.9.38）：单面翻一叶记一叶；对开一次进展
+    /// 两叶都记（右页与左页同时在眼前）；末叶之后不许越界虚报。
+    ///
+    /// 这条规矩错一点，书架上那个数目就是假的——而「假数目」比没有更伤：
+    /// 用户会觉得这软件连自己读了几页都数不明白。
+    #[test]
+    fn a_turn_counts_the_landing_leaves_and_never_passes_the_last() {
+        // 单面：一页一叶。
+        assert_eq!(
+            Root::landed_leaf_range(7, 1, 99).collect::<Vec<_>>(),
+            vec![7]
+        );
+        // 对开：右页 8、左页 9，两叶都在眼前，都算读过。
+        assert_eq!(
+            Root::landed_leaf_range(8, 2, 99).collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+        // 末叶（对开最后只剩一叶）：只记那一叶。
+        assert_eq!(
+            Root::landed_leaf_range(98, 2, 98).collect::<Vec<_>>(),
+            vec![98]
+        );
+        // 一本书只有一叶：仍要记下这一叶（不能被 saturating 削成空）。
+        assert_eq!(
+            Root::landed_leaf_range(0, 1, 0).collect::<Vec<_>>(),
+            vec![0]
+        );
+        // 越界（版式变了、旧进度比现有页数大）：一叶都不记，宁可少记不虚报。
+        assert_eq!(Root::landed_leaf_range(5, 1, 2).count(), 0);
+    }
 
     /// **注释显隐的真值表**（v1.9.37）：三项缺一，夹注就不进列流。
     ///

@@ -61,6 +61,10 @@ appstore = []
 core-graphics = "0.24"
 core-text = "21"
 core-foundation = "0.10"
+# v1.9.38 本地日历日（`clock.rs`）：`localtime_r` 拿系统时区把 epoch 秒
+# 落成「今天」。**不引 chrono**——为一次时区查询拖进半部日历库不划算；
+# libc 本就在依赖树里（rusqlite / gpui 都带），此处只是显式声明。
+libc = "0.2"
 # PDFKit 文本层抽取（真实坐标映射数据源）：PDFDocument / PDFPage 逐字包围盒。
 # 仅 macOS 目标编译；链接系统 PDFKit 框架（见 `pdf_text.rs` 的 `#[link]`）。
 objc = "0.2"

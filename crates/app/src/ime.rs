@@ -835,21 +835,36 @@ pub unsafe fn probe_input_context() {
     extern "C" {
         fn objc_getClass(name: *const c_char) -> *mut c_void;
         fn sel_registerName(name: *const c_char) -> *mut c_void;
-        fn objc_msgSend(receiver: *mut c_void, op: *mut c_void, ...) -> *mut c_void;
+        /// ⚠️ 只取符号地址，按真实签名 transmute 后再调（见 `conv.rs` 头注）：
+        /// 声明成变参在 arm64 上会把变参放进栈，而 objc_msgSend 只从寄存器读。
+        fn objc_msgSend();
     }
     let sel = |n: &[u8]| -> *mut c_void { sel_registerName(n.as_ptr() as *const c_char) };
     let cls = |n: &[u8]| -> *mut c_void { objc_getClass(n.as_ptr() as *const c_char) };
+
+    /// `id f(id, SEL)`
+    unsafe fn send0(r: *mut c_void, s: *mut c_void) -> *mut c_void {
+        let f: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(r, s)
+    }
+    /// `id f(id, SEL, id)`
+    unsafe fn send1(r: *mut c_void, s: *mut c_void, a: *mut c_void) -> *mut c_void {
+        let f: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(r, s, a)
+    }
 
     /// `[obj className]` → Rust 串。
     unsafe fn cls_name(obj: *mut c_void) -> String {
         if obj.is_null() {
             return "<nil>".to_string();
         }
-        let s = objc_msgSend(obj, sel_registerName(b"className\0".as_ptr() as *const c_char));
+        let s = send0(obj, sel_registerName(b"className\0".as_ptr() as *const c_char));
         if s.is_null() {
             return "<noname>".to_string();
         }
-        let p = objc_msgSend(s, sel_registerName(b"UTF8String\0".as_ptr() as *const c_char));
+        let p = send0(s, sel_registerName(b"UTF8String\0".as_ptr() as *const c_char));
         if p.is_null() {
             return "<nochars>".to_string();
         }
@@ -858,33 +873,33 @@ pub unsafe fn probe_input_context() {
             .into_owned()
     }
 
-    let app = objc_msgSend(cls(b"NSApplication\0"), sel(b"sharedApplication\0"));
-    let mut win = objc_msgSend(app, sel(b"keyWindow\0"));
+    let app = send0(cls(b"NSApplication\0"), sel(b"sharedApplication\0"));
+    let mut win = send0(app, sel(b"keyWindow\0"));
     if win.is_null() {
-        win = objc_msgSend(app, sel(b"mainWindow\0"));
+        win = send0(app, sel(b"mainWindow\0"));
     }
     // ⚠️ 只问 firstResponder 一件事，绝不遍历视图树——遍历会在 gpui 的
     //    `Lease` 栈上踩出「Leases must be ended」直接 abort（实测）。
     let fr = if win.is_null() {
         std::ptr::null_mut()
     } else {
-        objc_msgSend(win, sel(b"firstResponder\0"))
+        send0(win, sel(b"firstResponder\0"))
     };
     let ctx = if fr.is_null() {
         std::ptr::null_mut()
     } else {
-        objc_msgSend(fr, sel(b"inputContext\0"))
+        send0(fr, sel(b"inputContext\0"))
     };
-    let cur = objc_msgSend(cls(b"NSTextInputContext\0"), sel(b"currentInputContext\0"));
+    let cur = send0(cls(b"NSTextInputContext\0"), sel(b"currentInputContext\0"));
     let resp = if fr.is_null() {
         0
     } else {
-        objc_msgSend(fr, sel(b"respondsToSelector:\0"), sel(b"insertText:replacementRange:\0")) as i32
+        send1(fr, sel(b"respondsToSelector:\0"), sel(b"insertText:replacementRange:\0")) as i32
     };
     let acc = if fr.is_null() {
         0
     } else {
-        objc_msgSend(fr, sel(b"respondsToSelector:\0"), sel(b"acceptsFirstResponder\0")) as i32
+        send1(fr, sel(b"respondsToSelector:\0"), sel(b"acceptsFirstResponder\0")) as i32
     };
     eprintln!(
         "[ime-probe] window={win:?} firstResponder={} fr.inputContext={ctx:?} \

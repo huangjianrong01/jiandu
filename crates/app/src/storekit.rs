@@ -60,7 +60,7 @@
 //!   都**故意泄漏**（各存一个 `AtomicUsize`）——它们活到进程结束，泄漏量是
 //!   两个对象，比替它们做一套引用计数便宜得多。
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 /// 买断型内购的 product id。

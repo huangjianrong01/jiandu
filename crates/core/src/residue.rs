@@ -983,8 +983,10 @@ pub fn strip_orphan_lines(s: &str) -> Option<String> {
             if is_han(c) || c == '□' || c == '■' {
                 // 汉字 / 缺字框：搬到下一行去（可能是断列打散的真字，
                 // 只能搬不能扔）。已有待并字则先落地，绝不吞字。
+                //
+                // 这里的 `hit` 不必置位：紧跟着的 `carry = Some(c)` 之后
+                // 三行内就会置，置早了也读不到（`unused_assignments` 那条）。
                 if let Some(prev) = carry.take() {
-                    hit = true;
                     out.push(prev.to_string());
                 }
                 carry = Some(c);

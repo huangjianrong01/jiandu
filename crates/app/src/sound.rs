@@ -269,6 +269,28 @@ unsafe fn nssound_play_file(_path: &str) -> bool {
     false
 }
 
+/// 重放已经建好的那台 `NSSound`（`page_turn` 用；只发一条 `play`）。
+///
+/// ⚠️ 与 [`nssound_play_file`] 同一套纪律：`objc_msgSend` **只当符号地址**，
+/// 按 `id f(id, SEL)` 现 transmute 成具体签名再调。把它声明成变参（
+/// `fn objc_msgSend(id, SEL, ...)`）在 x86_64 上碰巧能跑，在 arm64 上参数
+/// 会走栈、它却读寄存器——见 `conv.rs` 头注那段实测。
+#[cfg(target_os = "macos")]
+unsafe fn nssound_replay(obj: usize) {
+    use std::os::raw::{c_char, c_void};
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_msgSend();
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+    }
+    let f: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        std::mem::transmute(objc_msgSend as *const ());
+    let _ = f(
+        obj as *mut c_void,
+        sel_registerName(b"play\0".as_ptr() as *const c_char),
+    );
+}
+
 /// 放一声翻纸。节流 + 总开关都在这里拦；失败静默（没声音不影响读书）。
 pub fn page_turn() {
     if !ENABLED.load(Ordering::Relaxed) {
@@ -285,24 +307,8 @@ pub fn page_turn() {
     // 已建过对象就直接重放（省一次文件解析），否则按路径建一台。
     if let Some(p) = SOUND.get() {
         #[cfg(target_os = "macos")]
-        {
-            use std::os::raw::c_void;
-            #[link(name = "objc")]
-            extern "C" {
-                fn objc_msgSend(
-                    receiver: *mut c_void,
-                    op: *mut c_void,
-                    ...
-                ) -> *mut c_void;
-                fn sel_registerName(name: *const std::os::raw::c_char) -> *mut c_void;
-            }
-            let snd = *p as *mut c_void;
-            unsafe {
-                let _ = objc_msgSend(
-                    snd,
-                    sel_registerName(b"play\0".as_ptr() as *const std::os::raw::c_char),
-                );
-            }
+        unsafe {
+            nssound_replay(*p);
         }
         #[cfg(not(target_os = "macos"))]
         let _ = p;

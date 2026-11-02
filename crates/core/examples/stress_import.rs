@@ -117,7 +117,7 @@ fn main() {
 
     // ② 广告整行剔除。
     let t2 = Instant::now();
-    let (clean, dropped) = jiandu_core::dclean::strip_piracy_lines_counted(&text);
+    let (_clean, dropped) = jiandu_core::dclean::strip_piracy_lines_counted(&text);
     let t_ad = t2.elapsed();
 
     // ③ **真机路径**：`import_txt_into`（逐行流式 + 每 256KB 报一次进度 +

@@ -1723,14 +1723,20 @@ mod vector_pdf_tests {
     use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 
     extern "C" {
+        // ⚠️ 与 `share_paint.rs` 那四条**逐字一致**：同一枚 C 符号写成两套
+        // 类型，编译器只会警告（redeclared with a different signature），
+        // 链接器却照旧按一个符号走——真出事是最难查的那种账。
         fn CGPDFContextCreateWithURL(
-            url: *const c_void,
+            url: core_foundation::url::CFURLRef,
             media: *const CGRect,
-            aux: *const c_void,
-        ) -> *mut c_void;
-        fn CGPDFContextBeginPage(ctx: *mut c_void, info: *const c_void);
-        fn CGPDFContextEndPage(ctx: *mut c_void);
-        fn CGPDFContextClose(ctx: *mut c_void);
+            aux: core_foundation::base::CFTypeRef,
+        ) -> core_graphics::sys::CGContextRef;
+        fn CGPDFContextBeginPage(
+            ctx: core_graphics::sys::CGContextRef,
+            info: core_foundation::base::CFTypeRef,
+        );
+        fn CGPDFContextEndPage(ctx: core_graphics::sys::CGContextRef);
+        fn CGPDFContextClose(ctx: core_graphics::sys::CGContextRef);
     }
 
     /// 用 24 pt 宋体、40 pt 步进、x=500 自上而下排一列，模拟笺读的竖排落笔。
@@ -1739,14 +1745,10 @@ mod vector_pdf_tests {
         let url = CFURL::from_path(path, false).unwrap();
         let media = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(595.0, 842.0));
         let raw = unsafe {
-            CGPDFContextCreateWithURL(
-                url.as_concrete_TypeRef() as *const c_void,
-                &media,
-                std::ptr::null(),
-            )
+            CGPDFContextCreateWithURL(url.as_concrete_TypeRef(), &media, std::ptr::null())
         };
         assert!(!raw.is_null(), "建 PDF 上下文失败");
-        let ctx = unsafe { CGContext::from_existing_context_ptr(raw as *mut _) };
+        let ctx = unsafe { CGContext::from_existing_context_ptr(raw) };
         unsafe { CGPDFContextBeginPage(raw, std::ptr::null()) };
         let font = core_text::font::new_from_name("Songti SC", 24.0).unwrap();
         let sample: Vec<char> = "天地玄黃宇宙洪荒日月盈昃辰宿列張寒來暑往秋收冬藏"
@@ -1822,14 +1824,20 @@ mod pdf_import_e2e {
     use std::path::Path;
 
     extern "C" {
+        // ⚠️ 与 `share_paint.rs` 那四条**逐字一致**：同一枚 C 符号写成两套
+        // 类型，编译器只会警告（redeclared with a different signature），
+        // 链接器却照旧按一个符号走——真出事是最难查的那种账。
         fn CGPDFContextCreateWithURL(
-            url: *const c_void,
+            url: core_foundation::url::CFURLRef,
             media: *const CGRect,
-            aux: *const c_void,
-        ) -> *mut c_void;
-        fn CGPDFContextBeginPage(ctx: *mut c_void, info: *const c_void);
-        fn CGPDFContextEndPage(ctx: *mut c_void);
-        fn CGPDFContextClose(ctx: *mut c_void);
+            aux: core_foundation::base::CFTypeRef,
+        ) -> core_graphics::sys::CGContextRef;
+        fn CGPDFContextBeginPage(
+            ctx: core_graphics::sys::CGContextRef,
+            info: core_foundation::base::CFTypeRef,
+        );
+        fn CGPDFContextEndPage(ctx: core_graphics::sys::CGContextRef);
+        fn CGPDFContextClose(ctx: core_graphics::sys::CGContextRef);
     }
 
     /// 用 **Core Text `draw_glyphs`** 生成一份竖排 CJK PDF：源文本按换行切成若干
@@ -1847,14 +1855,10 @@ mod pdf_import_e2e {
         let url = CFURL::from_path(path, false).unwrap();
         let media = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(595.0, 842.0));
         let raw = unsafe {
-            CGPDFContextCreateWithURL(
-                url.as_concrete_TypeRef() as *const c_void,
-                &media,
-                std::ptr::null(),
-            )
+            CGPDFContextCreateWithURL(url.as_concrete_TypeRef(), &media, std::ptr::null())
         };
         assert!(!raw.is_null(), "建 PDF 上下文失败");
-        let ctx = unsafe { CGContext::from_existing_context_ptr(raw as *mut _) };
+        let ctx = unsafe { CGContext::from_existing_context_ptr(raw) };
         unsafe { CGPDFContextBeginPage(raw, std::ptr::null()) };
         let f = font::new_from_name("Songti SC", 22.0).unwrap();
         // 一行＝一竖列，列从右（540）向左退 55pt。
@@ -1981,14 +1985,10 @@ mod pdf_import_e2e {
         let url = CFURL::from_path(path, false).unwrap();
         let media = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(595.0, 842.0));
         let raw = unsafe {
-            CGPDFContextCreateWithURL(
-                url.as_concrete_TypeRef() as *const c_void,
-                &media,
-                std::ptr::null(),
-            )
+            CGPDFContextCreateWithURL(url.as_concrete_TypeRef(), &media, std::ptr::null())
         };
         assert!(!raw.is_null(), "建 PDF 上下文失败");
-        let ctx = unsafe { CGContext::from_existing_context_ptr(raw as *mut _) };
+        let ctx = unsafe { CGContext::from_existing_context_ptr(raw) };
         let f = font::new_from_name("Songti SC", 22.0).unwrap();
         const STEP: f64 = 34.0;
         for page in pages {

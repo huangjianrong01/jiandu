@@ -1032,7 +1032,7 @@ fn read_head(
     if !is_html_name(name) {
         return None;
     }
-    let mut f = zip.by_name(name).ok()?;
+    let f = zip.by_name(name).ok()?;
     let mut buf = Vec::with_capacity(max_bytes);
     f.take(max_bytes as u64).read_to_end(&mut buf).ok()?;
     String::from_utf8(buf).ok()
