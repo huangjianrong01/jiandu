@@ -90,7 +90,23 @@ pub fn bundled_book(name: &str) -> Option<Book> {
     }
     for p in &candidates {
         if let Ok(txt) = std::fs::read_to_string(p) {
-            if let Ok(book) = serde_json::from_str::<Book>(&txt) {
+            if let Ok(mut book) = serde_json::from_str::<Book>(&txt) {
+                // v1.9.46：内置书也走一遍古籍化链（与用户导入同口径）。
+                // `.json` 直读路径（`adapt_json_book`）不跑 `classicize`，否则
+                // `（鰈 一作：蹙）` 这类异文注会跳过归一、被当正文大字排——
+                // 既刺眼又破坏版心呼吸感。这里补上；对已清洗的内容再跑一遍
+                // 幂等，无副作用（数字/标点归一、异文注降级为双行夹注）。
+                for ch in book.chapters.iter_mut() {
+                    ch.title = crate::pipeline::classicize(&ch.title);
+                    for para in ch.paragraphs.iter_mut() {
+                        para.text = crate::pipeline::classicize(&para.text);
+                    }
+                }
+                // 与导入链路同口径：把正文里残留的 `[注]…[/注]`（含刚由异文注
+                // 降级来的夹注）吸成 `paragraph.notes`，正文只留纯字——翻页 /
+                // 检索 / 长按取字拿到的都是干净文本，且测试断言「无 `[注]` 残留」
+                // 才不会破。幂等：已拆过的书再跑一遍无副作用。
+                book.ingest_inline_notes();
                 return Some(book);
             }
         }

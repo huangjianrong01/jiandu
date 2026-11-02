@@ -351,3 +351,40 @@ fn print_help() {
         "金标/预测均为 JSONL，每行一条；按 id 对齐。格式见 crates/eval/data/*.sample.jsonl"
     );
 }
+
+/// 评测台金标用例：异文注降级为双行小字夹注（v1.9.46，最高优先级修复）。
+///
+/// 这些用例直接驱动真实 `jiandu_core::pipeline::classicize`，守住「古籍校勘记
+/// `（X 一作：Y）` 必须转 `[注]…[/注]`、绝不按正文大字排」这条红线——
+/// 哪天 `classicize` 把异文注又排回正文，这一组断言立刻红。
+#[cfg(test)]
+mod gold_cases {
+    use super::classicize;
+
+    #[test]
+    fn variant_note_is_demoted_to_gloss() {
+        // 标准空格分隔、全角冒号。
+        assert_eq!(classicize("(顰 一作：蹙)"), "[注]顰 一作：蹙[/注]");
+        // 夹在正文里：句读保留，异文注整段降级。
+        assert_eq!(
+            classicize("歸不歸。(顰 一作：蹙)"),
+            "歸不歸。[注]顰 一作：蹙[/注]"
+        );
+        // `；` 分隔的多个异文：并作一条夹注。
+        assert_eq!(
+            classicize("(江南 一作：江湖；纖細 一作：腸斷)"),
+            "[注]江南 一作：江湖；纖細 一作：腸斷[/注]"
+        );
+    }
+
+    #[test]
+    fn non_variant_parens_are_only_fullwidthed() {
+        // 普通括注不含「一作」，只全角化，绝不误转夹注。
+        assert_eq!(classicize("(某注)"), "（某注）");
+        // 已经是夹注标记：幂等，不被二次处理。
+        assert_eq!(
+            classicize("[注]顰 一作：蹙[/注]"),
+            "[注]顰 一作：蹙[/注]"
+        );
+    }
+}

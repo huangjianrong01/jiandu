@@ -189,6 +189,57 @@ pub fn fullwidth_punct(s: &str) -> String {
     out
 }
 
+/// 异文注降级为双行小字夹注（v1.9.46）。
+///
+/// 古籍校勘记常见 `（鰈 一作：蹙）` / `(明年 一作：年年)` 这种「异文注」——
+/// 记录某字在别本中的异文。若全角化后当正文大字排，竖排里会极刺眼、破坏
+/// 版心呼吸感；而它本就是学术性的「小注」，不该抢正文的风头。这里识别
+/// `（X 一作：Y）` 模式（含 `；` 分隔的多个异文），强制转成双行小字夹注
+/// `[注]X 一作：Y[/注]`，让校勘记缩到正文旁边的小字，既保学术价值又美观。
+///
+/// 必须在 `classicize` 的 `fullwidth_punct` **之后**调用：那时外括弧已被折成
+/// 全角 `（）`，只需认全角括号即可；夹注内部若残留半角冒号 / 分号也一并归一。
+/// 半角 `(` 亦容（兜底），但正常链路在它之前已被折成全角。
+pub fn variant_notes_to_gloss(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < cs.len() {
+        // 异文注开括弧：优先全角 `（`（fullwidth_punct 已折好），亦容半角 `(` 兜底。
+        let open = if cs[i] == '（' {
+            Some('（')
+        } else if cs[i] == '(' {
+            Some('(')
+        } else {
+            None
+        };
+        if let Some(o) = open {
+            let close = if o == '（' { '）' } else { ')' };
+            if let Some(j) = (i + 1..cs.len()).find(|&k| cs[k] == close) {
+                let inner: String = cs[i + 1..j].iter().collect();
+                // 必须含「一作」且其后紧跟冒号（全角/半角）才算异文注；
+                // 否则只是普通括注，原样放行给下游。
+                if let Some(pos) = inner.find("一作") {
+                    let after = &inner[pos + "一作".len()..];
+                    if (after.starts_with('：') || after.starts_with(':')) && !inner.is_empty() {
+                        // 内部残留半角冒号 / 分号归一全角（夹注落版前统一）。
+                        let norm = inner.replace(':', "：").replace(';', "；");
+                        out.push_str("[注]");
+                        out.push_str(&norm);
+                        out.push_str("[/注]");
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+            // 不是异文注：原样保留开括弧（已是合法标点，交给下游）。
+        }
+        out.push(cs[i]);
+        i += 1;
+    }
+    out
+}
+
 /// 一道「古籍化」：全角标点 + 阿拉伯数字转汉字。
 pub fn classicize(s: &str) -> String {
     // 破折号竖排化与 EPUB 那条链同源（`vclean::dash_to_vertical`）：
@@ -209,6 +260,10 @@ pub fn classicize(s: &str) -> String {
     // 正文——竖排里就是一排「电线杆」。这条链（txt / epub / docx 都走
     // `parse_txt`）此前正栽在这里。
     let s = crate::vclean::map_outside_markers(&s, |seg| fullwidth_punct(seg));
+    // 异文注降级：`（X 一作：Y）` → `[注]X 一作：Y[/注]`（双行小字夹注）。
+    // 必须在 fullwidth_punct **之后**（外括弧已折全角），且必须在 normalize_numbers
+    // **之前**（异文注里没有数字，但保持「标点归一 → 结构归一 → 数字归一」的次序）。
+    let s = variant_notes_to_gloss(&s);
     crate::numcn::normalize_numbers(&s)
 }
 
@@ -2371,6 +2426,44 @@ mod tests {
         assert_eq!(crate::vclean::dash_to_vertical("甲—乙—丙"), "甲︱乙︱丙");
         assert_eq!(crate::vclean::dash_to_vertical("甲－乙"), "甲︱乙");
         assert_eq!(classicize("甲——乙"), "甲︱乙");
+    }
+
+    /// 异文注降级：`（X 一作：Y）` 必须转成双行小字夹注 `[注]…[/注]`，
+    /// 绝不能被全角化后当正文大字排（`v1.9.46` 最高优先级修复）。
+    #[test]
+    fn variant_notes_demoted_to_gloss() {
+        // 标准空格分隔、全角冒号。
+        assert_eq!(
+            classicize("(顰 一作：蹙)"),
+            "[注]顰 一作：蹙[/注]"
+        );
+        // 夹在正文里（句读保留，异文注整段降级）。
+        assert_eq!(
+            classicize("歸不歸。(顰 一作：蹙)"),
+            "歸不歸。[注]顰 一作：蹙[/注]"
+        );
+        // ASCII 半角冒号也归一。
+        assert_eq!(
+            classicize("(明年 一作:年年)"),
+            "[注]明年 一作：年年[/注]"
+        );
+        // `；` 分隔的多个异文：整段并作一条夹注。
+        assert_eq!(
+            classicize("(江南 一作：江湖；纖細 一作：腸斷)"),
+            "[注]江南 一作：江湖；纖細 一作：腸斷[/注]"
+        );
+        // 用户理想写法：外括弧本就是全角、无空格。
+        assert_eq!(
+            classicize("（鰈一作：蹙）"),
+            "[注]鰈一作：蹙[/注]"
+        );
+        // 非异文注的普通括注：只全角化，绝不误转夹注。
+        assert_eq!(classicize("(某注)"), "（某注）");
+        // 已经是夹注标记的不应被二次处理（幂等）。
+        assert_eq!(
+            classicize("[注]顰 一作：蹙[/注]"),
+            "[注]顰 一作：蹙[/注]"
+        );
     }
 
     #[test]
