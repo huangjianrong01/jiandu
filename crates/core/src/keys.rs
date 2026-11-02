@@ -45,6 +45,11 @@ pub enum Action {
     Rare,
     Traditional,
     Theme,
+    /// **回书架**（v1.9.36）：顶栏七枚里，只有「书阁」一直没有键——
+    /// 其余六枚（目录 ⌘L / 版字 ⌘E / 注 ⌘N / 检索 ⌘F / 问笺 ⌘⇧A /
+    /// 更多 点开）都各有一条，唯独回书架得摸鼠标去点左上角。
+    /// 读到一半想换一本，是最高频的一次「退出」。
+    Shelf,
     // ── 视图 ──────────────────────────────────────────────
     Style,
     Side,
@@ -95,7 +100,7 @@ pub enum Action {
 
 impl Action {
     /// 面板渲染顺序 = 这份数组的顺序（分组靠 [`Action::section`] 相邻聚拢）。
-    pub const ALL: [Action; 40] = [
+    pub const ALL: [Action; 41] = [
         Action::Search,
         Action::SearchNext,
         Action::SearchPrev,
@@ -109,6 +114,7 @@ impl Action {
         Action::Rare,
         Action::Traditional,
         Action::Theme,
+        Action::Shelf,
         Action::Style,
         Action::Side,
         Action::Focus,
@@ -154,6 +160,7 @@ impl Action {
             Action::Rare => "rare",
             Action::Traditional => "traditional",
             Action::Theme => "theme",
+            Action::Shelf => "shelf",
             Action::Style => "style",
             Action::Side => "side",
             Action::Focus => "focus",
@@ -206,6 +213,7 @@ impl Action {
             Action::Rare => "生僻注音显隐",
             Action::Traditional => "简体 / 繁体互转",
             Action::Theme => "切换纸色",
+            Action::Shelf => "回书架",
             Action::Style => "版字面板",
             Action::Side => "左侧栏（目录 / 书签 / 批注）",
             Action::Focus => "专注模式",
@@ -254,6 +262,7 @@ impl Action {
             | Action::Theme => "阅读",
             Action::Style
             | Action::Side
+            | Action::Shelf
             | Action::Focus
             | Action::Cards
             | Action::Help
@@ -303,6 +312,9 @@ impl Action {
             Action::Rare => "cmd+r",
             Action::Traditional => "cmd+t",
             Action::Theme => "cmd+p",
+            // ⌘⇧B：B 取「书架 / Bookshelf」。系统不占这一组（⌘⇧B 在
+            // Safari 里是书签栏，属应用内键，不会抢全局）。
+            Action::Shelf => "cmd+shift+b",
             Action::Style => "cmd+e",
             Action::Side => "cmd+l",
             Action::Focus => "cmd+z",

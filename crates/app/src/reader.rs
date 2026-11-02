@@ -763,46 +763,67 @@ fn banxin_vtext(line: &crate::banxin::BanxinLine, w: f32, family: &SharedString,
     d
 }
 
-/// 一枚藏印：朱砂红「箋讀」小方印。
+/// 印泥色：比句读的朱砂（`share::CINNABAR` 0xC3272D）**沉一档**。
 ///
-/// v1.28.0 起不再嵌在版心里（用户：版心只留鱼尾、书口字与叶码），改由
-/// `Root::render` 盖在**纸页左下角外侧**——像一册书摊在案上、角落落的
-/// 一方藏印，既认得出是谁的本子，又不隔在书口中缝里。
-/// 篆字是 `app::ensure_assets()` 写出的两枚 SVG（`seal_jian.svg` /
-/// `seal_du.svg`，等粗圆头线稿），这里只用 `text_color` 着朱砂色，
-/// 印面自留白（朱文）。
-pub(crate) fn banxin_seal(w: f32, h: f32) -> Div {
-    // v1.86.0 精致化：印面留一圈白边（朱文印本就该「红框 + 白地 + 红字」），
-    // 篆字不再贴着框线走——缩到 20px 见方时，贴边会让两字糊成一团。
-    let pad = 2.0;
-    // 每枚篆字约占印面一半高：两字竖排相叠，正好是一方竖长小印。
-    let gw = ((w - pad * 2.0) * 0.92).max(8.0);
-    let gh = (h - pad * 2.0 - 1.0) / 2.0;
+/// 同一抹朱砂用在句读上要清亮（那是笔尖点的），用在印面上要厚重（那是
+/// 印泥压的）。鲜红落在米色纸上像色块，压暗之后才有「旧印」的味道。
+const SEAL_INK: u32 = 0xA83A2C;
+
+/// 一枚纸角藏印：朱砂**白文**方印（红底、纸色字）。
+///
+/// v1.9.36 三处改动，都出自同一件事——**印缩到 20px 就糊**：
+///
+/// 1. **白文取代朱文**。朱文是细线（`stroke-width` 7/100），印面 22×40 时
+///    每笔只剩约 1.2px，「箋」的竹字头成了两个小箭头，「讀」的右半糊成一堆
+///    积木。白文反过来：红底、字是挖空的纸色，笔画由**底块**给出，缩得再小
+///    也只失细节、不失字口。汉印在指甲盖上还能认，靠的就是这个。
+/// 2. **方印取代竖长条**。22×40 是 1:1.8，那是「半通印」（秦汉长方官印）的
+///    比例，落在纸角像一枚标签。两字竖排的真藏印只比正方略长（1:1.1 到
+///     1:1.3），此处取正方。
+/// 3. **去圆角**。古印四角是硬的，`rounded(2.0)` 一眼就是 UI 按钮。
+///
+/// 字用正文宋体（大字符集、有真粗体），不用手绘篆：`ensure_assets` 里那两枚
+/// 线篆在小尺寸上本来就读不出，且系统没有篆体字库可换——与其画一枚认不出的
+/// 假篆，不如刻一方看得清的白文。印文仍作繁体「箋讀」，藏书印自古如此。
+pub(crate) fn page_seal(size: f32) -> Div {
+    // 白文印的「边」比字略宽（约印面一成二），四周留红是它成其为印的关键。
+    let pad = (size * 0.12).max(2.0);
+    // 两字各占一格、上下相叠；格高由印面反算，不用固定值——改尺寸时字跟着走。
+    let cell = ((size - pad * 2.0) / 2.0).floor();
+    let fs = cell * 0.98;
+    let mut col = div().flex().flex_col().items_center().justify_center();
+    for ch in ['箋', '讀'] {
+        col = col.child(
+            div()
+                .w(px(cell))
+                .h(px(cell))
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .text_size(px(fs))
+                // **必须显式居中**：div 里的文本默认从左排起，`justify_center`
+                // 管的是 flex 子项、管不到文本本身。不加这句，两字会整体贴到
+                // 印面左侧，右边留下一大块红（实测偏了半个字身）。
+                .text_align(gpui::TextAlign::Center)
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(crate::app::PAPER))
+                // **楷体**，不是正文宋体：宋体横细竖粗，做成白文后横画细到
+                // 快断（实测），像印版掉墨。楷体笔画匀，才像一刀刀刻出来的。
+                .font_family(crate::fonts::family_for_role(crate::fonts::FontRole::Note))
+                .child(SharedString::from(ch.to_string())),
+        );
+    }
     div()
-        .w(px(w))
-        .h(px(h))
+        .w(px(size))
+        .h(px(size))
         .p(px(pad))
-        .border_1()
-        .border_color(rgb(crate::share::CINNABAR))
+        .bg(rgb(SEAL_INK))
         .flex()
-        .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(1.0))
-        .child(
-            svg()
-                .path(SharedString::from("seal_jian.svg".to_string()))
-                .w(px(gw))
-                .h(px(gh))
-                .text_color(rgb(crate::share::CINNABAR)),
-        )
-        .child(
-            svg()
-                .path(SharedString::from("seal_du.svg".to_string()))
-                .w(px(gw))
-                .h(px(gh))
-                .text_color(rgb(crate::share::CINNABAR)),
-        )
+        .overflow_hidden()
+        .child(col)
 }
 
 /// 书耳：刻本贴在版框上角的一小片「耳朵」（题签小耳，线装 / 包背装
@@ -1747,35 +1768,40 @@ impl Root {
                 .child(toolbar);
         } else {
             root = root.child(body);
-            // 左上角常驻「退出专注」（避开右上角的字书浮层）。
-            // v1.52.3 强化（P2#5）：原先是 11.5px 无框小签，夜里几乎看不见、
-            // 用户找不到出口。现在加大到 13px + 纸底细框 + 朱砂 hover，
-            // 常驻不依赖悬停；Esc 亦可退出（见按键处理与帮助面板）。
+            // 退出专注：**右上角一枚极小的 ✕**（v1.9.36，用户点名改）
+            //
+            // 原来是左上角一枚 13px 的「退出专注」胶囊，纸底细框，压在天头
+            // 那段留白里。可专注模式本来叫「净室读书」——门口挂一块牌子，
+            // 室就漏了；而且它一直在那儿，读书时视线每次扫到左上角都会
+            // 被它拽一下。
+            //
+            // 现在只留一个 20×20 的 ✕：不着底色、不描边框、平时是淡墨，
+            // 鼠标拂过才转朱砂。退出还有三条路，都不必摸鼠标——
+            //   Esc、⌘Z（专注键本身）、再点一次「更多 → 專注」。
             root = root.child(
                 div()
+                    .id("focus-exit")
                     .absolute()
-                    .top(px(14.0))
-                    .left(px(14.0))
-                    .child(
-                        div()
-                            .cursor_pointer()
-                            .px_3()
-                            .py_1p5()
-                            .rounded(px(7.0))
-                            .bg(rgb(t.chip()))
-                            .border_1()
-                            .border_color(rgb(t.chrome_line()))
-                            .text_size(px(13.0))
-                            .text_color(rgb(t.chrome_text()))
-                            .hover(|s| s.text_color(rgb(sheet_zhu(t))))
-                            .child(SharedString::from("退出专注"))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.focus_mode = false;
-                                    cx.notify();
-                                }),
-                            ),
+                    .top(px(10.0))
+                    .right(px(12.0))
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .text_color(rgb(t.ink_soft()))
+                    .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+                    .child(SharedString::from("✕"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.focus_mode = false;
+                            cx.notify();
+                        }),
                     ),
             );
         }
@@ -1895,7 +1921,7 @@ impl Root {
         // 全文检索浮层：输入词 → 全书查找 → 跳面 + 朱砂红高亮。
         // 分享面板开着时不画——那条「搜索 / 上一处 / 下一处」输入框挂在
         // 屏幕底部，会把导出界面的沉浸感整个破坏掉（分享关掉后自动回来）。
-        if self.show_search && !self.focus_mode && !self.show_share_panel {
+        if self.show_search && !self.show_share_panel {
             root = root.child(self.render_search_sheet(cx));
         }
         // 帮助面板：快捷键与操作说明。
@@ -2434,6 +2460,9 @@ impl Root {
             }
             A::Theme => self.cycle_theme(),
             A::Style => self.set_ui_state(AppUIState::Style, cx),
+            // v1.9.36：⌘⇧B 回书架。与点顶栏「书阁」同一条路——`back_to_shelf`
+            // 里已做「先收浮层再切屏」，键与钮不可能分叉。
+            A::Shelf => self.back_to_shelf(),
             A::Side => {
                 self.show_help = false;
                 self.toggle_side();
@@ -4465,7 +4494,11 @@ impl Root {
         //   屏幕上零圆角会割手，2px 是「看着是直角」的上限；
         // ・悬停底 8% 朱砂：比灰底有温度，也不抢字。
         let menu_paper = t.paper();
-        let menu_fill = ((menu_paper & 0xFFFFFF) << 8) | 0xF2;
+        // **必须完全不透明**（v1.9.36）：原先取 0xF2（约 95%），实测菜单摊开时
+        // 底下的正文与天头朱批照样透上来，「导出」和「五季」两层字叠在一起既
+        // 看不清也读不准——用户看到的就是「菜单跟眉批打架」。菜单是一张纸，
+        // 纸不透明；浮起来靠的是阴影与描边，不是透明度。
+        let menu_fill = ((menu_paper & 0xFFFFFF) << 8) | 0xFF;
         let menu_edge = ((t.ink() & 0xFFFFFF) << 8) | 0x4D;
         let menu_hover = ((zhu & 0xFFFFFF) << 8) | 0x14;
         let menu_zhu_edge = ((zhu & 0xFFFFFF) << 8) | 0x99;
@@ -4585,7 +4618,14 @@ impl Root {
             .font_family(menu_family.clone())
             .text_color(rgb(t.ink()))
             // 命中栈在此截断，点菜单绝不会漏到纸面上翻页。
-            .occlude();
+            .occlude()
+            // 菜单**自身**再兜一层（v1.9.36）：`occlude` 只管命中栈，管不住
+            // 冒泡——根容器上挂着「点纸面收菜单」，点菜单里的空隙（组间那
+            // 几条 3px、内边距、朱线下沿）仍会冒上去，整张菜单当场散掉。
+            // 用户的要求是「钉死在那」：点在菜单身上，它就一直在。
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }));
         // 朱砂书签头：制签时压在签条顶端那道朱线，一眼看出「这是夹在书里的」。
         menu = menu.child(
             div()
@@ -4741,42 +4781,16 @@ impl Root {
         }
 
         // ════════════════════════════════════════════════════════════════
-        // **高频前置：印製**（v1.9.21）
+        // 「印製」一级钮 **移除**（v1.9.36，用户：八个太多了，压到七个）
         //
-        // 原先「导出本叶 PDF」藏在「更多 → 导出 → 当前页 PDF」三级之下：一年
-        // 点几百次的那一件，走的是最深的一条路。现在提上来做顶栏一级。
+        // v1.9.21 把它从「更多 → 导出 → 当前页 PDF」提到顶栏，理由是「一年点
+        // 几百次的事不该走最深的路」。但提出去之后，天头就成了**八个钮**——
+        // 书阁 / 目录 / 版字 / 注 / 检索 / 问笺 / 印製 / 更多，一眼扫不完，
+        // 反倒谁都不显眼。而它此刻与「更多 → 导出 → 当前页 PDF」是**同一个
+        // 动作的两条路**（都走 `MoreAct::PdfLeaf`），留一条即可。
         //
-        // 为什么是一枚**方印**而不是又一个纯文字：顶栏其余六枚都是「字即按钮」，
-        // 唯独这一枚要**一眼看出是按钮**——它是唯一带「出活」性质的动作，也该是
-        // 整条天头上唯一一处朱砂。1px 朱砂界框 + 「印製」二字，与菜单里那三枚
-        // 方印（出 / 卡 / 工）、与版框界行是同一套语言，不另引图标体系。
-        right = right.child(sep());
-        right = right.child(
-            div()
-                .id("bar-print")
-                .ml(px(2.0))
-                .h(px(22.0))
-                .px(px(9.0))
-                .flex()
-                .items_center()
-                .border_1()
-                .border_color(rgba(menu_zhu_edge))
-                .rounded(px(2.0))
-                .text_size(px(11.0))
-                .font_family(menu_family.clone())
-                .text_color(rgb(zhu))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgba(menu_hover)))
-                .child(SharedString::from("印製"))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        // 与菜单里那一项走同一条路（同一道 `catch_unwind`）。
-                        this.run_more(MoreAct::PdfLeaf, window, cx);
-                    }),
-                ),
-        );
+        // 功能一字未减：导出本叶仍在「更多 → 导出」第一项，一条不少。
+        // 留下的七个各有不可替代的职责，没有一个能和别人合并。
 
         // 「更多」+ 下拉：包一层 `relative` 当定位基准——菜单绝对定位、挂在钮
         // 的正下方，钮居中到哪，菜单就跟到哪。
@@ -4786,6 +4800,8 @@ impl Root {
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.more_menu = !this.more_menu;
+                // 与旧的「导出」下拉**互斥**：两个都开着会在钮下叠两层纸。
+                this.export_menu = false;
                 // 每次开合都把分组复位：下一次点开永远先看到三个分类，
                 // 不会停在上次悬停的那一类里（那会让人以为菜单换了内容）。
                 this.more_group = None;
@@ -5221,7 +5237,9 @@ impl Root {
         cx: &mut Context<Self>,
     ) -> Div {
         let mt = self.margin_top;
-        if self.focus_mode || mt < HEAD_BAND_MIN || self.margin_notes.is_empty() {
+        // v1.9.36：专注模式**不再挡眉批**。净室读书要去掉的是工具栏，不是
+        // 自己写的朱批——恰恰相反，没有顶栏挡着，天头那几行小字才看得清。
+        if mt < HEAD_BAND_MIN || self.margin_notes.is_empty() {
             return div();
         }
         let Some(book) = self.book.as_ref() else {
@@ -5389,7 +5407,9 @@ impl Root {
         let Some(at) = self.margin_draft_at else {
             return div();
         };
-        if !self.note_editing || self.focus_mode || mt < HEAD_BAND_MIN {
+        // v1.9.36：同 `render_margin_notes`——专注模式里也能起笔写眉批。
+        // 只留正文、不留入口，等于把「读到一半想批一句」的念头掐掉。
+        if !self.note_editing || mt < HEAD_BAND_MIN {
             return div();
         }
         let Some(book) = self.book.as_ref() else {
@@ -5727,33 +5747,15 @@ impl Root {
         if geo.interactive {
             sheet = sheet.h(px(self.content_h.max(120.0)));
         }
-        // 地脚牌记：天头宽、地脚窄，地脚那点留白缀一行极小宋体版权页
-        // （「笺读数字刻本」），优雅地把底部空间利用起来，而不是靠居中去遮挡。
+        // 地脚牌记「箋讀數字刻本」v1.9.36 **移除**（用户：「这 6 个字有必要
+        // 存在吗」）。
         //
-        // v1.83.0：仿刻本不画这行牌记——影印本的地脚只在左下角压一枚朱印，
-        // 居中一行现代版权字会把「这是一页刻本」的错觉戳破。
-        if geo.interactive && !self.theme.is_keben() {
-            // v1.86.0：牌记也降级成刻本口吻——繁体「箋讀數字刻本」、宋体、
-            // 8px（原先 9px 的简体现代字号仍嫌跳），再往纸色混一档。
-            let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
-            sheet = sheet.child(
-                div()
-                    .absolute()
-                    .bottom(px(4.0))
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .flex()
-                    .flex_row()
-                    .justify_center()
-                    .child(
-                        div()
-                            .font_family(song)
-                            .text_size(px(8.0))
-                            .text_color(rgb(crate::theme::mix(t.ink_soft(), t.paper(), 0.35)))
-                            .child(SharedString::from("箋讀數字刻本")),
-                    ),
-            );
-        }
+        // 它是照刻本「牌记」来的，但真牌记落在**卷末**——「某某堂藏板」「乾隆
+        // 某年刊」——从来不在每一叶的地脚。这行 8px 的字跟着八百叶一起翻，既
+        // 不是正文、也不是书口题字，读久了只像一条水印，反倒把「这是一页刻本」
+        // 的错觉戳破。地脚留白就让它空着：古籍的地脚本来就是空的。
+        //
+        // （仿刻本 v1.83.0 起本就不画这行，现在两条路统一。）
 
         // 注文不进正文时，退回页脚注。
         // 「注释隐藏」时整块页脚注不画——它是注释，不是正文。
@@ -10797,6 +10799,21 @@ impl Root {
             .overflow_y_scroll()
             .scrollbar_width(px(0.0));
 
+        // ── 顶栏七枚：单独成一节（v1.9.36）─────────────────────────
+        //
+        // 它们本来就各在下面那张键位表里占一行，但键位表是按**功能**分组的
+        // （阅读 / 视图 / 墨色 / 印制 / 卡片），而用户找键时的第一个念头是
+        // 「顶上那个钮，键是什么」。两种索引不是一回事，所以这里另起一节，
+        // 照**屏幕上的左右次序**排——照位置找，一眼就到。
+        list = list.child(help_sec("顶栏 · 一键", t));
+        list = list.child(help_row("书阁 ⌘⇧B", "回书架", t));
+        list = list.child(help_row("目录 ⌘L", "左栏：目录 / 书签 / 批注", t));
+        list = list.child(help_row("版字 ⌘E", "列数 · 字体 · 字级 · 留白 · 纸墨", t));
+        list = list.child(help_row("注 ⌘N", "注释显隐（亮朱砂 = 开着）", t));
+        list = list.child(help_row("检索 ⌘F", "全库检索 · ⏎ 开搜", t));
+        list = list.child(help_row("问笺 ⌘⇧A", "问小笺（框了原文就带原文）", t));
+        list = list.child(help_row("更多", "点开：导出 / 卡片 / 工具", t));
+
         list = list.child(help_sec("翻页", t));
         list = list.child(help_row("→ / ↓ / 点屏幕右半", "下一页", t));
         list = list.child(help_row("← / ↑ / 点屏幕左半", "上一页", t));
@@ -10864,11 +10881,11 @@ impl Root {
         list = list.child(help_row("点面板外空白", "收起左侧栏 / 卡片匣 / 帮助 / 导出菜单", t));
 
         list = list.child(help_sec("导出", t));
-        // v1.9.22：顶栏那枚已不是「导出」——按上面的口径一分为二：常用的
-        // 【印製】做了一级钮，其余全收进【更多】的三类书签里。
+        // v1.9.36：顶栏那枚「印製」一级钮已撤（八个钮压到七个）——它和
+        // 「更多 → 导出 → 当前页 PDF」是同一个动作，此处改指菜单里的路。
         list = list.child(help_row(
-            "顶栏「印製」",
-            "本叶 PDF（与 ⌘⌥P 同一个动作）",
+            "更多 → 导出",
+            "本叶 PDF（⌘⌥P）· 本章 · 整本 · 当前页图片",
             t,
         ));
         list = list.child(help_row(

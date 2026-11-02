@@ -1961,12 +1961,16 @@ impl Root {
     ///   * 工具条（`popup`）不再堵死悬停：停稳后收掉工具条让位给字书签。
     ///   * 长按 / 点字呼出的签仍「钉住」，只有悬停那张才自动收。
     pub fn probe_hover(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
-        // 这些状态下悬停一律不弹：写批注 / 拖选 / 专注 / 面板展开。
+        // v1.9.36：**专注模式不再挡悬停查字**。原先这里连着 `focus_mode`
+        // 一起挡，于是净室读书时把鼠标停在一个字上，什么都不会发生——
+        // 而「读到生字就想知道是什么字」恰恰是读书时最常有的一个动作。
+        // 专注要去掉的是顶栏与面板，不是工具本身。
         if self.note_editing
             || self.dragging
-            || self.focus_mode
             || self.show_side
             || self.show_style
+            || self.more_menu
+            || self.export_menu
             || self.book.is_none()
         {
             self.hover_key = None;
@@ -7107,11 +7111,12 @@ impl Render for Root {
         } else if !self.key_focus.is_focused(window) {
             window.focus(&self.key_focus);
         }
-        // 藏印只在阅读正文时出现：书架 / 封面是另一套书衣视觉，专注模式要
-        // 把整幅纸面还给正文（一枚红印也嫌吵）。
-        // 目录抽屉展开时收起纸角那枚朱印：印是画在 screen **之后**的，
-        // 若不收，它会盖在抽屉左首列的末字上（看起来像脏点）。
-        let show_seal = self.screen == Screen::Reading && !self.focus_mode && !self.show_side;
+        // 藏印：只在**开卷第一屏**与**全书末屏**各盖一枚实印（v1.9.36）。
+        // 真藏书印只落卷首、卷末、序目——叶叶都盖，反而像水印贴纸；只有
+        // 两处了，也就不必再压到 0.62 去躲正文，一枚实印才像印。
+        // 书架 / 封面是另一套书衣视觉，专注模式要把整幅纸面还给正文，皆不盖；
+        // 目录抽屉展开时也收起：印画在 screen **之后**，会盖在末字上像脏点。
+        let seal_spot = self.seal_spot();
         // v1.50.0：每帧探一眼后台导入（完成就登记入架，没完成就刷新进度）。
         self.poll_import(cx);
         // v1.9.5：把 Finder 拖进来的文件接住。挂载只在第一帧做成一次；
@@ -7193,19 +7198,15 @@ impl Render for Root {
                 cx, i, n, &name, pct, &label, done, skipped, canceling,
             ));
         }
-        // v1.9.x：每叶淡淡盖一枚藏书印——这是「这是我的本子」的暗记，
-        // 不该跟正文抢墨色（用户原话：不要抢了正文的风头）。印面压到 0.62
-        // 不透明、鼠标拂过才转实；位置钉纸面右下角外侧。
-        if show_seal {
-            root = root.child(
-                div()
-                    .absolute()
-                    .right(px(14.0))
-                    .bottom(px(30.0))
-                    .opacity(0.62)
-                    .hover(|s| s.opacity(1.0))
-                    .child(crate::reader::banxin_seal(22.0, 40.0)),
-            );
+        // v1.9.x：藏书印——卷首盖右下、卷末盖左下。两头对称，像一册书摊开后
+        // 压住两角；这也是真印的盖法（卷首「起首印」、卷末「压卷印」）。
+        if let Some(at_tail) = seal_spot {
+            let corner = if at_tail {
+                div().absolute().left(px(20.0)).bottom(px(28.0))
+            } else {
+                div().absolute().right(px(20.0)).bottom(px(28.0))
+            };
+            root = root.child(corner.child(crate::reader::page_seal(42.0)));
         }
         // 激活纸（v1.81.0 · 模块六）：画在**最后** = 最上层。
         //
@@ -7220,6 +7221,30 @@ impl Render for Root {
 }
 
 impl Root {
+    /// 本屏该不该盖藏书印，盖哪一头。
+    ///
+    /// `Some(false)` = 卷首（画面右下）、`Some(true)` = 卷末（画面左下）、
+    /// `None` = 不盖。
+    ///
+    /// **末叶判定要等分叶索引探明**（`is_complete`）。索引是开卷后一两秒由
+    /// `scan_more` 在空闲帧渐进铺出来的；在此之前 `known_total()` 只是个估值，
+    /// 拿它判末叶会在书中间冒出一枚「压卷印」。宁可这一帧空着。
+    fn seal_spot(&self) -> Option<bool> {
+        if self.screen != Screen::Reading || self.focus_mode || self.show_side {
+            return None;
+        }
+        if self.page == 0 {
+            return Some(false);
+        }
+        let pg = self.pager.as_ref()?;
+        if !pg.is_complete() {
+            return None;
+        }
+        let total = pg.known_total();
+        // 对开时一屏覆盖 `page` 与 `page+1`：本屏已含末叶（`total-1`）即算卷末。
+        (total > 2 && self.page + 1 >= total - 1).then_some(true)
+    }
+
     /// 阅读屏右下角的「笺校工作台」入口（悬浮钮，不占排版流）。
     ///
     /// 点一下把顶层模式机切到 `Collation`，`Root::render` 下一帧就直接返回
