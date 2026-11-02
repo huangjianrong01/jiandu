@@ -247,11 +247,17 @@ fn etch_one(
             *g = s;
         }
     };
+    let cb2 = cb.clone();
     match crate::stream::import_streaming(&p, Some(Box::new(cb))) {
         Ok((book, id)) => Ok((book, id, p.clone())),
-        Err(main_err) => crate::importer::import_file(&p)
-            .map(|ir| (ir.to_book(), String::new(), p.clone()))
-            .map_err(|e| format!("{main_err}；兜底也失败：{e}")),
+        Err(main_err) => {
+            // 兜底同样要心跳（v1.9.34）：PDF 整本逐页抽取期间若无进度推进，
+            // 批量导入的看门狗会把「正在刻」误判成「卡死」。
+            let mut cb2 = cb2;
+            crate::importer::import_file_with(&p, &mut cb2)
+                .map(|ir| (ir.to_book(), String::new(), p.clone()))
+                .map_err(|e| format!("{main_err}；兜底也失败：{e}"))
+        }
     }
 }
 

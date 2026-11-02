@@ -39,3 +39,17 @@ impl FormatParser for PdfParser {
 pub fn collect_regions(path: &Path) -> Vec<SourceRegion> {
     extract_pdf_text_regions(path)
 }
+
+/// **整本**逐页抽取（供书架上导入 PDF 用）。
+///
+/// 每抽完一页回调一次 `on_page(已抽页数, 总页数)`——导入看门狗 3 秒不见进度
+/// 就判「文件损坏」并中止，一本两百页的书没有这个心跳必然被误杀。
+///
+/// 与 [`collect_regions`] 的差别：后者只取第 1 页，是给**校对台左侧参考图**
+/// 用的（一次只显示一页，坐标不必跨页）；入书要的是整本。
+pub fn collect_pages(
+    path: &Path,
+    on_page: &mut dyn FnMut(usize, usize),
+) -> Vec<Vec<SourceRegion>> {
+    crate::pdf_text::extract_pdf_pages(path, on_page)
+}

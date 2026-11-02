@@ -1120,6 +1120,9 @@ impl ImportJob {
                     *g = s;
                 }
             };
+            // 两条导入路径共用同一套进度信道，故各持一份（闭包只捕获两个 Arc，
+            // clone 极廉价）。
+            let cb2 = cb.clone();
             // ── v1.69.0：**导入线程绝不许 panic 到消失** ──────────────
             // 后台线程一 panic，`done` 永远不会被填上，主线程就一直以为
             // 「还在刻印」——进度条永远停在 0%，App 看着就是假死，而用户
@@ -1132,9 +1135,15 @@ impl ImportJob {
                 // （整本入库，store_id 留空）。
                 match crate::stream::import_streaming(&p, Some(Box::new(cb))) {
                     Ok((book, id)) => Ok((book, id, p.clone())),
-                    Err(main_err) => crate::importer::import_file(&p)
-                        .map(|ir| (ir.to_book(), String::new(), p.clone()))
-                        .map_err(|e| format!("{main_err}；兜底也失败：{e}")),
+                    Err(main_err) => {
+                        // 兜底路径同样要心跳（v1.9.34）：PDF 整本抽取要一页页来，
+                        // 没有 `cb` 推进度，看门狗 3 秒不见变化就会判「文件损坏」
+                        // 把一本好端端的 PDF 掐死。
+                        let mut cb2 = cb2;
+                        crate::importer::import_file_with(&p, &mut cb2)
+                            .map(|ir| (ir.to_book(), String::new(), p.clone()))
+                            .map_err(|e| format!("{main_err}；兜底也失败：{e}"))
+                    }
                 }
             }))
             .unwrap_or_else(|_| {

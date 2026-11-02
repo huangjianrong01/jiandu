@@ -83,9 +83,122 @@ use objc::{class, msg_send, rc::autoreleasepool, runtime::Object, sel, sel_impl}
 #[cfg(target_os = "macos")]
 static PDFKIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 整本入书最多抽多少页。
+///
+/// 古籍一册通行 60–160 页，1200 页已是「合订本」量级；每页 10–40ms，
+/// 到顶约 20–40 秒，仍在导入看门狗的 45 秒档内。
+const PDF_BOOK_MAX_PAGES: usize = 1200;
+
+/// 整本入书的累计字数上限（与 TXT 导入的 [`TEXT_MAX_CHARS`] 同量级）。
+///
+/// 到顶即停：PDF 入书是**应急手段**（排版结构早在导出时丢了），不是阅读主路，
+/// 与其让用户对着进度条等一分钟，不如先把前面几十页给出。
+pub const PDF_BOOK_MAX_CHARS: usize = 80_000;
+
 #[cfg(target_os = "macos")]
 pub fn extract_pdf_text_regions(path: &Path) -> Vec<SourceRegion> {
     extract_pdf_text_regions_on(path, 0)
+}
+
+/// **整本文档**逐页抽取文本层（供「书架上导入 PDF」用）。
+///
+/// 与 [`extract_pdf_text_regions_on`] 的区别只有两点，其余逻辑一字不差：
+///
+/// * `PDFDocument` **只打开一次**。逐页版每调一次都要重开文档，120 页就是
+///   120 次解析 xref + 建页面树，而这正是整本导入最不该浪费的地方。
+/// * 每页抽完回调 `on_page(已抽页数, 总页数)`，让调用方推进度条。
+///   **这个回调不是装饰**：导入看门狗 3 秒不见进度就判「文件损坏」并中止，
+///   一本 200 页的 PDF 抽取要好几秒，没有回调必然被误杀。
+///
+/// 页内顺序即 [`cluster`] 的阅读序（竖排右→左、横排上→下），页与页按文档序。
+/// 达不到 `PDF_BOOK_MAX_CHARS` 之前一直抽；页数到 [`PDF_BOOK_MAX_PAGES`] 为止。
+#[cfg(target_os = "macos")]
+pub fn extract_pdf_pages(
+    path: &Path,
+    on_page: &mut dyn FnMut(usize, usize),
+) -> Vec<Vec<SourceRegion>> {
+    let _kit = PDFKIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    autoreleasepool(|| unsafe {
+        let nspath = ns_string(path);
+        let url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: nspath];
+        let doc: *mut Object = msg_send![class!(PDFDocument), alloc];
+        let doc: *mut Object = msg_send![doc, initWithURL: url];
+        if doc.is_null() {
+            return vec![];
+        }
+        let count: usize = msg_send![doc, pageCount];
+        if count == 0 {
+            return vec![];
+        }
+        let limit = count.min(PDF_BOOK_MAX_PAGES);
+        let mut out: Vec<Vec<SourceRegion>> = Vec::with_capacity(limit);
+        let mut chars = 0usize;
+        for i in 0..limit {
+            on_page(i, limit);
+            // 每页自己一个池：`pageAtIndex:` / selection 全是 autoreleased，
+            // 靠外层那个池兜住的话，1200 页的对象全活到函数末尾，几百 MB 起步。
+            let regions = autoreleasepool(|| {
+                let page: *mut Object = msg_send![doc, pageAtIndex: i];
+                if page.is_null() {
+                    return vec![];
+                }
+                regions_of_page(page)
+            });
+            chars += regions.iter().map(|r| r.text.chars().count()).sum::<usize>();
+            out.push(regions);
+            if chars >= PDF_BOOK_MAX_CHARS {
+                break;
+            }
+        }
+        out
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn extract_pdf_pages(
+    _path: &Path,
+    _on_page: &mut dyn FnMut(usize, usize),
+) -> Vec<Vec<SourceRegion>> {
+    vec![]
+}
+
+/// 单页 → 文本层区域。**调用方自己持有 autoreleasepool 与 PDFKIT_LOCK**。
+///
+/// 抽出来是为了让「逐页」与「整本」两条路用同一份判读逻辑：方向判断、退化盒
+/// 修复、聚类、旋转，任何一处改动都同时作用于两条路，不会各自漂移。
+#[cfg(target_os = "macos")]
+unsafe fn regions_of_page(page: *mut Object) -> Vec<SourceRegion> {
+    // 页面高度（PDF 坐标，y 向上）；用于把包围盒翻转为位图坐标（y 向下）。
+    let mb: NSRect = msg_send![page, boundsForBox: 0usize]; // kPDFDisplayBoxMediaBox
+    let page_h = mb.y + mb.h;
+    let string: *mut Object = msg_send![page, string];
+    if string.is_null() {
+        return vec![]; // 扫描图 PDF：无文本层
+    }
+    let len: usize = msg_send![string, length];
+    if len == 0 {
+        return vec![];
+    }
+
+    let mut chunks = chunks_by_line(page, string, len);
+    if chunks.is_empty() {
+        // 兜底：个别 PDF 的 selection 拿不到东西，退回逐字包围盒。
+        chunks = chunks_by_char_bounds(page, string, len);
+    }
+    // ⚠️ 顺序关键：**先**在未旋转坐标里聚类，**再**整体旋转。
+    //    `cluster` 靠 Δx/Δy 判竖排还是横排；旋转 90° 的页若先转坐标，
+    //    Δx 与 Δy 的角色会互换，竖排古籍会被当成横排去按 y 分桶，整页糊成一团。
+    //    未旋转坐标才是内容的**原始**排布方向，判断必须在那里做。
+    let regions = cluster(chunks, page_h);
+    // 图被 `CGPDFPageGetDrawingTransform` 按 /Rotate 转正了，坐标必须跟着转；
+    // 不转就是「图正着、框躺着」，高亮整片错位。
+    let rotation: i64 = msg_send![page, rotation];
+    let rotation = rotation as i32;
+    if rotation.rem_euclid(360) == 0 {
+        regions
+    } else {
+        rotate_regions(regions, rotation, (mb.x + mb.w) as f32, page_h as f32)
+    }
 }
 
 /// 抽取**指定页**（0-based）的文本层坐标；页号越界 / 非 PDF 一律返回空。
@@ -127,37 +240,7 @@ pub fn extract_pdf_text_regions_on(path: &Path, page_index: usize) -> Vec<Source
         if page.is_null() {
             return vec![];
         }
-        // 页面高度（PDF 坐标，y 向上）；用于把包围盒翻转为位图坐标（y 向下）。
-        let mb: NSRect = msg_send![page, boundsForBox: 0usize]; // kPDFDisplayBoxMediaBox
-        let page_h = mb.y + mb.h;
-        let string: *mut Object = msg_send![page, string];
-        if string.is_null() {
-            return vec![]; // 扫描图 PDF：无文本层
-        }
-        let len: usize = msg_send![string, length];
-        if len == 0 {
-            return vec![];
-        }
-
-        let mut chunks = chunks_by_line(page, string, len);
-        if chunks.is_empty() {
-            // 兜底：个别 PDF 的 selection 拿不到东西，退回逐字包围盒。
-            chunks = chunks_by_char_bounds(page, string, len);
-        }
-        // ⚠️ 顺序关键：**先**在未旋转坐标里聚类，**再**整体旋转。
-        //    `cluster` 靠 Δx/Δy 判竖排还是横排；旋转 90° 的页若先转坐标，
-        //    Δx 与 Δy 的角色会互换，竖排古籍会被当成横排去按 y 分桶，整页糊成一团。
-        //    未旋转坐标才是内容的**原始**排布方向，判断必须在那里做。
-        let regions = cluster(chunks, page_h);
-        // 图被 `CGPDFPageGetDrawingTransform` 按 /Rotate 转正了，坐标必须跟着转；
-        // 不转就是「图正着、框躺着」，高亮整片错位。
-        let rotation: i64 = msg_send![page, rotation];
-        let rotation = rotation as i32;
-        if rotation.rem_euclid(360) == 0 {
-            regions
-        } else {
-            rotate_regions(regions, rotation, (mb.x + mb.w) as f32, page_h as f32)
-        }
+        regions_of_page(page)
     })
 }
 
@@ -208,6 +291,96 @@ fn rotate_regions(
         _ => {}
     }
     regions
+}
+
+// ───────────────────────── 整本入书：页眉页脚剔除 + 拼接 ─────────────────────────
+
+/// 判「跨页重复行」的长度上限（字符数）。
+///
+/// 书口字（书名）、页眉（丛书名）、版权栏、页脚都在这个量级以内。正文一个
+/// 段落绝不会短到 12 字又**每页都一模一样**——那只有版式装饰才做得到。
+const RUNNING_MAX_CHARS: usize = 12;
+
+/// 归一化一行：去首尾空白、删掉所有空白字符（竖排 PDF 常在字间塞空格）。
+fn running_key(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// 剔掉**跨页重复的短行**（书口字 / 页眉 / 页脚 / 版权栏）。
+///
+/// 为什么必须做：PDF 入书是把每页的文本层按阅读序连成一串文本，一本 120 页的
+/// 影印书就会把「金剛般若波羅蜜經」抄 120 遍塞进正文，读起来像复读机。这些行
+/// 有两个稳定的特征，恰好都不是正文会有的：
+///
+/// * **短**——不超过 [`RUNNING_MAX_CHARS`] 字；
+/// * **跨页重复**——同一串字在三分之一以上的页面里出现。
+///
+/// 页码（一、二、三……）虽然也短，但每页都不同，不会命中这条；若有人把页码
+/// 排成固定字样，那本来就该剔。
+///
+/// 页数少于三页时不剔——样本太小，一条真实存在的短标题（书名、卷题）会被
+/// 误判成版式装饰，把书的内容整段删掉比留着噪声严重得多。
+pub fn strip_running_lines(pages: &mut [Vec<SourceRegion>]) {
+    if pages.len() < 3 {
+        return;
+    }
+    let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for page in pages.iter() {
+        // 同一页里出现两次只算一页（书名有时在版心与书口各排一次）。
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in page.iter() {
+            let k = running_key(&r.text);
+            if k.is_empty() || k.chars().count() > RUNNING_MAX_CHARS {
+                continue;
+            }
+            seen.insert(k);
+        }
+        for k in seen {
+            *freq.entry(k).or_insert(0) += 1;
+        }
+    }
+    let need = (pages.len() / 3).max(3);
+    let drop: std::collections::HashSet<String> = freq
+        .into_iter()
+        .filter(|(_, n)| *n >= need)
+        .map(|(k, _)| k)
+        .collect();
+    if drop.is_empty() {
+        return;
+    }
+    for page in pages.iter_mut() {
+        page.retain(|r| !drop.contains(&running_key(&r.text)));
+    }
+}
+
+/// 多页区域 → 入书用的纯文本。
+///
+/// 一行一段是**故意的**：竖排 PDF 的一个区域就是一整列，列序即阅读序，逐列成行
+/// 之后，`split_inline_heads` 才有「行」这个概念去做断章；若把整页连成一长串，
+/// 「道德经」独占一列这种天然的篇题就没法被认出来了。
+///
+/// 页与页之间空一行：让断章层有机会在页边界切段，也避免上一页末字与下一页
+/// 首字黏成「…已第三章」这种假词。
+pub fn pages_to_text(pages: &[Vec<SourceRegion>]) -> String {
+    let mut out = String::new();
+    for page in pages {
+        let mut wrote = false;
+        for r in page.iter() {
+            let t = r.text.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if wrote {
+                out.push('\n');
+            }
+            out.push_str(t);
+            wrote = true;
+        }
+        if wrote {
+            out.push_str("\n\n");
+        }
+    }
+    out
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1006,6 +1179,106 @@ pub(crate) fn tiny_pdf(rotate: i32) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// 整本入书的回归（**不 gate 平台**：纯文本处理，任何平台都该跑）。
+#[cfg(test)]
+mod book_tests {
+    use super::*;
+
+    fn col(x: f32, text: &str) -> SourceRegion {
+        SourceRegion {
+            x,
+            y: 0.0,
+            w: 18.0,
+            h: 200.0,
+            text: text.to_string(),
+        }
+    }
+
+    /// 四页，每页都顶着一列书口字（书名），正文各不相同。
+    fn run_of_four() -> Vec<Vec<SourceRegion>> {
+        vec![
+            vec![col(300.0, "金剛般若波羅蜜經"), col(260.0, "如是我聞一時佛在")],
+            vec![col(300.0, "金剛般若波羅蜜經"), col(260.0, "舍衛國祇樹給孤獨")],
+            vec![col(300.0, "金剛般若波羅蜜經"), col(260.0, "園與大比丘眾千")],
+            vec![col(300.0, "金剛般若波羅蜜經"), col(260.0, "二百五十人俱")],
+        ]
+    }
+
+    #[test]
+    fn running_heads_are_dropped_but_body_survives() {
+        let mut pages = run_of_four();
+        strip_running_lines(&mut pages);
+        for (i, page) in pages.iter().enumerate() {
+            assert_eq!(page.len(), 1, "第 {i} 页的书口字该被剔掉，正文该留着");
+            assert!(
+                !page[0].text.contains("金剛般若"),
+                "第 {i} 页仍残留书口字：{:?}",
+                page[0].text
+            );
+        }
+        // 正文一列都不许少（剔过头比留着噪声严重得多）。
+        let body: String = pages.iter().flatten().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            body,
+            "如是我聞一時佛在舍衛國祇樹給孤獨園與大比丘眾千二百五十人俱"
+        );
+    }
+
+    #[test]
+    fn two_page_sample_is_left_alone() {
+        // 样本太小时「每页都出现的短行」更可能是书名 / 卷题，宁可留着。
+        let mut pages = run_of_four();
+        pages.truncate(2);
+        strip_running_lines(&mut pages);
+        assert_eq!(pages[0].len(), 2, "两页的书不该被动刀");
+    }
+
+    #[test]
+    fn long_repeated_line_is_not_a_running_head() {
+        // 正文重复（诗歌叠句）即便超过 12 字也不会被误剔；这里验的是「短」这条
+        // 闸门真的在起作用：把同一串 20 字的正文放到每页，必须留下。
+        // ⚠️ 每页的配对行必须**各不相同**：若都写「正文」，那它本身就是一条
+        //    ≤12 字的跨页重复短行，理应被剔，测试会变成在验反面的东西。
+        let line = "一切有為法如夢幻泡影如露亦如電應作如是觀";
+        let mut pages: Vec<Vec<SourceRegion>> = (0..4)
+            .map(|i| {
+                vec![
+                    col(300.0 + i as f32, line),
+                    col(200.0, &format!("第{}頁開頭", i + 1)),
+                ]
+            })
+            .collect();
+        strip_running_lines(&mut pages);
+        assert_eq!(pages[0].len(), 2, "超过 12 字的重复正文不许被当成版式装饰");
+        assert!(
+            pages[0].iter().any(|r| r.text == line),
+            "那条叠句必须还在"
+        );
+    }
+
+    #[test]
+    fn pages_join_with_blank_line_between_and_single_newline_inside() {
+        let mut pages = run_of_four();
+        strip_running_lines(&mut pages);
+        let text = pages_to_text(&pages);
+        assert_eq!(
+            text,
+            "如是我聞一時佛在\n\n舍衛國祇樹給孤獨\n\n園與大比丘眾千\n\n二百五十人俱\n\n"
+        );
+    }
+
+    #[test]
+    fn empty_pages_do_not_emit_blank_blocks() {
+        let pages = vec![
+            vec![],
+            vec![col(300.0, "天地玄黃")],
+            vec![],
+            vec![col(300.0, "宇宙洪荒")],
+        ];
+        assert_eq!(pages_to_text(&pages), "天地玄黃\n\n宇宙洪荒\n\n");
+    }
+}
+
 /// 框选与拼接的回归（**不 gate 平台**：这些是纯几何，任何平台都该跑）。
 #[cfg(test)]
 mod pick_tests {
@@ -1697,6 +1970,135 @@ mod pdf_import_e2e {
             body.contains("第一章") && body.contains("第三章"),
             "章见出し切分异常：{body}"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 多页竖排 PDF：`pages` 的每一项是一页，项内 `\n` 分列（与 [`vertical_pdf_of`]
+    /// 同一套排法），列从右（540）向左退 55pt。
+    fn vertical_pages_pdf(path: &Path, pages: &[&str]) {
+        let _ = std::fs::remove_file(path);
+        let url = CFURL::from_path(path, false).unwrap();
+        let media = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(595.0, 842.0));
+        let raw = unsafe {
+            CGPDFContextCreateWithURL(
+                url.as_concrete_TypeRef() as *const c_void,
+                &media,
+                std::ptr::null(),
+            )
+        };
+        assert!(!raw.is_null(), "建 PDF 上下文失败");
+        let ctx = unsafe { CGContext::from_existing_context_ptr(raw as *mut _) };
+        let f = font::new_from_name("Songti SC", 22.0).unwrap();
+        const STEP: f64 = 34.0;
+        for page in pages {
+            unsafe { CGPDFContextBeginPage(raw, std::ptr::null()) };
+            let mut x = 540.0;
+            for line in page.split('\n') {
+                let mut y = 800.0;
+                for ch in line.chars() {
+                    let buf = [ch as u16];
+                    let mut g: [u16; 2] = [0; 2];
+                    let ok = unsafe {
+                        f.get_glyphs_for_characters(buf.as_ptr(), g.as_mut_ptr(), 1)
+                    };
+                    if ok {
+                        let p = [CGPoint::new(x, y)];
+                        let gs = [g[0]];
+                        f.draw_glyphs(&gs, &p, ctx.clone());
+                        y -= STEP;
+                    }
+                }
+                x -= 55.0;
+            }
+            unsafe { CGPDFContextEndPage(raw) };
+        }
+        unsafe { CGPDFContextClose(raw) };
+        drop(ctx);
+    }
+
+    /// **整本入书验收**：三页竖排 PDF（每页顶着一列书口字）→ 逐页抽取 → 剔书口
+    /// 字 → 拼成正文。
+    ///
+    /// 锁死的是 v1.9.34 修的那个哑巴坑：`import_file` 原先只抽第 1 页
+    /// （`extract_pdf_text_regions` = `(path, 0)`），一本两百页的 PDF 导进书架
+    /// 只剩一页字，既没有报错也没有提示。这条测试只要「第 3 页为空」就会红。
+    #[test]
+    fn whole_book_extraction_reaches_every_page() {
+        let path = std::env::temp_dir().join("jiandu_pdf_book_e2e.pdf");
+        // 每页第一列＝书口字（书名），后面是各不相同的正文。
+        let head = "箋讀樣本";
+        let bodies = [
+            "天地玄黃宇宙洪荒",
+            "日月盈昃辰宿列張",
+            "寒來暑往秋收冬藏",
+        ];
+        let pages_src: Vec<String> = bodies.iter().map(|b| format!("{head}\n{b}")).collect();
+        let refs: Vec<&str> = pages_src.iter().map(|s| s.as_str()).collect();
+        vertical_pages_pdf(&path, &refs);
+
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let mut pages = extract_pdf_pages(&path, &mut |i, n| seen.push((i, n)));
+
+        assert_eq!(
+            seen,
+            vec![(0, 3), (1, 3), (2, 3)],
+            "每页都要回调一次进度（导入看门狗全靠它）"
+        );
+        assert_eq!(pages.len(), 3, "三页的 PDF 必须抽出三页");
+        for (i, page) in pages.iter().enumerate() {
+            assert!(
+                !page.is_empty(),
+                "第 {i} 页一个字都没抽到——「只抽第一页」的老毛病又回来了"
+            );
+        }
+        // 三页的正文必须各不相同（万一 PDFKit 把同一页重复喂出来，这里会红）。
+        let texts: Vec<String> = pages
+            .iter()
+            .map(|p| p.iter().map(|r| r.text.as_str()).collect::<String>())
+            .collect();
+        assert!(
+            texts[0] != texts[1] && texts[1] != texts[2],
+            "三页抽出来的内容一模一样，说明页序或页内容串了：{texts:?}"
+        );
+
+        // 书口字每页都在最右一列，聚类后是每页的第一条。
+        for (i, page) in pages.iter().enumerate() {
+            assert!(
+                page[0].text.contains(head) || page[0].text.chars().count() <= head.chars().count() + 2,
+                "第 {i} 页第一条该是书口字（最右列），实得 {:?}",
+                page[0].text
+            );
+            assert!(page[0].x > page[1].x, "竖排列序必须是 x 降序（右→左）");
+        }
+
+        let before: usize = pages.iter().flatten().map(|r| r.text.chars().count()).sum();
+        strip_running_lines(&mut pages);
+        let after: usize = pages.iter().flatten().map(|r| r.text.chars().count()).sum();
+        assert!(
+            after < before,
+            "跨页重复的书口字该被剔掉（{before} → {after}）"
+        );
+        let text = pages_to_text(&pages);
+        println!("── 整本入书正文 ──\n{text}");
+        assert!(!text.contains(head), "书口字仍在正文里：{text}");
+        // ⚠️ 不逐字比对：这份 PDF 是自产的 CID 字体，ToUnicode 会把个别字映射成
+        //    别的码位（实测「日月辰」→「乞仈亠」）。**字数**才是与码位无关的不变量
+        //    ——错位不改长度，丢页、并页、吞字才会。
+        let blocks: Vec<&str> = text
+            .split("\n\n")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(blocks.len(), 3, "三页该是三个段落块：{text}");
+        for (i, b) in blocks.iter().enumerate() {
+            assert_eq!(
+                b.chars().count(),
+                bodies[i].chars().count(),
+                "第 {i} 页正文缺字：应 {} 字，实得 {b:?}",
+                bodies[i].chars().count()
+            );
+        }
 
         let _ = std::fs::remove_file(&path);
     }

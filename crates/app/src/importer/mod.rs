@@ -211,6 +211,21 @@ impl Format {
 ///   ① 按后缀定格式；② 该格式的 parser 只出「原始纯文本」（PDF 顺带抽坐标）；
 ///   ③ 清洗层唯一出口洗一遍；④ core 管线断章断卷；⑤ 拼成 BookIR 包进 ParsedDoc。
 pub fn import_file(path: &Path) -> Result<ParsedDoc, ImportError> {
+    import_file_with(path, &mut |_, _| {})
+}
+
+/// 与 [`import_file`] 相同，但把**逐页进度**交出去（v1.9.34）。
+///
+/// 只有 PDF 会真的用到它：文本层要一页页抽，一本两百页的书几百毫秒到几秒，
+/// 而导入看门狗 3 秒不见 `pct`/文案变化就当卡死中止、报「文件损坏」。其余格式
+/// 一次性读完，回调只在收尾时打一枪 100%。
+///
+/// 回调在**后台导入线程**里被调用，绝不许碰 UI 状态——与 `import_streaming`
+/// 的 `on_progress` 同一约定。
+pub fn import_file_with(
+    path: &Path,
+    progress: &mut dyn FnMut(f32, String),
+) -> Result<ParsedDoc, ImportError> {
     let fmt = Format::from_path(path).ok_or_else(|| {
         let ext = path
             .extension()
@@ -230,19 +245,29 @@ pub fn import_file(path: &Path) -> Result<ParsedDoc, ImportError> {
         Format::Docx => (docx_parser::DocxParser::parse(path)?, None),
         Format::Pdf => {
             // PDF 走系统原生文本层抽取（macOS PDFKit / 其他平台预留 pdfium）。
-            // 扫描图 PDF 无文本层 → 坐标空 → 提前报「需 OCR」，绝不把空笺塞给用户。
-            let regions = pdf_parser::collect_regions(path);
-            if regions.is_empty() {
+            // 扫描图 PDF 无文本层 → 全本坐标空 → 提前报「需 OCR」，绝不把空笺塞给用户。
+            //
+            // ⚠️ v1.9.34 之前这里只抽**第 1 页**（`collect_regions` = 第 0 页），
+            //    书架上导入一本 200 页的 PDF，进来只有一页的字，而且悄无声息。
+            //    现在改为整本逐页抽，页间空行分段，跨页重复的短行（书口字 /
+            //    页眉 / 页脚）先剔掉——否则「金剛般若波羅蜜經」会被抄进正文 120 遍。
+            let mut pages = pdf_parser::collect_pages(path, &mut |done, total| {
+                let pct = if total == 0 {
+                    0.0
+                } else {
+                    done as f32 / total as f32
+                };
+                progress(pct, format!("刻版 {}/{}", (done + 1).min(total), total));
+            });
+            if pages.iter().all(|p| p.is_empty()) {
                 return Err(ImportError::OcrNeeded(path.display().to_string()));
             }
-            let raw: String = regions
-                .iter()
-                .map(|r| r.text.trim())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            (raw, Some(regions))
+            crate::pdf_text::strip_running_lines(&mut pages);
+            let raw = crate::pdf_text::pages_to_text(&pages);
+            // `pdf_regions` 仍只装**第 1 页**：它服务的是校对台左侧参考图，
+            // 一次只显示一页，坐标系必须与当前页一致，跨页坐标没有意义。
+            let first = pages.first().cloned().unwrap_or_default();
+            (raw, Some(first))
         }
     };
 
