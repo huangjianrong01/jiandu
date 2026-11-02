@@ -378,17 +378,22 @@ pub struct Root {
     pub trad_gen: std::cell::Cell<u64>,
     pub show_tongjia: bool,
     pub show_notes: bool,
-    /// **注释显隐开关**（v1.9.25）——纯渲染层，随时可切，版式一寸不动。
+    /// **注释显隐开关**（v1.9.25 立，v1.9.37 改语义）。
     ///
-    /// 与 [`Self::show_notes`] 的分工（**别把两者合成一个**）：
-    ///   * `show_notes` = 「这本书要不要注释这套排版」——它参与分页
-    ///     （脚注模式要在地脚预留行、夹注要不要进列流），改了会**重排**；
-    ///   * `notes_shown` = 「此刻要不要看见它」——分页早已算完，这里只决定
-    ///     画不画。关掉时夹注块**格位照占**（宽高不变，只是不落墨），天头
-    ///     眉批 / 页脚注 / 圈号 / 批注红点统统不画。
+    /// 与 [`Self::show_notes`] 的分工：
+    ///   * `show_notes` = 「这本书要不要注释这套排版」——书的属性，跟书走；
+    ///   * `notes_shown` = 「此刻要不要看见它」——读者的即时选择。
     ///
-    /// 于是「一键沉浸」不会让任何一行字挪动一寸：底层坐标留在原处，
-    /// 再打开就原样回来。这是用户点名要的「绝不能让排版错位」。
+    /// ⚠️ **v1.9.37 起它参与分页**（旧版是纯渲染层）。原因见
+    /// [`Self::notes_in_column`]：夹注占格，光「不画」会在纸面留下一列列
+    /// 空洞，正是用户说的「没有恢复秩序」。现在关掉 = 夹注整块退出列流，
+    /// 正文上移补位；再打开照原样占回那半格。
+    ///
+    /// 代价是页数会变（注释一隐全书少几十叶），故切换必须走
+    /// [`Self::resort_keeping_place`] 用字锚点保位。
+    ///
+    /// **底稿一个字都不动**：`Book` / 段落 / `Note` 全是只读数据，这里只改
+    /// 「这一次怎么排」。切回来是同一个纯函数、同一份输入 → 逐字同位。
     pub notes_shown: bool,
     /// 注文是否以「双行小字夹注」排进正文（false 则退为页脚注）。
     pub notes_inline: bool,
@@ -2379,7 +2384,9 @@ impl Root {
         let content_w = (self.viewport_w - pad).max(220.0);
         self.content_w = content_w;
         self.content_h = content_h;
-        let notes_foot = self.show_notes && !self.notes_inline;
+        // 页脚注区是否预留：注释隐藏时不必留那一条白带——正文该往上长，
+        // 否则页脚会留一条空行，正是用户说的「没有恢复秩序」。
+        let notes_foot = self.show_notes && self.notes_shown && !self.notes_inline;
         // 古籍竖笺几何预留：版框双边 50、无天头（篇题进版框）、地脚 12 +
         // 页脚注区（脚注模式且开注释时）。列宽 / 字号 / 行高 / 总行数由网格
         // 引擎按列数动态算出（8 / 10 / 12 / 14 列可切）。
@@ -2959,37 +2966,61 @@ impl Root {
         if self.notes_inline == inline {
             return;
         }
-        // 锚点：当前页第一个字（章首缩进占位也算）。
-        let anchor = self
-            .layout_pages()
-            .get(self.page)
-            .and_then(|p| p.glyphs.first())
-            .map(|g| (g.chapter, g.para, g.offset));
-        self.notes_inline = inline;
-        if let Some((c, pa, o)) = anchor {
-            if let Some(pi) = self.layout_pages().iter().position(|pg| {
-                pg.glyphs
-                    .iter()
-                    .any(|g| (g.chapter, g.para, g.offset) == (c, pa, o))
-            }) {
-                self.page = pi;
+        self.resort_keeping_place(|s| s.notes_inline = inline);
+    }
+
+    /// 改版式后**保住阅读位置**：先记锚点，改，再按锚点回到含该字的那一面。
+    ///
+    /// 锚点取「当前页首字」而不是页码——重排后页数必变（注释一隐，夹注让出的
+    /// 半格全书累计下来是几十叶），页码毫无意义，字才是稳定坐标。
+    ///
+    /// ⚠️ **不许用 `layout_pages()` 找锚点**。那是「整本排一遍再线性找」，
+    /// 三百万字的书一次 0.3s 起；这里前后要取两次，一键沉浸就卡成幻灯片。
+    /// 改走 `Pager`：取锚点只排当前章（缓存命中几乎免费），回位走
+    /// [`crate::pager::Pager::page_of_glyph`]——逐章推进、命中即返回。
+    ///
+    /// 凡是「改了一项版式指纹」的动作都该走这里：`set_notes_inline`、
+    /// `toggle_notes_shown`、切列数、切字号。自己写一遍两步走，迟早漏掉
+    /// `sync_current_chapter`，目录高亮就会停在旧章上。
+    fn resort_keeping_place(&mut self, apply: impl FnOnce(&mut Self)) {
+        let anchor = self.page_at(self.page).and_then(|p| {
+            p.glyphs
+                .first()
+                .map(|g| (g.chapter, g.para, g.offset))
+        });
+        apply(self);
+        if let Some(key) = anchor {
+            // 版式指纹刚变 → 这里让分页器换成新 key（旧缓动作废）。
+            self.sync_pager();
+            let book = self.book.as_mut();
+            let pg = self.pager.as_mut();
+            if let (Some(book), Some(pg)) = (book, pg) {
+                if let Some(pi) = pg.page_of_glyph(book, key) {
+                    self.page = pi;
+                }
             }
         }
         self.sync_current_chapter();
     }
 
-    /// **一键显隐注释**（v1.9.25）——纯渲染层，绝不重排。
+    /// **一键显隐注释**（v1.9.25 起，v1.9.37 改为**真重排**）。
     ///
     /// 关掉时纸面上只剩纯正文网格：夹注块 / 天头眉批 / 页脚注 / 圈号 /
-    /// 批注红点 / 字旁短批注全部不画。**格位照占**（夹注那块高度是分页时
-    /// 算死的，少画一格整列就上移），所以当前页、当前字、选区锚点全都不动，
-    /// 再点一次原样回来。
+    /// 批注红点 / 字旁短批注全部不画。
     ///
-    /// 与 [`Self::set_notes_inline`] 的区别：那个改的是「注释怎么排」
-    /// （夹注 ⇄ 页脚注），要重排全书；这个改的是「此刻看不看见」，一行不重排。
+    /// ⚠️ **v1.9.37 的分野（用户改口）**：v1.9.25 那版是纯渲染层开关，
+    /// 夹注块「格位照占」——因为它占的高度是分页时算死的，少画一格整列
+    /// 就上移。代价是隐藏之后纸面上留下一列列**空洞**，读起来像版坏了。
+    /// 现在改成把 `notes_shown` 也并进版式指纹（见 [`Self::notes_in_column`]）：
+    /// 夹注从列流里**整块退出**，后面的正文自然上移补位，版面重新排整齐；
+    /// 再点一次夹注回来，照原样占回它那半格。
+    ///
+    /// 代价只有一个：**页数会变**（注释一隐全书少几十叶），所以必须靠
+    /// 字锚点保位（[`Self::resort_keeping_place`]），否则一按 ⌘N 就跳页。
     pub fn toggle_notes_shown(&mut self) {
-        self.notes_shown = !self.notes_shown;
-        if !self.notes_shown {
+        let shown = !self.notes_shown;
+        self.resort_keeping_place(|s| s.notes_shown = shown);
+        if !shown {
             // 挂在注释上的瞬态浮层一并收起。否则屏幕上会飘着一张「注文放大」
             // 卡 / 一份「改注删注」菜单，而纸面上一个注字都没有——像见鬼。
             self.note_zoom = None;
@@ -5750,6 +5781,29 @@ fn anki_push_card(
         cx.notify();
     }
 
+    /// 夹注此刻**是否排进列流**（= 是否参与分页与占格）。
+    ///
+    /// 三个开关取交集，缺一个就会两套页码：`show_notes`（这本书要不要注释）、
+    /// `notes_inline`（夹注还是页脚注）、`notes_shown`（此刻看不看见）。
+    ///
+    /// ⚠️ **这个判据必须只有一个源**。历史上 `pager_key` 只取前两个、而
+    /// `layout_pages` 只取 `notes_inline`，两者本来就差着一个 `show_notes`
+    /// ——平时恒为 true 没暴露，一旦有人让它参与分页，立刻「分页器说 300 页、
+    /// 布局说 302 页」，页码整体错位。所以抽在这里，三处同取：
+    /// `pager_key` / `layout_pages` / 地脚预留行（`notes_foot`）。
+    pub fn notes_in_column(&self) -> bool {
+        Self::notes_in_column_of(self.show_notes, self.notes_shown, self.notes_inline)
+    }
+
+    /// 判据本体：三项缺一，夹注就不进列流。
+    ///
+    /// 抽成无 `self` 的关联函数，是为了让测试能直接锁住这张真值表
+    /// （`Root` 依赖 GPUI 上下文，造不出来）——这是「三处同取」唯一
+    /// 能被机器验证的形态。
+    pub fn notes_in_column_of(show_notes: bool, notes_shown: bool, notes_inline: bool) -> bool {
+        show_notes && notes_shown && notes_inline
+    }
+
     /// 当前版式指纹：它变了的任何一项都会改变面数，故整份分页缓存作废。
     fn pager_key(&mut self) -> crate::pager::LayoutKey {
         // 卷首题署预留行数要遍历全书章题，缓存住（换书时清）。
@@ -5766,7 +5820,7 @@ fn anki_push_card(
             rows: self.grid_rows,
             reserve: crate::gloss::inscription_reserve(need, self.grid_rows),
             show_punct: self.show_punct,
-            inline_notes: self.notes_inline && self.show_notes,
+            inline_notes: self.notes_in_column(),
             west_mode: !self.han_digits,
         }
     }
@@ -5854,7 +5908,7 @@ fn anki_push_card(
         crate::gloss::layout_book_from_opts(
             &flow,
             |g| {
-                if self.notes_inline {
+                if self.notes_in_column() {
                     // 带上来源与宿主字形：来源决定渲染配色（用户注深朱砂红），
                     // 宿主字形用于右键/长按定位书稿里那条注文（改 / 删）。
                     self.note_chars_with_source(*g)
@@ -7294,6 +7348,39 @@ mod tests {
     // 单测验的是「算式本身」，直接调 `compute_grid` 绕开 `calculate_grid`
     // 的三模式分派（非测试代码一律走 `calculate_grid` 这个唯一入口）。
     use crate::grid::compute_grid;
+
+    /// **注释显隐的真值表**（v1.9.37）：三项缺一，夹注就不进列流。
+    ///
+    /// 这张表是「分页器 / `layout_pages` / 地脚预留」三处共用的**唯一**判据
+    /// ——它错了，表现出来的就不是「注释藏起来」，而是「页码整体错位」。
+    #[test]
+    fn notes_enter_columns_only_when_all_three_switches_are_on() {
+        assert!(Root::notes_in_column_of(true, true, true), "三项全开应进列流");
+        assert!(
+            !Root::notes_in_column_of(false, true, true),
+            "这本书不带注释 → 不进流"
+        );
+        assert!(
+            !Root::notes_in_column_of(true, false, true),
+            "读者隐藏了注释 → 不进流（正文要补位）"
+        );
+        assert!(
+            !Root::notes_in_column_of(true, true, false),
+            "页脚注模式 → 不进列流"
+        );
+        // 穷举八种：防以后有人把它改成 `||`（那会让「关了注释仍占格」）。
+        for a in [false, true] {
+            for b in [false, true] {
+                for c in [false, true] {
+                    assert_eq!(
+                        Root::notes_in_column_of(a, b, c),
+                        a && b && c,
+                        "({a}, {b}, {c}) 不是纯合取"
+                    );
+                }
+            }
+        }
+    }
 
     /// 默认窗口 1320×880、普通模式（工具栏 + 状态栏 + 四边留白）。
     const VW: f32 = 1320.0;

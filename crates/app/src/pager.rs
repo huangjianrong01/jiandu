@@ -442,7 +442,7 @@ impl Pager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Book, Chapter, Paragraph};
+    use crate::types::{Book, Chapter, Note, Paragraph};
 
     fn book_of(chapters: &[&str]) -> Book {
         let mut b = Book::new("测", "");
@@ -596,5 +596,143 @@ mod tests {
         let total = pg.known_total();
         assert!(pg.page(&mut bb, total).is_none());
         assert!(pg.page(&mut bb, total + 999).is_none());
+    }
+
+    /// **注释显隐 = 真重排**（v1.9.37 契约）。用户原话：「隐藏时正文网格必须
+    /// 严丝合缝地补齐，看起来像一本纯净的白文古籍；显示时毫秒级原样浮现，
+    /// 绝不丢失任何一个标点和位置。」
+    ///
+    /// 这里锁死四件事：
+    /// 1. 隐藏时列流里**一个 `Gloss` 片都不剩**（不是不画，是不占格）；
+    /// 2. 同样的字排进**更少的面**（正文真的补位上来了）；
+    /// 3. 两版的**字形序列逐字相同**（一个字没删、一个字没多，只改排布）；
+    /// 4. 再切回来**逐页同形**（纯函数，位置不漂）。
+    #[test]
+    fn hiding_notes_reflows_and_restoring_is_exact() {
+        let text = "天地玄黃宇宙洪荒日月盈昃辰宿列張寒來暑往秋收冬藏閏餘成歲律呂調陽";
+        // 每 4 字一条 8 字注文（≈ 4 格夹注），足以把一列（rows=4）撑爆。
+        let notes: Vec<Note> = (0..text.chars().count() / 4)
+            .map(|i| Note::new(i * 4, NoteKind::Note, "注文四字再四字"))
+            .collect();
+        let mut b = Book::new("测", "");
+        b.chapters = vec![Chapter {
+            title: "一".to_string(),
+            paragraphs: vec![Paragraph::with_notes(text, notes)],
+        }];
+        b.chapter_chars = vec![text.chars().count()];
+
+        let (cols, rows) = (4usize, 6usize);
+        let flow = b.to_flow(true);
+        let on = |g: &Glyph| -> Option<GlossPayload> {
+            if g.kind != GlyphKind::Char {
+                return None;
+            }
+            let p = b.chapters.get(g.chapter)?.paragraphs.get(g.para)?;
+            p.notes
+                .iter()
+                .find(|n| n.at == g.offset && n.kind == NoteKind::Note)
+                .map(|n| (n.text.clone(), n.source, *g))
+        };
+        let shown = layout_book_from_opts(&flow, &on, cols, rows, 0, true, false);
+        let hidden = layout_book_from_opts(&flow, |_| None, cols, rows, 0, true, false);
+
+        // ① 夹注退出列流（隐藏不是「画成全透明」，是整块不占格）。
+        let gloss_pieces = |ps: &[Page]| -> usize {
+            ps.iter()
+                .flat_map(|p| p.columns.iter())
+                .flatten()
+                .filter(|x| matches!(x, crate::gloss::Piece::Gloss(..)))
+                .count()
+        };
+        assert!(gloss_pieces(&shown) > 0, "开启时列流里应有夹注片");
+        assert_eq!(gloss_pieces(&hidden), 0, "隐藏时列流里不许剩夹注片");
+
+        // ② 正文补位 → 面数变少。
+        assert!(
+            hidden.len() < shown.len(),
+            "隐藏注释后页数应更少（正文补位），实为 {} vs {}",
+            hidden.len(),
+            shown.len()
+        );
+
+        // ③ 一个字没删、一个字没多、顺序不变。
+        let seq = |ps: &[Page]| -> Vec<(usize, usize, usize)> {
+            ps.iter()
+                .flat_map(|p| p.glyphs.iter())
+                .map(|g| (g.chapter, g.para, g.offset))
+                .collect()
+        };
+        assert_eq!(seq(&shown), seq(&hidden), "隐藏注释不许增删任何一个字");
+
+        // ④ 切回来逐页同形：页数、每页列数、每页字序全同（Piece 无 PartialEq，
+        //    但位置完全由这三者决定）。
+        let again = layout_book_from_opts(&flow, &on, cols, rows, 0, true, false);
+        let shape = |ps: &[Page]| -> Vec<(usize, Vec<(usize, usize, usize)>)> {
+            ps.iter()
+                .map(|p| {
+                    (
+                        p.columns.len(),
+                        p.glyphs
+                            .iter()
+                            .map(|g| (g.chapter, g.para, g.offset))
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(shape(&shown), shape(&again), "再切回「显示」必须逐页同形");
+    }
+
+    /// **保位**：注释显隐重排后，靠字锚点把读者放回原处（`page_of_glyph`）。
+    ///
+    /// 页码在重排后毫无意义（注释一隐全书少几十叶），所以 `resort_keeping_place`
+    /// 记的是「页首字」；这条验它在新 key 下确实能找回该字，且落在更前面。
+    #[test]
+    fn anchor_survives_note_reflow() {
+        let text = "天地玄黃宇宙洪荒日月盈昃辰宿列張寒來暑往秋收冬藏閏餘成歲律呂調陽";
+        let notes: Vec<Note> = (0..text.chars().count() / 4)
+            .map(|i| Note::new(i * 4, NoteKind::Note, "注文四字再四字"))
+            .collect();
+        let mut b = Book::new("测", "");
+        b.chapters = vec![Chapter {
+            title: "一".to_string(),
+            paragraphs: vec![Paragraph::with_notes(text, notes)],
+        }];
+        b.chapter_chars = vec![text.chars().count()];
+
+        let k_on = LayoutKey {
+            inline_notes: true,
+            rows: 6,
+            ..key()
+        };
+        let mut bb = b.clone();
+        let mut pg = Pager::new(b.chapters.len(), k_on, None);
+        pg.scan_all(&mut bb);
+        let total_on = pg.known_total();
+        assert!(total_on >= 2, "样本应排出至少两叶，实为 {total_on}");
+
+        // 取中段一叶的首字当锚点（读者此刻正看着它）。
+        let mid = total_on / 2;
+        let anchor = pg
+            .page(&mut bb, mid)
+            .and_then(|p| p.glyphs.first().copied())
+            .map(|g| (g.chapter, g.para, g.offset))
+            .expect("中段叶应有首字");
+
+        let k_off = LayoutKey {
+            inline_notes: false,
+            ..k_on
+        };
+        pg.rekey(k_off);
+        pg.scan_all(&mut bb);
+        let total_off = pg.known_total();
+        assert!(total_off < total_on, "隐藏注释后总叶数应变少");
+        let found = pg
+            .page_of_glyph(&mut bb, anchor)
+            .expect("锚点字在重排后应仍可定位");
+        assert!(
+            found < total_off,
+            "定位到的叶号必须落在新版式的总叶数内（{found} < {total_off}）"
+        );
     }
 }
