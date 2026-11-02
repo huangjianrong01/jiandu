@@ -820,6 +820,159 @@ pub fn unify_dashes(s: &str) -> Option<String> {
     )
 }
 
+// ---------------------------------------------------------------------------
+// ⑥ 孤字行 / 分节圈点（v1.9.27）
+// ---------------------------------------------------------------------------
+
+/// 行首的**装饰性分节圈点**：`○ ● ◎ ◉ ◯ ❍ ◇ ◆ ※`。
+///
+/// 佛经 / 类书的整理本习惯在品题前点一个 `○`（`○善现启请分　第二`），
+/// 它**不是文字**，是一个排版符号。竖排里它会独占一个正文字格，落在章题
+/// 列的最前头——读者看到的就是「标题前面凭空多了一个圈」。
+///
+/// 只在**行首**认：行中的 `○`（`其政悶悶○其民淳淳`）是正文里刻工打的
+/// 分隔记号，删了就改动了原书。
+fn is_section_mark(c: char) -> bool {
+    matches!(
+        c,
+        '○' | '●' | '◎' | '◉' | '◯' | '❍' | '◇' | '◆' | '※' | '⁂'
+    )
+}
+
+/// **版心残渣**：整行只剩这一个字时，它绝不可能是正文。
+///
+/// 两类：分节圈点（[`is_section_mark`]），以及 `〇`——它不是句读、不是
+/// 语气词，单独成行只可能是叶码 / 卷次 / 缺字占位。
+///
+/// ⚠️ **汉字一律不在此列**。用户的诉求是「单字的国 / 一直接剔除」，但实测
+/// 274,520 段真实数据里有 21 段「单个汉字独占一段」，其中 16 段是《红楼梦》
+/// 竖排本被断行打散的正文（`以` `珠` `雖` `有` `各` `余`…）、5 段是《诸子
+/// 百家》的篇号（`一` `二` `三` `四` `五`）。凭「单字 + 不像话」删它们，
+/// 删对了没人夸，删错了就是把书改残——所以汉字走**归并**（见
+/// [`strip_orphan_lines`]），只搬不改，一个字都不丢。
+fn is_orphan_marker(c: char) -> bool {
+    is_section_mark(c) || c == '〇'
+}
+
+/// **孤字行收口**：分节圈点剥掉，单字断列归并回正文。
+///
+/// 竖排原书一「列」就是排版的一行。PDF / OCR 抽取时，版心的圈点、叶码、
+/// 以及被列边界切断的末字，都会**各自成为一行**；下游 `tidy_blocks` 一行
+/// 一取段，它于是变成一列只有一枚字的「孤列」。竖排自右向左读，这一列
+/// 紧挨着正文列，眼睛就把它读进了正文——用户看到的
+/// `国时长老须菩提` / `一善哉、善哉` 正是这么来的：不是正文里多了一个字，
+/// 是多了一列。
+///
+/// 两条处置，界线分明：
+///
+/// | 这一列是什么 | 怎么办 | 为什么 |
+/// |---|---|---|
+/// | 分节圈点 / `〇` | **整行删** | 排版符号，删掉不损失文字 |
+/// | 单个汉字 | **并到下一行行首** | 它可能真是个字（断列残渣），只能搬不能扔 |
+///
+/// 末行落单时并到**上一行行尾**——宁可让它贴在段末，也不许凭空消失。
+///
+/// 一行都没有的短样本（< 3 行）整段放过：单行文档里那个字就是全文。
+pub fn strip_orphan_lines(s: &str) -> Option<String> {
+    let mut lines: Vec<&str> = s.split('\n').collect();
+    // 少于三行：没有「夹在正文中间的一列」这回事，一个字节都不动。
+    if lines.len() < 3 {
+        return None;
+    }
+    let mut hit = false;
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    // 待并进下一行的那个孤字。
+    let mut carry: Option<char> = None;
+    for line in lines.drain(..) {
+        let t = line.trim();
+        // 「原本就是空行」与「剥完圈点变空」是两件不同的事，必须先分开：
+        // 前者是段落边界，后者是一行纯版心符号（整行该删）。
+        let was_blank = t.is_empty();
+        // 先剥行首圈点（可能连续几个，`○○` 也见过）。
+        let mut body = t;
+        while let Some(c) = body.chars().next() {
+            if is_section_mark(c) {
+                body = &body[c.len_utf8()..];
+                hit = true;
+            } else {
+                break;
+            }
+        }
+        let body = body.trim_start();
+        if body.is_empty() {
+            if was_blank {
+                // 空行：交下游压（但待并字要跟着走，不能丢在空行里）。
+                if let Some(p) = carry.take() {
+                    hit = true;
+                    out.push(p.to_string());
+                }
+                out.push(String::new());
+            } else {
+                // 整行只有圈点：删掉这一行，不留空行。
+                if let Some(p) = carry.take() {
+                    out.push(p.to_string());
+                }
+            }
+            continue;
+        }
+        let n = body.chars().count();
+        // 只剩一枚字 → 孤列。
+        if n == 1 {
+            let c = body.chars().next().unwrap();
+            if is_orphan_marker(c) {
+                hit = true; // 版心残渣：整行删
+                continue;
+            }
+            if is_han(c) || c == '□' || c == '■' {
+                // 汉字 / 缺字框：搬到下一行去。已有待并字则先落地，绝不吞字。
+                if let Some(prev) = carry.take() {
+                    hit = true;
+                    out.push(prev.to_string());
+                }
+                carry = Some(c);
+                hit = true;
+                continue;
+            }
+        }
+        let mut line_out = String::with_capacity(body.len() + 4);
+        if let Some(p) = carry.take() {
+            line_out.push(p);
+        }
+        line_out.push_str(body);
+        out.push(line_out);
+    }
+    // 末尾落单的孤字：贴到上一个非空行尾。
+    if let Some(c) = carry {
+        hit = true;
+        match out.iter_mut().rev().find(|l| !l.trim().is_empty()) {
+            Some(l) => l.push(c),
+            None => out.push(c.to_string()),
+        }
+    }
+    if !hit {
+        return None;
+    }
+    // 收掉因删行产生的连续空行（下游 `tidy_blocks` 只压一次，这里先收一道，
+    // 免得整段书稿多出成片的空白）。
+    let mut s = String::with_capacity(s.len());
+    let mut blank = false;
+    for l in out {
+        if l.trim().is_empty() {
+            if blank {
+                continue;
+            }
+            blank = true;
+        } else {
+            blank = false;
+        }
+        if !s.is_empty() || !l.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&l);
+    }
+    Some(s.trim_start_matches('\n').to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,5 +1152,70 @@ mod tests {
         // 长度必须不变：三个还是三个。
         assert_eq!(unify_dashes("―――").as_deref(), Some("———"));
         assert_eq!(unify_dashes("本来就没有横线"), None);
+    }
+
+    // ---- 孤字行 / 分节圈点 -------------------------------------------
+
+    #[test]
+    fn section_mark_is_stripped_from_line_head() {
+        // 佛经整理本的品题前缀（真机案例：「○善现启请分　第二」）。
+        assert_eq!(
+            strip_orphan_lines("道可道\n○善現啟請分　第二\n時長老須菩提")
+                .as_deref(),
+            Some("道可道\n善現啟請分　第二\n時長老須菩提")
+        );
+        // 行中的圈点是刻工记号，一个不碰。
+        assert_eq!(strip_orphan_lines("甲乙丙\n其政悶悶○其民淳淳\n丁戊己"), None);
+    }
+
+    #[test]
+    fn orphan_column_is_merged_not_deleted() {
+        // 用户真机看到「一善哉、善哉」：其实是一列孤零零的「一」紧挨着正文列。
+        // 单字必须**搬**进下一行，绝不能删——它可能真是断列打散的字。
+        assert_eq!(
+            strip_orphan_lines("上善若水。\n一\n善哉善哉。\n水善利萬物")
+                .as_deref(),
+            Some("上善若水。\n一善哉善哉。\n水善利萬物")
+        );
+        // 叶码 / 版心「国」这种：单字列，同样只能归并。
+        assert_eq!(
+            strip_orphan_lines("如是我聞。\n国\n時長老須菩提。\n即從座起")
+                .as_deref(),
+            Some("如是我聞。\n国時長老須菩提。\n即從座起")
+        );
+    }
+
+    #[test]
+    fn orphan_marker_line_is_dropped_whole() {
+        // 单占一列的圈点 / 〇 是纯排版符号，整行删。
+        assert_eq!(
+            strip_orphan_lines("甲。\n○\n乙丙丁。\n戊己庚")
+                .as_deref(),
+            Some("甲。\n乙丙丁。\n戊己庚")
+        );
+        assert_eq!(
+            strip_orphan_lines("甲。\n〇\n乙丙丁。\n戊己庚")
+                .as_deref(),
+            Some("甲。\n乙丙丁。\n戊己庚")
+        );
+    }
+
+    #[test]
+    fn trailing_orphan_sticks_to_previous_line() {
+        // 末行落单：贴到上一行行尾，绝不凭空消失。
+        assert_eq!(
+            strip_orphan_lines("甲。\n乙丙丁。\n戊")
+                .as_deref(),
+            Some("甲。\n乙丙丁。戊")
+        );
+    }
+
+    #[test]
+    fn short_or_clean_input_is_untouched() {
+        // 单行文档里那个字就是全文，不许动。
+        assert_eq!(strip_orphan_lines("道"), None);
+        assert_eq!(strip_orphan_lines("道\n可"), None);
+        // 干净的多行文本零改动。
+        assert_eq!(strip_orphan_lines("道可道，非常道。\n名可名，非常名。\n玄之又玄。"), None);
     }
 }

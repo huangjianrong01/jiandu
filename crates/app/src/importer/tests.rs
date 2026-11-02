@@ -619,3 +619,49 @@ fn clean_stays_fast_on_a_hundred_thousand_chars() {
     assert!(!out.contains("道 可 道"), "汉字间空格没清掉");
     assert!(!out.contains('&'), "HTML 实体没解掉");
 }
+
+/// 真机回归（v1.9.27）：竖排源稿的「孤列」绝不能读进正文。
+///
+/// 用户看到的是「标题后面凭空多了一个国字」「善哉前面多了一个一字」。
+/// 真相不是正文里多了字，而是**多了一列**：竖排原书一列就是一行，PDF / OCR
+/// 抽取时版心的圈点、叶码、被列边界切断的末字各自成行，下游一行一取段，
+/// 于是变成一枚字独占一列的「孤列」；竖排自右向左读，眼睛就把它读进了
+/// 紧挨着的那一列正文。
+#[test]
+fn orphan_column_and_section_mark_are_cleaned() {
+    let raw = "金刚经\n○善现启请分\u{3000}第二\n国\n时长老须菩提。\n一\n善哉善哉。\n〇\n须菩提。\n";
+    let out = cleaner::clean(raw);
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    // ① 分节圈点与叶码是排版符号：剥掉，一个字都不留。
+    assert!(!out.contains('○'), "分节圈点必须剥：{out}");
+    assert!(!out.contains('〇'), "叶码 〇 必须删：{out}");
+    // ② 单个汉字是**搬**进下一列，不是删——它可能真是被列边界切开的字。
+    assert!(
+        lines.iter().any(|l| l.starts_with("国时长老须菩提")),
+        "孤字应并回后一列：{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("一善哉善哉")),
+        "孤字应并回后一列：{lines:?}"
+    );
+}
+
+/// 真机回归（v1.9.27）：弯引号必须成对，否则换成 `『` 后是「避头符」。
+///
+/// 显示层 `bracket_to_quote` 把 `“”‘’` 换成 `「」『』`，但换字在清洗之后：
+/// 一个没闭合的 `‘` 换过去就是一个没闭合的 `『`，竖排里它不许落在列首，
+/// 整段后半的列一列一列往下让位——用户看到的是「引号和文字排版全乱了」。
+#[test]
+fn curly_quotes_are_closed_before_they_become_corner_quotes() {
+    // 未闭合的右引号补在行末。
+    assert_eq!(
+        cleaner::clean("佛言：“善哉。"),
+        "佛言：“善哉。”\n"
+    );
+    assert_eq!(cleaner::clean("‘希有。"), "‘希有。’\n");
+    // 已经成对的一枚都不加。
+    assert_eq!(
+        cleaner::clean("他说：‘甲’乙。"),
+        "他说：‘甲’乙。\n"
+    );
+}

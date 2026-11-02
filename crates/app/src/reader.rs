@@ -7164,10 +7164,12 @@ impl Root {
         ink: u32,
         cell_w: f32,
         cell_h: f32,
+        // 画（以及量）用哪支字体。**必须与量的时候是同一支**：标点若从别的
+        // 字体取字形，它自带的内边距与设计尺寸都不同，落在同一格里的观感
+        // 就是「引号变小了、位置也偏了」——用户说的「被当成了小字」。
+        family: SharedString,
         cx: &App,
     ) -> Div {
-        // 量哪支字体的框？就是正文这支——标点没走逐字回退，画的是同一支。
-        let family = self.main_family();
         let dx = crate::mark_align::center_dx(cx, family.as_ref(), ch, size);
         div()
             .absolute()
@@ -7178,6 +7180,7 @@ impl Root {
             .flex()
             .items_center()
             .justify_center()
+            .font_family(family)
             .text_size(px(size))
             .line_height(px(cell_h))
             .text_color(rgb(ink))
@@ -7559,7 +7562,15 @@ impl Root {
             // 括号换竖排专用字形 ︵ / ︶：本身已横躺，在列中上下相接，
             // 贴合汉字基线（不再用右下角小字的句读摆法）。
             let pf = (fs * 0.88).max(8.0).min(cell_h);
-            cell = cell.relative().child(self.optical_center(vp, pf, ink, cell_w, cell_h, cx));
+            cell = cell.relative().child(self.optical_center(
+                vp,
+                pf,
+                ink,
+                cell_w,
+                cell_h,
+                self.main_family(),
+                cx,
+            ));
         } else if crate::types::is_title_mark(g.ch) {
             // **书名号**（兜底路径）：正常流程里 `to_flow` 已把它换成 `︽ ︾`
             // 并标成 `Attach`，由 `title_mark_overlay` 叠到邻字格的边栏上、
@@ -7572,18 +7583,29 @@ impl Root {
                 ink,
                 cell_w,
                 cell_h,
+                self.main_family(),
                 cx,
             ));
         } else if crate::types::is_quote_mark(g.ch) {
             // **直角引号**：竖排里要旋转 90°（开口朝下）。GPUI 0.2.2 没有
             // 元素级旋转变换，直接用 Unicode 竖排呈现形 `﹁ ﹂ ﹃ ﹄`
             // ——字库里存的就是转好的那一枚。
+            //
+            // ⚠️ 引号也必须走**逐字回退**（v1.9.27）：`﹃`(U+FE43) 这类竖排
+            // 呈现形很多字库根本没有，缺字时 GPUI 会自己找一支替身来画，
+            // 替身的内边距与设计尺寸都与正文无关——同一格里的引号于是显得
+            // 又小又偏，读者看到的是「引号被当成了小字」。这里用与正文同一
+            // 套判据取字体，量墨迹、落笔都用它，字号仍是正文字号。
+            let vq = crate::types::vertical_quote(g.ch);
+            let pick =
+                crate::font_fallback::body(self.font_ancient, self.script, vq, cx);
             cell = cell.relative().child(self.optical_center(
-                crate::types::vertical_quote(g.ch),
+                vq,
                 fs.min(cell_h),
                 ink,
                 cell_w,
                 cell_h,
+                pick.family.clone(),
                 cx,
             ));
         } else if crate::punct::kind_for(g.ch, self.punct_mode).is_some() {

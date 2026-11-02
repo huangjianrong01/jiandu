@@ -133,6 +133,14 @@ pub fn clean_with(raw: &str, opt: &CleanOptions) -> String {
         if let Some(x) = jiandu_core::residue::unify_dashes(&s) {
             s = x;
         }
+        // 孤字行收口（v1.9.27）：竖排原书一「列」就是一行，版心的圈点、叶码、
+        // 被列边界切断的末字在抽取后各自成行，下游一行一取段，就成了「一列
+        // 只有一枚字」的孤列——竖排自右向左读，眼睛把它读进了正文，看着就是
+        // 「凭空多了一个字」。分节圈点 / `〇` 整行删，单个汉字**并回下一行**
+        // （只搬不扔：可能是真字，见 `strip_orphan_lines` 的说明）。
+        if let Some(x) = jiandu_core::residue::strip_orphan_lines(&s) {
+            s = x;
+        }
     }
 
     if opt.cjk_punct {
@@ -411,7 +419,7 @@ fn unify_script(s: &str) -> String {
 /// `[注]` 不闭合则会把余下全文吞进夹注。补在行末（不是文末）——按段收口，
 /// 才不会被读者当成跨段的长注。
 fn close_notes(s: &str) -> String {
-    const PAIRS: [(char, char); 8] = [
+    const PAIRS: [(char, char); 10] = [
         ('（', '）'),
         ('〔', '〕'),
         ('［', '］'),
@@ -420,6 +428,13 @@ fn close_notes(s: &str) -> String {
         ('〈', '〉'),
         ('「', '」'),
         ('『', '』'),
+        // 弯引号也要收口（v1.9.27）：显示层 `bracket_to_quote` 会把 `“”‘’`
+        // 1:1 换成 `「」『』`，但**换字发生在清洗之后**——一个没闭合的 `‘`
+        // 换来的是一个没闭合的 `『`，竖排里它是「避头符」：整段后半的列首
+        // 都得给它让位，一列一列往下错，最后看起来像整段被「缩进」了。
+        // 在这里补齐，换过去才是成对的。
+        ('“', '”'),
+        ('‘', '’'),
     ];
     let mut out = String::with_capacity(s.len() + 8);
     for (n, line) in s.split('\n').enumerate() {
