@@ -4472,8 +4472,19 @@ fn rasterize_source(path: &Path, page_no: usize, target_px: f32) -> Result<Raste
     }
     // 媒体框（PDF 点）：坐标映射的基准尺寸，与文本层坐标同单位。
     let mb = unsafe { CGPDFPageGetBoxRect(page, 0) }; // kCGPDFMediaBox = 0
-    let nat_w = mb.w;
-    let nat_h = mb.h;
+    // ⚠️ 页面可能被要求**旋转显示**（/Rotate 90 / 270）：扫描件里横放的插页、
+    //    为省纸而旋转排版的内页都很常见。旋转 90/270 时显示宽高是**互换**的——
+    //    照 MediaBox 建画布、再让 GetDrawingTransform 等比塞进去，只会得到
+    //    「内容缩成一条横带、两侧大片留白」，文本层坐标也全对不上。
+    //    这里的 nat_w/nat_h 是**旋转后的显示尺寸**，与 `pdf_text` 里旋转过的
+    //    regions 同一坐标系，两边必须严格一致。
+    let rotation = unsafe { CGPDFPageGetRotationAngle(page) };
+    let quarter_turn = rotation.rem_euclid(180) == 90;
+    let (nat_w, nat_h) = if quarter_turn {
+        (mb.h, mb.w)
+    } else {
+        (mb.w, mb.h)
+    };
     if nat_w <= 0.0 || nat_h <= 0.0 {
         unsafe { CGPDFPageRelease(page) };
         return Err("PDF 页面尺寸为 0".to_string());
@@ -4521,11 +4532,13 @@ fn rasterize_source(path: &Path, page_no: usize, target_px: f32) -> Result<Raste
     //    实测：手动翻转 → 倒置；不翻转 / DrawingTransform → 正向）。
     //    改用官方 CGPDFPageGetDrawingTransform：把媒体框映射到目标矩形，并自动
     //    处理页面 /Rotate（0/90/180/270），缩放也一并交给它。
+    //
+    //    `rotation` 已在上面取过（画布尺寸要用），这里直接复用：传 0 的话
+    //    GetDrawingTransform 会忽略 /Rotate，位图就与 regions 差一次旋转。
     let target = CGRect::new(
         &CGPoint::new(0.0, 0.0),
         &CGSize::new(w as f64, h as f64),
     );
-    let rotation = unsafe { CGPDFPageGetRotationAngle(page) };
     let transform =
         unsafe { CGPDFPageGetDrawingTransform(page, 0, target, rotation, true) };
     unsafe {
@@ -5430,6 +5443,44 @@ mod raster_color_tests {
 mod raster_probe {
     use super::*;
     use std::time::Instant;
+
+    /// `/Rotate 90` 的页，栅格化出来的「自然尺寸」必须是**宽高互换**后的 400×300，
+    /// 位图本身也得横过来（宽 > 高），比例约 4:3。
+    ///
+    /// 为什么这条非有不可：`rasterize_source` 的 `nat_w/nat_h` 同时是**坐标映射
+    /// 的基准**（`source_size()` → 框的位置 = region / nat × 显示宽）。若还按
+    /// MediaBox 的 300×400 算，`GetDrawingTransform` 会把页面等比缩成一条横带
+    /// 塞进竖画布（上下大片留白），而且与 `pdf_text` 里旋转过的 regions 差一次
+    /// 旋转——用户看到的就是「图歪着、框飞到页边」。
+    #[test]
+    fn rotated_page_rasterizes_into_a_swapped_canvas() {
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("jiandu_rot_raster_{}.pdf", std::process::id()));
+        std::fs::write(&p, crate::pdf_text::tiny_pdf(90)).expect("写样张失败");
+        let r = rasterize_source(&p, 1, 1200.0).expect("栅格化失败");
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            (r.nat_w - 400.0).abs() < 0.5,
+            "自然宽应为 400（= MediaBox 的高），实得 {}",
+            r.nat_w
+        );
+        assert!(
+            (r.nat_h - 300.0).abs() < 0.5,
+            "自然高应为 300（= MediaBox 的宽），实得 {}",
+            r.nat_h
+        );
+        let img = r.image.expect("PDF 页应是内存位图");
+        let (pw, ph) = (
+            img.size(0).width.0 as f64,
+            img.size(0).height.0 as f64,
+        );
+        assert!(pw > ph, "位图应横过来（宽>高），实得 {pw}×{ph}");
+        let ratio = pw / ph;
+        assert!(
+            (ratio - 4.0 / 3.0).abs() < 0.05,
+            "宽高比应约 1.333（400:300），实得 {ratio:.3}——画布可能还在按未旋转尺寸建"
+        );
+    }
 
     #[test]
     #[ignore]

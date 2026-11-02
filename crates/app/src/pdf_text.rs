@@ -144,8 +144,70 @@ pub fn extract_pdf_text_regions_on(path: &Path, page_index: usize) -> Vec<Source
             // 兜底：个别 PDF 的 selection 拿不到东西，退回逐字包围盒。
             chunks = chunks_by_char_bounds(page, string, len);
         }
-        cluster(chunks, page_h)
+        // ⚠️ 顺序关键：**先**在未旋转坐标里聚类，**再**整体旋转。
+        //    `cluster` 靠 Δx/Δy 判竖排还是横排；旋转 90° 的页若先转坐标，
+        //    Δx 与 Δy 的角色会互换，竖排古籍会被当成横排去按 y 分桶，整页糊成一团。
+        //    未旋转坐标才是内容的**原始**排布方向，判断必须在那里做。
+        let regions = cluster(chunks, page_h);
+        // 图被 `CGPDFPageGetDrawingTransform` 按 /Rotate 转正了，坐标必须跟着转；
+        // 不转就是「图正着、框躺着」，高亮整片错位。
+        let rotation: i64 = msg_send![page, rotation];
+        let rotation = rotation as i32;
+        if rotation.rem_euclid(360) == 0 {
+            regions
+        } else {
+            rotate_regions(regions, rotation, (mb.x + mb.w) as f32, page_h as f32)
+        }
     })
+}
+
+/// 把文本层区域从**未旋转**页面坐标（y 向下）变换到**显示**坐标。
+///
+/// `rotation` 是 PDF 的 `/Rotate`（顺时针度数，0/90/180/270）；`w` / `h` 是
+/// **未旋转**的页面尺寸（点）。90 / 270 时显示宽高互换，矩形本身也要跟着换 ——
+/// 只挪位置不改宽高，框就会变成横躺的细条。
+///
+/// 为什么必须做：`PDFSelection.boundsForPage:` 恒返回**未旋转**坐标，而
+/// `CGPDFPageGetDrawingTransform` 会按 `/Rotate` 把**位图**转正。两边差一次
+/// 旋转，高亮就整片错位——扫描件里横放的插页、为省纸旋转排版的内页全中。
+///
+/// 坐标约定与 `cluster` 一致：原点 (0,0) 在页面左上，y 向下。
+fn rotate_regions(
+    mut regions: Vec<SourceRegion>,
+    rotation: i32,
+    w: f32,
+    h: f32,
+) -> Vec<SourceRegion> {
+    match rotation.rem_euclid(360) {
+        // 顺时针 90°：(x, y) → (h - y - rh, x)，宽高互换。
+        90 => {
+            for r in &mut regions {
+                let (x, y) = (r.x, r.y);
+                r.x = h - y - r.h;
+                r.y = x;
+                std::mem::swap(&mut r.w, &mut r.h);
+            }
+        }
+        // 顺时针 180°：中心对称，宽高不变。
+        180 => {
+            for r in &mut regions {
+                r.x = w - r.x - r.w;
+                r.y = h - r.y - r.h;
+            }
+        }
+        // 顺时针 270°（= 逆时针 90°）：(x, y) → (y, w - x - rw)，宽高互换。
+        270 => {
+            for r in &mut regions {
+                let (x, y) = (r.x, r.y);
+                r.x = y;
+                r.y = w - x - r.w;
+                std::mem::swap(&mut r.w, &mut r.h);
+            }
+        }
+        // 0 / 非法值：原样返回（非法值按「不旋转」处理，绝不把框转飞）。
+        _ => {}
+    }
+    regions
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -621,9 +683,52 @@ fn cluster(chunks: Vec<Chunk>, page_h: f64) -> Vec<SourceRegion> {
         .collect()
 }
 
+/// 手写一个最小 PDF，`rotate` 控制页面字典里的 `/Rotate`。
+///
+/// 为什么不用 `render_pdf_blocking`：那条路产出的样张**没有 /Rotate**，
+/// 而「旋转页坐标」这条回归必须要有一份真带 /Rotate 的 PDF 才能验。
+/// xref 偏移逐对象累加算出（内容全 ASCII，`str::len()` 就是字节数）。
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn tiny_pdf(rotate: i32) -> Vec<u8> {
+    let content = "BT /F1 24 Tf 50 300 Td (Hello) Tj ET";
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Rotate {rotate} \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+        ),
+        format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ];
+    let mut out = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for (i, body) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, body));
+    }
+    let xref_at = out.len();
+    out.push_str(&format!("xref\n0 {}\n", objs.len() + 1));
+    out.push_str("0000000000 65535 f \n");
+    for off in &offsets {
+        out.push_str(&format!("{:010} 00000 n \n", off));
+    }
+    out.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+        objs.len() + 1,
+        xref_at
+    ));
+    out.into_bytes()
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    use super::tiny_pdf;
 
     fn ch(x: f64, y: f64, w: f64, h: f64, text: &str) -> Chunk {
         Chunk {
@@ -668,6 +773,194 @@ mod tests {
         push_merged(&mut out, ch(500.4, 799.6, 23.8, 600.3, "乙"));
         assert_eq!(out.len(), 1, "亚像素抖动不该拆成两段：{out:?}");
         assert_eq!(out[0].text, "甲乙");
+    }
+
+    fn region(x: f32, y: f32, w: f32, h: f32) -> SourceRegion {
+        SourceRegion {
+            x,
+            y,
+            w,
+            h,
+            text: "甲".to_string(),
+        }
+    }
+
+    /// `/Rotate 90`：左上角的竖条必须变成**顶部右侧**的横条，且宽高互换。
+    ///
+    /// 这条守的是「图转了、坐标也得转」：`GetDrawingTransform` 按 /Rotate 把位图
+    /// 转正，`PDFSelection.boundsForPage:` 给的仍是未旋转坐标，差这一次旋转就是
+    /// 整片高亮错位——扫描件里横放的插页全中。
+    #[test]
+    fn rotation_90_turns_a_left_column_into_a_top_row() {
+        // 未旋转页面 300×400；左上一个 20×100 的竖条。
+        let out = rotate_regions(vec![region(0.0, 0.0, 20.0, 100.0)], 90, 300.0, 400.0);
+        let g = &out[0];
+        // x' = h - y - rh = 400 - 0 - 100 = 300；y' = x = 0。
+        assert!((g.x - 300.0).abs() < 0.01, "x 应为 300，实得 {}", g.x);
+        assert!((g.y - 0.0).abs() < 0.01, "y 应为 0，实得 {}", g.y);
+        assert!((g.w - 100.0).abs() < 0.01, "宽高必须互换，实得 w={}", g.w);
+        assert!((g.h - 20.0).abs() < 0.01, "宽高必须互换，实得 h={}", g.h);
+        // 显示页面是 400×300（宽高互换过），整块必须落在里面。
+        assert!(
+            g.x >= 0.0 && g.x + g.w <= 400.01 && g.y >= 0.0 && g.y + g.h <= 300.01,
+            "旋转后越界：{g:?}（显示 400×300）"
+        );
+    }
+
+    /// `/Rotate 270`：左上角竖条变成**左下角**横条（与 90° 镜像，方向别弄反）。
+    #[test]
+    fn rotation_270_turns_a_left_column_into_a_bottom_row() {
+        let out = rotate_regions(vec![region(0.0, 0.0, 20.0, 100.0)], 270, 300.0, 400.0);
+        let g = &out[0];
+        // x' = y = 0；y' = w - x - rw = 300 - 0 - 20 = 280。
+        assert!((g.x - 0.0).abs() < 0.01, "x 应为 0，实得 {}", g.x);
+        assert!((g.y - 280.0).abs() < 0.01, "y 应为 280，实得 {}", g.y);
+        assert!((g.w - 100.0).abs() < 0.01 && (g.h - 20.0).abs() < 0.01, "宽高必须互换");
+    }
+
+    /// 180° 是对合：转两次必须回到原位，且宽高**不**换。
+    #[test]
+    fn rotation_180_is_its_own_inverse() {
+        let src = region(10.0, 20.0, 30.0, 40.0);
+        let once = rotate_regions(vec![src.clone()], 180, 300.0, 400.0);
+        assert!((once[0].x - 260.0).abs() < 0.01, "x = 300-10-30 = 260，实得 {}", once[0].x);
+        assert!((once[0].y - 340.0).abs() < 0.01, "y = 400-20-40 = 340，实得 {}", once[0].y);
+        assert!(
+            (once[0].w - 30.0).abs() < 0.01 && (once[0].h - 40.0).abs() < 0.01,
+            "180° 不该换宽高"
+        );
+        let twice = rotate_regions(once, 180, 300.0, 400.0);
+        assert!((twice[0].x - 10.0).abs() < 0.01 && (twice[0].y - 20.0).abs() < 0.01, "转两次没回到原位");
+    }
+
+    /// 270 之后再 90（用互换后的页面尺寸）必须精确回到原位。
+    ///
+    /// 这条同时钉住「换宽高」这件事：宽高不互换的话，第二次旋转的基准就错了，
+    /// 回不到原位——而人的直觉是「转回来就该一模一样」。
+    #[test]
+    fn rotation_270_then_90_returns_home() {
+        let src = region(10.0, 20.0, 30.0, 40.0);
+        let a = rotate_regions(vec![src.clone()], 270, 300.0, 400.0);
+        // 270° 后显示页面 400×300。
+        let b = rotate_regions(a, 90, 400.0, 300.0);
+        assert!((b[0].x - 10.0).abs() < 0.01, "x 没回来：{}", b[0].x);
+        assert!((b[0].y - 20.0).abs() < 0.01, "y 没回来：{}", b[0].y);
+        assert!((b[0].w - 30.0).abs() < 0.01 && (b[0].h - 40.0).abs() < 0.01, "宽高没还回来");
+    }
+
+    /// 0° 与非法值一律原样返回（非法角度按「不旋转」处理，绝不把框转飞）。
+    #[test]
+    fn zero_or_bogus_rotation_is_a_no_op() {
+        for rot in [0, 360, -360, 45, 91] {
+            let out = rotate_regions(vec![region(10.0, 20.0, 30.0, 40.0)], rot, 300.0, 400.0);
+            assert!(
+                (out[0].x - 10.0).abs() < 0.01
+                    && (out[0].y - 20.0).abs() < 0.01
+                    && (out[0].w - 30.0).abs() < 0.01,
+                "rotation={rot} 不该改动坐标：{:?}",
+                out[0]
+            );
+        }
+    }
+
+    /// 整页所有区域旋转后都必须落在显示页面内——一个越界就说明公式某处取反了。
+    #[test]
+    fn every_region_stays_inside_the_rotated_page() {
+        // 未旋转 300×400；铺满整页的 3×4 网格。
+        let mut src = Vec::new();
+        for row in 0..4 {
+            for col in 0..3 {
+                src.push(region(
+                    col as f32 * 100.0,
+                    row as f32 * 100.0,
+                    80.0,
+                    90.0,
+                ));
+            }
+        }
+        for rot in [90, 180, 270] {
+            let (dw, dh) = if rot % 180 == 90 { (400.0, 300.0) } else { (300.0, 400.0) };
+            for r in rotate_regions(src.clone(), rot, 300.0, 400.0) {
+                assert!(
+                    r.x >= -0.01 && r.y >= -0.01 && r.x + r.w <= dw + 0.01 && r.y + r.h <= dh + 0.01,
+                    "rotation={rot} 有区域越界：{r:?}（显示 {dw}×{dh}）"
+                );
+            }
+        }
+    }
+
+    /// 端到端：真带 `/Rotate 90` 的 PDF，框必须落在**旋转后**的页面里。
+    ///
+    /// 这条守的是整条链路：PDFKit 读 `page.rotation` → `rotate_regions` 变换 →
+    /// 与 `rasterize_source` 里「宽高互换后的画布 + GetDrawingTransform」对齐。
+    /// 少任何一环，用户看到的就是「点右文，左图的框跑到页边或页外」。
+    ///
+    /// 对照那一步不能省：只断言「旋转页的框不越界」是能被「碰巧都很小」蒙过去的，
+    /// 必须同时证明未旋转页是另一个尺寸基准。
+    #[test]
+    fn rotated_pdf_regions_land_inside_the_display_page() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+
+        let flat = dir.join(format!("jiandu_rot0_{pid}.pdf"));
+        std::fs::write(&flat, tiny_pdf(0)).expect("写样张失败");
+        let r0 = extract_pdf_text_regions(&flat);
+        let _ = std::fs::remove_file(&flat);
+
+        let spun = dir.join(format!("jiandu_rot90_{pid}.pdf"));
+        std::fs::write(&spun, tiny_pdf(90)).expect("写样张失败");
+        let r90 = extract_pdf_text_regions(&spun);
+        let _ = std::fs::remove_file(&spun);
+
+        assert!(!r0.is_empty(), "/Rotate 0 的样张抽不出文本层（手写 PDF 有问题？）");
+        assert!(!r90.is_empty(), "/Rotate 90 的样张抽不出文本层（旋转角被当成 0 了？）");
+
+        // 未旋转页面 300×400。
+        for r in &r0 {
+            assert!(
+                r.x >= -1.0 && r.y >= -1.0 && r.x + r.w <= 301.0 && r.y + r.h <= 401.0,
+                "未旋转页的框越界：{r:?}"
+            );
+        }
+        // 旋转后显示页面 400×300（宽高互换）——超过 300 的高度就是没转。
+        for r in &r90 {
+            assert!(
+                r.x >= -1.0 && r.y >= -1.0 && r.x + r.w <= 401.0 && r.y + r.h <= 301.0,
+                "旋转页的框越界：{r:?}（显示页应为 400×300）"
+            );
+        }
+
+        // ⚠️ 下面两条才是真正有区分力的判据。只断言「不越界」会被「碰巧都很小」
+        //    蒙过去（"Hello" 那种小框在任何页面里都像在范围内）。
+        //
+        // ① 一行横排字转 90° 必然「变竖」：宽 < 高。若旋转角被当成 0，
+        //    这里会立刻翻车（原来是宽 > 高）。
+        let flat0 = &r0[0];
+        let spun0 = &r90[0];
+        assert!(
+            flat0.w > flat0.h,
+            "未旋转时这一行应是横的（宽>高），实得 w={} h={}",
+            flat0.w,
+            flat0.h
+        );
+        assert!(
+            spun0.w < spun0.h,
+            "旋转 90° 后这一行应变竖（宽<高），实得 w={} h={}——旋转角没生效？",
+            spun0.w,
+            spun0.h
+        );
+        // ② 位置也要对：原文落在页面左下偏左（x≈50，y_up≈300），顺时针转 90°
+        //    之后应跑到**右上**（x 靠大、y 靠小）。这是「图转了坐标也转了」的证据。
+        assert!(
+            spun0.x > 200.0,
+            "旋转后 x 应靠右（≈300），实得 {}——旋转方向或基准宽度算错了",
+            spun0.x
+        );
+        assert!(
+            spun0.y < 150.0,
+            "旋转后 y 应靠上（≈50），实得 {}",
+            spun0.y
+        );
     }
 
     /// 退化盒子（3.7×6.1，中心在真实字格中心）必须被补回一个字的大小，
