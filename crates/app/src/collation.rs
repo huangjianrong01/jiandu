@@ -44,9 +44,10 @@ use gpui::{
     div, img, px, rgb, rgba, Bounds, BoxShadow, Context,
     EntityInputHandler, EventEmitter, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ParentElement, Render,
-    ScrollHandle, SharedString, Styled, Window,
+    RenderImage, ScrollHandle, SharedString, Styled, Window,
 };
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 use std::path::{Path, PathBuf};
 
@@ -357,8 +358,29 @@ pub struct CollationWorkspace {
     dragging: bool,
     /// 竖排预览开关（骨架阶段只切占位浮层；真实栅格化在下一步）。
     show_preview: bool,
-    /// 预栅格化的原图位图（PDF 页 / PNG）；None 时左图用 mock 行带占位。
+    /// 位图原图（真正的 PNG / JPG）路径：由 `gpui::img` 自己解码，不预栅格化。
+    /// 与 `image_mem` 二选一，谁有值就画谁。
     image_path: Option<PathBuf>,
+    /// PDF 页的**内存位图**（v1.9.30）。
+    ///
+    /// 这是左栏手感的关键：原先 PDF 页要先编成 PNG 落盘、再让 `gpui::img` 异步
+    /// 读盘解码贴图——一次翻页就是「CG 画 → 转 RGBA → PNG 编码 → 写盘 → 读盘 →
+    /// PNG 解码」六趟，其中编解码两趟是纯浪费。`gpui` 本来就支持直接吃
+    /// `Arc<RenderImage>`（`ImageSource::Render` 分支零开销），于是把 CG 画好的
+    /// 像素直接留在内存：翻页只剩「画 + 上传纹理」。
+    ///
+    /// 顺带解决了清晰度问题：没有了 PNG 的体积顾虑，栅格化就敢按**显示尺寸**
+    /// 出图（见 [`raster_px`]），而不必把 300dpi 的影印本压到 72dpi。
+    image_mem: Option<Arc<RenderImage>>,
+    /// 待回收的内存位图（v1.9.30）：换页时把旧页挪进来，**下一帧** render 开头
+    /// 统一 `window.drop_image(...)` 释放它的 GPU 纹理。
+    ///
+    /// ⚠️ 这一条不能省。gpui 把 `RenderImage` 按 `ImageId` 上传到 sprite atlas，
+    /// 而 `ImageSource::Render` 的 `remove_asset` 是**空实现**——不显式
+    /// `drop_image`，翻 100 页就留下 100 张 1120×1679 的纹理常驻显存（每张约
+    /// 7.5MB，翻几百页就是几个 G）。隔一帧再删是照 `temp_gc` 的老规矩：本帧的
+    /// 场景可能还引用着旧图，等元素树换过再删才安全。
+    image_gc: Vec<Arc<RenderImage>>,
     /// 上一张临时栅格化 PNG（PDF 转图产生）；载入新图时删除以免堆积。
     last_temp: Option<PathBuf>,
     /// 导入失败信息（红色提示）。
@@ -436,6 +458,12 @@ pub struct CollationWorkspace {
     src_nat_w: f32,
     /// 左图原图自然像素高（由栅格化结果填充；无原图时由区域包围盒推导）。
     src_nat_h: f32,
+    /// 左栏**实际显示宽度的设备像素**（`vw * 0.4 * 屏幕缩放`，v1.9.30）。
+    ///
+    /// 由 `render` 每帧刷新（那里才拿得到 `window.scale_factor()` 与 `vw`），
+    /// 栅格化时读它决定画布多大：取「够用就好」的像素数，既不为 Retina 欠采样
+    /// 发糊，也不为 4K 白烧内存。0 = 还不知道（首帧），此时退回 1:1。
+    left_px: f32,
     /// 联动提示（非错误）：如「该段与原图此处文字不匹配，已跳过定位」。
     match_note: Option<String>,
     /// 排障用帧计数（每 120 帧打一次日志，狂刷 = 存在无限重绘循环）。
@@ -557,6 +585,8 @@ impl CollationWorkspace {
             dragging: false,
             show_preview: false,
             image_path: None,
+            image_mem: None,
+            image_gc: Vec::new(),
             last_temp: None,
             image_error: None,
             image_note: None,
@@ -584,6 +614,7 @@ impl CollationWorkspace {
             active_para_idx: None,
             src_nat_w: 0.0,
             src_nat_h: 0.0,
+            left_px: 0.0,
             match_note: None,
             frame_count: 0,
             // 启动时**没有任何原图**，故区域表为空：绝不用假坐标占位。
@@ -1319,7 +1350,7 @@ impl CollationWorkspace {
         // **空状态**（v1.9.22）：一张原图都没有时，绝不把「占位页 + 假区域框」
         // 摆出来——那看起来像一个渲染 Bug（真机反馈原话：「两个灰色线框太突兀」）。
         // 改成一张安静的空纸 + 一句提示，它是「还没开始」，不是「坏了」。
-        let empty = self.image_path.is_none();
+        let empty = self.image_path.is_none() && self.image_mem.is_none();
         let body = if empty {
             self.render_left_empty()
         } else {
@@ -1528,7 +1559,12 @@ impl CollationWorkspace {
         let disp_h = nh * scale;
         let mut page = div().relative().w_full().h(px(disp_h)).bg(rgb(0xf1e8cf));
 
-        if let Some(p) = &self.image_path {
+        // 两种源二选一：PDF 页走**内存位图**（`ImageSource::Render`，零解码零 IO），
+        // 位图原图走文件路径（`gpui::img` 自带解码器）。绝不同时画两张。
+        let has_source = self.image_path.is_some() || self.image_mem.is_some();
+        if let Some(m) = &self.image_mem {
+            page = page.child(img(m.clone()).w_full());
+        } else if let Some(p) = &self.image_path {
             page = page.child(img(p.clone()).w_full());
         }
         // 区域参考框：无原图时画出全部 regions（验证映射数学），有原图时仅画
@@ -1540,7 +1576,7 @@ impl CollationWorkspace {
         if self.show_region_box {
             for (i, r) in self.regions.iter().enumerate() {
                 let active = self.active_para_idx == Some(i);
-                if self.image_path.is_some() && !active {
+                if has_source && !active {
                     continue;
                 }
                 page = page.child(
@@ -1617,11 +1653,21 @@ impl CollationWorkspace {
                 });
             }
 
-            // 2) 最耗时的栅格化（CG 绘制该页 / 读 PNG 尺寸）放到后台 executor，
-            //    避免阻塞 UI；完成后回主线程写入 image_path 等字段。
+            // 2) 最耗时的栅格化（CG 绘制该页）放到后台 executor，避免阻塞 UI；
+            //    完成后回主线程写入内存位图等字段。
+            //
+            //    画布多大的依据是左栏**实际设备像素**（`left_px`，render 每帧刷新）。
+            //    这里读一次快照带进后台：即便窗口在栅格化途中变了尺寸，本页也用
+            //    一个稳定的目标，不会算出半个画布。
+            let target_px = this
+                .upgrade()
+                .and_then(|e| e.read_with(&app, |this, _| this.left_px).ok())
+                .unwrap_or(0.0);
             let bg = app.background_executor().clone();
             let raster_path = path.clone();
-            let result = bg.spawn(async move { rasterize_source(&raster_path, 1) }).await;
+            let result = bg
+                .spawn(async move { rasterize_source(&raster_path, 1, target_px) })
+                .await;
 
             if let Some(entity) = this.upgrade() {
                 let _ = entity.update(&mut app, |this, cx| {
@@ -1631,7 +1677,13 @@ impl CollationWorkspace {
                             if let Some(old) = this.last_temp.take() {
                                 let _ = std::fs::remove_file(&old);
                             }
-                            this.image_path = Some(r.path);
+                            // PDF 页走内存位图，位图原图走文件路径——两者互斥。
+                            // 旧位图挪进 `image_gc` 等下一帧释放纹理。
+                            if let Some(old) = this.image_mem.take() {
+                                this.image_gc.push(old);
+                            }
+                            this.image_mem = r.image;
+                            this.image_path = r.path;
                             this.last_temp = r.temp;
                             // 记录原图自然像素尺寸（PDF 点），供真实坐标映射缩放使用。
                             this.src_nat_w = r.nat_w as f32;
@@ -2273,12 +2325,14 @@ impl CollationWorkspace {
     /// 后台重栅格化左侧 PDF 的某一页（1-based），成功后换图 + 复位滚动。
     ///
     /// 与 `open_image_picker` 里首次导入走同一条 `rasterize_source`，区别只在
-    /// 「页号」与「旧图回收」：翻页必须删掉上一页的临时 PNG，否则长翻几百页
-    /// 会在临时目录里堆出几百张 1080p 图。
+    /// 「页号」与「旧图回收」：翻页必须扔掉上一页的位图（内存里那份随
+    /// `image_mem` 被覆盖即释放），否则长翻几百页会堆出几百页 8MB 的位图。
     fn request_pdf_page(&mut self, page: usize, cx: &mut Context<Self>) {
         let Some(path) = self.pdf_path.clone() else {
             return;
         };
+        // 画布目标宽：左栏设备像素（render 每帧刷新；首帧前为 0，退回 1:1）。
+        let target_px = self.left_px;
         self.page_busy = true;
         self.page_gen += 1;
         let gen = self.page_gen;
@@ -2294,7 +2348,7 @@ impl CollationWorkspace {
                 async move {
                     let exec = app.background_executor().clone();
                     let out = exec
-                        .spawn(async move { rasterize_source(&path, page) })
+                        .spawn(async move { rasterize_source(&path, page, target_px) })
                         .await;
                     if let Some(entity) = this.upgrade() {
                         let _ = entity.update(&mut app, |this, cx| {
@@ -2314,7 +2368,13 @@ impl CollationWorkspace {
                                     if let Some(old) = this.last_temp.take() {
                                         let _ = std::fs::remove_file(&old);
                                     }
-                                    this.image_path = Some(r.path);
+                                    // 新页的内存位图替换旧页；旧位图挪进 `image_gc`，
+                                    // 下一帧 render 才真正 `drop_image`（本帧场景可能仍在引用）。
+                                    if let Some(old) = this.image_mem.take() {
+                                        this.image_gc.push(old);
+                                    }
+                                    this.image_mem = r.image;
+                                    this.image_path = r.path;
                                     this.last_temp = r.temp;
                                     this.src_nat_w = r.nat_w as f32;
                                     this.src_nat_h = r.nat_h as f32;
@@ -2534,7 +2594,7 @@ impl CollationWorkspace {
         //    重合度，再把「重合度 4% < 50%」这种**内部指标**甩给用户看。既答非所问，
         //    又像是程序在报错。这里改成三级判断，每一级只说人话：
         //    没图 → 「未加载原图」；有图无文本层 → 「需 OCR」；有文本层 → 才去比对。
-        if self.image_path.is_none() {
+        if self.image_path.is_none() && self.image_mem.is_none() {
             self.active_para_idx = None;
             self.match_note = Some(
                 "未加载原图：请先点左上角「打开文件」导入 PDF / 图片，再点右文定位"
@@ -3773,6 +3833,11 @@ impl Render for CollationWorkspace {
         for p in self.temp_gc.drain(..) {
             let _ = std::fs::remove_file(&p);
         }
+        // 同理回收上一页的 GPU 纹理（`drop_image` 只减 atlas 引用计数，整块纹理
+        // 在无人引用时才真正释放）。不回收 = 翻一页漏一张 7.5MB 的纹理。
+        for m in self.image_gc.drain(..) {
+            let _ = window.drop_image(m);
+        }
         // 刚关过原生文件对话框（rfd）→ 强制重建输入焦点。
         // `Window::focus()` 在「已是焦点」时直接 return，故必须先 blur 一次把
         // 焦点 id 清掉，平台才会重新把 first responder / 输入法上下文交回来。
@@ -3783,6 +3848,13 @@ impl Render for CollationWorkspace {
         }
         let vw = px_f32(window.viewport_size().width);
         let vh = px_f32(window.viewport_size().height);
+        // 左栏实际显示宽度的**设备像素**：栅格化按它出图（`raster_px`）。
+        // 取不到缩放（未接显示器 / 测试环境）时按 1x，绝不会因为 0 而算出空画布。
+        let backing = {
+            let s = window.scale_factor();
+            if s.is_finite() && s > 0.0 { s } else { 1.0 }
+        };
+        self.left_px = vw * 0.4 * backing;
         // 排障：帧计数。静止时也狂刷 → 说明有无限重绘循环（脏标记漏了）。
         self.frame_count += 1;
         if self.frame_count % 30 == 0 {
@@ -4009,8 +4081,12 @@ impl Drop for CollationWorkspace {
 /// `nat_w` / `nat_h` 供真实坐标映射（`source_size`）把 `SourceRegion` 自然像素
 /// 缩放到显示坐标；无原图时回退到区域包围盒。
 struct Rasterized {
-    path: PathBuf,
+    /// 位图原图直接复用原路径（`gpui::img` 自带解码）；PDF 页为 `None`。
+    path: Option<PathBuf>,
+    /// 临时 PNG 路径（仅位图原图之外的兜底路径会产出；PDF 走内存后恒为 None）。
     temp: Option<PathBuf>,
+    /// PDF 页的**内存位图**：`img(Arc<RenderImage>)` 直接上传纹理，不落盘。
+    image: Option<Arc<RenderImage>>,
     nat_w: f64,
     nat_h: f64,
     /// 本次渲出的是第几页（1-based；位图原图恒为 1）。
@@ -4020,8 +4096,67 @@ struct Rasterized {
     note: Option<String>,
 }
 
+/// 栅格化长边上限（像素）。CGBitmapContext 分配失败是**直接闪退**，不是返回 nil。
 #[cfg(target_os = "macos")]
-fn rasterize_source(path: &Path, page_no: usize) -> Result<Rasterized, String> {
+const MAX_RASTER_DIM: f64 = 4096.0;
+
+/// 栅格化位图字节上限（64 MiB）。与 [`MAX_RASTER_DIM`] 一起兜住内存。
+#[cfg(target_os = "macos")]
+const MAX_RASTER_BYTES: f64 = 64.0 * 1024.0 * 1024.0;
+
+/// 由「页面点尺寸 + 显示像素宽」算出栅格化画布的像素尺寸（**只升不降**）。
+///
+/// # 为什么不能按 MediaBox 的「点」直接当像素
+///
+/// 这是影印本发糊的根，也是最容易被误判成「渲染不行」的一处。MediaBox 的单位
+/// 是**点**（1/72 英寸），而影印本内嵌的是 **300dpi 二值扫描**（JBIG2，一页约
+/// 1670×2500 像素）压在 595×892 点的页面上。旧实现拿 `nat_w × nat_h` 当像素
+/// 建位图上下文 —— 等于把 300dpi 的扫描**先降到 72dpi**（丢掉约 4 倍细节），
+/// 再由 `img().w_full()` 在 Retina 屏上放大回去（再插值一次）。一降一升，糊
+/// 是必然的，而且和字号、字库、抗锯齿都无关。
+///
+/// # 三条规则
+///
+/// ① **只升不降**：`target_px` 小于 MediaBox 宽（窄窗口 / 非 Retina）时仍按
+///    1:1，绝不把大尺寸扫描件主动缩下来——缩小省的那点内存，赔的是清晰度。
+/// ② **两条硬上限**：长边 ≤ [`MAX_RASTER_DIM`]、`宽×高×4 ≤ MAX_RASTER_BYTES`。
+///    上限优先于 ①（超大海报页必须降，否则分配失败直接闪退）。
+/// ③ `target_px <= 0`（调用方还不知道显示尺寸）时退回 1:1。
+#[cfg(target_os = "macos")]
+fn raster_px(nat_w: f64, nat_h: f64, target_px: f32) -> (usize, usize) {
+    let want = if target_px.is_finite() && target_px > 0.0 {
+        (target_px as f64 / nat_w.max(1.0)).max(1.0)
+    } else {
+        1.0
+    };
+    // 两条上限都是**比例**（不是 1.0）：页面比上限小时它是 >1 的数，不能反过来
+    // 把升采样也挡掉——这正是 `scan_is_rasterized_at_display_pixels_not_pdf_points`
+    // 抓到的那个 bug（写成 `if long > MAX { MAX/long } else { 1.0 }` 时，
+    // 1120 的目标被 1.0 掐回 595，等于白改）。
+    let long = nat_w.max(nat_h);
+    let dim_cap = if long > 0.0 {
+        MAX_RASTER_DIM / long
+    } else {
+        1.0
+    };
+    let area_cap = {
+        let bytes = nat_w * nat_h * 4.0;
+        if bytes > 0.0 {
+            (MAX_RASTER_BYTES / bytes).sqrt()
+        } else {
+            1.0
+        }
+    };
+    let scale = want.min(dim_cap).min(area_cap).max(0.01);
+    // MediaBox 宽高是浮点数：一律 ceil() 向上取整，绝不截断——截断会让画布比
+    // 实际内容窄 1px，行尾像素写到缓冲区外面去。
+    let w = (nat_w * scale).max(1.0).ceil() as usize;
+    let h = (nat_h * scale).max(1.0).ceil() as usize;
+    (w, h)
+}
+
+#[cfg(target_os = "macos")]
+fn rasterize_source(path: &Path, page_no: usize, target_px: f32) -> Result<Rasterized, String> {
     use core_foundation::base::TCFType;
     use core_foundation::url::CFURL;
     use core_graphics::color_space::CGColorSpace;
@@ -4048,8 +4183,9 @@ fn rasterize_source(path: &Path, page_no: usize) -> Result<Rasterized, String> {
             .map(|(w, h)| (w as f64, h as f64))
             .unwrap_or((800.0, 1100.0));
         return Ok(Rasterized {
-            path: path.to_path_buf(),
+            path: Some(path.to_path_buf()),
             temp: None,
+            image: None,
             nat_w: nw,
             nat_h: nh,
             page: 1,
@@ -4135,25 +4271,10 @@ fn rasterize_source(path: &Path, page_no: usize) -> Result<Rasterized, String> {
         return Err("PDF 页面尺寸为 0".to_string());
     }
 
-    // ① 计算防护：先把超大尺寸按比例缩小，确保单页栅格化后
-    //    最大边长 ≤ 4096px 且 宽*高*4 ≤ 64MB，避免 CGBitmapContext OOM / 闪退。
-    const MAX_DIM: f64 = 4096.0;
-    const MAX_BYTES: f64 = 64.0 * 1024.0 * 1024.0;
-    let long = nat_w.max(nat_h);
-    let dim_scale = if long > MAX_DIM { MAX_DIM / long } else { 1.0 };
-    let area_scale = {
-        let bytes = nat_w * nat_h * 4.0;
-        if bytes > MAX_BYTES {
-            (MAX_BYTES / bytes).sqrt()
-        } else {
-            1.0
-        }
-    };
-    let scale = dim_scale.min(area_scale);
-    // MediaBox 宽高是浮点数：一律 ceil() 向上取整，绝不截断——截断会让画布比
-    // 实际内容窄 1px，行尾像素写到缓冲区外面去。
-    let w = (nat_w * scale).max(1.0).ceil() as usize;
-    let h = (nat_h * scale).max(1.0).ceil() as usize;
+    // ① 画布像素尺寸：由**显示尺寸**反推，不是把 MediaBox 的点当像素。
+    //    影印本内嵌 300dpi 扫描，按点 1:1 建位图 = 先降到 72dpi 再被 Retina
+    //    放大回去，一降一升必然糊（详见 `raster_px` 的说明）。
+    let (w, h) = raster_px(nat_w, nat_h, target_px);
 
     let space = CGColorSpace::create_device_rgb();
     // 行距严格按 16 字节对齐（CoreGraphics 对位图行距有对齐要求）。若给非对齐值，
@@ -4170,7 +4291,14 @@ fn rasterize_source(path: &Path, page_no: usize) -> Result<Rasterized, String> {
             8,
             bpr,
             space.as_ptr() as *mut c_void,
-            1, // kCGImageAlphaPremultipliedLast
+            // kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big
+            //
+            // 必须显式给 `ByteOrder32Big`（v1.9.30）：只给 alpha 位时内存序随
+            // 主机端序走，实际是 **BGRA**，于是每帧都要在 Rust 里逐像素倒成 RGBA
+            // （1120×1678 就是 188 万次搬运）。指定 32Big 后 CG 直接按 R,G,B,A
+            // 落字节，这一整趟转换消失。alpha 恒为 255（书页不透明），故
+            // premultiplied 与 straight 等价。
+            1 | (4 << 12),
         )
     };
     if raw.is_null() {
@@ -4198,10 +4326,10 @@ fn rasterize_source(path: &Path, page_no: usize) -> Result<Rasterized, String> {
         CGPDFPageRelease(page);
     }
 
-    // CoreGraphics 位图内存序为 BGRA，转成 img / PNG 需要的 RGBA。
-    // ⚠️ 绝不直接下标切片：行距用系统返回的真实值（CGBitmapContextGetBytesPerRow，
-    //    CG 可能按 16 字节对齐放大），区间一律 .get() 取；一旦越界优雅报错返回，
-    //    绝不 panic / 越界写。
+    // CG 已按 R,G,B,A 落字节（见上面 `ByteOrder32Big`），这里**不再倒色序**，
+    // 只做「行距对齐 → 紧凑」的搬运：行距正好等于 宽×4 时直接整块拷走。
+    // ⚠️ 绝不直接下标切片：行距用系统返回的真实值（CG 可能按 16 字节对齐放大），
+    //    区间一律 .get() 取；一旦越界优雅报错返回，绝不 panic / 越界写。
     let bpr_actual = ctx.bytes_per_row();
     let row_bytes = w * 4;
     if bpr_actual < row_bytes {
@@ -4211,28 +4339,52 @@ fn rasterize_source(path: &Path, page_no: usize) -> Result<Rasterized, String> {
         ));
     }
     let data = ctx.data();
-    let mut rgba = Vec::with_capacity(w * h * 4);
-    for row in 0..h {
-        let start = row * bpr_actual;
-        let end = start + row_bytes;
-        let Some(src) = data.get(start..end) else {
-            return Err(format!(
-                "位图数据越界（第 {} 行，区间 {}..{}，缓冲区长度 {}）",
-                row,
-                start,
-                end,
-                data.len()
-            ));
-        };
-        for px in src.chunks_exact(4) {
-            rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]); // BGRA → RGBA
+    let tight: usize = row_bytes * h;
+    let pixels: Vec<u8> = if bpr_actual == row_bytes {
+        // 快路径：行距正好紧凑，一次整块拷走（绝大多数情况走这里）。
+        data.get(..tight)
+            .ok_or_else(|| {
+                format!(
+                    "位图缓冲区偏短（需 {} 字节，实得 {}）",
+                    tight,
+                    data.len()
+                )
+            })?
+            .to_vec()
+    } else {
+        let mut v: Vec<u8> = Vec::with_capacity(tight);
+        for row in 0..h {
+            let start = row * bpr_actual;
+            let end = start + row_bytes;
+            let Some(src) = data.get(start..end) else {
+                return Err(format!(
+                    "位图数据越界（第 {} 行，区间 {}..{}，缓冲区长度 {}）",
+                    row,
+                    start,
+                    end,
+                    data.len()
+                ));
+            };
+            v.extend_from_slice(src);
         }
-    }
+        v
+    };
     drop(ctx);
 
-    let out = temp_png_path();
-    image::save_buffer(&out, &rgba, w as u32, h as u32, image::ColorType::Rgba8)
-        .map_err(|e| format!("写入 PNG 失败：{}", e))?;
+    // **不落盘**（v1.9.30）：直接包成 gpui 的内存位图。
+    // 原先这里要 PNG 编码 + 写盘 + 由 `gpui::img` 读盘解码，一页两次编解码 +
+    // 两次 IO；现在 `ImageSource::Render` 分支直接拿去上传纹理。
+    let buffer = image::RgbaImage::from_raw(w as u32, h as u32, pixels).ok_or_else(|| {
+        format!(
+            "位图尺寸与缓冲区不符（{}×{} 需要 {} 字节）",
+            w,
+            h,
+            tight
+        )
+    })?;
+    // `RenderImage::new` 收 `SmallVec<[Frame; 1]>`，用 `Vec` 走 smallvec 的
+    // `From<Vec<_>>`（单帧图，多一步 move 而已）。
+    let image = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
 
     // ③ 多页：现在**能翻**了（见 `flip_page`），不再只渲首页；提示只报页码与总数。
     //    文案里明说「仅渲当前页」——大文件的页数由翻页承担，不整本进内存。
@@ -4245,8 +4397,9 @@ fn rasterize_source(path: &Path, page_no: usize) -> Result<Rasterized, String> {
         None
     };
     Ok(Rasterized {
-        path: out.clone(),
-        temp: Some(out),
+        path: None,
+        temp: None,
+        image: Some(image),
         nat_w,
         nat_h,
         page: page_no,
@@ -4256,7 +4409,7 @@ fn rasterize_source(path: &Path, page_no: usize) -> Result<Rasterized, String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn rasterize_source(_path: &Path, _page_no: usize) -> Result<Rasterized, String> {
+fn rasterize_source(_path: &Path, _page_no: usize, _target_px: f32) -> Result<Rasterized, String> {
     Err("原图导入仅在 macOS 支持".to_string())
 }
 
@@ -4917,6 +5070,208 @@ mod radical_fold_tests {
         let (ri, n) = locate_region("靡恃己长，信使可覆", &regions).expect("应当命中部首字形");
         assert_eq!(ri, 1, "该落在第二列");
         assert!(n >= 6, "连续重合 {n} 字");
+    }
+}
+
+/// **栅格化画布尺寸**的护栏（v1.9.30）。
+///
+/// 这四条断言盯的是一件事：**别再把 MediaBox 的「点」当像素**。影印本内嵌
+/// 300dpi 扫描，按点建画布等于先降到 72dpi 再让 Retina 放大回去——糊。
+#[cfg(all(test, target_os = "macos"))]
+mod raster_px_tests {
+    use super::*;
+
+    /// 影印本的典型尺寸：595×892 点、内嵌扫描。
+    const SCAN: (f64, f64) = (595.0, 892.0);
+
+    /// 左栏在 MacBook 上约 1120 设备像素宽 → 画布就该是 1120 宽（**升采样**）。
+    ///
+    /// 旧实现这里给的是 595，一比一放大到 1120 就糊了。
+    #[test]
+    fn scan_is_rasterized_at_display_pixels_not_pdf_points() {
+        let (w, h) = raster_px(SCAN.0, SCAN.1, 1120.0);
+        assert_eq!(w, 1120, "画布宽应等于显示设备像素宽");
+        // 高按 MediaBox 比例走：892/595 ≈ 1.499
+        let expect_h = (1120.0 * SCAN.1 / SCAN.0).ceil() as usize;
+        assert!((h as i64 - expect_h as i64).abs() <= 1, "画布高 {h} 应约 {expect_h}");
+    }
+
+    /// **只升不降**：目标宽比页面点还窄（窄窗口 / 1x 屏）时，仍按 1:1。
+    ///
+    /// 缩小省的那点内存，赔的是「大图看着锐」——而且下次窗口一拉宽还得重渲一遍。
+    #[test]
+    fn narrow_target_never_downscales_below_native_points() {
+        let (w, h) = raster_px(SCAN.0, SCAN.1, 300.0);
+        assert_eq!((w, h), (595, 892), "1:1 是下限，不是上限");
+    }
+
+    /// 还不知道显示尺寸（首帧 `left_px = 0`）时退回 1:1，绝不产出空画布。
+    #[test]
+    fn unknown_target_falls_back_to_one_to_one() {
+        assert_eq!(raster_px(SCAN.0, SCAN.1, 0.0), (595, 892));
+        assert_eq!(raster_px(SCAN.0, SCAN.1, f32::NAN), (595, 892));
+    }
+
+    /// 超大海报页必须被两条硬上限压住——分配失败是**闪退**，不是返回 nil。
+    #[test]
+    fn huge_page_is_held_by_hard_caps() {
+        let (w, h) = raster_px(20000.0, 30000.0, 4000.0);
+        assert!(
+            w.max(h) as f64 <= MAX_RASTER_DIM,
+            "长边 {} 不得超过 {}",
+            w.max(h),
+            MAX_RASTER_DIM
+        );
+        assert!(
+            (w * h * 4) as f64 <= MAX_RASTER_BYTES,
+            "{}×{} 的内存 {} 字节超过上限",
+            w,
+            h,
+            w * h * 4
+        );
+    }
+}
+
+/// **颜色通道序**的护栏（v1.9.30）。
+///
+/// 这一条盯的是「肉眼很难发现、但一定错」的那类 bug：`CGBitmapContextCreate` 的
+/// `bitmap_info` 少写 `kCGBitmapByteOrder32Big` 时，内存里是 **BGRA**，而我们把
+/// 它当 RGBA 用——纸会变成偏蓝、朱砂会变成青色，但因为整张图「色调整体一致地
+/// 错了」，在书页上极不容易被看出来。用纯红整页把它钉死。
+#[cfg(all(test, target_os = "macos"))]
+mod raster_color_tests {
+    use super::*;
+    use core_foundation::base::TCFType;
+    use core_foundation::url::CFURL;
+    use core_graphics::context::CGContext;
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+    use std::os::raw::c_void;
+
+    extern "C" {
+        fn CGPDFContextCreateWithURL(
+            url: *const c_void,
+            media: *const CGRect,
+            aux: *const c_void,
+        ) -> *mut c_void;
+        fn CGPDFContextBeginPage(ctx: *mut c_void, info: *const c_void);
+        fn CGPDFContextEndPage(ctx: *mut c_void);
+        fn CGPDFContextClose(ctx: *mut c_void);
+    }
+
+    /// 纯红整页 → 栅格化后第一个像素必须是 (255, 0, 0, 255)。
+    #[test]
+    fn rasterized_page_keeps_channel_order() {
+        let path = std::env::temp_dir().join("jiandu_raster_red.pdf");
+        let _ = std::fs::remove_file(&path);
+        let url = CFURL::from_path(&path, false).expect("路径");
+        let media = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(200.0, 200.0));
+        let raw = unsafe {
+            CGPDFContextCreateWithURL(
+                url.as_concrete_TypeRef() as *const c_void,
+                &media,
+                std::ptr::null(),
+            )
+        };
+        assert!(!raw.is_null(), "建 PDF 上下文失败");
+        let ctx = unsafe { CGContext::from_existing_context_ptr(raw as *mut _) };
+        unsafe { CGPDFContextBeginPage(raw, std::ptr::null()) };
+        ctx.set_rgb_fill_color(1.0, 0.0, 0.0, 1.0);
+        ctx.fill_rect(CGRect::new(
+            &CGPoint::new(0.0, 0.0),
+            &CGSize::new(200.0, 200.0),
+        ));
+        unsafe { CGPDFContextEndPage(raw) };
+        unsafe { CGPDFContextClose(raw) };
+        drop(ctx);
+
+        // 目标 256px → 升采样到 256×256（顺带验了「只升不降」在真 PDF 上生效）。
+        let r = rasterize_source(&path, 1, 256.0).expect("栅格化失败");
+        let _ = std::fs::remove_file(&path);
+        let img = r.image.expect("PDF 页应走内存位图，不再产出 PNG");
+        assert_eq!(img.size(0).width.0, 256, "画布宽应等于目标像素");
+        let bytes = img.as_bytes(0).expect("应当有像素");
+        // 断**中心**像素：`CGPDFPageGetDrawingTransform` 会按比例居中，画布首行
+        // 偶尔落在留白上（0,0,0,0），拿首像素断会误报。
+        let mid = (256 * 128 + 128) * 4;
+        assert_eq!(
+            &bytes[mid..mid + 4],
+            &[255, 0, 0, 255],
+            "颜色通道序被调换（期望 RGBA 纯红，实得 {:?}）——检查 bitmap_info 的 ByteOrder32Big",
+            &bytes[mid..mid + 4]
+        );
+        // 通道调换的签名：红变蓝。整页不该出现一枚纯蓝像素。
+        let blue = bytes
+            .chunks_exact(4)
+            .filter(|p| p[0] == 0 && p[1] == 0 && p[2] == 255 && p[3] == 255)
+            .count();
+        assert_eq!(blue, 0, "出现 {blue} 枚纯蓝像素：R/B 被调换了");
+    }
+}
+
+/// **真实影印本栅格化代价**探针（默认跳过，只在做性能决策时手动跑）。
+///
+/// 跑法：
+/// ```text
+/// JIANDU_PROBE_PDF=~/Downloads/xx.pdf \
+///   cargo test -p jiandu --bins probe_real_scan_raster_cost -- --ignored --nocapture
+/// ```
+/// 它会打印两种口径（`target=0` 按 MediaBox 点 1:1＝老行为；`target=1120`
+/// 按左栏设备像素＝新行为）的耗时与画布尺寸，并单独量一次 PNG 编码耗时——
+/// 那个数就是 v1.9.30 砍掉的那一趟（编 PNG + 写盘 + 由 img 读盘解码）。
+#[cfg(all(test, target_os = "macos"))]
+mod raster_probe {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn probe_real_scan_raster_cost() {
+        let Ok(p) = std::env::var("JIANDU_PROBE_PDF") else {
+            return;
+        };
+        let path = PathBuf::from(p);
+        for target in [0.0_f32, 1120.0_f32] {
+            let mut best = f64::MAX;
+            let mut dims = (0usize, 0usize);
+            let mut raw: Vec<u8> = Vec::new();
+            for _ in 0..3 {
+                let t = Instant::now();
+                let r = rasterize_source(&path, 1, target).expect("栅格化失败");
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                let img = r.image.expect("应是内存位图");
+                dims = (
+                    img.size(0).width.0 as usize,
+                    img.size(0).height.0 as usize,
+                );
+                raw = img.as_bytes(0).unwrap_or(&[]).to_vec();
+                if ms < best {
+                    best = ms;
+                }
+            }
+            // 旧路径还要把它编成 PNG 落盘、再由 gpui 读盘解码；两趟都单独量，
+            // 那个和就是 v1.9.30 真正砍掉的代价。
+            let out = std::env::temp_dir().join("jiandu_probe_raster.png");
+            let t = Instant::now();
+            let _ = image::save_buffer(
+                &out,
+                &raw,
+                dims.0 as u32,
+                dims.1 as u32,
+                image::ColorType::Rgba8,
+            );
+            let enc = t.elapsed().as_secs_f64() * 1000.0;
+            let t = Instant::now();
+            let _ = image::open(&out);
+            let dec = t.elapsed().as_secs_f64() * 1000.0;
+            let _ = std::fs::remove_file(&out);
+            println!(
+                "target={target:>6.0}  画布={}×{}  栅格化={best:>6.1}ms  已砍编解码={:.1}ms  现在总={best:.1}ms  原总={:.1}ms",
+                dims.0,
+                dims.1,
+                enc + dec,
+                best + enc + dec
+            );
+        }
     }
 }
 
