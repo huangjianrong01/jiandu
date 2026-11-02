@@ -854,6 +854,24 @@ fn is_orphan_marker(c: char) -> bool {
     is_section_mark(c) || c == '〇'
 }
 
+/// **已被真机确认的幽灵字**：`国` `國` `一` `〇`。
+///
+/// 码位实测（v1.9.28）：`国` = U+56FD、`一` = U+4E00、`〇` = U+3007，
+/// UTF-8 分别是 `E5 9B BD` / `E4 B8 80` / `E3 80 87`——**就是普通字**，
+/// 没有零宽空格、没有私用区、没有控制符。它们不是「脏字节」，是**版心
+/// 留下的字**：叶码（`一` `二`…）、函次千字文（`國`）、分卷记号（`〇`），
+/// 抽取时各占一列。
+///
+/// 为什么只列这四个：用户口径是「单字的国 / 一 直接剔除，不要怕误杀」。
+/// 但同一份语料里「单个汉字独占一段」的真内容是《红楼梦》被断行打散的
+/// `以` `珠` `雖` `有` 与《诸子百家》的篇号 `二` `三` `四` `五`——把这几类
+/// 一起删就是改书。故**只有这四个**进删除名单，其余汉字一律归并
+/// （[`strip_orphan_lines`]），并且只在「整行只剩它一个」时才动手：
+/// 行首的 `国` 后面还跟着字（`国风` `国朝` `国家`）是正文，一个都不碰。
+fn is_ghost_char(c: char) -> bool {
+    matches!(c, '国' | '國' | '一' | '〇')
+}
+
 /// **孤字行收口**：分节圈点剥掉，单字断列归并回正文。
 ///
 /// 竖排原书一「列」就是排版的一行。PDF / OCR 抽取时，版心的圈点、叶码、
@@ -868,7 +886,8 @@ fn is_orphan_marker(c: char) -> bool {
 /// | 这一列是什么 | 怎么办 | 为什么 |
 /// |---|---|---|
 /// | 分节圈点 / `〇` | **整行删** | 排版符号，删掉不损失文字 |
-/// | 单个汉字 | **并到下一行行首** | 它可能真是个字（断列残渣），只能搬不能扔 |
+/// | `国` `國` `一`（[`is_ghost_char`]） | **整行删** | 实测确认的版心残渣（叶码 / 函次），从不作正文 |
+/// | 其余单个汉字 | **并到下一行行首** | 它可能真是字（断列残渣），只能搬不能扔 |
 ///
 /// 末行落单时并到**上一行行尾**——宁可让它贴在段末，也不许凭空消失。
 ///
@@ -919,12 +938,13 @@ pub fn strip_orphan_lines(s: &str) -> Option<String> {
         // 只剩一枚字 → 孤列。
         if n == 1 {
             let c = body.chars().next().unwrap();
-            if is_orphan_marker(c) {
-                hit = true; // 版心残渣：整行删
+            if is_orphan_marker(c) || is_ghost_char(c) {
+                hit = true; // 版心残渣 / 已确认的幽灵字：整行删
                 continue;
             }
             if is_han(c) || c == '□' || c == '■' {
-                // 汉字 / 缺字框：搬到下一行去。已有待并字则先落地，绝不吞字。
+                // 其余汉字 / 缺字框：搬到下一行去（可能是断列打散的真字，
+                // 只能搬不能扔）。已有待并字则先落地，绝不吞字。
                 if let Some(prev) = carry.take() {
                     hit = true;
                     out.push(prev.to_string());
@@ -973,13 +993,119 @@ pub fn strip_orphan_lines(s: &str) -> Option<String> {
     Some(s.trim_start_matches('\n').to_string())
 }
 
+// ---------------------------------------------------------------------------
+// ⑦ 引号归一（v1.9.28）
+// ---------------------------------------------------------------------------
+
+/// **引号强行规整成 `「」『』`**（在**清洗期**完成，不留到显示层）。
+///
+/// 为什么不能在显示层做：`types::bracket_to_quote` 是 1:1 换字，它只管
+/// 「这个字符换成哪个字形」，**不管成不成对**。一个 `‘` 换过去就是一个
+/// `『`，配上没配上它不进不问；而 `『` 在竖排里是**避头符**——不许落在
+/// 列首，命中了就得给后面的列一列一列让位。读者看到的就是「引号和文字
+/// 排版全乱了、后面像缩进了一段」。在这里按**开合**换，换完必成对，
+/// 再交给 `close_notes` 兜最后一道。
+///
+/// 配对规则（一行之内自成一体，跨行不接续——与 `close_notes` 同口径）：
+///
+/// | 输入 | 输出 | 判据 |
+/// |---|---|---|
+/// | `“` `‘` | `「` `『` | 开引号，压栈一个对应闭号 |
+/// | `”` `’` | `」` `』` | 闭引号，栈顶配对则弹栈 |
+/// | `"` | `「` / `」` | 栈顶是 `」` 就闭合，否则开启 |
+/// | `'` | `『` / `』` | 同上，配 `』` |
+///
+/// 半角 `"` `'` **只在紧邻汉字时才动**：`don't`、`it's` 这类西文缩写里的
+/// 撇号两侧都是拉丁字母，一个都不碰。
+pub fn normalize_quotes(s: &str) -> Option<String> {
+    let cs: Vec<char> = s.chars().collect();
+    // 快筛：没有引号就一个字节都不动（古籍正文里 `"` `'` 出现率极低）。
+    if !cs
+        .iter()
+        .any(|&c| matches!(c, '‘' | '’' | '“' | '”' | '"' | '\''))
+    {
+        return None;
+    }
+    // 紧邻「中文」(汉字或中文标点) 才认：半角引号的判据。
+    //
+    // 标点也算中文侧——`'善哉，善哉。'` 的收尾那一枚左边是「。」，只认
+    // 汉字的话它会被漏掉，于是 `『` 开得、`』` 合不上，`close_notes` 只好
+    // 在行末再补一个，出来的就是 `『善哉。'』` 这种畸形。
+    let cn = |c: char| is_han(c) || is_cn_punct(c);
+    let near_han = |i: usize| -> bool {
+        (i > 0 && cn(cs[i - 1])) || (i + 1 < cs.len() && cn(cs[i + 1]))
+    };
+    let mut out = String::with_capacity(s.len());
+    // 栈里放「期望的闭号」：`」` 或 `』`。
+    let mut stack: Vec<char> = Vec::new();
+    let mut hit = false;
+    for (i, &c) in cs.iter().enumerate() {
+        match c {
+            '“' => {
+                out.push('「');
+                stack.push('」');
+                hit = true;
+            }
+            '”' => {
+                if stack.last() == Some(&'」') {
+                    stack.pop();
+                }
+                out.push('」');
+                hit = true;
+            }
+            '‘' => {
+                out.push('『');
+                stack.push('』');
+                hit = true;
+            }
+            '’' => {
+                if stack.last() == Some(&'』') {
+                    stack.pop();
+                }
+                out.push('』');
+                hit = true;
+            }
+            '"' if near_han(i) => {
+                if stack.last() == Some(&'」') {
+                    stack.pop();
+                    out.push('」');
+                } else {
+                    out.push('「');
+                    stack.push('」');
+                }
+                hit = true;
+            }
+            '\'' if near_han(i) => {
+                if stack.last() == Some(&'』') {
+                    stack.pop();
+                    out.push('』');
+                } else {
+                    out.push('『');
+                    stack.push('』');
+                }
+                hit = true;
+            }
+            '\n' => {
+                // 行末清栈：引号不跨行配对（与 `close_notes` 一致）。
+                stack.clear();
+                out.push('\n');
+            }
+            _ => out.push(c),
+        }
+    }
+    if hit {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn formfeed_breaks_instead_of_gluing() {
-        // 这是真 bug 的回归：删掉换页符会把两段粘成一句。
+    fn formfeed_breaks_instead_of_gluing() {        // 这是真 bug 的回归：删掉换页符会把两段粘成一句。
         assert_eq!(
             formfeed_to_break("名可名，非常名。\u{000C}無名天地之始。").as_deref(),
             Some("名可名，非常名。\n無名天地之始。")
@@ -1169,19 +1295,45 @@ mod tests {
     }
 
     #[test]
-    fn orphan_column_is_merged_not_deleted() {
-        // 用户真机看到「一善哉、善哉」：其实是一列孤零零的「一」紧挨着正文列。
-        // 单字必须**搬**进下一行，绝不能删——它可能真是断列打散的字。
-        assert_eq!(
-            strip_orphan_lines("上善若水。\n一\n善哉善哉。\n水善利萬物")
-                .as_deref(),
-            Some("上善若水。\n一善哉善哉。\n水善利萬物")
-        );
-        // 叶码 / 版心「国」这种：单字列，同样只能归并。
+    fn orphan_ghost_char_line_is_deleted() {
+        // 用户真机看到「标题后面凭空多了一个国字」「善哉前面多了一个一字」。
+        // 码位实测过：国 = U+56FD、一 = U+4E00，都没有零宽／控制符——
+        // 它们就是版心留下的单字（叶码 / 函次），各占一列。整行删。
         assert_eq!(
             strip_orphan_lines("如是我聞。\n国\n時長老須菩提。\n即從座起")
                 .as_deref(),
-            Some("如是我聞。\n国時長老須菩提。\n即從座起")
+            Some("如是我聞。\n時長老須菩提。\n即從座起")
+        );
+        assert_eq!(
+            strip_orphan_lines("上善若水。\n一\n善哉善哉。\n水善利萬物")
+                .as_deref(),
+            Some("上善若水。\n善哉善哉。\n水善利萬物")
+        );
+        // 繁体「國」同理（函次千字文）。
+        assert_eq!(
+            strip_orphan_lines("甲。\n國\n乙丙丁。\n戊己庚")
+                .as_deref(),
+            Some("甲。\n乙丙丁。\n戊己庚")
+        );
+    }
+
+    #[test]
+    fn other_single_han_is_merged_not_deleted() {
+        // 其余汉字只搬不删：《红楼梦》竖排本被断行打散的正文就是这种形态
+        // （以 珠 雖 有 各 余…），删了就是改书。
+        assert_eq!(
+            strip_orphan_lines("甲。\n以\n乙丙丁。\n戊己庚")
+                .as_deref(),
+            Some("甲。\n以乙丙丁。\n戊己庚")
+        );
+    }
+
+    #[test]
+    fn han_at_line_head_is_never_touched() {
+        // 「国风」「国家」这种行首的国是正文，一个都不许碰。
+        assert_eq!(
+            strip_orphan_lines("甲。\n国风周南。\n乙丙\n一时佛在舍衛國。"),
+            None
         );
     }
 
@@ -1217,5 +1369,47 @@ mod tests {
         assert_eq!(strip_orphan_lines("道\n可"), None);
         // 干净的多行文本零改动。
         assert_eq!(strip_orphan_lines("道可道，非常道。\n名可名，非常名。\n玄之又玄。"), None);
+    }
+
+    // ---- 引号归一 -----------------------------------------------------
+
+    #[test]
+    fn curly_quotes_become_corner_quotes_in_pairs() {
+        assert_eq!(normalize_quotes("‘希有’").as_deref(), Some("『希有』"));
+        assert_eq!(
+            normalize_quotes("他说：“甲乙。”").as_deref(),
+            Some("他说：「甲乙。」")
+        );
+        // 单层里套一层：弯引号 → 双直角，再进一层才是单直角。
+        assert_eq!(
+            normalize_quotes("曰：“甲‘乙’丙。”").as_deref(),
+            Some("曰：「甲『乙』丙。」")
+        );
+        // 已经是直角引号的原样留着。
+        assert_eq!(normalize_quotes("「甲乙」"), None);
+    }
+
+    #[test]
+    fn ascii_quotes_are_converted_only_next_to_han() {
+        // 用户截图里的 `'希有`：半角单引号，两侧都是汉字 → 归成 『。
+        assert_eq!(normalize_quotes("'希有'").as_deref(), Some("『希有』"));
+        assert_eq!(
+            normalize_quotes("\"善哉\"").as_deref(),
+            Some("「善哉」")
+        );
+        // 西文缩写里的撇号两侧是拉丁字母，一个都不碰。
+        assert_eq!(normalize_quotes("don't"), None);
+        assert_eq!(normalize_quotes("it's a test"), None);
+    }
+
+    #[test]
+    fn unpaired_quote_does_not_swallow_the_line() {
+        // 只有开号：仍换成直角引号，交给 close_notes 在行末补齐。
+        assert_eq!(normalize_quotes("‘希有。").as_deref(), Some("『希有。"));
+        // 行末清栈：上一行的开号不会把下一行的 ’ 错认成闭合。
+        assert_eq!(
+            normalize_quotes("甲‘乙\n丙’丁").as_deref(),
+            Some("甲『乙\n丙』丁")
+        );
     }
 }

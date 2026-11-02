@@ -141,6 +141,15 @@ pub fn clean_with(raw: &str, opt: &CleanOptions) -> String {
         if let Some(x) = jiandu_core::residue::strip_orphan_lines(&s) {
             s = x;
         }
+        // 引号归一（v1.9.28）：`‘’“”` 与紧邻汉字的半角 `'` `"` **在清洗期**
+        // 就换成成对的 `「」『』`。显示层的 `bracket_to_quote` 是 1:1 换字，
+        // 只管字形不管成对；一个没配上的 `『` 在竖排里是避头符，会把后面
+        // 整段的列一列列往下推——用户看到的就是「引号乱、后面像缩进」。
+        // 必须排在 `close_notes` **之前**：先按开合换对，再让 close_notes
+        // 兜最后一道缺号。
+        if let Some(x) = jiandu_core::residue::normalize_quotes(&s) {
+            s = x;
+        }
     }
 
     if opt.cjk_punct {
