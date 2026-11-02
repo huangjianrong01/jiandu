@@ -106,6 +106,10 @@ mod share_paint;
 mod shelf;
 mod sound;
 mod storekit;
+/// **Dock 复活**（v1.9.35）：macOS 点 Dock 图标回不到主窗口的两个断点在此修。
+/// 见模块注释——根因是 gpui 把 `applicationShouldHandleReopen:` 注册成了返回
+/// `()` 而 AppKit 要 `BOOL`，返回值是残留垃圾，系统时而判定「不要恢复窗口」。
+mod revive;
 /// **解锁纸**（v1.9.23）：商店版内购的前台。官网版构建里这个模块仍然编进来
 /// （「更多」里不挂入口），免得 `#[cfg]` 把整条链路切成两半、改一处忘一处。
 mod unlock;
@@ -125,7 +129,7 @@ use app::Root;
 use anyhow::Result;
 use gpui::{
     prelude::*, px, size, App, Application, AssetSource, Bounds, KeyBinding, Menu, MenuItem,
-    SharedString, TitlebarOptions, WindowBounds, WindowOptions,
+    Pixels, SharedString, TitlebarOptions, WindowBounds, WindowOptions,
 };
 use jiandu_core::library::Library;
 use std::borrow::Cow;
@@ -214,11 +218,35 @@ fn main() {
         }
     }
 
-    Application::new()
-        .with_assets(JianDuAssets {
-            base: Library::home(),
-        })
-        .run(move |cx: &mut App| {
+    let app = Application::new().with_assets(JianDuAssets {
+        base: Library::home(),
+    });
+
+    // ── Dock 复活 · 重建线（v1.9.35）──────────────────────────────────
+    //
+    // 窗口被红叉关掉后进程仍在跑（gpui 不会自己退出），此时点 Dock 图标走的是
+    // `applicationShouldHandleReopen:hasVisibleWindows:` 的 **无可见窗口** 分支
+    // → gpui 去调它的 `reopen` 回调。**没人注册那个回调就什么都不会发生**，
+    // 用户看到的就是「双击毫无反应」。这里把主窗口重新建出来。
+    //
+    // 另一半（窗口还在、只是被最小化或压在别的 app 后面）走 `revive::install()`
+    // 的通知线，两条线互补，根因见 `revive.rs` 模块注释。
+    app.on_reopen(|cx: &mut App| {
+        if cx.windows().is_empty() {
+            let root = cx.new(Root::new);
+            let bounds = default_window_bounds(cx);
+            if cx
+                .open_window(zen_window_options(bounds), move |_window, _cx| root.clone())
+                .is_ok()
+            {
+                cx.activate(true);
+            }
+        } else {
+            cx.activate(true);
+        }
+    });
+
+    app.run(move |cx: &mut App| {
         // 注册随包字体（存在才生效），找不到则沿回退链使用系统字体。
         fonts::register_bundled_fonts(cx);
 
@@ -227,29 +255,8 @@ fn main() {
         // 会重投未 finish 的交易）。官网页构建里这一步是空实现。
         storekit::prepare();
 
-        // 窗口尺寸：JIANDU_WIN=宽x高（开发用，便于截图核对横屏对开 / 竖屏单页）。
-        let (mut win_w, mut win_h) = (1320.0_f32, 880.0_f32);
-        if let Ok(v) = std::env::var("JIANDU_WIN") {
-            if let Some((w, h)) = v.split_once('x') {
-                if let (Ok(w), Ok(h)) = (w.parse::<f32>(), h.parse::<f32>()) {
-                    win_w = w.clamp(320.0, 3840.0);
-                    win_h = h.clamp(240.0, 2160.0);
-                }
-            }
-        }
-        // 屏幕容得下才是好窗口：默认 1320×880 在 13 寸（逻辑宽 1280 上下）上会被
-        // 挤出屏幕，标题栏和左侧内容都被裁掉。这里按主屏可用区收一档，
-        // 并给四周留出边距（窗口不会顶到菜单栏 / Dock）。
-        if let Some(display) = cx.displays().first() {
-            let ds = display.bounds().size;
-            let unit = px(1.0);
-            let (dw, dh) = (ds.width / unit, ds.height / unit);
-            if dw > 0.0 && dh > 0.0 {
-                win_w = win_w.min((dw - 24.0).max(320.0));
-                win_h = win_h.min((dh - 90.0).max(240.0));
-            }
-        }
-        let bounds = Bounds::centered(None, size(px(win_w), px(win_h)), cx);
+        // 窗口尺寸：`JIANDU_WIN=宽x高`（开发用，便于截图核对横屏对开 / 竖屏单页）。
+        let bounds = default_window_bounds(cx);
         // `--zen`：根视图换成原生 GPUI 竖笺演示（zen_kit::ZenView）——天头地脚非对称 +
         // Canvas 网格 + 三 Tab 设置 + 右侧热区 spring 抽屉；否则照旧开书架 Root。
         // （WindowOptions 不可 Clone，用工厂函数给两个分支各造一份。）
@@ -302,8 +309,43 @@ fn main() {
                 .expect("failed to open window");
         }
 
+        // ── Dock 复活（v1.9.35）────────────────────────────────────────
+        // 通知线：app 只要被激活就把主窗口前置，与 delegate 返回什么无关。
+        // （重建线注册在 `Application::on_reopen` 上，见 `run` 之前那一处——
+        //   那个方法是 `Application` 的，不在 `App` 上。）
+        revive::install();
         cx.activate(true);
     });
+}
+
+/// 主窗口的初始位置与尺寸。
+///
+/// 抽成函数是为了让「启动开窗」与「关窗后点 Dock 重建」（`on_reopen`）用**同一
+/// 套**几何：两条路各写一遍的话，重建出来的窗口迟早和首次启动的尺寸不一样。
+fn default_window_bounds(cx: &mut App) -> Bounds<Pixels> {
+    let (mut win_w, mut win_h) = (1320.0_f32, 880.0_f32);
+    // `JIANDU_WIN=宽x高`：开发用，便于截图核对横屏对开 / 竖屏单页。
+    if let Ok(v) = std::env::var("JIANDU_WIN") {
+        if let Some((w, h)) = v.split_once('x') {
+            if let (Ok(w), Ok(h)) = (w.parse::<f32>(), h.parse::<f32>()) {
+                win_w = w.clamp(320.0, 3840.0);
+                win_h = h.clamp(240.0, 2160.0);
+            }
+        }
+    }
+    // 屏幕容得下才是好窗口：默认 1320×880 在 13 寸（逻辑宽 1280 上下）上会被
+    // 挤出屏幕，标题栏和左侧内容都被裁掉。这里按主屏可用区收一档，
+    // 并给四周留出边距（窗口不会顶到菜单栏 / Dock）。
+    if let Some(display) = cx.displays().first() {
+        let ds = display.bounds().size;
+        let unit = px(1.0);
+        let (dw, dh) = (ds.width / unit, ds.height / unit);
+        if dw > 0.0 && dh > 0.0 {
+            win_w = win_w.min((dw - 24.0).max(320.0));
+            win_h = win_h.min((dh - 90.0).max(240.0));
+        }
+    }
+    Bounds::centered(None, size(px(win_w), px(win_h)), cx)
 }
 
 /// 书架 / 竖笺演示共用的窗口参数（标题、尺寸、居中）。

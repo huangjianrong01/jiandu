@@ -96,17 +96,32 @@ pub const HOVER_LOOKUP: std::time::Duration = std::time::Duration::from_millis(5
 /// v1.52.0 由 0.40 提到 **0.65**：40% 在 Retina 上只有十来个像素高，笔画
 /// 糊成一团像蚂蚁；65% 落在正文的六到七成之间——看得清，又仍比正文矮一档，
 /// 不至于压过版框里的正文。
-pub const HEAD_NOTE_FS_RATIO: f32 = 0.65;
+///
+/// v1.9.35 降到 **0.58**：实测（`JIANDU_HEAD_NOTE=1`）天头只有 57.6px，
+/// 65% 的眉批一列只能排 3 个字，八字的批语要横着铺三列、把整条天头占满，
+/// 视觉上压过正文。58% 退回到「夹注那一档」（分享卡夹注 0.44、注音 0.40），
+/// 仍比夹注大一点——眉批是读者自己写的，本该比底注更醒目。
+pub const HEAD_NOTE_FS_RATIO: f32 = 0.58;
 /// 眉批字号的**硬下限**（px）。
 ///
 /// 窗口缩到很窄时正文会被压小，眉批若等比跟着缩就又变回蚂蚁了——
-/// 故此处兜一个 14px：无论正文缩到多小，眉批至少 14px，永远看得清。
-pub const HEAD_NOTE_FS_MIN: f32 = 14.0;
+/// 故此处兜一个底：无论正文缩到多小，眉批至少这么大。
+///
+/// v1.9.35 由 14 收到 **12.5**：14 是个「地板顶住上限」的值——正文 21.5 时
+/// 0.65×21.5 = 14 恰好等于下限，等于这份比例参数在默认字号下根本没生效。
+/// 收到 12.5 之后，比例才真的说了算，眉批也才退得到正文的六成以下。
+pub const HEAD_NOTE_FS_MIN: f32 = 12.5;
 /// 眉批的**行间距**倍率（字身 × 此值 = 一格高）。
 ///
 /// 1.06 是「字挨字」，放大后笔画容易糊在一起；1.30 给字间留出一线空隙，
 /// 长批语逐字读下来不粘连。
 pub const HEAD_NOTE_LH_RATIO: f32 = 1.30;
+/// 眉批**列与列**的间距倍率（字身 × 此值 = 一列占宽）。
+///
+/// 必须比字号大一档（1.28 > 1.0），否则分列之后的第二列会和第一列贴成
+/// 一行两字。比行距 1.30 略小，让同一张天头里列距略紧于字距——
+/// 竖排古籍的读法是「先读满一列再左移」，列距紧一点才成「行」。
+pub const HEAD_NOTE_COL_PITCH: f32 = 1.28;
 /// 眉批朱砂的**不透明度**（0x00~0xFF）。
 ///
 /// v1.52.0 由 0xCC 提到 0xF2：字一小，半透明就显得发虚发粉；字放大后
@@ -8283,20 +8298,55 @@ impl Root {
                 continue;
             }
             let n_chars = n.text.chars().count();
-            let (x, y) = Self::head_note_pos(n.u, n.v, n_chars, bw, bh, fs, lh);
+            // **一列最多几个字**：由天头高度反算，与 `margin::layout_notes`
+            // 同一口径（那边叫 `per_col_max`）。
+            //
+            // v1.9.35 修的真 bug：旧代码把「整串字数 × 行高」交给
+            // `head_note_pos` 算 y，长的批语一 clamp 就塌到 0，然后照直往下画
+            // ——八字的批语在天头只有 3 字高的窗口里，后五个字直接落进版框、
+            // 压在正文头顶上（实测截图里「與《索隱》異」正盖着「天」「之」）。
+            // 古籍的规矩是**向左续列**，不是向下溢出。
+            let per_col = ((bh / lh).floor() as usize).max(1);
+            let chars: Vec<char> = n.text.chars().collect();
+            let ncol = n_chars.div_ceil(per_col).max(1);
+            let col_pitch = fs * HEAD_NOTE_COL_PITCH;
+            // 起点 y 按**一列**的字数算（不是整串），否则 clamp 会塌成 0。
+            let (x0, y) = Self::head_note_pos(
+                n.u,
+                n.v,
+                per_col.min(n_chars.max(1)),
+                bw,
+                bh,
+                fs,
+                lh,
+            );
+            // 第一列在最右，后续列向左排开；整条不许探出纸左缘。
+            let left = (x0 - (ncol as f32 - 1.0) * col_pitch).max(0.0);
+            let mut row = div()
+                .absolute()
+                .left(px(left))
+                .top(px(y))
+                .w(px(ncol as f32 * col_pitch))
+                .h(px((bh - y).max(lh)))
+                .flex()
+                .flex_row()
+                // 兜底：字号被上限/下限挤到算错时，也只裁不压正文。
+                .overflow_hidden();
+            // 反序塞：`flex_row` 从左往右，所以「末列」先进去、开头那列落在最右。
+            for c in (0..ncol).rev() {
+                let from = c * per_col;
+                let to = (from + per_col).min(n_chars);
+                let seg: String = chars[from..to].iter().collect();
+                row = row.child(
+                    div()
+                        .w(px(col_pitch))
+                        .child(Self::head_note_column(&seg, fs, lh, None, head_ink)),
+                );
+            }
             // 命中区比字柱略宽：天头批注是小字，给个宽松好点的框。
             // 点它 = 唤醒管理态（再点一次 = 就地改写），**不是**新建——
             // 与「点空白起新批」的分野就在这一层（防误触）。
-            // v1.52.0：倍率由 3.6 降到 2.2 —— 字号涨了 1.6 倍，倍率不改的话
-            // 命中框会跟着胀大 60%，空白处起新批就被它抢走了。降下来正好
-            // 让命中框的**绝对宽度**与放大前持平（0.40×3.6 ≈ 0.65×2.2）。
-            let mut note_box = div()
-                .absolute()
-                .left(px(x))
-                .top(px(y))
-                .w(px(fs * 2.2))
-                .cursor_pointer()
-                .child(Self::head_note_column(&n.text, fs, lh, None, head_ink));
+            let mut note_box = row.cursor_pointer();
             // v1.48.0 唤醒态：字柱下方挂一枚**极小古风菜单**——纯文字
             // 「改 / 删」，无底无框（与现代白框菜单划清界限）；删 朱砂。
             if self.head_active == Some(idx) {
@@ -8403,6 +8453,11 @@ impl Root {
 
     /// 眉批字柱的**左上角**：由归一化 (u, v) 换算，并向内夹紧——
     /// 一列写到底不许溢出天头、也不许被纸缘切掉半个字。
+    ///
+    /// ⚠️ `chars` 是**一列**的字数（`per_col`），不是整条批语的字数。
+    /// v1.9.35 之前传的是整串：八字的批语在 3 字高的天头里，`bh - 8×lh`
+    /// 一算就是负数，`.max(0)` 把它压成 0——于是整条从纸顶往下画，
+    /// 后五个字直接落进版框压住正文。传一列的字数，夹紧才夹得对。
     fn head_note_pos(u: f32, v: f32, chars: usize, bw: f32, bh: f32, fs: f32, lh: f32) -> (f32, f32) {
         let w = fs * 1.2;
         let x = (u * bw).min((bw - w).max(0.0)).max(0.0);
