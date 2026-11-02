@@ -7679,23 +7679,21 @@ impl Root {
             base_ink
         };
 
-        // ── 注音（生僻字拼音）────────────────────────────────────
-        // 最终态（v1.9.50）：带注音的字**贴字格左缘**排、拼音紧贴其右（横排、正立、
-        // 从左到右）。贴左后汉字右缘→字格右缘的空白远大于「字居中」时，1~2 字母
-        // 拼音在所有列数都吃满 80% 正文（比例恒定、随字号自适应），不再被列间空白
-        // 物理封顶；整串宽度仍**硬封顶到字格右缘**，绝不挤占左侧句读、绝不溢出
-        // 右界栏；纵向只占 `1.05× 拼音字号`、在格内竖直居中。
+        // ── 注音（生僻字拼音 / 多字夹注）─────────────────────────
+        // 最终态（v1.9.51）：古籍双行夹注形态——带注音的字**贴字格左缘**排，注音作一摞
+        // **竖排小字**排在主字右侧的空当里（多字拆成双列竖排）。短注音 55%、多字 45%，
+        // 字号随正文字号自适应；整块垂直居中于字格、绝不与主字粘连、绝不压右边界栏。
         // 颜色锁死朱砂红 `#8C2B22`、透明度 0.75（朱砂微微晕染宣纸的透气感，详见
-        // `ruby_glyph.rs`）。GPUI 没有排版引擎，整串走 `ruby_glyph`：CoreGraphics
-        // 离屏按 `ruby::layout` 的度量（**不旋转**）渲成透明位图，再用 `img` 贴进
-        // 字格。万一光栅失败（无字体 / 非 macOS），退回逐字母横排的 div。
+        // `ruby_glyph.rs`）。GPUI 没有排版引擎，整摞竖排小字走 `ruby_glyph`：CoreGraphics
+        // 离屏按 `ruby::layout` 的 `glyph_xy` 度量（**不旋转**）渲成透明位图，再用 `img`
+        // 贴进字格。万一光栅失败（无字体 / 非 macOS），退回逐字竖排的 div。
         if let Some(py) = rare_py.as_deref() {
             let rl = crate::ruby::layout(py, fs, cell_w, cell_h);
-            // 锁定：拼音颜色 = 朱砂红 #8C2B22、透明度 0.75（朱砂微微晕染宣纸的透气感，
-            // 不与批注混色）；整串横排正立、垂直居中于汉字右侧，宽度硬封顶到字格右缘，
+            // 锁定：注音颜色 = 朱砂红 #8C2B22、透明度 0.75（朱砂微微晕染宣纸的透气感，
+            // 不与批注混色）；整摞竖排小字、垂直居中于汉字右侧，宽度硬封顶到字格右缘，
             // 绝不横跨整列宽、绝不挤占左侧句读、绝不溢出右界栏。
             let ruby_ink = 0x8C2B22u32;
-            if let Some(im) = crate::ruby_glyph::ruby_image(py, rl.fs, ruby_ink) {
+            if let Some(im) = crate::ruby_glyph::ruby_image(py, &rl, ruby_ink) {
                 cell = cell.child(
                     div()
                         .absolute()
@@ -7706,23 +7704,18 @@ impl Root {
                         .child(gpui::img(im).w(px(rl.block_w)).h(px(rl.block_h))),
                 );
             } else {
-                // 退化：逐字母横排（等距分格，绝不叠墨、绝不越界）。
-                let n = py.chars().count().max(1) as f32;
-                let step = rl.block_w / n;
-                let mut ruby = div()
-                    .absolute()
-                    .left(px(rl.left))
-                    .top(px(rl.top))
-                    .w(px(rl.block_w))
-                    .h(px(rl.block_h))
-                    .flex()
-                    .flex_row()
-                    .items_center();
-                for ch in py.chars() {
+                // 退化（非 macOS 无 CoreGraphics）：逐字竖排小字，按 `glyph_xy`
+                // 落位——与 macOS 位图、PDF 同一套几何，绝不横排、绝不越界。
+                let mut ruby = div().absolute().left(px(0.0)).top(px(0.0));
+                for (i, ch) in py.chars().enumerate() {
+                    let (gx, gy) = rl.glyph_xy(i);
                     ruby = ruby.child(
                         div()
-                            .w(px(step))
-                            .h_full()
+                            .absolute()
+                            .left(px(gx))
+                            .top(px(gy))
+                            .w(px(rl.fs))
+                            .h(px(rl.fs))
                             .flex()
                             .items_center()
                             .justify_center()

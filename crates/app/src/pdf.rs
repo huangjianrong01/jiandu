@@ -539,13 +539,13 @@ impl Brush {
 
 }
 
-/// 注音：**横排、正立、从左到右**，落在汉字右侧（带注音的字已贴左缘排，
-/// 拼音紧贴其右）。与屏幕 `ruby::layout` 同一套几何、同一颜色 `#8C2B22`。
+/// 注音：**竖排、小字、正立**，落在汉字右侧（带注音的字已贴左缘排，注音小字
+/// 竖排在右侧空当里；多字注记拆成双列竖排）。与屏幕 `ruby::layout` 同一套几何、
+/// 同一颜色 `#8C2B22`。
 ///
-/// 屏幕那侧是一张 CoreGraphics 离屏位图；这里是 CG 逐字落笔。两者共用
-/// `jiandu_core::ruby::layout` 的度量（字号 80%、按可用宽收敛到 22%、
-/// 左缘从「贴左的汉字右缘」让开），所以 PDF 里的 `měng` 与屏幕逐字同位——
-/// 绝不歪着排、也绝不碰到下一列的字形。颜色锁死朱砂红 `#8C2B22`。
+/// 屏幕那侧是一张 CoreGraphics 离屏竖排位图；这里是 CG 逐字落笔，按
+/// `ruby::glyph_xy` 逐字同位——所以 PDF 里的「四行本」与屏幕逐字同位，
+/// 绝不该横排、也绝不碰到下一列的字形。颜色锁死朱砂红 `#8C2B22`。
 fn draw_ruby(
     b: &mut Brush,
     py: &str,
@@ -557,17 +557,17 @@ fn draw_ruby(
     g: &PdfGeo,
 ) {
     let rl = crate::ruby::layout(py, fs as f32, cell_w as f32, cell_h as f32);
-    let left = x + rl.left as f64;
-    let top = y + rl.top as f64;
-    // 等距分格落笔：格宽由 `ruby::layout` 定死，字距均匀，绝不会把串画长。
-    let n = py.chars().count().max(1) as f64;
-    let step = rl.block_w as f64 / n;
+    // 逐字竖排落笔：每字按其 `glyph_xy` 落进右侧空当的 `fs×fs` 小格，
+    // 字形在小格内居中（与屏幕位图、`ruby::glyph_xy` 逐字同位）。
     for (i, c) in py.chars().enumerate() {
+        let (gx, gy) = rl.glyph_xy(i); // 相对字格左上
+        let cx = x + gx as f64 + rl.fs as f64 * 0.5; // 小格中心 x
+        let ty = y + gy as f64; // 小格顶（盒顶，y 向下）
         b.glyph_at(
             c,
-            left + (i as f64 + 0.5) * step,
-            top,
-            rl.block_h as f64,
+            cx,
+            ty,
+            rl.fs as f64,
             rl.fs as f64,
             0x8C2B22,
             ShareFont::from(g.note_font),

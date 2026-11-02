@@ -1,14 +1,17 @@
-//! 生僻字注音位图（v1.9.13）：**横排、正立、从左到右**，落在汉字右侧的列间空白里。
+//! 生僻字 / 夹注注音位图（v1.9.51 重构）：**竖排、小字、贴在主字右侧**，古籍双行
+//! 夹注形态。
 //!
 //! ## 为什么要有这个文件
 //!
 //! GPUI 0.2.2 没有排版引擎可用（`paint_glyph` 只画单个字形、字距要自己算），
-//! 而注音是一整串带声调的拉丁字母，字距、升部、降部都得对。绕开的办法是：
-//! **CoreGraphics 离屏**把整串渲成一张透明位图，交给 GPUI 的 `img` 贴进字格。
+//! 而注音现在是一摞**竖排小字**（多字还会拆成双列），逐字落位都得对齐
+//! `jiandu_core::ruby::layout` 给的坐标。绕开的办法是：**CoreGraphics 离屏**把整条
+//! 注音渲成一张透明位图（竖排），交给 GPUI 的 `img` 贴进字格——与 PDF 侧
+//! 共用同一套 `glyph_xy` 度量，逐字同位。
 //!
-//! 用户铁律（v1.9.13 最终态）：**拼音保持横排（字母横向排列）**，严格垂直居中于
-//! 汉字右侧，整串宽度硬封顶到字格右缘——绝不横跨整列宽、绝不挤占左侧句读、
-//! 绝不溢出右界栏。
+//! 用户铁律（v1.9.51 最终态）：**严格竖排、绝不横向排列**；短注音 55%、多字注记
+//! 45%；多字拆成双列（一列写前几个、一列写后几个）竖排小字，整块垂直居中于字格、
+//! 绝不悬浮、绝不压界栏；颜色锁死朱砂红 `#8C2B22`、透明度 0.75。
 //!
 //! ## 坐标（照抄 `share_paint` 已验证的结论）
 //!
@@ -21,7 +24,7 @@
 //! * **颜色**：`ruby_image` 的调用方传入朱砂红 `#8C2B22`（锁死）；
 //! * **透明度**：填充 alpha = **0.75**（朱砂微微晕染宣纸的透气感，绝不刺眼）；
 //! * **字体**：**强制 Songti SC（宋体）**优先，绝不用 PingFang 等黑体；
-//! * **字号**：由 `ruby::layout` 给出，恒为正文 50%（蝇头小楷感）。
+//! * **字号 / 几何**：由 `ruby::layout` 给的 `RubyLayout` 全权决定。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -31,7 +34,7 @@ const SS: f64 = 3.0;
 
 /// 注音字体候选：**强制 Songti SC（宋体）优先**，绝不用 PingFang 等黑体；
 /// 后备仍是衬线（STSong / Songti TC），保证带调元音（ā á ǎ à …）齐全不缺字形。
-/// 都缺字形就**不画**（退回逐字母横排）。
+/// 都缺字形就**不画**（退回逐字母竖排）。
 const FONTS: [&str; 3] = ["Songti SC", "STSong", "Songti TC"];
 
 /// 位图格式：32 位**大端** + **预乘** alpha 在最后。
@@ -47,33 +50,54 @@ const BITMAP_INFO: u32 = BYTE_ORDER_32_BIG | ALPHA_PREMULTIPLIED_LAST;
 /// 注音位图填充透明度（朱砂微微晕染在宣纸上的透气感）。
 const RUBY_ALPHA: f64 = 0.75;
 
-/// 缓存：同一（拼音, 字号档, 墨色）只光栅一次。
+/// 缓存：同一（注音, 字号档, 整块尺寸, 墨色）只光栅一次。
 fn cache() -> &'static Mutex<HashMap<String, Arc<gpui::RenderImage>>> {
     static C: OnceLock<Mutex<HashMap<String, Arc<gpui::RenderImage>>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 一条拼音的横排位图。失败返回 `None`（调用方退化）。
+/// 一条注音的**竖排**位图。失败返回 `None`（调用方退化成逐字竖排 div）。
 ///
-/// * `fs`：拼音字号（由 `ruby::layout` 给出，恒为正文 50%）；
+/// * `rl`：`ruby::layout` 给的度量（字号、列数、整块宽高、各字 `glyph_xy`）；
 /// * `color`：`0xRRGGBB` 墨色（调用方锁死 `#8C2B22`）。
-pub fn ruby_image(py: &str, fs: f32, color: u32) -> Option<Arc<gpui::RenderImage>> {
-    if py.is_empty() || fs < 2.0 {
+///
+/// 位图尺寸 = `rl.block_w × rl.block_h`，每个字按其 `glyph_xy` 落进
+/// `fs × fs` 的小格里、字形在小格内居中（与 `ruby::glyph_xy`、PDF `draw_ruby`
+/// 逐字同位）。
+pub fn ruby_image(py: &str, rl: &crate::ruby::RubyLayout, color: u32) -> Option<Arc<gpui::RenderImage>> {
+    if py.is_empty() || rl.fs < 2.0 {
         return None;
     }
-    // 字号按 0.25px 分档，免得每帧翻页都重光栅一批。
-    let key = format!("{py}|{}|{color:X}", (fs * 4.0).round() as i32);
+    // 字号按 0.25px 分档、整块尺寸按 0.5px 分档，免得每帧翻页都重光栅一批。
+    let key = format!(
+        "{py}|{}|{}|{}|{color:X}",
+        (rl.fs * 4.0).round() as i32,
+        (rl.block_w * 2.0).round() as i32,
+        (rl.block_h * 2.0).round() as i32,
+    );
     if let Ok(c) = cache().lock() {
         if let Some(img) = c.get(&key) {
             return Some(img.clone());
         }
     }
-    let img = render(py, fs as f64, color)?;
+    let img = render(py, rl, color)?;
     let arc = Arc::new(img);
     if let Ok(mut c) = cache().lock() {
         c.insert(key, arc.clone());
     }
     Some(arc)
+}
+
+/// 一个 `char` 的 UTF-16 码元（与 `pdf.rs::utf16_units` 同口径，避免依赖）。
+/// 返回 (缓冲, 码元数)；BMP 字 1 个、扩展区 2 个。
+fn utf16_units(c: char) -> ([u16; 2], usize) {
+    let cp = c as u32;
+    if cp < 0x10000 {
+        ([cp as u16, 0], 1)
+    } else {
+        let v = cp - 0x10000;
+        ([0xD800 + (v >> 10) as u16, 0xDC00 + (v & 0x3FF) as u16], 2)
+    }
 }
 
 /// `0xRRGGBB` → 三分量（0~1）。
@@ -94,8 +118,8 @@ fn unpremul(c: u8, a: u8) -> u8 {
 }
 
 #[cfg(target_os = "macos")]
-fn render(py: &str, fs: f64, color: u32) -> Option<gpui::RenderImage> {
-    let (bw, bh, buf) = raster(py, fs, color)?;
+fn render(py: &str, rl: &crate::ruby::RubyLayout, color: u32) -> Option<gpui::RenderImage> {
+    let (bw, bh, buf) = raster_vertical(py, rl, color)?;
     let img = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(bw as u32, bh as u32, buf)?;
     Some(gpui::RenderImage::new(vec![image::Frame::new(img)]))
 }
@@ -104,7 +128,11 @@ fn render(py: &str, fs: f64, color: u32) -> Option<gpui::RenderImage> {
 /// `gpui/src/elements/img.rs` 里加载图片时的 RGBA→BGRA 交换）。
 /// 拆出这一层是为了让单测能直接验通道序与朝向——画反了在屏幕上一眼可见。
 #[cfg(target_os = "macos")]
-fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
+fn raster_vertical(
+    py: &str,
+    rl: &crate::ruby::RubyLayout,
+    color: u32,
+) -> Option<(usize, usize, Vec<u8>)> {
     use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::CGContext;
     use core_graphics::font::CGGlyph;
@@ -112,7 +140,9 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
     use core_text::font::new_from_name;
     use core_text::font_descriptor::kCTFontOrientationHorizontal;
 
-    // ① 挑一台能覆盖整串的字体（缺任何一个字形就换下一台）。强制 Songti SC 优先。
+    let fs = rl.fs as f64;
+    // ① 挑一台能覆盖整串所有字形的字体（缺任何一个字形就换下一台）。
+    //   强制 Songti SC 优先。
     let mut picked: Option<core_text::font::CTFont> = None;
     let mut glyphs: Vec<CGGlyph> = Vec::new();
     for name in FONTS {
@@ -120,11 +150,10 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
             let mut gs: Vec<CGGlyph> = Vec::new();
             let mut complete = true;
             for c in py.chars() {
-                let mut unit: [u16; 1] = [0];
-                c.encode_utf16(&mut unit);
+                let (unit, cnt) = utf16_units(c);
                 let mut g: CGGlyph = 0;
-                let ok = unsafe { f.get_glyphs_for_characters(unit.as_ptr(), &mut g, 1) };
-                if !ok {
+                let ok = unsafe { f.get_glyphs_for_characters(unit.as_ptr(), &mut g, cnt as isize) };
+                if !ok || g == 0 {
                     complete = false;
                     break;
                 }
@@ -142,8 +171,114 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
     if n == 0 {
         return None;
     }
+    let asc = font.ascent();
+    let desc = font.descent();
 
-    // ② 逐个步进 → 整串连写的自然宽度（横排的宽就是它）。
+    // ② 位图尺寸 = 整块宽高（与 `ruby::layout` 同一套）。
+    let w = rl.block_w as f64;
+    let h = rl.block_h as f64;
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let bw = (w * SS).round() as usize;
+    let bh = (h * SS).round() as usize;
+
+    let space = CGColorSpace::create_device_rgb();
+    let mut ctx =
+        CGContext::create_bitmap_context(None, bw, bh, 8, bw * 4, &space, BITMAP_INFO);
+    ctx.set_allows_antialiasing(true);
+    ctx.set_should_antialias(true);
+    // 新建的位图上下文内容全零 —— 即透明底，注音因此只叠在纸面上，不糊白块。
+
+    // ③ 放大到超采样网格（用户坐标 = 1× 像素）。y 向上，缓冲第 0 行是图像顶行。
+    ctx.scale(SS, SS);
+    let (r, g, b) = rgb_of(color);
+    ctx.set_rgb_fill_color(r, g, b, RUBY_ALPHA);
+
+    let H = h; // 整块高（1×）
+    let chars: Vec<char> = py.chars().collect();
+    for i in 0..n {
+        let c = chars[i];
+        let g_idx = glyphs[i];
+        // 该字在小格（fs×fs）内的屏坐标（顶端靠上）；bx/by 相对「整块左上」。
+        let (gx, gy) = rl.glyph_xy(i);
+        let bx = (gx - rl.left) as f64;
+        let by = (gy - rl.top) as f64;
+        // 字形在其小格内居中：横向按 advance 居中，纵向按 em 盒居中。
+        let mut adv = CGSize::new(0.0, 0.0);
+        unsafe {
+            font.get_advances_for_glyphs(
+                kCTFontOrientationHorizontal,
+                &g_idx,
+                &mut adv,
+                1,
+            );
+        }
+        let cx = bx + fs * 0.5;
+        let x0 = cx - adv.width * 0.5;
+        // 屏坐标 by（顶端）↔ CG 基线：base_cg = H - by - (fs-(asc+desc))/2 - asc。
+        let base_cg = H - by - (fs - (asc + desc)) * 0.5 - asc;
+        font.draw_glyphs(&[g_idx], &[CGPoint::new(x0, base_cg)], ctx.clone());
+    }
+
+    // ④ 取像素：预乘 → 反预乘，并转成 gpui 要的 **BGRA**。
+    let stride = ctx.bytes_per_row();
+    let data = ctx.data();
+    let mut buf: Vec<u8> = Vec::with_capacity(bw * bh * 4);
+    for y in 0..bh {
+        let base = y * stride;
+        for xx in 0..bw {
+            let i = base + xx * 4;
+            let a = data[i + 3];
+            let (pr, pg, pb) = (data[i], data[i + 1], data[i + 2]);
+            buf.push(unpremul(pb, a));
+            buf.push(unpremul(pg, a));
+            buf.push(unpremul(pr, a));
+            buf.push(a);
+        }
+    }
+    Some((bw, bh, buf))
+}
+
+/// 单字（或短串）的**横向**小位图：仅供**单测**验证通道序 / 朝向 / 透明度用，
+/// 不参与屏幕主路径（主路径走 `raster_vertical`）。行为与原 v1.9.50 同款。
+#[cfg(target_os = "macos")]
+fn raster_char(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
+    use core_graphics::color_space::CGColorSpace;
+    use core_graphics::context::CGContext;
+    use core_graphics::font::CGGlyph;
+    use core_graphics::geometry::{CGPoint, CGSize};
+    use core_text::font::new_from_name;
+    use core_text::font_descriptor::kCTFontOrientationHorizontal;
+
+    let mut picked: Option<core_text::font::CTFont> = None;
+    let mut glyphs: Vec<CGGlyph> = Vec::new();
+    for name in FONTS {
+        if let Ok(f) = new_from_name(name, fs) {
+            let mut gs: Vec<CGGlyph> = Vec::new();
+            let mut complete = true;
+            for c in py.chars() {
+                let (unit, cnt) = utf16_units(c);
+                let mut g: CGGlyph = 0;
+                let ok = unsafe { f.get_glyphs_for_characters(unit.as_ptr(), &mut g, cnt as isize) };
+                if !ok || g == 0 {
+                    complete = false;
+                    break;
+                }
+                gs.push(g);
+            }
+            if complete {
+                picked = Some(f);
+                glyphs = gs;
+                break;
+            }
+        }
+    }
+    let font = picked?;
+    let n = glyphs.len();
+    if n == 0 {
+        return None;
+    }
     let mut sizes = vec![CGSize::new(0.0, 0.0); n];
     unsafe {
         font.get_advances_for_glyphs(
@@ -157,8 +292,6 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
     if run_w <= 0.0 {
         return None;
     }
-
-    // ③ 位图尺寸：横 = 串长，纵 = 字母的高（升部 + 降部）。
     let asc = font.ascent();
     let desc = font.descent();
     let pad = 1.0;
@@ -172,26 +305,17 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
         CGContext::create_bitmap_context(None, bw, bh, 8, bw * 4, &space, BITMAP_INFO);
     ctx.set_allows_antialiasing(true);
     ctx.set_should_antialias(true);
-    // 新建的位图上下文内容全零 —— 即透明底，注音因此只叠在纸面上，不糊白块。
-
-    // ④ 正立横排：放大到超采样网格 → 原点挪到「左内边距 / 基线」。
-    //    CG 位图上下文原点在左下、y 向上，故基线离底边 `pad + desc`，
-    //    升部正好顶到 `h - pad`。**不旋转、不翻 CTM**（横排正立）。
     ctx.scale(SS, SS);
     ctx.translate(pad, pad + desc);
 
     let (r, g, b) = rgb_of(color);
-    // 注音墨色半透明（0.75）：朱砂微微晕染宣纸的透气感，绝不刺眼。
     ctx.set_rgb_fill_color(r, g, b, RUBY_ALPHA);
     let mut x = 0.0f64;
     for i in 0..n {
-        // `draw_glyphs` 按值取 context：`clone()` 是 CGContextRetain，随调用
-        // 结束 drop（release），一增一减不泄漏（与 `share_paint` 同款）。
         font.draw_glyphs(&[glyphs[i]], &[CGPoint::new(x, 0.0)], ctx.clone());
         x += sizes[i].width;
     }
 
-    // ⑤ 取像素：预乘 → 反预乘，并转成 gpui 要的 **BGRA**。
     let stride = ctx.bytes_per_row();
     let data = ctx.data();
     let mut buf: Vec<u8> = Vec::with_capacity(bw * bh * 4);
@@ -211,35 +335,37 @@ fn raster(py: &str, fs: f64, color: u32) -> Option<(usize, usize, Vec<u8>)> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn render(_py: &str, _fs: f64, _color: u32) -> Option<gpui::RenderImage> {
-    // 非 macOS 没有 CoreGraphics：由 `reader` 侧自行降级成逐字母横排。
+fn render(_py: &str, _rl: &crate::ruby::RubyLayout, _color: u32) -> Option<gpui::RenderImage> {
+    // 非 macOS 没有 CoreGraphics：由 `reader` 侧自行降级成逐字竖排。
     None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ruby;
 
-    /// 注音位图必须是**横长条**：宽（串长）明显大于高（字母高）。
-    /// 这条同时钉死两件事：位图真的画出来了，且是横排——若哪天又改回
-    /// 「转 90° 竖条」，宽高比会立刻反过来（w<h）。
+    /// 注音位图必须是**竖长条**：整块高（字摞起来）≥ 宽（一两列），古籍竖排特征。
+    /// 这条同时钉死两件事：位图真的画出来了，且是竖排——若哪天又改回「横条」，
+    /// 宽高比会立刻反过来（w>h）。
     #[test]
-    fn ruby_bitmap_is_wider_than_tall() {
-        let im = ruby_image("měng", 12.0, 0x8C2B22).expect("注音位图应当渲染成功");
+    fn ruby_bitmap_is_taller_than_wide() {
+        let rl = ruby::layout("四行本", 24.0, 80.0, 44.0);
+        let im = ruby_image("四行本", &rl, 0x8C2B22).expect("注音位图应当渲染成功");
         let s = im.size(0);
         let (w, h) = (s.width.0 as f32, s.height.0 as f32);
         assert!(
-            w > h * 1.25,
-            "四个字母横排后应是横长条，实得 {w:.1}×{h:.1}"
+            h >= w * 1.0,
+            "多字注音竖排后应是竖长条，实得 {w:.1}×{h:.1}"
         );
     }
 
-    /// **朝向钉死**：字母 `T` 顶部那条横杠（字母的「上」）必须落在位图**上半**，
+    /// **朝向钉死**：字母 `T` 顶部那条横杠（字母的「上」）必须落在字格**上半**，
     /// 竖杠居中。若哪天又被转成侧躺，重墨的行会跑到左右两侧去。
     #[cfg(target_os = "macos")]
     #[test]
     fn ruby_letters_stand_upright() {
-        let (bw, bh, buf) = raster("T", 40.0, 0xFF0000).expect("位图");
+        let (bw, bh, buf) = raster_char("T", 40.0, 0xFF0000).expect("位图");
         let mut row_ink = vec![0u32; bh];
         for y in 0..bh {
             for x in 0..bw {
@@ -267,8 +393,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ruby_ink_keeps_its_channel_order() {
-        let (bw, bh, buf) = raster("měng", 20.0, 0xFF0000).expect("位图");
-        // 找字内最不透明的像素（中心区，抗锯齿边缘不算），验证通道序。
+        let (bw, bh, buf) = raster_char("měng", 20.0, 0xFF0000).expect("位图");
         let mut best: Option<(u8, u8, u8, u8)> = None;
         for y in 0..bh {
             for x in 0..bw {
@@ -287,19 +412,20 @@ mod tests {
         );
     }
 
-    /// 同一条拼音只光栅一次（缓存命中）。
+    /// 同一条注音只光栅一次（缓存命中）。
     #[test]
     fn same_pinyin_is_rasterized_once() {
-        let a = ruby_image("bō", 11.0, 0x8C2B22).expect("位图");
-        let b = ruby_image("bō", 11.0, 0x8C2B22).expect("位图");
-        assert!(a.id == b.id, "缓存未命中：同一条拼音被光栅了两次");
+        let rl = ruby::layout("bō", 11.0, 100.0, 50.0);
+        let a = ruby_image("bō", &rl, 0x8C2B22).expect("位图");
+        let b = ruby_image("bō", &rl, 0x8C2B22).expect("位图");
+        assert!(a.id == b.id, "缓存未命中：同一条注音被光栅了两次");
     }
 
     /// 透明度确实落在 0.75 附近（取「最不透明字内像素」的 alpha）。
     #[cfg(target_os = "macos")]
     #[test]
     fn ruby_alpha_is_the_ink_wash() {
-        let (bw, bh, buf) = raster("měng", 20.0, 0x8C2B22).expect("位图");
+        let (bw, bh, buf) = raster_char("měng", 20.0, 0x8C2B22).expect("位图");
         let mut best_a: u8 = 0;
         for y in 0..bh {
             for x in 0..bw {
@@ -309,7 +435,6 @@ mod tests {
                 }
             }
         }
-        // 0.75 × 255 ≈ 191，允许少量抗锯齿误差。
         assert!(
             (best_a as i32 - 191).abs() <= 8,
             "注音 alpha 应为 ~0.75（≈191），实得 {best_a}"
