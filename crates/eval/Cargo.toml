@@ -1,0 +1,12 @@
+[package]
+name = "jiandu-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "笺读 · 评测台：标点保真 F1 / 注音正确率 / 文本保真 / AI 笺注 LLM 裁判。nightly 跑分与用户纠正沉淀金标。"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
