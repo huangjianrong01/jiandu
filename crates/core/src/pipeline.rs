@@ -1789,7 +1789,11 @@ pub fn chapters_to_book(fallback_title: &str, author: &str, chapters: Vec<RawCha
         }
     }
     let mut book = Book::new(&title, author);
-    book.cover.title = title.clone();
+    // v1.9.40：书名也要过一道章题清洗——源 txt 的头几行常是「書名 ◇ 卷第一」，
+    // 自动识别可能把整行当书名，`◇` 会一路带进封面 / 书脊 / 卷首大题。
+    book.title = crate::cleaner::clean_title(&title, &title);
+    book.cover.title = book.title.clone();
+    let bt = book.title.clone();
     for c in chapters {
         let mut paragraphs = Vec::new();
         for line in c.content.lines() {
@@ -1803,7 +1807,10 @@ pub fn chapters_to_book(fallback_title: &str, author: &str, chapters: Vec<RawCha
             continue;
         }
         book.chapters.push(Chapter {
-            title: crate::numcn::normalize_numbers(&c.title),
+            // v1.9.40：**章题去重**——源文本的卷题行往往带书名（`資治通鑑 ◇
+            // 卷第一`），而卷首题名那一列已经把书名当「大题」独排一次；不剥
+            // 就是纸面上「書名 書名 卷第一」的复读机。`◇` 一并剔除。
+            title: crate::numcn::normalize_numbers(&crate::cleaner::clean_title(&bt, &c.title)),
             paragraphs,
         });
     }
@@ -1813,6 +1820,10 @@ pub fn chapters_to_book(fallback_title: &str, author: &str, chapters: Vec<RawCha
             paragraphs: Vec::new(),
         });
     }
+    // v1.9.40：**史论断段**——整章挤成一段的源文本（OCR / 盗版 txt 通病）里，
+    // 「……為諸侯。臣光曰：……」要让论赞独立成段，排版引擎才认得出段首、
+    // 才降得了格。只动段落边界，一个字都不改（注文 offset 同步重映射）。
+    crate::cleaner::split_praise_in_book(&mut book);
     book
 }
 

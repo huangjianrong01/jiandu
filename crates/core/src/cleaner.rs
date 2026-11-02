@@ -1689,6 +1689,215 @@ fn name_tail_at(cs: &[char], m: usize) -> Option<usize> {
 }
 
 
+// ------------------------------------------------------------------
+// 二之三、章题去重（v1.9.40）
+//
+// 真机截图里出现过「資治通鑑 資治通鑑 ◇ 卷第一」——病根有两处：
+//   ① 源 txt 的卷题行就是「書名 ◇ 卷次」，`◇` 是分节装饰符；
+//   ② 卷首题名那一列**已经**把书名当「大题」排在篇题之上，篇题再把书名
+//      带一遍，就成了复读机。
+// 这里先把章题洗成「只留篇题」（`clean_title`），渲染层不再自己拼书名；
+// 旧书稿（已入库、没重洗过的 JSON）在 `Root::chapter_title` 再兜一道。
+// ------------------------------------------------------------------
+
+/// 章题里要剔除的**分节装饰符**：古籍版刻里表示「一节之终」，竖排里只会
+/// 变成一枚孤零零的菱形，既不是字也不是句读。`○` **不在此列**——它可能
+/// 是分节圈点，也是句号画法，交给句读层处理。
+fn is_title_junk(c: char) -> bool {
+    matches!(c, '◇' | '◆' | '※' | '·' | '•' | '・' | '＊' | '*')
+}
+
+/// **章题去重**：滤掉分节装饰符，并剥掉重复的书名前缀。
+///
+/// `資治通鑑 ◇ 卷第一` → `卷第一`；`資治通鑑資治通鑑卷第一` → `卷第一`；
+/// `五帝本紀第一`（书名不在题内）→ 原样。
+///
+/// 只剥「题首恰好是书名」的情况，绝不按子串删——正文里的篇题若碰巧含
+/// 书名中的字（《通鑑》里的「通」），按子串删会把篇题啃出窟窿。
+pub fn clean_title(book_title: &str, raw: &str) -> String {
+    // ① 装饰符一律剔除（含全角空格，它会在格子里留一块空白）。
+    let mut t: String = raw
+        .chars()
+        .filter(|c| !is_title_junk(*c) && *c != '\u{3000}')
+        .collect();
+    t = collapse_blank_runs(&t).trim().to_string();
+    let stripped: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // ② 剥重复书名（最多四道：`書名書名書名卷X` 这种复制粘贴的也收拾掉）。
+    let bt: String = book_title
+        .chars()
+        .filter(|c| !c.is_whitespace() && !is_title_junk(*c))
+        .collect();
+    let bt_n = bt.chars().count();
+    if bt_n >= 2 {
+        // 题就是书名本身（整章标题 = 书名）：**数据层原样留着**——它仍是这一章
+        // 的题（目录 / 中缝要用）；「别在纸面上写两遍」是渲染层的事
+        // （`ancient_title_column` 见小题 == 大题就不画小题）。
+        if stripped == bt {
+            return stripped;
+        }
+        let mut cur = stripped.clone();
+        for _ in 0..4 {
+            if cur.chars().count() <= bt_n || !cur.starts_with(&bt) {
+                break;
+            }
+            let rest: String = cur.chars().skip(bt_n).collect();
+            let rest = rest
+                .trim_start_matches(|c: char| matches!(c, '·' | '•' | '：' | ':' | '—' | '-' | ',' | '，' | '、'))
+                .to_string();
+            if rest.is_empty() {
+                break;
+            }
+            cur = rest;
+        }
+        if cur.chars().count() < stripped.chars().count() {
+            // ③ 剥过之后只剩标点 → 篇题本来就是空的。
+            //    题内若**只有书名**（整章就是书名，如卷首序），剥完也是空：
+            //    返回空串——卷首那一列的大题已经把书名排了一次，小题再写一遍
+            //    就是复读机。调用方（章题列 / 中缝 / 目录）对空串都是「不写」。
+            if cur.chars().any(|c| !c.is_whitespace() && !crate::types::is_punct(c)) {
+                return cur;
+            }
+            // 剥完只剩标点：篇题本来就没有字，把书名还给调用方兜底。
+            return stripped;
+        }
+        return stripped;
+    }
+    stripped
+}
+
+// ------------------------------------------------------------------
+// 三、史论断段（v1.9.40）
+//
+// 刻本的论赞（「臣光曰」「太史公曰」「贊曰」）是**另起一列、低两格**的独立
+// 段落。排版引擎（`gloss.rs`）只认「段首」，所以原文若把
+// 「……为诸侯。臣光曰：……」挤在同一段里，那条规矩就永远不触发。
+//
+// OCR / 盗版 txt 里这种挤压极常见（整章一段、标点乱飞）。这里在导入时补
+// 一刀：**句末之后紧跟论赞起手**才切，切点落在论赞首字上，前一段连句末
+// 标点（含收尾引号）一起收尾。
+//
+// ⚠️ 只切段、不改字：切完 word 数、标点、注文偏移必须一一对得上——
+// 下面 `split_praise_paragraph` 会同步重映射 `Note::at`，否则夹注会整体
+// 错位到隔壁字上去。
+// ------------------------------------------------------------------
+
+// 句末标点 / 收尾符号的判据**只有一份**（`types::is_sentence_end` /
+// `types::is_closer`）：断段、论赞另起、导出断句三处同取，免得改一处
+// 忘另一处，切出两个口径。
+use crate::types::{is_closer, is_sentence_end};
+
+/// 找出「史论另起」的断点，返回**段内 char 下标**列表（新段首字的位置）。
+///
+/// 判据：句末标点 → （可选的收尾引号 / 空白）→ [`crate::types::is_praise_head`]。
+/// 只取后面 8 个字做判据（`is_praise_head` 最长认到「臣安石曰」）。
+pub fn praise_cut_points(text: &str) -> Vec<usize> {
+    let cs: Vec<char> = text.chars().collect();
+    let n = cs.len();
+    let mut cuts: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if !is_sentence_end(cs[i]) {
+            i += 1;
+            continue;
+        }
+        // 跳过收尾引号与空白：它们留在前一段。
+        let mut j = i + 1;
+        while j < n && (cs[j].is_whitespace() || is_closer(cs[j])) {
+            j += 1;
+        }
+        if j >= n {
+            break;
+        }
+        let head: String = cs[j..(j + 8).min(n)].iter().collect();
+        if crate::types::is_praise_head(&head) && cuts.last() != Some(&j) {
+            cuts.push(j);
+        }
+        // 无论切不切，都从 j 继续（跳过的一串已在 j 之前，不必重扫）。
+        i = j.max(i + 1);
+    }
+    cuts
+}
+
+/// 把一段里「挤压在一起」的史论切成独立段落；没有断点就原样返回（零拷贝
+/// 之外只 clone 一次）。
+///
+/// 注文偏移按段重映射：落在本段之外的一律丢弃（那是上一段 / 下一段的注），
+/// 跨度越过段尾的截到段尾——绝不留下一个指向段外的 `at`。
+pub fn split_praise_paragraph(p: &crate::types::Paragraph) -> Vec<crate::types::Paragraph> {
+    let cuts = praise_cut_points(&p.text);
+    if cuts.is_empty() {
+        return vec![p.clone()];
+    }
+    let cs: Vec<char> = p.text.chars().collect();
+    let mut bounds: Vec<usize> = Vec::with_capacity(cuts.len() + 2);
+    bounds.push(0);
+    for c in cuts {
+        if c > *bounds.last().unwrap() && c < cs.len() {
+            bounds.push(c);
+        }
+    }
+    bounds.push(cs.len());
+
+    let mut out: Vec<crate::types::Paragraph> = Vec::with_capacity(bounds.len() - 1);
+    for w in bounds.windows(2) {
+        let (mut s, e) = (w[0], w[1]);
+        while s < e && cs[s].is_whitespace() {
+            s += 1; // 段首空白不占格；偏移随之下移
+        }
+        if s >= e {
+            continue;
+        }
+        let raw: String = cs[s..e].iter().collect();
+        let text = raw.trim_end().to_string();
+        let len = text.chars().count();
+        if len == 0 {
+            continue;
+        }
+        let mut notes = Vec::new();
+        for nt in &p.notes {
+            if nt.at < s || nt.at >= e {
+                continue;
+            }
+            let mut nn = nt.clone();
+            nn.at -= s;
+            if nn.at >= len {
+                continue; // 落在被裁掉的尾部空白里
+            }
+            if nn.at + nn.len > len {
+                nn.len = len - nn.at;
+            }
+            notes.push(nn);
+        }
+        out.push(crate::types::Paragraph { text, notes });
+    }
+    if out.is_empty() {
+        vec![p.clone()]
+    } else {
+        out
+    }
+}
+
+/// 整本过一遍史论断段（导入收口调用；只动段落边界，一个字都不改）。
+pub fn split_praise_in_book(book: &mut Book) {
+    for ch in &mut book.chapters {
+        // 绝大多数段落没有断点，`praise_cut_points` 一趟线性扫描 + 无分配，
+        // 先探再决定要不要真切，避免给整本书每段都 clone 一份。
+        if !ch
+            .paragraphs
+            .iter()
+            .any(|p| !praise_cut_points(&p.text).is_empty())
+        {
+            continue;
+        }
+        let mut next: Vec<crate::types::Paragraph> = Vec::with_capacity(ch.paragraphs.len() + 8);
+        for p in ch.paragraphs.drain(..) {
+            next.extend(split_praise_paragraph(&p));
+        }
+        ch.paragraphs = next;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2059,4 +2268,112 @@ mod tests {
         // 多余空格折叠。
         assert_eq!(strip_pinyin_runs("甲  乙"), "甲 乙");
     }
+
+    // ---- v1.9.40：章题去重（书名复读机）----------------------------------
+
+    #[test]
+    fn chapter_title_drops_repeated_book_name_and_section_mark() {
+        // 真机截图那一例：`資治通鑑 ◇ 卷第一`（◇ 是分节符，空格是半角）。
+        assert_eq!(clean_title("資治通鑑", "資治通鑑 ◇ 卷第一"), "卷第一");
+        // 复制粘贴造成的三连书名。
+        assert_eq!(
+            clean_title("資治通鑑", "資治通鑑資治通鑑資治通鑑卷第一"),
+            "卷第一"
+        );
+        // 全角空格 + 中点。
+        assert_eq!(clean_title("資治通鑑", "資治通鑑　·　卷第二"), "卷第二");
+        // 书名不在题内：一个字都不许动。
+        assert_eq!(clean_title("史記", "五帝本紀第一"), "五帝本紀第一");
+        // 题内只有书名（整章就是书名）：数据层原样留着，渲染层才不会把
+        // 目录 / 中缝的条目也一并抹成空。
+        assert_eq!(clean_title("史記", "史記"), "史記");
+        // 空书名：只清装饰符。
+        assert_eq!(clean_title("", "◇ 卷第一"), "卷第一");
+        // 长书名（四字以上）同样只剥前缀、不按子串删。
+        assert_eq!(
+            clean_title("資治通鑑", "資治通鑑外紀卷第一"),
+            "外紀卷第一"
+        );
+    }
+
+    #[test]
+    fn dedup_titles_is_idempotent() {
+        let mut b = Book::new("資治通鑑", "司馬光");
+        b.chapters.push(Chapter {
+            title: "資治通鑑 ◇ 卷第一".into(),
+            paragraphs: vec![Paragraph::plain("周紀一")],
+        });
+        b.chapters.push(Chapter {
+            title: "卷第二".into(),
+            paragraphs: vec![Paragraph::plain("周紀二")],
+        });
+        b.dedup_titles();
+        let first: Vec<String> = b.chapters.iter().map(|c| c.title.clone()).collect();
+        assert_eq!(first, vec!["卷第一".to_string(), "卷第二".to_string()]);
+        b.dedup_titles();
+        let second: Vec<String> = b.chapters.iter().map(|c| c.title.clone()).collect();
+        assert_eq!(first, second, "洗两遍结果必须一样");
+    }
+
+    // ---- v1.9.40：史论断段 ----------------------------------------------
+
+    #[test]
+    fn praise_runs_are_split_into_their_own_paragraphs() {
+        let p = Paragraph::plain("齊威王薨。臣光曰：臣聞天子之職莫大於禮。");
+        let out = split_praise_paragraph(&p);
+        assert_eq!(out.len(), 2, "史论没有断开：{out:?}");
+        assert_eq!(out[0].text, "齊威王薨。");
+        assert!(out[1].text.starts_with("臣光曰"), "第二段：{}", out[1].text);
+        // 逗号后面是句中转引，绝不断。
+        let q = Paragraph::plain("王曰，臣光曰不可，遂止。");
+        assert_eq!(split_praise_paragraph(&q).len(), 1, "逗号处被误断");
+        // 没有史论的段落原样返回（只有一份，不是零份）。
+        let r = Paragraph::plain("道可道，非常道。");
+        let out = split_praise_paragraph(&r);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, r.text);
+        // 闭引号归前段，不甩到下一段开头。
+        let s2 = Paragraph::plain("子曰「學而時習之。」贊曰蓋聞有虞氏之德。");
+        let out = split_praise_paragraph(&s2);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].text.ends_with('」'), "闭引号被甩到下一段：{}", out[0].text);
+    }
+
+    #[test]
+    fn splitting_paragraphs_remaps_note_offsets() {
+        let mut p = Paragraph::plain("甲乙。臣光曰丙丁");
+        p.notes.push(crate::types::Note::new(1, crate::types::NoteKind::Note, "乙注"));
+        p.notes.push(crate::types::Note::new(3, crate::types::NoteKind::Note, "臣注"));
+        let out = split_praise_paragraph(&p);
+        assert_eq!(out.len(), 2);
+        // 第一段「甲乙。」：只剩指向「乙」的那条，偏移仍是 1。
+        assert_eq!(out[0].notes.len(), 1, "注没跟着段走");
+        assert_eq!(out[0].notes[0].at, 1);
+        assert_eq!(out[0].notes[0].text, "乙注");
+        // 第二段「臣光曰丙丁」：原偏移 3 是「臣」，段内应变成 0。
+        assert_eq!(out[1].notes.len(), 1);
+        assert_eq!(out[1].notes[0].at, 0, "注偏移没重映射");
+        assert_eq!(out[1].notes[0].text, "臣注");
+        // 字一个不少（拼回去等于原文）。
+        let rejoined: String = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(rejoined, "甲乙。臣光曰丙丁");
+    }
+
+    #[test]
+    fn praise_split_touches_only_book_that_needs_it() {
+        let mut b = Book::new("資治通鑑", "司馬光");
+        b.chapters.push(Chapter {
+            title: "卷第一".into(),
+            paragraphs: vec![
+                Paragraph::plain("周紀一。臣光曰：臣聞天子之職莫大於禮。"),
+                Paragraph::plain("道可道，非常道。"),
+            ],
+        });
+        split_praise_in_book(&mut b);
+        assert_eq!(b.chapters[0].paragraphs.len(), 3);
+        assert_eq!(b.chapters[0].paragraphs[0].text, "周紀一。");
+        assert!(b.chapters[0].paragraphs[1].text.starts_with("臣光曰"));
+        assert_eq!(b.chapters[0].paragraphs[2].text, "道可道，非常道。");
+    }
+
 }

@@ -356,7 +356,21 @@ pub fn layout_book_from_opts(
         // ② 只在**段首**判（`offset == 0`），句子中段转引的「論曰」不动；
         // ③ 本列已经排了正文才另起一列——列本来就是空的（刚换过列 / 章首
         //    只剩题署预留带）时再空开一列，会排出一整列空白。
-        if g.offset == 0 && g.kind == GlyphKind::Char {
+        //
+        // ④ v1.9.40：判据从「只看段首」放宽到「段首 **或** 紧跟句末标点」——
+        //    OCR / 盗版 txt 常把整章挤成一段（`……為諸侯。臣光曰：……`），
+        //    导入时 `cleaner::split_praise_in_book` 已补断段；这里再兜一道，
+        //    让**已入库的旧书稿**也立刻降格。逗号后面不算（那是句中转引）。
+        let after_stop = i > 0
+            && flow[i - 1].chapter == g.chapter
+            && flow[i - 1].para == g.para
+            && (crate::types::is_sentence_end(flow[i - 1].ch)
+                || (crate::types::is_closer(flow[i - 1].ch)
+                    && i >= 2
+                    && flow[i - 2].chapter == g.chapter
+                    && flow[i - 2].para == g.para
+                    && crate::types::is_sentence_end(flow[i - 2].ch)));
+        if (g.offset == 0 || after_stop) && g.kind == GlyphKind::Char {
             // 取本段开头几个字做判据：够认最长的那条引语即可，不扫全段。
             let mut head = String::new();
             let mut j = i;
@@ -1734,6 +1748,45 @@ mod tests {
             .filter(|p| matches!(p, Piece::Main(g) if g.para == 1))
             .count();
         assert_eq!(laid, praise.len(), "论赞少了字");
+    }
+
+    /// **同一段**里挤着的论赞（旧书稿没断段）也要降格：判据从「段首」
+    /// 放宽到「紧跟句末标点」——v1.9.40。
+    #[test]
+    fn praise_after_a_sentence_end_lowers_even_inside_one_paragraph() {
+        // 一段：`治國道。臣光曰臣聞天子之職` ——「臣」在 offset=4，不在段首。
+        let text: Vec<char> = "治國道。臣光曰臣聞天子之職".chars().collect();
+        let flow: Vec<Glyph> = text
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Glyph {
+                chapter: 0,
+                para: 0,
+                offset: i,
+                ch: *c,
+                kind: GlyphKind::Char,
+            })
+            .collect();
+        let pages = layout_book_from_opts(&flow, |_| None, 4, 5, 0, false, false);
+        let cols = &pages[0].columns;
+        // 前四字占第一列（余一格空当），论赞必须另起一列、列顶低两格。
+        assert!(cols.len() >= 2, "同段论赞没有另起一列");
+        assert_eq!(cols[0].len(), 4, "第一列被论赞的字填满了");
+        assert!(matches!(cols[1].first(), Some(Piece::Gap)), "同段论赞没有降格");
+        assert!(matches!(cols[1].get(1), Some(Piece::Gap)), "只降了一格");
+        match cols[1].get(2) {
+            Some(Piece::Main(g)) => assert_eq!(g.ch, '臣', "降格两格后应直接起「臣」"),
+            other => panic!("论赞首字不在第三格：{other:?}"),
+        }
+        // 仍然是正文大字，绝不是夹注。
+        assert_eq!(
+            cols.iter()
+                .flatten()
+                .filter(|p| matches!(p, Piece::Gloss(..)))
+                .count(),
+            0,
+            "论赞被误排成夹注"
+        );
     }
 
     /// 论赞若正好起在一列之顶（上一段刚好排满换列），**不再空开一列**——

@@ -111,6 +111,23 @@ pub const HEAD_NOTE_FS_RATIO: f32 = 0.58;
 /// 0.65×21.5 = 14 恰好等于下限，等于这份比例参数在默认字号下根本没生效。
 /// 收到 12.5 之后，比例才真的说了算，眉批也才退得到正文的六成以下。
 pub const HEAD_NOTE_FS_MIN: f32 = 12.5;
+/// **双行夹注（小字）字号 = 正文的 62%**（v1.9.40 由写死的 0.5 上调）。
+///
+/// 为什么是 62%：注块两行共占**一个整字格**（半格账 `gloss::Filler`
+/// 记的就是 `ceil(行数 × 0.5)`），所以每行只有半格高 ≈ 0.59×正文字号。
+/// 字号可以略大于行高——汉字字面（ink）只占 em 框的 ~0.88，em 多出来的
+/// 上下内白正好吃掉那点溢出，笔画本身不会碰到格线，也不会与相邻行粘连。
+///
+/// 62% × 1.06（见 [`GLOSS_FS_MAX_OF_ROW`]）= 0.657 em，字面 0.58，仍在
+/// 半格（0.588）之内——**这是「注块不吃第二格」前提下的上限**。再往上，
+/// 两行就要占 1.5 格，行款与分页账全得改（那是版式决定，不是调参）。
+pub const GLOSS_FS_RATIO: f32 = 0.62;
+/// 注文行高的**溢出容差**：字号最多到「半格 × 此值」。
+///
+/// 1.06 = 字面内白的余量（em 框高出 ink 的这一截）。超过它，笔画就会
+/// 顶到相邻行的字头，双行夹注会糊成一片。
+pub const GLOSS_FS_MAX_OF_ROW: f32 = 1.06;
+
 /// 眉批的**行间距**倍率（字身 × 此值 = 一格高）。
 ///
 /// 1.06 是「字挨字」，放大后笔画容易糊在一起；1.30 给字间留出一线空隙，
@@ -5182,11 +5199,21 @@ impl Root {
     /// 章题（展示用）：源数据里的【】在此一律显作「」——
     /// 章题列、中缝篇题、卷首题署、分享题识都经这一道。
     pub fn chapter_title(&self, chapter: usize) -> String {
-        self.book
-            .as_ref()
-            .and_then(|b| b.chapters.get(chapter))
-            .map(|c| c.title.chars().map(crate::types::bracket_to_quote).collect())
-            .unwrap_or_default()
+        let Some(book) = self.book.as_ref() else {
+            return String::new();
+        };
+        let Some(ch) = book.chapters.get(chapter) else {
+            return String::new();
+        };
+        // ★ 渲染层兜底（v1.9.40）：卷首题名那一列把**书名**当大题排在篇题之上，
+        //   篇题若也带着书名（`資治通鑑 ◇ 卷第一`），纸面上就是「書名 書名 ◇
+        //   卷第一」的复读机。导入 / 开卷两处已洗过，这里再剥一次是给
+        //   「标题列 / 中缝 / 目录 / 分享」四条渲染路同一个口径——它们各自
+        //   取章题，谁也不许把书名带成两遍。
+        jiandu_core::cleaner::clean_title(&self.book_title(), &ch.title)
+            .chars()
+            .map(crate::types::bracket_to_quote)
+            .collect()
     }
 
     /// 书耳题签：篇章名 → 卷名 → 提要，按本章内容自适应
@@ -5204,7 +5231,10 @@ impl Root {
             .first()
             .map(|p| p.text.as_str())
             .unwrap_or("");
-        crate::types::ear_label(&ch.title, book.chapters.len(), chapter, opening)
+        // 书耳（中缝题签）与篇题同源：同样先剥重复书名与分节符，
+        // 否则左书口会出现两遍「資治通鑑」。
+        let ear = jiandu_core::cleaner::clean_title(&book.title, &ch.title);
+        crate::types::ear_label(&ear, book.chapters.len(), chapter, opening)
     }
 
     // ------------------------------------------------------------------
@@ -6302,7 +6332,9 @@ impl Root {
         // （放不下由 overflow_hidden 裁齐；跨列流转已由分页保证一段注
         // 不会超过一列容量，这里的 hidden 只是兜底）。
         let floor = if columns >= 10 { 10.0 } else { 7.0 };
-        let nfs = ((fs * 0.5).max(floor)).min(row_h.max(7.0));
+        // v1.9.40：0.5 → `GLOSS_FS_RATIO`（0.62），上限由「半格 × 1.06」兜住
+        // ——见常量注释：汉字字面的内白抵掉 em 溢出，笔画不出格、不与邻行粘连。
+        let nfs = ((fs * GLOSS_FS_RATIO).max(floor)).min((row_h * GLOSS_FS_MAX_OF_ROW).max(7.0));
         // **双行小字**：两个半宽小列，**各占 50%**（v1.25.0 用户指定）——
         // 右列读在前、左列续后，合起来正好铺满一个正文列的宽度，注块与
         // 上下正文同宽同界，行气才接得上（原先左缘留 1/6 空白、两列偏右）。
@@ -6381,6 +6413,11 @@ impl Root {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        // 浮层开着时注块也不响应（同正文字格那道闸门）：
+                        // 正在编辑夹注时再点一下注块，不该把编辑框挤掉。
+                        if this.any_overlay_open() {
+                            return;
+                        }
                         cx.stop_propagation();
                         // 碰过正文：松手时不翻页；并收起字工具条 / 拖选。
                         this.touched_glyph = true;
@@ -6490,7 +6527,14 @@ impl Root {
         fs: f32,
     ) -> Div {
         let t = self.theme;
-        let title = self.chapter_title(chapter);
+        // ★ 小题不与大题重复（v1.9.40）：这一列先排「大题 = 书名」，再排
+        //   「小题 = 篇题」。源文本里章的题若就是书名（`資治通鑑`，多见于
+        //   卷首序 / 单章书），小题再写一遍就是纸面上的复读机——此处不画，
+        //   只在大题那一行留一个书名。
+        let mut title = self.chapter_title(chapter);
+        if title.trim() == self.book_title().trim() {
+            title.clear();
+        }
         let col_w = cell_w * ANCIENT_TITLE_COL;
         // 篇题字号**略大于正文**（v1.28.0 用户口径「识别章节标题，其字号
         // 可以略大于正文」）：1.12 倍——刻本里章题比正文高一头，但不翻成
@@ -7775,6 +7819,16 @@ impl Root {
             cell = cell.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                    // ★ 底层命中闸门（v1.9.40）：浮层（夹注编辑 / 放大卡 / 修改
+                    //   菜单 / 任何顶层面板）开着时，**正文字格一律不响应**——
+                    //   不置 `touched_glyph`、不起锚、更不 `stop_propagation`。
+                    //   为什么光靠 `.occlude()` 还不够：它截断的是浮层那一帧的
+                    //   命中栈，而按下可能发生在浮层出现前的那几毫秒（动画滑出
+                    //   / 刚点开），抬起时正文字格仍在栈里。这一道早退是硬保险：
+                    //   浮层摊着时，底下这层纸对鼠标完全「死」掉。
+                    if this.any_overlay_open() {
+                        return;
+                    }
                     // 任意字格按下都先标记「碰过正文」，拦下翻页。
                     this.touched_glyph = true;
                     cx.stop_propagation();
@@ -12085,6 +12139,135 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             )
             .child(head);
 
+        // ---- 出图比例（v1.9.10）：发哪儿就出什么比例 ----
+        //
+        // 「随纸面」是本叶真实长宽比（把这一叶拍下来）；其余三档是社交平台
+        // 的版式——九比十六给小红书 / 朋友圈，方图在信息流里占面积最大，
+        // 三比四是微博那种竖幅。
+        let mut ratio_row = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(16.0))
+            .flex_wrap();
+        for (label, want) in Self::PNG_RATIO_OPTS {
+            ratio_row = ratio_row.child(
+                ink_option(label, self.png_ratio == want, t).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_png_ratio(want);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        sheet = sheet.child(style_row("图", ratio_row, t));
+
+        // ---- 语速（P1-5）：连读 / 听书共用倍率 ----
+        //
+        // 0.8× 慢 / 1.0× 常 / 1.25× 快。只改进程内字段（不落盘）。
+        let mut speed_row = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(16.0))
+            .flex_wrap();
+        for (label, want) in [("0.8×", 0.8f32), ("1.0×", 1.0f32), ("1.25×", 1.25f32)] {
+            speed_row = speed_row.child(
+                ink_option(label, (self.tts_rate - want).abs() < 1e-3, t).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_tts_rate(want);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        sheet = sheet.child(style_row("速", speed_row, t));
+
+        // ---- 批量出图（P1-3）：当前章每一叶按选定比例渲染 ----
+        //
+        // 走「极简一键」：点一下 → 弹目录框 → 全自动出完。比例用上方「出图」那一行
+        // 选好的（九比十六 / 方 / 三比四 / 随纸面）。
+        let batch_row = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(16.0));
+        let batch_row = batch_row.child(
+            ink_option("批量出图（本章）", false, t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.batch_export_png(cx);
+                    cx.notify();
+                }),
+            ),
+        );
+        sheet = sheet.child(style_row("批", batch_row, t));
+
+        // ---- 三页签（v1.9.40）：版式 / 装帧 / 校勘 ----
+        //
+        // 十八行平铺是一张「从上翻到下要点三次头」的长纸。分三页之后，每页
+        // 只回答一个问题：字多大怎么排 / 纸墨框长什么样 / 底本怎么校。
+        // 开关本身仍是 `Root` 的字段——页签只管「现在看哪一页」，切页不丢状态。
+        let tab_i = self.style_tab_idx();
+        let mut tabs = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(20.0))
+            .pb(px(3.0))
+            .border_b_1()
+            .border_color(rgba(((t.rule() & 0xFFFFFF) << 8) | 0x22));
+        for (i, (name, hint)) in [
+            ("版式", "列数 · 字级 · 字体"),
+            ("装帧", "纸墨 · 版框 · 界栏"),
+            ("校勘", "标注 · 简繁 · 句读"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let on = tab_i == i;
+            tabs = tabs.child(
+                div()
+                    .id(SharedString::from(format!("style-tab-{i}")))
+                    .cursor_pointer()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(1.0))
+                    .text_size(px(11.5))
+                    .text_color(rgb(if on { sheet_zhu(t) } else { t.ink_soft() }))
+                    .hover(|st| st.text_color(rgb(sheet_zhu(t))))
+                    .child(SharedString::from(*name))
+                    .child(
+                        div()
+                            .text_size(px(8.5))
+                            .text_color(rgb(t.ink_soft()))
+                            .child(SharedString::from(*hint)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(1.0))
+                            .h(px(1.5))
+                            .w(px(if on { 26.0 } else { 0.0 }))
+                            .bg(rgb(sheet_zhu(t))),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.style_tab = i as u8;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        sheet = sheet.child(tabs);
+
         // ---- 样式预设（v1.9.10）：一句记住一整套版式 ----
         //
         // 内建四套（灯下 / 雨窗 / 仿刻 / 素笺）+ 三个用户槽位。**空槽点一下
@@ -12186,78 +12369,15 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 ),
             );
         }
-        sheet = sheet.child(style_row("式", preset_row, t));
-
-        // ---- 出图比例（v1.9.10）：发哪儿就出什么比例 ----
-        //
-        // 「随纸面」是本叶真实长宽比（把这一叶拍下来）；其余三档是社交平台
-        // 的版式——九比十六给小红书 / 朋友圈，方图在信息流里占面积最大，
-        // 三比四是微博那种竖幅。
-        let mut ratio_row = div()
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(16.0))
-            .flex_wrap();
-        for (label, want) in Self::PNG_RATIO_OPTS {
-            ratio_row = ratio_row.child(
-                ink_option(label, self.png_ratio == want, t).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.set_png_ratio(want);
-                        cx.notify();
-                    }),
-                ),
-            );
+        if tab_i == 0 {
+            sheet = sheet.child(style_row("式", preset_row, t));
         }
-        sheet = sheet.child(style_row("图", ratio_row, t));
 
-        // ---- 语速（P1-5）：连读 / 听书共用倍率 ----
-        //
-        // 0.8× 慢 / 1.0× 常 / 1.25× 快。只改进程内字段（不落盘）。
-        let mut speed_row = div()
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(16.0))
-            .flex_wrap();
-        for (label, want) in [("0.8×", 0.8f32), ("1.0×", 1.0f32), ("1.25×", 1.25f32)] {
-            speed_row = speed_row.child(
-                ink_option(label, (self.tts_rate - want).abs() < 1e-3, t).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.set_tts_rate(want);
-                        cx.notify();
-                    }),
-                ),
-            );
+
+
+        if tab_i == 0 {
+            sheet = sheet.child(style_row("列", cols_row, t));
         }
-        sheet = sheet.child(style_row("速", speed_row, t));
-
-        // ---- 批量出图（P1-3）：当前章每一叶按选定比例渲染 ----
-        //
-        // 走「极简一键」：点一下 → 弹目录框 → 全自动出完。比例用上方「出图」那一行
-        // 选好的（九比十六 / 方 / 三比四 / 随纸面）。
-        let batch_row = div()
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(16.0));
-        let batch_row = batch_row.child(
-            ink_option("批量出图（本章）", false, t).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.batch_export_png(cx);
-                    cx.notify();
-                }),
-            ),
-        );
-        sheet = sheet.child(style_row("批", batch_row, t));
-
-        sheet = sheet.child(style_row("列", cols_row, t));
 
         // ---- 字级：蝇头 / 中楷 / 大字 / 榜书 四档 ----
         //
@@ -12305,18 +12425,24 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     ),
             );
         }
-        sheet = sheet.child(style_row("字", seg, t));
+        if tab_i == 0 {
+            sheet = sheet.child(style_row("字", seg, t));
+        }
 
         // ---- 字体：竖排字牌，一牌一款 ----
         //
         // v1.35.0：原先「排版字体」（预设对）与「字体」（单换正文）两行写同一
         // 个 `font_ancient`，各写各的。现在只留这一行，选一款即走
         // `set_font`——正文 + 批注 + 行高缩放 + 重算尺寸一次做完。
-        sheet = sheet.child(style_row("体", self.font_choices_row(cx), t));
+        if tab_i == 0 {
+            sheet = sheet.child(style_row("体", self.font_choices_row(cx), t));
+        }
         // 批注字体：楷体二选一，与正文宋体分开——
         // 正文匠体、注文手写体，正是刻本的层次。字体行定完对子后，
         // 这里还能单独挑一款批注。
-        sheet = sheet.child(style_row("注", self.note_font_row(cx), t));
+        if tab_i == 0 {
+            sheet = sheet.child(style_row("注", self.note_font_row(cx), t));
+        }
 
         // ---- 留白（左右）：版心宽 ÷ 单叶可用宽，三档 ----
         //
@@ -12344,7 +12470,9 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 ),
             );
         }
-        sheet = sheet.child(style_row("白", bx_row, t));
+        if tab_i == 1 {
+            sheet = sheet.child(style_row("白", bx_row, t));
+        }
 
         // ---- 页面：对开 / 单叶 / 整页（三模式）+ 「自动」开关 ----
         //
@@ -12384,7 +12512,9 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 }),
             ),
         );
-        sheet = sheet.child(style_row("面", modes, t));
+        if tab_i == 0 {
+            sheet = sheet.child(style_row("面", modes, t));
+        }
 
         // ---- 纸色：**遍历主题配置表自动生成**——新增一套配色只需在
         // `PAPER_THEMES` 加一行，此处零改动 ----
@@ -12440,10 +12570,14 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     ),
             );
         }
-        sheet = sheet.child(style_row("纸", themes_row, t));
+        if tab_i == 1 {
+            sheet = sheet.child(style_row("纸", themes_row, t));
+        }
 
         // ---- 墨色：五套正文 / 小字注色（两枚小色点 + 一行墨字）----
-        sheet = sheet.child(style_row("墨", self.palette_chips(cx), t));
+        if tab_i == 1 {
+            sheet = sheet.child(style_row("墨", self.palette_chips(cx), t));
+        }
 
         // ---- 版框：四周双边 / 左右双边 / 四周单边（v1.85.0）----
         //
@@ -12524,7 +12658,9 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     ),
             );
         }
-        sheet = sheet.child(style_row("框", frames_row, t));
+        if tab_i == 1 {
+            sheet = sheet.child(style_row("框", frames_row, t));
+        }
 
         // ---- 丝栏：乌 / 金 / 朱 三色界行（竖排列间那道细线）----
         // 色块里立三道竖线，直接预览界行颜色与粗细。
@@ -12573,7 +12709,25 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     ),
             );
         }
-        sheet = sheet.child(style_row("栏", rules, t));
+        if tab_i == 1 {
+            sheet = sheet.child(style_row("栏", rules, t));
+        }
+
+        // ---- 注文位置（v1.9.40）：雙行夾註（淨室）⇄ 頁腳註（天頭地腳）----
+        //
+        // 原本这枚开关在「更多」里，用户要它回到底本这一组：注文排在哪里，
+        // 是**校勘体例**的一部分，与「标注 / 简繁 / 句读」同页才讲得通。
+        // `set_notes_inline` 自带保位（记页首字锚点重排），切了不跳页。
+        let note_pos = self.style_chips(
+            vec![
+                ("雙行夾註", self.notes_inline, StyleAct::Inline),
+                ("頁腳註", !self.notes_inline, StyleAct::Footnote),
+            ],
+            cx,
+        );
+        if tab_i == 2 {
+            sheet = sheet.child(style_row("位", note_pos, t));
+        }
 
         // ---- 标注：通假 / 标点 / 生僻字 / 数字汉字 / 注释 / 繁体 ----
         //
@@ -12589,7 +12743,9 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             ],
             cx,
         );
-        sheet = sheet.child(style_row("标", marks, t));
+        if tab_i == 2 {
+            sheet = sheet.child(style_row("标", marks, t));
+        }
 
         // ---- 繁简：原文 / 简体 / 繁体（v1.81.0）----
         //
@@ -12604,7 +12760,9 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 .collect(),
             cx,
         );
-        sheet = sheet.child(style_row("简", trad_chips, t));
+        if tab_i == 2 {
+            sheet = sheet.child(style_row("简", trad_chips, t));
+        }
 
         // ---- 句读：形制（现代标点 / 古籍句读）+ 点画（墨 / 朱砂 / 回锋）----
         //
@@ -12627,7 +12785,9 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             ],
             cx,
         );
-        sheet = sheet.child(style_row("读", mode_chips, t));
+        if tab_i == 2 {
+            sheet = sheet.child(style_row("读", mode_chips, t));
+        }
 
         // 点画只在**古籍句读**下有意义（现代标点那套是「印刷体」的形，
         // 没有回锋这回事），故跟着模式显隐——省一行高度，也不误导。
@@ -12650,39 +12810,11 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 ("回锋", self.punct_hook, StyleAct::Hook),
             ];
             let ink_chips = self.style_chips(items, cx);
-            sheet = sheet.child(style_row("画", ink_chips, t));
+            if tab_i == 2 {
+                sheet = sheet.child(style_row("画", ink_chips, t));
+            }
         }
 
-        // ---- 实时反馈：引擎当下算出的列数 / 版心 / 列宽 / 字号 / 每面行款 ----
-        // 自动档每帧换挡，这一行是「当前到底排成什么样」的唯一凭据。
-        // 层次化：**版心% 与 天头:地脚** 用半透明朱砂微微高亮（核心参数），
-        // 其余（列数 / 列宽 / 字号 / 行数）用淡墨，让这行字有主次感。
-        let cols_auto = if self.columns_auto { "（自动）" } else { "" };
-        let banxin = self.banxin_ratio * 100.0;
-        let ratio = self.margin_top / self.margin_bot.max(0.01);
-        let zhu = rgba((sheet_zhu(t) << 8) | 0xCC);
-        let soft = rgb(t.ink_soft());
-        let seg = |s: String, z: bool| {
-            div()
-                .text_color(if z { zhu } else { soft })
-                .whitespace_nowrap()
-                .child(SharedString::from(s))
-        };
-        sheet = sheet.child(
-            div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .items_center()
-                .gap(px(6.0))
-                .text_size(px(10.5))
-                .child(seg(format!("{} 列{}", self.grid.columns, cols_auto), false))
-                .child(seg(format!("版心 {:.0}%", banxin), true))
-                .child(seg(format!("列宽 {:.0}", self.col_w), false))
-                .child(seg(format!("字号 {:.0}", self.size_ancient), false))
-                .child(seg(format!("每面 {} 行", self.grid_rows), false))
-                .child(seg(format!("天头:地脚 {:.1}:1", ratio), true)),
-        );
         // ---- v1.0.0-beta：底行那枚「分享所选 / 分享本叶」已撤 ----
         //
         // 理由（用户口径）：这张纸只管**排版**（列数 / 留白 / 字体 / 标注），
@@ -12764,6 +12896,37 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 .justify_end()
                 .pt(px(2.0))
                 .child(import_btn),
+        );
+
+        // ---- 实时反馈：引擎当下算出的列数 / 版心 / 列宽 / 字号 / 每面行款 ----
+        // 自动档每帧换挡，这一行是「当前到底排成什么样」的唯一凭据。
+        // 层次化：**版心% 与 天头:地脚** 用半透明朱砂微微高亮（核心参数），
+        // 其余（列数 / 列宽 / 字号 / 行数）用淡墨，让这行字有主次感。
+        let cols_auto = if self.columns_auto { "（自动）" } else { "" };
+        let banxin = self.banxin_ratio * 100.0;
+        let ratio = self.margin_top / self.margin_bot.max(0.01);
+        let zhu = rgba((sheet_zhu(t) << 8) | 0xCC);
+        let soft = rgb(t.ink_soft());
+        let seg = |s: String, z: bool| {
+            div()
+                .text_color(if z { zhu } else { soft })
+                .whitespace_nowrap()
+                .child(SharedString::from(s))
+        };
+        sheet = sheet.child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(px(10.5))
+                .child(seg(format!("{} 列{}", self.grid.columns, cols_auto), false))
+                .child(seg(format!("版心 {:.0}%", banxin), true))
+                .child(seg(format!("列宽 {:.0}", self.col_w), false))
+                .child(seg(format!("字号 {:.0}", self.size_ancient), false))
+                .child(seg(format!("每面 {} 行", self.grid_rows), false))
+                .child(seg(format!("天头:地脚 {:.1}:1", ratio), true)),
         );
 
         // 作为正文正下方的行内面板（像照片说明），宽度等于单张页面，不遮挡正文。

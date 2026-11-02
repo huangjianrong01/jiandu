@@ -456,6 +456,9 @@ impl IrBook {
         }
         // 章数变了，旧目录的下标就不作数了——整份按新卷章重建。
         book.toc = Vec::new();
+        // v1.9.40：EPUB / HTML 的卷题也常带书名后缀（`資治通鑑 · 卷第一`），
+        // 与卷首大题的「書名」叠在一起就是复读机；这里按同一把尺子洗一次。
+        book.dedup_titles();
         book.rebuild_toc_from_chapters();
     }
 

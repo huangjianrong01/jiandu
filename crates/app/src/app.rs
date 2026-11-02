@@ -495,6 +495,13 @@ pub struct Root {
     /// 「版字」面板是否展开（v1.35.0：样式与版式两页合并为一页，
     /// 面板只剩一张纸，故不再有「当前页签」这个状态）。
     pub show_style: bool,
+    /// 「版字」面板当前页签（v1.9.40）：0 版式 / 1 装帧 / 2 校勘。
+    ///
+    /// 面板原先是一张竖着排十八行的长纸，从上翻到下要点三次头。分三页之后，
+    /// 每页只回答一个问题：字多大怎么排 / 纸墨框长什么样 / 底本怎么校。
+    /// **只存下标不存枚举**：越界一律按 0 处理（`style_tab_idx()`），
+    /// 老存档 / 调试钩子给个野值也不会把面板渲染成空白。
+    pub style_tab: u8,
     /// 专注模式：隐藏工具栏、状态栏与目录，沉浸阅读。
     pub focus_mode: bool,
     /// 顶栏是否已滑出（v1.26.0「沉浸式古风化」）。
@@ -1360,6 +1367,7 @@ impl Root {
             bookmarks: Vec::new(),
             bookmarks_scroll: ScrollHandle::new(),
             show_style: false,
+            style_tab: 0,
             focus_mode: false,
             bar_shown: true,
             zoom: 1.0,
@@ -1817,6 +1825,15 @@ impl Root {
             || std::env::var("JIANDU_BANZI_OPEN").is_ok()
         {
             root.show_style = true;
+            // 专注模式下这张纸不渲染（顶栏都收起来了），调试开面板就先出专注。
+            root.focus_mode = false;
+        }
+        // 开发用：直接翻到「版字」某一页签（0 版式 / 1 装帧 / 2 校勘），
+        // 便于逐页截图核对（合成点击被 TCC 拦，只能从启动参数进）。
+        if let Ok(v) = std::env::var("JIANDU_STYLE_TAB") {
+            if let Ok(i) = v.parse::<u8>() {
+                root.style_tab = i.min(2);
+            }
         }
         // 开发用：直接进入专注模式。
         if std::env::var("JIANDU_FOCUS").is_ok() {
@@ -3111,6 +3128,9 @@ impl Root {
                 // v1.55.0：读档先规整——旧格式（u/v 眉批）直接清空、版本号
                 // 升到当前。用户明示旧数据是测试乱写的，不做迁移。
                 book.normalize_after_load();
+                // v1.9.40：旧书稿也修「书名复读」——已入库的 JSON 不会再走导入
+                // 清洗，开卷时按同一把尺子洗一次（幂等、只动 title）。
+                book.dedup_titles();
                 // 天头眉批开卷时从书稿里取一次（之后增删改都回写同一份）。
                 self.head_notes = book.head_notes.clone();
                 self.margin_notes = book.margin_notes.clone();
@@ -3163,6 +3183,18 @@ impl Root {
                 // 档案恢复），不再先落书衣封面——翻书就该回到原处。
                 // （v1.37.0 UI 瘦身撤掉了阅读页工具栏那枚「封面」，
                 //  书衣只在书架这一侧看了。）
+                // ★ 默认专注模式（v1.9.40）：
+                //   从书架进阅读，直接就是**满屏一叶**——工具栏、留白一概让开，
+                //   第一眼看到的是书，不是软件。退出只有两条路：Esc 或右上角
+                //   那枚极小的 ✕（见 `render_focus_exit`），退出后顶栏才回来。
+                //
+                //   ⚠️ 状态**只在这里置真**，别处一律只做「取反」或「置假」。
+                //   若在 render / fit_sizes 里按版面反推 focus_mode，就会形成
+                //   「设 true → 几何变 → 再设 true」的重绘死循环。单向触发是
+                //   硬规矩。
+                self.focus_mode = true;
+                self.bar_shown = false;
+                self.close_transient_ui();
                 self.screen = Screen::Reading;
                 self.notice.clear();
                 // 换书即换场景：上一本的导出收尾话不留（v1.52.3）。
@@ -3181,6 +3213,14 @@ impl Root {
                 self.notice = format!("打开失败：{e}");
             }
         }
+    }
+
+    /// 「版字」面板当前页签（0 版式 / 1 装帧 / 2 校勘）。
+    ///
+    /// 越界一律回落 0：页签下标只由面板自己写（0..=2），但调试钩子 / 将来的
+    /// 存档若给了野值，面板不该白屏——「回到第一页」永远是个安全的答案。
+    pub fn style_tab_idx(&self) -> usize {
+        (self.style_tab as usize).min(2)
     }
 
     /// 一次翻页**落在哪几叶**上（纯函数，单测锁死）。

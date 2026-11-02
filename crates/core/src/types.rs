@@ -1267,6 +1267,40 @@ impl Book {
         }
     }
 
+    /// **章题去重**（v1.9.40）：把每章标题里重复的书名与分节装饰符洗掉。
+    ///
+    /// 为什么要洗：源 txt 的卷题行常是「資治通鑑 ◇ 卷第一」，而卷首题名
+    /// 那一列**已经**把书名当「大题」独排一次——篇题再把书名带一遍，纸面
+    /// 上就是「書名 書名 ◇ 卷第一」的复读机（真机截图实测）。
+    ///
+    /// 幂等、无 I/O、只动 `title` 一个字段：导入时洗一次，旧书稿开卷时
+    /// 再洗一次（`normalize_after_load`），洗两遍结果一样。
+    pub fn dedup_titles(&mut self) {
+        let bt = self.title.clone();
+        // 记下「旧题 → 新题」，目录条目若用的正是旧题，一并换掉——
+        // 否则标题列已经干净了，目录里还挂着一串「資治通鑑 ◇ 卷第一」。
+        let mut changes: Vec<(usize, String, String)> = Vec::new();
+        for (i, c) in self.chapters.iter_mut().enumerate() {
+            let old = c.title.clone();
+            let new = crate::cleaner::clean_title(&bt, &old);
+            if new != old {
+                changes.push((i, old, new.clone()));
+                c.title = new;
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        for t in &mut self.toc {
+            if let Some((_, _, new)) = changes
+                .iter()
+                .find(|(i, old, _)| *i == t.chapter && *old == t.title)
+            {
+                t.title = new.clone();
+            }
+        }
+    }
+
     /// 没有目录时，按章节标题补一份平铺目录。
     pub fn ensure_toc(&mut self) {
         if self.toc.is_empty() {
@@ -1546,6 +1580,22 @@ pub fn is_praise_head(head: &str) -> bool {
         Some(pos) if pos == 2 || pos == 3 => cs[1..pos].iter().all(|c| is_han(*c)),
         _ => false,
     }
+}
+
+/// **句末标点**（断段与「论赞另起」共用的唯一判据）。
+///
+/// 只收句号 / 叹号 / 问号 / 分号（简繁半角一并）：逗号顿号不算句末，
+/// 否则「，臣光曰」这种夹在句中的转引也会被当成史论另起。
+pub fn is_sentence_end(c: char) -> bool {
+    matches!(c, '。' | '！' | '？' | '；' | '!' | '?' | ';')
+}
+
+/// **收尾符号**：句末之后可能跟着的引号 / 括号，它们属于**前一句**。
+pub fn is_closer(c: char) -> bool {
+    matches!(
+        c,
+        '」' | '』' | '”' | '"' | '\'' | '）' | ')' | '〕' | '】' | '》' | '〉'
+    )
 }
 
 /// 是否是汉字（判「臣X曰」的中间那截用；只排除拉丁与标点，够用即可）。
