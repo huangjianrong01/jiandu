@@ -12311,38 +12311,35 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         let hair = ((t.rule() & 0xFFFFFF) << 8) | 0x3C;
         let zhu = sheet_zhu(t);
 
-        // 倍速三档——直接以数字表示（v1.9.43）。选中态：朱砂字 + 下方 1.5px 朱细线。
-        let mut speed = div().flex().flex_row().items_center().gap(px(9.0));
-        for (label, want) in [("0.8", 0.8f32), ("1.0", 1.0f32), ("1.25", 1.25f32)] {
-            let on = (self.tts_rate - want).abs() < 1e-3;
-            // 选中档：数字下方压一条朱砂细线；未选：只是极淡墨数字。
-            let inner = if on {
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(2.0))
-                    .child(SharedString::from(label))
-                    .child(div().w(px(12.0)).h(px(1.5)).bg(rgb(zhu)))
-            } else {
-                div().child(SharedString::from(label))
-            };
-            speed = speed.child(
-                div()
-                    .cursor_pointer()
-                    .text_size(px(12.0))
-                    .text_color(rgb(if on { zhu } else { t.ink_soft() }))
-                    .child(inner)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.set_tts_rate(want);
-                            cx.notify();
-                        }),
-                    ),
+        // 当前语速：只显示「正在用的这一档」（用户要求：听的时候只看当前速度，
+        // 不堆其他倍速）。轻点即在 0.8 / 1.0 / 1.25 之间循环切换——仍可调，
+        // 但界面只露当前值，干净不抢戏。
+        let rates: [f32; 3] = [0.8, 1.0, 1.25];
+        let ridx = rates
+            .iter()
+            .position(|&r| (self.tts_rate - r).abs() < 1e-3)
+            .unwrap_or(1);
+        let rate_label = if (rates[ridx] - 0.8).abs() < 1e-3 {
+            "0.8×"
+        } else if (rates[ridx] - 1.0).abs() < 1e-3 {
+            "1.0×"
+        } else {
+            "1.25×"
+        };
+        let speed = div()
+            .cursor_pointer()
+            .text_size(px(12.5))
+            .text_color(rgb(zhu))
+            .child(SharedString::from(rate_label.to_string()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    let next = rates[(ridx + 1) % rates.len()];
+                    this.set_tts_rate(next);
+                    cx.notify();
+                }),
             );
-        }
 
         // 小字按钮（再讀 / 停）：极淡墨、hover 转朱。
         let action = |label: &str, z: u32| {
@@ -12399,14 +12396,21 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             ),
         );
 
-        // ★ 贴底悬浮胶囊（v1.9.42 起钉屏幕最底端）：单行、底部留 8px 安全边，
-        // 正文区已在 `fit_sizes` 里为它让出 60px，纸面整体顶上去，胶囊之下
-        // 绝无一字被压。
+        // ★ 锚定到「阅读纸面最外围黑色下框线」下沿（v1.9.47）：不再钉窗口底边
+        // （会悬空、偏上），改用 `page_rect` 真坐标算出版框底边 = page_rect.bottom
+        // − margin_bot；胶囊**顶缘**与该线留完美 1px 间距，绝不越到框上、绝不压
+        // 正文（正文止于版框之上）。横向仍居中（下外边框正中）。首帧 page_rect
+        // 未就绪时退回窗口底边，避免闪现错位。
+        let frame_bottom = match self.page_rect.get() {
+            Some((_, y, _, h)) => y + h - self.margin_bot,
+            None => self.viewport_h - 8.0,
+        };
+        let frame_gap = 1.0_f32;
         div()
             .absolute()
             .left(px(0.0))
             .right(px(0.0))
-            .bottom(px(8.0))
+            .top(px(frame_bottom + frame_gap)) // 顶缘 = 版框下沿 + 1px
             .flex()
             .flex_row()
             .justify_center()
