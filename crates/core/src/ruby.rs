@@ -1,7 +1,7 @@
 //! 注音（生僻字拼音）几何：**横排、正立、从左到右**，落在汉字右侧的列间空白里。
 //!
 //! v1.9.13 曾试过「整串竖排、旋转 90°」，用户最终要求回到**横排**：拼音作为
-//! 一个整体、字母横向排列，严格垂直居中于汉字右侧，且整串宽度**硬封顶到字格右缘**——
+//! 一个整体、字母横向排列，严格垂直居中于汉字右侧，且整串宽度**紧贴列边线（字格右缘）**——
 //! 既不挤占左列句读、也不溢出右界栏、更不横跨整列宽。
 //!
 //! ```text
@@ -86,13 +86,17 @@ pub struct RubyLayout {
 /// * `cell_w` / `cell_h`：字格宽高。
 pub fn layout(pinyin: &str, body_fs: f32, cell_w: f32, cell_h: f32) -> RubyLayout {
     let letters = pinyin.chars().count().max(1) as f32;
-    let inset = (cell_w * 0.03).clamp(1.0, 3.0);
     // 汉字在字格居中 → 右缘 = (cell_w + body_fs)/2。
     let char_right = (cell_w + body_fs) * 0.5;
-    // 字格内、汉字右缘到字格右缘的空白（让开 inset 呼吸）= 注音可用宽硬上限。
-    // 注音整串绝对不许越过字格右缘——既不挤占左列句读，也不溢出右界栏（用户铁律）。
-    let room = ((cell_w - body_fs) * 0.5 - inset).max(2.0);
-    // 目标字号 40%；受可用宽约束，放不下就按宽反算、下限 22%。
+    // 左留白：与汉字右缘的一丝呼吸，让注音不贴脸、干净落在生字右边。
+    let left_inset = (cell_w * 0.02).clamp(1.0, 2.0);
+    // 右留白：与「列边线」（字格右缘）的一丝呼吸——注音整串要**贴合列边线**，
+    // 但绝不许越过它（用户铁律：不溢出到隔壁列）。
+    let right_inset = 1.0;
+    // 注音可用宽硬上限 = 汉字右缘 → 列边线之间、扣掉两侧呼吸。
+    // 整串右缘死死钉在 `cell_w − right_inset`：既不挤占左列句读，也不溢出右界栏。
+    let room = (cell_w - char_right - left_inset - right_inset).max(2.0);
+    // 目标字号 62%；受可用宽约束，放不下就按宽反算、下限 22%。
     let mut fs = (body_fs * RUBY_SCALE).min(room / (letters * RUBY_ADVANCE));
     fs = fs.max(3.0);
     if fs < body_fs * RUBY_SCALE_MIN {
@@ -106,9 +110,10 @@ pub fn layout(pinyin: &str, body_fs: f32, cell_w: f32, cell_h: f32) -> RubyLayou
         fs,
         block_w,
         block_h,
-        left: char_right + inset,
+        // 紧贴生字右缘、整串向右铺到列边线（只留 right_inset 一丝呼吸）。
+        left: char_right + left_inset,
         top: ((cell_h - block_h) * 0.5).max(0.0),
-        // 宽度已被 `room` 死死封顶，不会再溢出，故 `tight` 恒 false。
+        // 右缘 ≤ 列边线 − right_inset，不会再溢出，故 `tight` 恒 false。
         tight: false,
     }
 }

@@ -255,6 +255,51 @@ impl Pager {
         self.scanned < n
     }
 
+    /// 某一面（全局叶号）的真实字数（只数 `GlyphKind::Char`，标点不计）。
+    ///
+    /// 用于菜单栏「今日阅卷字数」统计。当前章恒在 LRU 缓存里，翻页时近乎零成本；
+    /// 开卷第一叶可能触发一次单章排版（≈2ms），可忽略。找不到那一叶时返回 0。
+    pub fn leaf_char_count(&mut self, book: &mut Book, page: usize) -> usize {
+        if self.lens.is_empty() {
+            return 0;
+        }
+        // 渐进探明前缀和，直到找到包含 `page` 的章。
+        let mut ci = 0usize;
+        loop {
+            if ci >= self.lens.len() {
+                break;
+            }
+            if self.starts[ci].is_none() || self.lens[ci].is_none() {
+                self.scan_to(book, ci);
+            }
+            let s = self.starts[ci].unwrap_or(0);
+            let len = self.lens[ci].unwrap_or(0);
+            if page < s + len || ci + 1 >= self.lens.len() {
+                break;
+            }
+            ci += 1;
+        }
+        let s = self.starts[ci].unwrap_or(0);
+        let local = page.saturating_sub(s);
+        // 取章排版（缓存优先）：没在缓存里就排一章并进 LRU。
+        if !self.cache.contains_key(&ci) {
+            self.ensure_loaded(book, ci);
+            let pages = self.layout_chapter(book, ci);
+            self.cache.insert(ci, pages);
+            self.order.push_back(ci);
+            while self.order.len() > LRU_CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.cache.remove(&old);
+                }
+            }
+        }
+        self.cache
+            .get(&ci)
+            .and_then(|pages| pages.get(local))
+            .map(|pg| pg.glyphs.iter().filter(|g| g.kind == GlyphKind::Char).count())
+            .unwrap_or(0)
+    }
+
     /// 探明全书（后台线程干这个）。
     pub fn scan_all(
         &mut self,

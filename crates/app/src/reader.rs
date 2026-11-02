@@ -4986,6 +4986,15 @@ impl Root {
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
                 cx.stop_propagation();
             }))
+            // v1.9.43：**拦住工具栏区域的 mouseup**（与上面的 mousedown 对称）。
+            // 根容器在 `on_mouse_up` 里写死了 `this.more_menu = false`（见 1459
+            // 行附近），而「更多」钮是用 mousedown 开合菜单的——不拦 mouseup，
+            // 点一下「更多」会在同一次手势的抬起阶段把菜单又关掉，下拉开完即关、
+            // 根本选不了功能。拦下栏内的 mouseup，菜单就能稳稳钉在钮下方；点栏
+            // 之外的正文仍是「点外部即收」，不受影响。
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }))
             .with_animation(
                 SharedString::from(if shown {
                     "reading-bar-in"
@@ -10194,20 +10203,26 @@ impl Root {
         let vh = self.viewport_h;
 
         // 卡片宽度不超视口留边；正文字号 17px，每行字数按卡宽折。
-        let card_w = (vw - 40.0).clamp(220.0, 380.0);
-        let pad = 14.0;
+        // 注音浮签只是「一字一音」，无需那么宽——单独收窄、收紧内边距，
+        // 让小卡片更精致、不抢戏（v1.9.44）。
+        let is_ruby = zoom.pinyin.is_some();
+        let card_w = if is_ruby {
+            (vw - 40.0).clamp(170.0, 230.0)
+        } else {
+            (vw - 40.0).clamp(220.0, 380.0)
+        };
+        let pad = if is_ruby { 10.0 } else { 14.0 };
         let body_fs = 17.0;
         let line_h = body_fs * 1.75;
         let text_w = card_w - pad * 2.0;
         let per_line = ((text_w / body_fs).floor() as usize).max(8);
         let lines = wrap_lines(&zoom.text, per_line);
         // 注音浮签（`pinyin` 有值）：卡片内容换成「大字拼音 + 本字」，
-        // 高度按固定行算（39 拼音 + 36 本字 + 24 释义行）。
-        let is_ruby = zoom.pinyin.is_some();
-        let head_h = 20.0;
-        let foot_h = 16.0;
+        // 高度按固定行算（34 拼音 + 28 本字 + 20 释义行，比旧版更紧凑）。
+        let head_h = if is_ruby { 18.0 } else { 20.0 };
+        let foot_h = if is_ruby { 14.0 } else { 16.0 };
         let card_h = if is_ruby {
-            pad * 2.0 + head_h + 8.0 + 39.0 + 36.0 + 24.0 + foot_h
+            pad * 2.0 + head_h + 6.0 + 34.0 + 28.0 + 20.0 + foot_h
         } else {
             pad * 2.0 + head_h + 8.0 + lines.len() as f32 * line_h + 6.0 + foot_h
         };
@@ -10224,21 +10239,22 @@ impl Root {
         left = left.min((vw - card_w - 8.0).max(8.0));
         top = top.min((vh - card_h - 8.0).max(8.0));
 
-        // 关闭钮（v1.9.39 收小）：22 → 18，字 13 → 10.5。原来那枚跟「重录」
-        // 一般大，视觉上像第二个主钮，反而抢戏；小一号才像「角上的叉」。
+        // 关闭钮（v1.9.44 再收小）：18 → 14，字 10.5 → 11 且换成真正的「×」
+        // 叉形字符（U+00D7，基础 Latin-1，回退字体里不会零宽消失，比 ASCII X
+        // 更像一枚小叉）。它只是角上的一个轻轻的叉，绝不抢戏。
         let close = div()
             .id("note-zoom-close")
-            .w(px(18.0))
-            .h(px(18.0))
+            .w(px(14.0))
+            .h(px(14.0))
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(9.0))
-            .text_size(px(10.5))
-            .text_color(rgb(0xFFFFFFB0))
+            .rounded(px(7.0))
+            .text_size(px(11.0))
+            .text_color(rgb(0xFFFFFFA0))
             .cursor_pointer()
-            // v1.64.0：关闭一律 ASCII「X」（✕ U+2715 在回退字体里会零宽消失）。
-            .child(SharedString::from("X"))
+            // U+00D7 × 是真正的叉形（区别于字母 X）；基础字符集，字体覆盖可靠。
+            .child(SharedString::from("×"))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -10325,33 +10341,34 @@ impl Root {
 
         let mut body = div().flex().flex_col().gap(px(2.0));
         if is_ruby {
-            // 注音浮签：拼音 26px 大字 + 本字 22px + 释义行（横排，卡片里读横最清楚）。
+            // 注音浮签：拼音 22px 大字 + 本字 18px + 释义行（横排，卡片里读横最清楚）。
+            // 比旧版（26/22/12）更紧凑，单列小卡不抢戏（v1.9.44）。
             let py = zoom.pinyin.clone().unwrap_or_default();
             body = body
                 .child(
                     div()
-                        .h(px(39.0))
+                        .h(px(34.0))
                         .flex()
                         .items_center()
-                        .text_size(px(26.0))
+                        .text_size(px(22.0))
                         .text_color(rgb(0xFFFFFFFF))
                         .child(SharedString::from(py)),
                 )
                 .child(
                     div()
-                        .h(px(36.0))
+                        .h(px(28.0))
                         .flex()
                         .items_center()
-                        .text_size(px(22.0))
+                        .text_size(px(18.0))
                         .text_color(rgb(0xFFFFFFB0))
                         .child(SharedString::from(zoom.text.clone())),
                 )
                 .child(
                     div()
-                        .h(px(24.0))
+                        .h(px(20.0))
                         .flex()
                         .items_center()
-                        .text_size(px(12.0))
+                        .text_size(px(11.0))
                         .text_color(rgb(0xFFFFFF90))
                         .child(SharedString::from("生僻字 · 竖排注音")),
                 );
@@ -12203,123 +12220,109 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
     /// 摆着一条「怎么听」。现在它跟着「听」一起来：开读那一刻浮出这张小卡，
     /// 读什么、多快、停不停都在这里，收起来就散，不占常驻界面。
     ///
-    /// **不做居中大弹窗**：听书是边听边看的事，卡片压住半页正文就没法读了。
+    /// **贴底单行胶囊（v1.9.43）**：从竖向卡片压成一行极简胶囊——`聽 · 倍速
+    /// 数字 · 再讀 · 停 ×`，高度从 ~90px 砍到 ~30px，正文区让位也跟着从 96
+    /// 降到 60。倍速直接以数字呈现（0.8 / 1.0 / 1.25），选中态用朱砂 + 细下划线。
     fn render_tts_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let song = crate::fonts::family_for(FontChoice::SongTi, self.script);
         // 宣纸毛玻璃近似（v1.9.42）：GPUI 0.2.2 没有 `backdrop-filter`，做不出
-        // 真·磨砂；改用「高透宣纸底 + 细边 + 柔影」来模拟——底色用纸色掺到
-        // ~0.93 alpha，像一张半透明的宣纸笺浮在纸面上，既遮得住底层、又融得进
-        // 古籍氛围，绝不冒出「现代系统控件」的口音。
+        // 真·磨砂；改用「高透宣纸底 + 细边 + 柔影」来模拟，融进古籍氛围。
         let veil = ((t.paper() & 0xFFFFFF) << 8) | 0xEE;
         let hair = ((t.rule() & 0xFFFFFF) << 8) | 0x3C;
-        let head = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .child(
+        let zhu = sheet_zhu(t);
+
+        // 倍速三档——直接以数字表示（v1.9.43）。选中态：朱砂字 + 下方 1.5px 朱细线。
+        let mut speed = div().flex().flex_row().items_center().gap(px(9.0));
+        for (label, want) in [("0.8", 0.8f32), ("1.0", 1.0f32), ("1.25", 1.25f32)] {
+            let on = (self.tts_rate - want).abs() < 1e-3;
+            // 选中档：数字下方压一条朱砂细线；未选：只是极淡墨数字。
+            let inner = if on {
                 div()
                     .flex()
-                    .flex_row()
+                    .flex_col()
                     .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(t.ink()))
-                            .child(SharedString::from("聽書")),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(t.ink_soft()))
-                            .child(SharedString::from(if self.tts_scope.is_empty() {
-                                "正在朗讀本葉".to_string()
-                            } else {
-                                format!("正在朗讀：{}", self.tts_scope)
-                            })),
+                    .gap(px(2.0))
+                    .child(SharedString::from(label))
+                    .child(div().w(px(12.0)).h(px(1.5)).bg(rgb(zhu)))
+            } else {
+                div().child(SharedString::from(label))
+            };
+            speed = speed.child(
+                div()
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .text_color(rgb(if on { zhu } else { t.ink_soft() }))
+                    .child(inner)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.set_tts_rate(want);
+                            cx.notify();
+                        }),
                     ),
-            )
-            // 收卡片＝停读：听书卡是「正在出声」的控制器，收起来就该安静。
-            // 走 `set_tts_active(false)` —— 关条同时把正文区让出的高度收回、
-            // 并重排保住阅读位置（否则关条纸面长回会跳一下）。
-            .child(panel_close(t).on_mouse_down(
+            );
+        }
+
+        // 小字按钮（再讀 / 停）：极淡墨、hover 转朱。
+        let action = |label: &str, z: u32| {
+            div()
+                .cursor_pointer()
+                .text_size(px(11.5))
+                .text_color(rgb(t.ink_soft()))
+                .hover(|s| s.text_color(rgb(z)))
+                .child(SharedString::from(label.to_string()))
+        };
+
+        let mut row = div().flex().flex_row().items_center().gap(px(12.0));
+        // 聽：当次朗读范围（有选区读选区、否则读整叶），极淡提示，省竖向空间。
+        row = row.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(t.ink()))
+                .child(SharedString::from(if self.tts_scope.is_empty() {
+                    "聽".to_string()
+                } else {
+                    format!("聽·{}", self.tts_scope)
+                })),
+        );
+        row = row.child(speed);
+        // 分隔细线，把「设置」与「操作」两簇分开。
+        row = row.child(div().w(px(1.0)).h(px(13.0)).bg(rgba(hair)));
+        row = row.child(
+            action("再讀", zhu).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.speak_current_leaf();
+                    cx.notify();
+                }),
+            ),
+        );
+        row = row.child(
+            action("停", zhu).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
                     this.set_tts_active(false, cx);
                 }),
-            ));
+            ),
+        );
+        // 收卡片＝停读：听书卡是「正在出声」的控制器，收起来就该安静。
+        row = row.child(
+            panel_close(t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.set_tts_active(false, cx);
+                }),
+            ),
+        );
 
-        // 語速三档，选中态与版字面板同款（极淡朱底 + 通宽朱线）。
-        let mut speed = div().flex().flex_row().items_start().gap(px(18.0));
-        for (label, want) in [("慢 0.8×", 0.8f32), ("常 1.0×", 1.0f32), ("快 1.25×", 1.25f32)] {
-            speed = speed.child(
-                ink_option(label, (self.tts_rate - want).abs() < 1e-3, t).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.set_tts_rate(want);
-                        cx.notify();
-                    }),
-                ),
-            );
-        }
-
-        let body = div()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .child(style_row("速", speed, t))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(16.0))
-                    .child(
-                        div()
-                            .cursor_pointer()
-                            .text_size(px(11.0))
-                            .text_color(rgb(t.ink_soft()))
-                            .hover(|s| s.text_color(rgb(sheet_zhu(t))))
-                            .child(SharedString::from("再讀一遍"))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.speak_current_leaf();
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .cursor_pointer()
-                            .text_size(px(11.0))
-                            .text_color(rgb(t.ink_soft()))
-                            .hover(|s| s.text_color(rgb(sheet_zhu(t))))
-                            .child(SharedString::from("停"))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.set_tts_active(false, cx);
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(9.5))
-                            .text_color(rgb(t.ink_soft()))
-                            .child(SharedString::from("語速只記這一次開機，重啟回常速")),
-                    ),
-            );
-
-        // ★ 贴底悬浮胶囊（v1.9.42）：从居中卡片改为**钉在屏幕最底端**的极简
-        // 胶囊——底部留 8px 安全边，正文区已在 `fit_sizes` 里为它让出 88px，
-        // 纸面整体顶上去，胶囊之下绝无一字被压。
+        // ★ 贴底悬浮胶囊（v1.9.42 起钉屏幕最底端）：单行、底部留 8px 安全边，
+        // 正文区已在 `fit_sizes` 里为它让出 60px，纸面整体顶上去，胶囊之下
+        // 绝无一字被压。
         div()
             .absolute()
             .left(px(0.0))
@@ -12334,18 +12337,18 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 div()
                     .id("tts-capsule")
                     .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .px(px(18.0))
-                    .py(px(9.0))
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.0))
+                    .px(px(16.0))
+                    .py(px(6.0))
                     .bg(rgba(veil))
                     .border_1()
                     .border_color(rgba(hair))
                     .rounded(px(20.0))
                     .shadow_lg()
                     .font_family(song)
-                    .child(head)
-                    .child(body),
+                    .child(row),
             )
     }
 

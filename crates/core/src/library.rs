@@ -118,13 +118,15 @@ impl ShelfEntry {
         }
     }
     /// 归入哪一页签：用户设了经史子集就用它，没设就按书名自动归，
-    /// 自定书单（任意非四部名）统一落到「自定」页签。
+    /// 自定书单（任意非四部名）统一落到「自定」页签。「丛」是和四部并列的
+    /// 一个正式分类（丛书 / 丛刊），用户可经「整理」归到它名下。
     pub fn cat_key(&self) -> &'static str {
         match self.category.as_str() {
             "经" => "经",
             "史" => "史",
             "子" => "子",
             "集" => "集",
+            "丛" => "丛",
             "" => auto_category(&self.title),
             _ => "自定",
         }
@@ -281,6 +283,10 @@ pub struct ReadDay {
     pub day: String,
     /// 当日读过的叶数（同一叶只算一次，去重在 `Root::count_leaf`）。
     pub leaves: usize,
+    /// 当日读过的字数（同一叶只算一次；标点不计，只数 `GlyphKind::Char`）。
+    /// 菜单栏「今日阅卷 X 字」用的就是它（v1.9.44）。
+    #[serde(default)]
+    pub chars: usize,
 }
 
 /// 读叶账留多少天：一年有余。够数「连续」，也够将来做「近来」的曲线；
@@ -528,17 +534,19 @@ impl Library {
     ///
     /// **只加不写库**：真的落盘交给同一条路上的 `touch()` / `save()`，
     /// 翻一叶就多一次 `fsync` 是绝不允许的。
-    pub fn bump_read(&mut self, day: &str, leaves: usize) {
-        if leaves == 0 || day_epoch(day).is_none() {
+    pub fn bump_read(&mut self, day: &str, leaves: usize, chars: usize) {
+        if (leaves == 0 && chars == 0) || day_epoch(day).is_none() {
             return;
         }
         if let Some(r) = self.read_days.iter_mut().find(|r| r.day == day) {
             r.leaves = r.leaves.saturating_add(leaves);
+            r.chars = r.chars.saturating_add(chars);
             return;
         }
         self.read_days.push(ReadDay {
             day: day.to_string(),
             leaves,
+            chars,
         });
         // 按日期升序（新的一天追加在末尾是常态，这里只在跨日 / 系统时间倒拨
         // 之后才真的动一次），再削掉最老的。
@@ -556,6 +564,15 @@ impl Library {
             .iter()
             .find(|r| r.day == day)
             .map(|r| r.leaves)
+            .unwrap_or(0)
+    }
+
+    /// 某一天读了几字（标点不计，`0` = 那天没读 / 没记账）。
+    pub fn chars_on(&self, day: &str) -> usize {
+        self.read_days
+            .iter()
+            .find(|r| r.day == day)
+            .map(|r| r.chars)
             .unwrap_or(0)
     }
 
@@ -1134,17 +1151,17 @@ pub(crate) mod tests {
     #[test]
     fn read_log_buckets_by_day_and_survives_a_round_trip() {
         let mut lib = Library::default();
-        lib.bump_read("2026-11-02", 3);
-        lib.bump_read("2026-11-02", 5);
-        lib.bump_read("2026-11-01", 40);
+        lib.bump_read("2026-11-02", 3, 0);
+        lib.bump_read("2026-11-02", 5, 0);
+        lib.bump_read("2026-11-01", 40, 0);
         assert_eq!(lib.read_on("2026-11-02"), 8, "同日累加");
         assert_eq!(lib.read_on("2026-11-01"), 40, "他日分桶");
         assert_eq!(lib.read_on("2026-10-31"), 0, "没读就是 0");
         // 0 叶不建桶（否则「从没读过」也会留一行空账）。
-        lib.bump_read("2026-10-31", 0);
+        lib.bump_read("2026-10-31", 0, 0);
         assert!(lib.read_days.iter().all(|r| r.day != "2026-10-31"));
         // 坏日期键不收。
-        lib.bump_read("2026-02-30 上午", 9);
+        lib.bump_read("2026-02-30 上午", 9, 0);
         assert_eq!(lib.read_days.len(), 2);
         // 落档再读回来，账本一字不差。
         let json = serde_json::to_string(&lib).unwrap();
@@ -1168,11 +1185,11 @@ pub(crate) mod tests {
             ("2026-10-31", 9),
             ("2026-11-01", 12),
         ] {
-            lib.bump_read(d, n);
+            lib.bump_read(d, n, 0);
         }
         // 今天（11-02）还没读：连的是 10-31、11-01 两天。
         assert_eq!(lib.streak("2026-11-02"), 2);
-        lib.bump_read("2026-11-02", 1);
+        lib.bump_read("2026-11-02", 1, 0);
         assert_eq!(lib.streak("2026-11-02"), 3, "今日一读就接上");
         // 隔天没读，再往后就连不上了。
         assert_eq!(lib.streak("2026-11-03"), 3, "今天没读仍从昨天数");
@@ -1185,12 +1202,38 @@ pub(crate) mod tests {
         let mut lib = Library::default();
         let base = day_epoch("2026-01-01").unwrap();
         for i in 0..(READ_DAYS_KEEP + 20) {
-            lib.bump_read(&day_key_of(base + i as i64), 1);
+            lib.bump_read(&day_key_of(base + i as i64), 1, 0);
         }
         assert_eq!(lib.read_days.len(), READ_DAYS_KEEP);
         // 削的是最老的，最新那天一定还在。
         let last = day_key_of(base + (READ_DAYS_KEEP + 19) as i64);
         assert_eq!(lib.read_on(&last), 1);
         assert!(lib.read_days.windows(2).all(|w| w[0].day < w[1].day), "按日期升序");
+    }
+
+    /// 字数账（v1.9.44）：同日累加字数、他日分桶，且 `chars_on` 能读回来。
+    /// 菜单栏「今日阅卷 X 字」用的就是它。
+    #[test]
+    fn read_chars_accumulate_by_day() {
+        let mut lib = Library::default();
+        lib.bump_read("2026-11-02", 1, 120);
+        lib.bump_read("2026-11-02", 1, 80);
+        lib.bump_read("2026-11-01", 1, 500);
+        // 同日：叶 +1+1 = 2，字 120+80 = 200。
+        assert_eq!(lib.read_on("2026-11-02"), 2);
+        assert_eq!(lib.chars_on("2026-11-02"), 200, "同日字数累加");
+        // 他日分桶。
+        assert_eq!(lib.chars_on("2026-11-01"), 500);
+        assert_eq!(lib.chars_on("2026-10-31"), 0, "没读就是 0");
+        // 落档再读回来，字数不丢。
+        let json = serde_json::to_string(&lib).unwrap();
+        let back: Library = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.chars_on("2026-11-02"), 200);
+        assert_eq!(back.chars_on("2026-11-01"), 500);
+        // 老存档（ReadDay 没有 chars 字段）也能读，缺省为 0，不炸。
+        let old: Library =
+            serde_json::from_str(r#"{"books":[],"read_days":[{"day":"2026-11-02","leaves":3}]}"#)
+                .unwrap();
+        assert_eq!(old.chars_on("2026-11-02"), 0, "缺省 chars = 0");
     }
 }

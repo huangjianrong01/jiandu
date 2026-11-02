@@ -1059,24 +1059,43 @@ impl Root {
             )
     }
 
-    /// 分类页签（v1.49.4 全新）：**胶囊**——全部 / 经 / 史 / 子 / 集。
+    /// 分类页签（v1.49.4 全新）：**胶囊**——全部 / 经 / 史 / 子 / 集 / 丛。
     ///
-    /// 选中：朱砂实底 + 白字；未选：只有一圈淡墨细边。不再挂本数，
-    /// 也不再有下划线 tab 那套现代后台的做派。
+    /// 选中：朱砂实底 + 白字；未选：只有一圈淡墨细边。每枚页签挂上该分类的
+    /// 本数（书籍统计，受当前搜索词约束，与点击后看到的数量一致）。「丛」是与
+    /// 四部并列的正式分类（丛书 / 丛刊），用户可经「整理」归到它名下。
     fn render_shelf_tabs(&mut self, cx: &mut Context<Self>) -> Div {
         let cur = self.shelf_cat.clone();
         let song = crate::fonts::family_for(
             crate::types::FontChoice::SongTi,
             crate::types::Script::Ancient,
         );
+        // 各分类本数（受当前搜索词约束，与点击后看到的数量一致）。
+        let q = self.shelf_query.trim().to_lowercase();
+        let mut counts: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
+        let mut total = 0usize;
+        for e in &self.library.books {
+            let hit = q.is_empty()
+                || e.title.to_lowercase().contains(&q)
+                || e.author.to_lowercase().contains(&q)
+                || e.annotator.to_lowercase().contains(&q);
+            if !hit {
+                continue;
+            }
+            total += 1;
+            *counts.entry(e.cat_key()).or_insert(0) += 1;
+        }
+        // v1.9.43：在「集」之后新增「丛」分类，与四部并列组成书籍统计。
+        let tabs = [
+            ("全部", total),
+            ("经", *counts.get("经").unwrap_or(&0)),
+            ("史", *counts.get("史").unwrap_or(&0)),
+            ("子", *counts.get("子").unwrap_or(&0)),
+            ("集", *counts.get("集").unwrap_or(&0)),
+            ("丛", *counts.get("丛").unwrap_or(&0)),
+        ];
         let mut row = div().flex().flex_row().items_center().gap(px(10.0));
-        for (key, label) in [
-            ("全部", "全部"),
-            ("经", "经"),
-            ("史", "史"),
-            ("子", "子"),
-            ("集", "集"),
-        ] {
+        for (key, n) in tabs {
             let selected = match (&cur, key) {
                 (None, "全部") => true,
                 (Some(c), _) => c == key,
@@ -1094,7 +1113,21 @@ impl Root {
                 .font_family(song.clone())
                 .text_size(px(12.0))
                 .text_color(rgb(if selected { 0xFFFFFF } else { INK_SOFT }))
-                .child(SharedString::from(label))
+                // 页签名 + 该分类本数（统计）。
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(SharedString::from(key))
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(rgb(if selected { 0xFFFFFF } else { INK_FAINT }))
+                                .child(SharedString::from(n.to_string())),
+                        ),
+                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {

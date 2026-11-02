@@ -7,6 +7,7 @@ use crate::collation::{AppMode, CollationWorkspace};
 use crate::fonts;
 use crate::grid::{GridConfig, GridDir, LayoutConfig};
 use crate::library::{Bookmark, Library};
+use crate::menubar::{MenuData, MenuIntent};
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
     Book, Duplex, FontChoice, FontPreset, Glyph, GlyphHit, GlyphKey, GlyphKind,
@@ -326,6 +327,8 @@ pub struct Root {
     /// 结果**，由 [`Root::refresh_read_stats`] 在「进书架 / 翻一叶 / 隔一会儿」
     /// 三个时机刷新（见 `shelf::render_shelf_top`）。
     pub read_today: usize,
+    /// 今日读过的字数（标点不计，只数 `GlyphKind::Char`）。菜单栏「今日阅卷 X 字」用。
+    pub read_chars_today: usize,
     /// 连续阅读天数（含今日；今日未读则从昨日往前数）。
     pub read_streak: usize,
     /// 今天已经数过叶的 `(书序号, 叶序号)`。
@@ -1318,6 +1321,7 @@ impl Root {
             library,
             // 今日读叶账（v1.9.38）：开局先按账本算一遍，书架第一帧就有数。
             read_today: 0,
+            read_chars_today: 0,
             read_streak: 0,
             read_seen: std::collections::HashSet::new(),
             read_day: String::new(),
@@ -2461,7 +2465,9 @@ impl Root {
         // 让出一段高度把纸面上移——这是「绝不让控制条压住任何一行字」的唯一
         // 可靠机制：纸高由 `content_h` 决定，给它减掉胶囊占位，纸就整体缩
         // 短并顶对齐到顶部，底部自然空出整条胶囊的空间。关闭听书时回到原高。
-        let tts_reserve = if self.show_tts { 96.0 } else { 0.0 };
+        // 听书条（v1.9.43 起为单行胶囊，高约 30px）：正文区底部让出 60px，
+        // 纸面整体顶上去，胶囊之下绝无一字被压（纸高由 content_h 决定，机制可靠）。
+        let tts_reserve = if self.show_tts { 60.0 } else { 0.0 };
         let v_reserve = if self.focus_mode { tts_reserve } else { 70.0 + tts_reserve };
         // 版字面板为浮层（可盖住正文下部），不为它预留高度，正文始终铺满。
         let content_h = (self.viewport_h - v_reserve).max(220.0);
@@ -3359,8 +3365,15 @@ impl Root {
         if self.read_seen.len() < 20_000 && !self.read_seen.insert(key) {
             return;
         }
-        self.library.bump_read(&self.read_day, 1);
+        // 这一叶实际读了多少字（标点不计）：从当前章缓存里数，翻页时近乎零成本。
+        let chars = self
+            .pager
+            .as_mut()
+            .and_then(|p| self.book.as_mut().map(|b| p.leaf_char_count(b, page)))
+            .unwrap_or(0);
+        self.library.bump_read(&self.read_day, 1, chars);
         self.read_today = self.library.read_on(&self.read_day);
+        self.read_chars_today = self.library.chars_on(&self.read_day);
         self.read_streak = self.library.streak(&self.read_day);
     }
 
@@ -3372,6 +3385,7 @@ impl Root {
             self.read_seen.clear();
         }
         self.read_today = self.library.read_on(&self.read_day);
+        self.read_chars_today = self.library.chars_on(&self.read_day);
         self.read_streak = self.library.streak(&self.read_day);
         self.read_stats_at = Some(std::time::Instant::now());
     }
@@ -3500,6 +3514,71 @@ impl Root {
             _ => return,
         }
         cx.notify();
+    }
+
+    /// **菜单栏意图**（v1.9.44）：消费 macOS 状态栏菜单点出来的意图。
+    ///
+    /// AppKit 的菜单回调跑在 ObjC 调用栈上，按纪律**绝不直碰 GPUI 实体**——
+    /// 只把意图塞进队列（见 [`crate::menubar`]），这里在主线程每帧取空、执行。
+    /// 顺带把菜单需要的「今日字数 / 最近打开」刷进共享区，供下次开菜单时读。
+    pub fn poll_menu_intents(&mut self, cx: &mut Context<Self>) {
+        // 把「今日字数 / 最近打开」刷进菜单栏共享区（菜单在 AppKit 侧构建）。
+        crate::menubar::refresh_menu_data(MenuData {
+            today_chars: self.read_chars_today,
+            recents: self
+                .library
+                .books
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.last_read > 0)
+                .map(|(i, e)| (e.title.clone(), i))
+                .collect(),
+        });
+
+        let intents = crate::menubar::take_intents();
+        if intents.is_empty() {
+            return;
+        }
+        for intent in intents {
+            match intent {
+                MenuIntent::OpenShelf => {
+                    self.ensure_window(cx);
+                    self.screen = Screen::Shelf;
+                }
+                MenuIntent::Collation => {
+                    self.ensure_window(cx);
+                    self.mode = AppMode::Collation;
+                }
+                MenuIntent::OpenRecent(idx) => {
+                    self.ensure_window(cx);
+                    self.open_book(idx);
+                }
+                MenuIntent::CheckUpdate => {
+                    self.ensure_window(cx);
+                    self.notice =
+                        format!("笺读已是最新版本 v{}", env!("CARGO_PKG_VERSION"));
+                }
+                MenuIntent::Quit => {
+                    cx.shutdown();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// **保证主窗口可见并置顶**（v1.9.44）：菜单项唤起主窗口时的核心体验。
+    ///
+    /// 窗口被红叉关掉后进程仍在跑（gpui 不自动退出），此时要**重建**窗口；
+    /// 窗口还在就直接 `activate(true)` 把它顶到最前。
+    fn ensure_window(&mut self, cx: &mut Context<Self>) {
+        if cx.windows().is_empty() {
+            let root = cx.entity();
+            let bounds = crate::default_window_bounds(cx);
+            let _ = cx.open_window(crate::zen_window_options(bounds), move |_window, _cx| {
+                root.clone()
+            });
+        }
+        cx.activate(true);
     }
 
     /// **批量导入**（v1.77.0）：一次喂进一批文件，后台**串行**刻印。
@@ -7453,6 +7532,8 @@ impl Render for Root {
         // 之后每帧只是一次原子读 + 一次取空队列。
         crate::dropzone::arm_once();
         self.poll_dropped(cx);
+        // v1.9.44：菜单栏意图（唤起工作台 / 书架 / 最近打开 / 退出）。每帧取空队列。
+        self.poll_menu_intents(cx);
         // v1.77.0：每帧探一眼批量导入（点检 / 上架 / 收工）与后台建索引。
         self.poll_batch(cx);
         self.poll_fts();
@@ -7498,11 +7579,10 @@ impl Render for Root {
         // 被它整块盖住（第一版就是这样，印根本看不见）。印章只在左下角
         // 一小块，压不到居中的浮层。
         root = root.child(screen);
-        // 笺校工作台入口：**只在书架显示**（用户 2026-11-01 定）。
+        // 笺校工作台入口：**只在书架显示**（用户 2026-11-01 定，2026-11-02 再确认）。
         //
-        // 原来阅读屏也挂了一枚，两处入口做同一件事，纯属重复；而且阅读屏右下
-        // 那枚正好压在正文/藏书印旁边，读着书突然冒出一个悬浮钮，很碍事。
-        // 书架是「选书 + 导入 + 进工具」的那一屏，入口放这里就够了。
+        // 阅读屏不挂——右下那枚正好压在正文/藏书印旁边，读着书突然冒出一个悬浮钮，
+        // 很碍事；书架是「选书 + 导入 + 进工具」的那一屏，入口放这里就够了。
         // 专注模式仍然不显示。
         if self.screen == Screen::Shelf && !self.focus_mode {
             root = root.child(self.render_collation_entry(cx));
