@@ -115,6 +115,23 @@ pub fn punctuation_f1(gold: &[PunctSpan], pred: &[PunctSpan], by_type: bool) -> 
     }
 }
 
+/// 提取「位置对齐但类型不同」的标点错配：`(gold_kind, pred_kind)` 列表。
+///
+/// `classicize` 是逐字符变换，标点序列保序；故按下标对齐，只在 `after` 相同、
+/// `kind` 不同时记为一次类型差。这能如实反映「合法归一化」（如半角 `(`→全角
+/// `（`），而不会把同一位置上的多枚标点（如 `。」`）因排序错位配成假错配。
+/// 数量不一致（有增删）时退化为仅比对能对齐的前 N 个，增删本身交给 [`punctuation_f1`]。
+pub fn punct_type_mismatches(gold: &[PunctSpan], pred: &[PunctSpan]) -> Vec<(char, char)> {
+    let n = gold.len().min(pred.len());
+    let mut out = Vec::new();
+    for i in 0..n {
+        if gold[i].after == pred[i].after && gold[i].kind != pred[i].kind {
+            out.push((gold[i].kind, pred[i].kind));
+        }
+    }
+    out
+}
+
 /// 文本字符保真度。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextFidelity {
@@ -314,6 +331,37 @@ mod tests {
         assert_eq!(f.pred_chars, 5);
         assert_eq!(f.lcs, 5);
         assert!((f.preservation - 5.0 / 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn type_mismatch_uses_index_alignment_not_kind_sort() {
+        // 同一位置叠两枚标点：`。` + 半角 `(`（异文注 `。(顰 一作：蹙)`）。
+        // classicize 只把 `(` 全角化 → `（`，`。` 不动。下标对齐后唯一类型差应是
+        // `(`→`（`；绝不允许把 `。` 错配成 `（`、把 `(` 错配成 `。`（旧排序实现的假错配）。
+        let gold = extract_puncts("歸不歸。(顰 一作：蹙)");
+        let pred = extract_puncts("歸不歸。(顰 一作：蹙)"); // 占位；下面手动改 pred 的 kind
+        // 模拟 classicize：把半角 `(`(U+0028) 改成全角 `（`(U+FF08)。
+        let mut pred = pred.clone();
+        for s in pred.iter_mut() {
+            if s.kind == '(' {
+                s.kind = '（';
+            }
+        }
+        let mism = punct_type_mismatches(&gold, &pred);
+        assert_eq!(mism, vec![('(', '（')], "只应有半角→全角一种类型差");
+    }
+
+    #[test]
+    fn type_mismatch_ignores_pure_fullwidth_normalization() {
+        // 全部是合法归一化时，错配应恰好是四种半角→全角，不应有假错配。
+        let gold = extract_puncts("山(高)水,長!");
+        let pred_spans = extract_puncts("山（高）水，長！");
+        let mism = punct_type_mismatches(&gold, &pred_spans);
+        assert_eq!(mism.len(), 4, "四枚半角标点全角化，四种类型差");
+        assert!(mism.contains(&('(', '（')));
+        assert!(mism.contains(&(')', '）')));
+        assert!(mism.contains(&(',', '，')));
+        assert!(mism.contains(&('!', '！')));
     }
 
     #[test]

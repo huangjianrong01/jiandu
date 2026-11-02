@@ -8,7 +8,7 @@ use crate::score::PunctSpan;
 use serde::{Deserialize, Serialize};
 
 /// 单条金标用例。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GoldCase {
     pub id: String,
     /// 原文（带标准标点）。若未显式给 `puncts`，评测时用 [`crate::score::extract_puncts`] 从它抽。
@@ -41,7 +41,7 @@ impl GoldCase {
 }
 
 /// 引擎/管线的一次输出，与金标按 `id` 对齐。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Prediction {
     pub id: String,
     /// 引擎输出的正文（用于文本保真比对）。

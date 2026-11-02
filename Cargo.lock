@@ -2977,6 +2977,7 @@ name = "jiandu-eval"
 version = "1.9.44"
 dependencies = [
  "anyhow",
+ "jiandu-core",
  "serde",
  "serde_json",
 ]

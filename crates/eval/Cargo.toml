@@ -10,3 +10,6 @@ description = "笺读 · 评测台：标点保真 F1 / 注音正确率 / 文本�
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# 真实集成：直接跑 jiandu_core 的清洗链（classicize）当预测，
+# 把打包书目当金标——既验真实代码，又当回归守卫（哪天清洗开始吞标点，F1 立刻掉）。
+jiandu-core = { path = "../core" }
