@@ -10054,8 +10054,8 @@ impl Root {
         let item_h = fs * 2.5; // 两字一钮（竖排）
         let gap = 8.0; // 钮间距
         // v1.95.0（feature/tts-voice 极简重构）：**克制**——
-        //   外露 5 枚主钮：查典 / 听 / 朱批 / 问笺 / 更多（「更多」展开二级菜单）；
-        //   低频 4 枚（存卡 / 眉批 / 夹注 / 拓印）收进二级菜单，绝不堆满一排挡字。
+        //   外露 7 枚主钮：查典 / 朱批 / 问笺 / 夹注 / 眉批 / 拓印（另「听」已
+        //   独立为贴底胶囊，不放进划词工具条，避免与底部控件重复）。
         // 左右内边距放宽到 10，让最左（查典）/ 最右（更多）两枚与朱框之间留出
         // 均匀呼吸；外框宽度**不再写死 n**，改由下方「实际按钮数」反算（GPUI 无
         // fit-content，这是它的等价物）——按钮增减时红框永远死死包裹、绝不露字。
@@ -10080,9 +10080,9 @@ impl Root {
         // v1.9.12：统一为**单级**工具栏——七枚动作平铺一排、一步到位（不再有
         // 「更多」二级菜单）；红框宽由 `items.len()` 反算，按钮增减不露字。
         // （「连读」已并入「听」；存卡走选区长按，不占这排位。）
+        // 「听」已独立为贴底胶囊（见 render_tts_sheet），划词工具条不再放听钮，
+        // 避免与底部控件功能重复。
         push_btn("查典", &mut items);
-        push_btn("听", &mut items);
-        // 「连读」已并入「听」：无选区读整叶、有选区读选区，不再单列（见听钮）。
         push_btn("朱批", &mut items);
         push_btn("问笺", &mut items);
         push_btn("夹注", &mut items);
@@ -10120,7 +10120,7 @@ impl Root {
             .map(|n| n.text.clone())
             .unwrap_or_default();
 
-        // ── 逐枚绑上动作（与上面 push 的次序一一对应：查典 / 听 / 朱批 / 问笺 / 夹注 / 眉批 / 拓印）──
+        // ── 逐枚绑上动作（与上面 push 的次序一一对应：查典 / 朱批 / 问笺 / 夹注 / 眉批 / 拓印）──
         let mut items = items.into_iter();
         let b_query = items
             .next()
@@ -10152,20 +10152,7 @@ impl Root {
                     cx.notify();
                 }),
             );
-        // 听（feature/tts-voice MVP）：把选中的这句交给系统语音合成朗读。
-        // 放在「查典」之后最顺手的位置——划词后先查再听是最高频组合。
-        // 听：无选区读整叶、有选区读选区（原「连读」已并入此处）。
-        let b_ting = items.next().unwrap().on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                // v1.9.42：**点「听」= 开聽書卡**。开条会改变正文区可用高，
-                // 保位交给 `set_tts_active`；卡上自带语速与「停」。
-                this.set_tts_active(true, cx);
-                this.more_open = false;
-                this.popup = None;
-            }),
-        );
+        // 「听」已从划词工具条移除（独立为贴底胶囊），此处不再绑定听钮动作。
         let b_note = items.next().unwrap().on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
@@ -10239,7 +10226,7 @@ impl Root {
             .justify_center()
             .gap(px(gap))
             .child(b_query);
-        for b in [b_ting, b_note, b_ask, b_gloss, b_margin, b_copy] {
+        for b in [b_note, b_ask, b_gloss, b_margin, b_copy] {
             row = row.child(b);
         }
 
