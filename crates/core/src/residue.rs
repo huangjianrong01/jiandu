@@ -851,7 +851,10 @@ fn is_section_mark(c: char) -> bool {
 /// 删对了没人夸，删错了就是把书改残——所以汉字走**归并**（见
 /// [`strip_orphan_lines`]），只搬不改，一个字都不丢。
 fn is_orphan_marker(c: char) -> bool {
-    is_section_mark(c) || c == '〇'
+    // 注意：`〇` 不在这里，它归 [`is_ghost_char`] 走白名单——虽然它拼不成
+    // 任何词、结果一样是删，但让所有「汉字形的残渣」走同一条判据，将来加
+    // 词表才不会漏掉一条路径。
+    is_section_mark(c)
 }
 
 /// **已被真机确认的幽灵字**：`国` `國` `一` `〇`。
@@ -881,28 +884,54 @@ fn is_ghost_char(c: char) -> bool {
 /// `国时长老须菩提` / `一善哉、善哉` 正是这么来的：不是正文里多了一个字，
 /// 是多了一列。
 ///
-/// 两条处置，界线分明：
+/// 两条处置，界线分明（v1.9.29 起删字前**必须过词表**）：
 ///
 /// | 这一列是什么 | 怎么办 | 为什么 |
 /// |---|---|---|
-/// | 分节圈点 / `〇` | **整行删** | 排版符号，删掉不损失文字 |
-/// | `国` `國` `一`（[`is_ghost_char`]） | **整行删** | 实测确认的版心残渣（叶码 / 函次），从不作正文 |
-/// | 其余单个汉字 | **并到下一行行首** | 它可能真是字（断列残渣），只能搬不能扔 |
+/// | 分节圈点 `○ ● ◎ …` | **整行删** | 纯排版符号，删掉不损失文字 |
+/// | `国` `國` `一` `〇`（[`is_ghost_char`]） | 拼得上词 → **归并**；拼不上 → **删** | 版心残渣，但 `一时` `国风` 是真词 |
+/// | 其余单个汉字 | **并到下一行行首** | 可能是断列打散的真字，只能搬不能扔 |
+///
+/// # 白名单为什么是必需的（v1.9.29，用户当场叫停）
+///
+/// 只按「单字 + 不像话」删是拿刀切书：文言单字成句不少见（`之` `乎`
+/// `者` `也`），《金刚经》的 `希有`、人名、官职名更是一个都不能少。故删
+/// 之前先做一次拼词：把孤字与**下一行首字**拼成双字词，去
+/// [`crate::lexicon`] 查——拼得上（`希`+`有`、`一`+`时`、`国`+`风`）就
+/// 判定它是真字，归并进下一行；拼不上才删（`国`+`时`、`一`+`善`）。
 ///
 /// 末行落单时并到**上一行行尾**——宁可让它贴在段末，也不许凭空消失。
 ///
 /// 一行都没有的短样本（< 3 行）整段放过：单行文档里那个字就是全文。
 pub fn strip_orphan_lines(s: &str) -> Option<String> {
-    let mut lines: Vec<&str> = s.split('\n').collect();
+    let lines: Vec<&str> = s.split('\n').collect();
     // 少于三行：没有「夹在正文中间的一列」这回事，一个字节都不动。
     if lines.len() < 3 {
         return None;
     }
+    // 下一行的「首字」：跳过空行与行首圈点。词表判据要用。
+    let next_head = |from: usize| -> Option<char> {
+        for line in lines.iter().skip(from + 1) {
+            let mut b = line.trim();
+            while let Some(c) = b.chars().next() {
+                if is_section_mark(c) {
+                    b = &b[c.len_utf8()..];
+                } else {
+                    break;
+                }
+            }
+            let b = b.trim_start();
+            if let Some(c) = b.chars().next() {
+                return Some(c);
+            }
+        }
+        None
+    };
     let mut hit = false;
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     // 待并进下一行的那个孤字。
     let mut carry: Option<char> = None;
-    for line in lines.drain(..) {
+    for (idx, line) in lines.iter().enumerate() {
         let t = line.trim();
         // 「原本就是空行」与「剥完圈点变空」是两件不同的事，必须先分开：
         // 前者是段落边界，后者是一行纯版心符号（整行该删）。
@@ -938,12 +967,21 @@ pub fn strip_orphan_lines(s: &str) -> Option<String> {
         // 只剩一枚字 → 孤列。
         if n == 1 {
             let c = body.chars().next().unwrap();
-            if is_orphan_marker(c) || is_ghost_char(c) {
-                hit = true; // 版心残渣 / 已确认的幽灵字：整行删
+            if is_orphan_marker(c) {
+                hit = true; // 纯排版符号：整行删
                 continue;
             }
+            if is_ghost_char(c) {
+                // **白名单一票否决**：拼得上词就说明它是真字（希有 / 一时 /
+                // 国风），只能归并，不许删。
+                let is_word = next_head(idx).map(|d| crate::lexicon::is_word2(c, d));
+                if is_word != Some(true) {
+                    hit = true; // 拼不成词（国+时、一+善）→ 版心残渣，删
+                    continue;
+                }
+            }
             if is_han(c) || c == '□' || c == '■' {
-                // 其余汉字 / 缺字框：搬到下一行去（可能是断列打散的真字，
+                // 汉字 / 缺字框：搬到下一行去（可能是断列打散的真字，
                 // 只能搬不能扔）。已有待并字则先落地，绝不吞字。
                 if let Some(prev) = carry.take() {
                     hit = true;
@@ -1035,69 +1073,98 @@ pub fn normalize_quotes(s: &str) -> Option<String> {
     let near_han = |i: usize| -> bool {
         (i > 0 && cn(cs[i - 1])) || (i + 1 < cs.len() && cn(cs[i + 1]))
     };
-    let mut out = String::with_capacity(s.len());
-    // 栈里放「期望的闭号」：`」` 或 `』`。
-    let mut stack: Vec<char> = Vec::new();
+    let mut lines_out: Vec<String> = Vec::new();
+    let mut cur: Vec<char> = Vec::new();
+    // 栈里放「(开号在 cur 里的下标, 期望的闭号)」：行末要回填降级用。
+    let mut opens: Vec<(usize, char)> = Vec::new();
     let mut hit = false;
     for (i, &c) in cs.iter().enumerate() {
         match c {
             '“' => {
-                out.push('「');
-                stack.push('」');
+                cur.push('「');
+                opens.push((cur.len() - 1, '」'));
                 hit = true;
             }
             '”' => {
-                if stack.last() == Some(&'」') {
-                    stack.pop();
+                if opens.last().map(|o| o.1) == Some('」') {
+                    opens.pop();
                 }
-                out.push('」');
+                cur.push('」');
                 hit = true;
             }
             '‘' => {
-                out.push('『');
-                stack.push('』');
+                cur.push('『');
+                opens.push((cur.len() - 1, '』'));
                 hit = true;
             }
             '’' => {
-                if stack.last() == Some(&'』') {
-                    stack.pop();
+                if opens.last().map(|o| o.1) == Some('』') {
+                    opens.pop();
+                    cur.push('』');
+                } else {
+                    // 没有配对的内层开号：这一枚就是外侧的闭引号，降级成单直角。
+                    cur.push('」');
                 }
-                out.push('』');
                 hit = true;
             }
             '"' if near_han(i) => {
-                if stack.last() == Some(&'」') {
-                    stack.pop();
-                    out.push('」');
+                if opens.last().map(|o| o.1) == Some('」') {
+                    opens.pop();
+                    cur.push('」');
                 } else {
-                    out.push('「');
-                    stack.push('」');
+                    cur.push('「');
+                    opens.push((cur.len() - 1, '」'));
                 }
                 hit = true;
             }
             '\'' if near_han(i) => {
-                if stack.last() == Some(&'』') {
-                    stack.pop();
-                    out.push('』');
+                if opens.last().map(|o| o.1) == Some('』') {
+                    opens.pop();
+                    cur.push('』');
                 } else {
-                    out.push('『');
-                    stack.push('』');
+                    cur.push('『');
+                    opens.push((cur.len() - 1, '』'));
                 }
                 hit = true;
             }
             '\n' => {
-                // 行末清栈：引号不跨行配对（与 `close_notes` 一致）。
-                stack.clear();
-                out.push('\n');
+                // 行末收口：引号不跨行配对（与 `close_notes` 同口径）。
+                flush_quote_line(&mut cur, &mut opens, &mut lines_out);
             }
-            _ => out.push(c),
+            _ => cur.push(c),
         }
     }
-    if hit {
-        Some(out)
-    } else {
-        None
+    flush_quote_line(&mut cur, &mut opens, &mut lines_out);
+    if !hit {
+        return None;
     }
+    Some(lines_out.join("\n"))
+}
+
+/// 收一行的引号尾账。
+///
+/// 行末还没闭合的开号，按**用户口径**处理：`『` 一路降级成 `「`，闭号一律
+/// `」`。所以 `『希有。` 出来是 `「希有。」`，不是 `『希有。』`——
+///
+/// * 单层未配对时无从判断「这是内层引号还是外层引号」，`「」` 是竖排里
+///   最中性、最不会误读的形制；
+/// * `『` 在竖排里是避头符，留着它就得给后面的列让位，整段会像被缩进。
+///
+/// 成对的（`‘甲’`）不受影响，仍是 `『甲』`——内层引号该双层还是双层。
+fn flush_quote_line(cur: &mut Vec<char>, opens: &mut Vec<(usize, char)>, out: &mut Vec<String>) {
+    let mut tail: Vec<char> = Vec::new();
+    // 后开先闭：从最后一个未闭合的开号往回填。
+    for (pos, want) in opens.drain(..).rev() {
+        if want == '』' {
+            cur[pos] = '「'; // 降级：双直角 → 单直角
+        }
+        tail.push('」');
+    }
+    cur.extend(tail);
+    out.push(cur.iter().collect());
+    // ⚠️ 必须清空：这是**逐行**复用同一个缓冲区，忘了清就把上一行的内容
+    // 整段又拼一遍（第一次跑测试时出来的正是 `甲「乙」\n甲「乙」丙』丁`）。
+    cur.clear();
 }
 
 #[cfg(test)]
@@ -1329,6 +1396,33 @@ mod tests {
     }
 
     #[test]
+    fn language_whitelist_blocks_deletion() {
+        // **白名单一票否决**（v1.9.29，用户当场叫停）：文言单字成句与佛经
+        // 词头太常见，删之前必须拼词查表。`希`+`有` 是《金刚经》的核心词，
+        // 拼得上就说明这个「希」是真字，只能归并。
+        assert_eq!(
+            strip_orphan_lines("如是我聞。\n希\n有世尊。\n即從座起")
+                .as_deref(),
+            Some("如是我聞。\n希有世尊。\n即從座起"),
+            "希有 在白名单里，绝不许删"
+        );
+        // `一`+`时` = 一时（佛经起句），同样受保护。
+        assert_eq!(
+            strip_orphan_lines("金剛經\n一\n時佛在舍衛國。\n與大比丘眾")
+                .as_deref(),
+            Some("金剛經\n一時佛在舍衛國。\n與大比丘眾"),
+            "一时 在白名单里，绝不许删"
+        );
+        // `国`+`风` = 国风（《诗经》类目），也受保护。
+        assert_eq!(
+            strip_orphan_lines("甲。\n国\n風周南。\n乙丙")
+                .as_deref(),
+            Some("甲。\n国風周南。\n乙丙"),
+            "国风 在白名单里，绝不许删"
+        );
+    }
+
+    #[test]
     fn han_at_line_head_is_never_touched() {
         // 「国风」「国家」这种行首的国是正文，一个都不许碰。
         assert_eq!(
@@ -1403,13 +1497,24 @@ mod tests {
     }
 
     #[test]
-    fn unpaired_quote_does_not_swallow_the_line() {
-        // 只有开号：仍换成直角引号，交给 close_notes 在行末补齐。
-        assert_eq!(normalize_quotes("‘希有。").as_deref(), Some("『希有。"));
-        // 行末清栈：上一行的开号不会把下一行的 ’ 错认成闭合。
+    fn unpaired_quote_is_downgraded_to_single_corner() {
+        // 用户口径（v1.9.29）：未配对的单引号**不再**升成 `『`——单层时无从
+        // 判断是不是内层引号，`「」` 最中性；而 `『` 是避头符，留着会让
+        // 后面整段的列往下让位，看着像缩进。故 `『希有` → `「希有」`。
+        assert_eq!(normalize_quotes("‘希有。").as_deref(), Some("「希有。」"));
+        // 行末收口，行与行之间不互相传染。
         assert_eq!(
             normalize_quotes("甲‘乙\n丙’丁").as_deref(),
-            Some("甲『乙\n丙』丁")
+            Some("甲「乙」\n丙」丁")
+        );
+    }
+
+    #[test]
+    fn paired_inner_quote_keeps_double_corner() {
+        // 成对时它确实是内层引号，必须保持 `『』`。
+        assert_eq!(
+            normalize_quotes("曰：“甲‘乙’丙。”").as_deref(),
+            Some("曰：「甲『乙』丙。」")
         );
     }
 }

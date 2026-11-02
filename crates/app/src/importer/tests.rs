@@ -649,12 +649,16 @@ fn orphan_column_and_quote_are_cleaned() {
     );
 }
 
-/// 真机回归（v1.9.28）：引号在**清洗期**就归成成对的直角引号。
+/// 真机回归（v1.9.29）：引号在**清洗期**就归成成对的直角引号。
 #[test]
 fn quotes_are_normalized_before_layout() {
+    // 成对的单引号 = 内层引号，保持双层。
     assert_eq!(cleaner::clean("‘希有’世尊。"), "『希有』世尊。\n");
     assert_eq!(cleaner::clean("佛言：“善哉。”"), "佛言：「善哉。」\n");
-    // 没有闭合也换成直角形，由 close_notes 行末补齐（不再是畸形的弯引号）。
-    assert_eq!(cleaner::clean("‘希有。"), "『希有。』\n");
+    // **未配对的**一律降成单直角（用户口径：`『希有` → `「希有」`）。
+    // 单层时无从判断是不是内层，`「」` 最中性；`『` 还是避头符，留着会把
+    // 后面整段的列一列列往下推。
+    assert_eq!(cleaner::clean("‘希有。"), "「希有。」\n");
+    assert_eq!(cleaner::clean("'希有。"), "「希有。」\n");
 }
 

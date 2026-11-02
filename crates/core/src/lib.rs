@@ -49,6 +49,10 @@ pub mod dclean;
 /// 伪空格 / 页码行 / HTML 实体 / 点线目录 / Markdown 标记 / 上标注号 /
 /// 破折号字形。判据一律「宁漏不误」，全部 `Option` 早退（没命中零分配）。
 pub mod residue;
+/// **文言白名单词表**（v1.9.29）：守卫 [`residue::strip_orphan_lines`] 的
+/// 删字判据——孤字 + 下一行首字拼得上词，就说明它是真字（`希有` `一时`
+/// `国风`），只归并不删。词表在 `data/ancient_dict.json`，编译期嵌入。
+pub mod lexicon;
 pub mod content;
 /// **常用字白名单**（v1.81.0）：自动注音的判据（GB2312 一级字 + 其繁体形）。
 /// 文件由 `scripts/gen_common_chars.py` 生成，勿手改。
