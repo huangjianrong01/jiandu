@@ -482,6 +482,21 @@ pub struct CollationWorkspace {
     page_busy: bool,
     /// 左图栅格化的代际令牌：连按方向键时，旧页结果回来即丢弃（绝不闪回）。
     page_gen: usize,
+    /// PDF 页缓存：页码（1-based）→ 位图 + 该页文本层坐标（v1.9.31）。
+    ///
+    /// 翻页的丝滑感全在这里。单次栅格化约 12ms、文本层 10–40ms，单看都不长，
+    /// 但按住 → 连翻时它们是**串行**压在每一次换页上，手会明显「追不上」。
+    /// 缓存 4 页后，来回对照阅读（校对最常干的事）几乎零等待。
+    ///
+    /// 与 `image_mem` 的分工：`image_mem` 是**此刻正在显示**的那一页（决定纹理
+    /// 生命周期），这里存**最近看过的**几页的 CPU 位图。命中时只是换个 `Arc`，
+    /// 不重新栅格化、不重新抽文本层。
+    pdf_cache: std::collections::HashMap<usize, CachedPage>,
+    /// 是否有预取在途（同时只允许一个）。
+    ///
+    /// 连翻十页时若每页都起一个预取，后台线程池会被十份栅格化塞满，反而拖慢
+    /// 用户真正在等的那一页。一个在途就够：预取 12ms 就完成，手再快也追不上。
+    prefetch_busy: bool,
     /// 下一次 render 要不要**强制重建输入焦点**（true 时先 blur 再 focus）。
     ///
     /// 为什么必须有这个开关：`rfd` 是原生 NSOpenPanel，它关掉之后窗口的 first
@@ -627,6 +642,8 @@ impl CollationWorkspace {
             pdf_pages: 1,
             page_busy: false,
             page_gen: 0,
+            pdf_cache: std::collections::HashMap::new(),
+            prefetch_busy: false,
             refocus: false,
             text_file: None,
             text_note: None,
@@ -1695,6 +1712,10 @@ impl CollationWorkspace {
                                 .map(|s| s.eq_ignore_ascii_case("pdf"))
                                 .unwrap_or(false);
                             this.pdf_path = if is_pdf { Some(path.clone()) } else { None };
+                            // 换书 → 旧书的页缓存全部作废：页码在另一本书里毫无
+                            // 意义，留着就是拿别家的图冒充这一页。
+                            this.pdf_cache.clear();
+                            this.prefetch_busy = false;
                             this.pdf_pages = r.total.max(1);
                             this.pdf_page = r.page;
                             // 换原图 = 之前联动的段 / 框全部作废（属于旧图坐标）。
@@ -1710,6 +1731,9 @@ impl CollationWorkspace {
                             }
                             // 原生对话框刚关 → 强制重建输入焦点（见 `refocus`）。
                             this.refocus = true;
+                            // 第 1 页已经在屏幕上：顺手把第 2 页热进缓存，用户第一次
+                            // 按 → 就是零等待（这也是「打开书就想往下看」的常见路径）。
+                            this.prefetch_pdf_page(2, cx);
                         }
                         Err(e) => {
                             this.image_error = Some(e);
@@ -2324,16 +2348,16 @@ impl CollationWorkspace {
 
     /// 后台重栅格化左侧 PDF 的某一页（1-based），成功后换图 + 复位滚动。
     ///
-    /// 与 `open_image_picker` 里首次导入走同一条 `rasterize_source`，区别只在
-    /// 「页号」与「旧图回收」：翻页必须扔掉上一页的位图（内存里那份随
-    /// `image_mem` 被覆盖即释放），否则长翻几百页会堆出几百页 8MB 的位图。
+    /// 三条纪律（v1.9.31 重写）：
+    ///  ① **缓存优先**：最近看过的几页直接换 `Arc`，零等待（`pdf_cache`）。
+    ///     校对最常干的事是「两页之间来回对」——这条才是丝滑的来源。
+    ///  ② **图与文本层同一趟后台产**：不再让主线程为 `regions` 多等 10–40ms。
+    ///  ③ **代际令牌**：连翻时旧页结果绝不显示（绝不闪回），但**照样塞缓存**——
+    ///     用户手滑翻过头再翻回来，那页已经热着了。
     fn request_pdf_page(&mut self, page: usize, cx: &mut Context<Self>) {
         let Some(path) = self.pdf_path.clone() else {
             return;
         };
-        // 画布目标宽：左栏设备像素（render 每帧刷新；首帧前为 0，退回 1:1）。
-        let target_px = self.left_px;
-        self.page_busy = true;
         self.page_gen += 1;
         let gen = self.page_gen;
         // 换页即作废旧页的文本层坐标与联动状态：右边的段落还没点，左边不该
@@ -2342,63 +2366,182 @@ impl CollationWorkspace {
         self.active_line = None;
         self.match_note = None;
 
+        // —— ① 缓存命中：连栅格化都不用等，只换个指针 ——
+        if let Some(c) = self.pdf_cache.get(&page).cloned() {
+            self.page_busy = false;
+            let note = self.pdf_note(page);
+            self.show_pdf_page(page, &c, note);
+            cx.notify();
+            self.prefetch_pdf_page(page + 1, cx);
+            return;
+        }
+
+        // —— ② 未命中：后台一趟搞定位图 + 文本层 ——
+        // 画布目标宽：左栏设备像素（render 每帧刷新；首帧前为 0，退回 1:1）。
+        let target_px = self.left_px;
+        self.page_busy = true;
         cx.spawn(
             move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
                 let mut app = app.clone();
                 async move {
                     let exec = app.background_executor().clone();
-                    let out = exec
-                        .spawn(async move { rasterize_source(&path, page, target_px) })
-                        .await;
+                    let (out, regs) = render_pdf_page(exec, path, page, target_px).await;
                     if let Some(entity) = this.upgrade() {
                         let _ = entity.update(&mut app, |this, cx| {
                             this.page_busy = false;
-                            // 代际过期（用户又翻了几页）→ 丢弃结果与临时图。
-                            if gen != this.page_gen {
-                                if let Ok(r) = &out {
+                            match out {
+                                Ok(r) => {
+                                    // 走内存位图后恒为 None；留着是给非 PDF 兜底路径。
                                     if let Some(t) = &r.temp {
                                         let _ = std::fs::remove_file(t);
                                     }
-                                }
-                                cx.notify();
-                                return;
-                            }
-                            match out {
-                                Ok(r) => {
-                                    if let Some(old) = this.last_temp.take() {
-                                        let _ = std::fs::remove_file(&old);
+                                    match r.image {
+                                        Some(image) => {
+                                            let c = CachedPage {
+                                                image,
+                                                nat_w: r.nat_w,
+                                                nat_h: r.nat_h,
+                                                regions: regs,
+                                            };
+                                            let cur = this.pdf_page;
+                                            this.cache_page(page, c.clone(), cur);
+                                            // 代际过期：只入缓存，绝不动画面。
+                                            if gen == this.page_gen {
+                                                let note = this.pdf_note(page);
+                                                this.show_pdf_page(page, &c, note);
+                                            }
+                                        }
+                                        None => {
+                                            // 非 PDF（正常进不来）：沿用路径显示。
+                                            if gen == this.page_gen {
+                                                if let Some(old) = this.image_mem.take() {
+                                                    this.image_gc.push(old);
+                                                }
+                                                this.image_path = r.path;
+                                                this.last_temp = r.temp;
+                                                this.src_nat_w = r.nat_w as f32;
+                                                this.src_nat_h = r.nat_h as f32;
+                                                this.regions = regs;
+                                                this.image_error = None;
+                                                this.image_note = r.note;
+                                            }
+                                        }
                                     }
-                                    // 新页的内存位图替换旧页；旧位图挪进 `image_gc`，
-                                    // 下一帧 render 才真正 `drop_image`（本帧场景可能仍在引用）。
-                                    if let Some(old) = this.image_mem.take() {
-                                        this.image_gc.push(old);
-                                    }
-                                    this.image_mem = r.image;
-                                    this.image_path = r.path;
-                                    this.last_temp = r.temp;
-                                    this.src_nat_w = r.nat_w as f32;
-                                    this.src_nat_h = r.nat_h as f32;
-                                    this.pdf_page = r.page;
-                                    this.pdf_pages = r.total.max(1);
-                                    // 新页的文本层坐标：翻页后仍要能「点右文 → 亮左图」，
-                                    // 若沿用上一页的框，高亮会落到完全不相干的位置。
-                                    let real =
-                                        crate::pdf_text::extract_pdf_text_regions_on(
-                                            this.pdf_path.as_deref().unwrap_or(Path::new("")),
-                                            r.page.saturating_sub(1),
-                                        );
-                                    this.regions = real;
-                                    // 滚动复位：新页从顶上看起（旧的偏移对不上新页）。
-                                    this.left_scroll
-                                        .set_offset(Point::new(px(0.0), px(0.0)));
-                                    this.image_error = None;
-                                    this.image_note = r.note;
                                 }
                                 Err(e) => {
-                                    this.image_error = Some(e);
+                                    if gen == this.page_gen {
+                                        this.image_error = Some(e);
+                                    }
                                 }
                             }
+                            // —— ③ 预取下一页 ——
+                            // 只有「这一页确实被显示出来了」才值得预取它的下一页；
+                            // 已被翻走的请求不该顺手把算力花在错的方向上。
+                            if this.pdf_page == page {
+                                this.prefetch_pdf_page(page + 1, cx);
+                            }
                             cx.notify();
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// 左栏 PDF 的页码提示（只有多页才值得占一行字）。
+    fn pdf_note(&self, page: usize) -> Option<String> {
+        (self.pdf_pages > 1).then(|| format!("第 {} / {} 頁（← → 翻页）", page, self.pdf_pages))
+    }
+
+    /// 把一页成品挂到左栏。
+    ///
+    /// 缓存命中与后台完成**必须走同一段代码**：否则「第一次看」和「翻回来看」
+    /// 会在滚动位置、页码提示、联动框上呈现两种样子——这种不一致最难查。
+    fn show_pdf_page(&mut self, page: usize, c: &CachedPage, note: Option<String>) {
+        // 旧的临时图（若有）删掉；PDF 页本就不落盘。
+        if let Some(old) = self.last_temp.take() {
+            let _ = std::fs::remove_file(&old);
+        }
+        // 旧的显示位图挪进 `image_gc`：纹理要**下一帧**才 drop（本帧场景可能
+        // 仍引用着它，当帧就删会让 gpui 画到一半丢图）。
+        if let Some(old) = self.image_mem.take() {
+            self.image_gc.push(old);
+        }
+        self.image_mem = Some(c.image.clone());
+        self.image_path = None;
+        self.src_nat_w = c.nat_w as f32;
+        self.src_nat_h = c.nat_h as f32;
+        self.pdf_page = page;
+        self.regions = c.regions.clone();
+        // 滚动复位：新页从顶上看起（旧的偏移对不上新页）。
+        self.left_scroll
+            .set_offset(Point::new(px(0.0), px(0.0)));
+        self.image_error = None;
+        self.image_note = note;
+    }
+
+    /// 把一页塞进缓存，并把「离当前页最远」的旧页挤出去。
+    ///
+    /// 按距离淘汰而不是 LRU：来回对读时 LRU 会把「刚离开的那页」先踢掉，而它
+    /// 恰恰是最可能被翻回来的。距离最远的那页才是真的冷。
+    fn cache_page(&mut self, page: usize, c: CachedPage, cur: usize) {
+        self.pdf_cache.insert(page, c);
+        while self.pdf_cache.len() > PDF_CACHE_CAP {
+            let Some(far) = victim_of(self.pdf_cache.keys().copied(), cur) else {
+                break;
+            };
+            self.pdf_cache.remove(&far);
+        }
+    }
+
+    /// 提前把 `page` 备好塞进缓存（翻过去时零等待）。
+    ///
+    /// 三条纪律：
+    ///  ① 已缓存 / 越界 / 已有预取在途 → 什么都不做；
+    ///     （一个在途就够：预取 12ms 完成，手再快也追不上；十个并发反而把后台
+    ///     线程池塞满，拖慢用户真正在等的那一页。）
+    ///  ② 失败静默：预取是锦上添花，失败就让翻页走正常路径，绝不弹错打扰校对；
+    ///  ③ **只进缓存，不动 `image_mem`**：那页还没显示，抢纹理没有意义。
+    fn prefetch_pdf_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        if self.prefetch_busy || page == 0 || page > self.pdf_pages {
+            return;
+        }
+        if self.pdf_cache.contains_key(&page) {
+            return;
+        }
+        let Some(path) = self.pdf_path.clone() else {
+            return;
+        };
+        let target_px = self.left_px;
+        self.prefetch_busy = true;
+        cx.spawn(
+            move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    let exec = app.background_executor().clone();
+                    let (out, regs) = render_pdf_page(exec, path, page, target_px).await;
+                    if let Some(entity) = this.upgrade() {
+                        // 预取不改画面，所以**不 notify**：省一次无谓重绘。
+                        let _ = entity.update(&mut app, |this, _cx| {
+                            this.prefetch_busy = false;
+                            let Ok(r) = out else { return };
+                            if let Some(t) = &r.temp {
+                                let _ = std::fs::remove_file(t);
+                            }
+                            if let Some(image) = r.image {
+                                let cur = this.pdf_page;
+                                this.cache_page(
+                                    page,
+                                    CachedPage {
+                                        image,
+                                        nat_w: r.nat_w,
+                                        nat_h: r.nat_h,
+                                        regions: regs,
+                                    },
+                                    cur,
+                                );
+                            }
                         });
                     }
                 }
@@ -3854,7 +3997,18 @@ impl Render for CollationWorkspace {
             let s = window.scale_factor();
             if s.is_finite() && s > 0.0 { s } else { 1.0 }
         };
-        self.left_px = vw * 0.4 * backing;
+        let left_px = vw * 0.4 * backing;
+        // 左栏宽度变了（拉窗口 / 进全屏 / 挪到另一块屏）→ 缓存里那几页是按**旧**
+        // 像素栅格化的，拉宽后照样贴上去就是糊的。这是缓存带来的新风险，必须显式
+        // 兜住：超过 10% 才算「变宽」，像素级抖动不值得重栅格化。
+        let resized = self.left_px > 0.0 && (left_px - self.left_px).abs() > self.left_px * 0.1;
+        self.left_px = left_px;
+        if resized && self.pdf_path.is_some() {
+            self.pdf_cache.clear();
+            // 当前这一页也按新像素重出一张（不然屏幕上就是那张旧的低清图）。
+            let page = self.pdf_page.max(1);
+            self.request_pdf_page(page, cx);
+        }
         // 排障：帧计数。静止时也狂刷 → 说明有无限重绘循环（脏标记漏了）。
         self.frame_count += 1;
         if self.frame_count % 30 == 0 {
@@ -4080,6 +4234,60 @@ impl Drop for CollationWorkspace {
 /// 栅格化结果：显示路径、临时路径、原图自然像素尺寸、页码信息、温和提示。
 /// `nat_w` / `nat_h` 供真实坐标映射（`source_size`）把 `SourceRegion` 自然像素
 /// 缩放到显示坐标；无原图时回退到区域包围盒。
+/// PDF 页缓存的容量（页）。
+///
+/// 1120×1679 RGBA ≈ 7.5MB/页 → 4 页约 30MB。再往上加就是拿内存换「翻得再远
+/// 也秒开」，性价比开始变差（校对通常只在相邻两三页之间来回）。缓存的是 CPU
+/// 位图，不占 GPU 纹理。
+const PDF_CACHE_CAP: usize = 4;
+
+/// 缓存溢出时挑牺牲者：离当前页**最远**的那一页。
+///
+/// 为什么不用 LRU：校对的动作就是「两页之间来回对」。刚离开的那一页恰恰最
+/// 可能马上被翻回来，LRU 会第一个把它踢掉——越是来回看，越是每次都重新栅格化。
+/// 距离最远的那页才是真的冷。当前页自己永不牺牲（回 `None`，调用方就此停手）。
+fn victim_of(keys: impl Iterator<Item = usize>, cur: usize) -> Option<usize> {
+    keys.max_by_key(|&p| p.abs_diff(cur)).filter(|&p| p != cur)
+}
+
+/// 一页 PDF 的成品：位图 + 该页文本层坐标。
+///
+/// 两者**必须绑在一起缓存**：翻页后「点右文 → 亮左图」依赖 `regions` 与新页
+/// 对齐；只缓存图、坐标每次重抽，等于把省下的 10–40ms 又还回去了。
+#[derive(Clone)]
+struct CachedPage {
+    /// 已栅格化的整页位图（就是交给 `img()` 的那一份）。
+    image: Arc<RenderImage>,
+    nat_w: f64,
+    nat_h: f64,
+    regions: Vec<crate::pdf_text::SourceRegion>,
+}
+
+/// 后台产出一页 PDF 的「位图 + 文本层坐标」。
+///
+/// 两件事必须**同一趟**做完：都要开 PDF 文档，分开就是两次 IO + 两次
+/// `PDFDocument` 初始化。更关键的是——文本层抽取以前排在主线程，翻页时那
+/// 10–40ms 直接压在输入响应上。
+///
+/// 线程安全：`extract_pdf_text_regions_on` 每次 `alloc/init` 自己的
+/// `PDFDocument`，不共享可变状态，见其文档注释里的前提。
+async fn render_pdf_page(
+    exec: gpui::BackgroundExecutor,
+    path: PathBuf,
+    page: usize,
+    target_px: f32,
+) -> (
+    Result<Rasterized, String>,
+    Vec<crate::pdf_text::SourceRegion>,
+) {
+    exec.spawn(async move {
+        let raster = rasterize_source(&path, page, target_px);
+        let regions = crate::pdf_text::extract_pdf_text_regions_on(&path, page.saturating_sub(1));
+        (raster, regions)
+    })
+    .await
+}
+
 struct Rasterized {
     /// 位图原图直接复用原路径（`gpui::img` 自带解码）；PDF 页为 `None`。
     path: Option<PathBuf>,
@@ -5272,6 +5480,56 @@ mod raster_probe {
                 best + enc + dec
             );
         }
+        // 文本层抽取：v1.9.31 从主线程挪到后台。它是翻页路上的第二笔固定开销，
+        // 以前那 10–40ms 是直接压在输入响应上的（翻页时按 → 会「粘手」）。
+        let mut best_scan = f64::MAX;
+        let mut n_regions = 0usize;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let r = crate::pdf_text::extract_pdf_text_regions_on(&path, 0);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            n_regions = r.len();
+            if ms < best_scan {
+                best_scan = ms;
+            }
+        }
+        println!(
+            "文本层抽取={best_scan:>6.1}ms  regions={n_regions}（v1.9.31 起在后台，与栅格化同一趟）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pdf_cache_rules {
+    use super::*;
+
+    /// 淘汰要挑「离当前页最远」的，不是最久没用的。
+    ///
+    /// 这条口径直接决定手感：LRU 会在「第 1 页 ↔ 第 2 页来回对读」时反复把
+    /// 第 1 页踢掉，每一次回翻都重新栅格化；按距离淘汰则两页都稳稳热着。
+    #[test]
+    fn cache_evicts_the_farthest_page_not_the_oldest() {
+        let v = victim_of([1usize, 2, 3, 4, 5].into_iter(), 2).expect("5 个条目必然有牺牲者");
+        assert_eq!(v, 5, "离第 2 页最远的是第 5 页");
+        assert_ne!(v, 1, "刚离开的第 1 页最可能被翻回来，不能先踢");
+        assert_ne!(v, 3, "相邻页是来回对照的另一半，不能踢");
+    }
+
+    /// 只剩当前页自己时不许删它——删了左图会直接空掉。
+    #[test]
+    fn cache_never_evicts_the_current_page() {
+        assert_eq!(victim_of([7usize].into_iter(), 7), None);
+        assert_eq!(victim_of(std::iter::empty(), 7), None);
+    }
+
+    /// 当前页不管在哪个位置都不牺牲（含它恰好最远这种构造场景）。
+    #[test]
+    fn current_page_survives_from_any_position() {
+        for cur in 1..=5 {
+            let v = victim_of([1usize, 2, 3, 4, 5].into_iter(), cur)
+                .expect("5 个条目必然有牺牲者");
+            assert_ne!(v, cur, "当前页第 {cur} 页被淘汰了");
+        }
     }
 }
 
@@ -5291,7 +5549,17 @@ mod vector_pdf_regression {
     const SAMPLE: &str = "天地玄黄 宇宙洪荒 日月盈昃 辰宿列张 寒来暑往 秋收冬藏 闰余成岁 律吕调阳 云腾致雨 露结为霜 金生丽水 玉出昆冈 剑号巨阙 珠称夜光 果珍李柰 菜重芥姜 海咸河淡 鳞潜羽翔 龙师火帝 鸟官人皇 始制文字 乃服衣裳 推位让国 有虞陶唐";
 
     fn sample_pdf() -> Vec<SourceRegion> {
-        let path = std::env::temp_dir().join("jiandu_collation_roundtrip.pdf");
+        // ⚠️ 每个调用必须用**自己的**临时文件：cargo test 默认多线程，几条用例
+        // 曾共用一个固定文件名，于是 A 写→B 抽→A 删 三者交错，抽到空 regions，
+        // 表现为「偶发失败、单跑不挂」。v1.9.31 给 PDFKit 加了串行锁后撞得更
+        // 频繁，才把这个老问题顶出来。pid + 自增序号保证跨进程、跨线程都唯一。
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "jiandu_collation_roundtrip_{}_{}.pdf",
+            std::process::id(),
+            n
+        ));
         CollationWorkspace::render_pdf_blocking(
             SAMPLE,
             12,

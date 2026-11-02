@@ -48,13 +48,20 @@ pub struct SourceRegion {
     pub text: String,
 }
 
-/// 单页最多处理多少个**文本片段**。
+/// 单页最多处理多少个**字符**（含空白；防病态输入烧 CPU 的总闸门）。
 ///
-/// 本模块必须在主线程跑（PDFKit 不保证线程安全），没法后台化，所以只能把工作量
-/// 钉死在上限内：正常一页几十到几百片段，`selectionsByLine` 一遍下来是毫秒级；
-/// 整页缩印（一页当四页用）能到上万片段，那时宁可少框几列，也绝不冻住界面。
-/// 古籍影印本单页几乎不可能破这条线。
-const MAX_GLYPH_SCAN: usize = 6000;
+/// ⚠️ 它**不是**精度上限 —— v1.9.31 之前它是，于是整页缩印（一页当四页印、
+/// 上万字）的后半页永远拿不到坐标：「点右文不亮左图」，而且毫无提示。
+/// 现在真正的精度由 [`SCAN_SEGMENT`] 分段保证，这个数只是「一页再离谱也不
+/// 可能超过」的护栏（A4 300dpi 双栏密排约 1.2 万字，留一倍余量）。
+const MAX_GLYPH_SCAN: usize = 24000;
+
+/// 单次 `selectionForRange:` 扫多少字符。
+///
+/// PDFKit 对超长 range 的 `selectionsByLine` 在部分文档上只回前半段（实测约
+/// 6 千字开始截）。切到 1500 字一段，每段都短到不会触发，拼起来就是整页。
+/// 分段会把同一行切成前后两半，由 [`push_merged`] 按几何合一。
+const SCAN_SEGMENT: usize = 1500;
 
 #[cfg(target_os = "macos")]
 #[link(name = "PDFKit", kind = "framework")]
@@ -62,6 +69,19 @@ extern "C" {}
 
 #[cfg(target_os = "macos")]
 use objc::{class, msg_send, rc::autoreleasepool, runtime::Object, sel, sel_impl};
+
+/// 串行化所有 PDFKit 调用的进程级锁。
+///
+/// 为什么需要：v1.9.31 起「当前页」与「下一页预取」会**同时**在后台跑，各自
+/// 开自己的 `PDFDocument`。私有实例之间数据不共享，但 PDFKit 内部的字体注册、
+/// 页面缓存、字形解析都是进程级状态，苹果从未承诺多实例并发安全。这把锁的代价
+/// 是一次 10–40ms 的排队，换的是「绝不因为并发翻页而崩」——完全不值得赌。
+///
+/// 注意：只锁 PDFKit / PDFSelection 这条路径，**不锁** `rasterize_source` 的
+/// `CGPDFDocument`（那是 CoreGraphics，独立实例并发绘制是安全的，且栅格化
+/// 12ms 里并行度最值钱）。
+#[cfg(target_os = "macos")]
+static PDFKIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(target_os = "macos")]
 pub fn extract_pdf_text_regions(path: &Path) -> Vec<SourceRegion> {
@@ -72,8 +92,22 @@ pub fn extract_pdf_text_regions(path: &Path) -> Vec<SourceRegion> {
 ///
 /// 左右双屏翻页同步后，左侧 PDF 会真的翻页，文本层坐标必须跟着换页——
 /// 否则翻到第 5 页仍在用第 1 页的框，高亮会落在完全不相干的地方。
+///
+/// # 线程模型（v1.9.31）
+///
+/// **可以后台调用**：本函数每次都 `alloc/init` 一个自己的 `PDFDocument`，
+/// 页、字符串、选择集全部在这棵私有对象树里，不共享任何可变状态；内部的
+/// `autoreleasepool` 负责回收。以前它排在主线程，翻页时那 10–40ms 直接压在
+/// 输入响应上；现在与栅格化同赴后台（见 `collation::render_pdf_page`）。
+/// ⚠️ 若将来有人改成复用同一个 `PDFDocument` 实例，这条就立刻不成立了。
+///
+/// 「各用各的实例」只保证**我们的**数据不共享；PDFKit 内部还有字体、页面缓存
+/// 这类进程级状态，苹果从没承诺过多实例并发安全。所以整段仍串在
+/// [`PDFKIT_LOCK`] 上——单次 10–40ms，串行化换来的是「绝不因为同时开两页而崩」。
 #[cfg(target_os = "macos")]
 pub fn extract_pdf_text_regions_on(path: &Path, page_index: usize) -> Vec<SourceRegion> {
+    // 中毒不影响正确性：只说明某个线程在临界区里 panic 过，数据本身没坏。
+    let _kit = PDFKIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // ⚠️ 必须有 autorelease pool：PDFKit / Foundation 创建的对象（NSURL / NSString /
     // PDFDocument / PDFPage / PDFSelection）多为 autoreleased，脱离主 runloop 的调用点
     // 若没有 pool 承载，对象无处释放会直接崩溃（"导入即闪退"的元凶）。
@@ -105,7 +139,7 @@ pub fn extract_pdf_text_regions_on(path: &Path, page_index: usize) -> Vec<Source
             return vec![];
         }
 
-        let mut chunks = chunks_by_line(page, len);
+        let mut chunks = chunks_by_line(page, string, len);
         if chunks.is_empty() {
             // 兜底：个别 PDF 的 selection 拿不到东西，退回逐字包围盒。
             chunks = chunks_by_char_bounds(page, string, len);
@@ -204,7 +238,7 @@ unsafe fn ns_to_rust(obj: *mut Object) -> String {
 /// 别的软件排的 PDF 一行十几个字，这里就是一整行。两种形态都往后传，由
 /// [`cluster`] 统一聚成列 / 行。
 #[cfg(target_os = "macos")]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Chunk {
     x: f64,
     y: f64,
@@ -233,43 +267,90 @@ impl Chunk {
 ///
 /// 这是 v1.9.23 的核心修复，理由见模块头的对照说明（`characterBoundsAtIndex:`
 /// 在竖排 / 逐字排布的页面上只给前半段坐标，后半段全空）。
+///
+/// v1.9.31 起按 [`SCAN_SEGMENT`] **分段扫描**：一次 `selectionForRange:` 只吃
+/// 1500 字，短到 PDFKit 不会截断，循环到最后拼成整页。
 #[cfg(target_os = "macos")]
-unsafe fn chunks_by_line(page: *mut Object, len: usize) -> Vec<Chunk> {
-    let span = len.min(MAX_GLYPH_SCAN);
-    let sel: *mut Object = msg_send![page, selectionForRange: NSRange { location: 0, length: span }];
-    if sel.is_null() {
-        return vec![];
-    }
-    let lines: *mut Object = msg_send![sel, selectionsByLine];
-    if lines.is_null() {
-        return vec![];
-    }
-    let n: usize = msg_send![lines, count];
-    let mut out: Vec<Chunk> = Vec::with_capacity(n.min(MAX_GLYPH_SCAN));
-    let mut seen = 0usize;
-    for i in 0..n {
-        if i >= MAX_GLYPH_SCAN || seen >= MAX_GLYPH_SCAN {
+unsafe fn chunks_by_line(page: *mut Object, string: *mut Object, len: usize) -> Vec<Chunk> {
+    let total = len.min(MAX_GLYPH_SCAN);
+    let mut out: Vec<Chunk> = Vec::new();
+    let mut start = 0usize;
+    while start < total {
+        // 切点绝不落在 UTF-16 代理对中间：NSRange 以 UTF-16 计，切在低位代理上
+        // 会让这一段的尾巴变成一个孤零零的半字（Ext-B 生僻字才会遇到，但代价只有
+        // 一次 objc 往返，值）。
+        while start > 0 && start < total && is_low_surrogate(string, start) {
+            start += 1;
+        }
+        if start >= total {
             break;
         }
-        let l: *mut Object = msg_send![lines, objectAtIndex: i];
-        if l.is_null() {
+        let span = (total - start).min(SCAN_SEGMENT);
+        let sel: *mut Object =
+            msg_send![page, selectionForRange: NSRange { location: start, length: span }];
+        start += span;
+        if sel.is_null() {
             continue;
         }
-        let r: NSRect = msg_send![l, boundsForPage: page];
-        if !(r.w > 0.0) || !(r.h > 0.0) {
-            continue; // 这一行没有几何（空行 / 删掉的注）
+        let lines: *mut Object = msg_send![sel, selectionsByLine];
+        if lines.is_null() {
+            continue;
         }
-        let text = ns_to_rust(msg_send![l, string]);
-        seen += text.chars().count();
-        out.push(Chunk {
-            x: r.x,
-            y: r.y,
-            w: r.w,
-            h: r.h,
-            text,
-        });
+        let n: usize = msg_send![lines, count];
+        for i in 0..n {
+            let l: *mut Object = msg_send![lines, objectAtIndex: i];
+            if l.is_null() {
+                continue;
+            }
+            let r: NSRect = msg_send![l, boundsForPage: page];
+            if !(r.w > 0.0) || !(r.h > 0.0) {
+                continue; // 这一行没有几何（空行 / 删掉的注）
+            }
+            let text = ns_to_rust(msg_send![l, string]);
+            push_merged(
+                &mut out,
+                Chunk {
+                    x: r.x,
+                    y: r.y,
+                    w: r.w,
+                    h: r.h,
+                    text,
+                },
+            );
+        }
     }
     out
+}
+
+/// `i` 处的 UTF-16 单元是否是代理对的后半（低位代理）。
+#[cfg(target_os = "macos")]
+unsafe fn is_low_surrogate(string: *mut Object, i: usize) -> bool {
+    let c: u16 = msg_send![string, characterAtIndex: i];
+    (0xDC00..=0xDFFF).contains(&c)
+}
+
+/// 追加一个片段；若它与上一段是**同一行被分段切开的两个半截**，就并回去。
+///
+/// 判据只用几何：包围盒四边差都 < 1pt。分段切点只会把一行切成前后两半，两半
+/// 取自同一行，`boundsForPage:` 必然一致；而同一页上真正相邻的两行（竖排为
+/// 相邻两列）间距是字号量级（≥ 10pt），不可能误并。
+///
+/// 为什么必须并：不并的话每 1500 字就多出一个「半行」，右侧联动定位时这一行
+/// 的文字只剩一半，`locate_region` 按文字匹配会匹配不上 —— 分段救了后半页的
+/// 坐标，却可能弄坏前半页的匹配。这条合并是配套的。
+fn push_merged(out: &mut Vec<Chunk>, c: Chunk) {
+    const SAME_LINE_EPS: f64 = 1.0;
+    if let Some(last) = out.last_mut() {
+        let same = (last.x - c.x).abs() < SAME_LINE_EPS
+            && (last.y - c.y).abs() < SAME_LINE_EPS
+            && (last.w - c.w).abs() < SAME_LINE_EPS
+            && (last.h - c.h).abs() < SAME_LINE_EPS;
+        if same {
+            last.text.push_str(&c.text);
+            return;
+        }
+    }
+    out.push(c);
 }
 
 /// 兜底路径：逐字 `characterBoundsAtIndex:`（含 UTF-16 代理对合并）。
@@ -552,6 +633,41 @@ mod tests {
             h,
             text: text.to_string(),
         }
+    }
+
+    /// 分段扫描把一行切成前后两半时必须合回去。
+    ///
+    /// 这正是 v1.9.31 分段方案的前置条件：不合的话，每 1500 字就多出一个只有
+    /// 半截文字的「行」，`locate_region` 按文字匹配会认不出来 —— 坐标救回来了，
+    /// 匹配却又坏了。两个功能必须一起上。
+    #[test]
+    fn split_line_halves_are_merged_back() {
+        let mut out = Vec::new();
+        push_merged(&mut out, ch(500.0, 800.0, 24.0, 600.0, "甲甲甲"));
+        push_merged(&mut out, ch(500.0, 800.0, 24.0, 600.0, "乙乙"));
+        assert_eq!(out.len(), 1, "同一行被切成两段，必须合并：{out:?}");
+        assert_eq!(out[0].text, "甲甲甲乙乙", "合并后文字应首尾相接");
+    }
+
+    /// 相邻两列（竖排）只差一个字距：绝不能被当成「同一行」并掉，
+    /// 否则整页会被并成一列，右侧所有段落都指向同一处。
+    #[test]
+    fn adjacent_columns_are_not_merged() {
+        let mut out = Vec::new();
+        push_merged(&mut out, ch(500.0, 800.0, 24.0, 600.0, "甲"));
+        push_merged(&mut out, ch(460.0, 800.0, 24.0, 600.0, "乙"));
+        assert_eq!(out.len(), 2, "相邻两列被误并了：{out:?}");
+    }
+
+    /// 同一行的包围盒有亚像素抖动（PDFKit 浮点误差）仍要合并；
+    /// 容差 1pt 若被误设成 0，缩印页会重新裂成一堆半行。
+    #[test]
+    fn sub_point_jitter_still_merges() {
+        let mut out = Vec::new();
+        push_merged(&mut out, ch(500.0, 800.0, 24.0, 600.0, "甲"));
+        push_merged(&mut out, ch(500.4, 799.6, 23.8, 600.3, "乙"));
+        assert_eq!(out.len(), 1, "亚像素抖动不该拆成两段：{out:?}");
+        assert_eq!(out[0].text, "甲乙");
     }
 
     /// 退化盒子（3.7×6.1，中心在真实字格中心）必须被补回一个字的大小，
