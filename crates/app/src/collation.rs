@@ -529,6 +529,18 @@ pub struct CollationWorkspace {
     ocr_panel: bool,
     /// 队列的一次性提示（如「3 件已入队 · 2 件不支持，已跳过」）。
     ocr_note: Option<String>,
+    /// 左图**正在拖选**的起点（原图自然坐标）。`None` = 没在拖。
+    pick_from: Option<(f32, f32)>,
+    /// 左图拖选出来的矩形（自然坐标，已归一）。它同时是「选区框」的绘制依据。
+    pick_rect: Option<crate::pdf_text::PickRect>,
+    /// 拖选命中区域拼出来的**待补文字**；`None` = 没有可补的东西。
+    ///
+    /// 存下来而不是每次重算：一次拖选要遍历整页区域（几百条），每帧都算一遍
+    /// 会让「拖动中」掉帧；而且它也是「补入」按钮的唯一依据——没有它就说明
+    /// 这次框选没选中字，按钮不该出现。
+    pick_text: Option<String>,
+    /// 本次拖选命中的区域数（只用于状态提示「共 N 处」）。
+    pick_hits: usize,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -651,6 +663,10 @@ impl CollationWorkspace {
             ocr_queue: jiandu_core::ocr::OcrQueue::new(),
             ocr_panel: false,
             ocr_note: None,
+            pick_from: None,
+            pick_rect: None,
+            pick_text: None,
+            pick_hits: 0,
         };
         // 启动即清扫上一进程遗留的临时图（崩溃 / 强退时 `Drop` 跑不到，只能等下次
         // 启动补扫）。只认本应用自己的命名前缀，且只删「够旧」的，绝不误伤另开的
@@ -1380,7 +1396,7 @@ impl CollationWorkspace {
                     .h_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.left_scroll)
-                    .child(self.render_left_content(vw)),
+                    .child(self.render_left_content(vw, cx)),
             )
         };
         div()
@@ -1402,7 +1418,21 @@ impl CollationWorkspace {
                             .bottom(px(8.0))
                             .left(px(8.0))
                             .child(self.render_pdf_pager(cx)),
-                    ),
+                    )
+                    // 框选后的确认条（底部居中）。放底部不放顶部：竖排是从右上
+                    // 起读的，顶栏一浮就正好压住正文的第一列；左下角已被页码条
+                    // 占了，所以居中——离图近，又不遮字。
+                    .child(match self.render_pick_bar(cx) {
+                        Some(bar) => div()
+                            .absolute()
+                            .bottom(px(10.0))
+                            .left(px(0.0))
+                            .right(px(0.0))
+                            .flex()
+                            .justify_center()
+                            .child(bar),
+                        None => div().h(px(0.0)),
+                    }),
             )
             .child(match self.render_image_status() {
                 Some(s) => s,
@@ -1568,7 +1598,7 @@ impl CollationWorkspace {
     /// `source_size()` 自然尺寸等比缩放），两种情况都叠加 `regions` 区域参考框与
     /// 当前联动段的高亮矩形——高亮坐标全部来自 `SourceRegion` 的真实 (x,y,w,h)
     /// 自然像素，按 `src_nat` 缩放后落到显示坐标（彻底告别 N*BAND_H Mock）。
-    fn render_left_content(&self, vw: f32) -> gpui::Div {
+    fn render_left_content(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
         let (_nw, nh) = self.source_size();
         // 缩放比与 `scroll_region_to_center` **同源**（都走 `left_scale`）。
         // 一旦两处各算各的，框就会整体偏移几十像素——「框飘了」的经典死因。
@@ -1617,7 +1647,249 @@ impl CollationWorkspace {
                 );
             }
         }
+
+        // 拖选产区（v1.9.33）：按住拖出一块，松手就把里面的字提出来，等一句
+        // 「补入」。框本身只画**边界**（1px 朱砂）+ 极淡的底，让底下的字仍然
+        // 读得清——这一层是「圈一个范围」，不是「盖住一片」。
+        if let Some(r) = self.pick_rect {
+            page = page.child(
+                div()
+                    .absolute()
+                    .top(px(r.y0 * scale))
+                    .left(px(r.x0 * scale))
+                    .w(px((r.width() * scale).max(1.0)))
+                    .h(px((r.height() * scale).max(1.0)))
+                    .border_1()
+                    .border_color(rgba(0x8c2b22aa))
+                    .bg(rgba(0x8c2b2214)),
+            );
+        }
+
+        // 鼠标三件事，全部换算到**原图自然坐标**再存——屏幕坐标会被窗口大小、
+        // 滚动位置、缩放比三重影响，存下来一挪窗口就全废。
+        page = page
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |c, e: &MouseDownEvent, _w, cx| {
+                    let (nx, ny) =
+                        c.natural_from_window(px_f32(e.position.x), px_f32(e.position.y), vw);
+                    c.pick_from = Some((nx, ny));
+                    c.pick_rect = Some(crate::pdf_text::PickRect::new(nx, ny, nx, ny));
+                    // 重新开框 = 上一次的待补文字作废（否则会补进上一次的段落）。
+                    c.pick_text = None;
+                    c.pick_hits = 0;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |c, e: &MouseMoveEvent, _w, cx| {
+                    // 只有「按着左键拖」才画框；光是把鼠标移过去不算。
+                    if e.pressed_button != Some(MouseButton::Left) {
+                        return;
+                    }
+                    let Some((sx, sy)) = c.pick_from else {
+                        return;
+                    };
+                    let (nx, ny) =
+                        c.natural_from_window(px_f32(e.position.x), px_f32(e.position.y), vw);
+                    c.pick_rect = Some(crate::pdf_text::PickRect::new(sx, sy, nx, ny));
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |c, _e, _w, cx| c.pick_finish(cx)),
+            );
         page
+    }
+
+    // ── 左图框选 → 补入右文（v1.9.33）─────────────────────────────────────
+
+    /// 窗口坐标 → **原图自然坐标**。
+    ///
+    /// 三件事必须一起算，漏任何一个框都会整体偏一截：
+    ///  ① 左栏起点：窗口最左（x = 0）、全局天头之下（y = `HEADER_H`）；
+    ///  ② 滚动偏移（`left_scroll`，向下滚为**负**）；
+    ///  ③ `left_scale`——与画框、与滚动定位**同一个**缩放比。
+    ///
+    /// 这和 `editor_origin` 是同一类坑：量出来的原点和画出来的原点一旦分叉，
+    /// 高亮就会落在错的字上，而且只在某些窗口尺寸下才错，极难复现。
+    fn natural_from_window(&self, x: f32, y: f32, vw: f32) -> (f32, f32) {
+        let scale = self.left_scale(vw).max(1e-6);
+        let scroll_y = px_f32(self.left_scroll.offset().y);
+        (
+            (x / scale).max(0.0),
+            ((y - HEADER_H - scroll_y) / scale).max(0.0),
+        )
+    }
+
+    /// 松手：把框里的字提出来，等用户点【补入】。
+    ///
+    /// 三种结局的交代**分轻重**（这条是「不吵人」的关键）：
+    ///   * 提到字 → 浮出确认条（预览前 14 字 + 字数）；
+    ///   * 拖了一框但没字（图版 / 印章 / 空白）→ 状态条明说换一处再框；
+    ///   * 只是点了一下 / 整页无文本层 → **静默**。点一下空白就弹一条提示，
+    ///     读图的时候会一直被打断；而无文本层的「需 OCR」早已常驻在左栏状态条，
+    ///     再重复一遍纯属噪声。
+    fn pick_finish(&mut self, cx: &mut Context<Self>) {
+        self.pick_from = None;
+        let Some(rect) = self.pick_rect else {
+            return;
+        };
+        let idx = crate::pdf_text::pick_indices(&self.regions, rect);
+        let text = crate::pdf_text::join_picked(&self.regions, &idx);
+        if !text.is_empty() {
+            self.pick_hits = idx.len();
+            self.pick_text = Some(text);
+            cx.notify();
+            return;
+        }
+        self.pick_text = None;
+        self.pick_hits = 0;
+        self.pick_rect = None;
+        if !rect.is_tap() && !self.regions.is_empty() {
+            self.match_note =
+                Some("这一框里没有文字（可能是图版 / 印章 / 空白），换一处再框".to_string());
+        }
+        cx.notify();
+    }
+
+    /// 确认条：【补入右文 · N 字】+ 前 14 字预览 + 【✕】。没框到字时不存在。
+    fn render_pick_bar(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let text = self.pick_text.as_ref()?;
+        let n = text.chars().count();
+        let lines = text.lines().count();
+        // 预览只取**首段**前 14 字：跨行截断会让人以为原文就是断的。
+        // 多段时补一句「共 N 段」——一框下去补进来几段，用户必须能提前看见。
+        let first = text.lines().next().unwrap_or("");
+        let head: String = first.chars().take(14).collect();
+        let more = if first.chars().count() > 14 { "…" } else { "" };
+        let preview = if lines > 1 {
+            format!("{head}{more} · 共 {lines} 段")
+        } else {
+            format!("{head}{more}")
+        };
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(8.0))
+                .bg(rgba(0xFBF6E6F2))
+                .border_1()
+                .border_color(rgba(0x8c2b2240))
+                .shadow(vec![BoxShadow {
+                    color: rgba(0x2B262026).into(),
+                    blur_radius: px(10.0),
+                    spread_radius: px(0.0),
+                    offset: Point::new(px(0.0), px(2.0)),
+                }])
+                .child(
+                    div()
+                        .font_family(song.clone())
+                        .text_size(px(11.5))
+                        .text_color(rgba(0x2B2620A6))
+                        .max_w(px(150.0))
+                        .child(SharedString::from(preview)),
+                )
+                .child(
+                    // 主动作：胶囊实底朱砂（与主按钮同一套语言，但小一号——
+                    // 它是一次「插入」，不是一屏的主入口）。
+                    div()
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .text_size(px(11.5))
+                        .text_color(rgb(0xFBF6E6))
+                        .bg(rgb(0x8c2b22))
+                        .hover(|s| s.bg(rgb(0x9d352a)))
+                        .child(SharedString::from(format!("补入 {n} 字")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|c, _, window, cx| {
+                                // 关键：不让这次点击冒泡到左图画布的 on_mouse_down，
+                                // 否则点按钮会顺手清掉选区（然后就补不进去了）。
+                                cx.stop_propagation();
+                                c.pick_commit(window, cx);
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(4.0))
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .text_size(px(12.0))
+                        .text_color(rgba(0x2B26208C))
+                        .hover(|s| s.text_color(rgb(0x8c2b22)))
+                        .child(SharedString::from("✕"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|c, _, _, cx| {
+                                cx.stop_propagation();
+                                c.pick_text = None;
+                                c.pick_rect = None;
+                                c.pick_hits = 0;
+                                cx.notify();
+                            }),
+                        ),
+                ),
+        )
+    }
+
+    /// 把待补文字插进右文，落点规则与手打一致（有选区就替换选区）。
+    fn pick_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(raw) = self.pick_text.take() else {
+            return;
+        };
+        let hits = self.pick_hits;
+        self.pick_hits = 0;
+        self.pick_rect = None;
+
+        // 插入点不在行首且前面还有字 → 先断一行，免得把新段黏在上一段尾巴上。
+        // 有选区时不断行：那是「用底本覆盖这一段」，覆盖完接着原样往下。
+        let replaced = self
+            .selection
+            .as_ref()
+            .map(|r| r.end.saturating_sub(r.start))
+            .unwrap_or(0);
+        let at_line_start = self.cursor == 0
+            || self.text.chars().nth(self.cursor.saturating_sub(1)) == Some('\n');
+        let added = raw.chars().count();
+        let payload = if replaced == 0 && !at_line_start {
+            format!("\n{raw}")
+        } else {
+            raw
+        };
+        let from = match self.selection.as_ref() {
+            Some(sel) => sel.start.min(sel.end),
+            None => self.cursor,
+        };
+        self.insert_text(&payload, cx);
+        // 补完**把刚补进来的这段选中**。三个作用：
+        //  ① 用户一眼看见补进来的是什么（不用在一屏字里找）；
+        //  ② 编辑器没有 undo，选中就是「软撤销」——按一下 Delete 就回到原样；
+        //  ③ 若补错了，直接打字覆盖，不必先删一段再写。
+        let to = self.cursor;
+        if to > from {
+            self.selection = Some(from..to);
+        }
+        // 插完把焦点还给编辑器：不然接着打字会打进虚空（左图画布没有输入上下文）。
+        Self::hard_refocus(window, &self.focus);
+        self.match_note = Some(if replaced > 0 {
+            format!("已用原图文字替换 {replaced} 字（取自 {hits} 处）")
+        } else {
+            format!("已从原图补入 {added} 字（取自 {hits} 处）")
+        });
+        cx.notify();
     }
 
     /// 导入原图（PDF / PNG）：弹出系统文件选择框（rfd **前台直调**），
@@ -1654,6 +1926,11 @@ impl CollationWorkspace {
                     //    显示、照常翻页、照常导出。用户看到的是「这本书能看，只是没法
                     //    自动定位」，而不是一个红叉。
                     let real = crate::pdf_text::extract_pdf_text_regions(&path);
+                    // 换原图 = 上一次框选的待补文字作废（它属于旧图的坐标与文字）。
+                    this.pick_from = None;
+                    this.pick_rect = None;
+                    this.pick_text = None;
+                    this.pick_hits = 0;
                     if !real.is_empty() {
                         this.regions = real;
                         this.image_error = None;
@@ -2369,8 +2646,7 @@ impl CollationWorkspace {
         // —— ① 缓存命中：连栅格化都不用等，只换个指针 ——
         if let Some(c) = self.pdf_cache.get(&page).cloned() {
             self.page_busy = false;
-            let note = self.pdf_note(page);
-            self.show_pdf_page(page, &c, note);
+            self.show_pdf_page(page, &c);
             cx.notify();
             self.prefetch_pdf_page(page + 1, cx);
             return;
@@ -2407,8 +2683,7 @@ impl CollationWorkspace {
                                             this.cache_page(page, c.clone(), cur);
                                             // 代际过期：只入缓存，绝不动画面。
                                             if gen == this.page_gen {
-                                                let note = this.pdf_note(page);
-                                                this.show_pdf_page(page, &c, note);
+                                                this.show_pdf_page(page, &c);
                                             }
                                         }
                                         None => {
@@ -2451,14 +2726,23 @@ impl CollationWorkspace {
 
     /// 左栏 PDF 的页码提示（只有多页才值得占一行字）。
     fn pdf_note(&self, page: usize) -> Option<String> {
-        (self.pdf_pages > 1).then(|| format!("第 {} / {} 頁（← → 翻页）", page, self.pdf_pages))
+        let mut parts: Vec<String> = Vec::new();
+        if self.pdf_pages > 1 {
+            parts.push(format!("第 {} / {} 頁（← → 翻页）", page, self.pdf_pages));
+        }
+        // 只有**这一页真能取到字**才提示框选。扫描件上写这句等于骗人去框一块
+        // 什么也框不出来的图。
+        if !self.regions.is_empty() {
+            parts.push("框选原图可补入右文".to_string());
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
     /// 把一页成品挂到左栏。
     ///
     /// 缓存命中与后台完成**必须走同一段代码**：否则「第一次看」和「翻回来看」
     /// 会在滚动位置、页码提示、联动框上呈现两种样子——这种不一致最难查。
-    fn show_pdf_page(&mut self, page: usize, c: &CachedPage, note: Option<String>) {
+    fn show_pdf_page(&mut self, page: usize, c: &CachedPage) {
         // 旧的临时图（若有）删掉；PDF 页本就不落盘。
         if let Some(old) = self.last_temp.take() {
             let _ = std::fs::remove_file(&old);
@@ -2474,11 +2758,21 @@ impl CollationWorkspace {
         self.src_nat_h = c.nat_h as f32;
         self.pdf_page = page;
         self.regions = c.regions.clone();
+        // 换页 = 上一页的框选作废。这不是洁癖：`pick_text` 是**旧页**的文字，
+        // 留着它，用户在新页上直接点【补入】就会把上一页的段落插进正文——
+        // 校对比对最怕的就是「补错了页还没人发现」。
+        self.pick_rect = None;
+        self.pick_text = None;
+        self.pick_hits = 0;
+        self.pick_from = None;
         // 滚动复位：新页从顶上看起（旧的偏移对不上新页）。
         self.left_scroll
             .set_offset(Point::new(px(0.0), px(0.0)));
         self.image_error = None;
-        self.image_note = note;
+        // 提示**必须在这里算**：`pdf_note` 要读 `regions`（决定要不要提示「可框选
+        // 补入」），而 `regions` 正是本函数刚刚换上的。放在调用方算就会拿到上一
+        // 页的文本层——扫描页上凭空冒出「可框选」，点了却什么也框不出来。
+        self.image_note = self.pdf_note(page);
     }
 
     /// 把一页塞进缓存，并把「离当前页最远」的旧页挤出去。
@@ -5663,6 +5957,47 @@ mod vector_pdf_regression {
             needle.contains(&hay),
             "命中的那一列 {:?} 不是这一行的子串——框会落在不相干的字上",
             hay
+        );
+    }
+
+    /// **端到端：框住整页 → 拼出来的文字必须与版式源文本一致，且顺序正确。**
+    ///
+    /// 这是「左图框选 → 补入右文」的最后一道验收：前面几条守的是坐标与匹配，
+    /// 这条守的是**读出来的字本身**。自产 PDF 的源文本（`SAMPLE`）是已知的，
+    /// 于是可以断言「拼出来的就是它」。
+    ///
+    /// 特别守「方向」这一条：若列序写成左→右，拼出来会以最后一列（`推位让国`）
+    /// 开头，`starts_with("天地")` 立刻红。
+    #[test]
+    fn picking_the_whole_page_reproduces_the_source_text() {
+        let regions = sample_pdf();
+        assert!(!regions.is_empty(), "自产矢量 PDF 必须抽得出文本层");
+        let whole = crate::pdf_text::PickRect::new(-10.0, -10.0, 10_000.0, 10_000.0);
+        let idx = crate::pdf_text::pick_indices(&regions, whole);
+        assert_eq!(idx.len(), regions.len(), "整页框选应当命中全部区域");
+        let picked = crate::pdf_text::join_picked(&regions, &idx);
+
+        let src: String = SAMPLE.chars().filter(|c| !c.is_whitespace()).collect();
+        println!("[框选拼出 {} 字] {picked}", picked.chars().count());
+        assert!(
+            picked.starts_with("天地"),
+            "竖排应从右上第一列读起（「天地玄黄…」），实得 {:?}",
+            picked.chars().take(12).collect::<String>()
+        );
+        // 正文必须**逐字一致**（顺序、丢字、多字、错字都靠这句守）。
+        //
+        // 末尾允许多出极短的尾巴：样张自己在版框外落了一处「笺校」（书口 / 落款），
+        // 它在文本层里是真字，框住整页时理应被框进来——真实影印本的叶码、卷次
+        // 也一样。**刻意不做「版框外就丢」的过滤**：眉批、夹注正是生在版框外的，
+        // 那才是校对要补的东西，为一行落款把它们一起滤掉是拿原稿换整洁。
+        assert!(
+            picked.starts_with(&src),
+            "框选拼出来的正文与版式源文本不一致（顺序 / 丢字 / 多字）\n实得：{picked}"
+        );
+        let tail: String = picked.chars().skip(src.chars().count()).collect();
+        assert!(
+            tail.trim_start_matches('\n').chars().count() <= 4,
+            "正文之后多出太多字（{tail:?}）——有区域被读重了"
         );
     }
 }

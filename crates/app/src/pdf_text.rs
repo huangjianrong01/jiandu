@@ -683,6 +683,287 @@ fn cluster(chunks: Vec<Chunk>, page_h: f64) -> Vec<SourceRegion> {
         .collect()
 }
 
+// ───────────────────────── 左图框选 → 补入右文 ─────────────────────────
+
+/// 左图拖出来的矩形（**原图自然坐标**，与 [`SourceRegion`] 同单位同原点）。
+///
+/// 恒满足 `x0 <= x1`、`y0 <= y1`：拖选有四个方向，存的时候一律归一，后面
+/// 判断「交叠」就不必再写四遍 `min/max`——那种地方最容易漏一个方向。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PickRect {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+impl PickRect {
+    pub fn new(ax: f32, ay: f32, bx: f32, by: f32) -> Self {
+        Self {
+            x0: ax.min(bx),
+            y0: ay.min(by),
+            x1: ax.max(bx),
+            y1: ay.max(by),
+        }
+    }
+
+    pub fn width(&self) -> f32 {
+        self.x1 - self.x0
+    }
+
+    pub fn height(&self) -> f32 {
+        self.y1 - self.y0
+    }
+
+    /// 是不是「一下就松手」的点按（不是拖）。
+    ///
+    /// 阈值取 3pt：Retina 上人手最稳的一次点击也会抖 1–2 个设备像素，折成
+    /// 页面的点不足 1；3 是「确实想拖」的下限。
+    pub fn is_tap(&self) -> bool {
+        self.width() < 3.0 && self.height() < 3.0
+    }
+}
+
+/// 一维交叠长度（负数/无交叠 → 0）。
+fn overlap(a0: f32, a1: f32, b0: f32, b1: f32) -> f32 {
+    (a1.min(b1) - a0.max(b0)).max(0.0)
+}
+
+/// 点到区间 `[lo, hi]` 的距离（区间内为 0）。
+fn edge_gap(lo: f32, hi: f32, v: f32) -> f32 {
+    if v < lo {
+        lo - v
+    } else if v > hi {
+        v - hi
+    } else {
+        0.0
+    }
+}
+
+/// 拖选命中了哪些区域（返回下标，保持入参顺序）。
+///
+/// 两条判据，**都是「够到一半就算」**：
+///
+/// * 点按（矩形退化成点）→ 只要点落在区域里。手点一处就该取那一列/那一行，
+///   不需要「点满一行宽」。
+/// * 拖拉 → **横跨方向**（竖排列取 x、横排行取 y）压住该区域的一半以上，且
+///   沿读向有交叠。这样「在一列里从上拉到下」取到整列，而手指抖出去一点点
+///   蹭到隔壁列时不会把隔壁也捎上——按面积比判断就会，一列才 18pt 宽，蹭 4pt
+///   已经 22% 了。
+pub fn pick_indices(regions: &[SourceRegion], rect: PickRect) -> Vec<usize> {
+    // 点按：只取**一处**。
+    //
+    // 为什么不用「点在框内」：竖排一列的宽度只有字号那么大，列与列之间还有
+    // 字距缝（实测 13pt 宽），鼠标正好落进缝里就什么也选不中——「点了没反应」
+    // 是最差的交互。所以按**离哪一列最近**判定：
+    //   ① 沿读向必须落在这条的跨度内（±半个字），隔着一大截的不算相关；
+    //   ② 横跨方向取到方框的**边距**（不是中心距）——中心距会惩罚宽框，
+    //      横排页里一条长行反而比短行更「远」；
+    //   ③ 边距超过一个字身就不算（点空白处不该选中两三列以外的字）。
+    if rect.is_tap() {
+        let (px, py) = (rect.x0, rect.y0);
+        let mut best: Option<(usize, f32)> = None; // (下标, 边距)
+        for (i, g) in regions.iter().enumerate() {
+            if !(g.w > 0.0) || !(g.h > 0.0) {
+                continue;
+            }
+            let tall = g.h >= g.w;
+            let pad = g.w.min(g.h) * 0.5;
+            let along_hit = if tall {
+                py >= g.y - pad && py <= g.y + g.h + pad
+            } else {
+                px >= g.x - pad && px <= g.x + g.w + pad
+            };
+            if !along_hit {
+                continue;
+            }
+            let cross = if tall {
+                edge_gap(g.x, g.x + g.w, px)
+            } else {
+                edge_gap(g.y, g.y + g.h, py)
+            };
+            if cross > g.w.min(g.h) {
+                continue;
+            }
+            if best.map(|(_, bd)| cross < bd).unwrap_or(true) {
+                best = Some((i, cross));
+            }
+        }
+        return best.map(|(i, _)| vec![i]).unwrap_or_default();
+    }
+
+    let mut out = Vec::new();
+    for (i, g) in regions.iter().enumerate() {
+        if !(g.w > 0.0) || !(g.h > 0.0) {
+            continue;
+        }
+        let tall = g.h >= g.w; // 竖排的一列：横跨方向是 x
+        let hit = if tall {
+            overlap(g.x, g.x + g.w, rect.x0, rect.x1) >= g.w * 0.5
+                && overlap(g.y, g.y + g.h, rect.y0, rect.y1) > 0.0
+        } else {
+            overlap(g.y, g.y + g.h, rect.y0, rect.y1) >= g.h * 0.5
+                && overlap(g.x, g.x + g.w, rect.x0, rect.x1) > 0.0
+        };
+        if hit {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// 去掉 PDF 文本层里的**排版噪声**：PDFKit 在竖排页每两个字之间插一个 `\n`，
+/// 逐字落笔的 PDF 还会带空格。这些字符在原图里是「换行」，在我们这儿是垃圾。
+fn strip_layer_noise(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !c.is_whitespace()
+                && !matches!(*c, '\u{200B}'..='\u{200D}' | '\u{FEFF}')
+        })
+        .collect()
+}
+
+/// 中位数（就地排序；空集 → 0）。
+fn median_f32(mut v: Vec<f32>) -> f32 {
+    v.retain(|x| x.is_finite());
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[v.len() / 2]
+}
+
+/// 把选中的区域按**阅读顺序**拼成一段可直接插入正文的文字。
+///
+/// 这是「在左图框一段 → 补进右文」的最后一步，判据全部来自几何：
+///
+/// ① **方向**：选中区域的中位宽高比。竖排一列又高又窄（w/h 远小于 1），横排
+///    一行又扁又宽（远大于 1）。0.85 是两者的分界——字形本身是方的，取 1 会
+///    让「一列只有两三个字」的短列被误判成横排。
+/// ② **分列/分行**：沿横跨方向聚类，容差半个字宽（列）/ 半个字高（行）。先排序
+///    再聚类，所以列内顺序天然是 y 升序（`SourceRegion.y` 已是 y 向下）。
+/// ③ **列序**：竖排**右 → 左**（古籍读法），横排**上 → 下**。
+/// ④ **换行**：行内黏连（竖排的换列、横排的换行都只是视觉折行，不是分段），
+///    只有当间距超过 1.6 倍字格时才算分段、补一个 `\n`。
+///
+/// 不合任何一条就会读出「倒序」「串行」——校对时那比不补更糟。
+pub fn join_picked(regions: &[SourceRegion], idx: &[usize]) -> String {
+    let sel: Vec<&SourceRegion> = idx
+        .iter()
+        .filter_map(|&i| regions.get(i))
+        .filter(|r| r.w > 0.0 && r.h > 0.0 && !strip_layer_noise(&r.text).is_empty())
+        .collect();
+    if sel.is_empty() {
+        return String::new();
+    }
+
+    let vertical = {
+        let ratio = median_f32(
+            sel.iter()
+                .filter(|r| r.h > 0.0)
+                .map(|r| r.w / r.h)
+                .collect(),
+        );
+        ratio < 0.85
+    };
+
+    // ④ 的基准：竖排按字高、横排按字宽。
+    let along_size = median_f32(
+        sel.iter()
+            .map(|r| if vertical { r.h } else { r.w })
+            .collect(),
+    );
+    let cross_size = median_f32(
+        sel.iter()
+            .map(|r| if vertical { r.w } else { r.h })
+            .collect(),
+    );
+    let para_gap = along_size * 1.6;
+    let block_gap = cross_size * 1.6;
+
+    // ② 分列 / 分行。
+    let mut items: Vec<&SourceRegion> = sel;
+    items.sort_by(|a, b| {
+        let (ka, kb) = if vertical { (a.x, b.x) } else { (a.y, b.y) };
+        ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let tol = cross_size.max(0.5) * 0.5;
+    let mut groups: Vec<Vec<&SourceRegion>> = Vec::new();
+    let mut anchor = f32::NAN;
+    for r in items {
+        let key = if vertical { r.x } else { r.y };
+        if groups.is_empty() || (key - anchor).abs() > tol {
+            groups.push(Vec::new());
+            anchor = key;
+        }
+        if let Some(g) = groups.last_mut() {
+            g.push(r);
+        }
+    }
+    // 组内：竖排上→下（y 升序）、横排左→右（x 升序）。
+    for g in &mut groups {
+        g.sort_by(|a, b| {
+            let (ka, kb) = if vertical { (a.y, b.y) } else { (a.x, b.x) };
+            ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    // ③ 列序：竖排右→左（x 降序）。
+    if vertical {
+        groups.reverse();
+    }
+
+    // 拼。
+    let mut out = String::new();
+    for (gi, g) in groups.iter().enumerate() {
+        if gi > 0 {
+            // 组间：竖排看「上一列的左缘」与本列右缘的水平缝，横排看竖直缝。
+            let prev = &groups[gi - 1];
+            let gap = match (prev.last(), g.first()) {
+                (Some(p), Some(c)) => {
+                    if vertical {
+                        p.x - (c.x + c.w)
+                    } else {
+                        c.y - (p.y + p.h)
+                    }
+                }
+                _ => 0.0,
+            };
+            if gap > block_gap {
+                out.push('\n');
+            }
+        }
+        let mut last_end: Option<f32> = None;
+        for r in g {
+            let (start, end) = if vertical { (r.y, r.y + r.h) } else { (r.x, r.x + r.w) };
+            if let Some(pe) = last_end {
+                if start - pe > para_gap {
+                    out.push('\n');
+                }
+            }
+            out.push_str(&strip_layer_noise(&r.text));
+            last_end = Some(end);
+        }
+    }
+    // 收尾：去掉首尾空行、把连续空行压成一个（PDF 里空行很常见）。
+    let mut cleaned = String::with_capacity(out.len());
+    let mut last_was_nl = true; // 首部的换行一律丢掉
+    for c in out.chars() {
+        if c == '\n' {
+            if !last_was_nl {
+                cleaned.push('\n');
+                last_was_nl = true;
+            }
+        } else {
+            cleaned.push(c);
+            last_was_nl = false;
+        }
+    }
+    while cleaned.ends_with('\n') {
+        cleaned.pop();
+    }
+    cleaned
+}
+
 /// 手写一个最小 PDF，`rotate` 控制页面字典里的 `/Rotate`。
 ///
 /// 为什么不用 `render_pdf_blocking`：那条路产出的样张**没有 /Rotate**，
@@ -723,6 +1004,104 @@ pub(crate) fn tiny_pdf(rotate: i32) -> Vec<u8> {
         xref_at
     ));
     out.into_bytes()
+}
+
+/// 框选与拼接的回归（**不 gate 平台**：这些是纯几何，任何平台都该跑）。
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    fn reg(x: f32, y: f32, w: f32, h: f32, text: &str) -> SourceRegion {
+        SourceRegion {
+            x,
+            y,
+            w,
+            h,
+            text: text.to_string(),
+        }
+    }
+
+    /// 竖排三列：右起 300 / 260 / 220，各一列字。
+    fn vertical_page() -> Vec<SourceRegion> {
+        vec![
+            reg(300.0, 100.0, 18.0, 200.0, "甲乙"),
+            reg(260.0, 100.0, 18.0, 200.0, "丙丁"),
+            reg(220.0, 100.0, 18.0, 200.0, "戊己"),
+        ]
+    }
+
+    /// 框住右边两列：第三列只压住 44%（不足一半），必须被排除。
+    ///
+    /// 这条守的是「手指抖出去一点不能把隔壁列也捎上」——按面积比算就会中招，
+    /// 因为一列只有 18pt 宽，蹭 4pt 已经 22%。
+    #[test]
+    fn drag_picks_only_columns_covered_by_half() {
+        let regions = vertical_page();
+        let rect = PickRect::new(232.0, 90.0, 320.0, 320.0);
+        let idx = pick_indices(&regions, rect);
+        assert_eq!(idx, vec![0, 1], "应只选中右边两列，实得 {idx:?}");
+    }
+
+    /// 点按只取一处，且是离得最近的那一列。
+    #[test]
+    fn tap_picks_the_nearest_column() {
+        let regions = vertical_page();
+        // 落在第二列（260..278）左侧的列缝里：到第二列的边距 8，到第三列（..238）
+        // 的边距 14，所以应选第二列。
+        let idx = pick_indices(&regions, PickRect::new(252.0, 200.0, 252.0, 200.0));
+        assert_eq!(idx, vec![1], "点按应选中最近的一列，实得 {idx:?}");
+        // 按在页面外的空白处：一个字身之外什么都不该选中。
+        assert!(pick_indices(&regions, PickRect::new(40.0, 200.0, 40.0, 200.0)).is_empty());
+    }
+
+    /// 竖排：列序必须是**右 → 左**，否则读出来整段倒着。
+    #[test]
+    fn vertical_columns_are_joined_right_to_left() {
+        let regions = vertical_page();
+        let idx = pick_indices(&regions, PickRect::new(210.0, 90.0, 320.0, 320.0));
+        let text = join_picked(&regions, &idx);
+        assert_eq!(text, "甲乙丙丁戊己", "竖排应从右往左读，实得 {text:?}");
+    }
+
+    /// 横排：行序上 → 下，行内左 → 右。
+    #[test]
+    fn horizontal_rows_are_joined_top_to_bottom() {
+        let regions = vec![
+            reg(100.0, 140.0, 200.0, 18.0, "丙丁"),
+            reg(100.0, 100.0, 200.0, 18.0, "甲乙"),
+        ];
+        let idx = pick_indices(&regions, PickRect::new(90.0, 90.0, 310.0, 170.0));
+        let text = join_picked(&regions, &idx);
+        assert_eq!(text, "甲乙丙丁", "横排应从上往下读，实得 {text:?}");
+    }
+
+    /// PDFKit 在竖排页每两个字之间插一个 `\n`；这些不是分段，必须去掉。
+    #[test]
+    fn layer_newlines_are_stripped_out() {
+        let regions = vec![reg(300.0, 100.0, 18.0, 200.0, "甲\n乙\n丙")];
+        let text = join_picked(&regions, &[0]);
+        assert_eq!(text, "甲乙丙", "排版噪声没清掉：{text:?}");
+    }
+
+    /// 列间距明显大于字格（中间空出一整行）才算分段。
+    #[test]
+    fn wide_gap_starts_a_new_paragraph() {
+        let regions = vec![
+            reg(300.0, 100.0, 18.0, 200.0, "甲乙"),
+            reg(200.0, 100.0, 18.0, 200.0, "丙丁"),
+        ];
+        let text = join_picked(&regions, &[0, 1]);
+        assert_eq!(text, "甲乙\n丙丁", "大间距应分段，实得 {text:?}");
+    }
+
+    /// 空输入一律空串，绝不 panic（扫描件没有文本层就是这条路径）。
+    #[test]
+    fn nothing_picked_means_empty_text() {
+        assert_eq!(join_picked(&[], &[]), "");
+        let regions = vertical_page();
+        assert_eq!(pick_indices(&regions, PickRect::new(0.0, 0.0, 10.0, 10.0)), Vec::<usize>::new());
+        assert_eq!(join_picked(&regions, &[]), "");
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
