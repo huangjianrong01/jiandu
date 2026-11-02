@@ -502,6 +502,16 @@ pub struct Root {
     /// **只存下标不存枚举**：越界一律按 0 处理（`style_tab_idx()`），
     /// 老存档 / 调试钩子给个野值也不会把面板渲染成空白。
     pub style_tab: u8,
+    /// **冻结的叶码**（v1.9.41）：`(当前叶, 总叶数)`。
+    ///
+    /// 版字面板开着的时候，用户每点一次列数 / 字级 / 字体，全书就要重排
+    /// 一遍——叶数变了、当前叶也跟着换号，底部那行「第 X 葉」于是在眼皮
+    /// 底下**一帧一个数**地跳。读的人是拿它当坐标感的，跳一次就丢一次视线。
+    ///
+    /// 所以面板一开就把这一刻的叶码冻住，面板关掉再解冻：期间书怎么重排，
+    /// 底下那行字纹丝不动；松手那一刻（此刻锚点已经回位）才换成新的坐标。
+    /// `None` = 没冻，照常显示实时叶码。
+    pub page_frozen: Option<(usize, usize)>,
     /// 专注模式：隐藏工具栏、状态栏与目录，沉浸阅读。
     pub focus_mode: bool,
     /// 顶栏是否已滑出（v1.26.0「沉浸式古风化」）。
@@ -828,6 +838,14 @@ pub struct Root {
     /// 只作**进程内**记忆（不落盘）——语速是临时偏好，重启回到 1.0 无伤大雅；
     /// 也免得为它动 `Prefs` 的存档迁移。
     pub tts_rate: f32,
+    /// **「聽書」浮层**开着没（v1.9.41）。
+    ///
+    /// 语速原先挂在「版字」面板第一屏，和列数、纸色挤在一张纸上——那是一张
+    /// 「怎么排」的纸，语速却是「怎么听」的事。现在点「听」才浮出这张小卡：
+    /// 读什么、多快、停不停，三件事都在这一处，关掉就散。
+    pub show_tts: bool,
+    /// 听书浮层上那行「读的是什么」：`本葉`（无选区连读）或 `所選`。
+    pub tts_scope: String,
     /// 改键失败的一句话（冲突 / 不可用），显示到下次改键为止。
     pub key_hint: Option<String>,
     /// **文本量化分析抽屉**开着没（v1.81.0 · 模块五）。
@@ -1368,6 +1386,7 @@ impl Root {
             bookmarks_scroll: ScrollHandle::new(),
             show_style: false,
             style_tab: 0,
+            page_frozen: None,
             focus_mode: false,
             bar_shown: true,
             zoom: 1.0,
@@ -1468,6 +1487,8 @@ impl Root {
             png_ratio: prefs.png_ratio,
             style_presets: Vec::new(),
             tts_rate: 1.0,
+            show_tts: false,
+            tts_scope: String::new(),
             key_hint: None,
             show_analysis: false,
             analysis_tab: AnalysisTab::Char,
@@ -1683,6 +1704,10 @@ impl Root {
         if let Ok(v) = std::env::var("JIANDU_PANEL") {
             if v == "more" || v.starts_with("more:") {
                 root.more_menu = true;
+                // 「更多」长在顶栏上，而顶栏在专注模式里不画——截图核对时
+                // 先把顶栏叫出来，否则永远拍不到这张菜单。
+                root.focus_mode = false;
+                root.bar_shown = true;
                 // 开发用：`JIANDU_PANEL=more:1` 同时展开第 1 组子菜单（截图核对）。
                 if let Some(g) = v.split_once(':').and_then(|(_, n)| n.parse::<usize>().ok()) {
                     root.more_group = Some(g);
@@ -1828,6 +1853,11 @@ impl Root {
             // 专注模式下这张纸不渲染（顶栏都收起来了），调试开面板就先出专注。
             root.focus_mode = false;
         }
+        // 开发用：直接摊开「聽書」小卡（截图核对版式）。
+        if std::env::var("JIANDU_TTS_OPEN").is_ok() {
+            root.show_tts = true;
+            root.focus_mode = false;
+        }
         // 开发用：直接翻到「版字」某一页签（0 版式 / 1 装帧 / 2 校勘），
         // 便于逐页截图核对（合成点击被 TCC 拦，只能从启动参数进）。
         if let Ok(v) = std::env::var("JIANDU_STYLE_TAB") {
@@ -1937,16 +1967,22 @@ impl Root {
     ///   3. 换**批注**字体（永远与正文不同体，见 `FontPreset::note_choice`）；
     ///   4. **重算尺寸**（`fit_sizes`）——行高 / 行数 / 字号全部重算。
     pub fn set_font(&mut self, c: FontChoice) {
-        match self.script {
-            Script::Ancient => self.font_ancient = c,
-            Script::Modern => self.font_modern = c,
-        }
-        // 楷体是「写体」，行间要更松（`preset_line_scale`）；其余按匠体排。
-        self.font_preset = FontPreset::for_main(c);
-        let preset = self.font_preset;
-        self.font_note = preset.note_choice();
-        self.grid.line_scale = crate::fonts::preset_line_scale(preset);
-        self.fit_sizes();
+        // v1.9.41：换字体 = 换行高 = 换行数 = 整本重排，页码必变。
+        // 走 `resort_keeping_place`：改之前记下这一叶的首字，重排之后按
+        // 「那个字现在落在第几叶」回位。不这样做就是用户报的
+        // 「点一下字体，底下的书忽然翻走了」。
+        self.resort_keeping_place(|s| {
+            match s.script {
+                Script::Ancient => s.font_ancient = c,
+                Script::Modern => s.font_modern = c,
+            }
+            // 楷体是「写体」，行间要更松（`preset_line_scale`）；其余按匠体排。
+            s.font_preset = FontPreset::for_main(c);
+            let preset = s.font_preset;
+            s.font_note = preset.note_choice();
+            s.grid.line_scale = crate::fonts::preset_line_scale(preset);
+            s.fit_sizes();
+        });
         self.persist();
     }
 
@@ -2529,9 +2565,14 @@ impl Root {
             }
             if cols != self.grid.columns {
                 // 换档 = 整本重排、页码全变。记下当前页首字，等新页排好再回找
-                // （此处几何还是旧的，`layout_pages` 会按旧列数算，锚点才准）。
+                // （此处几何还是旧的，锚点才准）。
+                //
+                // v1.9.41：锚点改走 `page_at`（只排当前章）。`page_anchor()`
+                // 是「整本排一遍」，自动档每跨一次档就白排一次全书。
                 if self.pending_anchor.is_none() {
-                    self.pending_anchor = self.page_anchor();
+                    self.pending_anchor = self.page_at(self.page).and_then(|p| {
+                        p.glyphs.first().map(|g| (g.chapter, g.para, g.offset))
+                    });
                 }
                 self.grid.columns = cols;
                 // 版式键跟着走，面板上那一档才会亮。
@@ -2673,15 +2714,17 @@ impl Root {
         if self.layout_key == cfg.key {
             return; // 同一档，跳过无谓重排
         }
-        // 锚点：当前页第一个字（段首缩进占位也算），切版前后都用它定位。
-        let anchor = self.page_anchor();
-        self.layout_key = cfg.key;
-        self.grid.columns = cfg.columns;
-        self.grid.dir = cfg.dir;
-        self.grid.margin = cfg.margin;
-        self.fit_sizes();
-        self.restore_anchor(anchor);
-        self.sync_current_chapter();
+        // v1.9.41：锚点改走 `resort_keeping_place`——**逐章取、逐章找**，
+        // 原来这一对 `page_anchor` / `restore_anchor` 是「整本排两遍再线性
+        // 扫」，三百万字的书一点列数就白卡 0.6s，页还得跳两下。
+        // 现在是「取当前章首字 → 重排 → 逐章推进找回」，一叶之内落定。
+        self.resort_keeping_place(|s| {
+            s.layout_key = cfg.key;
+            s.grid.columns = cfg.columns;
+            s.grid.dir = cfg.dir;
+            s.grid.margin = cfg.margin;
+            s.fit_sizes();
+        });
     }
 
     /// 当前页首字的 **charIndex 锚点**（章, 段, 偏移）。
@@ -2918,15 +2961,15 @@ impl Root {
         if self.layout_mode == mode {
             return;
         }
-        let anchor = self.page_anchor();
-        self.layout_mode = mode;
-        // 手动选模式即视为「不再自动响应屏幕」——否则下一帧 `fit_sizes`
-        // 又按宽高比把它改回去，面板上的选择看着像没生效。
-        // 想回到自动，重新打开「自动版式」开关即可。
-        self.auto_duplex = false;
-        self.fit_sizes();
-        self.restore_anchor(anchor);
-        self.sync_current_chapter();
+        // v1.9.41：同 `set_layout`，锚点走逐章路径（整页 ↔ 单叶也改行款）。
+        self.resort_keeping_place(|s| {
+            s.layout_mode = mode;
+            // 手动选模式即视为「不再自动响应屏幕」——否则下一帧 `fit_sizes`
+            // 又按宽高比把它改回去，面板上的选择看着像没生效。
+            // 想回到自动，重新打开「自动版式」开关即可。
+            s.auto_duplex = false;
+            s.fit_sizes();
+        });
         self.notice = format!(
             "版式：{}（{}）· {} 列",
             mode.label(),
@@ -2992,10 +3035,20 @@ impl Root {
     /// （见 `crate::grid::top_frac_for`），行款字数不受影响——这一档只管
     /// 「文字区占多宽」，不管「一行几字」。
     ///
-    /// 几何在下一帧 `fit_sizes` 重算（分页只数字数，不随宽度变，故不必
-    /// 保锚重排）；偏好**读-改-写**落盘，老存档其余字段不受影响。
+    /// 几何在下一帧 `fit_sizes` 重算；偏好**读-改-写**落盘，老存档其余字段不受影响。
+    ///
+    /// v1.9.41：**必须保锚**。原注释说「分页只数字数，不随宽度变，故不必
+    /// 保锚重排」——那是错的：版心率反过来定列宽，列宽定字号，字号定行高，
+    /// 行高一变每列字数就变，全书页码跟着变。切一档留白，页码照样跳。
     pub fn set_banxin_ratio(&mut self, ratio: f32) {
-        self.banxin_ratio = ratio.clamp(0.35, 1.0);
+        let ratio = ratio.clamp(0.35, 1.0);
+        if (self.banxin_ratio - ratio).abs() < 0.005 {
+            return;
+        }
+        self.resort_keeping_place(|s| {
+            s.banxin_ratio = ratio;
+            s.fit_sizes();
+        });
         let mut prefs = crate::prefs::Prefs::load();
         prefs.margin_tier = crate::grid::BANXIN_RATIOS
             .iter()
@@ -3183,16 +3236,23 @@ impl Root {
                 // 档案恢复），不再先落书衣封面——翻书就该回到原处。
                 // （v1.37.0 UI 瘦身撤掉了阅读页工具栏那枚「封面」，
                 //  书衣只在书架这一侧看了。）
-                // ★ 默认专注模式（v1.9.40）：
-                //   从书架进阅读，直接就是**满屏一叶**——工具栏、留白一概让开，
-                //   第一眼看到的是书，不是软件。退出只有两条路：Esc 或右上角
-                //   那枚极小的 ✕（见 `render_focus_exit`），退出后顶栏才回来。
+                // ★ 自动专注（v1.9.41）：**先看这一叶有没有字**。
                 //
-                //   ⚠️ 状态**只在这里置真**，别处一律只做「取反」或「置假」。
-                //   若在 render / fit_sizes 里按版面反推 focus_mode，就会形成
-                //   「设 true → 几何变 → 再设 true」的重绘死循环。单向触发是
-                //   硬规矩。
-                self.focus_mode = true;
+                // v1.9.40 是一律置真——从书架点进来就满屏一叶。可「专注」得
+                // 先有可专注的东西：扫描件还没 OCR、空卷、坏书，进去只有一张
+                // 白纸，连工具栏都收走了，用户只会以为书打不开。现在先排一次
+                // 页，这一叶**真有字**才进净室；没字就把界面留着（提示行、
+                // 顶栏、状态栏都在），该怎么补救一目了然。
+                //
+                // 退出仍只有两条路：Esc 或面板里那枚「退出專注」。
+                //
+                // ⚠️ 状态**只在这里置真**，别处一律只做「取反」或「置假」。
+                // 若在 render / fit_sizes 里按版面反推 focus_mode，就会形成
+                // 「设 true → 几何变 → 再设 true」的重绘死循环。单向触发是
+                // 硬规矩。
+                let leaves = self.paginate();
+                let leaf_chars = leaves.get(self.page).map_or(0, |g| g.len());
+                self.focus_mode = leaf_chars > 0;
                 self.bar_shown = false;
                 self.close_transient_ui();
                 self.screen = Screen::Reading;
@@ -3204,7 +3264,10 @@ impl Root {
                 // v1.9.38：开卷即在读——这一叶也算今日读过的（同一叶一天
                 // 只记一次，所以反复开关同一本书不会把账刷上去）。
                 // 旧进度若比现有页数大（换过字号 / 版式），一叶不记。
-                if self.page_count() > 0 && self.page <= self.max_page() {
+                //
+                // v1.9.41：上面这一次 `paginate()` 就够——原先是
+                // `page_count()` + `max_page()` 各排一遍，开一本大书白排两次。
+                if self.page < leaves.len() {
                     self.count_leaf(self.page);
                 }
                 self.persist();
@@ -5037,7 +5100,16 @@ fn anki_push_card(
     /// `zoom` 存的是倍率，档位由 `ZoomLevel::from_zoom` 反推，
     /// 所以这里只需把倍率落到该档的 `factor()` 上，排版下一帧自动重算。
     pub fn set_zoom_level(&mut self, lvl: crate::types::ZoomLevel) {
-        self.zoom = lvl.factor();
+        if (self.zoom - lvl.factor()).abs() < 1e-4 {
+            return;
+        }
+        // v1.9.41：字级一动，行高、行数、字号全变——必须**先记字、后重排、
+        // 再回位**。原来这里只写一行 `self.zoom`，靠下一帧 `fit_sizes`
+        // 自己重排，页码于是从眼皮底下跳走（用户报的「切字级，书翻了」）。
+        self.resort_keeping_place(|s| {
+            s.zoom = lvl.factor();
+            s.fit_sizes();
+        });
         self.notice = format!("字级：{}（{}）", lvl.ancient_name(), lvl.label());
         self.persist();
     }
@@ -5060,6 +5132,9 @@ fn anki_push_card(
             return;
         }
         self.zoom = next;
+        // v1.9.41：⌘+ / ⌘- 与四档写同一个倍率，也就同样要保锚——连按几下
+        // 不该把读的那一叶按丢。
+        self.resort_keeping_place(|s| s.fit_sizes());
         self.notice = format!(
             "字级：{}（{}）",
             pct,
@@ -5323,6 +5398,9 @@ fn anki_push_card(
         // v1.80.0：「更多」下拉同理（导出六条 + 说明都住在里面）。
         self.export_menu = false;
         self.more_menu = false;
+        // v1.9.41：聽書卡**不**在这里收——它是「正在出声」的控制器，
+        // 顺手开一下版字就把这块停表的界面抹掉，用户会找不到「停」。
+        // 它只认自己的「停 / ×」与 Esc。
     }
 
     /// 全局 UI 状态机：同一时刻只开一个顶层面板，并强制关闭所有底层瞬态浮层。
@@ -5414,6 +5492,9 @@ fn anki_push_card(
             || self.note_zoom.is_some()
             || self.note_menu.is_some()
             || self.note_editing
+            // v1.9.41：聽書卡也是浮层。摊着时点卡片外沿，只该收卡，
+            // 不该让底下的书翻过去。
+            || self.show_tts
     }
 
     /// 呼出**左侧栏**（v1.79.0）：从左侧平滑滑出 260px 的抽屉。

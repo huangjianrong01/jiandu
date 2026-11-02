@@ -36,6 +36,11 @@ pub enum Action {
     SearchNext,
     SearchPrev,
     Lookup,
+    /// **聽書（朗读本叶 / 选区）**（v1.9.41）：开读并浮出语速卡。
+    ///
+    /// 原来语速住在「版字」面板里、读起来却没个统一入口；给一个键，读到
+    /// 一半想听就按一下，卡跟着出来。
+    Tts,
     Copy,
     Underline,
     Notes,
@@ -100,11 +105,12 @@ pub enum Action {
 
 impl Action {
     /// 面板渲染顺序 = 这份数组的顺序（分组靠 [`Action::section`] 相邻聚拢）。
-    pub const ALL: [Action; 41] = [
+    pub const ALL: [Action; 42] = [
         Action::Search,
         Action::SearchNext,
         Action::SearchPrev,
         Action::Lookup,
+        Action::Tts,
         Action::Copy,
         Action::Underline,
         Action::Notes,
@@ -151,6 +157,7 @@ impl Action {
             Action::SearchNext => "search_next",
             Action::SearchPrev => "search_prev",
             Action::Lookup => "lookup",
+            Action::Tts => "tts",
             Action::Copy => "copy",
             Action::Underline => "underline",
             Action::Notes => "notes",
@@ -204,6 +211,7 @@ impl Action {
             Action::SearchNext => "下一处命中",
             Action::SearchPrev => "上一处命中",
             Action::Lookup => "查字（选区或本页首字）",
+            Action::Tts => "聽書：朗讀本葉（並調語速）",
             Action::Copy => "复制（有选区复制选区，否则整页）",
             Action::Underline => "划线（有选区划选区）",
             Action::Notes => "注释显隐",
@@ -251,6 +259,7 @@ impl Action {
             | Action::SearchNext
             | Action::SearchPrev
             | Action::Lookup
+            | Action::Tts
             | Action::Copy
             | Action::Underline
             | Action::Notes
@@ -302,6 +311,8 @@ impl Action {
             Action::SearchNext => "cmd+shift+g",
             Action::SearchPrev => "cmd+alt+g",
             Action::Lookup => "cmd+g",
+            // ⌘⌥Y：「听」的键。⌘Y 已归「通假显隐」，故走 ⌘⌥ 这一族。
+            Action::Tts => "cmd+alt+y",
             Action::Copy => "cmd+c",
             Action::Underline => "cmd+u",
             Action::Notes => "cmd+n",

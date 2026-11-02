@@ -551,23 +551,23 @@ fn zhu_dashed(w: f32, color: u32) -> Div {
     row
 }
 
-/// 面板的「收起」：两字，无底无框，悬停转朱砂。
+/// 面板的「收起」：一枚极小的 ×，无底无框。
 /// （原来那枚灰底「关闭」按钮，是面板里最像网页控件的一颗。）
 fn panel_close(t: Theme) -> Div {
+    // v1.9.41：用户第三次点名这枚钮。上一版是小写 x + 55% 淡墨，仍被读成
+    // 「硬邦邦的叉」——问题不在字形在**体量**：11.5px 的拉丁字母 x 在宋体里
+    // 是个实心小方块。现在换成真正的乘号「×」（U+00D7，Latin-1 补给区，
+    // 任何中文字体都有字形，不像 U+2715 那样可能被画成零宽），字号再收一档，
+    // 颜色向纸色掺到 30%——退场记号该淡到几乎只是纸上一点灰；
+    // 悬停只**轻微加深**（不转朱砂：朱砂是选中色，不该被一枚关闭钮借走）。
     div()
-        .px(px(5.0))
-        .py(px(2.0))
+        .px(px(6.0))
+        .py(px(1.0))
         .cursor_pointer()
-        .text_size(px(12.5))
-        // v1.85.0：大写 X 太抢眼（用户点名「突兀」）。改**小写 x**、字号收小一档，
-        // 墨色向纸色掺到 55%——退场记号该淡到几乎看不见，不该喧宾夺主。
-        // 悬停时才转朱砂，一眼能找回来。
-        .text_color(rgb(jiandu_core::theme::mix(t.paper(), t.ink_soft(), 0.55)))
-        .hover(|s| s.text_color(rgb(sheet_zhu(t))))
-        // ⚠️ 仍是 ASCII：U+2715（✕）/ U+00D7（×）在本机中文 UI 字体里可能没有
-        // 字形，会被画成零宽——按钮在、字不见，等于没有关闭入口。小写 x 任何
-        // 字体都有（v1.64.0 用 ✕ 踩过这个坑，别再踩）。
-        .child(SharedString::from("x"))
+        .text_size(px(10.0))
+        .text_color(rgb(jiandu_core::theme::mix(t.paper(), t.ink_soft(), 0.30)))
+        .hover(|s| s.text_color(rgb(jiandu_core::theme::mix(t.paper(), t.ink_soft(), 0.62))))
+        .child(SharedString::from("×"))
 }
 
 /// 面板的**选项文字**：整块面板的基本单位。
@@ -581,6 +581,15 @@ fn ink_option(label: &str, on: bool, t: Theme) -> Div {
         .flex_col()
         .items_center()
         .gap(px(2.0))
+        // v1.9.41：**选中态加一层极淡朱底 + 通宽朱砂底边**。
+        // 原先只有一道 16px 的短红线，字号一小（11.5）就埋进字缝里，扫一眼
+        // 分不清哪一枚是当下这一档。现在底色只掺 7% 朱砂——近看是纸微微泛
+        // 暖，远看是一格被圈住了；底边通宽，比短横更像「压了一条朱线」。
+        // 内白常驻（有无选中都一样），所以点选不会把旁边几枚挤走。
+        .px(px(6.0))
+        .pt(px(1.0))
+        .rounded(px(2.0))
+        .when(on, |d| d.bg(rgba((sheet_zhu(t) << 8) | 0x12)))
         .cursor_pointer()
         .text_color(rgb(fg))
         .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
@@ -588,15 +597,15 @@ fn ink_option(label: &str, on: bool, t: Theme) -> Div {
         // 为它开一条 `String → &'static str` 的泄漏通道不值得（面板上
         // 至多十来张牌，一份 SharedString 而已）。
         .child(div().text_size(px(12.0)).child(SharedString::from(label.to_string())))
-        // 写匠风：选中只压一道**微弱朱砂红线**，不描框、不填底——像在书眉
-        // 上圈了一个字，而不是按下一枚控制台按钮。
+        // 写匠风：选中的那枚，字下压一道**通宽朱线**；未选中的留白占位。
         .child(
             div()
                 .h(px(3.0))
+                .w_full()
                 .flex()
                 .justify_center()
                 .child(if on {
-                    div().w(px(16.0)).h(px(1.0)).bg(rgb(sheet_zhu(t)))
+                    div().w_full().h(px(1.5)).bg(rgb(sheet_zhu(t)))
                 } else {
                     div().w(px(16.0)).h(px(2.0))
                 }),
@@ -1120,6 +1129,13 @@ pub(crate) const COLUMN_OPTS: [(&str, Option<usize>); 5] = [
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MoreAct {
+    /// **出图比例循环**（v1.9.41）：随纸面 → 九比十六 → 方 → 三比四。
+    ///
+    /// 原先住在版字面板第一行，用四枚小字平铺选；现在收进「更多 → 出」的
+    /// 一条菜单里，点一下换下一档，标签上就写着当前是哪一档。
+    RatioCycle,
+    /// **批量出图（本章）**（v1.9.41）：原版字面板「批」那一行。
+    BatchPng,
     /// 导出当前页 PNG：截原屏，带纸面、界栏与朱批。
     PngLeaf,
     /// 循环「出图时间」三档（古风 → 公历 → 关）。
@@ -1823,6 +1839,53 @@ impl Root {
             );
         }
 
+        // ---- 聽：阅读界面正下方一枚小图标（v1.9.41）----
+        //
+        // 用户口径：听不能只藏在「框选文字 → 工具条 → 听」里——不选字想听
+        // 整叶，还得先划一道，太绕。纸面正下方放一枚「聽」，点一下调出语速
+        // 卡并开始读；再点一下（或按卡上的「停」）收声收卡。
+        //
+        // 位置：专注模式贴纸底（7px），常规模式抬到页码条之上（26px）——
+        // 两种模式都不压正文，也不跟藏书印抢那一角。
+        let tts_y = if self.focus_mode { 7.0 } else { 26.0 };
+        root = root.child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(tts_y))
+                .flex()
+                .flex_row()
+                .justify_center()
+                .child(
+                    div()
+                        .id("tts-tab")
+                        // 命中栈在此截断：点这枚小字不该被底下的正文读成翻页。
+                        .occlude()
+                        .cursor_pointer()
+                        .px(px(10.0))
+                        .py(px(2.0))
+                        .text_size(px(10.5))
+                        .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.42)))
+                        .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+                        .child(SharedString::from("聽"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                if this.show_tts {
+                                    crate::tts::stop();
+                                    this.show_tts = false;
+                                } else {
+                                    this.show_tts = true;
+                                    this.speak_current_leaf();
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                ),
+        );
+
         // v1.71.0：**导出收尾提示条（Toast）**——极简一枚纸签，浮在页码条之上。
         //
         // 三条例行公事：
@@ -1922,6 +1985,11 @@ impl Root {
                     .occlude()
                     .child(self.render_style_sheet(cx)),
             );
+        }
+        // 聽書 / 印製（v1.9.41）：两张小卡。语速归听、出图归印，各住各的门，
+        // 不再挤在版字那张「怎么排」的纸上。
+        if self.show_tts {
+            root = root.child(self.render_tts_sheet(cx));
         }
         // （原「版式控制面板」浮层 v1.35.0 已删除：那四枚 8/10/12/14 档位与
         // 版字面板的「列数」是同一件事的两副面孔，现统一并入「版字」页的
@@ -2389,6 +2457,12 @@ impl Root {
                         // 「焦点不在纸上」时的兜底。
                         self.show_license = false;
                         self.show_share_panel = false;
+                        // v1.9.41：聽書卡也认 Esc。收起的同时**停读**——
+                        // Esc 是「都停下」的意思。
+                        if self.show_tts {
+                            crate::tts::stop();
+                            self.show_tts = false;
+                        }
                         self.close_lookup();
                         self.clear_selection();
                         self.popup = None;
@@ -2447,6 +2521,11 @@ impl Root {
             A::SearchNext => self.search_next(cx),
             A::SearchPrev => self.search_prev(cx),
             A::Lookup => self.act_lookup(cx),
+            // v1.9.41：⌘⌥Y 聽書——开读并把语速卡带出来（与「听」钮同一条路）。
+            A::Tts => {
+                self.show_tts = true;
+                self.speak_current_leaf();
+            }
             A::Copy => {
                 self.copy_page_text(cx);
                 self.popup = None;
@@ -4730,7 +4809,23 @@ impl Root {
                 // ① 出活：一切「变成文件」的东西
                 0 => {
                     let stamp_label = format!("出圖時間 · {}", self.stamp_style.label());
+                    let ratio_name = Self::PNG_RATIO_OPTS
+                        .iter()
+                        .find(|(_, v)| *v == self.png_ratio)
+                        .map(|(n, _)| *n)
+                        .unwrap_or("随纸面");
+                    let ratio_label = format!("出圖比例 · {ratio_name}");
                     sub = sub
+                        // v1.9.41：出图那两件（比例 / 批量）从版字面板搬进
+                        // 这一组——印的事归印的门。比例是「点一下换一档」，
+                        // 标签上直接写当前档，不必再开一层面板。
+                        .child(aitem(
+                            cx,
+                            "more-ratio",
+                            &ratio_label,
+                            MoreAct::RatioCycle,
+                        ))
+                        .child(aitem(cx, "more-batch", "批量出圖（本章）", MoreAct::BatchPng))
                         .child(aitem(cx, "export-png", "导出当前页图片", MoreAct::PngLeaf))
                         .child(aitem(cx, "more-stamp", &stamp_label, MoreAct::StampCycle))
                         .child(aitem(cx, "export-pdf-leaf", "当前页 PDF", MoreAct::PdfLeaf))
@@ -4932,6 +5027,16 @@ impl Root {
         }
         match act {
             // ---- 出活：一切「变成文件」的东西 ----
+            // 印製卡（v1.9.41）：出图比例 / 批量出图这两件从版字面板搬出来，
+            // 落在这张专属小卡里——「看比例、改比例、开印」一条线。
+            // 印製（v1.9.41 用户口径）：**就住在「更多」下拉里**，不再另开
+            // 一张卡——出图比例点一下换一档，批量出图点一下开印，两行就够。
+            MoreAct::RatioCycle => {
+                let next = (self.png_ratio + 1) % Self::PNG_RATIO_OPTS.len();
+                self.set_png_ratio(next);
+                cx.notify();
+            }
+            MoreAct::BatchPng => guarded!(|| self.batch_export_png(cx)),
             MoreAct::PngLeaf => guarded!(|| self.export_page_png(window, cx)),
             MoreAct::PdfLeaf => {
                 guarded!(|| self.export_pdf(crate::app::PdfScope::Leaf, cx))
@@ -8161,6 +8266,27 @@ impl Root {
 
     fn render_reading_status(&mut self, total: usize, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
+        // ---- 叶码冻结（v1.9.41）------------------------------------------
+        //
+        // 版字面板开着时，改列数 / 字级 / 字体 / 留白都要整本重排，`page` 与
+        // `total` 会一路变；这一行字要是跟着变，就成了「一帧一个数」的走马
+        // 灯，读的人视线当场丢。故**开面板那一刻冻住**，关掉面板才解冻。
+        //
+        // 解冻后的第一个数已经是锚点回位之后的新坐标——也就是「还是刚才
+        // 那一段字，只是页数重新数过了」，不是跳到别处。
+        //
+        // 冻结值在**这里**取（而不是在开面板的那几处赋值）是有意的：面板
+        // 有六七个开关入口（顶栏 / ⌘ 快捷键 / 调试钩子 / Esc 兜底……），
+        // 每个入口都补一句 `page_frozen = ...` 迟早漏一个；渲染这一处是
+        // 唯一收口，漏不掉。
+        if self.show_style {
+            if self.page_frozen.is_none() {
+                self.page_frozen = Some((self.page, total));
+            }
+        } else if self.page_frozen.is_some() {
+            self.page_frozen = None;
+        }
+        let (page_no, total_no) = self.page_frozen.unwrap_or((self.page, total));
         // v1.86.0：古籍视图一律写繁体「葉」（版心书口叶码同字），现代视图仍是「页」。
         let unit = match self.script {
             Script::Ancient => "葉",
@@ -8173,9 +8299,9 @@ impl Root {
         // 偏好（默认关），而这一行是纸面牌记的一部分——古籍视图就该是刻本口径，
         // 不该跟着正文数字样式在两套口径之间摇摆。
         let (pa, ta) = if matches!(self.script, Script::Ancient) {
-            (han_num4(self.page + 1), han_num4(total))
+            (han_num4(page_no + 1), han_num4(total_no))
         } else {
-            ((self.page + 1).to_string(), total.to_string())
+            ((page_no + 1).to_string(), total_no.to_string())
         };
         let left = format!("第{pa}{unit} · 全{ta}{unit}");
         // 页码处**双击**＝一键回到卷首（v1.38.0）。
@@ -9939,22 +10065,10 @@ impl Root {
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                let sel = this.selected_text();
-                let (t, reading_whole) = if !sel.is_empty() {
-                    (sel, false)
-                } else {
-                    (this.leaf_text(), true)
-                };
-                if !t.is_empty() {
-                    crate::tts::speak(&t, this.tts_rate);
-                    this.notice = if reading_whole {
-                        "连读本页中…".to_string()
-                    } else {
-                        "正在朗读…".to_string()
-                    };
-                } else {
-                    this.notice = "这一叶没有可朗读的正文".to_string();
-                }
+                // v1.9.41：**点「听」= 开聽書卡**。语速只在这张卡上出现，
+                // 所以「听」就得把卡带出来——开读与调语速是同一次动作。
+                this.show_tts = true;
+                this.speak_current_leaf();
                 this.more_open = false;
                 this.popup = None;
                 cx.notify();
@@ -10883,13 +10997,35 @@ impl Root {
         // 「顶上那个钮，键是什么」。两种索引不是一回事，所以这里另起一节，
         // 照**屏幕上的左右次序**排——照位置找，一眼就到。
         list = list.child(help_sec("顶栏 · 一键", t));
-        list = list.child(help_row("书阁 ⌘⇧B", "回书架", t));
-        list = list.child(help_row("目录 ⌘L", "左栏：目录 / 书签 / 批注", t));
-        list = list.child(help_row("版字 ⌘E", "列数 · 字体 · 字级 · 留白 · 纸墨", t));
-        list = list.child(help_row("注 ⌘N", "注释显隐（亮朱砂 = 开着）", t));
-        list = list.child(help_row("检索 ⌘F", "全库检索 · ⏎ 开搜", t));
-        list = list.child(help_row("问笺 ⌘⇧A", "问小笺（框了原文就带原文）", t));
-        list = list.child(help_row("更多", "点开：导出 / 卡片 / 工具", t));
+        // v1.9.41：键位**从键表现取**（原先是手抄的「书阁 ⌘⇧B」这类死字）。
+        // 用户在「改键」里换了键，这一节跟着换——顶栏是用户找键的第一站，
+        // 写死一处就等于在帮助里埋了一个会过期的谎。
+        {
+            use jiandu_core::keys::Action as A;
+            for (a, what) in [
+                (A::Shelf, "回书架"),
+                (A::Side, "左栏：目录 / 书签 / 批注"),
+                (A::Style, "列数 · 字体 · 字级 · 留白 · 纸墨"),
+                (A::Notes, "注释显隐（亮朱砂 = 开着）"),
+                (A::Search, "全库检索 · ⏎ 开搜"),
+                (A::AskAi, "问小笺（框了原文就带原文）"),
+            ] {
+                let k = self.keymap.chord(a).display();
+                list = list.child(help_row(&k, what, t));
+            }
+        }
+        list = list.child(help_row(
+            "更多 → 出",
+            "出圖比例（点一下换一档）· 批量出圖 · 三種 PDF · 分享卡",
+            t,
+        ));
+        // 没有钮、但常用的两枚（v1.9.41）：听得见、印得出，各一个键。
+        {
+            use jiandu_core::keys::Action as A;
+            let tts = self.keymap.chord(A::Tts).display();
+            list = list.child(help_row(&tts, "聽書：朗讀本葉 · 語速在卡上調", t));
+            list = list.child(help_row("纸面下方「聽」", "点一下调出语速卡并开读，再点即停", t));
+        }
 
         list = list.child(help_sec("翻页", t));
         list = list.child(help_row("→ / ↓ / 点屏幕右半", "下一页", t));
@@ -12057,6 +12193,180 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         cx.notify();
     }
 
+    /// **「聽書」浮层**（v1.9.41）：语速的唯一入口。
+    ///
+    /// 语速原先住在「版字」面板最上面那一行——一张讲「怎么排」的纸，上面
+    /// 摆着一条「怎么听」。现在它跟着「听」一起来：开读那一刻浮出这张小卡，
+    /// 读什么、多快、停不停都在这里，收起来就散，不占常驻界面。
+    ///
+    /// **不做居中大弹窗**：听书是边听边看的事，卡片压住半页正文就没法读了。
+    fn render_tts_sheet(&mut self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme;
+        let paper_veil = ((t.paper() & 0xFFFFFF) << 8) | 0xFC;
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(t.ink()))
+                            .child(SharedString::from("聽書")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(t.ink_soft()))
+                            .child(SharedString::from(if self.tts_scope.is_empty() {
+                                "正在朗讀本葉".to_string()
+                            } else {
+                                format!("正在朗讀：{}", self.tts_scope)
+                            })),
+                    ),
+            )
+            .child(panel_close(t).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    // 关卡片 = 停读：听书卡是「正在出声」的控制器，收起来
+                    // 就该安静——背景还在响、界面却没了入口，是最坏的形态。
+                    crate::tts::stop();
+                    this.show_tts = false;
+                    cx.notify();
+                }),
+            ));
+
+        // 語速三档，选中态与版字面板同款（极淡朱底 + 通宽朱线）。
+        let mut speed = div().flex().flex_row().items_start().gap(px(18.0));
+        for (label, want) in [("慢 0.8×", 0.8f32), ("常 1.0×", 1.0f32), ("快 1.25×", 1.25f32)] {
+            speed = speed.child(
+                ink_option(label, (self.tts_rate - want).abs() < 1e-3, t).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_tts_rate(want);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(style_row("速", speed, t))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(16.0))
+                    .child(
+                        div()
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(rgb(t.ink_soft()))
+                            .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+                            .child(SharedString::from("再讀一遍"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.speak_current_leaf();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(rgb(t.ink_soft()))
+                            .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+                            .child(SharedString::from("停"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    crate::tts::stop();
+                                    this.show_tts = false;
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgb(t.ink_soft()))
+                            .child(SharedString::from("語速只記這一次開機，重啟回常速")),
+                    ),
+            );
+
+        div()
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(42.0))
+            .flex()
+            .flex_row()
+            .justify_center()
+            // 命中栈在此截断：点卡片不该漏到纸面上翻页。
+            .occlude()
+            .child(
+                div()
+                    .w(px(340.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.0))
+                    .px(px(14.0))
+                    .py(px(10.0))
+                    .bg(rgba(paper_veil))
+                    .border_1()
+                    .border_color(rgba(((t.rule() & 0xFFFFFF) << 8) | 0x33))
+                    .rounded(px(2.0))
+                    .shadow_lg()
+                    .font_family(self.main_family())
+                    .child(head)
+                    .child(body),
+            )
+    }
+
+    /// 朗读当前这一叶（或选区）——「听」钮与「再讀一遍」共用。
+    ///
+    /// 抽出来是为了让两条入口说同一句话：有选区读选区、没有就读整叶；
+    /// 没正文就说「没有可朗读的正文」，不出声也不报错。
+    fn speak_current_leaf(&mut self) {
+        let sel = self.selected_text();
+        let (text, whole) = if !sel.is_empty() {
+            (sel, false)
+        } else {
+            (self.leaf_text(), true)
+        };
+        if text.is_empty() {
+            self.notice = "这一叶没有可朗读的正文".to_string();
+            return;
+        }
+        crate::tts::speak(&text, self.tts_rate);
+        self.tts_scope = if whole {
+            "本葉".to_string()
+        } else {
+            text.chars().take(12).collect()
+        };
+        self.notice = if whole {
+            "连读本页中…".to_string()
+        } else {
+            "正在朗读…".to_string()
+        };
+    }
+
     /// **「版字」面板**：列数 · 字级 · 字体 · 批注 · 留白 · 页面 ·
     /// 纸色 · 墨色 · 丝栏 · 标注——**一张纸、一页**，没有第二处入口。
     ///
@@ -12075,7 +12385,37 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
     fn render_style_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         // 面板宽度：比「单张页面」略收一档，紧凑不撑满（v1.46.0 瘦身）。
-        let style_w = (self.page_w * 0.80).max(360.0);
+        //
+        // v1.9.41：**左右各封一道**。原先只写下限（`.max(360)`），上限完全
+        // 交给纸面宽——大字 / 榜书那两档纸面更宽，面板就跟着变宽；一换字级，
+        // 行款重新折行，行数忽多忽少，面板高度跟着跳（用户实测：切到榜书，
+        // 底部的字级行被窗口上沿吃掉）。宽窄与字级脱钩之后，这张纸在四档
+        // 字级下长得一模一样。
+        let style_w = (self.page_w * 0.80).clamp(360.0, (self.viewport_w - 72.0).clamp(360.0, 480.0));
+
+        // ---- 高度上限 + 内部滚动（v1.9.41）----
+        //
+        // 面板原先没有高度上限：它锚在底栏上方（`bottom: 42`），内容一多就
+        // 往上长，长过窗口上沿的部分被直接裁掉——「字体 / 版字」那几行正是
+        // 这样消失的。现在整张纸 ≤ `sheet_h`，抬头钉在纸上，其余全部住进
+        // 一条可滚的竖栏（`body`）：内容再多也只是「下面还有」，不会「看不
+        // 见」。滚动条压到 3px——够用，不抢。
+        let vh = self.viewport_h.max(320.0);
+        let sheet_h = (vh - 96.0).max(240.0);
+        // 抬头（12px 字 + 一点下白）+ 纸底那三行落款（專注 / 導入 / 状态）
+        // + 纸的上下内白，合计约四行的量。宁可少给滚动区几像素，也不让整张
+        // 纸高过上限——高了就得裁，裁掉的正是用户想看的那几行。
+        let body_h = (sheet_h - 104.0).max(120.0);
+
+        // 纸以下的一切都挂在这条滚动的竖栏里。
+        let mut body = div()
+            .id("style-sheet-body")
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .max_h(px(body_h))
+            .overflow_y_scroll()
+            .scrollbar_width(px(3.0));
 
         // ---- 抬头：一个名字 + 一枚关闭 ----
         //
@@ -12110,6 +12450,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         let mut sheet = div()
             .relative()
             .w(px(style_w))
+            .max_h(px(sheet_h))
             .flex()
             .flex_col()
             .gap(px(5.0))
@@ -12139,74 +12480,16 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             )
             .child(head);
 
-        // ---- 出图比例（v1.9.10）：发哪儿就出什么比例 ----
+        // ---- v1.9.41：**这张纸只管排版** ----
         //
-        // 「随纸面」是本叶真实长宽比（把这一叶拍下来）；其余三档是社交平台
-        // 的版式——九比十六给小红书 / 朋友圈，方图在信息流里占面积最大，
-        // 三比四是微博那种竖幅。
-        let mut ratio_row = div()
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(16.0))
-            .flex_wrap();
-        for (label, want) in Self::PNG_RATIO_OPTS {
-            ratio_row = ratio_row.child(
-                ink_option(label, self.png_ratio == want, t).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.set_png_ratio(want);
-                        cx.notify();
-                    }),
-                ),
-            );
-        }
-        sheet = sheet.child(style_row("图", ratio_row, t));
-
-        // ---- 语速（P1-5）：连读 / 听书共用倍率 ----
+        // 「图（出图比例）」「速（听书语速）」「批（批量出图）」原先挤在这张
+        // 纸的最上面，理由是「高频」——但高频不等于同类。语速是**听**的事，
+        // 出图是**印**的事，列数字体是**看**的事，三种活动各有一套心智模型，
+        // 硬塞进一张纸，用户读到的是一句「这软件到底想让我干什么」。
         //
-        // 0.8× 慢 / 1.0× 常 / 1.25× 快。只改进程内字段（不落盘）。
-        let mut speed_row = div()
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(16.0))
-            .flex_wrap();
-        for (label, want) in [("0.8×", 0.8f32), ("1.0×", 1.0f32), ("1.25×", 1.25f32)] {
-            speed_row = speed_row.child(
-                ink_option(label, (self.tts_rate - want).abs() < 1e-3, t).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.set_tts_rate(want);
-                        cx.notify();
-                    }),
-                ),
-            );
-        }
-        sheet = sheet.child(style_row("速", speed_row, t));
-
-        // ---- 批量出图（P1-3）：当前章每一叶按选定比例渲染 ----
-        //
-        // 走「极简一键」：点一下 → 弹目录框 → 全自动出完。比例用上方「出图」那一行
-        // 选好的（九比十六 / 方 / 三比四 / 随纸面）。
-        let batch_row = div()
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(16.0));
-        let batch_row = batch_row.child(
-            ink_option("批量出图（本章）", false, t).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.batch_export_png(cx);
-                    cx.notify();
-                }),
-            ),
-        );
-        sheet = sheet.child(style_row("批", batch_row, t));
+        // 现在：语速住进「聽書」浮层（点「听」才出现），出图与批量住进
+        // 「印製」浮层（顶栏「更多 → 出 → 印製」）。这张纸从抬头到落款只剩
+        // 排版本身：列数 / 字级 / 字体 / 纸墨 / 版框 / 校勘。
 
         // ---- 三页签（v1.9.40）：版式 / 装帧 / 校勘 ----
         //
@@ -12266,7 +12549,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     ),
             );
         }
-        sheet = sheet.child(tabs);
+        body = body.child(tabs);
 
         // ---- 样式预设（v1.9.10）：一句记住一整套版式 ----
         //
@@ -12370,13 +12653,13 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             );
         }
         if tab_i == 0 {
-            sheet = sheet.child(style_row("式", preset_row, t));
+            body = body.child(style_row("式", preset_row, t));
         }
 
 
 
         if tab_i == 0 {
-            sheet = sheet.child(style_row("列", cols_row, t));
+            body = body.child(style_row("列", cols_row, t));
         }
 
         // ---- 字级：蝇头 / 中楷 / 大字 / 榜书 四档 ----
@@ -12395,6 +12678,11 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     .flex_col()
                     .items_center()
                     .gap(px(2.0))
+                    // v1.9.41：与其余选项同一套选中态（极淡朱底 + 通宽底边）。
+                    .px(px(7.0))
+                    .pt(px(1.0))
+                    .rounded(px(2.0))
+                    .when(on, |d| d.bg(rgba((sheet_zhu(t) << 8) | 0x12)))
                     .cursor_pointer()
                     .text_color(rgb(if on { sheet_zhu(t) } else { t.chrome_text() }))
                     .hover(|s| if on { s } else { s.text_color(rgb(t.ink())) })
@@ -12405,14 +12693,14 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     )
                     .child(
                         div()
-                            .w(px(26.0))
-                            .h(px(1.0))
+                            .w_full()
+                            .h(px(2.0))
                             .flex()
                             .justify_center()
                             .child(if on {
-                                hairline(26.0, sheet_zhu(t))
+                                hairline(1.0, sheet_zhu(t)).w_full()
                             } else {
-                                div().w(px(0.0)).h(px(1.0))
+                                div().w(px(0.0)).h(px(2.0))
                             }),
                     )
                     .on_mouse_down(
@@ -12426,7 +12714,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             );
         }
         if tab_i == 0 {
-            sheet = sheet.child(style_row("字", seg, t));
+            body = body.child(style_row("字", seg, t));
         }
 
         // ---- 字体：竖排字牌，一牌一款 ----
@@ -12435,13 +12723,13 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         // 个 `font_ancient`，各写各的。现在只留这一行，选一款即走
         // `set_font`——正文 + 批注 + 行高缩放 + 重算尺寸一次做完。
         if tab_i == 0 {
-            sheet = sheet.child(style_row("体", self.font_choices_row(cx), t));
+            body = body.child(style_row("体", self.font_choices_row(cx), t));
         }
         // 批注字体：楷体二选一，与正文宋体分开——
         // 正文匠体、注文手写体，正是刻本的层次。字体行定完对子后，
         // 这里还能单独挑一款批注。
         if tab_i == 0 {
-            sheet = sheet.child(style_row("注", self.note_font_row(cx), t));
+            body = body.child(style_row("注", self.note_font_row(cx), t));
         }
 
         // ---- 留白（左右）：版心宽 ÷ 单叶可用宽，三档 ----
@@ -12471,7 +12759,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             );
         }
         if tab_i == 1 {
-            sheet = sheet.child(style_row("白", bx_row, t));
+            body = body.child(style_row("白", bx_row, t));
         }
 
         // ---- 页面：对开 / 单叶 / 整页（三模式）+ 「自动」开关 ----
@@ -12513,7 +12801,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             ),
         );
         if tab_i == 0 {
-            sheet = sheet.child(style_row("面", modes, t));
+            body = body.child(style_row("面", modes, t));
         }
 
         // ---- 纸色：**遍历主题配置表自动生成**——新增一套配色只需在
@@ -12571,12 +12859,12 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             );
         }
         if tab_i == 1 {
-            sheet = sheet.child(style_row("纸", themes_row, t));
+            body = body.child(style_row("纸", themes_row, t));
         }
 
         // ---- 墨色：五套正文 / 小字注色（两枚小色点 + 一行墨字）----
         if tab_i == 1 {
-            sheet = sheet.child(style_row("墨", self.palette_chips(cx), t));
+            body = body.child(style_row("墨", self.palette_chips(cx), t));
         }
 
         // ---- 版框：四周双边 / 左右双边 / 四周单边（v1.85.0）----
@@ -12659,7 +12947,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             );
         }
         if tab_i == 1 {
-            sheet = sheet.child(style_row("框", frames_row, t));
+            body = body.child(style_row("框", frames_row, t));
         }
 
         // ---- 丝栏：乌 / 金 / 朱 三色界行（竖排列间那道细线）----
@@ -12710,7 +12998,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             );
         }
         if tab_i == 1 {
-            sheet = sheet.child(style_row("栏", rules, t));
+            body = body.child(style_row("栏", rules, t));
         }
 
         // ---- 注文位置（v1.9.40）：雙行夾註（淨室）⇄ 頁腳註（天頭地腳）----
@@ -12726,7 +13014,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             cx,
         );
         if tab_i == 2 {
-            sheet = sheet.child(style_row("位", note_pos, t));
+            body = body.child(style_row("位", note_pos, t));
         }
 
         // ---- 标注：通假 / 标点 / 生僻字 / 数字汉字 / 注释 / 繁体 ----
@@ -12744,7 +13032,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             cx,
         );
         if tab_i == 2 {
-            sheet = sheet.child(style_row("标", marks, t));
+            body = body.child(style_row("标", marks, t));
         }
 
         // ---- 繁简：原文 / 简体 / 繁体（v1.81.0）----
@@ -12761,7 +13049,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             cx,
         );
         if tab_i == 2 {
-            sheet = sheet.child(style_row("简", trad_chips, t));
+            body = body.child(style_row("简", trad_chips, t));
         }
 
         // ---- 句读：形制（现代标点 / 古籍句读）+ 点画（墨 / 朱砂 / 回锋）----
@@ -12786,7 +13074,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             cx,
         );
         if tab_i == 2 {
-            sheet = sheet.child(style_row("读", mode_chips, t));
+            body = body.child(style_row("读", mode_chips, t));
         }
 
         // 点画只在**古籍句读**下有意义（现代标点那套是「印刷体」的形，
@@ -12811,7 +13099,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             ];
             let ink_chips = self.style_chips(items, cx);
             if tab_i == 2 {
-                sheet = sheet.child(style_row("画", ink_chips, t));
+                body = body.child(style_row("画", ink_chips, t));
             }
         }
 
@@ -12823,6 +13111,9 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         // 清楚得多。撤掉后这张纸从上到下只剩「怎么排」，没有「拿去干嘛」。
         // 分享卡本体与 `open_share_panel` 仍在（更多 → 分享所选为图片、
         // 选区工具条第九枚），故不是死代码。
+
+        // 落款一行（專注 / 導入字體 / 状态）：**钉在纸底**，不随内容滚。
+        let mut foot = div().flex().flex_col().gap(px(4.0)).pt(px(1.0));
 
         // ---- 專注（v1.80.0）：顶栏那枚「专注」钮搬进这张纸 ----
         //
@@ -12851,7 +13142,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     cx.notify();
                 }),
             );
-        sheet = sheet.child(
+        foot = foot.child(
             div()
                 .flex()
                 .flex_row()
@@ -12889,7 +13180,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     this.import_font_dialog(cx);
                 }),
             );
-        sheet = sheet.child(
+        foot = foot.child(
             div()
                 .flex()
                 .flex_row()
@@ -12913,7 +13204,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 .whitespace_nowrap()
                 .child(SharedString::from(s))
         };
-        sheet = sheet.child(
+        foot = foot.child(
             div()
                 .flex()
                 .flex_row()
@@ -12928,6 +13219,9 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 .child(seg(format!("每面 {} 行", self.grid_rows), false))
                 .child(seg(format!("天头:地脚 {:.1}:1", ratio), true)),
         );
+
+        // 抬头钉在纸上（不滚），其余一切住进 `body`。
+        sheet = sheet.child(body).child(foot);
 
         // 作为正文正下方的行内面板（像照片说明），宽度等于单张页面，不遮挡正文。
         sheet
