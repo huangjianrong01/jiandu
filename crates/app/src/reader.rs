@@ -12396,21 +12396,22 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             ),
         );
 
-        // ★ 锚定到「阅读纸面最外围黑色下框线」下沿（v1.9.47）：不再钉窗口底边
-        // （会悬空、偏上），改用 `page_rect` 真坐标算出版框底边 = page_rect.bottom
-        // − margin_bot；胶囊**顶缘**与该线留完美 1px 间距，绝不越到框上、绝不压
-        // 正文（正文止于版框之上）。横向仍居中（下外边框正中）。首帧 page_rect
-        // 未就绪时退回窗口底边，避免闪现错位。
-        let frame_bottom = match self.page_rect.get() {
-            Some((_, y, _, h)) => y + h - self.margin_bot,
+        // ★ 锚定到「纸面最外围下边框」正中（v1.9.47 修订）：既不钉窗口底边
+        // （悬空偏上），也不贴内版框下沿（那样地脚一大片空白把胶囊吊在半空、
+        // 离纸面外下边框老远）。胶囊**底缘**距纸面底边 6px、横向居中——
+        // 即「下外边框正中」：框下、绝不压正文（正文止于版框之上、远在胶囊上方），
+        // 纸面仍由 `content_h` 锁死铺满。首帧 page_rect 未就绪时退回窗口底边，
+        // 避免闪现错位。
+        let paper_bottom = match self.page_rect.get() {
+            Some((_, y, _, h)) => y + h,
             None => self.viewport_h - 8.0,
         };
-        let frame_gap = 1.0_f32;
+        let frame_gap = 6.0_f32;
         div()
             .absolute()
             .left(px(0.0))
             .right(px(0.0))
-            .top(px(frame_bottom + frame_gap)) // 顶缘 = 版框下沿 + 1px
+            .bottom(px(self.viewport_h - paper_bottom + frame_gap)) // 底缘 = 纸面底边 − 6px
             .flex()
             .flex_row()
             .justify_center()
