@@ -34,6 +34,12 @@ pub struct CleanOptions {
     pub unify_script: bool,
     /// 闭合括号 / 注疏标签（默认开）。
     pub close_notes: bool,
+    /// 剥外部格式残留（默认开）：页码行 / 点线目录 / HTML 实体 / Markdown
+    /// 标记 / 上标注号 / 汉字间伪空格 / 换页符断段 / 破折号字形。
+    ///
+    /// 关掉只在两种场合有意义：**已确认干净的稿子**（省一遍扫描）、以及
+    /// 排障时想看清「原样到底脏在哪」。日常绝不能关——见 [`residue`]。
+    pub residue: bool,
 }
 
 impl Default for CleanOptions {
@@ -44,6 +50,7 @@ impl Default for CleanOptions {
             cjk_punct: true,
             unify_script: true,
             close_notes: true,
+            residue: true,
         }
     }
 }
@@ -67,7 +74,8 @@ pub fn clean(raw: &str) -> String {
 /// 带开关的清洗。顺序有讲究，别乱调：
 ///
 /// ```text
-///   摘注音 → 换行归一 → 去不可见字符 → 空白规整 → 标点 → 简繁 → 闭合注疏
+///   摘注音 → 换行归一 → 换页符断段 → 去控制字符 → 剥 HTML 标签 → 解实体
+///   → 空白规整 → 汉字间空格 → 行级残渣 → 破折号 → 标点 → 简繁 → 闭合注疏
 ///   → 注音还回去
 ///   （简繁必须在标点之后：否则全角化会把刚折好的字再判一次）
 /// ```
@@ -76,14 +84,56 @@ pub fn clean(raw: &str) -> String {
 /// `cjk_punct` 会把它折成全角 `：`，后面再去方括号，注音就散成
 /// `拼音：hàn` 混进正文——竖排里就是一排「电线杆」。故整枚先摘、洗完原样
 /// 放回，一个字母都不能动。
+///
+/// # 三道防线的先后（v1.9.26，改了会出人命）
+///
+/// 1. **换页符先于控制字符清理**：`\x0C` 要变成换行，不能当普通控制符删掉
+///    ——删了上下两页的文字会粘成一句。
+/// 2. **剥标签先于解实体**：反过来 `&lt;div&gt;` 会先变成 `<div>` 再被当标签
+///    剥掉，用户原文里真写着的「<div>」就凭空消失。
+/// 3. **解实体先于标点全角化**：`&ldquo;` 尾部的 `;` 一旦被折成 `；`，
+///    从此再也解不出来，读者看到的是 `&ldquo；玄之又玄`。
 pub fn clean_with(raw: &str, opt: &CleanOptions) -> String {
     let (staged, pinyin) = take_pinyin_marks(&normalize_newlines(raw));
     let mut s = staged;
 
+    // —— 外部格式残留：先做「换页符断段」，否则它会被下面的控制符清理吃掉。
+    if opt.residue {
+        if let Some(x) = jiandu_core::residue::formfeed_to_break(&s) {
+            s = x;
+        }
+    }
+
     if opt.zero_width {
         s = strip_invisible(&s);
     }
+
+    if opt.residue {
+        // 网页复制 / 扒站 EPUB：标签先剥，实体后解（顺序见上面的文档）。
+        if let Some(x) = jiandu_core::residue::strip_tags(&s) {
+            s = x;
+        }
+        if let Some(x) = jiandu_core::residue::decode_entities(&s) {
+            s = x;
+        }
+    }
+
     s = tidy_whitespace(&s);
+
+    if opt.residue {
+        // 汉字之间的伪空格（PDF / OCR 的头号产物），必须在标点全角化之前：
+        // 先删空格，`道 ,` 的左邻才会暴露出「道」，全角化判据才成立。
+        if let Some(x) = jiandu_core::residue::despace_cjk(&s) {
+            s = x;
+        }
+        // 页码行 / 点线目录 / Markdown 标记 / 上标注号：一次遍历全办。
+        if let Some(x) = jiandu_core::residue::sweep_lines(&s) {
+            s = x;
+        }
+        if let Some(x) = jiandu_core::residue::unify_dashes(&s) {
+            s = x;
+        }
+    }
 
     if opt.cjk_punct {
         s = cjk_punct(&s);
@@ -167,13 +217,34 @@ fn normalize_newlines(s: &str) -> String {
     out
 }
 
-/// 去掉零宽字符、方向控制符、孤立控制字符。
+/// 去掉零宽字符、方向控制符、以及**全部底层控制字符**。
 ///
 /// 这些字符**看不见但占位**：一个 `\u{200B}` 就能让「道可道」在竖排里多出一
 /// 个空字格，把整列顶歪。BOM 还会让首行标题认不出来（比对时永远差一个字节）。
+///
+/// # 覆盖范围（v1.9.26 收紧）
+///
+/// 除 `\n`（分段）与 `\t`（后续 `tidy_whitespace` 会折成全角缩进）之外，
+/// **U+0000–U+001F 全清**，外加 U+007F（DEL）与 U+0080–U+009F（C1 控制区）。
+/// 早先只列了 C0 里的若干段，漏了 `U+0010–U+001F` 之间零星几个与整个 C1 区——
+/// 从 PDF / Word 里抠出来的文本经常夹着 `\u{0013}` `\u{0085}` 这类，渲染成
+/// 空字格还查不出原因。
+///
+/// ⚠️ **`\x0C`（换页符）不在这里处理**：它先由
+/// [`jiandu_core::residue::formfeed_to_break`] 换成换行。直接删会把上下两页
+/// 的文字粘成一句，那是比留一个控制符严重得多的错。
 fn strip_invisible(s: &str) -> String {
     s.chars()
         .filter(|c| {
+            // 分段与缩进要留：它们是排版唯一的结构信息。
+            if *c == '\n' || *c == '\t' {
+                return true;
+            }
+            let u = *c as u32;
+            // C0 控制区 + DEL + C1 控制区：看得见才怪。
+            if u < 0x20 || u == 0x7F || (0x80..=0x9F).contains(&u) {
+                return false;
+            }
             !matches!(
                 *c,
                 '\u{200B}'..='\u{200F}'   // 零宽空格 / 连接符 / 方向标记
@@ -182,19 +253,20 @@ fn strip_invisible(s: &str) -> String {
                 | '\u{FEFF}'              // BOM
                 | '\u{00AD}'              // 软连字符
                 | '\u{180E}'              // 蒙古文元音分隔符
-                | '\u{0000}'..='\u{0008}'
-                | '\u{000B}'
-                | '\u{000C}'
-                | '\u{000E}'..='\u{001F}'
             )
         })
         .collect()
 }
 
-/// 空白规整：NBSP / 窄空格 → 普通空格；行尾空白剪掉。
+/// 空白规整：NBSP / 窄空格 → 普通空格；剪掉首尾空白。
 ///
 /// **全角空格 `\u{3000}` 必须留着**：它是古籍稿里唯一的段首缩进记号，
 /// 变成半角空格后「段首缩进」这条信息就没了。
+///
+/// 但**行首的半角空格要删**（v1.9.26）：古籍从来不用半角空格缩进，行首
+/// 冒出来的半角空格只有一个来源——PDF / OCR 抽取时把页边距留了下来。
+/// 留着它在竖排里就是一个凭空多出的半字空格子，还查不出原因。
+/// 全角空格一个不碰，段首缩进照旧。
 fn tidy_whitespace(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for (i, line) in s.split('\n').enumerate() {
@@ -210,11 +282,10 @@ fn tidy_whitespace(s: &str) -> String {
                 _ => l.push(c),
             }
         }
-        // 行尾空白（含全角空格）剪掉：竖排里行尾空格会顶出一个空格。
-        while l.ends_with(' ') || l.ends_with('　') {
-            l.pop();
-        }
-        out.push_str(&l);
+        // 首：只剪半角（全角是缩进记号，动它就把段首记号洗没了）。
+        // 尾：半角与全角都剪（竖排里行尾空格会顶出一个空格）。
+        let l = l.trim_start_matches(' ').trim_end_matches([' ', '　']);
+        out.push_str(l);
     }
     out
 }

@@ -45,6 +45,10 @@ pub mod cleaner;
 /// EPUB 内联样式 / 图片假标点 / 专名号，JSON 递归寻址 / HTML 残留，
 /// DOCX 脚注 / 软回车 / 缩进垃圾。全是纯函数，先过单测才准接进漏斗。
 pub mod dclean;
+/// **外部格式残留清洗**（v1.9.26）：原格式的脚手架混进正文流——汉字间
+/// 伪空格 / 页码行 / HTML 实体 / 点线目录 / Markdown 标记 / 上标注号 /
+/// 破折号字形。判据一律「宁漏不误」，全部 `Option` 早退（没命中零分配）。
+pub mod residue;
 pub mod content;
 /// **常用字白名单**（v1.81.0）：自动注音的判据（GB2312 一级字 + 其繁体形）。
 /// 文件由 `scripts/gen_common_chars.py` 生成，勿手改。

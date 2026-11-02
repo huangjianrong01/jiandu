@@ -483,3 +483,139 @@ fn real_books_are_cleaned() {
         }
     }
 }
+
+/// **外部格式残留总验收**：一段「PDF 抽取 + 扒站 EPUB + OCR」三合一的
+/// 典型脏文本，脏进 → 干净出。
+///
+/// 这份样本不是编的，每一条都能在真实电子书里找到出处（括号里的注释就是
+/// 它的来源）。它锁死 [`jiandu_core::residue`] 的整条防线——任何一个函数
+/// 被改坏，这里立刻现形。
+#[test]
+fn dirty_format_residue_is_filtered_end_to_end() {
+    let raw = concat!(
+        "道德經　上篇\n",                    // 页眉
+        "第一章　道可道\n",
+        "道 可 道 ， 非 常 道 。\n",           // 汉字间空格（PDF/OCR 头号产物）
+        "- 12 -\n",                            // 孤立页码
+        "名可名，非常名。\u{000C}無名天地之始。\n", // 分页符粘连
+        "· 13 ·\n",
+        "有名萬物之母。\n",
+        "道 可 道 ， 非 常 道 。\n",           // 重复行（重章叠句，故意保留）
+        "&nbsp;&ldquo;玄之又玄&rdquo;&#12288;眾妙之門。\n", // HTML 实体
+        "**此句為全書綱領**\n",                // MD 加粗残留
+        "> 案：此句疑衍。\n",                  // MD 引用残留
+        "第二章　天下皆知美之為美[1]\n",        // 上标注号
+        "①斯惡已。②有無相生。\n",              // 圈号分条（是内容，必须留）
+        "目錄\n",
+        "第一章　導論………………1\n",       // 点线目录
+        "第二章　本論………………25\n",
+        "其政悶悶，其民淳淳□□。\n",           // OCR 缺字框（留给字体回退）
+        "絕學無憂――此之謂也。\n",              // 破折号残留（U+2015 ×2）
+        "第 14 页\n",
+        "Page 15 of 300\n",
+        "上善若水。水善利萬物\n",              // 竖排碎片（无句读收尾）
+        "而不爭。\n",
+    );
+    let out = cleaner::clean(raw);
+    println!("\n===== clean() 输出 =====");
+    for (i, l) in out.lines().enumerate() {
+        println!("{i:>2}| {l}");
+    }
+
+    // ① 汉字间伪空格必须全部消失（竖排里每个空格都会顶出一个空字格）。
+    assert!(!out.contains("道 可 道"), "汉字间空格没清掉：{out}");
+    assert!(out.contains("道可道，非常道。"), "空格清掉后没拼回原句：{out}");
+
+    // ② 页码行：四种写法一个都不许剩。
+    for p in ["- 12 -", "· 13 ·", "第 14 页", "Page 15 of 300"] {
+        assert!(!out.contains(p), "页码行残留 `{p}`：{out}");
+    }
+
+    // ③ HTML 实体：既要解出来，也要解成**中文引号**而不是字面的 `&ldquo;`。
+    assert!(!out.contains('&'), "HTML 实体没解干净：{out}");
+    assert!(out.contains("“玄之又玄”"), "实体没解成中文引号：{out}");
+
+    // ④ Markdown 标记剥掉、内容留下。
+    assert!(!out.contains("**"), "Markdown 加粗标记残留：{out}");
+    assert!(out.contains("此句為全書綱領"), "Markdown 内容被误删：{out}");
+    assert!(out.contains("案：此句疑衍。"), "引用标记没剥掉：{out}");
+
+    // ⑤ 上标注号剥掉；圈号**必须留**（方书里「①人参 ②白朮」是内容）。
+    assert!(!out.contains("[1]"), "上标注号残留：{out}");
+    assert!(out.contains("①斯惡已"), "圈号是内容，不该被剥：{out}");
+
+    // ⑥ 点线目录整行删。
+    assert!(!out.contains("導論"), "点线目录没删：{out}");
+    assert!(!out.contains("本論"), "点线目录没删：{out}");
+
+    // ⑦ 换页符断段而不是粘连：两页的文字必须分处两行。
+    assert!(
+        out.contains("名可名，非常名。\n") && out.contains("無名天地之始。"),
+        "换页符把两段粘住了：{out}"
+    );
+
+    // ⑧ 破折号字形归一（U+2015 → U+2014，长度不变）。
+    assert!(out.contains("——"), "破折号没归一：{out}");
+    assert!(!out.contains('―'), "旧破折号字形残留：{out}");
+
+    // ⑨ OCR 缺字框保留原样，交给字体回退机制去画占位。
+    assert!(out.contains("□□"), "缺字框被误删（这是原文信息）：{out}");
+}
+
+/// **【题解】这类章节标签必须活下来**。
+///
+/// 三条链路（清洗层升格 / `purge_bracket_marks` 换引号）各有一道坎，任何
+/// 一道拦错了，正文就少一段——而且少得看不出来，因为「题解」两个字被
+/// 排成了双行小字，读者只会觉得这一段怎么少了开头。
+#[test]
+fn tijie_label_survives_import() {
+    let raw = "【题解】\n此章言道之體。\n\n【注釋】\n道可道，非常道。\n\n正文一段，其間有（注）者。\n\n〔案〕此句疑衍。\n";
+    let text = cleaner::clean(raw);
+    let body: String = parse_str(SrcKind::Txt, &text)
+        .unwrap_or_default()
+        .iter()
+        .map(|c| c.content.clone())
+        .collect();
+    println!("\n===== 题解链路 =====\n{body}\n");
+
+    // ① 标签原样保留方头括号（整理本印刷就这么排）。
+    assert!(body.contains("【题解】"), "【题解】被改写了：{body}");
+    assert!(body.contains("【注釋】"), "【注釋】被改写了：{body}");
+    // ② 绝不升格成夹注。
+    assert!(!body.contains("[注]题解"), "【题解】被升格成夹注：{body}");
+    assert!(!body.contains("[注]注釋"), "【注釋】被升格成夹注：{body}");
+    // ③ 标签后面的正文一个字都不能少。
+    assert!(body.contains("此章言道之體"), "题解正文丢了：{body}");
+    // ④ 单字圆括号 `（注）` 不许升格 —— `[注]注[/注]` 会被下游当壳吞掉，
+    //    于是「其間有（注）者」变成「其間有者」，凭空少两个字。
+    assert!(body.contains("其間有"), "正文被夹注吞了：{body}");
+    assert!(!body.contains("[注]注[/注]"), "单字括号不该升格：{body}");
+    // ⑤ 行首的〔案〕剥壳留字（它是按语，不是标签）。
+    assert!(body.contains("案此句疑衍"), "〔案〕内容丢了：{body}");
+}
+
+/// **性能护栏**：十万字脏文本的清洗必须停在毫秒级。
+///
+/// 这不是炫耀数字，是拦退化用的。`residue` 里任何一个函数被写成「对每个
+/// 空格回溯找左右邻居」或者「对每行 re-scan 全文」，在十万字上都会掉到
+/// 秒级——导入时用户看到的就是转圈。实测约 13 ms（含全部脏特征），
+/// 阈值给到 200 ms 留了十几倍余量，只为拦住量级错误，不为卡死机器抖动。
+#[test]
+fn clean_stays_fast_on_a_hundred_thousand_chars() {
+    // 每一条都是真脏：汉字间空格 / HTML 实体 / 上标注号 / 假分页。
+    let dirty: String = "道 可 道 ， 非 常 道 。&nbsp;名可名[1]，非常名。\n".repeat(3000);
+    let n = dirty.chars().count();
+    assert!(n > 90_000, "样本太小，测不出退化：{n}");
+    let _ = cleaner::clean(&dirty); // 预热
+    let t = std::time::Instant::now();
+    let out = cleaner::clean(&dirty);
+    let dt = t.elapsed();
+    println!("[清洗吞吐] {n} 字 → {} 字，耗时 {dt:?}", out.chars().count());
+    assert!(
+        dt < std::time::Duration::from_millis(200),
+        "清洗退化到 {dt:?}（>200ms），十万字不该这么慢"
+    );
+    // 顺便钉死「脏进干净出」：空格与实体都不能剩。
+    assert!(!out.contains("道 可 道"), "汉字间空格没清掉");
+    assert!(!out.contains('&'), "HTML 实体没解掉");
+}
