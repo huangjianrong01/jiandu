@@ -1464,15 +1464,15 @@ mod tests {
             Err(e) => panic!("导入失败：{e}"),
         };
         println!("── 端到端 ──────────────────────────");
-        println!("书名「{}」作者「{}」卷数 {}", ir.meta.title, ir.meta.author, ir.juans.len());
-        for j in ir.juans.iter().take(8) {
+        println!("书名「{}」作者「{}」卷数 {}", ir.book.meta.title, ir.book.meta.author, ir.book.juans.len());
+        for j in ir.book.juans.iter().take(8) {
             println!("  卷：{}（{} 块）", j.title, j.blocks.len());
         }
         for bad in ["管锡华", "译注", "全本全注全译", "z-library", "中华书局"] {
-            assert!(!ir.meta.title.contains(bad), "书名里还有「{bad}」：{}", ir.meta.title);
+            assert!(!ir.book.meta.title.contains(bad), "书名里还有「{bad}」：{}", ir.book.meta.title);
         }
         // 样本书只有两三卷，门槛按「切出了卷」定；《尔雅》那类真书会切出 19 卷。
-        assert!(!ir.juans.is_empty(), "一卷都没切出来");
+        assert!(!ir.book.juans.is_empty(), "一卷都没切出来");
     }
 
     #[test]

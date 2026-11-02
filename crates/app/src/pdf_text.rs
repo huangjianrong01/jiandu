@@ -34,7 +34,7 @@ use std::path::Path;
 ///
 /// 横排 PDF：一个区域 ≈ 一行；竖排 PDF：一个区域 ≈ 一列。文本为区域原文
 /// （匹配时按文字找，不依赖索引对齐）。
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SourceRegion {
     /// 左上角 X（页面点）。
     pub x: f32,
@@ -122,6 +122,37 @@ pub fn extract_pdf_text_regions(_path: &Path) -> Vec<SourceRegion> {
 #[cfg(not(target_os = "macos"))]
 pub fn extract_pdf_text_regions_on(_path: &Path, _page_index: usize) -> Vec<SourceRegion> {
     vec![]
+}
+
+/// PDF 总页数（供 UI 预检 / 进度条 / 翻页边界用）。
+///
+/// macOS 走 PDFKit；其余平台按 `#[cfg]` 分派——Windows 预留 `pdfium-render`
+/// 接入点（当前返回 0，待接 pdfium 后填上真实页数），其余（Linux / iOS / Android
+/// 等暂未接 PDF 后端的平台）统一返回 0，绝不 panic。
+#[cfg(target_os = "macos")]
+pub fn pdf_page_count(path: &Path) -> usize {
+    autoreleasepool(|| unsafe {
+        let nspath = ns_string(path);
+        let url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: nspath];
+        let doc: *mut Object = msg_send![class!(PDFDocument), alloc];
+        let doc: *mut Object = msg_send![doc, initWithURL: url];
+        if doc.is_null() {
+            return 0;
+        }
+        let count: usize = msg_send![doc, pageCount];
+        count
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub fn pdf_page_count(_path: &Path) -> usize {
+    // TODO(Windows): 接入 `pdfium-render` 取页数（当前未接后端，返回 0 表示未知）。
+    0
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+pub fn pdf_page_count(_path: &Path) -> usize {
+    0
 }
 
 #[cfg(target_os = "macos")]
@@ -333,6 +364,21 @@ fn repaired(c: Chunk, ref_w: f64, ref_h: f64, thresh: f64) -> Chunk {
     g
 }
 
+/// 康熙部首（U+2F00–U+2FDF）与对应标准 CJK 一字一画相同，但码位不同。
+/// Core Text 经 `draw_glyphs` 写出的 PDF，PDFKit 抽取时常用康熙部首码位回填
+/// （如 `非`→`⾮` U+2F8F、`老`→`⽼` U+2F54、`子`→`⼦` U+2F5B）。这会让后续
+/// 比对 / 清洗因为码位不等而失配。两者映射是 1:1 的：康熙码位 − 0x2F00 + 0x4E00
+/// 即标准 CJK。抽取阶段统一折回，外部无需再关心。
+#[cfg(target_os = "macos")]
+fn fold_kangxi(c: char) -> char {
+    let u = c as u32;
+    if (0x2F00..=0x2FDF).contains(&u) {
+        char::from_u32(u - 0x2F00 + 0x4E00).unwrap_or(c)
+    } else {
+        c
+    }
+}
+
 /// 把一桶片段压成一个 `SourceRegion`（坐标翻转为位图坐标 y 向下）。
 #[cfg(target_os = "macos")]
 fn bucket_to_region(b: Vec<Chunk>, page_h: f64, min_ref: f64) -> Option<SourceRegion> {
@@ -345,7 +391,7 @@ fn bucket_to_region(b: Vec<Chunk>, page_h: f64, min_ref: f64) -> Option<SourceRe
             if ch.is_control() || ch.is_whitespace() {
                 continue;
             }
-            text.push(ch);
+            text.push(fold_kangxi(ch));
         }
         // 走到这里才是「真有墨的片段」，才允许它撑包围盒。空白片段（`\n`、空行）
         // 只参与聚类、不参与几何，否则每一列都会凭空多出一格空白。
@@ -695,6 +741,170 @@ mod vector_pdf_tests {
             "列高 {} 应覆盖 19 个步进（不能只是前半个字）",
             r.h
         );
+    }
+}
+
+/// **全链路验收（仅在 macOS 真跑）**：自己导出的横排 CJK 矢量 PDF →
+/// `pdf_text` 抽坐标 → `importer::import_file` 走完整漏斗（清洗 → 断章 → ParsedDoc）。
+///
+/// 这条测试锁死本次修复的两条死穴：
+/// ① 全角【题解】/（注）绝不能变成 `[注]` 双行夹注；
+/// ② 文本层抽出来不能粘连、坐标盒不塌成 0；ParsedDoc 必须带上 pdf_regions。
+#[cfg(all(test, target_os = "macos"))]
+mod pdf_import_e2e {
+    use super::*;
+    use core_foundation::base::TCFType;
+    use core_foundation::url::CFURL;
+    use core_graphics::context::CGContext;
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+    use core_text::font;
+    use std::path::Path;
+
+    extern "C" {
+        fn CGPDFContextCreateWithURL(
+            url: *const c_void,
+            media: *const CGRect,
+            aux: *const c_void,
+        ) -> *mut c_void;
+        fn CGPDFContextBeginPage(ctx: *mut c_void, info: *const c_void);
+        fn CGPDFContextEndPage(ctx: *mut c_void);
+        fn CGPDFContextClose(ctx: *mut c_void);
+    }
+
+    /// 用 **Core Text `draw_glyphs`** 生成一份竖排 CJK PDF：源文本按换行切成若干
+    /// 竖列，列与列从右向左排——这正是古籍 PDF 的天然形态，也还原了「章见出し独占
+    /// 一列」的结构，清洗层据此正确断章。
+    ///
+    /// 选 `draw_glyphs`（而非 `CTFrameDraw`）是有意为之：本机实测 `CTFrameDraw` 写出的
+    /// 横排 PDF，PDFKit 的 `selectionForRange` 抽不到文本层（返回 0 行）；而逐字
+    /// `draw_glyphs` 的竖排页能被 `selectionsByLine` 完整切出（`own_vector_pdf_yields_every_glyph`
+    /// 早锁死这条路径）。代价是 ToUnicode 在 CID 字体上偶发把个别字映射成别的码位，
+    /// 所以本测试**不**对具体汉字做字面对等断言，只锁死「坐标非空 / 全角括号原样保留 /
+    /// 不出现 `[注]` / 正文非空」这几条与码位无关的不变量。
+    fn vertical_pdf_of(path: &Path, text: &str) {
+        let _ = std::fs::remove_file(path);
+        let url = CFURL::from_path(path, false).unwrap();
+        let media = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(595.0, 842.0));
+        let raw = unsafe {
+            CGPDFContextCreateWithURL(
+                url.as_concrete_TypeRef() as *const c_void,
+                &media,
+                std::ptr::null(),
+            )
+        };
+        assert!(!raw.is_null(), "建 PDF 上下文失败");
+        let ctx = unsafe { CGContext::from_existing_context_ptr(raw as *mut _) };
+        unsafe { CGPDFContextBeginPage(raw, std::ptr::null()) };
+        let f = font::new_from_name("Songti SC", 22.0).unwrap();
+        // 一行＝一竖列，列从右（540）向左退 55pt。
+        const STEP: f64 = 34.0;
+        let mut x = 540.0;
+        for line in text.split('\n') {
+            let mut y = 800.0;
+            for ch in line.chars() {
+                let buf = [ch as u16];
+                let mut g: [u16; 2] = [0; 2];
+                let ok = unsafe { f.get_glyphs_for_characters(buf.as_ptr(), g.as_mut_ptr(), 1) };
+                if ok {
+                    let p = [CGPoint::new(x, y)];
+                    let gs = [g[0]];
+                    f.draw_glyphs(&gs, &p, ctx.clone());
+                    y -= STEP;
+                }
+            }
+            x -= 55.0;
+        }
+        unsafe { CGPDFContextEndPage(raw) };
+        unsafe { CGPDFContextClose(raw) };
+        drop(ctx);
+    }
+
+    #[test]
+    fn pdf_import_end_to_end_preserves_fullwidth_brackets() {
+        let path = std::env::temp_dir().join("jiandu_pdf_e2e.pdf");
+        // 故意塞进全角【题解】与（注），验收它们原样保留、不当夹注；
+        // 同时避开 ToUnicode 偶发错位的字（老/子/非/言/用/二/无/生），使断言稳定。
+        let src = "道德经\n第一章\n道可道，常道。名可名，常名。\n【题解】此章明道之体，开卷之总纲也。\n第三章\n天下皆知美之为美，斯恶已。\n（注）故有相成，难易相形。\n不尚贤，使民不争。";
+        vertical_pdf_of(&path, src);
+
+        // ① 文本层抽取：坐标 + 文本都在（不为空＝不是扫描件）。
+        let regions = extract_pdf_text_regions(&path);
+        let sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        println!(
+            "── 生成的竖排 PDF：{:?} 大小={} 区域数={}",
+            path,
+            sz,
+            regions.len()
+        );
+        assert!(!regions.is_empty(), "文本层坐标不该为空（扫描件才会空）");
+        for r in &regions {
+            assert!(r.w > 0.0 && r.h > 0.0, "坐标盒不该塌成 0：{r:?}");
+        }
+        let layer: String = regions.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(" / ");
+        println!("── PDF 文本层（逐区域）──\n{layer}");
+
+        // ② 完整漏斗：PDF → 清洗 → ParsedDoc
+        let doc = crate::importer::import_file(&path).expect("PDF 导入失败");
+        let regions_in_doc = doc
+            .pdf_regions
+            .as_ref()
+            .expect("ParsedDoc 应携带 pdf_regions");
+        assert_eq!(
+            regions_in_doc.len(),
+            regions.len(),
+            "ParsedDoc 的坐标应与原抽取一致"
+        );
+
+        // ③ 全角【题解】/（注）绝不能变成 `[注]` 双行夹注（本次修复的死穴）。
+        //    【】（）是 CJK 标点，ToUnicode 不串码，断言稳定；`[注]` 含 ASCII 方括号，
+        //    若清洗层误升格必然现形。
+        let book = doc.book.to_book();
+        let body: String = book
+            .chapters
+            .iter()
+            .flat_map(|c| {
+                std::iter::once(c.title.clone())
+                    .chain(c.paragraphs.iter().map(|p| p.text.clone()))
+            })
+            .collect();
+        println!(
+            "── 清洗后正文（首 360 字）──\n{}",
+            &body.chars().take(360).collect::<String>()
+        );
+        // 排障：逐级看全角括号在哪一层被吃掉的（留在这里，下次回归一眼定位）。
+        println!(
+            "── classicize 后（首 200 字）──\n{}",
+            &jiandu_core::pipeline::classicize(src)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        );
+
+        // 死穴：全角括号被误转成 `[注]` 夹注，正文缺一段。
+        assert!(!body.contains("[注]"), "全角括号被误转成夹注：[注] 残留在正文");
+        // 【题解】 → 「题解」：篇题转直角引号，**内容仍在正文里**。
+        // （旧版这里变成 `[注]题解[/注]`，于是「题解」二字进了夹注、正文少一截。）
+        assert!(
+            body.contains("「题解」"),
+            "【题解】应转成直角引号留在正文：{body}"
+        );
+        assert!(
+            body.contains("此章明道之体"),
+            "题解的内容被夹注吞掉了：{body}"
+        );
+        // （注） → 「注」：竖排化把现代括号换成直角引号（`cleanup_punct_inner`）。
+        assert!(body.contains("「注」"), "全角（注）应转成「注」：{body}");
+        // 正文非空、没被吞字：用 ToUnicode 稳定的字（道 / 章 / 不尚贤）做探针。
+        assert!(!body.is_empty(), "清洗后正文不应为空");
+        assert!(body.contains("道可道"), "正文丢失/粘连：{body}");
+        assert!(body.contains("不尚贤"), "末段丢失：{body}");
+        // 章级切分正常（第一章 / 第三章 独占一列，清洗层识别为见出し）。
+        assert!(
+            body.contains("第一章") && body.contains("第三章"),
+            "章见出し切分异常：{body}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 

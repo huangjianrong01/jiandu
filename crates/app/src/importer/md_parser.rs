@@ -6,7 +6,7 @@
 //! * `#` 标题只去掉井号、保留标题文字（标题要进正文，它是断章的依据）；
 //! * `**` `__` `*` `_` `~~` `` ` `` 一律剥掉；链接留文字、图片整个丢；
 //! * 引用 `>` 与列表记号 `- ` `1. ` 去掉记号留内容；
-//! * 围栏代码块的**围栏行**丢掉、内容保留（代码也是作者写的字，不该被吞）；
+//! * 围栏代码块（``` / ~~~）**整块丢弃**——代码不是古籍正文，进竖排排版只会污染版心；
 //! * 表格的竖线换成空格（表格在竖排里排不了，至少字别丢）。
 
 use std::path::Path;
@@ -50,13 +50,12 @@ pub fn strip_markdown(src: &str) -> String {
         let raw = line.trim_end();
         let t = raw.trim_start();
 
-        // 围栏：``` 或 ~~~ 起头；围栏行本身不进正文（内容留）。
+        // 围栏：``` 或 ~~~ 起头；整块（含围栏行与内容）丢弃——代码不是古籍正文。
         if t.starts_with("```") || t.starts_with("~~~") {
             in_fence = !in_fence;
             continue;
         }
         if in_fence {
-            out.push(raw.to_string());
             continue;
         }
 
@@ -172,10 +171,11 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_keeps_content() {
+    fn fenced_code_is_dropped() {
         let md = "```rust\nlet x = 1;\n```\n正文";
         let t = strip_markdown(md);
-        assert!(t.contains("let x = 1;"), "代码内容被吞了：{t:?}");
+        assert!(!t.contains("let x = 1;"), "代码内容不该进古籍正文：{t:?}");
+        assert!(t.contains("正文"), "代码块外的正文丢了：{t}");
         assert!(!t.contains("```"));
     }
 

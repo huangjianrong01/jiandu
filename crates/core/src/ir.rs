@@ -44,6 +44,8 @@ pub enum IrSource {
     Json,
     /// TEI / DocBook 等古籍 XML。
     Xml,
+    /// PDF 文本层（矢量导出 / 数字古籍影印本，含坐标）。
+    Pdf,
 }
 
 impl IrSource {
@@ -56,6 +58,7 @@ impl IrSource {
             IrSource::Docx => "docx",
             IrSource::Json => "json",
             IrSource::Xml => "xml",
+            IrSource::Pdf => "pdf",
         }
     }
 
@@ -68,6 +71,7 @@ impl IrSource {
             "docx" => IrSource::Docx,
             "json" => IrSource::Json,
             "xml" | "tei" => IrSource::Xml,
+            "pdf" => IrSource::Pdf,
             _ => IrSource::Txt,
         }
     }

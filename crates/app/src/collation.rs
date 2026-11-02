@@ -413,8 +413,15 @@ pub struct CollationWorkspace {
     export_note: Option<String>,
     /// 样式选择面板是否展开。
     show_style_panel: bool,
-    /// 当前联动的**右文行号**（0-based，行 = `text` 里 `\n` 分隔的第几行）。
+    /// **原图高亮框显隐**（v1.9.25）——顶栏「注」那一枚说了算，默认开。
     ///
+    /// 关掉时左图只剩底图：区域参考框与联动高亮矩形一概不画。它是「校对
+    /// 时的注释层」，读图看图时嫌它挡字就一键收掉——与阅读器里那枚「注」
+    /// 同名义、同手感（只不过那边关的是纸上的夹注与眉批）。
+    ///
+    /// 纯渲染开关：`active_para_idx` / `regions` 一个不动，框随时能再长回来。
+    show_region_box: bool,
+    /// 当前联动的**右文行号**（0-based，行 = `text` 里 `\n` 分隔的第几行）。    ///
     /// 与下面的 `active_para_idx` 是一对「源 → 靶」：这里是**用户点的哪一行**，
     /// 那里是**左图命中的哪一处区域**。分开记的原因：命中不了时（跨页 / 扫描版 /
     /// 稿子对不上）仍需如实显示「你点的是第几行」，否则用户点了没反应，连
@@ -571,6 +578,8 @@ impl CollationWorkspace {
             preview_frame: ShareFrame::Red,
             preview_columns: 12,
             show_style_panel: false,
+            // 出厂显示高亮框：校对时它是「这一段落在原图哪一处」的唯一凭据。
+            show_region_box: true,
             active_line: None,
             active_para_idx: None,
             src_nat_w: 0.0,
@@ -1055,6 +1064,32 @@ impl CollationWorkspace {
             )
     }
 
+    /// 「注」开关（v1.9.25）：形制与 [`Self::ghost_button`] 同一档（无边框、
+    /// 纸灰底），只有**字色**表达开关态——朱砂 = 框开着，墨 = 已收起。
+    /// 单字、不换宽，翻转时顶栏一行不会因为字多字少跳半格。
+    fn region_box_chip(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let on = self.show_region_box;
+        let fg = if on { 0x8c2b22 } else { 0x4a4335 };
+        div()
+            .px(px(11.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(fg))
+            .bg(rgba(0x2B26200A))
+            .hover(|s| s.bg(rgba(0x2B26201A)))
+            .child(SharedString::from("注"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|c, _, _, cx| {
+                    cx.stop_propagation();
+                    c.show_region_box = !c.show_region_box;
+                    cx.notify();
+                }),
+            )
+    }
+
     /// **次级按钮**（v1.9.24）：无边框，只留一层几乎看不见的纸灰底。
     ///
     /// 给【打开文件】【导入 MD】这类「入口」用——它们是渠道，不是动作的高潮。
@@ -1234,6 +1269,10 @@ impl CollationWorkspace {
             // 与「打开文件」的区别不是选几份，而是**选完不立刻渲染**——它只是
             // 把活接下来，等 OCR 接入后由队列消费（见 `OcrQueue`）。
             .child(self.ghost_button("批量导入", |c, _, _, cx| c.open_batch_picker(cx), cx))
+            // 「注」：一键显隐**原图高亮框**（v1.9.25）。与阅读器顶栏那枚同名
+            // 同义——那边关的是纸上的夹注 / 眉批，这边关的是原图上的联动框，
+            // 两处一起关才是「只剩字、只剩图」的安静状态。朱砂 = 框开着。
+            .child(self.region_box_chip(cx))
             .child(div().flex_1())
             // 唯一的实底主按钮。
             .child(self.primary_button(
@@ -1494,30 +1533,36 @@ impl CollationWorkspace {
         }
         // 区域参考框：无原图时画出全部 regions（验证映射数学），有原图时仅画
         // 当前联动段（避免遮挡整图）；真实文本层接入后这些框即原图真实文本位置。
-        for (i, r) in self.regions.iter().enumerate() {
-            let active = self.active_para_idx == Some(i);
-            if self.image_path.is_some() && !active {
-                continue;
+        //
+        // 「注」关掉（v1.9.25）时整层不画：只剩底图，读图时不被框打扰。
+        // 这是纯渲染开关——`regions` 与 `active_para_idx` 一个都不动，
+        // 再点一次框原样回到原来的位置。
+        if self.show_region_box {
+            for (i, r) in self.regions.iter().enumerate() {
+                let active = self.active_para_idx == Some(i);
+                if self.image_path.is_some() && !active {
+                    continue;
+                }
+                page = page.child(
+                    div()
+                        .absolute()
+                        .top(px(r.y * scale))
+                        .left(px(r.x * scale))
+                        .w(px(r.w * scale))
+                        .h(px(r.h * scale))
+                        .border_1()
+                        .border_color(if active {
+                            rgba(0x8c2b22cc)
+                        } else {
+                            rgba(0x8c2b2255)
+                        })
+                        .bg(if active {
+                            rgba(0x8c2b2222)
+                        } else {
+                            rgba(0x00000000)
+                        }),
+                );
             }
-            page = page.child(
-                div()
-                    .absolute()
-                    .top(px(r.y * scale))
-                    .left(px(r.x * scale))
-                    .w(px(r.w * scale))
-                    .h(px(r.h * scale))
-                    .border_1()
-                    .border_color(if active {
-                        rgba(0x8c2b22cc)
-                    } else {
-                        rgba(0x8c2b2255)
-                    })
-                    .bg(if active {
-                        rgba(0x8c2b2222)
-                    } else {
-                        rgba(0x00000000)
-                    }),
-            );
         }
         page
     }
@@ -4928,6 +4973,11 @@ mod vector_pdf_regression {
     #[test]
     fn own_vector_pdf_can_be_highlighted_by_right_text() {
         let regions = sample_pdf();
+        // 排障：自产 PDF 的文本层到底抽出了什么字（ToUnicode 一旦串码，
+        // 这里就是证据）。留一行，回归时一眼看出是「坐标错」还是「字错」。
+        for r in regions.iter().take(6) {
+            println!("[区域 {:.0}×{:.0}] {:?}", r.w, r.h, r.text);
+        }
         // 右文第一段的开头（正常汉字，不带标点）。
         let line = "天地玄黄宇宙洪荒日月盈昃辰宿列张";
         let (ri, n) = locate_region(line, &regions).expect("在我们自己的 PDF 上应当定位得到");

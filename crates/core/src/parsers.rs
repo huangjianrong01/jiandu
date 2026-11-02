@@ -201,6 +201,13 @@ impl AncientParser for TxtParser {
     }
 }
 
+impl TxtParser {
+    /// 同 [`TxtParser::parse`]，但**不把全角括号升格成夹注**（PDF 用）。
+    pub fn parse_keeping_brackets(&self, raw: &str) -> Result<Vec<RawChapter>> {
+        Ok(crate::pipeline::parse_txt_opts(raw, false))
+    }
+}
+
 /// Markdown（标题 / 引用 / 加粗 / 去图去表）。
 pub struct MarkdownParser;
 impl AncientParser for MarkdownParser {
@@ -256,6 +263,16 @@ impl UniversalParser {
             SrcKind::Xml => XmlParser.parse(raw)?,
             SrcKind::Json => JsonParser.parse(raw)?,
         };
+        Ok(Self::finish(chapters))
+    }
+
+    /// 纯文本、**不升格全角括号**（PDF 专用）。后处理与 [`Self::parse`] 完全一致。
+    pub fn parse_txt_keeping_brackets(raw: &str) -> Result<Vec<RawChapter>> {
+        Ok(Self::finish(TxtParser.parse_keeping_brackets(raw)?))
+    }
+
+    /// 所有格式汇流后的**唯一后处理**：古籍化红线 + 按品题再断章。
+    fn finish(chapters: Vec<RawChapter>) -> Vec<RawChapter> {
         let chapters: Vec<RawChapter> = chapters
             .into_iter()
             .map(|mut c| {
@@ -267,7 +284,7 @@ impl UniversalParser {
         // v1.75.0：**一品为一章**。清洗完之后品题已成独立行，但 EPUB / HTML
         // 只认结构标签，`第X品` 在它们眼里仍是普通段落——这里统一再扫一遍
         // 行首标题开章，六种格式归于一律（TXT 那条链已切过，幂等）。
-        Ok(crate::pipeline::resplit_by_heads(chapters))
+        crate::pipeline::resplit_by_heads(chapters)
     }
 }
 
@@ -378,10 +395,11 @@ fn strip_html_residue(s: &str) -> String {
 /// 现代整理本爱用方括号括注（「威烈王〔名午，考王之子〕」）。竖排里这四个
 /// 括号会各占**一个完整的正文字格**——一排方括号横在版心，比错字还刺眼。
 ///
-/// 处理规则（括号符号本身绝不留下）：
-/// * `〔…〕` / `【…】`：内容 ≤ [`BRACKET_NOTE_MAX`] 字 → 转 `[注]…[/注]`
-///   （落成双行小字夹注，正合古籍体例）；更长的一律剥壳、内容留作正文——
-///   整段注疏塞进半格会把版面撑破。
+/// 处理规则（**全角括号一律不是夹注**，v1.9.26 定死）：
+/// * `【…】`：转成直角引号 `「…」`（篇题 / 题解 / 方书门类的小标题）——
+///   它是正文里的一个「标签」，**绝不**转 `[注]`（旧版转了，尔雅
+///   `【题解】` 因此被排成双行小字、正文缺一段）。
+/// * `〔…〕`：只剥壳、内容留作正文（朝代 / 校勘括注：`〔周〕李耳`）。
 /// * 半角 `[…]`：除自家标记（`[注]` / `[/注]` / `[高亮]` / `[拼音:…]`）
 ///   原样放行，其余一律剥壳留内容。
 /// * 落单的半个括号（无配对的开 / 闭）直接删字符。
@@ -404,15 +422,25 @@ pub fn purge_bracket_marks(s: &str) -> String {
             // 找配对的闭括号（同一副）。
             if let Some(j) = (i + 1..cs.len()).find(|&j| cs[j] == CLOSE[k]) {
                 let inner: String = cs[i + 1..j].iter().collect();
-                let n = inner.chars().count();
-                if n == 0 {
+                if inner.is_empty() {
                     // 空壳：连括号一起删。
-                } else if k < 2 && n <= BRACKET_NOTE_MAX {
-                    out.push_str("[注]");
+                } else if k == 1 {
+                    // `【…】`：篇题 / 题解 / 方书门类的小标题（`【题解】`、
+                    // `【组成】`）。转成**直角引号**——它仍是正文里的一个
+                    // 「标签」，绝不转 `[注]`。
+                    //
+                    // ⚠️ v1.9.26 死穴：这里原先把 【…】 转成 `[注]…[/注]`，
+                    // 于是尔雅《释诂》的 `【题解】` 被排成双行小字、正文缺一段。
+                    // 清洗层（`cleaner::brackets_to_notes`）已经改过一次，但这条
+                    // 链（txt / epub / pdf 都走 `classicize`）漏在外面——全角
+                    // 括号一律不是夹注，这条规矩必须两处一致。
+                    // 转「」与 `types::bracket_to_quote` 的显示口径同源。
+                    out.push('「');
                     out.push_str(&inner);
-                    out.push_str("[/注]");
+                    out.push('」');
                 } else {
-                    // 半角括号 / 超长括注：只剥壳，内容照进正文。
+                    // `〔…〕`（朝代 / 校勘括注）与半角 `[…]`：只剥壳，内容照进
+                    // 正文。`〔周〕李耳` 不能变成「周」李耳——它不是引文。
                     out.push_str(&inner);
                 }
                 i = j + 1;
@@ -432,9 +460,6 @@ pub fn purge_bracket_marks(s: &str) -> String {
     }
     out
 }
-
-/// 转成夹注的括注长度上限（超过就只剥壳，不当夹注排）。
-const BRACKET_NOTE_MAX: usize = 80;
 
 /// `i` 处是不是自家标记（保护它们不被当杂质剥掉）。
 fn starts_own_marker(cs: &[char], i: usize) -> bool {
@@ -1262,12 +1287,19 @@ mod tests {
     /// 数字强制汉字化：年份、页码、数量都转，绝不残留阿拉伯数字被竖排拆散。
     #[test]
     fn digits_become_chinese_not_vertical_runs() {
-        // v1.40.0：现代括号绝不进正文流
+        // v1.9.26：**全角括号一律不是夹注**，这条两头都得守。
+        //   * `〔…〕` 是朝代 / 校勘括注 → 只剥壳（`〔周〕李耳` 不能变「周」李耳）；
+        //   * `【…】` 是篇题 / 题解 → 转直角引号，绝不转 `[注]`
+        //     （旧版转了，尔雅《释诂》的 `【题解】` 被排成双行小字）。
         assert_eq!(
             purge_bracket_marks("威烈王〔名午，考王之子〕元年"),
-            "威烈王[注]名午，考王之子[/注]元年"
+            "威烈王名午，考王之子元年"
         );
-        assert_eq!(purge_bracket_marks("甲【乙丙】丁"), "甲[注]乙丙[/注]丁");
+        assert_eq!(purge_bracket_marks("甲【乙丙】丁"), "甲「乙丙」丁");
+        assert_eq!(
+            purge_bracket_marks("【题解】此章言道之体"),
+            "「题解」此章言道之体"
+        );
         // 半角方括号：只剥壳，内容照进正文
         assert_eq!(purge_bracket_marks("甲[乙丙]丁"), "甲乙丙丁");
         // 自家标记原样放行
@@ -1281,8 +1313,7 @@ mod tests {
         assert_eq!(purge_bracket_marks("甲〕乙"), "甲乙");
         // 超长括注：只剥壳，不撑破版面
         let long: String = std::iter::repeat_n('注', 100).collect();
-        assert!(purge_bracket_marks(&format!("甲〔{long}〕乙")).contains(&long));
-        let s = cleanup_ancient_text("贞观223年，卷十五第3回，共1980页");
+        assert!(purge_bracket_marks(&format!("甲〔{long}〕乙")).contains(&long));        let s = cleanup_ancient_text("贞观223年，卷十五第3回，共1980页");
         assert!(!s.contains('2'), "数字未转：{s}");
         assert!(!s.contains('3'), "数字未转：{s}");
         assert!(s.contains("贞观二二三年") || s.contains("贞观二百二十三年"), "年份应汉字化：{s}");

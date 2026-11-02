@@ -40,8 +40,8 @@ fn write_zip(dir: &Path, name: &str, entries: &[(&str, &str)]) -> PathBuf {
 }
 
 /// 整本书的正文（所有章的所有段拼起来），断言用。
-fn all_text(ir: &BookIR) -> String {
-    let b = ir.to_book();
+fn all_text(doc: &ParsedDoc) -> String {
+    let b = doc.book.to_book();
     // 注意：core 的断章器会把「第一章」这类行**从正文里摘出去**当章名，
     // 所以整本书的正文必须连章名一起拼，否则会误判成「标题丢了」。
     let mut parts: Vec<String> = Vec::new();
@@ -86,7 +86,7 @@ fn dirty_txt_gb18030_zero_width_and_soft_wraps() {
         t.contains("此開卷第一回也") && !t.contains("此開卷第一回也；作者"),
         "软换行没拼好：{t}"
     );
-    assert!(ir.juans.len() >= 1, "一章都没切出来");
+    assert!(ir.book.juans.len() >= 1, "一章都没切出来");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -162,7 +162,7 @@ fn empty_file_yields_empty_book_not_panic() {
     let dir = tmpdir("empty");
     let p = write_bytes(&dir, "空.txt", b"");
     let ir = import_file(&p).expect("空文件不该报错");
-    assert!(ir.juans.is_empty(), "空文件居然切出了章");
+    assert!(ir.book.juans.is_empty(), "空文件居然切出了章");
     // 空书 `to_book()` 会补一个占位章「正文」，但段落必须一个都没有。
     assert!(
         ir.to_book().chapters.iter().all(|c| c.paragraphs.is_empty()),
@@ -221,7 +221,8 @@ fn dirty_markdown_strips_marks_and_front_matter() {
     assert!(!t.contains("http://"), "链接地址漏进正文：{t}");
     assert!(t.contains("道可道"), "正文丢了：{t}");
     assert!(t.contains("上善若水"), "列表内容丢了：{t}");
-    assert!(t.contains("名字") || t.contains("名可名"), "代码块内容丢了：{t}");
+    // 围栏代码块整块丢弃：里面的「名可名，非常名。」不该进古籍正文。
+    assert!(!t.contains("名可名"), "围栏代码块内容不该进正文：{t}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -306,12 +307,22 @@ fn dirty_json_nested_and_truncated() {
 #[test]
 fn unsupported_extension_is_a_readable_error() {
     let dir = tmpdir("ext");
-    let p = write_bytes(&dir, "书.pdf", b"%PDF-1.4");
+    // PDF 自 v1.9.25 起是**正式格式**（统一漏斗里的一等公民），不再是「不支持
+    // 的后缀」。这条契约改用真正没实现的后缀来钉。
+    let p = write_bytes(&dir, "书.xyz", b"whatever");
     let e = import_file(&p).unwrap_err();
     assert!(matches!(e, ImportError::Unsupported(_)), "实际：{e:?}");
-    assert!(e.to_string().contains("pdf"), "错误信息没点出后缀：{e}");
+    assert!(e.to_string().contains("xyz"), "错误信息没点出后缀：{e}");
     assert!(!is_supported(&p));
     assert!(is_supported(Path::new("a.EPUB")), "后缀大小写该不敏感");
+    // 反向钉死：PDF 进了支持表，且坏的 PDF 报的是「需 OCR」而不是「不认识」。
+    let bad = write_bytes(&dir, "坏.pdf", b"%PDF-1.4");
+    assert!(is_supported(&bad), "PDF 应进支持表");
+    let e2 = import_file(&bad).unwrap_err();
+    assert!(
+        matches!(e2, ImportError::OcrNeeded(_)),
+        "坏 PDF 应报「需 OCR」：{e2:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

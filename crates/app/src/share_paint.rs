@@ -24,10 +24,15 @@ use crate::share_layout::{
     Binding, CardLayout, PlacedChar, PlacedSeal, ShareFont, punct_box, spread_slots,
 };
 
+use core_foundation::attributed_string::CFMutableAttributedString;
+use core_foundation::base::{CFRange, TCFType};
+use core_foundation::string::CFString;
 use core_graphics::color_space::CGColorSpace;
 use core_graphics::context::CGContext;
-use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+use core_graphics::geometry::{CGAffineTransform, CGPoint, CGRect, CGSize};
 use core_text::font::new_from_name;
+use core_text::line::CTLine;
+use core_text::string_attributes::kCTFontAttributeName;
 
 /// 位图格式：32 位大端（内存序 R,G,B,X）+ 忽略 alpha。
 ///
@@ -121,6 +126,52 @@ fn glyph_origin(c: &PlacedChar, asc: f64) -> (f64, f64) {
     }
 }
 
+/// 落一枚字（`x` = 落笔点、`y` = **CG 坐标的基线**）。
+///
+/// ── 为什么要分两条路（v1.9.27，PDF 文本层的命门）────────────────
+/// 位图不在乎「这是个什么字符」，按字形序号落笔最快；**PDF 在乎**——它要
+/// 往文件里嵌 ToUnicode 映射表，阅读器复制/检索时才反查得回原文。
+///
+/// * 位图 → `font.draw_glyphs(...)`：只给 GID。
+/// * PDF  → `CTLineDraw`：必须**按字符串**排一行。CoreText 因此握有
+///   「这一笔是哪个字符」，写 PDF 时才嵌得出正确的 ToUnicode。
+///
+/// 若 PDF 也走 GID，CG 只能拿 GID 去反查字体 cmap；Apple 中文字体里
+/// `玄`/`日`/`月`/`辰` 这些字形同时还挂着**康熙部首**那一路的兼容码位
+/// （U+2F5E ⽞ / U+2F47 ⽇ / U+2F49 ⽉ / U+2FA0 ⾠），反查就挑到那儿去。
+/// 页面看着分毫不差，复制出来却是 `⽞⽇⽉⾠`——肉眼永远查不出，只能靠
+/// 测试钉死（`collation::vector_pdf_regression`）。
+///
+/// 两条路的**落笔点与基线完全相同**，故几何一寸不改。
+fn paint_glyph(
+    ctx: &CGContext,
+    font: &core_text::font::CTFont,
+    ch: char,
+    glyph: core_graphics::font::CGGlyph,
+    x: f64,
+    y: f64,
+    pdf: bool,
+) {
+    if !pdf {
+        // `draw_glyphs` 按值取 context：`clone()` 底层是 `CGContextRetain`，
+        // 随调用结束 drop（release），一增一减，绝不泄漏。
+        font.draw_glyphs(&[glyph], &[CGPoint::new(x, y)], ctx.clone());
+        return;
+    }
+    let mut buf = [0u8; 4];
+    let s = CFString::new(ch.encode_utf8(&mut buf));
+    let mut astr = CFMutableAttributedString::new();
+    astr.replace_str(&s, CFRange::init(0, 0));
+    let range = CFRange::init(0, astr.char_len());
+    astr.set_attribute(range, unsafe { kCTFontAttributeName }, font);
+    let line = CTLine::new_with_attributed_string(astr.as_concrete_TypeRef());
+    // 行由 CoreText 排，上下文只提供落笔点；文本矩阵显式复位成单位阵，
+    // 免得上一笔留下任何变换把字画歪。
+    ctx.set_text_matrix(&CGAffineTransform::new(1.0, 0.0, 0.0, 1.0, 0.0, 0.0));
+    ctx.set_text_position(x, y);
+    line.draw(ctx);
+}
+
 /// 把一张 `CardLayout` 光栅成 PNG 字节（失败返回可读原因，绝不 panic）。
 pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
     let w = l.w.round().max(1.0) as usize;
@@ -129,7 +180,7 @@ pub fn render_png(l: &CardLayout) -> Result<Vec<u8>, String> {
     // ---- 位图上下文（Drop → CGContextRelease；ColorSpace 同理）----
     let space = CGColorSpace::create_device_rgb();
     let mut ctx = CGContext::create_bitmap_context(None, w, h, 8, w * 4, &space, BITMAP_INFO);
-    draw_card(l, &ctx, h as f64, 0.0, 0.0)?;
+    draw_card(l, &ctx, h as f64, 0.0, 0.0, false)?;
     encode_png(&mut ctx, w, h)
 }
 
@@ -246,7 +297,7 @@ pub fn render_spread_png(
             &CGPoint::new(ox, 0.0),
             &CGSize::new(p.w as f64, h as f64),
         );
-        with_page_clip(&ctx, box_, || draw_card(p, &ctx, h as f64, ox, 0.0))?;
+        with_page_clip(&ctx, box_, || draw_card(p, &ctx, h as f64, ox, 0.0, false))?;
     }
     // 正中一条中缝线：让「一张纸对折、左右各一页」一眼可辨。
     draw_fold(&ctx, h as f64, sheet_w, first);
@@ -422,7 +473,7 @@ fn pdf_write(
             ctx.fill_rect(box_);
             // 落笔前 clip 到本页矩形：越界的字被裁掉，绝不写进隔壁那半张纸。
             let drew = with_page_clip(&ctx, box_, || {
-                draw_card(page, &ctx, sheet_h, *dx, *dy)
+                draw_card(page, &ctx, sheet_h, *dx, *dy, true)
             });
             if let Err(e) = drew {
                 failed = Some(e);
@@ -475,7 +526,17 @@ pub fn render_pdf_spread(
 /// 两处上下文的行为相同：`CGBitmapContext` 与 `CGPDFContext` 都是 CG 坐标、
 /// 都是 y 向上，故同一套「只把每个元素的 y 镜像一次」的换算完全通用——
 /// **两边都不许翻 CTM**（翻了字会被镜像，v1.58 的坑）。
-fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64, ox: f64, oy: f64) -> Result<(), String> {
+///
+/// `pdf` 只影响**怎么落字**（位图按字形序号、PDF 按字符串以嵌对 ToUnicode），
+/// 不影响任何坐标——见 [`paint_glyph`]。
+fn draw_card(
+    l: &CardLayout,
+    ctx: &CGContext,
+    hf: f64,
+    ox: f64,
+    oy: f64,
+    pdf: bool,
+) -> Result<(), String> {
     // 防雷 ①：**不翻 CTM**。整幅坐标仍走 CG 原生（原点左下、y 向上），
     // 每个元素落笔前用 `cg_*` 把屏幕坐标（左上原点）换算过来。
     // 位图缓冲的第 0 行是图像**顶行**，故「屏幕 y」与「缓冲行号」同序。
@@ -567,12 +628,10 @@ fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64, ox: f64, oy: f64) -> Resu
         }
         let (fr, fg, fb) = rgb(c.color);
         ctx.set_rgb_fill_color(fr, fg, fb, 1.0);
-        // `draw_glyphs` 按值取 context：`clone()` 底层是 `CGContextRetain`，
-        // 随调用结束 drop（release），一增一减，绝不泄漏。
         // ⚠️ 竖排**不旋转字形**：方块汉字竖排靠「纵向依次排列」实现，
         // 逐字落笔即可，转 90° 反而把字放倒。这里只把基线镜像到 CG 侧，
         // 字形本身保持正向（CTM 未翻，故无镜像）。
-        font.draw_glyphs(&[glyph], &[CGPoint::new(sx(gx), cg_base(gy))], ctx.clone());
+        paint_glyph(ctx, &font, c.ch, glyph, sx(gx), cg_base(gy), pdf);
         // **加粗**（Markdown `**…**`）：同字再落两笔极微量偏移，墨迹自然加厚。
         //
         // 为什么不换 Bold 字体面：`pick_font` 走的是 PostScript 回退链，系统宋体
@@ -581,22 +640,14 @@ fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64, ox: f64, oy: f64) -> Resu
         // 已经能看出「这一行是重的」，且与底色同一抗锯齿，不会有描边毛刺。
         if c.bold {
             let d = 0.45;
-            font.draw_glyphs(
-                &[glyph],
-                &[CGPoint::new(sx(gx) + d, cg_base(gy))],
-                ctx.clone(),
-            );
-            font.draw_glyphs(
-                &[glyph],
-                &[CGPoint::new(sx(gx), cg_base(gy + d))],
-                ctx.clone(),
-            );
+            paint_glyph(ctx, &font, c.ch, glyph, sx(gx) + d, cg_base(gy), pdf);
+            paint_glyph(ctx, &font, c.ch, glyph, sx(gx), cg_base(gy + d), pdf);
         }
     }
 
     // ---- 朱印 ----
     if let Some(s) = &l.seal {
-        paint_seal(&ctx, s, l.bg, hf, ox, oy);
+        paint_seal(&ctx, s, l.bg, hf, ox, oy, pdf);
     }
 
     Ok(())
@@ -605,7 +656,15 @@ fn draw_card(l: &CardLayout, ctx: &CGContext, hf: f64, ox: f64, oy: f64) -> Resu
 /// 朱砂方章：**纯色红方块 + 黑色「笺读」二字**（横排居中）。
 ///
 /// 先跑通闭环：不画鱼尾、不刻书名——印就是一枚朱砂底、墨字落款的方章。
-fn paint_seal(ctx: &CGContext, s: &PlacedSeal, _paper: u32, h: f64, ox: f64, oy: f64) {
+fn paint_seal(
+    ctx: &CGContext,
+    s: &PlacedSeal,
+    _paper: u32,
+    h: f64,
+    ox: f64,
+    oy: f64,
+    pdf: bool,
+) {
     let (r, g, b) = rgb(CINNABAR);
     let sz = s.size as f64;
     ctx.set_rgb_fill_color(r, g, b, 1.0);
@@ -642,7 +701,7 @@ fn paint_seal(ctx: &CGContext, s: &PlacedSeal, _paper: u32, h: f64, ox: f64, oy:
         }
         let x = s.x as f64 + ox + sz * 0.08 + i as f64 * fs;
         ctx.set_rgb_fill_color(0.06, 0.06, 0.06, 1.0);
-        font.draw_glyphs(&[glyph], &[CGPoint::new(x, baseline)], ctx.clone());
+        paint_glyph(ctx, &font, *ch, glyph, x, baseline, pdf);
     }
 }
 

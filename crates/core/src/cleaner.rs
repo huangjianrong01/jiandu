@@ -1067,7 +1067,7 @@ fn rebuild_headings(juans: Vec<IrJuan>) -> Vec<IrJuan> {
 
 /// 第二遍之二：括号里的短串**升格**成夹注。
 ///
-/// 判据保守：只认全角 `（）`（现代编辑加的注释都这么写），内容 1–30 字、
+/// 判据保守：只认圆括号 `（）` / `()`（现代编辑加的注释都这么写），内容 1–30 字、
 /// 不含句读（含句读的说明是正文本身，不是注）、不含嵌套括号。
 pub fn paren_to_note(s: &str) -> String {
     let mut out = String::new();
@@ -1123,18 +1123,26 @@ pub fn paren_to_note(s: &str) -> String {
     out
 }
 
-/// **统一「括号→双行夹注」入口**：把 `〔…〕` / `【…】` 与全角圆括号 `（）`、
-/// 半角 `()` 都归一成系统一等公民的 `[注]…[/注]` 标记。
+/// **统一「括号→双行夹注」入口**：把 `〔…〕` / `【…】` 与圆括号 `（）` / `()`
+/// 都归一成系统一等公民的 `[注]…[/注]` 标记。
 ///
 /// 这样 TXT / DOCX（走 `pipeline::parse_txt`）与 EPUB（走 `vclean::clean_epub`）
 /// 三条导入路共享同一套夹注识别——这才是真正的「全格式」。
 ///
 /// 设计要点：
 /// - `〔…〕` / `【…】` 一律升格（古籍注疏、校勘记的正规写法，不限额长）。
-/// - `（）` / `()` 用**保守判据**升格：内容 1–30 字、不含句读（含句读说明是正文）、
-///   不含嵌套括号、且不是已存在的 `[注]` 壳；否则原样保留，绝不吞字。
+/// - `（）` / `()` 用**保守判据**升格：内容 1–30 字、不含句读（含句读说明是
+///   正文）、不含嵌套括号、且不是已存在的 `[注]` 壳；否则原样保留，绝不吞字。
 /// - `（）` 若嵌在 `〔…〕` / `【…】` 注内，原样透传，绝不套出双层 `[注]`。
 /// - 残留未闭合的括号一律兜底成对，绝不产生不配对的 `[注]` 标记。
+/// - **严格标记 `[note]…[/note]`** 直接映射成 `[注]…[/注]`，给用户一个绝不会
+///   被标点误触发的安全入口。
+///
+/// ⚠️ **PDF 链不经过这里**。PDF 抽取文本走 `parsers::classicize` →
+/// `parsers::purge_bracket_marks`，那条链上的 `【题解】` 绝不能升格成夹注
+/// （尔雅式的章节标签，升格就等于正文缺一段，v1.9.26 已定死）。两条链的
+/// 口径**故意不同**：这里面对的是「括号就是注释协议」的裸文本 / EPUB，
+/// 那边面对的是版式已定的印刷品。改任何一边之前，先确认动的是哪条链。
 pub fn brackets_to_notes(s: &str) -> String {
     let cs: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -1155,8 +1163,8 @@ pub fn brackets_to_notes(s: &str) -> String {
                 out.push_str("[注]");
             }
             '〕' => {
-                // 与栈顶 〔 配对才闭；落单右括号（正文里的噪声）丢弃，与旧
-                // `txt_bracket_notes` 行为一致。
+                // 与栈顶 〔 配对才闭；落单右括号（正文里的噪声）丢弃，
+                // 与旧 `txt_bracket_notes` 行为一致。
                 if let Some(&0) = stack.last() {
                     stack.pop();
                     out.push_str("[/注]");
@@ -1167,6 +1175,28 @@ pub fn brackets_to_notes(s: &str) -> String {
                     stack.pop();
                     out.push_str("[/注]");
                 }
+            }
+            // —— 严格标记 [note] / [/note] ——
+            //
+            // ⚠️ 步进必须**吃掉整个标记**（含 `]`）：`continue` 会跳过循环末尾的
+            // `i += 1`，少跳一格就把右方括号当正文留在原地，输出 `[注]]`。
+            '[' => {
+                // `[/note]` = 7 个字符
+                if i + 7 <= cs.len()
+                    && cs[i + 1] == '/'
+                    && &cs[i + 2..i + 7] == ['n', 'o', 't', 'e', ']']
+                {
+                    out.push_str("[/注]");
+                    i += 7;
+                    continue;
+                }
+                // `[note]` = 6 个字符
+                if i + 6 <= cs.len() && &cs[i + 1..i + 6] == ['n', 'o', 't', 'e', ']'] {
+                    out.push_str("[注]");
+                    i += 6;
+                    continue;
+                }
+                out.push(c);
             }
             '（' | '(' => {
                 if paren.is_some() {
@@ -1213,8 +1243,12 @@ pub fn brackets_to_notes(s: &str) -> String {
         i += 1;
     }
     if let Some(b) = paren.take() {
+        // 没闭合的括号：把内容原样补回（含开括号），绝不吞字。
+        out.push('(');
         out.push_str(&b);
     }
+    // 残留未闭合的 〔 / 【：一律兜底补收壳，保证 `[注]` 与 `[/注]` 成对——
+    // 下游 `split_body_marks` 见到悬空开壳会把它当正文吐出来（整段变夹注）。
     while stack.pop().is_some() {
         out.push_str("[/注]");
     }
@@ -1226,6 +1260,7 @@ fn rebuild_notes_juan(j: &mut IrJuan) {
     for b in j.blocks.iter_mut() {
         if let IrBlock::Para(spans) = b {
             let line = spans_line(spans);
+            // 圆括号（全角 / 半角）才可能触发夹注。
             if !line.contains('（') && !line.contains('(') {
                 continue;
             }
@@ -1632,16 +1667,28 @@ mod tests {
 
     #[test]
     fn paren_notes_become_annotations() {
-        assert_eq!(paren_to_note("名可名（河上公曰：有名）非常名"), "名可名[注]河上公曰：有名[/注]非常名");
+        // （）保守升格（内容不含句读、不超过 30 字）
+        assert_eq!(
+            paren_to_note("名可名（河上公曰：有名）非常名"),
+            "名可名[注]河上公曰：有名[/注]非常名"
+        );
+        // 半角 () 同一口径
+        assert_eq!(
+            paren_to_note("名可名(河上公注)非常名"),
+            "名可名[注]河上公注[/注]非常名"
+        );
         // 含句读的不是注——那是正文自己带的括号
-        assert_eq!(paren_to_note("他说（不对，其实是错的）。"), "他说（不对，其实是错的）。");
+        assert_eq!(
+            paren_to_note("他说（不对，其实是错的）。"),
+            "他说（不对，其实是错的）。"
+        );
         // 没闭合：绝不吞字
         assert_eq!(paren_to_note("道（可道"), "道（可道");
     }
 
     #[test]
     fn brackets_to_notes_unifies_all_bracket_kinds() {
-        // 〔〕 / 【】 一律升格
+        // 〔〕 / 【】 一律升格——裸文本里这就是注疏 / 校勘记的正规写法
         assert_eq!(brackets_to_notes("甲〔注曰〕乙"), "甲[注]注曰[/注]乙");
         assert_eq!(brackets_to_notes("甲【注曰】乙"), "甲[注]注曰[/注]乙");
         // （）保守升格（无句读）
@@ -1653,8 +1700,26 @@ mod tests {
         assert_eq!(brackets_to_notes("他说（不对，错的）。"), "他说（不对，错的）。");
         // （）嵌在〔〕注内不嵌套，原样透传
         assert_eq!(brackets_to_notes("〔外（內）尾〕"), "[注]外（內）尾[/注]");
-        // 半角 ()
-        assert_eq!(brackets_to_notes("道(a note)名"), "道[注]a note[/注]名");
+        // 半角 () 同一口径
+        assert_eq!(
+            brackets_to_notes("名可名(河上公注)非常名"),
+            "名可名[注]河上公注[/注]非常名"
+        );
+        // 含句读不升格——那是正文自己带的括号（开闭括号统一归一到全角）
+        assert_eq!(
+            brackets_to_notes("他说(不对，错的)。"),
+            "他说（不对，错的）。"
+        );
+        // 严格标记 [note] / [/note] → [注] / [/注]（整段吃掉，不留残 `]`）
+        assert_eq!(
+            brackets_to_notes("道[note]a note[/note]名"),
+            "道[注]a note[/注]名"
+        );
+        // 半角 () 与全角混排：全角不动，半角升格
+        assert_eq!(
+            brackets_to_notes("【题解】(注曰)乙"),
+            "[注]题解[/注][注]注曰[/注]乙"
+        );
     }
 
     #[test]

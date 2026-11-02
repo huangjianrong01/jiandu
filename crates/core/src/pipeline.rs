@@ -364,6 +364,21 @@ pub fn txt_is_title_line(line: &str) -> bool {
 
 /// txt → 标准章数组。
 pub fn parse_txt(text: &str) -> Vec<RawChapter> {
+    parse_txt_opts(text, true)
+}
+
+/// `txt → 标准章数组`，并决定**要不要把全角括号升格成夹注**。
+///
+/// * `bracket_notes = true`（默认，裸文本 / TXT / DOCX）：`〔…〕` / `【…】` /
+///   `（短注）` 归一成 `[注]…[/注]`，下游落成双行夹注。这是被压平的胡三省注、
+///   校勘记唯一的救赎。
+/// * `bracket_notes = false`（**PDF**）：原样保留。印刷品的版式已经定了，
+///   `【题解】` / `【注释】` 是章节标签、`（注）` 是现代括号，升格成夹注就等于
+///   「正文缺一段」——尔雅式 PDF 的老 bug 就是这么来的。
+///
+/// 这个开关之所以必须由**调用方**给：同一段文字的来源决定了括号的含义，
+/// 靠文本内容猜（长度 / 有没有句读）一定会误判。
+pub fn parse_txt_opts(text: &str, bracket_notes: bool) -> Vec<RawChapter> {
     // 头部幽灵先切一刀（BOM / 零宽 / 全角空格 / YAML 元数据块 / 连续空行）：
     // 它们每一个都占一个正文字格，留着就是第一列顶部的「幽灵空行」。
     // v1.75.0：品题断行必须在**逐行判章之前**——网上的佛经 txt 常是一整坨，
@@ -372,13 +387,13 @@ pub fn parse_txt(text: &str) -> Vec<RawChapter> {
     let norm = crate::cleaner::split_inline_heads(&crate::cleaner::strip_head_junk(
         &text.replace("\r\n", "\n").replace('\r', "\n"),
     ));
-    // TXT 专用：裸文本里被压平的全角括号注疏（胡三省注 / 校勘记）先归一成
-    // `[注]…[/注]`，下游 `split_body_marks` 自然落成双行夹注。这一步只在 TXT
-    // 链走，不动 EPUB / HTML（它们有自己的清洗，且 `purge_bracket_marks` 有
-    // 长度上限，不在本函数里改）。
     // 全格式夹注归一：`〔…〕`/`【…】`/`（）`/`()` 全部归一成 `[注]…[/注]`，
     // 下游 `split_body_marks` 自然落成双行夹注。这一行让 TXT / DOCX 走通夹注。
-    let norm = crate::cleaner::brackets_to_notes(&norm);
+    let norm = if bracket_notes {
+        crate::cleaner::brackets_to_notes(&norm)
+    } else {
+        norm
+    };
     let mut chapters: Vec<RawChapter> = Vec::new();
     let mut title = "正文".to_string();
     let mut paras: Vec<String> = Vec::new();
@@ -1386,6 +1401,15 @@ pub fn parse_to_jiandu_format(name: &str, bytes: &[u8]) -> Result<Vec<RawChapter
 /// 标点竖排化、残留标签清理、页码过滤，六格式共用一道闸。
 pub fn parse_str(kind: SrcKind, text: &str) -> Result<Vec<RawChapter>> {
     crate::parsers::UniversalParser::parse(kind, text)
+}
+
+/// 与 [`parse_str`] 相同，但纯文本**不做「全角括号→夹注」升格**。
+///
+/// 专给 PDF 这条链：印刷品的 `【题解】` / `（注）` 是章节标签与现代括号，
+/// 升格成双行夹注就是正文缺一段。断章 / 断卷 / 古籍化后处理一道不少，
+/// 只是不碰括号。
+pub fn parse_str_keeping_brackets(text: &str) -> Result<Vec<RawChapter>> {
+    crate::parsers::UniversalParser::parse_txt_keeping_brackets(text)
 }
 
 /// 摘出 `[注]…[/注]`（双行夹注），返回（干净文本, [(宿主字下标, 注文)]）。

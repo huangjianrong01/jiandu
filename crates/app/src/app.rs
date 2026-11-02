@@ -378,6 +378,18 @@ pub struct Root {
     pub trad_gen: std::cell::Cell<u64>,
     pub show_tongjia: bool,
     pub show_notes: bool,
+    /// **注释显隐开关**（v1.9.25）——纯渲染层，随时可切，版式一寸不动。
+    ///
+    /// 与 [`Self::show_notes`] 的分工（**别把两者合成一个**）：
+    ///   * `show_notes` = 「这本书要不要注释这套排版」——它参与分页
+    ///     （脚注模式要在地脚预留行、夹注要不要进列流），改了会**重排**；
+    ///   * `notes_shown` = 「此刻要不要看见它」——分页早已算完，这里只决定
+    ///     画不画。关掉时夹注块**格位照占**（宽高不变，只是不落墨），天头
+    ///     眉批 / 页脚注 / 圈号 / 批注红点统统不画。
+    ///
+    /// 于是「一键沉浸」不会让任何一行字挪动一寸：底层坐标留在原处，
+    /// 再打开就原样回来。这是用户点名要的「绝不能让排版错位」。
+    pub notes_shown: bool,
     /// 注文是否以「双行小字夹注」排进正文（false 则退为页脚注）。
     pub notes_inline: bool,
     /// 纸色主题。
@@ -1278,6 +1290,8 @@ impl Root {
             trad_gen: std::cell::Cell::new(0),
             show_tongjia: true,
             show_notes: true,
+            // 出厂「显示注释」（用户口径）：一进书就是注疏俱全的本子。
+            notes_shown: true,
             notes_inline: true,
             theme: Theme::Xuan,
             size_ancient: 26.0,
@@ -2949,6 +2963,28 @@ impl Root {
             }
         }
         self.sync_current_chapter();
+    }
+
+    /// **一键显隐注释**（v1.9.25）——纯渲染层，绝不重排。
+    ///
+    /// 关掉时纸面上只剩纯正文网格：夹注块 / 天头眉批 / 页脚注 / 圈号 /
+    /// 批注红点 / 字旁短批注全部不画。**格位照占**（夹注那块高度是分页时
+    /// 算死的，少画一格整列就上移），所以当前页、当前字、选区锚点全都不动，
+    /// 再点一次原样回来。
+    ///
+    /// 与 [`Self::set_notes_inline`] 的区别：那个改的是「注释怎么排」
+    /// （夹注 ⇄ 页脚注），要重排全书；这个改的是「此刻看不看见」，一行不重排。
+    pub fn toggle_notes_shown(&mut self) {
+        self.notes_shown = !self.notes_shown;
+        if !self.notes_shown {
+            // 挂在注释上的瞬态浮层一并收起。否则屏幕上会飘着一张「注文放大」
+            // 卡 / 一份「改注删注」菜单，而纸面上一个注字都没有——像见鬼。
+            self.note_zoom = None;
+            self.note_menu = None;
+            // 注块包围盒清空：隐藏后那些矩形根本不存在，留着只会让点击落
+            // 在一片空白上却弹注卡。
+            self.note_boxes.clear();
+        }
     }
 
     /// 取一本书的完整 `Book`（v1.50.0）。
@@ -5872,7 +5908,9 @@ fn anki_push_card(
         next: Option<&crate::gloss::Page>,
     ) {
         self.note_boxes.clear();
-        if !self.notes_inline || !self.show_notes {
+        // 注释隐藏时不必算包围盒：那些注块根本没画出来，留一堆坐标只会
+        // 让点击落在一片空白上却弹出放大注卡（v1.9.25）。
+        if !self.notes_inline || !self.show_notes || !self.notes_shown {
             return;
         }
         let mut leaves: Vec<(usize, bool, &crate::gloss::Page)> = Vec::new();

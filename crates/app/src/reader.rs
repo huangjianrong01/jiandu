@@ -2395,7 +2395,10 @@ impl Root {
                 self.clear_selection();
             }
             A::Underline => self.act_underline(),
-            A::Notes => self.show_notes = !self.show_notes,
+            // v1.9.25：改切**渲染层**开关（`notes_shown`），不再动 `show_notes`。
+            // 后者参与分页，切它要整本重排、页码会跳；前者只决定画不画，
+            // 格位照占，翻页位置分毫不动——这才是「一键沉浸」该有的手感。
+            A::Notes => self.toggle_notes_shown(),
             A::Tongjia => self.show_tongjia = !self.show_tongjia,
             A::Punct => {
                 // 显隐与形制是两件事：⌘B 只管「画不画」，⌘J 只管「怎么画」。
@@ -4356,6 +4359,22 @@ impl Root {
                 cx.notify();
             }),
         ));
+        // ── 「注」：一键显隐注释（v1.9.25 · 用户点名要的沉浸式阅读）──────
+        //
+        // 一枚单字、与「版字」相邻——它是版式的近亲（看什么 vs 怎么看），
+        // 但**必须是一级入口**：读书时想「清净一下」不该翻两层面板。
+        //
+        // 亮朱砂 = 注释开着（与其它钮「此门已开」同一套语义）；点一下转墨
+        // = 全纸只剩正文。它切的是 `notes_shown`（渲染层），**从不**碰
+        // `show_notes`——后者参与分页，切它页码会跳。
+        mid = mid.child(item("注", self.notes_shown).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_notes_shown();
+                cx.notify();
+            }),
+        ));
         mid = mid.child(sep());
 
         // ---- 右组：检索 / 问笺 ｜ 印製 ｜ 更多 ----
@@ -4587,6 +4606,7 @@ impl Root {
         // 估宽：一字 ≈ 字号宽（CJK 全角），印製 11px 二字另加 1px 双边。
         let est = |chars: f32, fs: f32, pad: f32| chars * fs + pad * 2.0;
         let bar_w = est(2.0, 13.0, 14.0) * 3.0  // 书阁 / 目录 / 版字
+            + est(1.0, 13.0, 14.0)              // 注（单字钮，v1.9.25）
             + est(2.0, 13.0, 9.0) * 2.0         // 检索 / 问笺
             + est(2.0, 11.0, 9.0) + 2.0         // 印製
             + est(2.0, 13.0, 14.0)              // 更多
@@ -5038,7 +5058,9 @@ impl Root {
         };
         // 有笔记的叶：右上角探出一颗朱批红点。
         let mut wrap = div().relative().child(inner);
-        if self.notes.contains_key(&idx) {
+        // 「注释隐藏」时连这颗点也收起来——它本身就是一条「此处有批注」的
+        // 提示，留着就破坏了「只剩正文」的沉浸感。
+        if self.notes_shown && self.notes.contains_key(&idx) {
             wrap = wrap.child(
                 div()
                     .absolute()
@@ -5719,7 +5741,8 @@ impl Root {
         }
 
         // 注文不进正文时，退回页脚注。
-        if !geo.notes_inline {
+        // 「注释隐藏」时整块页脚注不画——它是注释，不是正文。
+        if !geo.notes_inline && self.notes_shown {
             let notes = self.page_footnotes(glyphs, &note_index);
             if !notes.is_empty() {
                 let mut area = div()
@@ -5759,7 +5782,10 @@ impl Root {
         // canvas 绘制 + `anchor_char_index` 绝对锚定：坐标每帧由当帧版面反算，
         // 故翻页 / 改字号 / 换列数 / 换留白档都自动跟随。非交互（导出长图、
         // 分享卡）不画——那两处不该带上阅读时随手写下的批语。
-        if geo.interactive {
+        //
+        // 「注释隐藏」（v1.9.25）：天头眉批整层不画。它挂在**纸面**上、
+        // 不占行格，所以不画也不动版式——字一列都不会挪。
+        if geo.interactive && self.notes_shown {
             // `pl + INNER_PAD`：天头眉批挂在**纸面**上按纸面坐标画，而字格
             // 自 v1.86.0 起又往内缩了一道 `INNER_PAD`，故画布原点同步右移，
             // 引线才仍落在字上（宽度同步加两倍内衬）。
@@ -5901,7 +5927,14 @@ impl Root {
                                 .w(px(cell_w))
                                 .h(px(cell_h))
                                 .relative()
-                                .child(self.title_mark_overlay(g.ch, cell_w, cell_h, fs, back)),
+                                .child(self.title_mark_overlay(
+                                    g.ch,
+                                    cell_w,
+                                    cell_h,
+                                    fs,
+                                    back,
+                                    crate::types::is_open_title(g.ch),
+                                )),
                         );
                     }
                     idx += 1;
@@ -6299,6 +6332,18 @@ impl Root {
             .items_center()
             .overflow_hidden()
             .font_family(note_family.clone());
+        // ── 注释隐藏（v1.9.25）：**格位照占，一个字都不画** ─────────────
+        //
+        // 这是「一键沉浸」唯一不破坏版式的做法。夹注是**排进列流的**：
+        // 它占 `block_h` 这么高（`ceil_to_cells` 取整到整字格），这块高度
+        // 早已算进分页——少画一格，这一列后面所有字就整列上移，两叶立刻
+        // 错位。所以这里只把「墨」抽掉，把「格」留着：一块同宽同高的空纸。
+        //
+        // 不挂任何监听器、不画用户夹注底衬、不画放大卡的锚点——隐藏时它
+        // 就是一格空白，点它既不会弹注卡，也不会被误认为正文。
+        if !self.notes_shown {
+            return div().w(px(cell_w)).h(px(block_h));
+        }
         // 用户夹注：整块垫一层极淡朱砂底衬（不抢正文，只作「这是我加的」提示）。
         if let Some(bg) = note_bg {
             block = block.bg(rgb(bg));
@@ -6377,15 +6422,27 @@ impl Root {
                         } else {
                             nfs
                         };
-                        div()
+                        // 批注同样过一道逐字回退（v1.9.25）：楷体小字的生僻字
+                        // 比正文更多——夹注里一旦出现豆腐块，整块注文就没法读。
+                        // 小字格宽高本来就钉死在 `sub_w × row_h`，回退字体撑不动。
+                        let np = crate::font_fallback::note(self.font_note, ch, cx);
+                        let (glyph_ch, glyph_ink) = if np.is_missing() {
+                            (crate::font_fallback::PLACEHOLDER, self.palette.note(t))
+                        } else {
+                            (ch, note_color)
+                        };
+                        let mut d = div()
                             .w(px(sub_w))
                             .h(px(row_h))
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_size(px(char_fs))
-                            .text_color(rgb(note_color))
-                            .child(SharedString::from(ch.to_string()))
+                            .text_color(rgb(glyph_ink));
+                        if np.needs_lock() {
+                            d = d.font_family(np.family.clone()).overflow_hidden();
+                        }
+                        d.child(SharedString::from(glyph_ch.to_string()))
                     }
                     None => div().w(px(sub_w)).h(px(row_h)),
                 });
@@ -7031,34 +7088,100 @@ impl Root {
     /// `fs = 正文 × 0.4`、`dx = 格宽 × 0.3`、`dy = 格高 × 0.3`。
     /// 颜色是「朱砂兑纸色」的淡朱（比正文轻，却仍是句读的朱意），两套
     /// 深浅主题都稳——用兑色而非 opacity，不依赖底色透出来。
-    /// 书名号叠加层（v1.30.0）：缩到正文 **0.7 倍**，贴在字格**右上角**，
-    /// 不撑满格子、不与正文争格心。
+    /// 书名号叠加层（v1.30.0；v1.9.26 上半 / 下半分开落位）：缩到正文
+    /// **0.7 倍**，贴在字格**边栏**上，不撑满格子、不与正文争格心。
     ///
     /// 书名号绝不单独占一格——半格账记 0（见 `gloss::piece_units`），
     /// 开号 `︽` 叠在书名首字那一格、闭号 `︾` 叠在书名末字那一格，
     /// 一对角标正好把书名「括」住，行气不断（旧版它独占一格，读起来一断一断）。
-    fn title_mark_overlay(&self, ch: char, cell_w: f32, cell_h: f32, fs: f32, back: bool) -> Div {
+    ///
+    /// **v1.9.26 为什么要分上下**（用户「书名号看着偏向一边」的真凶之一）：
+    /// 旧版开号闭号**都贴格上缘**，于是 `︾` 落在末字的**头顶**而不是字脚——
+    /// 一对角标全挤在上半格，视觉上整对都在往上飘；一字书名（《道》）更惨，
+    /// 两号叠在同一处。现在开号占上半格、闭号占下半格，一对角标以书名
+    /// 为中心**上下对称**，这才是刻本里「括起来」的样子。
+    ///
+    /// 只改这两个**绝对定位盒**的 `top` / `bottom`：宽高仍是小方盒，
+    /// 半格账与分页一寸不动。
+    fn title_mark_overlay(
+        &self,
+        ch: char,
+        cell_w: f32,
+        cell_h: f32,
+        fs: f32,
+        back: bool,
+        // true = 开号（上半格）；false = 闭号（下半格）。
+        open: bool,
+    ) -> Div {
         let t = self.theme;
         let c = crate::types::title_mark(ch);
         let pfs = (fs * crate::punct::TITLE_FS_RATIO)
             .max(6.0)
             .min(cell_h.min(cell_w));
         let ink = if back { t.ink_soft() } else { t.ink() };
-        div()
+        // 小方盒宽 = 一枚标点的字号宽，高 = **半格**：盒内居中，标点就落在
+        // 这一半的正中（横向仍贴格右缘——竖排的书名号长在字列右侧）。
+        let mut boxed = div()
             .absolute()
-            // 右上角：贴格上缘与格右缘（竖排右缘是上一列那一侧，正是
-            // 刻本旁标的位置）。只占一个小方盒，正文字仍在格心。
-            .top(px(0.0))
             .right(px(0.0))
             .w(px(pfs))
-            .h(px(pfs))
+            .h(px(cell_h * 0.5))
             .flex()
-            .flex_row()
-            .items_start()
-            .justify_end()
+            .items_center()
+            .justify_center()
             .text_size(px(pfs))
+            .line_height(px(pfs))
             .text_color(rgb(ink))
-            .child(SharedString::from(c.to_string()))
+            .child(SharedString::from(c.to_string()));
+        boxed = if open {
+            boxed.top(px(0.0))
+        } else {
+            boxed.bottom(px(0.0))
+        };
+        boxed
+    }
+
+    /// **全角标点的视觉居中盒**（v1.9.26）。
+    ///
+    /// 返回一个**满格**的绝对定位盒子，整格横移到
+    /// [`crate::mark_align::center_dx`] 算出的位置，标点在盒内居中。
+    ///
+    /// 三件事一次说清：
+    ///
+    ///   ① **只改 translate**：盒子的宽高恒为 `cell_w × cell_h`，被平移的那一
+    ///      下就是 `left(px(dx))`。它不参与 flex 流（`absolute`），所以**绝不
+    ///      影响网格、字距、分页**——`calculate_grid` 一行没动。
+    ///   ② **`dx` 是量出来的**：竖排形（`﹁﹂︽︾︵︶`）在字库里贴右缘设计，
+    ///      按前进宽度居中的结果就是肉眼偏右。这里要字体的真实墨迹框，把
+    ///      墨心拉回格心（详见 `mark_align`）。字已经居中的（`dx ≈ 0`）不动。
+    ///   ③ **纵向只锁行盒**：`line_height = cell_h`。竖排标点的上下位置有
+    ///      体例含义（`﹁` 贴格上缘领起下文），**不能**硬挪到正中；锁行盒
+    ///      只是把「字体 ascent/descent 带来的几像素漂移」去掉。
+    fn optical_center(
+        &self,
+        ch: char,
+        size: f32,
+        ink: u32,
+        cell_w: f32,
+        cell_h: f32,
+        cx: &App,
+    ) -> Div {
+        // 量哪支字体的框？就是正文这支——标点没走逐字回退，画的是同一支。
+        let family = self.main_family();
+        let dx = crate::mark_align::center_dx(cx, family.as_ref(), ch, size);
+        div()
+            .absolute()
+            .left(px(dx))
+            .top(px(0.0))
+            .w(px(cell_w))
+            .h(px(cell_h))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(size))
+            .line_height(px(cell_h))
+            .text_color(rgb(ink))
+            .child(SharedString::from(ch.to_string()))
     }
 
     /// 句读浮层：**绝不用字体字形**，也绝不用 SVG 贴图——一枚 `canvas`
@@ -7421,50 +7544,48 @@ impl Root {
             }
             cell = cell.child(hint);
         }
-        if let Some((txt, color)) = self.annotation_of(g) {
-            cell = cell.child(
-                div()
-                    .text_size(px((fs * 0.34).max(7.0)))
-                    .text_color(rgb(if back { t.ink_soft() } else { color }))
-                    .child(SharedString::from(txt)),
-            );
+        // 字旁的短批注（`annotation_of`）：属于注释，注释隐藏时不画。
+        if self.notes_shown {
+            if let Some((txt, color)) = self.annotation_of(g) {
+                cell = cell.child(
+                    div()
+                        .text_size(px((fs * 0.34).max(7.0)))
+                        .text_color(rgb(if back { t.ink_soft() } else { color }))
+                        .child(SharedString::from(txt)),
+                );
+            }
         }
         if let Some(vp) = crate::west::vertical_paren(g.ch) {
             // 括号换竖排专用字形 ︵ / ︶：本身已横躺，在列中上下相接，
             // 贴合汉字基线（不再用右下角小字的句读摆法）。
             let pf = (fs * 0.88).max(8.0).min(cell_h);
-            cell = cell.child(
-                div()
-                    .text_size(px(pf))
-                    .text_color(rgb(ink))
-                    .child(SharedString::from(vp.to_string())),
-            );
+            cell = cell.relative().child(self.optical_center(vp, pf, ink, cell_w, cell_h, cx));
         } else if crate::types::is_title_mark(g.ch) {
             // **书名号**（兜底路径）：正常流程里 `to_flow` 已把它换成 `︽ ︾`
-            // 并标成 `Attach`，由 `title_mark_overlay` 叠到邻字格的右上角、
+            // 并标成 `Attach`，由 `title_mark_overlay` 叠到邻字格的边栏上、
             // 半格账记 0、不占格。走到这里说明它是**孤立**的（前后都没有
             // 可依附的正文），只能单独一格——字号仍是 0.7 倍正文。
             let tf = (fs * crate::punct::TITLE_FS_RATIO).max(9.0).min(cell_h);
-            cell = cell.child(
-                div()
-                    .text_size(px(tf))
-                    .text_color(rgb(ink))
-                    .child(SharedString::from(
-                        crate::types::title_mark(g.ch).to_string(),
-                    )),
-            );
+            cell = cell.relative().child(self.optical_center(
+                crate::types::title_mark(g.ch),
+                tf,
+                ink,
+                cell_w,
+                cell_h,
+                cx,
+            ));
         } else if crate::types::is_quote_mark(g.ch) {
             // **直角引号**：竖排里要旋转 90°（开口朝下）。GPUI 0.2.2 没有
             // 元素级旋转变换，直接用 Unicode 竖排呈现形 `﹁ ﹂ ﹃ ﹄`
             // ——字库里存的就是转好的那一枚。
-            cell = cell.child(
-                div()
-                    .text_size(px(fs.min(cell_h)))
-                    .text_color(rgb(ink))
-                    .child(SharedString::from(
-                        crate::types::vertical_quote(g.ch).to_string(),
-                    )),
-            );
+            cell = cell.relative().child(self.optical_center(
+                crate::types::vertical_quote(g.ch),
+                fs.min(cell_h),
+                ink,
+                cell_w,
+                cell_h,
+                cx,
+            ));
         } else if crate::punct::kind_for(g.ch, self.punct_mode).is_some() {
             // 句读（标点）：**正文字号 × 0.35** 的朱砂小手绘（空心圈 / 小弧），
             // 中心钉在字格右下角（x + 格宽×0.7、y + 格高×0.7），格心整个
@@ -7495,8 +7616,30 @@ impl Root {
             } else {
                 shown
             };
-            cell = cell.child(
-                div()
+            // ── 逐字字体回退（v1.9.25）────────────────────────────────
+            // 先问「这个字该用哪支字体」：首选字体有它就照旧（绝大多数），
+            // 缺字只许落到系统 CJK 字库，全系统无解则画占位符。
+            //
+            // **这一步只决定「用谁画」，一寸几何都不碰**：字格宽高仍是
+            // `cell_w × cell_h`，行盒仍锁 `cell_h`——回退字体的自带留白
+            // 撑不动竖排网格。
+            let pick = crate::font_fallback::body(
+                self.font_ancient,
+                self.script,
+                shown.chars().next().unwrap_or(' '),
+                cx,
+            );
+            // 缺字：画几何占位符（与「字体没装好」的豆腐块一眼可辨），
+            // 颜色压到注文那一档，绝不抢正文的墨。
+            let (label, label_ink) = if pick.is_missing() {
+                (
+                    SharedString::from(crate::font_fallback::PLACEHOLDER.to_string()),
+                    self.palette.note(t),
+                )
+            } else {
+                (SharedString::from(shown), ink)
+            };
+            let glyph = div()
                     .text_size(px(fs))
                     // ── v1.59.0 首行顶格的**另一半**：行盒锁死 ──────────
                     // 列容器已锚 `grid::top_baseline`，但光锚容器不够：字格的
@@ -7507,9 +7650,32 @@ impl Root {
                     // 它的等价物），字形在格内的位置只由格高决定，与字体无关。
                     // 纯样式层：不改格宽高、不改分页、不改命中矩形。
                     .line_height(px(cell_h))
-                    .text_color(rgb(ink))
-                    .child(SharedString::from(shown)),
-            );
+                    .text_color(rgb(label_ink))
+                    .child(label);
+            // ── 网格保护（回退专用）──────────────────────────────────
+            // 首选字体走原路（继承根元素的族名、行盒锁格高），一个字节都不
+            // 多加；只有**回退 / 缺字**这两个分支才加一层「物理字框」：
+            // 宽高**照抄** `cell_w × cell_h`、居中、超出的部分裁掉。
+            //
+            // 为什么必须加这一层：回退字体的 em box 与首选完全不同（某支
+            // 楷体的 ascent 能顶到 1.2em），字一旦按它自己的行距落笔，竖排
+            // 的整列就会往下漂——而这一列的字格总数是分页时算死的，漂出去
+            // 就与下一列错位。锁死之后，回退字体只能在这个框**里面**画。
+            let glyph = if pick.needs_lock() {
+                let mut boxed = div()
+                    .w(px(cell_w))
+                    .h(px(cell_h))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .font_family(pick.family.clone());
+                boxed = boxed.child(glyph);
+                boxed
+            } else {
+                glyph
+            };
+            cell = cell.child(glyph);
         }
         // 挤压标点（列排满时排不下的那枚句读）：挂在**本格**右下角，与末字
         // 同格、共用一格。它半格账记 0，故绝不会另起一列占列首格。
@@ -7518,20 +7684,21 @@ impl Root {
                 .relative()
                 .child(self.punct_overlay(h.ch, cell_w, cell_h, fs, back, true));
         }
-        // 书名号：贴**本格右上角**、0.7 倍正文。开号在本格（书名首字）、
-        // 闭号也在本格（书名末字）——一格至多各一枚，绝不单独占列。
+        // 书名号：0.7 倍正文，**开号占上半格、闭号占下半格**（v1.9.26）。
+        // 开号在本格（书名首字）、闭号也在本格（书名末字）——一格至多各一枚，
+        // 绝不单独占列。分上下之后，一字书名（《道》）两号也不会叠在一处。
         let (open_mk, close_mk) = title_marks;
         if open_mk.is_some() || close_mk.is_some() {
             cell = cell.relative();
             if let Some(c) = open_mk {
-                cell = cell.child(self.title_mark_overlay(c, cell_w, cell_h, fs, back));
+                cell = cell.child(self.title_mark_overlay(c, cell_w, cell_h, fs, back, true));
             }
             if let Some(c) = close_mk {
-                cell = cell.child(self.title_mark_overlay(c, cell_w, cell_h, fs, back));
+                cell = cell.child(self.title_mark_overlay(c, cell_w, cell_h, fs, back, false));
             }
         }
-        // 脚注模式下补圈号角标。
-        if !self.notes_inline && self.show_notes {
+        // 脚注模式下补圈号角标（注释隐藏时不补：正文只留纯文字）。
+        if !self.notes_inline && self.show_notes && self.notes_shown {
             if let Some(n) = note_index.get(&(g.chapter, g.para, g.offset)) {
                 cell = cell.child(
                     div()
@@ -12301,7 +12468,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 ("标点", self.show_punct, StyleAct::Punct),
                 ("生僻字", self.show_rare, StyleAct::Rare),
                 ("数字汉字", self.han_digits, StyleAct::Han),
-                ("注释", self.show_notes, StyleAct::Notes),
+                ("注释", self.notes_shown, StyleAct::Notes),
             ],
             cx,
         );
@@ -12564,7 +12731,9 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                                 cx,
                             ),
                             StyleAct::Tong => this.show_tongjia = !this.show_tongjia,
-                            StyleAct::Notes => this.show_notes = !this.show_notes,
+                            // v1.9.25：与顶栏那枚「注」同一条路——只切渲染层，
+                            // 不触发重排（改 `show_notes` 会重算地脚预留、页码跳）。
+                            StyleAct::Notes => this.toggle_notes_shown(),
                             StyleAct::Punct => this.show_punct = !this.show_punct,
                             StyleAct::Rare => this.show_rare = !this.show_rare,
                             // 数字转汉字：改它要重排（格数账变了），

@@ -39,6 +39,7 @@ pub mod epub_parser;
 pub mod html_parser;
 pub mod json_parser;
 pub mod md_parser;
+pub mod pdf_parser;
 pub mod traits;
 pub mod txt_parser;
 
@@ -55,6 +56,28 @@ use traits::FormatParser;
 
 /// 用户口径里的「BookIR」＝ core 的 [`IrBook`]（同一份结构，绝不复刻第二份）。
 pub type BookIR = IrBook;
+
+/// 导入漏斗的统一返回：**薄包装** [`BookIR`]，附带可选 PDF 坐标。
+///
+/// 设计原则（v1.9.x）：**绝不改 `BookIR` 本身**——所有历史测试与调用点只需
+/// `.book` 拆出 `BookIR`（`into_book()` 一句即可）就能跑，逻辑一行不变。
+/// PDF 文本层坐标只是「顺带的赠品」：非 PDF 一律 `None`，扫描 PDF 在入口处
+/// 已由 [`ImportError::OcrNeeded`] 提前报错，不会走到这里。
+#[derive(Debug)]
+pub struct ParsedDoc {
+    /// 既有的书稿中间表示，一字未改。
+    pub book: BookIR,
+    /// PDF 文本层坐标（仅 PDF 导入时有；扫描件为 `None`）。
+    pub pdf_regions: Option<Vec<crate::pdf_text::SourceRegion>>,
+}
+
+impl ParsedDoc {
+    /// 拆出历史 API 用的 [`jiandu_core::types::Book`]（与 `BookIR::to_book` 同语义，
+    /// 老调用点 `ir.to_book()` 一行都不用改）。
+    pub fn to_book(&self) -> jiandu_core::types::Book {
+        self.book.to_book()
+    }
+}
 
 /// 单文件读取上限（128 MiB）：超过就报错而不是把内存吃穿。
 ///
@@ -81,6 +104,8 @@ pub enum ImportError {
     MissingEntry(String),
     /// 超过 [`MAX_BYTES`]。
     TooLarge { limit: u64 },
+    /// PDF 是扫描图、没有文本层，需要先 OCR 才能导入。
+    OcrNeeded(String),
 }
 
 impl std::fmt::Display for ImportError {
@@ -88,7 +113,7 @@ impl std::fmt::Display for ImportError {
         match self {
             ImportError::Io { path, detail } => write!(f, "读不了这个文件：{path}（{detail}）"),
             ImportError::Unsupported(ext) => {
-                write!(f, "认不出「{ext}」这种格式，暂只收 epub / txt / md / html / json / docx")
+                write!(f, "认不出「{ext}」这种格式，暂只收 epub / txt / md / html / json / docx / pdf")
             }
             ImportError::Zip(d) => write!(f, "压缩包损坏或加密：{d}"),
             ImportError::Xml(d) => write!(f, "书里的 XML/XHTML 结构坏了：{d}"),
@@ -98,6 +123,10 @@ impl std::fmt::Display for ImportError {
             ImportError::TooLarge { limit } => {
                 write!(f, "文件超过 {} MiB，请先分卷再导入", limit / 1024 / 1024)
             }
+            ImportError::OcrNeeded(path) => write!(
+                f,
+                "「{path}」是扫描图 PDF，没有文本层，无法导入。请先用 OCR 工具把文字识别出来，再导入 txt / md。"
+            ),
         }
     }
 }
@@ -122,6 +151,8 @@ pub enum Format {
     Html,
     Markdown,
     Docx,
+    /// PDF 文本层（macOS 走 PDFKit，其他平台预留 pdfium 入口）。
+    Pdf,
 }
 
 impl Format {
@@ -139,6 +170,7 @@ impl Format {
             "html" | "htm" | "xhtml" | "xml" => Format::Html,
             "md" | "markdown" | "mdown" | "mkd" => Format::Markdown,
             "docx" => Format::Docx,
+            "pdf" => Format::Pdf,
             _ => return None,
         })
     }
@@ -155,6 +187,7 @@ impl Format {
             Format::Html => (SrcKind::Txt, IrSource::Html),
             Format::Markdown => (SrcKind::Txt, IrSource::Markdown),
             Format::Txt => (SrcKind::Txt, IrSource::Txt),
+            Format::Pdf => (SrcKind::Txt, IrSource::Pdf),
         }
     }
 
@@ -167,16 +200,17 @@ impl Format {
             Format::Html => "HTML",
             Format::Markdown => "Markdown",
             Format::Docx => "DOCX",
+            Format::Pdf => "PDF",
         }
     }
 }
 
-/// **漏斗总入口**：任意支持的文件 → `BookIR`。
+/// **漏斗总入口**：任意支持的文件 → [`ParsedDoc`]（薄包装 [`BookIR`] + 可选 PDF 坐标）。
 ///
 /// 五步，一步都不许跳：
-///   ① 按后缀定格式；② 该格式的 parser 只出「原始纯文本」；
-///   ③ 清洗层唯一出口洗一遍；④ core 管线断章断卷；⑤ 拼成 BookIR。
-pub fn import_file(path: &Path) -> Result<BookIR, ImportError> {
+///   ① 按后缀定格式；② 该格式的 parser 只出「原始纯文本」（PDF 顺带抽坐标）；
+///   ③ 清洗层唯一出口洗一遍；④ core 管线断章断卷；⑤ 拼成 BookIR 包进 ParsedDoc。
+pub fn import_file(path: &Path) -> Result<ParsedDoc, ImportError> {
     let fmt = Format::from_path(path).ok_or_else(|| {
         let ext = path
             .extension()
@@ -186,17 +220,33 @@ pub fn import_file(path: &Path) -> Result<BookIR, ImportError> {
         ImportError::Unsupported(ext)
     })?;
 
-    // ② 各格式的「字节 → 纯文本」
-    let raw = match fmt {
-        Format::Json => json_parser::JsonParser::parse(path)?,
-        Format::Epub => epub_parser::EpubParser::parse(path)?,
-        Format::Txt => txt_parser::TxtParser::parse(path)?,
-        Format::Html => html_parser::HtmlParser::parse(path)?,
-        Format::Markdown => md_parser::MdParser::parse(path)?,
-        Format::Docx => docx_parser::DocxParser::parse(path)?,
+    // ② 各格式的「字节 → 纯文本」；PDF 顺带抽文本层坐标（扫描件为空）。
+    let (raw, pdf_regions) = match fmt {
+        Format::Json => (json_parser::JsonParser::parse(path)?, None),
+        Format::Epub => (epub_parser::EpubParser::parse(path)?, None),
+        Format::Txt => (txt_parser::TxtParser::parse(path)?, None),
+        Format::Html => (html_parser::HtmlParser::parse(path)?, None),
+        Format::Markdown => (md_parser::MdParser::parse(path)?, None),
+        Format::Docx => (docx_parser::DocxParser::parse(path)?, None),
+        Format::Pdf => {
+            // PDF 走系统原生文本层抽取（macOS PDFKit / 其他平台预留 pdfium）。
+            // 扫描图 PDF 无文本层 → 坐标空 → 提前报「需 OCR」，绝不把空笺塞给用户。
+            let regions = pdf_parser::collect_regions(path);
+            if regions.is_empty() {
+                return Err(ImportError::OcrNeeded(path.display().to_string()));
+            }
+            let raw: String = regions
+                .iter()
+                .map(|r| r.text.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (raw, Some(regions))
+        }
     };
 
-    // ③ 全局唯一清洗出口
+    // ③ 全局唯一清洗出口（把换行 / 乱码 / 假夹注彻底洗掉）
     let text = cleaner::clean(&raw);
 
     let stem = jiandu_core::importer::file_stem(path);
@@ -204,11 +254,21 @@ pub fn import_file(path: &Path) -> Result<BookIR, ImportError> {
 
     // 空书不是错误：一本空笺也是笺（UI 弹「此书空白」比弹「导入失败」诚实）。
     if text.trim().is_empty() {
-        return Ok(BookIR::new(&stem, "", source));
+        return Ok(ParsedDoc {
+            book: BookIR::new(&stem, "", source),
+            pdf_regions,
+        });
     }
 
     // ④ core 既有管线（一字未改）
-    let chapters = parse_str(kind, &text).map_err(|e| ImportError::Parse(e.to_string()))?;
+    //    ⚠️ PDF 走**不升格全角括号**的那条：印刷品的 `【题解】` / `（注）` 是
+    //    章节标签与现代括号，升格成双行夹注就是正文缺一段（尔雅式 PDF 的老 bug）。
+    let chapters = if fmt == Format::Pdf {
+        jiandu_core::pipeline::parse_str_keeping_brackets(&text)
+    } else {
+        parse_str(kind, &text)
+    }
+    .map_err(|e| ImportError::Parse(e.to_string()))?;
 
     // ④ JSON 的元数据（`book` / `author` 字段）**单独提出来**当书名 / 作者
     // （v1.69.0）——它们既不该混进正文流，也不该退化成文件名。
@@ -248,7 +308,10 @@ pub fn import_file(path: &Path) -> Result<BookIR, ImportError> {
         title
     };
     let author = jiandu_core::vclean::tidy_meta_title(&jiandu_core::vclean::strip_meta_junk(&a));
-    Ok(BookIR::from_chapters(&title, &author, source, &chapters))
+    Ok(ParsedDoc {
+        book: BookIR::from_chapters(&title, &author, source, &chapters),
+        pdf_regions,
+    })
 }
 
 /// **分块读取**：`BufReader` + 64 KiB 缓冲，绝不 `read_to_string` 一把梭。

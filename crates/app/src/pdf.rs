@@ -37,12 +37,16 @@ use crate::gloss::Piece;
 use jiandu_core::platform::{LeafSpec, PdfExporter, PdfGeometry};
 use crate::share_layout::ShareFont;
 use crate::types::GlyphKind;
-use core_foundation::base::TCFType;
+use core_foundation::attributed_string::CFMutableAttributedString;
+use core_foundation::base::{CFRange, TCFType};
+use core_foundation::string::CFString;
 use core_foundation::url::CFURL;
 use core_graphics::context::CGContext;
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 use core_graphics::sys;
 use core_text::font::CTFont;
+use core_text::line::CTLine;
+use core_text::string_attributes::kCTFontAttributeName;
 use foreign_types::ForeignType;
 use std::path::Path;
 
@@ -205,6 +209,10 @@ const SYS_FALLBACK: &[&str] = &[
 /// 缓存不清空**（清空会让每页重建字体，反而更慢更费），只在上限处兜底。
 const FONT_CACHE_MAX: usize = 64;
 
+/// `CTLine` 缓存上限。键是 `(字体对象地址, 字)`——整本只有「几千个不同的字
+/// × 两三台字体」，正常一本撑满也就三五千条；上限只为防意外撑爆。
+const LINE_CACHE_MAX: usize = 8192;
+
 // ── 画笔 ──────────────────────────────────────────────────────────────
 /// 一支笔：持一个 CG 上下文（**PDF**），把「屏幕坐标」翻成 CG 坐标落笔。
 struct Brush {
@@ -215,6 +223,14 @@ struct Brush {
     fonts: Vec<(ShareFont, i32, CTFont, f64, f64)>,
     /// 系统兜底字体缓存：`(PostScript 名, 字号×4) → (字体, ascent, descent)`。
     sys: Vec<(&'static str, i32, CTFont, f64, f64)>,
+    /// **单字排版行缓存**：`(字体对象地址, 字) → CTLine`。
+    ///
+    /// 为什么要有这一层：落字必须走 `CTLineDraw`（**按字符串**排一行），
+    /// 才能让 CG 在 PDF 里嵌出正确的 ToUnicode；按字形序号落笔
+    /// （`draw_glyphs`）会让 CG 反查码位时挑到**康熙部首**那一路的兼容码位——
+    /// 抽出来的文本是 `⽞⽇⽉⾠`（U+2F5E 等）而不是 `玄日月辰`，
+    /// 「文字可复制 / 可检索」当场作废。建行有开销，故按字缓存复用。
+    lines: Vec<(usize, char, CTLine)>,
     /// **缺字计数**：连系统兜底都查不到字形的字（只记数，绝不崩、绝不静默）。
     missing: usize,
 }
@@ -235,6 +251,7 @@ impl Brush {
             h,
             fonts: Vec::new(),
             sys: Vec::new(),
+            lines: Vec::new(),
             missing: 0,
         }
     }
@@ -408,11 +425,43 @@ impl Brush {
         Some((font, asc, desc, glyphs[0]))
     }
 
-    /// 把一枚字形落到纸上（拿到的 `asc/desc` 决定行盒居中）。
+    /// 取（并缓存）**一枚字排成的单字行**。
+    ///
+    /// 这是 PDF 文本层正确性的全部依据：行由「字 + 字体属性」建，
+    /// CoreText 因此知道这一笔到底是个什么字符，写 PDF 时才会生成
+    /// 正确的 ToUnicode 映射。走字形序号（`draw_glyphs`）时 CG 只能拿
+    /// GID 反查字体 cmap，Apple 中文字体里 `玄`/`日`/`月`/`辰` 这些字形
+    /// 同时挂着康熙部首的码位（U+2F5E…），反查就挑到那儿去了——
+    /// PDF 看上去一模一样，复制出来却是 `⽞⽇⽉⾠`。**肉眼查不出，只能靠测试钉死。**
+    fn line_for(&mut self, font: &CTFont, ch: char) -> Option<CTLine> {
+        let key = font.as_concrete_TypeRef() as usize;
+        if let Some((_, _, l)) = self.lines.iter().find(|(k, c, _)| *k == key && *c == ch) {
+            return Some(l.clone());
+        }
+        let mut buf = [0u8; 4];
+        let s = CFString::new(ch.encode_utf8(&mut buf));
+        let mut astr = CFMutableAttributedString::new();
+        astr.replace_str(&s, CFRange::init(0, 0));
+        let range = CFRange::init(0, astr.char_len());
+        astr.set_attribute(range, unsafe { kCTFontAttributeName }, font);
+        let line = CTLine::new_with_attributed_string(astr.as_concrete_TypeRef());
+        if self.lines.len() >= LINE_CACHE_MAX {
+            self.lines.clear();
+        }
+        self.lines.push((key, ch, line.clone()));
+        Some(line)
+    }
+
+    /// 把一枚字落到纸上（拿到的 `asc/desc` 决定行盒居中）。
+    ///
+    /// 横向**按这一行的真实行长居中**：`CTLineDraw` 的落笔点是基线左端，
+    /// 字形墨迹中心在 `width/2` 处。全角汉字 `width ≈ fs`，与旧写法
+    /// `cx - fs*0.5` 完全一致；半角、标点则自动收窄到自己的身宽——
+    /// 于是 PDF 的标点居中口径与屏幕（`mark_align`）天然对齐。
     fn put(
-        &self,
+        &mut self,
         font: &CTFont,
-        glyph: core_graphics::font::CGGlyph,
+        ch: char,
         cx: f64,
         y: f64,
         h: f64,
@@ -424,11 +473,16 @@ impl Brush {
         let baseline = y + (h - (asc + desc)) * 0.5 + asc;
         let (r, g, b) = rgb(color);
         self.ctx.set_rgb_fill_color(r, g, b, 1.0);
-        font.draw_glyphs(
-            &[glyph],
-            &[CGPoint::new(cx - fs * 0.5, self.cy(baseline))],
-            self.ctx.clone(),
-        );
+        let Some(line) = self.line_for(font, ch) else {
+            // 建不出行（理论上 `lookup` 已经挡掉了）：记一笔缺字，绝不画空格。
+            self.missing += 1;
+            return;
+        };
+        let adv = line.get_typographic_bounds().width;
+        let adv = if adv.is_finite() && adv > 0.0 { adv } else { fs };
+        self.ctx
+            .set_text_position(cx - adv * 0.5, self.cy(baseline));
+        line.draw(&self.ctx);
     }
 
     /// 落一枚字：横向按 `cx` 居中、纵向按行盒居中。返回**有没有真落上**。
@@ -458,8 +512,8 @@ impl Brush {
         // ② 本字体 → 楷 / 黑 / 宋
         let chain = [kind, ShareFont::Kai, ShareFont::Hei, ShareFont::Song];
         for k in chain {
-            if let Some((font, asc, desc, glyph)) = self.lookup(k, fs, unit) {
-                self.put(&font, glyph, cx, y, h, fs, asc, desc, color);
+            if let Some((font, asc, desc, _glyph)) = self.lookup(k, fs, unit) {
+                self.put(&font, ch, cx, y, h, fs, asc, desc, color);
                 return true;
             }
         }
@@ -475,7 +529,7 @@ impl Brush {
             if !ok || glyphs[0] == 0 {
                 continue;
             }
-            self.put(&font, glyphs[0], cx, y, h, fs, asc, desc, color);
+            self.put(&font, ch, cx, y, h, fs, asc, desc, color);
             return true;
         }
         // 全系统都没有这枚字：记一笔，**绝不崩、绝不画空格**。

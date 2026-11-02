@@ -52,6 +52,10 @@ mod conv;
 /// 的 NSView 补上 `performDragOperation:`——不加任何新依赖（纪律同 `sound`）。
 mod dropzone;
 mod exporter;
+/// **逐字字体回退**（v1.9.25）：首选古籍字体缺字时，只许回退到系统 CJK
+/// 字库（西文字体一律不许），全系统无解则画占位符并打 Warning。
+/// 只挑字体、不参与几何——字格宽高恒由网格引擎给（见 `font_fallback` 头注）。
+mod font_fallback;
 mod fonts;
 // `gloss`（双行夹注排版引擎）v1.0.0-beta 起住在 `jiandu-core`，本 crate 只
 // 再导出（见下方 `pub use jiandu_core::{… gloss …}`）——跨平台壳子要的是
@@ -69,6 +73,10 @@ mod lines;
 /// 归一 / 凭据）在 `jiandu_core::license`。
 mod license;
 mod margin;
+/// **全角标点的视觉居中**（v1.9.26）：竖排形 `﹁︽︵` 在字库里贴右缘设计，
+/// 按前进宽度居中的结果就是「肉眼偏右」。这里量真实墨迹框算横移量，
+/// 只改落笔 translate，绝不碰网格（见 `mark_align` 头注）。
+mod mark_align;
 /// **内存探针（macOS）**（v1.81.0）：`task_info(TASK_BASIC_INFO_64)` 读本进程
 /// 常驻内存，交给 `jiandu_core::mem` 的护栏。core 不许 `#[cfg(target_os)]`，
 /// 所以读 RSS 这一层必须留在壳里。
