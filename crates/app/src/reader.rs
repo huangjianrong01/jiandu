@@ -8663,6 +8663,10 @@ impl Root {
             .absolute()
             .left(px(left))
             .top(px(top))
+            // ★ 编辑栏也必须截断命中栈（v1.9.39）：它盖的正是正文，少了这一行，
+            //   在框内点一下改字，抬起事件会穿过框落到下面那一列字上——正文层
+            //   收到 `note_editing` 就当作「点纸面」提交并关框，于是「夹注改不动」。
+            .occlude()
             .child(card)
     }
 
@@ -10048,15 +10052,17 @@ impl Root {
         left = left.min((vw - card_w - 8.0).max(8.0));
         top = top.min((vh - card_h - 8.0).max(8.0));
 
+        // 关闭钮（v1.9.39 收小）：22 → 18，字 13 → 10.5。原来那枚跟「重录」
+        // 一般大，视觉上像第二个主钮，反而抢戏；小一号才像「角上的叉」。
         let close = div()
             .id("note-zoom-close")
-            .w(px(22.0))
-            .h(px(22.0))
+            .w(px(18.0))
+            .h(px(18.0))
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(11.0))
-            .text_size(px(13.0))
+            .rounded(px(9.0))
+            .text_size(px(10.5))
             .text_color(rgb(0xFFFFFFB0))
             .cursor_pointer()
             // v1.64.0：关闭一律 ASCII「X」（✕ U+2715 在回退字体里会零宽消失）。
@@ -10231,6 +10237,13 @@ impl Root {
             // 放大注卡同样走**批注字体**（楷体）：卡片里读的是注文，
             // 与行内夹注小字同一副面孔，放大后仍是「注文的字」。
             .font_family(crate::fonts::note_family(self.note_font()))
+            // ★ 阻断鼠标穿透（v1.9.39）：光 `stop_propagation` 只拦得住**冒泡**，
+            //   拦不住命中测试——GPUI 会把压在卡片底下的正文字格一并算作
+            //   hovered，于是卡片上这一下抬起仍会派发给正文那层：正在编辑夹注
+            //   时它被判成「点纸面 = 自动保存」→ 编辑框一按就关；不在编辑时则
+            //   被判成单击翻页 → 卡片底下的书页自己翻过去。`.occlude()` 让命中
+            //   栈在卡片处截断（与目录抽屉 / 问笺侧栏同款），卡片之外才算纸面。
+            .occlude()
             // 点卡片内容不冒泡到 root（否则会被当「点别处」秒关）。
             .on_mouse_down(MouseButton::Left, cx.listener(|_this, _, _, cx| {
                 cx.stop_propagation();
@@ -10287,6 +10300,10 @@ impl Root {
             .border_1()
             .border_color(rgba(0xFFFFFF26))
             .shadow_lg()
+            // ★ 同放大卡：菜单也要截断命中栈（v1.9.39）。少这一行，点「修改 /
+            //   删除」时那一下抬起会漏到正文，正在编辑的夹注会被「点纸面自动
+            //   保存」直接提交——菜单点得开、字却改不成。
+            .occlude()
             // 点菜单不冒泡到 root（否则会被当「点别处」秒关）。
             .on_mouse_down(MouseButton::Left, cx.listener(|_this, _, _, cx| {
                 cx.stop_propagation();

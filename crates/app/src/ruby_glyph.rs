@@ -21,7 +21,7 @@
 //! * **颜色**：`ruby_image` 的调用方传入朱砂红 `#8C2B22`（锁死）；
 //! * **透明度**：填充 alpha = **0.75**（朱砂微微晕染宣纸的透气感，绝不刺眼）；
 //! * **字体**：**强制 Songti SC（宋体）**优先，绝不用 PingFang 等黑体；
-//! * **字号**：由 `ruby::layout` 给出，恒为正文 40%（蝇头小楷感）。
+//! * **字号**：由 `ruby::layout` 给出，恒为正文 50%（蝇头小楷感）。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -55,7 +55,7 @@ fn cache() -> &'static Mutex<HashMap<String, Arc<gpui::RenderImage>>> {
 
 /// 一条拼音的横排位图。失败返回 `None`（调用方退化）。
 ///
-/// * `fs`：拼音字号（由 `ruby::layout` 给出，恒为正文 40%）；
+/// * `fs`：拼音字号（由 `ruby::layout` 给出，恒为正文 50%）；
 /// * `color`：`0xRRGGBB` 墨色（调用方锁死 `#8C2B22`）。
 pub fn ruby_image(py: &str, fs: f32, color: u32) -> Option<Arc<gpui::RenderImage>> {
     if py.is_empty() || fs < 2.0 {

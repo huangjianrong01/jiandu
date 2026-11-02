@@ -347,6 +347,52 @@ pub fn layout_book_from_opts(
             }
         }
 
+        // ── 论赞（史论）的专属排法（v1.9.40）────────────────────────
+        // 「臣光曰」「太史公曰」「贊曰」这类史家断语，**不是夹注**：
+        // 刻本把它排成大字的独立段落，并在**当前列顶部低两格**（降格）。
+        //
+        // 三条铁律：
+        // ① 字号走正常正文流——它进的是 `Piece::Main`，绝不生成 `Gloss`；
+        // ② 只在**段首**判（`offset == 0`），句子中段转引的「論曰」不动；
+        // ③ 本列已经排了正文才另起一列——列本来就是空的（刚换过列 / 章首
+        //    只剩题署预留带）时再空开一列，会排出一整列空白。
+        if g.offset == 0 && g.kind == GlyphKind::Char {
+            // 取本段开头几个字做判据：够认最长的那条引语即可，不扫全段。
+            let mut head = String::new();
+            let mut j = i;
+            while j < flow.len()
+                && flow[j].chapter == g.chapter
+                && flow[j].para == g.para
+                && head.chars().count() < 8
+            {
+                head.push(flow[j].ch);
+                j += 1;
+            }
+            if crate::types::is_praise_head(&head) {
+                // 本列有没有「真内容」：只看正文片与注块。卷首题署预留只扣
+                // 账、不产片，故不会被误判成「已有正文」。
+                let has_body = columns
+                    .last()
+                    .map(|c| {
+                        c.iter()
+                            .any(|p| matches!(p, Piece::Main(_) | Piece::Gloss(..)))
+                    })
+                    .unwrap_or(false);
+                if has_body {
+                    roll_column!();
+                }
+                // 列顶低两格：两枚整格空白（与避头尾让位同一个 `Piece::Gap`，
+                // 渲染层画的就是一格白，账目与画面同源）。
+                for _ in 0..crate::types::PRAISE_INDENT_CELLS {
+                    if filler.room() < 2 {
+                        break;
+                    }
+                    columns.last_mut().unwrap().push(Piece::Gap);
+                    filler.push_gap();
+                }
+            }
+        }
+
         // ── 数字串兜底（防呆）：整串成组、一个数字占半格 ─────────────
         // 即便清洗漏了（`1980` 原样入库），也绝不能逐字一格竖着摞成四截。
         // 这里把连续数字当成一个 **Block**：账上每数字记 1 个半格
@@ -1626,6 +1672,104 @@ mod tests {
 
     fn flow_of(book: &Book) -> Vec<Glyph> {
         book.to_flow(true)
+    }
+
+    /// **论赞降格**（v1.9.40）：段首「臣光曰」另起一列、列顶低两格；
+    /// 字号**仍是大字正文**（`Piece::Main` + `GlyphKind::Char`），
+    /// 绝不能被夹注那条路接走。
+    #[test]
+    fn praise_head_starts_a_new_column_lowered_by_two_cells() {
+        let mut flow: Vec<Glyph> = Vec::new();
+        // 第一段：四字正文（占两格）。一列只有 5 行时它排不满。
+        for (i, c) in "治國之道".chars().enumerate() {
+            flow.push(Glyph {
+                chapter: 0,
+                para: 0,
+                offset: i,
+                ch: c,
+                kind: GlyphKind::Char,
+            });
+        }
+        // 第二段：论赞（臣光曰……）。
+        let praise: Vec<char> = "臣光曰臣聞天子之職莫大於禮".chars().collect();
+        for (i, c) in praise.iter().enumerate() {
+            flow.push(Glyph {
+                chapter: 0,
+                para: 1,
+                offset: i,
+                ch: *c,
+                kind: GlyphKind::Char,
+            });
+        }
+        // 4 列 / 5 行：一面放得下四列，「另起一列」落在同一面里。
+        let pages = layout_book_from_opts(&flow, |_| None, 4, 5, 0, false, false);
+        let cols = &pages[0].columns;
+        // ① 另起一列：论赞不在第一列，第一列只放第一段。
+        assert!(cols.len() >= 2, "论赞没有另起一列（只有 {} 列）", cols.len());
+        assert!(
+            cols[0].iter().all(|p| !matches!(p, Piece::Main(g) if g.para == 1)),
+            "论赞的字混进了上一列"
+        );
+        // ② 列顶低两格：新列头两片是整格空白，第三片才是「臣」。
+        assert!(matches!(cols[1].first(), Some(Piece::Gap)), "论赞列首没有降格");
+        assert!(matches!(cols[1].get(1), Some(Piece::Gap)), "只降了一格");
+        match cols[1].get(2) {
+            Some(Piece::Main(g)) => {
+                assert_eq!(g.ch, '臣', "降格两格后应直接起「臣」");
+                assert_eq!(g.kind, GlyphKind::Char, "论赞必须是正文大字，不是挂件");
+            }
+            other => panic!("论赞首字不在第三格：{other:?}"),
+        }
+        // ③ 全段没有一个夹注片——夹注会把字排成小字，那就不是论赞了。
+        let gloss_count = cols
+            .iter()
+            .flatten()
+            .filter(|p| matches!(p, Piece::Gloss(..)))
+            .count();
+        assert_eq!(gloss_count, 0, "论赞被误排成了夹注");
+        // ④ 逐字都在：降格不吞字。
+        let laid: usize = cols
+            .iter()
+            .flatten()
+            .filter(|p| matches!(p, Piece::Main(g) if g.para == 1))
+            .count();
+        assert_eq!(laid, praise.len(), "论赞少了字");
+    }
+
+    /// 论赞若正好起在一列之顶（上一段刚好排满换列），**不再空开一列**——
+    /// 否则纸面上会凭空多出一整列空白。
+    #[test]
+    fn praise_head_does_not_open_an_empty_column_when_already_at_column_top() {
+        let mut flow: Vec<Glyph> = Vec::new();
+        // 第一段正好占满一列（5 行 = 5 字）。
+        for (i, c) in "治國之道者".chars().enumerate() {
+            flow.push(Glyph {
+                chapter: 0,
+                para: 0,
+                offset: i,
+                ch: c,
+                kind: GlyphKind::Char,
+            });
+        }
+        for (i, c) in "贊曰蓋聞".chars().enumerate() {
+            flow.push(Glyph {
+                chapter: 0,
+                para: 1,
+                offset: i,
+                ch: c,
+                kind: GlyphKind::Char,
+            });
+        }
+        let pages = layout_book_from_opts(&flow, |_| None, 4, 5, 0, false, false);
+        let cols = &pages[0].columns;
+        // 第一列满 5 字，第二列直接从「贊」起（前面仍是两格降格），
+        // 中间不许夹一列纯空白。
+        assert_eq!(cols[0].len(), 5, "第一列应是满列");
+        assert!(
+            !cols.iter().any(|c| c.iter().all(|p| matches!(p, Piece::Gap))),
+            "多出了一列纯空白"
+        );
+        assert!(matches!(cols[1].first(), Some(Piece::Gap)));
     }
 
     /// 符号库：现代模式下句与疑叹都收成一枚细线空心圆。
