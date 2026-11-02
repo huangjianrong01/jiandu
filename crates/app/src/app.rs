@@ -2457,7 +2457,12 @@ impl Root {
         // 纵向预留：状态栏(~34) + 正文区上下内白(p_4=32) + 安全余量(~4)，
         // 让算出的纸高(content_h)正好等于正文区可用高——这样纸张撑满、不再
         // 有「居中才能遮丑」的残余留白（见 render_ancient 的天头地脚非对称）。
-        let v_reserve = if self.focus_mode { 0.0 } else { 70.0 };
+        // 听书控制条（贴底胶囊，见 `render_tts_sheet`）激活时，正文区底部
+        // 让出一段高度把纸面上移——这是「绝不让控制条压住任何一行字」的唯一
+        // 可靠机制：纸高由 `content_h` 决定，给它减掉胶囊占位，纸就整体缩
+        // 短并顶对齐到顶部，底部自然空出整条胶囊的空间。关闭听书时回到原高。
+        let tts_reserve = if self.show_tts { 96.0 } else { 0.0 };
+        let v_reserve = if self.focus_mode { tts_reserve } else { 70.0 + tts_reserve };
         // 版字面板为浮层（可盖住正文下部），不为它预留高度，正文始终铺满。
         let content_h = (self.viewport_h - v_reserve).max(220.0);
         // 目录改为浮层，不占水平空间。
@@ -3098,6 +3103,34 @@ impl Root {
             }
         }
         self.sync_current_chapter();
+    }
+
+    /// **听书控制条显隐**（v1.9.42）：开 / 关聽書卡并同步出声。
+    ///
+    /// 关键：听书条会改变正文区可用高（`fit_sizes` 的 `tts_reserve`）——
+    /// 开条纸面缩短、关条纸面长回，两者都会触发整页重排、页码重数。若不保位，
+    /// 用户每开 / 关一次听书，视线就丢一回。故统一走 [`Self::resort_keeping_place`]，
+    /// 以「当前页首字」为锚，重排后把同一处字找回。
+    ///
+    /// 同态调用（已是目标态）不重排，但若目标是「开」，仍补一次朗读——
+    /// 例如连按 ⌘⌥Y 想重新开读，不该被「已经开着」吞掉。
+    pub fn set_tts_active(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.show_tts == on {
+            if on {
+                self.speak_current_leaf();
+            }
+            return;
+        }
+        self.resort_keeping_place(|s| {
+            s.show_tts = on;
+            s.fit_sizes();
+        });
+        if on {
+            self.speak_current_leaf();
+        } else {
+            crate::tts::stop();
+        }
+        cx.notify();
     }
 
     /// **一键显隐注释**（v1.9.25 起，v1.9.37 改为**真重排**）。
@@ -7557,7 +7590,7 @@ impl Root {
             .rounded(px(8.0))
             .cursor_pointer()
             .text_color(rgb(0xf4ecd8))
-            .child(SharedString::from("笺校工作台"))
+            .child(SharedString::from("笺校"))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event, _window, cx| {

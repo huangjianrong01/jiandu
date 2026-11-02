@@ -1322,7 +1322,7 @@ impl CollationWorkspace {
                             .font_family(song.clone())
                             .text_size(px(13.5))
                             .text_color(rgb(0x2b2620))
-                            .child(SharedString::from("笺校工作台")),
+                            .child(SharedString::from("笺校")),
                     ),
             )
             .child(div().w(px(18.0)))

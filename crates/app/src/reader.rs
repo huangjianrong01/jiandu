@@ -1847,44 +1847,43 @@ impl Root {
         //
         // 位置：专注模式贴纸底（7px），常规模式抬到页码条之上（26px）——
         // 两种模式都不压正文，也不跟藏书印抢那一角。
-        let tts_y = if self.focus_mode { 7.0 } else { 26.0 };
-        root = root.child(
-            div()
-                .absolute()
-                .left(px(0.0))
-                .right(px(0.0))
-                .bottom(px(tts_y))
-                .flex()
-                .flex_row()
-                .justify_center()
-                .child(
-                    div()
-                        .id("tts-tab")
-                        // 命中栈在此截断：点这枚小字不该被底下的正文读成翻页。
-                        .occlude()
-                        .cursor_pointer()
-                        .px(px(10.0))
-                        .py(px(2.0))
-                        .text_size(px(10.5))
-                        .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.42)))
-                        .hover(|s| s.text_color(rgb(sheet_zhu(t))))
-                        .child(SharedString::from("聽"))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                if this.show_tts {
-                                    crate::tts::stop();
-                                    this.show_tts = false;
-                                } else {
-                                    this.show_tts = true;
-                                    this.speak_current_leaf();
-                                }
-                                cx.notify();
-                            }),
-                        ),
-                ),
-        );
+        //
+        // v1.9.42：这枚小字只是「收起态」的触发器——听书条（胶囊）激活时
+        // 它让位给胶囊本身，故 `show_tts` 为真时整枚不渲染，绝不重复。
+        if !self.show_tts {
+            let tts_y = if self.focus_mode { 7.0 } else { 26.0 };
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(tts_y))
+                    .flex()
+                    .flex_row()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("tts-tab")
+                            // 命中栈在此截断：点这枚小字不该被底下的正文读成翻页。
+                            .occlude()
+                            .cursor_pointer()
+                            .px(px(10.0))
+                            .py(px(2.0))
+                            .text_size(px(10.5))
+                            .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.42)))
+                            .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+                            .child(SharedString::from("聽"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    // 开条即出声；保位交给 `set_tts_active`。
+                                    this.set_tts_active(true, cx);
+                                }),
+                            ),
+                    ),
+            );
+        }
 
         // v1.71.0：**导出收尾提示条（Toast）**——极简一枚纸签，浮在页码条之上。
         //
@@ -2457,11 +2456,11 @@ impl Root {
                         // 「焦点不在纸上」时的兜底。
                         self.show_license = false;
                         self.show_share_panel = false;
-                        // v1.9.41：聽書卡也认 Esc。收起的同时**停读**——
-                        // Esc 是「都停下」的意思。
+                        // v1.9.42：聽書卡也认 Esc。收起的同时**停读**——
+                        // Esc 是「都停下」的意思。关条会把正文区让出的高度
+                        // 收回并重排，故走 `set_tts_active` 保住阅读位置。
                         if self.show_tts {
-                            crate::tts::stop();
-                            self.show_tts = false;
+                            self.set_tts_active(false, cx);
                         }
                         self.close_lookup();
                         self.clear_selection();
@@ -2523,8 +2522,9 @@ impl Root {
             A::Lookup => self.act_lookup(cx),
             // v1.9.41：⌘⌥Y 聽書——开读并把语速卡带出来（与「听」钮同一条路）。
             A::Tts => {
-                self.show_tts = true;
-                self.speak_current_leaf();
+                // 開聽書卡并出声；保位交给 `set_tts_active`（开条会改变正文区
+                // 可用高，必须锚住当前页首字，否则纸面跳一下）。
+                self.set_tts_active(true, cx);
             }
             A::Copy => {
                 self.copy_page_text(cx);
@@ -8287,6 +8287,12 @@ impl Root {
             self.page_frozen = None;
         }
         let (page_no, total_no) = self.page_frozen.unwrap_or((self.page, total));
+        // v1.9.42：听书控制条（贴底胶囊）占用屏幕最底端这条状态栏的位置，
+        // 听书时整条状态栏让位——页码读数是次要信息，别跟胶囊叠在一起。
+        // （叶码冻结逻辑已在上面跑完，不受影响。）
+        if self.show_tts {
+            return div();
+        }
         // v1.86.0：古籍视图一律写繁体「葉」（版心书口叶码同字），现代视图仍是「页」。
         let unit = match self.script {
             Script::Ancient => "葉",
@@ -10065,13 +10071,11 @@ impl Root {
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                // v1.9.41：**点「听」= 开聽書卡**。语速只在这张卡上出现，
-                // 所以「听」就得把卡带出来——开读与调语速是同一次动作。
-                this.show_tts = true;
-                this.speak_current_leaf();
+                // v1.9.42：**点「听」= 开聽書卡**。开条会改变正文区可用高，
+                // 保位交给 `set_tts_active`；卡上自带语速与「停」。
+                this.set_tts_active(true, cx);
                 this.more_open = false;
                 this.popup = None;
-                cx.notify();
             }),
         );
         let b_note = items.next().unwrap().on_mouse_down(
@@ -12202,7 +12206,13 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
     /// **不做居中大弹窗**：听书是边听边看的事，卡片压住半页正文就没法读了。
     fn render_tts_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
-        let paper_veil = ((t.paper() & 0xFFFFFF) << 8) | 0xFC;
+        let song = crate::fonts::family_for(FontChoice::SongTi, self.script);
+        // 宣纸毛玻璃近似（v1.9.42）：GPUI 0.2.2 没有 `backdrop-filter`，做不出
+        // 真·磨砂；改用「高透宣纸底 + 细边 + 柔影」来模拟——底色用纸色掺到
+        // ~0.93 alpha，像一张半透明的宣纸笺浮在纸面上，既遮得住底层、又融得进
+        // 古籍氛围，绝不冒出「现代系统控件」的口音。
+        let veil = ((t.paper() & 0xFFFFFF) << 8) | 0xEE;
+        let hair = ((t.rule() & 0xFFFFFF) << 8) | 0x3C;
         let head = div()
             .flex()
             .flex_row()
@@ -12231,15 +12241,14 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                             })),
                     ),
             )
+            // 收卡片＝停读：听书卡是「正在出声」的控制器，收起来就该安静。
+            // 走 `set_tts_active(false)` —— 关条同时把正文区让出的高度收回、
+            // 并重排保住阅读位置（否则关条纸面长回会跳一下）。
             .child(panel_close(t).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
-                    // 关卡片 = 停读：听书卡是「正在出声」的控制器，收起来
-                    // 就该安静——背景还在响、界面却没了入口，是最坏的形态。
-                    crate::tts::stop();
-                    this.show_tts = false;
-                    cx.notify();
+                    this.set_tts_active(false, cx);
                 }),
             ));
 
@@ -12261,7 +12270,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         let body = div()
             .flex()
             .flex_col()
-            .gap(px(6.0))
+            .gap(px(4.0))
             .child(style_row("速", speed, t))
             .child(
                 div()
@@ -12296,9 +12305,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
-                                    crate::tts::stop();
-                                    this.show_tts = false;
-                                    cx.notify();
+                                    this.set_tts_active(false, cx);
                                 }),
                             ),
                     )
@@ -12310,30 +12317,33 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                     ),
             );
 
+        // ★ 贴底悬浮胶囊（v1.9.42）：从居中卡片改为**钉在屏幕最底端**的极简
+        // 胶囊——底部留 8px 安全边，正文区已在 `fit_sizes` 里为它让出 88px，
+        // 纸面整体顶上去，胶囊之下绝无一字被压。
         div()
             .absolute()
             .left(px(0.0))
             .right(px(0.0))
-            .bottom(px(42.0))
+            .bottom(px(8.0))
             .flex()
             .flex_row()
             .justify_center()
-            // 命中栈在此截断：点卡片不该漏到纸面上翻页。
+            // 命中栈在此截断：点胶囊不该漏到纸面上翻页。
             .occlude()
             .child(
                 div()
-                    .w(px(340.0))
+                    .id("tts-capsule")
                     .flex()
                     .flex_col()
-                    .gap(px(5.0))
-                    .px(px(14.0))
-                    .py(px(10.0))
-                    .bg(rgba(paper_veil))
+                    .gap(px(4.0))
+                    .px(px(18.0))
+                    .py(px(9.0))
+                    .bg(rgba(veil))
                     .border_1()
-                    .border_color(rgba(((t.rule() & 0xFFFFFF) << 8) | 0x33))
-                    .rounded(px(2.0))
+                    .border_color(rgba(hair))
+                    .rounded(px(20.0))
                     .shadow_lg()
-                    .font_family(self.main_family())
+                    .font_family(song)
                     .child(head)
                     .child(body),
             )
@@ -12343,7 +12353,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
     ///
     /// 抽出来是为了让两条入口说同一句话：有选区读选区、没有就读整叶；
     /// 没正文就说「没有可朗读的正文」，不出声也不报错。
-    fn speak_current_leaf(&mut self) {
+    pub(crate) fn speak_current_leaf(&mut self) {
         let sel = self.selected_text();
         let (text, whole) = if !sel.is_empty() {
             (sel, false)
