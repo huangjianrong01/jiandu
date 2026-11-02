@@ -2077,6 +2077,19 @@ impl Root {
             root = root.child(self.render_glyph_menu(cx));
         }
 
+        // 划词即出：拖选一句原文，右上角浮一枚「問小箋」，点一下即问（应用内）。
+        // 与 7 钮工具条错峰——只在「没开工具条、没在拖、面板未开、没在批注」
+        // 时浮现，是拖选后最直接的那一下；面板一旦打开这枚就隐去。
+        if self.screen == Screen::Reading
+            && self.has_selection()
+            && !self.dragging
+            && self.popup.is_none()
+            && !self.show_ai
+            && !self.note_editing
+        {
+            root = root.child(self.render_ask_jian(cx));
+        }
+
         // v2.0 知识图谱：选中人名后右侧弹出的极简人物卡片（绝不连线图 UI）。
         if self.entity_card.is_some() {
             root = root.child(self.render_entity_card(cx));
@@ -9926,6 +9939,72 @@ impl Root {
                             cx.notify();
                         }),
                     )),
+            )
+    }
+
+    /// **划词即出的悬浮「問小箋」钮**（v1.9.45）：选中一句原文，一枚朱砂小笺
+    /// 浮在选区右上角（贴顶则落到选区下方，左右也收进视口）。点一下即把这句
+    /// 交给小笺——应用内右下角面板一字一字吐出解释，**绝不跳转外部浏览器**
+    /// （RAG 全程在 `AiPanel` 这个独立 Entity 里跑，连网络线程都不碰纸面）。
+    ///
+    /// 与 7 钮选词工具条（`render_glyph_menu`）错峰：工具条是长按出来的
+    /// 「动作全集」，这枚是拖选后**最直接**的那一下——少一步、不挡字。
+    fn render_ask_jian(&mut self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme;
+        let zhu = sheet_zhu(t);
+        let Some(a) = self.selected_anchor() else {
+            return div();
+        };
+        let vw = self.viewport_w;
+        let vh = self.viewport_h;
+        let bw = 64.0_f32;
+        let bh = 28.0_f32;
+        // 选区包围盒的右上角上方 8px；贴顶则下移到选区下方，再收进视口。
+        let mut x = a.x + a.w + 8.0;
+        let mut y = a.y - bh - 8.0;
+        if y < 8.0 {
+            y = a.y + a.h + 8.0;
+        }
+        if x + bw > vw - 8.0 {
+            x = (vw - 8.0 - bw).max(8.0);
+        }
+        if y + bh > vh - 8.0 {
+            y = (vh - 8.0 - bh).max(8.0);
+        }
+        let note = crate::fonts::family_for_role(crate::fonts::FontRole::Note);
+        div()
+            .absolute()
+            .top(px(y))
+            .left(px(x))
+            .w(px(bw))
+            .h(px(bh))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(999.0))
+            .bg(rgb(zhu))
+            .shadow(vec![BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.28),
+                offset: gpui::point(px(0.0), px(2.0)),
+                blur_radius: px(8.0),
+                spread_radius: px(0.0),
+            }])
+            .cursor_pointer()
+            .child(
+                div()
+                    .font_family(note)
+                    .text_size(px(12.0))
+                    .text_color(rgb(t.paper()))
+                    .child(SharedString::from("問小箋")),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    // 先带选区发问（此刻选区还在），再清选区收掉这枚悬浮钮。
+                    this.ask_ai_selection(window, cx);
+                    this.clear_selection();
+                }),
             )
     }
 
