@@ -539,12 +539,12 @@ impl Brush {
 
 }
 
-/// 注音：**横排、正立、从左到右**，落在汉字右侧的列间空白里
-/// （与屏幕 `ruby::layout` 同一套几何、同一颜色 `#8C2B22`）。
+/// 注音：**横排、正立、从左到右**，落在汉字右侧（带注音的字已贴左缘排，
+/// 拼音紧贴其右）。与屏幕 `ruby::layout` 同一套几何、同一颜色 `#8C2B22`。
 ///
 /// 屏幕那侧是一张 CoreGraphics 离屏位图；这里是 CG 逐字落笔。两者共用
-/// `jiandu_core::ruby::layout` 的度量（字号 40%、按可用宽收敛到 22%、
-/// 左缘从汉字右缘让开），所以 PDF 里的 `měng` 与屏幕逐字同位——
+/// `jiandu_core::ruby::layout` 的度量（字号 80%、按可用宽收敛到 22%、
+/// 左缘从「贴左的汉字右缘」让开），所以 PDF 里的 `měng` 与屏幕逐字同位——
 /// 绝不歪着排、也绝不碰到下一列的字形。颜色锁死朱砂红 `#8C2B22`。
 fn draw_ruby(
     b: &mut Brush,
@@ -867,7 +867,7 @@ fn walk_column(
                 };
                 if !has_host {
                     // 落单（列尾 / 段尾）：单独占一格，仍是 0.7 倍小字。
-                    draw_cell(b, gd.ch, x, *y, cell_w, cell_h, fs, g);
+                    draw_cell(b, gd.ch, x, *y, cell_w, cell_h, fs, false, g);
                     *y += cell_h;
                 }
                 idx += 1;
@@ -895,7 +895,8 @@ fn walk_column(
                     _ => None,
                 };
                 idx += 1 + hang.map(|_| 1).unwrap_or(0) + close_mk.map(|_| 1).unwrap_or(0);
-                draw_cell(b, gd.ch, x, *y, cell_w, cell_h, fs, g);
+                let has_ruby = ruby.contains_key(&(gd.chapter, gd.para, gd.offset));
+                draw_cell(b, gd.ch, x, *y, cell_w, cell_h, fs, has_ruby, g);
                 // 注音：贴着这一格右上角竖排，**不占额外界位**（与屏幕同）。
                 if let Some(py) = ruby.get(&(gd.chapter, gd.para, gd.offset)) {
                     draw_ruby(b, py, x, *y, cell_w, cell_h, fs, g);
@@ -993,7 +994,7 @@ fn draw_run(b: &mut Brush, items: &[Piece], from: usize, to: usize, x: f64, y: &
 
 /// 一枚正文单字：句读走**手绘**（与 `punct::place` 同一落位），
 /// 括号 / 引号 / 书名号走竖排专用字形，其余按繁简开关落字。
-fn draw_cell(b: &mut Brush, ch: char, x: f64, y: f64, cell_w: f64, cell_h: f64, fs: f64, g: &PdfGeo) {
+fn draw_cell(b: &mut Brush, ch: char, x: f64, y: f64, cell_w: f64, cell_h: f64, fs: f64, ruby: bool, g: &PdfGeo) {
     let c = crate::types::bracket_to_quote(ch);
     if crate::types::is_punct(c) {
         // 句读：格心整个让给正文，只在角上落一枚朱砂记号。
@@ -1028,7 +1029,22 @@ fn draw_cell(b: &mut Brush, ch: char, x: f64, y: f64, cell_w: f64, cell_h: f64, 
     } else {
         crate::trad::simplified_of(shown).unwrap_or(shown)
     };
-    b.glyph_in(shown, x, y, cell_w, cell_h, fs.min(cell_h), g.ink, ShareFont::from(g.font));
+    if ruby {
+        // 带注音的字贴左缘：字形中心落在 `x + RUBY_CHAR_LEFT + 字宽/2`，左缘即
+        // `x + RUBY_CHAR_LEFT`——与屏幕 `ancient_cell`、`ruby::layout` 的
+        // `RUBY_CHAR_LEFT` 严格同位，故纸上拼音与字右缘紧贴（同屏幕）。
+        b.glyph_at(
+            shown,
+            x + crate::ruby::RUBY_CHAR_LEFT as f64 + (fs.min(cell_h)) * 0.5,
+            y,
+            cell_h,
+            fs.min(cell_h),
+            g.ink,
+            ShareFont::from(g.font),
+        );
+    } else {
+        b.glyph_in(shown, x, y, cell_w, cell_h, fs.min(cell_h), g.ink, ShareFont::from(g.font));
+    }
 }
 
 /// 一枚**手绘句读**：落位与尺寸全读 `punct::place`（阅读器同一函数），

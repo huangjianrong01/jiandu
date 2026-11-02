@@ -7573,13 +7573,20 @@ impl Root {
         // 悬停联动（v1.55.0）：鼠标停在天头某条眉批上 → 它锚定的那个字衬
         // 一层朱红。只比一次键，不查书稿——字格渲染里这是最省的判据。
         let margin_hit = g.kind == GlyphKind::Char && self.margin_hover_key == Some(key);
+        let ruby_cell = rare_py.is_some();
         let mut cell = div()
             .w(px(cell_w))
             .h(px(cell_h))
             .flex()
             .flex_row()
-            .items_center()
-            .justify_center();
+            .items_center();
+        // 带注音的字贴左缘、拼音紧贴其右（与 `ruby::layout` 同位：详见
+        // `RUBY_CHAR_LEFT`）。非注音字仍居中，保持整列对齐。
+        if ruby_cell {
+            cell = cell.justify_start();
+        } else {
+            cell = cell.justify_center();
+        }
         if marked || rare_py.is_some() || mark_line.is_some() || hit.is_some() || emph || margin_hit
         {
             cell = cell.relative();
@@ -7673,9 +7680,11 @@ impl Root {
         };
 
         // ── 注音（生僻字拼音）────────────────────────────────────
-        // 最终态（v1.9.14）：拼音**横排、正立、从左到右**，作为整体贴在汉字右侧
-        // 的列间空白里。整串宽度**硬封顶到字格右缘**，绝不横跨整列宽、绝不挤占左侧
-        // 句读、绝不溢出右界栏；纵向只占 `1.05× 拼音字号`、在格内竖直居中。
+        // 最终态（v1.9.50）：带注音的字**贴字格左缘**排、拼音紧贴其右（横排、正立、
+        // 从左到右）。贴左后汉字右缘→字格右缘的空白远大于「字居中」时，1~2 字母
+        // 拼音在所有列数都吃满 80% 正文（比例恒定、随字号自适应），不再被列间空白
+        // 物理封顶；整串宽度仍**硬封顶到字格右缘**，绝不挤占左侧句读、绝不溢出
+        // 右界栏；纵向只占 `1.05× 拼音字号`、在格内竖直居中。
         // 颜色锁死朱砂红 `#8C2B22`、透明度 0.75（朱砂微微晕染宣纸的透气感，详见
         // `ruby_glyph.rs`）。GPUI 没有排版引擎，整串走 `ruby_glyph`：CoreGraphics
         // 离屏按 `ruby::layout` 的度量（**不旋转**）渲成透明位图，再用 `img` 贴进
@@ -7883,11 +7892,19 @@ impl Root {
                     .h(px(cell_h))
                     .flex()
                     .items_center()
-                    .justify_center()
                     .overflow_hidden()
                     .font_family(pick.family.clone());
+                // 注音字在字框内也贴左（与外层 justify_start + ml 同位），
+                // 否则回退字体里注音拼音会偏到字右侧很远。
+                if ruby_cell {
+                    boxed = boxed.justify_start().ml(px(crate::ruby::RUBY_CHAR_LEFT));
+                } else {
+                    boxed = boxed.justify_center();
+                }
                 boxed = boxed.child(glyph);
                 boxed
+            } else if ruby_cell {
+                glyph.ml(px(crate::ruby::RUBY_CHAR_LEFT))
             } else {
                 glyph
             };
