@@ -41,10 +41,11 @@ use crate::share_layout::{
 use crate::share_paint::{render_pdf, render_pdf_spread, render_png, render_spread_png};
 use gpui::prelude::*;
 use gpui::{
-    div, img, px, rgb, rgba, Bounds, BoxShadow, Context,
-    EntityInputHandler, EventEmitter, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    div, img, px, rgb, rgba, Bounds, BoxShadow, Context, Div,
+    EntityInputHandler, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, StatefulInteractiveElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ParentElement, Render,
-    RenderImage, ScrollHandle, SharedString, Styled, Window,
+    RenderImage, ScrollHandle, SharedString, Stateful, Styled, Window,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -145,6 +146,20 @@ const ED_PAD: f32 = 40.0;
 /// 近似字宽：原图转录以 CJK 为主，按字号取值做编辑器内点击定位（仅用于右文
 /// 落光标 / 选区估算，不影响左图高亮精度——左图高亮走 `SourceRegion` 真实映射）。
 const CHAR_W: f32 = FONT_SIZE * 0.95;
+
+/// 估算一段文本在「每行约 `cpl` 字」下的视觉行数（对照模式段落对齐用）。
+///
+/// 中文近等宽，`whitespace_normal` 几乎处处可断，故按「字数 ÷ 每行字数」上取整即可；
+/// 对 CJK 近似足够准（亚行级误差不影响段落锚定）。空段按 1 行计，与 GPUI 占位一致。
+fn est_wrapped_lines(s: &str, cpl: usize) -> usize {
+    let cpl = cpl.max(1);
+    let n = s.chars().count();
+    if n == 0 {
+        1
+    } else {
+        n.div_ceil(cpl)
+    }
+}
 
 // ── 「一张木桌，两张纸」（v1.9.24 视觉定稿）─────────────────────────
 //
@@ -402,6 +417,10 @@ pub struct CollationWorkspace {
     scroll: ScrollHandle,
     /// 左侧原图滚动柄（用于右文点击联动滚动）。
     left_scroll: ScrollHandle,
+    /// 对照模式（show_diff）左右**共用**的滚动柄：左栏毛坯与右栏清洗正文双向同步。
+    /// 与 `scroll`（编辑器常态柄）分离——编辑器在常态/纯文本模式仍走 `scroll`，
+    /// 那条路径已验证可编辑；对照模式单独挂 `diff_scroll`，互不干扰。
+    diff_scroll: ScrollHandle,
     /// 鼠标拖拽选择中的锚点（字符下标）。
     anchor: usize,
     /// 是否正在拖拽选择。
@@ -732,6 +751,7 @@ impl CollationWorkspace {
             preview_focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             left_scroll: ScrollHandle::new(),
+            diff_scroll: ScrollHandle::new(),
             anchor: 0,
             dragging: false,
             show_preview: false,
@@ -991,6 +1011,10 @@ impl CollationWorkspace {
             return;
         }
         self.show_diff = !self.show_diff;
+        // v1.9.63：进对照即把共用 `diff_scroll` 归零，左右从顶部对齐起步。
+        if self.show_diff {
+            self.diff_scroll.set_offset(Point::new(px(0.0), px(0.0)));
+        }
         cx.notify();
     }
 
@@ -1028,7 +1052,7 @@ impl CollationWorkspace {
              | 转换异文 / 括号夹注 | {notes} | `〔…〕` `（…）` 升格为 `[注]…[/注]` |\n\n\
              ## 二、体量变化\n\n\
              - 毛坯字符数：**{raw_len}**\n\
-             - 清洗后字符数：**{cleaned_len}**（净减 {delta}）\n\n\
+             - 清洗后字符数：**{cleaned_len}**（{delta_label}）\n\n\
              ## 三、防误杀声明\n\n\
              清洗层对**可见可读的正文字符一律不动**：幽灵字符删除清单只含零宽 / 控制符，\
              异体字归一只动有通式的字、生僻字保留，段落级噪声删除（广告 / 页码 / 版权页）\
@@ -1038,7 +1062,11 @@ impl CollationWorkspace {
             notes = stats.notes,
             raw_len = raw_len,
             cleaned_len = cleaned_len,
-            delta = raw_len.saturating_sub(cleaned_len),
+            delta_label = if cleaned_len as i64 >= raw_len as i64 {
+                format!("净增 {}", cleaned_len as i64 - raw_len as i64)
+            } else {
+                format!("净减 {}", raw_len as i64 - cleaned_len as i64)
+            },
         );
         // 落盘到临时目录（与书库隔离），再交给访达打开。
         let dir = std::env::temp_dir().join("jiandu-sanitize");
@@ -1222,7 +1250,7 @@ impl CollationWorkspace {
     /// **清洗日志内嵌面板**（v1.9.60）：极简浮卡，如实展示本次清洗的三类统计——
     /// 折叠异体/康熙部首 X 处、清除幽灵字符 Y 个、转换异文/括号夹注 Z 处，让
     /// 用户一眼确认「没有把原书真字吞掉」。不离开 App，点「导出明细」才落盘报告。
-    fn render_sanitize_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_sanitize_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let song = crate::fonts::family_for(
             crate::types::FontChoice::WenJinMincho,
             crate::types::Script::Ancient,
@@ -1231,7 +1259,13 @@ impl CollationWorkspace {
         let stats = jiandu_core::cleaner::sanitize_stats(&raw);
         let cleaned_len = crate::importer::cleaner::clean(&raw).chars().count();
         let raw_len = raw.chars().count();
-        let delta = raw_len.saturating_sub(cleaned_len);
+        // v1.9.63：清洗可能「增字」（如 〔…〕 → [注]…[/注]），故用**有符号**差值：
+        // 净增 / 净减，杜绝旧版 `saturating_sub` 在增字时夹成 0（314万→317万 误显「净减 0」）。
+        let delta_label = if cleaned_len as i64 >= raw_len as i64 {
+            format!("净增 {}", cleaned_len as i64 - raw_len as i64)
+        } else {
+            format!("净减 {}", raw_len as i64 - cleaned_len as i64)
+        };
         // 单项条目：朱砂数字 + 说明，左对齐。
         let item = |label: &'static str, n: usize, note: &'static str| {
             div()
@@ -1267,110 +1301,107 @@ impl CollationWorkspace {
         };
         div()
             .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .size_full()
+            // 必须 `.id()` 使 `Div` 变 `Stateful<Div>` —— `overflow_y_scroll` 等方法
+            // 只在 `StatefulInteractiveElement`（仅对 `Stateful<E>` 实现）上可用。
+            .id(SharedString::from("collation-sanitize-panel"))
+            .top(px(16.0))
+            .right(px(16.0))
+            .w(px(400.0))
+            // 注：GPUI 0.2.2 无 `max_h`，卡片按内容自适应高度（本面板内容很少，
+            // 不会过高）；`overflow_y_scroll()` 仍兜底长内容。
+            .overflow_y_scroll()
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x14100A66))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|c, _, _, cx| {
-                    cx.stop_propagation();
-                    c.show_sanitize_panel = false;
-                    cx.notify();
-                }),
-            )
+            .flex_col()
+            .p(px(20.0))
+            // v1.9.63：右上角悬浮卡片，**绝不遮挡**左右对照正文（旧版全屏居中遮罩
+            // 直接压住底部原文对照）。GPUI 0.2.2 无 backdrop-filter（见 collation.rs:2125），
+            // 用半透明宣纸浅米色近似毛玻璃；字体统一宋体（WenJinMincho）。
+            .bg(rgba(0xF3ECD9F0))
+            .border_1()
+            .border_color(rgb(0x9A6B4F))
+            .rounded(px(12.0))
+            .font_family(song.clone())
+            .shadow(vec![gpui::BoxShadow {
+                color: gpui::hsla(0.09, 0.30, 0.20, 0.22),
+                offset: gpui::point(px(0.0), px(6.0)),
+                blur_radius: px(24.0),
+                spread_radius: px(0.0),
+            }])
+            .occlude()
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .w(px(420.0))
-                    .p(px(24.0))
-                    .bg(rgb(0xF3ECD9))
-                    .border_1()
-                    .border_color(rgb(0x9A6B4F))
-                    .rounded(px(8.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    )
+                    .flex_row()
+                    .items_center()
+                    .mb(px(4.0))
                     .child(
                         div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .mb(px(4.0))
-                            .child(
-                                div()
-                                    .text_size(px(16.0))
-                                    .font_family(song.clone())
-                                    .text_color(rgb(0x2b2620))
-                                    .child(SharedString::from("清洗审计日志")),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .cursor_pointer()
-                                    .text_size(px(16.0))
-                                    .text_color(rgb(0x9A9184))
-                                    .child(SharedString::from("✕"))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|c, _, _, cx| {
-                                            cx.stop_propagation();
-                                            c.show_sanitize_panel = false;
-                                            cx.notify();
-                                        }),
-                                    ),
-                            ),
+                            .text_size(px(16.0))
+                            .font_family(song.clone())
+                            .text_color(rgb(0x2b2620))
+                            .child(SharedString::from("清洗审计日志")),
                     )
+                    .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(11.5))
+                            .cursor_pointer()
+                            .text_size(px(16.0))
                             .text_color(rgb(0x9A9184))
-                            .mb(px(18.0))
-                            .child(SharedString::from(
-                                "以导入毛坯为基准，如实汇报清洗引擎动了哪些字。",
-                            )),
-                    )
-                    .child(item(
-                        "折叠异体 / 康熙部首",
-                        stats.variant,
-                        "只改有通式的字，生僻字一律保留",
-                    ))
-                    .child(item(
-                        "清除幽灵字符",
-                        stats.ghost,
-                        "零宽 / BOM / 软连 / 控制符，删除零风险",
-                    ))
-                    .child(item(
-                        "转换异文 / 括号夹注",
-                        stats.notes,
-                        "〔…〕（…）升格为 [注]…[/注]",
-                    ))
+                            .child(SharedString::from("✕"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|c, _, _, cx| {
+                                    cx.stop_propagation();
+                                    c.show_sanitize_panel = false;
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgb(0x9A9184))
+                    .mb(px(18.0))
+                    .child(SharedString::from(
+                        "以导入毛坯为基准，如实汇报清洗引擎动了哪些字。",
+                    )),
+            )
+            .child(item(
+                "折叠异体 / 康熙部首",
+                stats.variant,
+                "只改有通式的字，生僻字一律保留",
+            ))
+            .child(item(
+                "清除幽灵字符",
+                stats.ghost,
+                "零宽 / BOM / 软连 / 控制符，删除零风险",
+            ))
+            .child(item(
+                "转换异文 / 括号夹注",
+                stats.notes,
+                "〔…〕（…）升格为 [注]…[/注]",
+            ))
+            .child(
+                div()
+                    .mt(px(6.0))
+                    .pt(px(12.0))
+                    .border_t_1()
+                    .border_color(rgba(0x2B26201A))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
-                            .mt(px(6.0))
-                            .pt(px(12.0))
-                            .border_t_1()
-                            .border_color(rgba(0x2B26201A))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x4a4335))
-                                    .child(SharedString::from(format!(
-                                        "毛坯 {raw_len} 字 → 清洗后 {cleaned_len} 字（净减 {delta}）"
-                                    ))),
-                            )
-                            .child(
-                                self.button("导出明细", |c, _, _, cx| c.open_sanitize_log(cx), cx),
-                            ),
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x4a4335))
+                            .child(SharedString::from(format!(
+                                "毛坯 {raw_len} 字 → 清洗后 {cleaned_len} 字（{delta_label}）"
+                            ))),
+                    )
+                    .child(
+                        self.button("导出明细", |c, _, _, cx| c.open_sanitize_log(cx), cx),
                     ),
             )
     }
@@ -1389,7 +1420,12 @@ impl CollationWorkspace {
         let li = self.line_of(end)?;
         let (line_start, _) = *self.line_ranges().get(li)?;
         let col = end.saturating_sub(line_start);
-        let scroll_y = px_f32(self.scroll.offset().y);
+        // v1.9.63：对照模式滚在 `diff_scroll`，选区气泡 y 坐标口径同步。
+        let scroll_y = px_f32(if self.show_diff {
+            self.diff_scroll.offset().y
+        } else {
+            self.scroll.offset().y
+        });
         let panel_w = vw - self.left_col_w(vw);
         // 气泡贴选区末行的下一行；右缘留 8px，越界则往回顶。
         let x = (ED_PAD + col as f32 * CHAR_W + 4.0).min((panel_w - 108.0).max(ED_PAD));
@@ -1544,7 +1580,12 @@ impl CollationWorkspace {
         // 纯文本模式顶部多一条静默提示条（render 里 `pure_text_mode` 分支），
         // 必须算进 Y 原点，否则兜底点击（点正文下方空白）落行错位。
         let hint_h = if self.pure_text_mode { 20.0 } else { 0.0 };
-        let scroll_y = px_f32(self.scroll.offset().y);
+        // v1.9.63：对照模式编辑器滚在 `diff_scroll` 上，坐标口径要跟着走。
+        let scroll_y = px_f32(if self.show_diff {
+            self.diff_scroll.offset().y
+        } else {
+            self.scroll.offset().y
+        });
         (
             origin_x,
             HEADER_H + status_h + link_h + PUNCT_BAR_H + hint_h + ED_PAD + scroll_y,
@@ -2223,17 +2264,44 @@ impl CollationWorkspace {
                 .text_color(rgb(0x9A9184))
                 .child(SharedString::from("原文（导入毛坯 · 未清洗）")),
         );
-        for line in raw.split('\n') {
+        // v1.9.63：段落对齐（防错位，极重要）。清洗会增减字数，若左右各滚各的、
+        // 只按「总高」同步，段落必然越滚越错。做法：把每一段（按 \n 切）当对齐单元，
+        // 两侧各段都填充到「同一段在两栏里较高的那个行数」→ 第 i 段永远停在同一个 y，
+        // 零漂移。两侧等宽（各 vw*0.5）、同字体同字号同行距，段内行数用「字数 ÷ 每行字数」
+        // 估（对中文近似足够准）；极淡浅色底纹逐段勾出左右对应，眼睛不丢。
+        let cpl = ((self.left_col_w(vw) - 2.0 * ED_PAD) / CHAR_W)
+            .max(1.0)
+            .floor() as usize;
+        let raw_segs: Vec<&str> = raw.split('\n').collect();
+        let clean_segs: Vec<&str> = self.text.split('\n').collect();
+        for (i, seg) in raw_segs.iter().enumerate() {
+            let clean_seg = clean_segs.get(i).copied().unwrap_or("");
+            let seg_lines = est_wrapped_lines(seg, cpl);
+            let clean_lines = est_wrapped_lines(clean_seg, cpl);
+            let max_lines = seg_lines.max(clean_lines);
+            // 极淡浅色底纹：逐段勾出左右对应（隔段略深一档，便于眼睛定位）。
+            let band = if i % 2 == 1 {
+                rgba(0x2B26200A)
+            } else {
+                rgba(0x2B262004)
+            };
+            let pad = (max_lines - seg_lines) as f32 * LINE_H;
             content = content.child(
                 div()
                     .w_full()
-                    .min_w(px(0.0))
-                    .whitespace_normal()
-                    .text_size(px(FONT_SIZE))
-                    .text_color(rgb(0x333333))
-                    .font_family(song.clone())
-                    .line_height(px(LINE_H))
-                    .child(SharedString::from(line.to_string())),
+                    .bg(band)
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .whitespace_normal()
+                            .text_size(px(FONT_SIZE))
+                            .text_color(rgb(0x333333))
+                            .font_family(song.clone())
+                            .line_height(px(LINE_H))
+                            .child(SharedString::from(seg.to_string())),
+                    )
+                    .child(div().h(px(pad))), // 填充到与右栏同段等高 → 段落对齐
             );
         }
         div()
@@ -2252,7 +2320,10 @@ impl CollationWorkspace {
                     .w_full()
                     .h_full()
                     .overflow_y_scroll()
-                    .track_scroll(&self.left_scroll)
+                    // v1.9.63：对照模式左右**共用**专用 `diff_scroll` 句柄 → 双向像素级同步
+                    // （滚轮 / 触控板 / PageUp·Down / 拖滚动条一律同步）。与 `scroll`（编辑器
+                    // 常态柄）分离，互不干扰，编辑器交互（焦点 / 光标 / 选区 / IME）不受影响。
+                    .track_scroll(&self.diff_scroll)
                     .px(px(ED_PAD))
                     .py(px(ED_PAD))
                     .child(content),
@@ -2916,6 +2987,7 @@ impl CollationWorkspace {
         self.active_line = None;
         self.match_note = None;
         self.left_scroll.set_offset(Point::new(px(0.0), px(0.0)));
+        self.diff_scroll.set_offset(Point::new(px(0.0), px(0.0)));
         self.image_error = None;
         // 若此前因无文本层已设 OCR 提示则保留；否则用栅格化 note。
         if self.image_note.is_none() {
@@ -2969,6 +3041,7 @@ impl CollationWorkspace {
         self.regions.clear();
         self.image_error = None;
         self.left_scroll.set_offset(Point::new(px(0.0), px(0.0)));
+        self.diff_scroll.set_offset(Point::new(px(0.0), px(0.0)));
         self.preview_page = 0;
         if has_image {
             self.pure_text_mode = false;
@@ -4626,10 +4699,49 @@ impl CollationWorkspace {
         let mut char_start = 0usize;
         // 行号 `li` 在渲染时就绑给每一行（见 `render_line` 的点击闭包），
         // 这样「点第几行」是结构事实，不再靠鼠标坐标反推。
-        for (li, line) in self.text.split('\n').enumerate() {
-            let lc = line.chars().count();
-            content = content.child(self.render_line(line, char_start, li, cx));
-            char_start += lc + 1;
+        if self.show_diff {
+            // v1.9.63：对照模式（Diff）右栏段落对齐 + 差异高亮。
+            // 与左栏毛坯共用同一套「段落(按 \n 切)对齐」口径：两侧等宽(vw*0.5)、
+            // 同字体同字号同行距、段内行数按 `chars ÷ cpl` 估，每段填充到
+            // `max(左段行数, 右段行数)` 等高 → 第 i 段在两栏永远停在同一 y，零漂移。
+            // 段落块内部仍走 `render_line`（光标 / 选区 / 打字全部保留），只是整体
+            // 包进带底色的块 + 尾部等高填充，编辑交互不受任何影响。
+            // 「差异高亮」：本段被清洗引擎修改过（raw_seg != clean_seg）→ 极弱朱砂底，
+            // 一眼看出哪些段被改了；未改动段沿用与左栏一致的隔段浅色底纹（眼睛不丢）。
+            let cpl = ((self.left_col_w(vw) - 2.0 * ED_PAD) / CHAR_W)
+                .max(1.0)
+                .floor() as usize;
+            let raw_text = self.raw_text.clone().unwrap_or_default();
+            let raw_segs: Vec<&str> = raw_text.split('\n').collect();
+            let clean_segs: Vec<&str> = self.text.split('\n').collect();
+            for (i, seg) in clean_segs.iter().copied().enumerate() {
+                let raw_seg = raw_segs.get(i).copied().unwrap_or("");
+                let seg_lines = est_wrapped_lines(seg, cpl);
+                let raw_lines = est_wrapped_lines(raw_seg, cpl);
+                let max_lines = seg_lines.max(raw_lines);
+                let band = if raw_seg != seg {
+                    rgba(0x8c2b221A) // 差异高亮：本段被清洗引擎改动过
+                } else if i % 2 == 1 {
+                    rgba(0x2B26200A) // 隔段浅色底纹（与左栏一致）
+                } else {
+                    rgba(0x2B262004)
+                };
+                let pad = (max_lines - seg_lines) as f32 * LINE_H;
+                content = content.child(
+                    div()
+                        .w_full()
+                        .bg(band)
+                        .child(self.render_line(seg, char_start, i, cx))
+                        .child(div().h(px(pad))), // 等高填充 → 段落对齐
+                );
+                char_start += seg.chars().count() + 1;
+            }
+        } else {
+            for (li, line) in self.text.split('\n').enumerate() {
+                let lc = line.chars().count();
+                content = content.child(self.render_line(line, char_start, li, cx));
+                char_start += lc + 1;
+            }
         }
         // 用 `InputField` 包裹，使其在获得焦点时把 IME 回传中文接住。
         // ⚠️ **这一层是「内容层」，不给高度**——它的高度由正文行数决定，正是
@@ -4692,7 +4804,13 @@ impl CollationWorkspace {
             .h_full()
             .w_full()
             .overflow_y_scroll()
-            .track_scroll(&self.scroll)
+            // v1.9.63：对照模式挂专用 `diff_scroll`（与左栏毛坯共用 → 同步滚动）；
+            // 常态 / 纯文本模式仍走 `scroll`（已验证可编辑），两柄分离互不干扰。
+            .track_scroll(if self.show_diff {
+                &self.diff_scroll
+            } else {
+                &self.scroll
+            })
             .child(editor);
         // 选区悬浮钮（问小笺）叠在编辑器之上：`relative` 容器 + 绝对定位气泡，
         // 气泡是**滚动视口之外**的兄弟节点（不随滚动位移），故 y 要自己减

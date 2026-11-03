@@ -7919,14 +7919,9 @@ impl Render for Root {
         // 被它整块盖住（第一版就是这样，印根本看不见）。印章只在左下角
         // 一小块，压不到居中的浮层。
         root = root.child(screen);
-        // 笺校工作台入口：**只在书架显示**（用户 2026-11-01 定，2026-11-02 再确认）。
-        //
-        // 阅读屏不挂——右下那枚正好压在正文/藏书印旁边，读着书突然冒出一个悬浮钮，
-        // 很碍事；书架是「选书 + 导入 + 进工具」的那一屏，入口放这里就够了。
-        // 专注模式仍然不显示。
-        if self.screen == Screen::Shelf && !self.focus_mode {
-            root = root.child(self.render_collation_entry(cx));
-        }
+        // 注：书架上的「笺校」悬浮红钮已于 v1.9.63 移除——与卡片级「一键笺校」
+        // （shelf.rs，调 `enter_collation` 带书载入）功能重叠。进入工作台的入口保留
+        // 两条：卡片「一键笺校」+ 菜单栏「快速笺校」（均载书），工作台内另可【打开文件】。
         // 「雕版刻印中… 34%」：盖在最上层，导入期间挡住操作，免得重复点导入。
         let import_ui = self
             .import_job
@@ -7995,30 +7990,6 @@ impl Root {
         (total > 2 && self.page + 1 >= total - 1).then_some(true)
     }
 
-    /// 阅读屏右下角的「笺校工作台」入口（悬浮钮，不占排版流）。
-    ///
-    /// 点一下把顶层模式机切到 `Collation`，`Root::render` 下一帧就直接返回
-    /// 工作台视图——对阅读界面零影响（见 `collation.rs` 文件头）。
-    fn render_collation_entry(&self, cx: &mut Context<Self>) -> Div {
-        div()
-            .absolute()
-            .right(px(14.0))
-            .bottom(px(72.0))
-            .px(px(14.0))
-            .py(px(8.0))
-            .bg(rgba(0x8c2b22ff))
-            .rounded(px(8.0))
-            .cursor_pointer()
-            .text_color(rgb(0xf4ecd8))
-            .child(SharedString::from("笺校"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _event, _window, cx| {
-                    this.mode = AppMode::Collation;
-                    cx.notify();
-                }),
-            )
-    }
 }
 
 /// 用**系统默认浏览器**打开一个网址（「在线查阅」用）。
