@@ -166,7 +166,9 @@ impl Default for Prefs {
             font_modern: 0,
             font_note: default_font_note(),
             font_preset: 0,
-            zoom: 1.0,
+            // v1.9.61：出厂即「默认大字模式」——最大档（榜书）倍率，与
+            // `Root` 初始化里的 `zoom` 保持一致。
+            zoom: crate::types::ZoomLevel::Huge.factor(),
             columns: 12,
             // 自动档默认开：列数按书的内容与视口算，不写死某一档。
             columns_auto: true,

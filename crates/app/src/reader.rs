@@ -2099,7 +2099,9 @@ impl Root {
         }
         // 版字面板浮层：点工具栏「样式」展开，宽度与单张页面一致，
         // 可盖住正文下部（像照片说明压在照片上），但全部样式内容完整显示。
-        if self.show_style && !self.focus_mode {
+        // v1.9.61：去掉 `!self.focus_mode` 守卫——专注模式下也允许弹窗
+        // （见 `set_ui_state` 里的破局：开面板即临时退出专注），不再被压住。
+        if self.show_style {
             root = root.child(
                 div()
                     .absolute()

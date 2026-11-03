@@ -609,6 +609,8 @@ pub struct CollationWorkspace {
     raw_text: Option<String>,
     /// 是否开启【原文对照】（左栏毛坯 / 右栏清洗后）。
     show_diff: bool,
+    /// 是否弹出【清洗日志】内嵌面板（极简统计浮卡，不离开 App）。
+    show_sanitize_panel: bool,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -797,6 +799,7 @@ impl CollationWorkspace {
             // 清洗审计（v1.9.60）：导入时的「毛坯文本」与对照开关。
             raw_text: None,
             show_diff: false,
+            show_sanitize_panel: false,
         };
         // 启动即清扫上一进程遗留的临时图（崩溃 / 强退时 `Drop` 跑不到，只能等下次
         // 启动补扫）。只认本应用自己的命名前缀，且只删「够旧」的，绝不误伤另开的
@@ -991,12 +994,21 @@ impl CollationWorkspace {
         cx.notify();
     }
 
+    /// 切换【清洗日志】内嵌面板的显隐（极简浮卡，不离开 App）。
+    fn toggle_sanitize_panel(&mut self, cx: &mut Context<Self>) {
+        if self.raw_text.is_none() {
+            return;
+        }
+        self.show_sanitize_panel = !self.show_sanitize_panel;
+        cx.notify();
+    }
+
     /// 生成 `sanitize_report.md` 并在访达中打开（macOS `open`）。
     ///
     /// 报告以 Raw 毛坯为基准，如实罗列清洗引擎会做的三类改动：
     /// 清除幽灵字符 X 个、折叠异体/康熙部首 Y 处、转换异文/括号夹注 Z 处——
     /// 让用户一眼确认「没有把原书真字吞掉」。落盘到与本书同源的临时目录，绝不
-    /// 污染用户书库。
+    /// 污染用户书库。供【清洗日志】面板的「导出明细」按钮调用。
     fn open_sanitize_log(&mut self, cx: &mut Context<Self>) {
         let Some(raw) = self.raw_text.clone() else {
             return;
@@ -1207,6 +1219,162 @@ impl CollationWorkspace {
     /// 坐标口径与 `render_line` 完全一致（同一个 `CHAR_W` / `LINE_H` / `ED_PAD`，
     /// 再减编辑器滚动偏移），否则气泡会飘在半空——这是「点哪亮哪」那条链的
     /// 同一个坑，故这里只算一次、不再另立一套。
+    /// **清洗日志内嵌面板**（v1.9.60）：极简浮卡，如实展示本次清洗的三类统计——
+    /// 折叠异体/康熙部首 X 处、清除幽灵字符 Y 个、转换异文/括号夹注 Z 处，让
+    /// 用户一眼确认「没有把原书真字吞掉」。不离开 App，点「导出明细」才落盘报告。
+    fn render_sanitize_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
+        let raw = self.raw_text.clone().unwrap_or_default();
+        let stats = jiandu_core::cleaner::sanitize_stats(&raw);
+        let cleaned_len = crate::importer::cleaner::clean(&raw).chars().count();
+        let raw_len = raw.chars().count();
+        let delta = raw_len.saturating_sub(cleaned_len);
+        // 单项条目：朱砂数字 + 说明，左对齐。
+        let item = |label: &'static str, n: usize, note: &'static str| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .mb(px(10.0))
+                .child(
+                    div()
+                        .text_size(px(26.0))
+                        .font_family(song.clone())
+                        .text_color(rgb(0x8c2b22))
+                        .child(SharedString::from(format!("{n}"))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(rgb(0x2b2620))
+                                .child(SharedString::from(label)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x9A9184))
+                                .child(SharedString::from(note)),
+                        ),
+                )
+        };
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x14100A66))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|c, _, _, cx| {
+                    cx.stop_propagation();
+                    c.show_sanitize_panel = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(420.0))
+                    .p(px(24.0))
+                    .bg(rgb(0xF3ECD9))
+                    .border_1()
+                    .border_color(rgb(0x9A6B4F))
+                    .rounded(px(8.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .mb(px(4.0))
+                            .child(
+                                div()
+                                    .text_size(px(16.0))
+                                    .font_family(song.clone())
+                                    .text_color(rgb(0x2b2620))
+                                    .child(SharedString::from("清洗审计日志")),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .cursor_pointer()
+                                    .text_size(px(16.0))
+                                    .text_color(rgb(0x9A9184))
+                                    .child(SharedString::from("✕"))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|c, _, _, cx| {
+                                            cx.stop_propagation();
+                                            c.show_sanitize_panel = false;
+                                            cx.notify();
+                                        }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgb(0x9A9184))
+                            .mb(px(18.0))
+                            .child(SharedString::from(
+                                "以导入毛坯为基准，如实汇报清洗引擎动了哪些字。",
+                            )),
+                    )
+                    .child(item(
+                        "折叠异体 / 康熙部首",
+                        stats.variant,
+                        "只改有通式的字，生僻字一律保留",
+                    ))
+                    .child(item(
+                        "清除幽灵字符",
+                        stats.ghost,
+                        "零宽 / BOM / 软连 / 控制符，删除零风险",
+                    ))
+                    .child(item(
+                        "转换异文 / 括号夹注",
+                        stats.notes,
+                        "〔…〕（…）升格为 [注]…[/注]",
+                    ))
+                    .child(
+                        div()
+                            .mt(px(6.0))
+                            .pt(px(12.0))
+                            .border_t_1()
+                            .border_color(rgba(0x2B26201A))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0x4a4335))
+                                    .child(SharedString::from(format!(
+                                        "毛坯 {raw_len} 字 → 清洗后 {cleaned_len} 字（净减 {delta}）"
+                                    ))),
+                            )
+                            .child(
+                                self.button("导出明细", |c, _, _, cx| c.open_sanitize_log(cx), cx),
+                            ),
+                    ),
+            )
+    }
+
     fn render_selection_bar(
         &self,
         vw: f32,
@@ -1222,7 +1390,7 @@ impl CollationWorkspace {
         let (line_start, _) = *self.line_ranges().get(li)?;
         let col = end.saturating_sub(line_start);
         let scroll_y = px_f32(self.scroll.offset().y);
-        let panel_w = vw * 0.6;
+        let panel_w = vw - self.left_col_w(vw);
         // 气泡贴选区末行的下一行；右缘留 8px，越界则往回顶。
         let x = (ED_PAD + col as f32 * CHAR_W + 4.0).min((panel_w - 108.0).max(ED_PAD));
         let y = (ED_PAD + (li as f32 + 1.0) * LINE_H - scroll_y + 4.0).max(4.0);
@@ -1334,6 +1502,8 @@ impl CollationWorkspace {
     ///   * 正常有图模式：左栏原图占 **40%**。
     /// `render_right` 的右栏宽 = `vw - left_col_w(vw)`，二者必须同源。
     fn left_col_w(&self, vw: f32) -> f32 {
+        // 原文对照开启时，无论是否纯文本模式，左栏都占 50% 给 Raw 毛坯、右栏 50%
+        // 给清洗后正文——纯文本模式（无原图）同样需要这份「逐字比对」视图。
         if self.show_diff {
             vw * 0.5
         } else if self.pure_text_mode {
@@ -1765,11 +1935,18 @@ impl CollationWorkspace {
             })
     }
 
-    /// 「清洗日志」入口（v1.9.60）：生成 `sanitize_report.md`（如实汇报清洗引擎
-    /// 动了哪些字）并在访达中打开。无毛坯时禁用——日志必以 Raw 为基准。
+    /// 「清洗日志」入口（v1.9.60）：弹出内嵌极简面板，展示本次清洗的三类统计。
+    /// 无毛坯时禁用——日志必以 Raw 为基准。
     fn clean_log_chip(&self, cx: &mut Context<Self>) -> gpui::Div {
         let has = self.raw_text.is_some();
-        let fg = if has { 0x4a4335 } else { 0x9A9184 };
+        let on = self.show_sanitize_panel && has;
+        let fg = if !has {
+            0x9A9184
+        } else if on {
+            0x8c2b22
+        } else {
+            0x4a4335
+        };
         div()
             .px(px(11.0))
             .py(px(5.0))
@@ -1777,7 +1954,11 @@ impl CollationWorkspace {
             .cursor_pointer()
             .text_size(px(12.0))
             .text_color(rgb(fg))
-            .bg(rgba(0x2B26200A))
+            .bg(if on {
+                rgba(0x8C2B221A)
+            } else {
+                rgba(0x2B26200A)
+            })
             .hover(|s| s.bg(if has { rgba(0x2B26201A) } else { rgba(0x2B26200A) }))
             .child(SharedString::from("清洗日志"))
             .when(has, |d| {
@@ -1785,7 +1966,7 @@ impl CollationWorkspace {
                     MouseButton::Left,
                     cx.listener(|c, _, _, cx| {
                         cx.stop_propagation();
-                        c.open_sanitize_log(cx);
+                        c.toggle_sanitize_panel(cx);
                     }),
                 )
             })
@@ -4446,24 +4627,11 @@ impl CollationWorkspace {
             char_start += lc + 1;
         }
         // 用 `InputField` 包裹，使其在获得焦点时把 IME 回传中文接住。
+        // ⚠️ **这一层是「内容层」，不给高度**——它的高度由正文行数决定，正是
+        //   滚动视口要「滚动」的那个内容高度。任何 `h_full` 都不能挂在这里。
         let editor = crate::ime::InputField::new(
             div()
-                .id(SharedString::from("collation-editor-scroll"))
-                .flex_1()
-                .min_w(px(0.0))
                 .w_full()
-                // **强制填满右侧 60% 高度**（v1.9.43 修交互 Bug 的根）。
-                //
-                // `InputField` 把布局直接委托给子元素、自身不施加任何高度——
-                // 于是这层滚动容器如果没有显式高度，就会被 GPUI 按「内容高度」
-                // 撑开：长文直接溢出视口下沿（内部不滚动，后半段永远点不到），
-                // 短文则在面板底部留出一块不属于滚动容器的空白（点下去毫无反应）。
-                // 坐标换算 `caret_from_point` 本就能把空白点夹到末行，问题全在
-                // 「容器没填满、命中区错位」。这里用 `h_full()` 把它锁成面板高度，
-                // `overflow_y_scroll` 才会真正接管滚动，整屏右 60% 变成一个滚动视口。
-                .h_full()
-                .overflow_y_scroll()
-                .track_scroll(&self.scroll)
                 // **GPUI 原生「点一下就聚焦」**（v1.22.1）。
                 //
                 // 真机反馈：导入 MD 之后点进右侧编辑器，连光标都不给，更别说打字。
@@ -4503,15 +4671,33 @@ impl CollationWorkspace {
             self.focus.clone(),
             cx.entity(),
         );
-        // 选区悬浮钮（问小笺）叠在编辑器之上：`relative` 容器 + 绝对定位气泡。
-        // 气泡是**滚动视口之外**的兄弟节点，故 y 要自己减 `scroll.offset()`
-        //（见 `render_selection_bar` 的坐标口径）。
+        // **滚动视口**：`h_full()` 现在解析到 `wrap`（`flex_1` 在右栏 flex 列里有
+        // 确定高度）给出的**确定高度**，于是视口被锁成面板高度、内容（正文行）超出
+        // 即滚动。
+        //
+        // ⚠️ **关键修复（纯文本模式「滚不动」半身不遂的根）**：旧实现把
+        //    `overflow_y_scroll() + h_full()` 直接挂在 `InputField` **内部**的子 div
+        //    上。而 `InputField` 是自定义元素、自身高度由子元素回推——于是内层
+        //    `h_full()` 解析回「内容高度」而非被拉伸的面板高度 → 视口高 == 内容高 →
+        //    永远不滚动、长文溢出屏幕。把滚动容器挪到 `InputField` **外层**
+        //    （`wrap` 的内层 `scroll_view`）即根治：外层 `wrap` 的高度来自右栏 flex
+        //    列的 `flex_1`（确定），`scroll_view.h_full()` 才有真正的视口高度可依。
+        let scroll_view = div()
+            .id(SharedString::from("collation-editor-scroll"))
+            .h_full()
+            .w_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .child(editor);
+        // 选区悬浮钮（问小笺）叠在编辑器之上：`relative` 容器 + 绝对定位气泡，
+        // 气泡是**滚动视口之外**的兄弟节点（不随滚动位移），故 y 要自己减
+        // `scroll.offset()`（见 `render_selection_bar` 的坐标口径）。
         let mut wrap = div()
             .relative()
             .flex_1()
             .min_w(px(0.0))
             .w_full()
-            .child(editor);
+            .child(scroll_view);
         if let Some(bar) = self.render_selection_bar(vw, cx) {
             wrap = wrap.child(bar);
         }
@@ -5367,6 +5553,10 @@ impl Render for CollationWorkspace {
                     ),
             );
         }
+        // 清洗日志内嵌面板：压在最上（与覆盖确认同级），点遮罩或 ✕ 收。
+        if self.show_sanitize_panel {
+            root = root.child(self.render_sanitize_panel(cx));
+        }
         root
     }
 }
@@ -5954,15 +6144,15 @@ impl EntityInputHandler for CollationWorkspace {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<gpui::UTF16Selection> {
-        let (s, e) = match self.selection.as_ref() {
-            Some(r) => (r.start.min(r.end), r.start.max(r.end)),
-            None => {
-                let a = char_to_utf16(&self.text, self.cursor);
-                (a, a)
-            }
-        };
+        // **永远返回零宽选区**：平台（macOS NSTextInputClient）会按 `selected_text_range`
+        // 绘制**原生选中高亮**——未聚焦时是灰蓝、聚焦时是蓝，正好盖住我们自绘的朱砂
+        // `rgba(0x8c2b2233)`（`render_line` 在字下画的底色）。自绘层只画我们自己的
+        // 颜色、且永远在字下面，所以这里绝不能把真实选区交给平台，否则朱砂被原生蓝
+        // 「反客为主」。选区高亮**完全由 `render_line` 负责**；复制 / 拖拽扩展 / IME
+        // 合成都走我们自己的逻辑，不依赖平台选区范围。
+        let a = char_to_utf16(&self.text, self.cursor);
         Some(gpui::UTF16Selection {
-            range: s..e,
+            range: a..a,
             reversed: false,
         })
     }

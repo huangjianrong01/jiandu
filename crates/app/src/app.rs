@@ -1427,7 +1427,10 @@ impl Root {
             bar_shown: true,
             anchor_beat: 0,
             anchor_pulsing: false,
-            zoom: 1.0,
+            // v1.9.61：「阅读界面默认大字模式」——开书即最大档（榜书），
+            // 正文网格字号直接按最大档倍率初始化，每本书开卷自动生效。
+            // 想调小，顶栏「版字」里选「大字 / 中楷 / 蝇头」即可。
+            zoom: crate::types::ZoomLevel::Huge.factor(),
             lookup: None,
             lookup_key: None,
             lookup_text: String::new(),
@@ -5648,6 +5651,14 @@ fn anki_push_card(
         };
         let s = if on { AppUIState::None } else { s };
         self.ui_state = s;
+        // v1.9.61 · 破局「自动专注模式 vs 面板渲染守卫（!self.focus_mode）」：
+        // 点【版字】/【问笺】时若正沉浸于专注模式，强制临时退出——否则面板被
+        // `render` 里的 `!self.focus_mode` 守卫压住、点了毫无反应（真机回归
+        // Bug）。专注模式只是「净室读书」的视觉态，开面板天然要回到可操作态，
+        // 退出无害；想再沉浸，顶栏「專注」钮或 ⌘T 随时拉回。
+        if matches!(s, AppUIState::Style | AppUIState::Ai) {
+            self.focus_mode = false;
+        }
         self.show_style = matches!(s, AppUIState::Style);
         // 开「版字」那张纸时**读一次**用户预设（最多三个，几百字节）。
         // 渲染时不读盘——帧里读 JSON 是拿磁盘当内存用。
