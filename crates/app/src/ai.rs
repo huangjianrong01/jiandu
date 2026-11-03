@@ -809,7 +809,7 @@ impl AiPanel {
 /// 用独立线程而非 `cx.background_executor()`：这条活儿是**阻塞式**的长连接
 /// （一次请求可能持续一两分钟），不该去占 UI 的后台执行器。线程里
 /// `catch_unwind` 兜住——网络栈的 panic 绝不能越过线程边界把进程带走。
-fn spawn_chat(
+pub(crate) fn spawn_chat(
     cfg: AiConfig,
     system: String,
     user: String,
@@ -836,7 +836,7 @@ fn spawn_chat(
 }
 
 /// 真的发一次请求并读完响应。
-async fn chat(
+pub(crate) async fn chat(
     cfg: &AiConfig,
     system: &str,
     user: &str,

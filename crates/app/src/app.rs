@@ -10,9 +10,15 @@ use crate::library::{Bookmark, Library};
 use crate::menubar::{MenuData, MenuIntent};
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
-    Book, Duplex, FontChoice, FontPreset, Glyph, GlyphHit, GlyphKey, GlyphKind,
+    Book, Chapter, Duplex, FontChoice, FontPreset, Glyph, GlyphHit, GlyphKey, GlyphKind,
     MarkKind, NoteKind, NoteSource, RuleColor, Script,
 };
+use crate::ai::spawn_chat;
+use jiandu_core::ai::{
+    jodu_assign, jodu_needed, jodu_plan, jodu_user_prompt, AiConfig, JODU_MAX_CHARS, JODU_SYSTEM,
+    StreamEvent,
+};
+use jiandu_core::store::{begin_bulk, end_bulk, load_chapter, put_chapter};
 use gpui::{
     div, px, rgb, rgba, AppContext, AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
@@ -1043,6 +1049,18 @@ pub struct Root {
     /// 收起三选一：点「关」/ Esc / 点纸面；下一次交互即清，不常驻。
     pub toast: Option<String>,
 
+    // ---- AI 句读（断句）----
+    /// 句读进行中（UI 浮层与取消按钮都看它）。
+    pub jodu_running: bool,
+    /// 已完成组数（进度分子）。
+    pub jodu_done: usize,
+    /// 总组数（进度分母）。
+    pub jodu_total: usize,
+    /// 最近一次句读的错误（若有；UI 浮层与完成提示会显示）。
+    pub jodu_error: Option<String>,
+    /// 句读批次序号：取消时 bump，异步循环据此判断要不要停下。
+    pub jodu_seq: u64,
+
     /// 窄屏首次提示的显示态（v1.52.3，P3#8）：窄屏（手机竖持 / 窗口拉窄）
     /// 单叶阅读时，纸面贴右缘、竖排自右向左——冷启动用户完全找不到正文，
     /// 故第一次进窄屏在底部正中亮一句「竖排自右向左，纸面贴右缘」，
@@ -1575,6 +1593,11 @@ impl Root {
             png_export: None,
             export_busy: false,
             toast: None,
+            jodu_running: false,
+            jodu_done: 0,
+            jodu_total: 0,
+            jodu_error: None,
+            jodu_seq: 0,
             narrow_hint: false,
             narrow_hint_seen: prefs.narrow_hint_seen,
             book_stat: (0, 0),
@@ -3372,9 +3395,14 @@ impl Root {
             })
             .unwrap_or(false);
         // ③ 把数据灌进工作台实体（常驻 Entity，跨会话复用同一份）。
+        //     同时重新解析源文件取「毛坯文本」（已提取段落、未清洗），供【原文对照】
+        //     使用——绝不把 EPUB 的 HTML 源码当 Raw 给用户看。
+        let raw = source_path
+            .as_ref()
+            .and_then(|p| crate::importer::import_raw_text(p));
         let collation = self.collation.clone();
         let _ = collation.update(cx, |ws, cx| {
-            ws.load_book_auto(source_path, text, has_image, cx);
+            ws.load_book_auto(source_path, text, has_image, raw, cx);
         });
         // ④ 切到笺校模态：`Root::render` 见 `AppMode::Collation` 直接返回工作台，
         //    不构建阅读器，对阅读零影响。
@@ -6744,6 +6772,211 @@ fn anki_push_card(
         if let Some(book) = self.book.as_ref() {
             let _ = crate::importer::write_book_json(book, &path);
         }
+    }
+
+    /// **AI 句读（断句）**：把全书无标点的古文分批送模型补标点，写回正文。
+    ///
+    /// 复用问小笺的网络通道（`spawn_chat`）与配置（`AiConfig`）。每段一项、
+    /// 按预算并组；回包行数对不上就整组保留原样（见 `jodu_assign`），绝不把
+    /// 错乱文本塞进书里。虚拟化书落 DB，非虚拟化书落 JSON。
+    pub fn run_jodu(&mut self, cx: &mut Context<Self>) {
+        if self.jodu_running {
+            return; // 进行中不重入
+        }
+        let Some(book) = self.book.as_ref() else {
+            self.toast = Some("没有打开的书".to_string());
+            cx.notify();
+            return;
+        };
+        // 问小笺没配置 → 提示去设置（不悄无声息地失败）。
+        let cfg = AiConfig::load();
+        if !cfg.ready() {
+            self.toast = Some("先去设置里配置「问小笺」再句读".to_string());
+            cx.notify();
+            return;
+        }
+        // 已含足量标点 → 跳过，避免叠加错误标点。
+        if !jodu_needed(book) {
+            self.toast = Some("本书似乎已含标点，无需句读".to_string());
+            cx.notify();
+            return;
+        }
+        let plan = jodu_plan(book, JODU_MAX_CHARS);
+        if plan.is_empty() {
+            self.toast = Some("没有可句读的文句".to_string());
+            cx.notify();
+            return;
+        }
+        // 关掉菜单、开跑。
+        self.more_menu = false;
+        self.more_group = None;
+        self.jodu_running = true;
+        self.jodu_done = 0;
+        self.jodu_total = plan.len();
+        self.jodu_error = None;
+        self.jodu_seq = self.jodu_seq.wrapping_add(1);
+        let seq = self.jodu_seq;
+        cx.notify();
+
+        // 把 plan 与 cfg 移进异步任务：逐组发请求、收流、拼回。
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let mut results: Vec<Option<String>> = Vec::with_capacity(plan.len());
+                for (gi, group) in plan.iter().enumerate() {
+                    // 取消 / 重入：seq 变了或已停 → 收手。
+                    let alive = this
+                        .update(&mut cx, |r, _| r.jodu_seq == seq && r.jodu_running)
+                        .unwrap_or(false);
+                    if !alive {
+                        break;
+                    }
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+                    spawn_chat(
+                        cfg.clone(),
+                        JODU_SYSTEM.to_string(),
+                        jodu_user_prompt(&group.joined),
+                        false, // 非流式：整段回包，收一个 Delta 即够
+                        tx,
+                    );
+                    let mut acc = String::new();
+                    let mut err: Option<String> = None;
+                    while let Some(ev) = rx.recv().await {
+                        match ev {
+                            StreamEvent::Delta(s) => acc.push_str(&s),
+                            StreamEvent::Done => break,
+                            StreamEvent::Error(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(e) = err {
+                        // 记录首个错误，但继续跑剩余组（能断多少是多少）。
+                        let _ = this.update(&mut cx, |r, cx| {
+                            if r.jodu_error.is_none() {
+                                r.jodu_error = Some(e.clone());
+                            }
+                            r.jodu_done = gi + 1;
+                            cx.notify();
+                        });
+                        results.push(None);
+                    } else {
+                        results.push(Some(acc));
+                        let _ = this.update(&mut cx, |r, cx| {
+                            r.jodu_done = gi + 1;
+                            cx.notify();
+                        });
+                    }
+                }
+                // 全部组跑完（或取消）→ 主线程写回。
+                let assignment = jodu_assign(&plan, &results);
+                let _ = this.update(&mut cx, |r, cx| {
+                    r.jodu_finalize(assignment, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 取消进行中的句读：bump 批次序号，异步循环据此停下；已完成的组照常写回。
+    pub fn jodu_cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.jodu_running {
+            return;
+        }
+        self.jodu_running = false;
+        self.jodu_seq = self.jodu_seq.wrapping_add(1);
+        cx.notify();
+    }
+
+    /// 句读跑完后的写回与收尾（在主线程执行）。
+    fn jodu_finalize(
+        &mut self,
+        assignment: std::collections::BTreeMap<(usize, usize), String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.jodu_running = false;
+        if assignment.is_empty() {
+            // 全组都失败 / 行数全错：什么都没改，给个提示。
+            let msg = self
+                .jodu_error
+                .clone()
+                .unwrap_or_else(|| "未产生有效结果".to_string());
+            self.toast = Some(format!("AI 句读失败：{msg}"));
+            cx.notify();
+            return;
+        }
+        // ① 写回内存正文（仅当该段确实在内存里）。
+        if let Some(book) = self.book.as_mut() {
+            for ((ci, pi), new_text) in &assignment {
+                if let Some(ch) = book.chapters.get_mut(*ci) {
+                    if let Some(p) = ch.paragraphs.get_mut(*pi) {
+                        p.text = new_text.clone();
+                    }
+                }
+            }
+        }
+        // ② 落盘：虚拟化书走 DB，非虚拟化书走 JSON。
+        let store_id = self.book.as_ref().and_then(|b| b.store_id.clone());
+        match store_id {
+            Some(id) => self.jodu_persist_db(&id, &assignment),
+            None => self.persist_book_json(),
+        }
+        // ③ 作废分页器：下一帧重新排版（标点变了，面数也变）。
+        self.pager = None;
+        self.inscription_need = None;
+        // ④ 完成提示。
+        let n = assignment.len();
+        if let Some(e) = &self.jodu_error {
+            self.toast = Some(format!("AI 句读完成 {n} 段（部分失败：{e}）"));
+        } else {
+            self.toast = Some(format!("AI 句读完成，共补标点 {n} 段"));
+        }
+        cx.notify();
+    }
+
+    /// 虚拟化书：把改动过的章节从 DB 读回（带全量段落）、替换对应段文本、
+    /// 再整章写回——绝不用内存里可能残缺的段落覆盖 DB（见 [`open_book`]
+    /// 处注释：虚拟化书的 `chapters[i].paragraphs` 平时是空的）。
+    fn jodu_persist_db(
+        &mut self,
+        id: &str,
+        assignment: &std::collections::BTreeMap<(usize, usize), String>,
+    ) {
+        let Ok(conn) = jiandu_core::store::connect() else {
+            self.jodu_error = Some("章节库打开失败，改动未落盘".to_string());
+            return;
+        };
+        // 收集要改的章下标（去重、有序）。
+        let mut cis: Vec<usize> = assignment.keys().map(|(ci, _)| *ci).collect();
+        cis.sort_unstable();
+        cis.dedup();
+        // 整批一个事务：千章级也不至于每章一次 fsync。
+        if begin_bulk(&conn).is_err() {
+            self.jodu_error = Some("章节库事务开启失败".to_string());
+            return;
+        }
+        for ci in cis {
+            // 从 DB 读全章（段落齐全），只换被句读的那几段。
+            let mut ch: Chapter = match load_chapter(&conn, id, ci) {
+                Ok(Some(c)) => c,
+                _ => continue,
+            };
+            for ((ci2, pi), new_text) in assignment {
+                if *ci2 != ci {
+                    continue;
+                }
+                if let Some(p) = ch.paragraphs.get_mut(*pi) {
+                    p.text = new_text.clone();
+                }
+            }
+            let json = match serde_json::to_string(&ch) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
+            let _ = put_chapter(&conn, id, ci, &ch.title, ch.char_count(), &json);
+        }
+        let _ = end_bulk(&conn);
     }
 
     /// 把草稿写进书稿里那条注文（并按原通道回写 JSON，下次打开仍在）。

@@ -17,6 +17,7 @@
 //! 卡片匣（模块三）才负责「留住」，问小笺只负责「当下这一问」。
 
 use crate::library::Library;
+use crate::types::Book;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -636,6 +637,183 @@ pub fn tidy_answer(s: &str) -> String {
         .to_string()
 }
 
+/// **AI 句读（断句）** 的纯逻辑层。
+///
+/// 「句读」就是给没有标点的古文补上现代标点。本模块只回答三件与界面无关
+/// 的事：
+///   ① 告诉模型怎么断（[`JODU_SYSTEM`]）；
+///   ② 把一本书打平成「一段一项」的待处理清单，再按字符预算并成组
+///      （[`jodu_plan`]）——正文就在 `Book.chapters[].paragraphs[].text` 里，
+///      标点也只是内联进去的字符，渲染层（`punct`）会照旧手绘朱砂；
+///   ③ 把模型回包（一段带标点的文本）按行数解析回每一项（[`jodu_assign`]）。
+///
+/// 网络与落盘都在这层之外：本层零网络依赖，照旧。
+///
+/// **一段一项、绝不拆段**：拆段会让「按行对齐回写」失去依据，得不偿失。
+/// 超长段（少数）单独成组、独自发送即可；回包行数一旦对不上，整组保留原样
+/// ——宁可白跑一组，也绝不把错乱文本塞进书里。
+///
+/// 单组的最大字符预算：超过就另起一组。模型上下文远不止此，但一组塞太满
+/// 一来慢、二来行数对齐更容易错（见 [`jodu_assign`]），故压在 1500 字左右。
+pub const JODU_MAX_CHARS: usize = 1500;
+
+/// **系统提示词**：把「句读先生」的边界写死。
+///
+/// 三条铁律：只加标点不改动一字、严格保持行数、零解释零 markdown。
+/// 行数守恒是回包能对齐的前提——模型若并 / 拆行，[`jodu_assign`] 就整组
+/// 保留原样（安全兜底）。
+pub const JODU_SYSTEM: &str = "\
+你是古籍句读（断句）专家。用户会给你一段没有标点的古文，请为其补上现代常用标点。
+
+要求：
+一、只加标点，绝不增删、改写任何文字；原有的空格与换行也要原样保留。
+二、严格保持输入的行数不变：输入有几行，输出就几行，行与行之间用换行分隔，不要合并行，也不要多出空行。
+三、不输出任何解释、前言、后记、markdown 符号（# * 等），直接输出标点化后的文本本身。
+四、使用现代标点：逗号（，）、句号（。）、问号（？）、感叹号（！）、分号（；）、冒号（：）、顿号（、）。
+五、若书名、篇名明确可辨，可加书名号《》；若引语明确，可加引号“”。把握不准就只用前七种。
+六、以简体输入就用简体输出，以繁体输入就用繁体输出。";
+
+/// 句读的一项：书里的一个自然段（不拆分）。
+#[derive(Clone, Debug)]
+pub struct JoduItem {
+    /// 章下标。
+    pub ci: usize,
+    /// 段下标。
+    pub pi: usize,
+    /// 该段原文（要送去断句的那一段）。
+    pub text: String,
+}
+
+/// 一组：若干段拼起来一次性发给模型。
+///
+/// `joined` 是各段用 `\n` 连接后的整段——模型据此保持行数，回包再按 `\n`
+/// 拆回每一项。
+#[derive(Clone, Debug)]
+pub struct JoduGroup {
+    /// 本组包含的段（顺序即 joined 里的行序）。
+    pub items: Vec<JoduItem>,
+    /// 各段以 `\n` 连接后的整段文本。
+    pub joined: String,
+}
+
+/// 组装给模型的用户消息：原文包在【原文】一节里。
+pub fn jodu_user_prompt(text: &str) -> String {
+    format!("【原文】\n{text}")
+}
+
+/// 这本书是否还需要句读：若已有足量标点，视为「已断过」，跳过以免叠加错误。
+///
+/// 判据：非空白字符里，标点占比超过 2% 即认为已含标点。阈值压得很低——真·
+/// 无标点古文几乎一颗标点都没有，2% 足以区分「天然无标点」与「已断」。
+pub fn jodu_needed(book: &Book) -> bool {
+    let mut total = 0usize;
+    let mut punct = 0usize;
+    for ch in book
+        .chapters
+        .iter()
+        .flat_map(|c| c.paragraphs.iter())
+        .flat_map(|p| p.text.chars())
+    {
+        if ch.is_whitespace() {
+            continue;
+        }
+        total += 1;
+        if crate::types::is_punct(ch) {
+            punct += 1;
+        }
+    }
+    if total == 0 {
+        return false; // 没字可读
+    }
+    (punct as f64 / total as f64) < 0.02
+}
+
+/// 把一本书打平成组：一段一项，按字符预算并组（超长段独自成组）。
+///
+/// 空段不入组（无需断句，留原样）；返回可能为空（整本书没字）。
+pub fn jodu_plan(book: &Book, max_chars: usize) -> Vec<JoduGroup> {
+    let max = max_chars.max(1);
+    let mut items: Vec<JoduItem> = Vec::new();
+    for (ci, ch) in book.chapters.iter().enumerate() {
+        for (pi, p) in ch.paragraphs.iter().enumerate() {
+            let t = p.text.trim().to_string();
+            if t.is_empty() {
+                continue; // 空段不送：对齐时它本就不占一行
+            }
+            items.push(JoduItem { ci, pi, text: t });
+        }
+    }
+    let mut groups: Vec<JoduGroup> = Vec::new();
+    let mut cur: Vec<JoduItem> = Vec::new();
+    let mut cur_len = 0usize;
+    for it in items {
+        let len = it.text.chars().count();
+        // 当前组非空、且塞下这一段会超预算 → 先封当前组。
+        if !cur.is_empty() && cur_len + 1 + len > max {
+            groups.push(flush(&mut cur, &mut cur_len));
+        }
+        // 单段就超预算：它自己独占一组（不拆段）。
+        if cur.is_empty() && len > max {
+            groups.push(JoduGroup {
+                items: vec![it.clone()],
+                joined: it.text.clone(),
+            });
+        } else {
+            cur_len += if cur.is_empty() { 0 } else { 1 } + len;
+            cur.push(it);
+        }
+    }
+    if !cur.is_empty() {
+        groups.push(flush(&mut cur, &mut cur_len));
+    }
+    groups
+}
+
+/// 把当前累积的 items 收成一组（计算 `joined`）。
+fn flush(cur: &mut Vec<JoduItem>, cur_len: &mut usize) -> JoduGroup {
+    let joined = cur
+        .iter()
+        .map(|i| i.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let g = JoduGroup {
+        items: std::mem::take(cur),
+        joined,
+    };
+    *cur_len = 0;
+    g
+}
+
+/// 把每组的模型回包解析回各段。
+///
+/// `results[i]` 是该组的结果：`Some(text)` 成功、`None` 失败（保留原样）。
+/// 成功时按 `\n` 拆行，行数恰等于项数才采纳（逐段 `trim` 后写回）；行数对不上
+/// 一律丢弃——宁可这组白跑，也绝不把错乱文本塞进书里。
+///
+/// 返回 `(章下标, 段下标) -> 新文本` 的映射，供上层写回。
+pub fn jodu_assign(
+    groups: &[JoduGroup],
+    results: &[Option<String>],
+) -> std::collections::BTreeMap<(usize, usize), String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (g, res) in groups.iter().zip(results.iter()) {
+        let Some(text) = res else {
+            continue;
+        };
+        // 去掉模型偶发加在首尾的空行（典型是末尾一个 `\n`）：我们不发空段，
+        // 故对齐只看「中间」的行数，首尾空行一律不算。
+        let body = text.trim_matches(['\n', '\r']);
+        let lines: Vec<&str> = body.split('\n').collect();
+        if lines.len() != g.items.len() {
+            continue; // 行数不符：整组保留原样
+        }
+        for (item, line) in g.items.iter().zip(lines.iter()) {
+            out.insert((item.ci, item.pi), line.trim().to_string());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,5 +1133,129 @@ mod tests {
     fn tidy_answer_strips_leading_blank_lines() {
         assert_eq!(tidy_answer("\n\n 道可道。\n"), "道可道。");
         assert_eq!(tidy_answer("﻿可"), "可");
+    }
+
+    // ── AI 句读：纯函数逻辑 ──────────────────────────────────────────
+
+    fn mk_book(paras: &[&str]) -> Book {
+        use crate::types::Cover;
+        Book {
+            title: "test".to_string(),
+            author: String::new(),
+            cover: Cover::default(),
+            tongjia: Default::default(),
+            toc: Vec::new(),
+            head_notes: Vec::new(),
+            margin_notes: Vec::new(),
+            schema_version: 0,
+            store_id: None,
+            chapter_chars: Vec::new(),
+            chapters: vec![crate::types::Chapter {
+                title: "一".to_string(),
+                paragraphs: paras.iter().map(|s| crate::types::Paragraph::plain(*s)).collect(),
+            }],
+        }
+    }
+
+    #[test]
+    fn jodu_plan_groups_by_budget_and_keeps_one_item_per_paragraph() {
+        let b = mk_book(&["天地玄黄", "宇宙洪荒", "日月盈昃"]);
+        // 预算足够 → 一组三项，joined 用 \n 连接。
+        let groups = jodu_plan(&b, 100);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].items.len(), 3);
+        assert_eq!(groups[0].joined, "天地玄黄\n宇宙洪荒\n日月盈昃");
+
+        // 预算很小 → 每段各一组。
+        let groups = jodu_plan(&b, 5);
+        assert_eq!(groups.len(), 3);
+        for g in &groups {
+            assert_eq!(g.items.len(), 1);
+        }
+    }
+
+    #[test]
+    fn jodu_plan_skips_empty_paragraphs() {
+        let b = mk_book(&["", "   ", "有字"]);
+        let groups = jodu_plan(&b, 100);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].items.len(), 1);
+        assert_eq!(groups[0].items[0].pi, 2, "空段不入组，原样保留");
+    }
+
+    #[test]
+    fn jodu_plan_keeps_oversized_paragraph_alone() {
+        let big = "甲".repeat(200);
+        let b = mk_book(&["短段", &big, "又一段"]);
+        let groups = jodu_plan(&b, 50);
+        // 短段一组、超长段独占一组、又一段一组。
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[1].items.len(), 1);
+        assert_eq!(groups[1].items[0].text.chars().count(), 200);
+    }
+
+    #[test]
+    fn jodu_assign_adopts_when_line_count_matches() {
+        let g = JoduGroup {
+            items: vec![
+                JoduItem { ci: 0, pi: 0, text: "甲乙".into() },
+                JoduItem { ci: 0, pi: 1, text: "丙丁".into() },
+            ],
+            joined: "甲乙\n丙丁".into(),
+        };
+        let m = jodu_assign(&[g], &[Some("甲。乙\n丙，丁".to_string())]);
+        assert_eq!(m.get(&(0, 0)), Some(&"甲。乙".to_string()));
+        assert_eq!(m.get(&(0, 1)), Some(&"丙，丁".to_string()));
+    }
+
+    #[test]
+    fn jodu_assign_keeps_original_on_mismatch_or_failure() {
+        let g = JoduGroup {
+            items: vec![
+                JoduItem { ci: 0, pi: 0, text: "甲乙".into() },
+                JoduItem { ci: 0, pi: 1, text: "丙丁".into() },
+            ],
+            joined: "甲乙\n丙丁".into(),
+        };
+        // 行数不符 → 丢弃。
+        let m = jodu_assign(&[g.clone()], &[Some("甲。乙丙，丁".to_string())]);
+        assert!(m.is_empty(), "行数不符必须整组保留原样");
+        // 失败（None）→ 丢弃。
+        let m = jodu_assign(&[g], &[None]);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn jodu_assign_trims_each_line() {
+        let g = JoduGroup {
+            items: vec![JoduItem { ci: 0, pi: 0, text: "甲乙".into() }],
+            joined: "甲乙".into(),
+        };
+        let m = jodu_assign(&[g], &[Some("  甲。乙  \n".to_string())]);
+        assert_eq!(m.get(&(0, 0)), Some(&"甲。乙".to_string()));
+    }
+
+    #[test]
+    fn jodu_needed_false_when_already_punctuated() {
+        let b = mk_book(&["天地玄黄，宇宙洪荒。日月盈昃，辰宿列张。"]);
+        assert!(!jodu_needed(&b), "已含标点应判为无需句读");
+
+        let b2 = mk_book(&["天地玄黄宇宙洪荒日月盈昃辰宿列张"]);
+        assert!(jodu_needed(&b2), "纯无标点应判为需要句读");
+
+        let empty = Book {
+            title: String::new(),
+            author: String::new(),
+            cover: crate::types::Cover::default(),
+            tongjia: Default::default(),
+            toc: Vec::new(),
+            head_notes: Vec::new(),
+            margin_notes: Vec::new(),
+            schema_version: 0,
+            store_id: None,
+            chapter_chars: Vec::new(),
+            chapters: Vec::new(),
+        };
+        assert!(!jodu_needed(&empty), "没字不判需要");
     }
 }

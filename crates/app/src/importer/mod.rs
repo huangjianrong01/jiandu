@@ -214,6 +214,31 @@ pub fn import_file(path: &Path) -> Result<ParsedDoc, ImportError> {
     import_file_with(path, &mut |_, _| {})
 }
 
+/// **取「解析后的毛坯文本」**：只跑各格式的 parser（②），**不**走清洗层
+/// （③），**不**做康熙部首折叠 / 异体字转换 / 幽灵字符清除。
+///
+/// 用途：笺校台【原文对照】。用户要看到的是「已提取段落、但还没被正则/归一
+/// 动过的原始脏文本」，而不是 EPUB 的 HTML 源码——这样才能直观对比出清洗
+/// 引擎到底删了哪些字符、改了哪些字，防误杀。
+///
+/// 解析失败（不支持后缀 / 文件损坏）返回 `None`，调用方照常走清洗后的正文。
+pub fn import_raw_text(path: &Path) -> Option<String> {
+    let fmt = Format::from_path(path)?;
+    let raw = match fmt {
+        Format::Json => json_parser::JsonParser::parse(path).ok()?,
+        Format::Epub => epub_parser::EpubParser::parse(path).ok()?,
+        Format::Txt => txt_parser::TxtParser::parse(path).ok()?,
+        Format::Html => html_parser::HtmlParser::parse(path).ok()?,
+        Format::Markdown => md_parser::MdParser::parse(path).ok()?,
+        Format::Docx => docx_parser::DocxParser::parse(path).ok()?,
+        Format::Pdf => {
+            let pages = pdf_parser::collect_pages(path, &mut |_, _| {});
+            crate::pdf_text::pages_to_text(&pages)
+        }
+    };
+    Some(raw)
+}
+
 /// 与 [`import_file`] 相同，但把**逐页进度**交出去（v1.9.34）。
 ///
 /// 只有 PDF 会真的用到它：文本层要一页页抽，一本两百页的书几百毫秒到几秒，

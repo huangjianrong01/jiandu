@@ -1225,6 +1225,12 @@ pub(crate) enum MoreAct {
     License,
     /// **解锁全部功能**（商店版）：打开内购那张纸。
     Unlock,
+    /// **AI 句读（断句）**（v1.9.60）：给无标点的古文一键补现代标点。
+    ///
+    /// 引擎只认正文里的 `，。！？` 字符（`punct::kind_for` 直接读字符手绘朱砂
+    /// 句读），故本项本质是：把无标点文本送问小笺 → 拿回带标点文本 →
+    /// 写回 `Paragraph.text`，渲染层自动画出句读——零渲染改动。
+    Jodu,
 }
 
 impl Root {
@@ -2022,6 +2028,59 @@ impl Root {
                     .right(px(0.0))
                     .flex()
                     .flex_row()
+                    .justify_center()
+                    .child(slip),
+            );
+        }
+
+        // v1.9.60：**AI 句读进度浮层**——居中一枚宣纸纸签，比 toast 高半档
+        // （读书时弹出、挡住纸面正中），显示「第 X/Y 段」并带「取消」。
+        // 与 toast 互斥与否无关：句读进行中即便刚吐了提示也照常浮着。
+        if self.jodu_running {
+            let label = format!("AI 句读進行中… 第 {} / {} 段", self.jodu_done, self.jodu_total);
+            let slip = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .px_3()
+                .py_1p5()
+                .rounded(px(7.0))
+                .bg(rgb(t.chip()))
+                .border_1()
+                .border_color(rgb(t.chrome_line()))
+                .shadow_sm()
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(t.chrome_text()))
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .cursor_pointer()
+                        .text_size(px(11.5))
+                        .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.5)))
+                        .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+                        .child(SharedString::from("取消"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.jodu_cancel(cx);
+                            }),
+                        ),
+                );
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
                     .justify_center()
                     .child(slip),
             );
@@ -4979,6 +5038,7 @@ impl Root {
                     sub = sub
                         .child(aitem(cx, "more-analysis", "文本分析", MoreAct::Analysis))
                         .child(aitem(cx, "export-md", "导出 MD", MoreAct::Md))
+                        .child(aitem(cx, "more-jodu", "AI 句读（断句）", MoreAct::Jodu))
                         .child(aitem(cx, "more-help", "說明", MoreAct::Help));
                     // 商店版不挂「激活」：App Review 2.4.5(vi) 禁止 licence
                     // screen / licence key，菜单上留个门等于给审核递把柄。
@@ -5293,6 +5353,9 @@ impl Root {
             // 那边 `storekit::purchase()` 是空实现，纸上会显示「此版本不经
             // App Store 购买」——比「点了没反应」诚实。
             MoreAct::Unlock => self.open_unlock(cx),
+            // AI 句读（断句）：无网络 / 无邀码 / 无需句读 时，`run_jodu` 自己
+            // 会在 toast 上给一句可读提示并原地返回，不会留半途状态。
+            MoreAct::Jodu => self.run_jodu(cx),
         }
     }
 

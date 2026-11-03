@@ -56,6 +56,56 @@ fn px_f32(p: Pixels) -> f32 {
     p / px(1.0)
 }
 
+/// 当前本地时间戳（紧凑 `YYYY-MM-DD HH:MM`），纯标准库实现，不引入额外依赖。
+fn ts_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => 0,
+    };
+    // 简单公历换算（2038 之后仍正确，足够本工具使用）。以 1970-01-01 00:00 UTC 为锚。
+    const DAY: i64 = 86400;
+    let days = secs / DAY;
+    let rem = secs - days * DAY;
+    // 已知 1970-01-01 是星期四，累计天数求年月日（蔡勒式无需，直接递推）。
+    let mut y = 1970i64;
+    let mut d = days;
+    loop {
+        let leap = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            366
+        } else {
+            365
+        };
+        if d < leap {
+            break;
+        }
+        d -= leap;
+        y += 1;
+    }
+    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mut m = 0usize;
+    let mut dd = d;
+    loop {
+        let md = month_days[m] + if m == 1 && leap { 1 } else { 0 };
+        if dd < md {
+            break;
+        }
+        dd -= md;
+        m += 1;
+    }
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        y,
+        m + 1,
+        dd + 1,
+        hh,
+        mm
+    )
+}
+
 /// 顶层应用模式：阅读器 / 笺校工作台。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AppMode {
@@ -554,6 +604,11 @@ pub struct CollationWorkspace {
     pure_text_mode: bool,
     /// **替换确认**（v1.9.59）：点【替换当前书籍】若已有校对内容，先弹此确认框。
     replace_confirm: bool,
+    /// 清洗审计（v1.9.60）：导入时的「毛坯文本」（已提取段落、未清洗），
+    /// 供【原文对照】逐字比对，防误杀。无源文件可解析时为 `None`。
+    raw_text: Option<String>,
+    /// 是否开启【原文对照】（左栏毛坯 / 右栏清洗后）。
+    show_diff: bool,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -739,6 +794,9 @@ impl CollationWorkspace {
             hide_gloss: false,
             pure_text_mode: false,
             replace_confirm: false,
+            // 清洗审计（v1.9.60）：导入时的「毛坯文本」与对照开关。
+            raw_text: None,
+            show_diff: false,
         };
         // 启动即清扫上一进程遗留的临时图（崩溃 / 强退时 `Drop` 跑不到，只能等下次
         // 启动补扫）。只认本应用自己的命名前缀，且只删「够旧」的，绝不误伤另开的
@@ -923,6 +981,74 @@ impl CollationWorkspace {
         cx.notify();
     }
 
+    /// 切换【原文对照】：左栏在「原图 / 毛坯文本」之间切换。无关图时左栏本就空，
+    /// 开对照即把毛坯铺上去与右栏清洗后正文并排。无毛坯直接返回（按钮已禁用）。
+    fn toggle_diff(&mut self, cx: &mut Context<Self>) {
+        if self.raw_text.is_none() {
+            return;
+        }
+        self.show_diff = !self.show_diff;
+        cx.notify();
+    }
+
+    /// 生成 `sanitize_report.md` 并在访达中打开（macOS `open`）。
+    ///
+    /// 报告以 Raw 毛坯为基准，如实罗列清洗引擎会做的三类改动：
+    /// 清除幽灵字符 X 个、折叠异体/康熙部首 Y 处、转换异文/括号夹注 Z 处——
+    /// 让用户一眼确认「没有把原书真字吞掉」。落盘到与本书同源的临时目录，绝不
+    /// 污染用户书库。
+    fn open_sanitize_log(&mut self, cx: &mut Context<Self>) {
+        let Some(raw) = self.raw_text.clone() else {
+            return;
+        };
+        let stats = jiandu_core::cleaner::sanitize_stats(&raw);
+        let cleaned_len = crate::importer::cleaner::clean(&raw).chars().count();
+        let raw_len = raw.chars().count();
+        let now = ts_now();
+        let report = format!(
+            "# 清洗审计日志 · sanitize_report\n\n\
+             生成时间：{now}\n\n\
+             ## 一、统计（以导入毛坯为基准）\n\n\
+             | 项目 | 数量 | 说明 |\n\
+             | --- | --- | --- |\n\
+             | 清除幽灵字符 | {ghost} | 零宽 / BOM / 软连字符 / 控制符（竖排里全是空白格，删除零风险） |\n\
+             | 折叠异体 / 康熙部首 | {variant} | 只改 VARIANT_MAP 与兼容区里有通式的字；生僻字一律保留 |\n\
+             | 转换异文 / 括号夹注 | {notes} | `〔…〕` `（…）` 升格为 `[注]…[/注]` |\n\n\
+             ## 二、体量变化\n\n\
+             - 毛坯字符数：**{raw_len}**\n\
+             - 清洗后字符数：**{cleaned_len}**（净减 {delta}）\n\n\
+             ## 三、防误杀声明\n\n\
+             清洗层对**可见可读的正文字符一律不动**：幽灵字符删除清单只含零宽 / 控制符，\
+             异体字归一只动有通式的字、生僻字保留，段落级噪声删除（广告 / 页码 / 版权页）\
+             全部带关键词 + 长度双阈值，绝不在不确定的情况下直接吞字。\n",
+            ghost = stats.ghost,
+            variant = stats.variant,
+            notes = stats.notes,
+            raw_len = raw_len,
+            cleaned_len = cleaned_len,
+            delta = raw_len.saturating_sub(cleaned_len),
+        );
+        // 落盘到临时目录（与书库隔离），再交给访达打开。
+        let dir = std::env::temp_dir().join("jiandu-sanitize");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("sanitize_report.md");
+        if let Err(e) = std::fs::write(&path, report) {
+            eprintln!("[jiandu] 清洗日志写入失败：{e}");
+            cx.notify();
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&path).status();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(&path).status();
+        }
+        self.image_note = Some(format!("清洗日志已生成：{}", path.display()));
+        cx.notify();
+    }
+
     // ── 问小笺（v1.9.54）───────────────────────────────────────────────
 
     /// 当前选区的原文（无选区 = 空串）。
@@ -1044,7 +1170,7 @@ impl CollationWorkspace {
                     .border_color(rgba(0x2B26200D))
                     .child(
                         div()
-                            .font_family(song)
+                            .font_family(song.clone())
                             .text_size(px(12.0))
                             .text_color(rgb(0x2B2620))
                             .child(SharedString::from("问小笺")),
@@ -1200,6 +1326,23 @@ impl CollationWorkspace {
         }
     }
 
+    /// 左栏实际宽度（CSS 像素）：决定右栏左缘，进而决定编辑器内容的 X 原点。
+    ///
+    /// 三种情形：
+    ///   * 原文对照开（`show_diff`）：左栏是 Raw 毛坯，占整屏 **50%**；
+    ///   * 纯文本模式（无图）：左栏为 0（右栏占满整屏）；
+    ///   * 正常有图模式：左栏原图占 **40%**。
+    /// `render_right` 的右栏宽 = `vw - left_col_w(vw)`，二者必须同源。
+    fn left_col_w(&self, vw: f32) -> f32 {
+        if self.show_diff {
+            vw * 0.5
+        } else if self.pure_text_mode {
+            0.0
+        } else {
+            vw * 0.4
+        }
+    }
+
     /// 右侧编辑器的**内容原点**（正文第一行第一字的窗口坐标）。
     ///
     /// 四个必须一起算的量，漏任何一个都会让「点第 N 行」落到别的行上：
@@ -1223,10 +1366,18 @@ impl CollationWorkspace {
         } else {
             0.0
         };
+        // 纯文本模式（一键笺校进无图的书）：没有左栏原图，右栏占满整屏，
+        // 编辑器内容左缘就是 `ED_PAD`，**不是** `vw*0.4 + ED_PAD`——这正是真机
+        // 「点哪光标歪到行首」的 X 轴死因：原点偏右了 40% 屏宽，列位被夹成 0。
+        // 原文对照开启时左栏是 50% 的 Raw，原点随之右移。
+        let origin_x = self.left_col_w(vw) + ED_PAD;
+        // 纯文本模式顶部多一条静默提示条（render 里 `pure_text_mode` 分支），
+        // 必须算进 Y 原点，否则兜底点击（点正文下方空白）落行错位。
+        let hint_h = if self.pure_text_mode { 20.0 } else { 0.0 };
         let scroll_y = px_f32(self.scroll.offset().y);
         (
-            vw * 0.4 + ED_PAD,
-            HEADER_H + status_h + link_h + PUNCT_BAR_H + ED_PAD + scroll_y,
+            origin_x,
+            HEADER_H + status_h + link_h + PUNCT_BAR_H + hint_h + ED_PAD + scroll_y,
         )
     }
 
@@ -1247,6 +1398,51 @@ impl CollationWorkspace {
         };
         let in_line = (local_x / CHAR_W).floor() as usize;
         s + in_line.min(e - s)
+    }
+
+    /// 双击选「句」：以 `pos` 为中心，向前后扩张到最近的句读 / 空白边界，
+    /// 返回 `[start, end)` 字符区间。CJK 无空格分词，故以常见句读、括号、引号、
+    /// 换行及空白作为句界——双击一次即选中光标所在的整句（而非整段）。
+    fn sentence_bounds(&self, pos: usize) -> (usize, usize) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let total = chars.len();
+        let p = pos.min(total);
+        let delim = |c: char| -> bool {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '。' | '！'
+                        | '？'
+                        | '；'
+                        | '，'
+                        | '、'
+                        | '：'
+                        | '（'
+                        | '）'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '《'
+                        | '》'
+                        | '“'
+                        | '”'
+                        | '\n'
+                )
+        };
+        let mut a = p;
+        while a > 0 && !delim(chars[a - 1]) {
+            a -= 1;
+        }
+        let mut b = p;
+        while b < total && !delim(chars[b]) {
+            b += 1;
+        }
+        // 落在标点 / 空白上（区间为空）时，退而选中该单字，避免「双击无反应」。
+        if a == b && p < total {
+            b = p + 1;
+        }
+        (a, b)
     }
 
     /// 右文**某一行的行身**被点中：落光标 + 直连左图联动。
@@ -1270,6 +1466,7 @@ impl CollationWorkspace {
         x: f32,
         vw: f32,
         vh: f32,
+        click_count: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1277,9 +1474,17 @@ impl CollationWorkspace {
         let (origin_x, _) = self.editor_origin(vw);
         let col = ((x - origin_x).max(0.0) / CHAR_W).round() as usize;
         self.cursor = line_start + col.min(line_len);
-        self.selection = None;
         self.anchor = self.cursor;
-        self.dragging = true;
+        if click_count >= 2 {
+            // 双击：选中光标所在的「句」（到前后最近标点 / 空白边界）。
+            let (a, b) = self.sentence_bounds(self.cursor);
+            self.selection = if a < b { Some(a..b) } else { None };
+        } else {
+            // 单击：只落光标，**绝不当拖拽**——否则轻微移动即触发跨行大选区，
+            // 连带把原生 macOS 的蓝色选区招出来、吃掉光标焦点。
+            self.selection = None;
+        }
+        self.dragging = false;
         Self::hard_refocus(window, &self.focus);
         self.link_to_paragraph(li, vw, vh, cx);
         cx.stop_propagation();
@@ -1294,9 +1499,15 @@ impl CollationWorkspace {
         let vw = px_f32(window.viewport_size().width);
         let vh = px_f32(window.viewport_size().height);
         self.cursor = self.caret_from_point(px_f32(event.position.x), px_f32(event.position.y), vw);
-        self.selection = None;
         self.anchor = self.cursor;
-        self.dragging = true;
+        if event.click_count >= 2 {
+            let (a, b) = self.sentence_bounds(self.cursor);
+            self.selection = if a < b { Some(a..b) } else { None };
+        } else {
+            // 单击只落光标，绝不当拖拽。
+            self.selection = None;
+        }
+        self.dragging = false;
         // 点进编辑器 = 用户想打字。这里走硬重建（而不是裸 focus）：原生对话框
         // 关掉后平台侧可能已经丢了输入上下文，而 GPUI 仍以为聚焦（见 hard_refocus）。
         Self::hard_refocus(window, &self.focus);
@@ -1316,9 +1527,13 @@ impl CollationWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.dragging {
+        // 只在左键**按住**时扩展选区：单击（按下即抬起、无移动）永远不会进入这里，
+        // 于是「单击变整段蓝选」的根因被彻底掐断。拖拽状态由「按钮是否还按着」
+        // 实时决定，不再靠 mousedown 时瞎置 `dragging=true`。
+        if event.pressed_button != Some(MouseButton::Left) {
             return;
         }
+        self.dragging = true;
         let vw = px_f32(window.viewport_size().width);
         let to = self.caret_from_point(px_f32(event.position.x), px_f32(event.position.y), vw);
         let (s, e) = (self.anchor.min(to), self.anchor.max(to));
@@ -1513,6 +1728,69 @@ impl CollationWorkspace {
             )
     }
 
+    /// 「原文对照」开关（v1.9.60）：左栏切到导入毛坯、右栏保留清洗后正文。
+    /// 无毛坯（如「打开文件」手选、无源文件可解析）时按钮变灰禁用，绝不闪。
+    fn diff_chip(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let has = self.raw_text.is_some();
+        let on = self.show_diff && has;
+        let fg = if !has {
+            0x9A9184
+        } else if on {
+            0x8c2b22
+        } else {
+            0x4a4335
+        };
+        div()
+            .px(px(11.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(fg))
+            .bg(if on {
+                rgba(0x8C2B221A)
+            } else {
+                rgba(0x2B26200A)
+            })
+            .hover(|s| s.bg(if has { rgba(0x2B26201A) } else { rgba(0x2B26200A) }))
+            .child(SharedString::from("原文对照"))
+            .when(has, |d| {
+                d.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|c, _, _, cx| {
+                        cx.stop_propagation();
+                        c.toggle_diff(cx);
+                    }),
+                )
+            })
+    }
+
+    /// 「清洗日志」入口（v1.9.60）：生成 `sanitize_report.md`（如实汇报清洗引擎
+    /// 动了哪些字）并在访达中打开。无毛坯时禁用——日志必以 Raw 为基准。
+    fn clean_log_chip(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let has = self.raw_text.is_some();
+        let fg = if has { 0x4a4335 } else { 0x9A9184 };
+        div()
+            .px(px(11.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(fg))
+            .bg(rgba(0x2B26200A))
+            .hover(|s| s.bg(if has { rgba(0x2B26201A) } else { rgba(0x2B26200A) }))
+            .child(SharedString::from("清洗日志"))
+            .when(has, |d| {
+                d.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|c, _, _, cx| {
+                        cx.stop_propagation();
+                        c.open_sanitize_log(cx);
+                    }),
+                )
+            })
+    }
+
     /// **次级按钮**（v1.9.24）：无边框，只留一层几乎看不见的纸灰底。
     ///
     /// 给【打开文件】【导入 MD】这类「入口」用——它们是渠道，不是动作的高潮。
@@ -1699,6 +1977,11 @@ impl CollationWorkspace {
             .child(self.region_box_chip(cx))
             // 「掩注」（v1.9.54）：隐藏括注 / 夹注，只看正文。与 ⌘N 同源。
             .child(self.gloss_chip(cx))
+            // 「原文对照」（v1.9.60）：左栏切到导入毛坯、右栏保留清洗后正文，
+            // 逐字比对防误杀。无毛坯（如「打开文件」手选）时按钮变灰禁用。
+            .child(self.diff_chip(cx))
+            // 「清洗日志」（v1.9.60）：生成 sanitize_report.md 并在访达中打开。
+            .child(self.clean_log_chip(cx))
             .child(div().flex_1())
             // 唯一的实底主按钮。
             .child(self.primary_button(
@@ -1725,7 +2008,7 @@ impl CollationWorkspace {
                     .rounded(px(6.0))
                     .cursor_pointer()
                     .text_size(px(11.5))
-                    .font_family(song)
+                    .font_family(song.clone())
                     .text_color(rgba(0x2B26208C))
                     .hover(|s| s.text_color(rgb(0x8c2b22)))
                     .child(SharedString::from("← 返回阅读"))
@@ -1738,10 +2021,72 @@ impl CollationWorkspace {
             )
     }
 
+    /// 原文对照左栏：把导入时的「毛坯文本」（未清洗）逐行铺开，只读、可滚。
+    /// 与右栏清洗后正文并排，让用户一眼看出清洗引擎删了哪些字、改了哪些字（防误杀）。
+    fn render_raw_pane(&self, vw: f32, _cx: &mut Context<Self>) -> gpui::Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
+        let raw = self.raw_text.clone().unwrap_or_default();
+        let mut content = div().w_full().flex().flex_col();
+        // 顶部一条标签：明确这是「未清洗」的毛坯，与右栏的清洗后正文区分。
+        content = content.child(
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .py(px(4.0))
+                .bg(rgba(0x2B26200D))
+                .text_size(px(11.0))
+                .text_color(rgb(0x9A9184))
+                .child(SharedString::from("原文（导入毛坯 · 未清洗）")),
+        );
+        for line in raw.split('\n') {
+            content = content.child(
+                div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .whitespace_normal()
+                    .text_size(px(FONT_SIZE))
+                    .text_color(rgb(0x333333))
+                    .font_family(song.clone())
+                    .line_height(px(LINE_H))
+                    .child(SharedString::from(line.to_string())),
+            );
+        }
+        div()
+            .w(px(self.left_col_w(vw)))
+            .h_full()
+            .flex()
+            .flex_col()
+            // 左「纸」压深一档（与正常左栏同款），两张纸靠明度差分开。
+            .bg(rgb(PAPER_L))
+            // 与右栏同样的滚动容器：长文可滚，命中区才不会错位。
+            .child(
+                div()
+                    .id(SharedString::from("collation-raw-scroll"))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .w_full()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.left_scroll)
+                    .px(px(ED_PAD))
+                    .py(px(ED_PAD))
+                    .child(content),
+            )
+    }
+
     /// 左侧 40%：原图区。顶部悬浮【打开文件】按钮；下方滚动容器挂 `left_scroll`，
     /// 内容（栅格化位图或 mock 行带）内部用 `relative()` 承载绝对定位的高亮叠加层；
     /// 底部状态条显示导入错误或温和提示（如多页 PDF 仅渲首页）。
     fn render_left(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
+        // 原文对照开启：左栏不再是原图，而是导入时的「毛坯文本」（未清洗），
+        // 供用户逐字比对清洗引擎删了哪些字、改了哪些字（防误杀）。
+        if self.show_diff {
+            return self.render_raw_pane(vw, cx);
+        }
         // **空状态**（v1.9.22）：一张原图都没有时，绝不把「占位页 + 假区域框」
         // 摆出来——那看起来像一个渲染 Bug（真机反馈原话：「两个灰色线框太突兀」）。
         // 改成一张安静的空纸 + 一句提示，它是「还没开始」，不是「坏了」。
@@ -1762,7 +2107,7 @@ impl CollationWorkspace {
             )
         };
         div()
-            .w(px(vw * 0.4))
+            .w(px(self.left_col_w(vw)))
             .h_full()
             .flex()
             .flex_col()
@@ -1940,7 +2285,7 @@ impl CollationWorkspace {
                     .child(div().h(px(7.0)))
                     .child(
                         div()
-                            .font_family(song)
+                            .font_family(song.clone())
                             .text_size(px(11.5))
                             .text_color(rgba(0x5A5346B5))
                             .child(SharedString::from("请点左上角「打开文件」导入")),
@@ -2410,10 +2755,15 @@ impl CollationWorkspace {
         source_path: Option<PathBuf>,
         text: String,
         has_image: bool,
+        raw_text: Option<String>,
         cx: &mut Context<Self>,
     ) {
         // 重置与「上一本书」相关的全部状态（文本 / 图像 / 联动 / 翻页缓存）。
         self.text = text;
+        // 毛坯文本：供【原文对照】展示。重新进书时清空旧值，避免上一本的
+        // 脏数据残留到这一本（没图的书 raw 来自重新解析源文件）。
+        self.raw_text = raw_text;
+        self.show_diff = false;
         self.cursor = 0;
         self.selection = None;
         self.marked = None;
@@ -2477,7 +2827,11 @@ impl CollationWorkspace {
                         let _ = entity.update(&mut app, |this, cx| {
                             match res {
                                 Ok((body, note)) => {
-                                    this.text = body;
+                                    this.text = body.clone();
+                                    // 手选文件：Raw 与清洗后同源（导入即未清洗），
+                                    // 让【原文对照】仍然可用且一致；同时清掉旧稿残留。
+                                    this.raw_text = Some(body);
+                                    this.show_diff = false;
                                     this.cursor = 0;
                                     this.selection = None;
                                     this.marked = None;
@@ -3709,8 +4063,9 @@ impl CollationWorkspace {
     /// 右侧 60%：竖排预览工具条 + 原生编辑器。
     fn render_right(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
         let editor = self.render_editor(vw, cx);
-        // 纯文本模式：右栏占满整屏（无左图），否则占 60%。
-        let right_w = if self.pure_text_mode { vw } else { vw * 0.6 };
+        // 右栏宽 = 整屏 − 左栏宽（原文对照 50% / 纯文本 0 / 正常 40%）。必须与
+        // `left_col_w` 同源，否则右栏溢出或缩水都会让编辑器原点失准。
+        let right_w = vw - self.left_col_w(vw);
         // 原先这里还有一条**自己的**小工具条（导入 MD / 竖排预览）。v1.9.22
         // 把它并进全局那条——两栏各顶一条色带，看起来像两套软件拼在一起。
         // 现在整屏只有一条工具条，右栏从第一行字就是稿纸。
@@ -4010,6 +4365,7 @@ impl CollationWorkspace {
                         px_f32(event.position.x),
                         vw,
                         vh,
+                        event.click_count,
                         window,
                         cx,
                     );
@@ -4126,7 +4482,7 @@ impl CollationWorkspace {
                 .text_size(px(FONT_SIZE))
                 // #333 而不是纯黑：亮纸上纯黑会「刺」，深灰才像墨晕开的样子。
                 .text_color(rgb(0x333333))
-                .font_family(song)
+                .font_family(song.clone())
                 .line_height(px(LINE_H))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -4757,6 +5113,11 @@ impl CollationWorkspace {
             self.toggle_gloss(cx);
             return;
         }
+        // ②′ 原文对照：⌘⇧D / Ctrl+Shift+D。
+        if (mods.platform || mods.control) && mods.shift && (k == "d" || k == "D") {
+            self.toggle_diff(cx);
+            return;
+        }
         // ③ 浮卡开着时 Esc 先收卡，再轮到预览 / 选区。
         if self.ai_open && k == "escape" {
             self.close_ai(window, cx);
@@ -4885,14 +5246,14 @@ impl Render for CollationWorkspace {
                 .flex()
                 .flex_row()
                 .flex_1()
-                .when(!self.pure_text_mode, |d| {
+                .when(self.left_col_w(vw) > 0.0, |d| {
                     d.child(self.render_left(vw, cx))
                         .child(
                             div()
                                 .absolute()
                                 .top(px(0.0))
                                 .bottom(px(0.0))
-                                .left(px(vw * 0.4))
+                                .left(px(self.left_col_w(vw)))
                                 .w(px(1.0))
                                 .bg(rgba(0x2B26200D)),
                         )
@@ -5594,7 +5955,7 @@ impl EntityInputHandler for CollationWorkspace {
         _cx: &mut Context<Self>,
     ) -> Option<gpui::UTF16Selection> {
         let (s, e) = match self.selection.as_ref() {
-            Some(r) => (r.start.min(r.end), r.end.max(r.end)),
+            Some(r) => (r.start.min(r.end), r.start.max(r.end)),
             None => {
                 let a = char_to_utf16(&self.text, self.cursor);
                 (a, a)

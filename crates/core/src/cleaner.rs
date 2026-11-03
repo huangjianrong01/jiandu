@@ -1478,6 +1478,56 @@ pub fn normalize_variants(s: &str) -> String {
     out
 }
 
+/// 清洗审计统计（供笺校台【原文对照】/ 清洗日志使用）。
+///
+/// 三项分别对应用户最关心的「有没有误杀」：
+///   * `ghost`   —— 清除的**幽灵字符**数（零宽 / BOM / 软连字符 / 控制符。
+///                  它们在竖排里全是空白格或豆腐块，删除不会丢任何可读字）；
+///   * `variant` —— 折叠的**异体 / 康熙部首 / 兼容表意字**（只改 `VARIANT_MAP`
+///                  与兼容区里有通式的字；生僻字一律保留，绝不篡改古籍）；
+///   * `notes`   —— 转换的**异文 / 括号夹注**数（`〔…〕` `（…）` 升格为
+///                  `[注]…[/注]` 的次数）。
+///
+/// ⚠️ 这些统计**只读不写**：枚举的是「若经清洗会改动的字符」，绝不为了计数
+/// 而多删一个字。这是「防误杀」的透明凭证。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SanitizeStats {
+    pub ghost: usize,
+    pub variant: usize,
+    pub notes: usize,
+}
+
+/// 在**不修改**任何文本的前提下，统计 `raw`（解析后的毛坯文本）若经清洗会产生的
+/// 三类改动次数。供「清洗日志」如实汇报，让用户一眼看出清洗引擎动了哪些字、
+/// 确保没把原书真字吞掉。
+pub fn sanitize_stats(raw: &str) -> SanitizeStats {
+    let mut ghost = 0usize;
+    let mut variant = 0usize;
+    for c in raw.chars() {
+        match c {
+            // 与 `denoise_text` 删除清单严格一致：零宽 / BOM / 软连 / 方向控制 /
+            // 控制符——这些在竖排里全是空白格或豆腐块，删掉零风险。
+            '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{FEFF}'
+            | '\u{00AD}'
+            | '\u{0000}'..='\u{0008}'
+            | '\u{000E}'..='\u{001F}' => ghost += 1,
+            _ => {}
+        }
+        // 异体 / 康熙部首 / 兼容表意字归一：只动有通式的字，生僻字保留。
+        if normalize_variant_char(c) != c {
+            variant += 1;
+        }
+    }
+    // 异文 / 括号注：先〔〕【】再（）（与管线同序），数 `[注]` 标记即升格次数。
+    let noted = brackets_to_notes(raw);
+    let noted = paren_to_note(&noted);
+    let notes = noted.matches("[注]").count();
+    SanitizeStats { ghost, variant, notes }
+}
+
 fn normalize_variants_book(ir: &mut IrBook) {
     ir.meta.title = normalize_variants(&ir.meta.title);
     ir.meta.author = normalize_variants(&ir.meta.author);
