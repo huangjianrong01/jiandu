@@ -1310,7 +1310,12 @@ impl Root {
         let count = library.books.len();
         // 笺校工作台实体：开局就建（常驻，进入时才渲染）。与阅读器完全解耦，
         // 不引用 Reader 任何字段；订阅其「返回阅读」事件切回 Reader 模式。
-        let collation = cx.new(CollationWorkspace::new);
+        // 工作台与阅读器**共用同一个问小笺面板**：会话、配置、流式输出都在一处，
+        // 用户在哪儿问都是同一位先生（v1.9.54）。
+        let collation = {
+            let panel = ai_panel.clone();
+            cx.new(move |cx| CollationWorkspace::new(cx, panel))
+        };
         let collation_sub = cx.subscribe(&collation, |this, _e, _event, cx| {
             // 工作台点「返回阅读」→ 切回正常阅读态。
             this.mode = AppMode::Reader;
@@ -7359,6 +7364,9 @@ impl Render for Root {
         }
         // 笺校工作台全屏态：直接返回工作台视图，根本不构建阅读界面 → 对阅读零影响。
         if self.mode == AppMode::Collation {
+            // 工作台里也可能用问小笺的「全庫 / 全書」——翻库的派活口在这个
+            // 每帧轮询里，早退之前必须走一遍，否则面板会一直悬在「翻检中」。
+            self.poll_ai(cx);
             return self.collation.clone().into_any_element();
         }
         if std::env::var("JIANDU_IME_DEBUG").is_ok() {

@@ -394,7 +394,7 @@ pub struct CollationWorkspace {
     /// 不当场删是因为本帧的 `img` 可能还在异步读该文件；隔一帧元素树已换，删了安全。
     temp_gc: Vec<PathBuf>,
     /// 当前这批预览图对应的版式指纹（`preview_sig`）；相同请求直接跳过不重排。
-    preview_sig: Option<(u64, usize, u8, u8, u8, u8, u8)>,
+    preview_sig: Option<(u64, usize, u8, u8, u8, u8, u8, u8)>,
     /// 当前预览页码（0-based）；`preview_paths` 为空时无意义。
     preview_page: usize,
     /// 预览栅格化失败信息（红色提示，如系统缺中文字体）。
@@ -541,6 +541,14 @@ pub struct CollationWorkspace {
     pick_text: Option<String>,
     /// 本次拖选命中的区域数（只用于状态提示「共 N 处」）。
     pick_hits: usize,
+    /// **问小笺面板**（v1.9.54）：与阅读器**共用同一个 Entity**——
+    /// 会话、配置、流式输出全在同一处，用户在哪儿问都是同一位先生。
+    ai_panel: gpui::Entity<crate::ai::AiPanel>,
+    /// 问小笺浮卡是否展开。
+    ai_open: bool,
+    /// **掩注开关**（v1.9.54，Cmd+N）：竖排预览 / 导出时剥掉括注（夹注）小字，
+    /// 只留正文。纯派生状态——`text` 一个字都不动，故随时能切回来。
+    hide_gloss: bool,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -594,8 +602,62 @@ fn wrap_text(
     (out.into_iter().collect(), cursor)
 }
 
+/// **掩注**（⌘N）的纯计算：剥掉括注 / 夹注，只留正文。
+///
+/// 认两种写法，都是古稿里真在用的：
+///  ① 全角 / 半角圆括号括注：`（注文）`、`(gloss)`——可嵌套，整段一起剥；
+///  ② 方头注记：`[注:…]`、`[註:…]`（Markdown 稿里最常见的一种）。
+///
+/// 只删注文、**不动正文字序**；括号本身也不留（掩注就是「当它没写过」）。
+/// 抽成自由函数是为了可单测——它是纯字符串活，不该只能开窗口按键才验得到。
+fn strip_gloss(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        // ② `[注:…]` / `[註:…]`：整段连同方括号一起剥。
+        if c == '[' {
+            let is_note = matches!(chars.get(i + 1), Some('注') | Some('註'))
+                && matches!(chars.get(i + 2), Some(':') | Some('：'));
+            if is_note {
+                let mut j = i + 3;
+                while j < chars.len() && chars[j] != ']' {
+                    j += 1;
+                }
+                i = (j + 1).min(chars.len());
+                continue;
+            }
+        }
+        // ① 圆括号括注：支持嵌套，深度归零才继续抄正文。
+        if c == '（' || c == '(' {
+            let mut depth = 0i32;
+            let mut j = i;
+            while j < chars.len() {
+                match chars[j] {
+                    '（' | '(' => depth += 1,
+                    '）' | ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            i = j.min(chars.len());
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 impl CollationWorkspace {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>, ai_panel: gpui::Entity<crate::ai::AiPanel>) -> Self {
         let me = Self {
             // 示例转录：一段较长的古文（千字文节选），让用户一进来就能看到
             // 编辑器、立即尝试选择/输入，并直接打开「竖排预览」看到多页分页。
@@ -667,6 +729,9 @@ impl CollationWorkspace {
             pick_rect: None,
             pick_text: None,
             pick_hits: 0,
+            ai_panel,
+            ai_open: false,
+            hide_gloss: false,
         };
         // 启动即清扫上一进程遗留的临时图（崩溃 / 强退时 `Drop` 跑不到，只能等下次
         // 启动补扫）。只认本应用自己的命名前缀，且只删「够旧」的，绝不误伤另开的
@@ -836,6 +901,238 @@ impl CollationWorkspace {
         cx.notify();
     }
 
+    /// **⌘N：掩注**（v1.9.54）——把括注 / 夹注小字从**预览与导出**里隐去。
+    ///
+    /// 「无痕重排」的三条口径：
+    ///   ① `text` 一个字都不改（掩注是**派生视图**，随时切回来还是原稿）；
+    ///   ② 版式指纹显式作废——不然内容变了还被短路成「同一版式」，看着像没反应；
+    ///   ③ `preview_page` 原样保留：用户在第三页按的 ⌘N，重排完仍停在第三页。
+    fn toggle_gloss(&mut self, cx: &mut Context<Self>) {
+        self.hide_gloss = !self.hide_gloss;
+        self.preview_sig = None;
+        if self.show_preview {
+            self.request_preview(cx);
+        }
+        cx.notify();
+    }
+
+    // ── 问小笺（v1.9.54）───────────────────────────────────────────────
+
+    /// 当前选区的原文（无选区 = 空串）。
+    fn selected_text(&self) -> String {
+        let Some(r) = self.selection.as_ref() else {
+            return String::new();
+        };
+        let chars: Vec<char> = self.text.chars().collect();
+        let a = r.start.min(r.end).min(chars.len());
+        let b = r.end.max(r.start).min(chars.len());
+        chars[a..b].iter().collect()
+    }
+
+    /// **框一句原文来问**：把选区压成 [`Ask`]，交给与阅读器共用的问小笺面板。
+    ///
+    /// 与阅读器同一条口径：引文只进不出（随这一轮请求发出，不落盘、不进存档），
+    /// 前后文各带 80 字，让先生知道这句在说什么。面板没开就顺手开——用户的意图
+    /// 是「问这一句」，不是「开个面板看看」。
+    fn ask_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let quote = self.selected_text();
+        if quote.trim().is_empty() {
+            return;
+        }
+        let chars: Vec<char> = self.text.chars().collect();
+        let (a, b) = match self.selection.as_ref() {
+            Some(r) => (
+                r.start.min(r.end).min(chars.len()),
+                r.end.max(r.start).min(chars.len()),
+            ),
+            None => (self.cursor.min(chars.len()), self.cursor.min(chars.len())),
+        };
+        let before: String = chars[a.saturating_sub(80)..a].iter().collect();
+        let after: String = chars[b..(b + 80).min(chars.len())].iter().collect();
+        let ask = jiandu_core::ai::Ask {
+            book: self
+                .text_file
+                .as_ref()
+                .map(|p| file_display_name(p))
+                .unwrap_or_else(|| "笺校稿".to_string()),
+            chapter: String::new(),
+            quote,
+            before,
+            after,
+            question: String::new(),
+            refs: Vec::new(),
+        };
+        self.ai_open = true;
+        // 面板与阅读器共用，纸墨可能是阅读那边同步过的（深色 / 别的底色）——
+        // 工作台永远是浅宣纸，故开卡时按出厂纸墨校一次，免得深底浮在浅纸上。
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
+        self.ai_panel.update(cx, |p, cx| {
+            p.sync_look(jiandu_core::theme::Theme::default(), song);
+            p.take_context(ask, cx);
+            p.ask_quote(cx);
+        });
+        // 焦点递给提问框：否则输入法没有落点，追问打不进中文。
+        let f = self.ai_panel.read(cx).ask_focus();
+        window.focus(&f);
+        cx.notify();
+    }
+
+    /// 收起问小笺浮卡（焦点交还编辑器）。
+    fn close_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ai_open = false;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// 问小笺浮卡：右下角宣纸卡，内嵌**共用**的 `AiPanel` 实体。
+    ///
+    /// 与阅读器同款视觉（圆角纸卡 + 淡朱边 + 柔影），但不做滑入动画——
+    /// 工作台是「一屏做一件事」的工具，浮卡随点随到即可。
+    fn render_ai_card(&self, vw: f32, vh: f32, cx: &mut Context<Self>) -> gpui::Div {
+        let w = 560.0_f32.min((vw - 56.0).max(320.0));
+        let h = (vh * 0.66).clamp(320.0, 560.0);
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
+        div()
+            .absolute()
+            .right(px(18.0))
+            .bottom(px(18.0))
+            .w(px(w))
+            .h(px(h))
+            .flex()
+            .flex_col()
+            .rounded(px(10.0))
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgba(0x2B26202E))
+            .shadow(vec![BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.18),
+                offset: gpui::point(px(0.0), px(4.0)),
+                blur_radius: px(14.0),
+                spread_radius: px(0.0),
+            }])
+            // 阻断穿透：否则点面板会把「抬起」漏给正文（同阅读器浮层的老坑）。
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_c, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .h(px(34.0))
+                    .px(px(12.0))
+                    .bg(rgb(CHROME))
+                    .border_b_1()
+                    .border_color(rgba(0x2B26200D))
+                    .child(
+                        div()
+                            .font_family(song)
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x2B2620))
+                            .child(SharedString::from("问小笺")),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(rgba(0x2B26208C))
+                            .hover(|s| s.text_color(rgb(0x8c2b22)))
+                            .child(SharedString::from("收起"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|c, _, window, cx| {
+                                    cx.stop_propagation();
+                                    c.close_ai(window, cx);
+                                }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(self.ai_panel.clone()),
+            )
+    }
+
+    /// 编辑器选区旁的**悬浮钮**（v1.9.54）：框住一段字才出现，点「问小笺」即发问。
+    ///
+    /// 坐标口径与 `render_line` 完全一致（同一个 `CHAR_W` / `LINE_H` / `ED_PAD`，
+    /// 再减编辑器滚动偏移），否则气泡会飘在半空——这是「点哪亮哪」那条链的
+    /// 同一个坑，故这里只算一次、不再另立一套。
+    fn render_selection_bar(
+        &self,
+        vw: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let sel = self.selection.as_ref()?;
+        if sel.start == sel.end {
+            return None;
+        }
+        let total = self.text.chars().count();
+        let end = sel.end.max(sel.start).min(total);
+        let li = self.line_of(end)?;
+        let (line_start, _) = *self.line_ranges().get(li)?;
+        let col = end.saturating_sub(line_start);
+        let scroll_y = px_f32(self.scroll.offset().y);
+        let panel_w = vw * 0.6;
+        // 气泡贴选区末行的下一行；右缘留 8px，越界则往回顶。
+        let x = (ED_PAD + col as f32 * CHAR_W + 4.0).min((panel_w - 108.0).max(ED_PAD));
+        let y = (ED_PAD + (li as f32 + 1.0) * LINE_H - scroll_y + 4.0).max(4.0);
+        Some(
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_c, _, _, cx| cx.stop_propagation()),
+                )
+                .child(
+                    div()
+                        .px(px(11.0))
+                        .py(px(5.0))
+                        .rounded(px(14.0))
+                        .bg(rgb(CHROME))
+                        .border_1()
+                        .border_color(rgba(0x8C2B2255))
+                        .shadow(vec![BoxShadow {
+                            color: gpui::hsla(0.0, 0.0, 0.0, 0.10),
+                            offset: gpui::point(px(0.0), px(2.0)),
+                            blur_radius: px(6.0),
+                            spread_radius: px(0.0),
+                        }])
+                        .cursor_pointer()
+                        .text_size(px(11.5))
+                        .text_color(rgb(0x8C2B22))
+                        .hover(|s| s.bg(rgba(0xF3EBD4FF)))
+                        .child(SharedString::from("问小笺"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|c, _, window, cx| {
+                                cx.stop_propagation();
+                                c.ask_ai(window, cx);
+                            }),
+                        ),
+                ),
+        )
+    }
+
     /// 快捷标点栏落子：三类动作统一走这里，**只有一处**决定「插还是包」。
     fn punct_apply(&mut self, key: PunctKey, cx: &mut Context<Self>) {
         // 组字中（拼音还没上屏）不许插：此时选区与光标都还是旧的，插进去会叠字。
@@ -857,6 +1154,30 @@ impl CollationWorkspace {
         }
         let k = event.keystroke.key.as_str();
         let shift = event.keystroke.modifiers.shift;
+        // ── 平台键（⌘ / Ctrl）───────────────────────────────────────────
+        // GPUI 0.2.2 不会替自绘编辑器接管剪贴板：⌘V 必须自己读系统剪贴板再落字
+        // （与阅读器草稿框同一条路，见 `reader` 的 note 输入）。否则用户在
+        // 工作台里按 ⌘V 是**一点反应都没有**——这就是「粘贴不通」的真因。
+        if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
+            match k {
+                "v" | "V" => {
+                    // 正文要保留换行（稿子是多段的），故不走 `paste_text`
+                    //（那个口子把 \n 压成空格，是给单行草稿用的）。
+                    if let Some(s) = crate::clipboard::read_text(cx) {
+                        if !s.is_empty() {
+                            self.insert_text(&s, cx);
+                        }
+                    }
+                    return;
+                }
+                // ⌘N：**掩注**（隐藏夹注小字）——竖排预览就地静默重排。
+                "n" | "N" => {
+                    self.toggle_gloss(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match k {
             "left" | "right" | "up" | "down" => self.move_cursor(k, shift, cx),
             "backspace" => self.delete_char(false, cx),
@@ -1154,6 +1475,37 @@ impl CollationWorkspace {
             )
     }
 
+    /// **掩注**开关（v1.9.54，同 ⌘N）：朱砂 = 已掩（预览里只剩正文）。
+    ///
+    /// 为什么要有一枚看得见的钮：⌘N 是给熟手用的，第一次用的人不可能猜得到；
+    /// 而「夹注遮住版心」恰恰是竖排预览里最常被抱怨的一件。钮与键同源，都走
+    /// [`Self::toggle_gloss`]，不存在两套状态。
+    fn gloss_chip(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let on = self.hide_gloss;
+        let fg = if on { 0x8c2b22 } else { 0x4a4335 };
+        div()
+            .px(px(11.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(fg))
+            .bg(if on {
+                rgba(0x8C2B221A)
+            } else {
+                rgba(0x2B26200A)
+            })
+            .hover(|s| s.bg(rgba(0x2B26201A)))
+            .child(SharedString::from("掩注"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|c, _, _, cx| {
+                    cx.stop_propagation();
+                    c.toggle_gloss(cx);
+                }),
+            )
+    }
+
     /// **次级按钮**（v1.9.24）：无边框，只留一层几乎看不见的纸灰底。
     ///
     /// 给【打开文件】【导入 MD】这类「入口」用——它们是渠道，不是动作的高潮。
@@ -1337,6 +1689,8 @@ impl CollationWorkspace {
             // 同义——那边关的是纸上的夹注 / 眉批，这边关的是原图上的联动框，
             // 两处一起关才是「只剩字、只剩图」的安静状态。朱砂 = 框开着。
             .child(self.region_box_chip(cx))
+            // 「掩注」（v1.9.54）：隐藏括注 / 夹注，只看正文。与 ⌘N 同源。
+            .child(self.gloss_chip(cx))
             .child(div().flex_1())
             // 唯一的实底主按钮。
             .child(self.primary_button(
@@ -2180,9 +2534,11 @@ impl CollationWorkspace {
         paper: Paper,
         imp: Imposition,
         binding: Binding,
+        hide_gloss: bool,
         path: &Path,
     ) -> Result<(usize, usize, bool), String> {
-        let cleaned = clean_md(text);
+        let src = if hide_gloss { strip_gloss(text) } else { text.to_string() };
+        let cleaned = clean_md(&src);
         if cleaned.body.is_empty() {
             return Err("正文为空（清洗后一个字都没有）".to_string());
         }
@@ -2274,6 +2630,9 @@ impl CollationWorkspace {
         cx.notify();
 
         let text = self.text.clone();
+        // 掩注（⌘N）在导出侧同样生效：屏幕上掩掉的字，纸上也不该冒出来
+        // ——「所见即所印」是这条链的一致口径。
+        let hide_gloss = self.hide_gloss;
         let columns = self.preview_columns;
         let bg = self.preview_bg;
         let frame = self.preview_frame;
@@ -2325,7 +2684,15 @@ impl CollationWorkspace {
                     let out = exec
                         .spawn(async move {
                             CollationWorkspace::render_pdf_blocking(
-                                &text, columns, bg, frame, paper, imp, binding, &path_bg,
+                                &text,
+                                columns,
+                                bg,
+                                frame,
+                                paper,
+                                imp,
+                                binding,
+                                hide_gloss,
+                                &path_bg,
                             )
                         })
                         .await;
@@ -2372,13 +2739,17 @@ impl CollationWorkspace {
         paper: Paper,
         imp: Imposition,
         binding: Binding,
+        hide_gloss: bool,
     ) -> Result<(Vec<PathBuf>, Option<String>), String> {
+        // **掩注**（⌘N，v1.9.54）：先把括注 / 夹注剥掉再进排版——它在 clean_md
+        // 之前做，因为括号里的字也是正文流的一部分，必须整段一起消失。
+        let src = if hide_gloss { strip_gloss(text) } else { text.to_string() };
         let t0 = std::time::Instant::now();
         // **Markdown 清洗**（预览解析）：编辑器里存的是源码（`#`、`**`、`---`
         // 原样可见），出图前才洗成「干净文字 + 标题/加粗装饰位」。清洗器在
         // `share_layout`（纯函数、零 macOS API），故本步同样可在后台线程跑。
         // 它同时吃掉换行与空行：竖排是连续流，`\n` 只会白占一格。
-        let cleaned = clean_md(text);
+        let cleaned = clean_md(&src);
         if cleaned.body.is_empty() {
             return Ok((Vec::new(), None)); // 空稿（或全是标记）：浮层显示占位提示。
         }
@@ -2855,12 +3226,23 @@ impl CollationWorkspace {
         paper: Paper,
         imp: Imposition,
         binding: Binding,
-    ) -> (u64, usize, u8, u8, u8, u8, u8) {
+        hide_gloss: bool,
+    ) -> (u64, usize, u8, u8, u8, u8, u8, u8) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut h);
         // 拼版 / 装订也进指纹：换拼版就是换版式，绝不能拿旧图充数。
-        (h.finish(), columns, bg as u8, frame as u8, paper as u8, imp as u8, binding as u8)
+        // 掩注同理——它是**派生正文**，必须参与指纹，否则 ⌘N 会被短路成「没反应」。
+        (
+            h.finish(),
+            columns,
+            bg as u8,
+            frame as u8,
+            paper as u8,
+            imp as u8,
+            binding as u8,
+            hide_gloss as u8,
+        )
     }
 
     /// 请求重排预览（**绝不阻塞 UI**）：节流 + 代际令牌 + 后台栅格化。
@@ -2900,6 +3282,7 @@ impl CollationWorkspace {
             self.preview_paper,
             self.eff_imposition(),
             self.binding,
+            self.hide_gloss,
         );
         if !self.preview_paths.is_empty() && self.preview_sig == Some(key) {
             self.preview_pending = false;
@@ -2933,6 +3316,7 @@ impl CollationWorkspace {
         let paper = self.preview_paper;
         let imp = self.eff_imposition();
         let binding = self.binding;
+        let hide_gloss = self.hide_gloss;
 
         cx.spawn(
             // ⚠️ 必须 move：把快照（text/columns/bg/frame/paper/gen）的所有权交给异步块，
@@ -2944,7 +3328,14 @@ impl CollationWorkspace {
                     let out = exec
                         .spawn(async move {
                             CollationWorkspace::render_preview_pages(
-                                &text, columns, bg, frame, paper, imp, binding,
+                                &text,
+                                columns,
+                                bg,
+                                frame,
+                                paper,
+                                imp,
+                                binding,
+                                hide_gloss,
                             )
                         })
                         .await;
@@ -3250,7 +3641,7 @@ impl CollationWorkspace {
 
     /// 右侧 60%：竖排预览工具条 + 原生编辑器。
     fn render_right(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
-        let editor = self.render_editor(cx);
+        let editor = self.render_editor(vw, cx);
         // 原先这里还有一条**自己的**小工具条（导入 MD / 竖排预览）。v1.9.22
         // 把它并进全局那条——两栏各顶一条色带，看起来像两套软件拼在一起。
         // 现在整屏只有一条工具条，右栏从第一行字就是稿纸。
@@ -3602,7 +3993,7 @@ impl CollationWorkspace {
     ///
     /// 注：GPUI 0.2.2 无内置 Editor，这里用自绘文本 + `crate::ime::InputField`
     /// 注册焦点，中文输入经 `EntityInputHandler` 落回 `self.text`。
-    fn render_editor(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_editor(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
         // 稿纸的三件套（v1.9.22）：**宋体**、**#333 的墨**、**1.7 倍行距**。
         // 纯黑（0x000/0x2b2620）在亮纸上是刺的，深灰（#333）才像墨晕开的样子。
         let song = crate::fonts::family_for(
@@ -3687,7 +4078,19 @@ impl CollationWorkspace {
             self.focus.clone(),
             cx.entity(),
         );
-        div().flex_1().min_w(px(0.0)).w_full().child(editor)
+        // 选区悬浮钮（问小笺）叠在编辑器之上：`relative` 容器 + 绝对定位气泡。
+        // 气泡是**滚动视口之外**的兄弟节点，故 y 要自己减 `scroll.offset()`
+        //（见 `render_selection_bar` 的坐标口径）。
+        let mut wrap = div()
+            .relative()
+            .flex_1()
+            .min_w(px(0.0))
+            .w_full()
+            .child(editor);
+        if let Some(bar) = self.render_selection_bar(vw, cx) {
+            wrap = wrap.child(bar);
+        }
+        wrap
     }
 
     /// 竖排预览浮层：把转录文本离屏栅格化成「笺读风」竖排书页，`gpui::img` 贴图。
@@ -3739,6 +4142,20 @@ impl CollationWorkspace {
                     .child(self.paper_selector(cx))
                     .child(self.imposition_selector(cx))
                     .child(self.binding_selector(cx))
+                    // **掩注**（v1.9.54，⌘N）：隐藏括注 / 夹注小字，只看正文。
+                    // 放在导出旁边，是因为它的最终目的就是「印一版干净的正文」。
+                    .child(self.button(
+                        if self.hide_gloss {
+                            "掩注：开"
+                        } else {
+                            "掩注：关"
+                        },
+                        |c, _, _, cx| {
+                            c.toggle_gloss(cx);
+                            cx.notify();
+                        },
+                        cx,
+                    ))
                     .child(self.button(
                         "导出 PDF",
                         |c, _, _, cx| c.export_pdf(cx),
@@ -4253,11 +4670,37 @@ impl CollationWorkspace {
 impl EventEmitter<CollationEvent> for CollationWorkspace {}
 
 impl CollationWorkspace {
-    /// 预览浮层的键盘总入口（挂在根 div 上，仅在 `show_preview` 时生效）。
+    /// 键盘总入口（挂在根 div 上）。
+    ///
+    /// 派发顺序就是优先级，**不能乱**：
+    ///   ① 问小笺开着 → 键先归面板（⏎ 发送 / ⇧⏎ 换行 / 输入法组字 / Esc 清框）；
+    ///   ② 预览开着 → ←/→ 翻页、Esc 关闭、⌘N 掩注；
+    ///   ③ 其余键一概不拦（编辑器自己的 `handle_key` 收）。
+    fn ws_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // ① 面板优先：它自己会说「这一键我要不要」（false = 不要）。
+        if self.ai_open && crate::ai::forward_key(&self.ai_panel, event, window, cx) {
+            return;
+        }
+        let k = event.keystroke.key.as_str();
+        let mods = event.keystroke.modifiers;
+        // ② 掩注：预览没开也要能切（切了下次开预览即生效）。
+        if (mods.platform || mods.control) && (k == "n" || k == "N") {
+            self.toggle_gloss(cx);
+            return;
+        }
+        // ③ 浮卡开着时 Esc 先收卡，再轮到预览 / 选区。
+        if self.ai_open && k == "escape" {
+            self.close_ai(window, cx);
+            return;
+        }
+        self.preview_key(event, window, cx);
+    }
+
+    /// 预览浮层的键盘（仅在 `show_preview` 时生效）。
     ///
     /// ←/→ 翻页（**左右双屏一起翻**，见 [`CollationWorkspace::flip_page`]）；
     /// Esc 关闭浮层。预览关闭时直接返回，绝不干扰编辑器自身的方向键光标移动。
-    fn preview_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn preview_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.show_preview {
             return;
         }
@@ -4266,6 +4709,7 @@ impl CollationWorkspace {
             "right" => self.flip_page(1, cx),
             "escape" => {
                 self.close_preview();
+                window.focus(&self.focus);
                 cx.notify();
             }
             _ => {}
@@ -4339,10 +4783,11 @@ impl Render for CollationWorkspace {
         let mut root = div()
             .flex()
             .flex_col()
+            .relative()
             .size_full()
             .bg(rgb(PAPER_R))
             .track_focus(&self.preview_focus)
-            .on_key_down(cx.listener(|c, event, _window, cx| c.preview_key(event, cx)))
+            .on_key_down(cx.listener(|c, event, window, cx| c.ws_key(event, window, cx)))
             .child(self.render_header(cx))
             .child(
                 // **视觉分割**（v1.9.24）：一条黑线都不要。
@@ -4370,6 +4815,10 @@ impl Render for CollationWorkspace {
             );
         if self.show_preview {
             root = root.child(self.render_preview_overlay(vh, cx));
+        }
+        // 问小笺浮卡：压在预览之上（预览里也能接着问），点「收起」或 Esc 收。
+        if self.ai_open {
+            root = root.child(self.render_ai_card(vw, vh, cx));
         }
         root
     }
@@ -5314,6 +5763,7 @@ mod tests {
             Paper::A3,
             Imposition::Single,
             Binding::Right,
+            false,
             &single_out,
         )
         .expect("单页导出应能跑通");
@@ -5325,6 +5775,7 @@ mod tests {
             Paper::A3,
             Imposition::Spread,
             Binding::Right,
+            false,
             &spread_out,
         )
         .expect("双页拼版导出应能跑通");
@@ -5384,6 +5835,7 @@ mod tests {
                 Paper::A3,
                 imp,
                 Binding::Right,
+                false,
                 &out,
             )
             .expect("样张生成失败");
@@ -5411,6 +5863,7 @@ mod tests {
             Paper::A3,
             Imposition::Spread,
             Binding::Right,
+            false,
         )
         .expect("预览出图失败");
         eprintln!("[preview-sample] {} 张 {note:?}", pages.len());
@@ -5435,6 +5888,7 @@ mod tests {
             Paper::A3,
             Imposition::Single,
             Binding::Right,
+            false,
             &out,
         );
         let (pages, chars, cut) = r.expect("MD → A3 PDF 应能跑通");
@@ -5477,6 +5931,40 @@ mod tests {
 #[cfg(test)]
 mod punct_bar_tests {
     use super::*;
+
+    // ── 掩注（⌘N）────────────────────────────────────────────────────
+    #[test]
+    fn strip_gloss_removes_full_and_half_width_parentheses() {
+        assert_eq!(strip_gloss("天地（玄黃）宇宙"), "天地宇宙");
+        assert_eq!(strip_gloss("天地(玄黃)宇宙"), "天地宇宙");
+    }
+
+    #[test]
+    fn strip_gloss_handles_nested_and_unclosed() {
+        // 嵌套：一剥到底
+        assert_eq!(strip_gloss("甲（乙（丙）丁）戊"), "甲戊");
+        // 未闭合：到文末为止，绝不把后文吞成乱码
+        assert_eq!(strip_gloss("甲（乙丙"), "甲");
+        // 空串 / 无注：原样
+        assert_eq!(strip_gloss(""), "");
+        assert_eq!(strip_gloss("天地玄黃"), "天地玄黃");
+    }
+
+    #[test]
+    fn strip_gloss_removes_bracket_notes() {
+        assert_eq!(strip_gloss("天地[注:玄黃]宇宙"), "天地宇宙");
+        assert_eq!(strip_gloss("天地[註：玄黃]宇宙"), "天地宇宙");
+        // 普通方括号不动（快捷标点栏就靠它包注文）
+        assert_eq!(strip_gloss("天地[玄黃]"), "天地[玄黃]");
+    }
+
+    #[test]
+    fn strip_gloss_counts_cjk_by_char_not_byte() {
+        // 「（玄）」是多字节字符：按字节切会切进字中间（panic 或出乱码）。
+        let out = strip_gloss("猛（měng）虎");
+        assert_eq!(out, "猛虎");
+        assert_eq!(out.chars().count(), 2);
+    }
 
     #[test]
     fn wrap_without_selection_puts_caret_between_symbols() {
@@ -5924,6 +6412,7 @@ mod vector_pdf_regression {
             Paper::A4,
             Imposition::Single,
             Binding::Right,
+            false,
             &path,
         )
         .expect("样张 PDF 生成失败");

@@ -98,10 +98,8 @@ mod pager;
 mod pdf;
 mod punct;
 mod reader;
-// v1.85.0：竖排注音的**真·旋转**位图——GPUI 的 paint_glyph 转不动字形，
-// 故走 CoreGraphics 离屏把整串拼音顺时针转 90° 渲成位图，再交给 `img` 贴。
-// 只在 macOS 编译；非 macOS 由 `reader` 侧自动退回竖叠。
-mod ruby_glyph;
+// v1.9.53：注音回归「汉字正上方横排」，GPUI 原生文字排版即可胜任，
+// 原先为竖排/旋转服务的 CoreGraphics 离屏位图（`ruby_glyph`）已整体删除。
 mod share;
 // v1.57.0：分享卡拆成「版式数据层 + 两个渲染后端」。
 //   share_layout  纯数据版式（零 GPUI / 零 macOS API，可单测）

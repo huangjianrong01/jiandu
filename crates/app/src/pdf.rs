@@ -539,54 +539,36 @@ impl Brush {
 
 }
 
-/// 注音：**竖排、小字、正立**，落在汉字右侧（带注音的字已贴左缘排，注音小字
-/// 竖排在右侧空当里；多字注记拆成双列竖排）。与屏幕 `ruby::layout` 同一套几何、
-/// 同一颜色 `#8C2B22`。
+/// 注音外挂（v1.9.54）：**贴在字格顶端的浅灰小标签，零占正文空间**。
 ///
-/// 屏幕那侧是一张 CoreGraphics 离屏竖排位图；这里是 CG 逐字落笔，按
-/// `ruby::glyph_xy` 逐字同位——所以 PDF 里的「四行本」与屏幕逐字同位，
-/// 绝不该横排、也绝不碰到下一列的字形。颜色锁死朱砂红 `#8C2B22`。
-fn draw_ruby(
-    b: &mut Brush,
-    py: &str,
-    x: f64,
-    y: f64,
-    cell_w: f64,
-    cell_h: f64,
-    fs: f64,
-    g: &PdfGeo,
-) {
-    let rl = crate::ruby::layout(py, fs as f32, cell_w as f32, cell_h as f32);
-    // 逐字竖排落笔：每字按其 `glyph_xy` 落进右侧空当的 `fs×fs` 小格，
-    // 字形在小格内居中（与屏幕位图、`ruby::glyph_xy` 逐字同位）。
-    // 绝对裁剪：整字若会画到字格下缘之外，直接跳过（与屏幕 `.overflow_hidden()` 同效）。
+/// 与屏幕 `ancient_cell` 共用 `jiandu_core::ruby::layout` 的度量：标签上缘
+/// 钉在格顶（`top = 0`）、高 `band_h`（30% 格高），字号由 min() 链收口
+/// （≤主字 25%、≤86% 格宽），整串水平居中。
+///
+/// **主字一概不动**：`draw_cell` 永远让字落在格心、永远用正文字号——注音
+/// 在不在都一样，一列的字因此串成一条死直的基线。
+///
+/// 横向由几何保证不出格（`block_w ≤ 86% 格宽` 且居中，左右各留 7%），
+/// 故这里不再做「逐字越界跳过」的裁剪：那种裁剪会把整串字的**后几个**
+/// 悄悄丢掉，比超宽更难查。
+fn draw_ruby(b: &mut Brush, py: &str, rl: &crate::ruby::RubyLayout, x: f64, y: f64, g: &PdfGeo) {
+    let rfs = rl.fs as f64;
+    // 逐字横排：左缘 = 标签左缘 + 前面各字母的估宽之和（与 `glyph_dx` 同一张表）。
     for (i, c) in py.chars().enumerate() {
-        let (gx, gy) = rl.glyph_xy(i); // 相对字格左上
-        let gy = gy as f64;
-        if gy + rl.fs as f64 > cell_h + 0.5 {
-            continue; // 越界裁剪，绝不画到格子外面（用户「Clip」要求）
-        }
-        let cx = x + gx as f64 + rl.fs as f64 * 0.5; // 小格中心 x
-        let ty = y + gy; // 小格顶（盒顶，y 向下）
+        let dx = rl.glyph_dx(py, i) as f64;
+        let adv = crate::ruby::advance_em(c) as f64 * rfs;
+        let cx = x + rl.left as f64 + dx + adv * 0.5; // 该字母的水平中心
+        // 盒高取 `rfs`（不是 `band_h`）：`put` 按盒心居中算基线，盒高等于
+        // 字号时墨迹自然贴着盒顶——与屏幕 `.line_height(px(rl.fs))` 同口径。
         b.glyph_at(
             c,
             cx,
-            ty,
-            rl.fs as f64,
-            rl.fs as f64,
-            0x8C2B22,
+            y + rl.top as f64,
+            rfs,
+            rfs,
+            crate::ruby::RUBY_INK,
             ShareFont::from(g.note_font),
         );
-    }
-    // 三点提示（与屏幕同款）：贴字格下缘右侧，三道极细短横——只作
-    // 「此字有音」的暗示，不抢正文。宽高都随格缩，A4 上是一道灰线。
-    let dw = (cell_w * 0.34) / (3.0 * 1.9);
-    let gap = dw * 0.9;
-    let total = dw * 3.0 + gap * 2.0;
-    let left = x + cell_w - cell_w * 0.10 - total;
-    let dy = y + cell_h - cell_h * 0.055 - 0.7;
-    for i in 0..3 {
-        b.rect(left + i as f64 * (dw + gap), dy, dw, 0.7, 0x8C2B22, None);
     }
 }
 
@@ -872,7 +854,7 @@ fn walk_column(
                 };
                 if !has_host {
                     // 落单（列尾 / 段尾）：单独占一格，仍是 0.7 倍小字。
-                    draw_cell(b, gd.ch, x, *y, cell_w, cell_h, fs, false, g);
+                    draw_cell(b, gd.ch, x, *y, cell_w, cell_h, fs, g);
                     *y += cell_h;
                 }
                 idx += 1;
@@ -900,11 +882,13 @@ fn walk_column(
                     _ => None,
                 };
                 idx += 1 + hang.map(|_| 1).unwrap_or(0) + close_mk.map(|_| 1).unwrap_or(0);
-                let has_ruby = ruby.contains_key(&(gd.chapter, gd.para, gd.offset));
-                draw_cell(b, gd.ch, x, *y, cell_w, cell_h, fs, has_ruby, g);
-                // 注音：贴着这一格右上角竖排，**不占额外界位**（与屏幕同）。
-                if let Some(py) = ruby.get(&(gd.chapter, gd.para, gd.offset)) {
-                    draw_ruby(b, py, x, *y, cell_w, cell_h, fs, g);
+                let py = ruby.get(&(gd.chapter, gd.para, gd.offset));
+                // 注音几何（v1.9.54）：主字先按格心落笔（不看注音），
+                // 拼音再当一枚小标签盖在格顶——两者互不干涉。
+                draw_cell(b, gd.ch, x, *y, cell_w, cell_h, fs, g);
+                if let Some(py) = py {
+                    let rl = crate::ruby::layout(py, fs as f32, cell_w as f32, cell_h as f32);
+                    draw_ruby(b, py, &rl, x, *y, g);
                 }
                 let cy = *y;
                 // 书名号：贴本格右上角，0.7 倍正文（开号领起书名、闭号收束）。
@@ -999,7 +983,19 @@ fn draw_run(b: &mut Brush, items: &[Piece], from: usize, to: usize, x: f64, y: &
 
 /// 一枚正文单字：句读走**手绘**（与 `punct::place` 同一落位），
 /// 括号 / 引号 / 书名号走竖排专用字形，其余按繁简开关落字。
-fn draw_cell(b: &mut Brush, ch: char, x: f64, y: f64, cell_w: f64, cell_h: f64, fs: f64, ruby: bool, g: &PdfGeo) {
+///
+/// **没有注音参数**（v1.9.54）：主字的位置与字号与注音无关，永远格心、
+/// 永远正文字号。注音由 [`draw_ruby`] 另起一笔盖在格顶。
+fn draw_cell(
+    b: &mut Brush,
+    ch: char,
+    x: f64,
+    y: f64,
+    cell_w: f64,
+    cell_h: f64,
+    fs: f64,
+    g: &PdfGeo,
+) {
     let c = crate::types::bracket_to_quote(ch);
     if crate::types::is_punct(c) {
         // 句读：格心整个让给正文，只在角上落一枚朱砂记号。
@@ -1034,22 +1030,7 @@ fn draw_cell(b: &mut Brush, ch: char, x: f64, y: f64, cell_w: f64, cell_h: f64, 
     } else {
         crate::trad::simplified_of(shown).unwrap_or(shown)
     };
-    if ruby {
-        // 带注音的字贴左缘：字形中心落在 `x + RUBY_CHAR_LEFT + 字宽/2`，左缘即
-        // `x + RUBY_CHAR_LEFT`——与屏幕 `ancient_cell`、`ruby::layout` 的
-        // `RUBY_CHAR_LEFT` 严格同位，故纸上拼音与字右缘紧贴（同屏幕）。
-        b.glyph_at(
-            shown,
-            x + crate::ruby::RUBY_CHAR_LEFT as f64 + (fs.min(cell_h)) * 0.5,
-            y,
-            cell_h,
-            fs.min(cell_h),
-            g.ink,
-            ShareFont::from(g.font),
-        );
-    } else {
-        b.glyph_in(shown, x, y, cell_w, cell_h, fs.min(cell_h), g.ink, ShareFont::from(g.font));
-    }
+    b.glyph_in(shown, x, y, cell_w, cell_h, fs.min(cell_h), g.ink, ShareFont::from(g.font));
 }
 
 /// 一枚**手绘句读**：落位与尺寸全读 `punct::place`（阅读器同一函数），

@@ -1,172 +1,184 @@
-//! 注音（生僻字拼音 / 多字注记）几何：**竖排、小字、贴在主字右侧**，古籍双行
-//! 夹注形态。
+//! 注音几何（v1.9.54 定稿）：**汉字纹丝不动、拼音做小巧外挂**。
 //!
-//! v1.9.52——**拼音（拉丁字母）单列竖排**。v1.9.51 把拼音也按 CJK 注记的规矩
-//! 拆成「双列竖排」，`wéi` / `cāng` 于是变成 2×2 的字母方块，撞碎界栏、压住句读
-//! 红点，是彻底的视觉车祸。现在按两条规矩分开：
+//! ## 为什么废弃 v1.9.53 的「主字让位」
 //!
-//! * **拼音（全拉丁字母，如 `měi` / `yǐ` / `cāng`）**：**单列竖排**——字母从上到
-//!   下垂直堆叠，像一条细长的小尾巴顺着文字流向（日文注音形态）。字号上限
-//!   **主字的 40%**；太长（如 `zhuang`）就按字格高自动缩小，硬下限 18%，再放
-//!   不下由渲染层**裁剪**，绝不越出字格。
-//! * **CJK 多字注记（如 `四行本`）**：维持古籍**双行/多列竖排夹注**——一列写前
-//!   几个字、一列写后几个字，字号 45%~55%。
+//! v1.9.53 让拼音占住字格顶部、主字下移让位（`char_top` / `char_h` / `char_fs`）。
+//! 用户一眼看出问题：**带拼音的字被挤下去了，整列基线不齐**。这是致命的——
+//! 竖排一列读的是「一条线」，任何一个字下沉半格，列气就断了。
 //!
-//! 两类的共同铁律：
-//! * 主字在字格内**贴左缘**，注音整块**垂直居中**于字格、绝不悬浮在间隙里；
-//! * 主字与注音之间恒留 ≥1px 呼吸缝（`RUBY_GAP_MIN`），绝不粘连；
-//! * 注音整块右缘恒在字格右缘内侧 `RUBY_RIGHT_INSET`（绝不压右边界栏）；
-//! * 绝不与句读红点抢位（单列拼音本来就窄，只占主字右侧一小条）。
+//! ## v1.9.54 的铁律（用户原话）
+//!
+//! 1. **绝对锁定正文坐标**：主字**永远**在字格的正中心、**永远**是正文字号、
+//!    行盒**永远**等于格高。有注音没注音，主字一个像素都不许动。
+//!    —— 本文件的结构体里**没有任何主字字段**，这是结构性保证，不是口头承诺。
+//! 2. **拼音叠加（Overlay）**：拼音是贴在字格**顶端**的一枚小标签，浮在字面
+//!    上方 13%~17% 的天然空当里，**零占正文空间**。
+//! 3. **极致降噪**：拼音字号 ≤ 主字 **25%**，浅灰 `RUBY_INK`，无点无下划线。
+//! 4. **绝不横向溢出**：整串宽 ≤ 格宽 86%，水平居中，绝不压左右相邻列。
+//!
+//! ## 几何（竖排字格是「宽而扁」的：12 列 55.5×27.75、字号 23.6）
 //!
 //! ```text
-//! ┌─┬──────┐      ┌─┬──────┐
-//! │猛│ m    │      │猛│四行  │   ← 拼音单列竖排（m/ě/i 自上而下）
-//! │  │ ě    │      │  │  本  │      vs  CJK 注记双列竖排
-//! │  │ i    │      └─┴──────┘
-//! └─┴──────┘
+//! ┌──────────────┐  ← 字格顶（top = 0）
+//! │    m ě i     │  band_h = 30% 格高（裁剪框，标签永不越此框）
+//! │ ┌──────────┐ │  ← 主字墨迹顶 ≈ 13.4% 格高（居中后天然空当）
+//! │ │    猛    │ │  主字：格心、正文号、行盒 = 格高 —— 恒不变
+//! │ └──────────┘ │
+//! └──────────────┘  ← 字格底
 //! ```
 //!
-//! ⚠️ 屏幕与 PDF 共用本文件的度量（`layout` + `glyph_xy`），逐字同位。
+//! 竖排里 `格高 = 1.176 × 字号`，主字墨高约 `0.86 × 字号`，居中后顶上只剩
+//! `0.134 × 格高`（12 列 ≈ 3.7px）的空当。拼音墨高 = `0.25 × 字号 × 0.78`
+//! ≈ `0.166 × 格高`，比空当高出约 1px；屏幕上行盒的半个行距还会先吃掉
+//! 约 0.17×拼音字号（12 列 ≈ 1px），故**实际压边约 2~3px（≈11% 格高）**。
+//!
+//! 这 2~3px 是几何硬账，也是用户明确许可的：「至多允许顶端轻微溢出」。
+//! 为什么绝不到上一字：上一字的墨迹**底**离它自己的格底还有 13.4% 的空当，
+//! 而标签只从**本格顶**往下长——两头差着一个完整字格的 13%，永远接不上。
+//! 视觉上它是一抹 25% 大小的浅灰（`RUBY_INK`、90% 不透明），压在字头最上
+//! 一线，远看只是「这个字有注」的记号；要看清读音，读器里有注音卡片。
+//!
+//! ⚠️ 屏幕（`reader::ancient_cell`）与 PDF（`pdf::draw_ruby`）共用本文件的度量，
+//! 逐字同位；**不许各自再算一套**。
 
-/// 拼音（拉丁）字号上限 = 主字的 **40%**（用户铁律：拼音必须比主字小得多）。
-pub const RUBY_SCALE_PINYIN_MAX: f32 = 0.40;
-/// 拼音太长时的硬下限 = 主字的 **18%**（再小则由渲染层裁剪，绝不越格）。
-pub const RUBY_SCALE_PINYIN_MIN: f32 = 0.18;
-
-/// CJK 短注音（≤2 字）的目标字号 = 主字的 **55%**（古籍双行小字约半大的观感）。
-pub const RUBY_SCALE_SHORT: f32 = 0.55;
-/// CJK 多字注记（≥3 字）的目标字号 = 主字的 **45%**。
-pub const RUBY_SCALE_LONG: f32 = 0.45;
-/// CJK 字号硬下限 = 主字的 30%（再小就不可读；仅当右侧空当极窄时兜底触发）。
-pub const RUBY_SCALE_MIN: f32 = 0.30;
-
-/// 带注音的主字在字格内**贴左缘**时的左内边距（像素）。屏幕 `ancient_cell` 与
-/// PDF `draw_cell` 共用，确保「主字左移」与注音落点严格同位。
-pub const RUBY_CHAR_LEFT: f32 = 1.0;
-/// 主字与注音之间的最小呼吸缝（像素）：用户铁律「绝不能粘在一起」——
-/// 注音整块左缘恒在主字右缘右侧 ≥ 此值处。
-pub const RUBY_GAP_MIN: f32 = 1.0;
-/// 注音整块右缘距字格右缘的内边距（像素）：绝不压到右边的界栏线。
-pub const RUBY_RIGHT_INSET: f32 = 1.0;
-/// CJK 多列注音之间的列距（像素）：极简，仅一丝呼吸。
-pub const RUBY_COL_GAP: f32 = 1.0;
-
-/// 一次注音排版的度量结果。
+/// 拼音字号上限 = 主字的 **25%**（用户铁律：小巧外挂，浮在字面上）。
 ///
-/// 所有长度都是「屏幕逻辑像素」，且都**相对字格左上角**（渲染层直接拿来定位，
-/// PDF 侧同一套）。
+/// 12 列时约 5.9px——远看只是一抹灰痕，不抢正文；要看清读音，读器里有
+/// 「注音卡片」（点字弹出的那张，正文字号排）承担可读性。
+pub const RUBY_PINYIN_MAX: f32 = 0.25;
+/// 拼音裁剪框高 = 格高的 **30%**。标签只许活在这个框里，框外什么都不画。
+///
+/// 取 30% 而不是「拼音墨高 + 1px」，是为了保证屏幕 `line_height` 不小于
+/// 拼音字号——行盒若小于字号，字体的 ascent 会顶出盒子被 `overflow_hidden`
+/// 削掉一笔（声调符号最先受害）。
+pub const RUBY_BAND_FRAC: f32 = 0.30;
+/// 一行拉丁字母的**墨迹高 / 字号**：含声调符（`ě` `ā`）与下行字母（`g` `y`）。
+/// 取 0.78 是「小写 + 声调」的稳妥上界。
+pub const RUBY_INK_OF_EM: f32 = 0.78;
+/// 拼音整串宽度上限 = 字格宽的 **86%**：两侧各留 7%，绝不压到相邻列。
+pub const RUBY_WIDTH_FRAC: f32 = 0.86;
+/// 拼音字号的物理下限（像素）：极端窄格里的兜底，再由裁剪带切掉溢出部分。
+pub const RUBY_MIN_FS: f32 = 2.5;
+/// 字与字之间的额外字距（以字号为 1em 的比例）：极简，一丝不糊在一起。
+pub const RUBY_TRACKING: f32 = 0.02;
+/// 拼音墨色：**浅灰**（降噪，不与朱砂句读抢眼）。
+pub const RUBY_INK: u32 = 0x8C877E;
+
+/// 一条注音（拼音 / CJK 小字注记）的**外挂标签**度量。
+///
+/// 长度单位都是屏幕逻辑像素，坐标**相对字格左上角**。
+///
+/// ⚠️ 这里**故意不含** `char_fs` / `char_top` / `char_h`：主字的位置与字号
+/// 由排版本身决定（格心、正文号、行盒 = 格高），注音无权干涉。测试
+/// `ruby_layout_carries_no_character_geometry` 会穷举解构所有字段，
+/// 谁想把「主字让位」加回来，谁就先编译不过。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RubyLayout {
-    /// 注音字号。
+    /// 拼音字号（≤ 主字 25%）。
     pub fs: f32,
-    /// 竖排的列数：拼音恒为 1（单列小尾巴）；CJK 注记可能拆 2 列以上。
-    pub cols: usize,
-    /// 每列最多行数（拼音 = 字数；CJK 注记 = ⌊(格高 − 1) / 字号⌋）。
-    pub rows: usize,
-    /// 整块宽（CJK 多列 + 列距；拼音 = 字号）。
+    /// 标签裁剪框高（= 30% 格高），从格顶往下量。
+    pub band_h: f32,
+    /// 整串的估算宽度（各字母前进宽之和，≤ 86% 格宽）。
     pub block_w: f32,
-    /// 整块高（已按字格高裁剪、并垂直居中）。
-    pub block_h: f32,
-    /// **整块左缘**（紧贴主字右缘那一侧）相对字格左边的偏移。
+    /// 标签左缘（水平居中于字格）。
     pub left: f32,
-    /// 整块上缘相对字格上边的偏移（已垂直居中）。
+    /// 标签上缘（恒为 0：悬挂在字格顶端）。
     pub top: f32,
 }
 
 impl RubyLayout {
-    /// 第 `i` 个字（0 基，按古籍阅读序：先左列后右列、列内自上而下）的
-    /// **左上角**坐标（相对字格左上角）。
-    ///
-    /// 单列（拼音）时 `rows = 字数`，故恒 `col = 0`、`r = i`——字母自上而下堆叠。
-    pub fn glyph_xy(&self, i: usize) -> (f32, f32) {
-        let rows = self.rows.max(1);
-        let col = i / rows; // 拼音恒 0；CJK 注记 0 = 紧贴主字
-        let r = i % rows;
-        let x = self.left + col as f32 * (self.fs + RUBY_COL_GAP);
-        let y = self.top + r as f32 * self.fs;
-        (x, y)
-    }
-}
-
-/// 是否 CJK（含扩展 A / 兼容区 / 扩展 B 起）。用来区分「CJK 注记」与「拉丁拼音」。
-fn is_cjk(c: char) -> bool {
-    matches!(c as u32,
-        0x3400..=0x4DBF      // 扩展 A
-        | 0x4E00..=0x9FFF    // 基本区
-        | 0xF900..=0xFAFF    // 兼容
-        | 0x20000..=0x3FFFF  // 扩展 B 起（含生僻字）
-    )
-}
-
-/// 计算一条注音的竖排度量。
-///
-/// * `text`：注音串（拉丁拼音如 `měi`；或 CJK 注记如 `四行本`）；
-/// * `body_fs`：正文字号；
-/// * `cell_w` / `cell_h`：字格宽高（本 app 竖排：字格**宽 > 高**，故主字右侧
-///   恒有横向空当容得下竖排小字）。
-pub fn layout(text: &str, body_fs: f32, cell_w: f32, cell_h: f32) -> RubyLayout {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len().max(1);
-    // 主字贴左缘：右缘 = RUBY_CHAR_LEFT + body_fs。
-    let char_right = RUBY_CHAR_LEFT + body_fs;
-    // 注音可用宽 = 主字右缘 → 字格右缘 之间、扣掉两侧呼吸。
-    let avail_w = (cell_w - char_right - RUBY_GAP_MIN - RUBY_RIGHT_INSET).max(2.0);
-    let left = char_right + RUBY_GAP_MIN;
-
-    // 全拉丁（无 CJK）→ 拼音：**单列竖排**，字母自上而下堆叠。
-    let is_pinyin = !chars.iter().any(|c| is_cjk(*c));
-    if is_pinyin {
-        // 字号 = min(主字 40%, 竖着塞进字格高, 右侧可用宽)，硬下限 18%。
-        let by_h = ((cell_h - 1.0) / n as f32).max(1.0);
-        let mut fs = (body_fs * RUBY_SCALE_PINYIN_MAX)
-            .min(by_h)
-            .min(avail_w)
-            .max(3.0);
-        fs = fs.max(body_fs * RUBY_SCALE_PINYIN_MIN);
-        let block_w = fs;
-        // 绝不越出字格：整块高按字格高裁剪（再放不下由渲染层 mask 掉）。
-        let block_h = (n as f32 * fs).min(cell_h);
-        let top = ((cell_h - block_h) * 0.5).max(0.0);
-        return RubyLayout {
-            fs,
-            cols: 1,
-            rows: n,
-            block_w,
-            block_h,
-            left,
-            top,
-        };
+    /// 拼音墨迹高度（实际占的高度，≤ `band_h`）。
+    pub fn ink_h(&self) -> f32 {
+        (self.fs * RUBY_INK_OF_EM).min(self.band_h)
     }
 
-    // CJK 多字注记：维持古籍双行/多列竖排（短 55%、多 45%，按可用宽等比缩）。
-    let scale0 = if n <= 2 { RUBY_SCALE_SHORT } else { RUBY_SCALE_LONG };
-    let mut scale = scale0;
-    let (fs, cols, rows, block_w, block_h, top);
-    loop {
-        let fs_cand = (body_fs * scale).max(3.0);
-        // 每列最多行数（竖向紧贴，步进 = 字号；留 1px 防粘连）。
-        let rows_cand = (((cell_h - 1.0) / fs_cand).floor().max(1.0)) as usize;
-        let cols_cand = (n + rows_cand - 1) / rows_cand; // ⌈n / rows⌉
-        let bw = cols_cand as f32 * fs_cand + (cols_cand - 1).max(0) as f32 * RUBY_COL_GAP;
-        if bw <= avail_w + 1e-3 || scale <= RUBY_SCALE_MIN + 1e-3 {
-            fs = fs_cand;
-            cols = cols_cand;
-            rows = rows_cand;
-            block_w = bw;
-            block_h = (rows as f32 * fs_cand).min(cell_h);
-            top = ((cell_h - block_h) * 0.5).max(0.0);
-            break;
+    /// 第 `i` 个字母的**左缘**相对标签左缘的偏移（PDF 逐字落笔用）。
+    pub fn glyph_dx(&self, text: &str, i: usize) -> f32 {
+        let mut acc = 0.0f32;
+        for (k, c) in text.chars().enumerate() {
+            if k >= i {
+                break;
+            }
+            acc += advance_em(c) + RUBY_TRACKING;
         }
-        scale = (scale * 0.9).max(RUBY_SCALE_MIN);
+        acc * self.fs
     }
+}
+
+/// 单字母的**前进宽度**（以字号为 1em 的比例）。
+///
+/// 核心 crate 里没有字体度量（不许依赖 gpui / CoreText），故用一张按字形
+/// 归类的表：窄字母（`i l j t f r`）≈0.32em、宽字母（`m w`）≈0.86em、
+/// 其余小写 ≈0.56em、大写 ≈0.70em、带调元音按普通小写算、CJK 满格 1.0em。
+/// 误差几个百分点，而 `RUBY_WIDTH_FRAC = 0.86` 留出的余量足够吸收。
+pub fn advance_em(c: char) -> f32 {
+    match c {
+        'i' | 'l' | 'j' | 't' | 'f' | 'r' | 'I' | '.' | '\'' | ' ' => 0.32,
+        'm' | 'w' | 'M' | 'W' => 0.86,
+        'a'..='z' => 0.56,
+        'A'..='Z' => 0.70,
+        // CJK 注记（「四行本」这类）是全宽字，必须按 1em 算——
+        // 否则 PDF 逐字落笔会把它挤成一团（屏幕走真字体排版，看不出来）。
+        _ if is_cjk(c) => 1.0,
+        _ => 0.58, // 带调元音（ā á ǎ à …）、其他
+    }
+}
+
+/// 是否是 CJK 汉字（含扩展 A / 兼容区 / 扩展 B 以上）。
+fn is_cjk(c: char) -> bool {
+    let u = c as u32;
+    (0x2E80..=0x9FFF).contains(&u)          // 部首补充 / 康熙部首 / 统一表意
+        || (0xF900..=0xFAFF).contains(&u)   // 兼容表意
+        || (0x20000..=0x3FFFF).contains(&u) // 扩展 B~H
+        || (0x3000..=0x303F).contains(&u)   // CJK 标点
+}
+
+/// 整串的宽度（以字号为 1em 的比例），含字距。
+pub fn text_width_em(text: &str) -> f32 {
+    let n = text.chars().count();
+    if n == 0 {
+        return 0.0;
+    }
+    let w: f32 = text.chars().map(advance_em).sum();
+    w + RUBY_TRACKING * (n.saturating_sub(1)) as f32
+}
+
+/// 计算一条注音的**外挂标签**度量。
+///
+/// * `text`：注音串（`měi` / `四行本` …）；
+/// * `body_fs`：正文字号（**只读**，本函数绝不返回任何主字几何）；
+/// * `cell_w` / `cell_h`：字格宽高。
+///
+/// 约束链是纯 `min()`：
+/// `fs = min(25% 正文, 按 86% 格宽, 按 30% 格高)`，再夹物理下限；
+/// 宽度再兜一次硬顶格宽。所有约束都是不等式，故结果天然满足
+/// 「不超宽、不出带、不压邻列」。
+pub fn layout(text: &str, body_fs: f32, cell_w: f32, cell_h: f32) -> RubyLayout {
+    let w_em = text_width_em(text).max(0.05);
+
+    // ── ① 裁剪框：30% 格高（标签的活动范围，主字一概不管）──────────────
+    let band_h = (cell_h * RUBY_BAND_FRAC).max(1.0).min(cell_h);
+
+    // ── ② 字号 = min(25% 正文, 按 86% 格宽, 按框高) ────────────────────
+    let by_width = (cell_w * RUBY_WIDTH_FRAC) / w_em;
+    let by_band = band_h / RUBY_INK_OF_EM;
+    let fs = (body_fs * RUBY_PINYIN_MAX)
+        .min(by_width)
+        .min(by_band)
+        .max(RUBY_MIN_FS)
+        .min(by_width.max(RUBY_MIN_FS)) // 再兜一次：绝不超过 86% 格宽
+        .min(by_band.max(RUBY_MIN_FS)); // 再兜一次：绝不越出裁剪框
+
+    // ── ③ 水平居中（用户：拼音与汉字同轴）──────────────────────────
+    let block_w = (fs * w_em).min(cell_w);
+    let left = ((cell_w - block_w) * 0.5).max(0.0);
+
     RubyLayout {
         fs,
-        cols,
-        rows,
+        band_h,
         block_w,
-        block_h,
         left,
-        top,
+        top: 0.0,
     }
 }
 
@@ -175,7 +187,11 @@ mod tests {
     use super::*;
     use crate::grid::{compute_grid, GridConfig, GridDir};
 
-    /// 8 / 14 列两档的真实几何（宽屏 1320×880，与 `grid` 测试同源）。
+    /// 主字墨高 / 字号的保守比例：竖排格高 = 1.176×字号，字面居中后
+    /// 格顶到字面顶的空当 = `(cell_h − 0.86×fs) / 2`。
+    const CHAR_INK_OF_EM: f32 = 0.86;
+
+    /// 8 / 10 / 12 / 14 列的真实几何（宽屏 1320×880，与 `grid` 测试同源）。
     fn cell(cols: usize) -> (f32, f32, f32) {
         let m = compute_grid(
             1320.0,
@@ -183,7 +199,10 @@ mod tests {
             GridConfig {
                 columns: cols,
                 dir: GridDir::Vertical,
-                margin: 0.04, line_scale: 1.0, fs_ratio: 0.75, line_ratio: 1.0 / 0.75,
+                margin: 0.04,
+                line_scale: 1.0,
+                fs_ratio: 0.75,
+                line_ratio: 1.0 / 0.75,
                 target_chars: crate::grid::LayoutConfig::by_columns(cols)
                     .map(|c| c.target_chars)
                     .unwrap_or(21),
@@ -200,116 +219,218 @@ mod tests {
         (m.col_w, m.row_h, m.fs)
     }
 
-    /// 拼音恒**单列竖排**、字号 ≤ 主字 40%、整块高不出格。
+    /// **契约测试**：主字几何绝不许被注音影响。
+    ///
+    /// 穷举解构 `RubyLayout` 的每一个字段——一旦有人把 v1.9.53 的
+    /// `char_fs` / `char_top` / `char_h`（「主字让位」）加回来，这里立即编译失败。
+    /// 「整列基线不齐」那次事故，从类型上就再也不可能发生。
     #[test]
-    fn pinyin_is_single_column_under_40pct() {
+    fn ruby_layout_carries_no_character_geometry() {
+        let l = layout("měi", 24.0, 56.0, 28.0);
+        let RubyLayout {
+            fs: _,
+            band_h: _,
+            block_w: _,
+            left: _,
+            top: _,
+        } = l;
+    }
+
+    /// 拼音必须悬挂在字格顶端：`top == 0`，裁剪框 ≤ 30% 格高。
+    #[test]
+    fn pinyin_hangs_from_the_cell_top() {
         for cols in [8usize, 10, 12, 14] {
             let (cw, chh, fs) = cell(cols);
-            for py in ["měi", "yǐ", "wéi", "cāng", "zhuang"] {
+            for py in ["měi", "yǐ", "cāng", "zhuang"] {
                 let l = layout(py, fs, cw, chh);
-                assert_eq!(l.cols, 1, "{cols} 列 / {py}：拼音必须单列（不得拆两列）");
-                assert_eq!(l.rows, py.chars().count(), "{cols} 列 / {py}：行数应等于字母数");
+                assert_eq!(l.top, 0.0, "{cols} 列 / {py}：标签必须贴字格顶");
                 assert!(
-                    l.fs <= fs * RUBY_SCALE_PINYIN_MAX + 0.01,
-                    "{cols} 列 / {py}：拼音字号 {:.3} 超主字 40%",
-                    l.fs / fs
+                    l.band_h <= chh * RUBY_BAND_FRAC + 0.01,
+                    "{cols} 列 / {py}：裁剪框 {:.2} 超 30% 格高（{:.2}）",
+                    l.band_h,
+                    chh * RUBY_BAND_FRAC
                 );
-                assert!(
-                    l.fs >= fs * RUBY_SCALE_PINYIN_MIN - 0.01,
-                    "{cols} 列 / {py}：拼音字号跌破 18% 下限"
-                );
-                // 整块高不出字格；右缘不越界栏。
-                assert!(l.top >= 0.0 && l.top + l.block_h <= chh + 0.01, "{cols} 列 / {py}：纵向出格");
-                assert!(l.left + l.block_w <= cw - RUBY_RIGHT_INSET + 0.01, "{cols} 列 / {py}：越右界栏");
-                let char_right = RUBY_CHAR_LEFT + fs;
-                assert!(l.left >= char_right + RUBY_GAP_MIN - 1e-3, "{cols} 列 / {py}：压住主字");
+                assert!(l.ink_h() <= l.band_h + 1e-3, "{cols} 列：墨高越出裁剪框");
             }
         }
     }
 
-    /// 拼音字母自上而下堆叠：第 i 个字母的 y 严格递增、x 恒定。
+    /// 字号 ≤ 主字 25%（用户铁律：极致降噪）。
     #[test]
-    fn pinyin_letters_stack_vertically() {
-        let (cw, chh, fs) = cell(12);
-        let l = layout("cāng", fs, cw, chh);
-        let (x0, y0) = l.glyph_xy(0);
-        for i in 1..4 {
-            let (x, y) = l.glyph_xy(i);
-            assert!((x - x0).abs() < 1e-3, "字母 {i} 的 x 应与首字母一致（同列）");
-            assert!(y > y0, "字母 {i} 的 y 应大于首字母（自上而下）");
-        }
-    }
-
-    /// CJK 多字注记维持双列竖排（不因拼音改动被误伤）。
-    #[test]
-    fn cjk_note_still_splits_into_columns() {
+    fn pinyin_never_exceeds_25pct_of_body() {
         for cols in [8usize, 10, 12, 14] {
             let (cw, chh, fs) = cell(cols);
-            let l = layout("四行本", fs, cw, chh);
-            assert_eq!(l.cols, 2, "{cols} 列：四行本应拆 2 列（古籍双行夹注）");
-            assert!(l.cols * l.rows >= 3, "列数 × 行数 不足以容下 3 字");
-        }
-    }
-
-    /// CJK 短注音吃满 55%、多字 45%，且都不溢出字格右缘。
-    #[test]
-    fn short_keeps_055_long_keeps_045() {
-        for cols in [8usize, 10, 12, 14] {
-            let (cw, chh, fs) = cell(cols);
-            for py in ["猛", "四行"] {
+            for py in ["měi", "yǐ", "zhǎng", "zhuāng", "chuáng", "四行本"] {
                 let l = layout(py, fs, cw, chh);
                 assert!(
-                    (l.fs - fs * RUBY_SCALE_SHORT).abs() < 0.01,
-                    "{cols} 列 / {py}：短注音没吃满 0.55（实得 {:.3}）",
-                    l.fs / fs
+                    l.fs <= fs * RUBY_PINYIN_MAX + 0.01,
+                    "{cols} 列 / {py}：拼音字号 {:.2} 超主字 25%（{:.2}）",
+                    l.fs,
+                    fs * RUBY_PINYIN_MAX
                 );
+                assert!(l.fs >= RUBY_MIN_FS - 1e-3, "{cols} 列 / {py}：低于物理下限");
             }
-            for py in ["四行本"] {
+        }
+    }
+
+    /// 拼音墨高只许**微微**超出血缘净空（≤1.2px），否则整块压死字头。
+    ///
+    /// 这是「主字既不下移、拼音又要看得见」的几何答卷：格高 1.176×字号，
+    /// 主字墨高 0.86×字号，顶上净空打对折只剩 13.4% 格高；拼音墨高
+    /// 0.25×0.78 = 0.195×字号（16.6% 格高），故只许溢出一点点。
+    /// （屏幕上还要再吃 0.17×拼音字号的半个行距，故实际压边 2~3px——
+    /// 见文件头注释，那是渲染器的事，不是这里的度量。）
+    #[test]
+    fn pinyin_ink_never_exceeds_the_headroom_by_much() {
+        for cols in [8usize, 10, 12, 14] {
+            let (cw, chh, fs) = cell(cols);
+            let headroom = ((chh - fs * CHAR_INK_OF_EM) * 0.5).max(0.0);
+            for py in ["měi", "yǐ", "cāng"] {
                 let l = layout(py, fs, cw, chh);
                 assert!(
-                    (l.fs - fs * RUBY_SCALE_LONG).abs() < 0.01,
-                    "{cols} 列 / {py}：多字注记没吃满 0.45（实得 {:.3}）",
-                    l.fs / fs
+                    l.ink_h() <= headroom + 1.2,
+                    "{cols} 列 / {py}：拼音墨高 {:.2} 压过字面 {:+.2}px（净空 {:.2}）",
+                    l.ink_h(),
+                    l.ink_h() - headroom,
+                    headroom
                 );
             }
         }
     }
 
-    /// CJK：整块右缘绝不越过字格右缘、左缘不压主字、纵向不出格。
+    /// 绝不横向溢出：整串 ≤ 86% 格宽，居中后左右都不越界（不压邻列）。
     #[test]
-    fn cjk_note_stays_in_cell() {
+    fn pinyin_never_bleeds_sideways() {
         for cols in [8usize, 10, 12, 14] {
             let (cw, chh, fs) = cell(cols);
-            for py in ["猛", "四行", "四行本", "双行夹注示例"] {
+            for py in ["měi", "zhuāng", "zhuāngzhòng", "四行本", "双行夹注"] {
                 let l = layout(py, fs, cw, chh);
                 assert!(
-                    l.left + l.block_w <= cw - RUBY_RIGHT_INSET + 0.01,
-                    "{cols} 列 / {py}：注音越过字格右缘（右缘 {:.2} > {:.2}）",
+                    l.block_w <= cw * RUBY_WIDTH_FRAC + 0.01,
+                    "{cols} 列 / {py}：整串宽 {:.2} 超格宽 86%（{:.2}）",
+                    l.block_w,
+                    cw * RUBY_WIDTH_FRAC
+                );
+                assert!(l.left >= -1e-3, "{cols} 列 / {py}：左缘越界");
+                assert!(
+                    l.left + l.block_w <= cw + 0.01,
+                    "{cols} 列 / {py}：右缘越界（{:.2} > {:.2}）",
                     l.left + l.block_w,
-                    cw - RUBY_RIGHT_INSET
+                    cw
                 );
-                let char_right = RUBY_CHAR_LEFT + fs;
-                assert!(
-                    l.left >= char_right + RUBY_GAP_MIN - 1e-3,
-                    "{cols} 列 / {py}：注音压住了主字"
-                );
-                assert!(l.top >= 0.0 && l.top + l.block_h <= chh + 0.01, "{cols} 列 / {py}：纵向出格");
             }
         }
     }
 
-    /// 字号下限兜底：即使右侧空当极窄，也不跌破 30%、也不压到字上、也不越界栏。
+    /// 拼音与汉字同轴：左缘恰为 `(格宽 − 整串宽) / 2`。
     #[test]
-    fn never_below_floor() {
-        let (cw, chh, fs) = cell(14);
-        let l = layout("双行夹注示例", fs, cw, chh);
+    fn pinyin_is_centered_over_the_char() {
+        for cols in [8usize, 10, 12, 14] {
+            let (cw, chh, fs) = cell(cols);
+            let l = layout("cāng", fs, cw, chh);
+            let want = (cw - l.block_w) * 0.5;
+            assert!(
+                (l.left - want).abs() < 0.01,
+                "{cols} 列：未居中（left {:.2}，应为 {:.2}）",
+                l.left,
+                want
+            );
+        }
+    }
+
+    /// 长注记**按宽自动缩**：字号随串长单调不增，长到溢宽必缩，且绝不破 86%。
+    ///
+    /// ⚠️ 25% 上限极低（≈每格只给 2.3 个字母的宽度），所以只有 8em 以上的
+    /// 长注记才会触发宽度约束——这正说明「短拼音吃满 25%、长注记按宽收」
+    /// 的分工是对的，别把宽度测试写在短串上（那会误报「没缩」）。
+    #[test]
+    fn long_note_shrinks_by_width() {
+        let (cw, chh, fs) = cell(12);
+        let mut prev = f32::MAX;
+        for t in ["měi", "zhuāng", "chuángshàng", "双行夹注示例之又一"] {
+            let l = layout(t, fs, cw, chh);
+            assert!(
+                l.fs <= prev + 1e-3,
+                "{t}：字号反而变大（{:.2} > {:.2}）",
+                l.fs,
+                prev
+            );
+            assert!(
+                l.block_w <= cw * RUBY_WIDTH_FRAC + 0.01,
+                "{t}：整串宽 {:.2} 超 86% 格宽（{:.2}）",
+                l.block_w,
+                cw * RUBY_WIDTH_FRAC
+            );
+            prev = l.fs;
+        }
+        // 九枚全宽字的夹注（9em）必然越过宽度上限，故必须真的缩下来。
+        let short = layout("měi", fs, cw, chh);
+        let long = layout("双行夹注示例之又一", fs, cw, chh);
         assert!(
-            l.fs >= fs * RUBY_SCALE_MIN - 0.01,
-            "字号跌破 30% 下限（{:.3}）",
-            l.fs / fs
+            long.fs < short.fs - 0.01,
+            "长注记未缩（长 {:.2} vs 短 {:.2}）",
+            long.fs,
+            short.fs
         );
-        assert!(l.left + l.block_w <= cw - RUBY_RIGHT_INSET + 0.01);
-        let char_right = RUBY_CHAR_LEFT + fs;
-        assert!(l.left >= char_right + RUBY_GAP_MIN - 1e-3);
+        assert!(long.fs >= RUBY_MIN_FS - 1e-3);
+        // 缩到刚好贴住 86% 格宽（宽度约束真的在起作用，不是碰巧）。
+        assert!((long.block_w - cw * RUBY_WIDTH_FRAC).abs() < 0.6);
+    }
+
+    /// **10 列专项**（用户点名要同步的那一档）：宽 61.00 / 高 30.50 / 字号 25.92。
+    ///
+    /// 10 列的字格比 12 列宽、比 8 列窄，是「拼音能不能挤进净空」的临界档，
+    /// 单独钉死它的四个数，免得日后调 `RUBY_*` 常量时只测 12 列。
+    #[test]
+    fn ten_columns_is_covered() {
+        let (cw, chh, fs) = cell(10);
+        assert!((cw - 61.0).abs() < 0.6, "10 列格宽实测 {cw:.2}，预期 ≈61.00");
+        assert!((chh - 30.5).abs() < 0.6, "10 列格高实测 {chh:.2}，预期 ≈30.50");
+        assert!((fs - 25.92).abs() < 0.6, "10 列字号实测 {fs:.2}，预期 ≈25.92");
+
+        let l = layout("měi", fs, cw, chh);
+        // 25% 上限是关键约束：10 列下应当正好吃到 25%。
+        assert!(
+            (l.fs - fs * RUBY_PINYIN_MAX).abs() < 0.05,
+            "10 列：拼音字号 {:.2} 未吃到 25% 上限 {:.2}",
+            l.fs,
+            fs * RUBY_PINYIN_MAX
+        );
+        assert_eq!(l.top, 0.0);
+        assert!((l.band_h - chh * RUBY_BAND_FRAC).abs() < 0.01);
+        assert!(l.block_w < cw * 0.5, "10 列：三字母拼音不该占掉半格宽");
+        assert!((l.left - (cw - l.block_w) * 0.5).abs() < 0.01);
+        // 墨迹压在净空里（10 列净空 ≈ (30.5 − 22.3)/2 ≈ 4.1px）。
+        let headroom = (chh - fs * CHAR_INK_OF_EM) * 0.5;
+        assert!(l.ink_h() <= headroom + 1.2, "10 列：拼音压进字面太深");
+    }
+
+    /// CJK 注记（如「四行本」）同样走顶端外挂，且按 1em/字 计宽（不挤成一团）。
+    #[test]
+    fn cjk_note_also_hangs_from_the_top() {
+        let (cw, chh, fs) = cell(12);
+        let l = layout("四行本", fs, cw, chh);
+        assert_eq!(l.top, 0.0);
+        assert!(l.block_w <= cw * RUBY_WIDTH_FRAC + 0.01, "12 列：注记超宽");
+        // 三枚全宽字 = 3em：估宽必须 ≈ 3×字号，否则 PDF 会叠字。
+        assert!(
+            (l.block_w - 3.0 * l.fs).abs() < l.fs * 0.2,
+            "CJK 注记估宽 {:.2} 偏离 3em（{:.2}）",
+            l.block_w,
+            3.0 * l.fs
+        );
+    }
+
+    /// 逐字左缘单调右移（PDF 依此落笔，绝不回头叠字）。
+    #[test]
+    fn glyph_dx_increases_monotonically() {
+        let (cw, chh, fs) = cell(12);
+        let l = layout("chuáng", fs, cw, chh);
+        let mut prev = -1.0;
+        for i in 0..6 {
+            let dx = l.glyph_dx("chuáng", i);
+            assert!(dx > prev, "第 {i} 字的左缘未右移");
+            prev = dx;
+        }
     }
 }

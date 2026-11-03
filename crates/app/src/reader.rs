@@ -7573,20 +7573,23 @@ impl Root {
         // 悬停联动（v1.55.0）：鼠标停在天头某条眉批上 → 它锚定的那个字衬
         // 一层朱红。只比一次键，不查书稿——字格渲染里这是最省的判据。
         let margin_hit = g.kind == GlyphKind::Char && self.margin_hover_key == Some(key);
-        let ruby_cell = rare_py.is_some();
+        // ── 注音几何（v1.9.54）────────────────────────────────────────
+        // **汉字纹丝不动、拼音做小巧外挂**。主字恒在格心、恒用正文字号、
+        // 行盒恒等于格高——有没有注音都一样（v1.9.53 的「主字让位」把整列
+        // 基线挤歪了，已废）。拼音只是一枚贴在格顶的浅灰小标签，
+        // 全部度量只认 `jiandu_core::ruby::layout`（那里**没有**任何主字字段），
+        // 屏幕与 PDF 同源。
+        let ruby_layout = rare_py
+            .as_deref()
+            .map(|py| crate::ruby::layout(py, fs, cell_w, cell_h));
         let mut cell = div()
             .w(px(cell_w))
             .h(px(cell_h))
             .flex()
             .flex_row()
-            .items_center();
-        // 带注音的字贴左缘、拼音紧贴其右（与 `ruby::layout` 同位：详见
-        // `RUBY_CHAR_LEFT`）。非注音字仍居中，保持整列对齐。
-        if ruby_cell {
-            cell = cell.justify_start();
-        } else {
-            cell = cell.justify_center();
-        }
+            .items_center()
+            // 主字（与拼音）都居中于字格：竖排一列的字必须同轴，否则列气歪斜。
+            .justify_center();
         if marked || rare_py.is_some() || mark_line.is_some() || hit.is_some() || emph || margin_hit
         {
             cell = cell.relative();
@@ -7679,78 +7682,41 @@ impl Root {
             base_ink
         };
 
-        // ── 注音（生僻字拼音 / 多字夹注）─────────────────────────
-        // 最终态（v1.9.52）：带注音的字**贴字格左缘**排，注音作一摞**竖排小字**排在主字
-        // 右侧的空当里。**拼音 = 单列小尾巴**（字母自上而下堆叠）、字号 ≤ 主字 40%；
-        // **CJK 多字注记 = 双列竖排**（短 55% / 多 45%）。整块垂直居中、绝不粘连、
-        // 绝不压右边界栏；超出字格由 `.overflow_hidden()` 裁剪。
-        // 颜色锁死朱砂红 `#8C2B22`、透明度 0.75（朱砂微微晕染宣纸的透气感，详见
-        // `ruby_glyph.rs`）。GPUI 没有排版引擎，整摞竖排小字走 `ruby_glyph`：CoreGraphics
-        // 离屏按 `ruby::layout` 的 `glyph_xy` 度量（**不旋转**）渲成透明位图，再用 `img`
-        // 贴进字格。万一光栅失败（无字体 / 非 macOS），退回逐字竖排的 div。
-        if let Some(py) = rare_py.as_deref() {
-            let rl = crate::ruby::layout(py, fs, cell_w, cell_h);
-            // 锁定：注音颜色 = 朱砂红 #8C2B22、透明度 0.75（朱砂微微晕染宣纸的透气感，
-            // 不与批注混色）；整摞竖排小字、垂直居中于汉字右侧，宽度硬封顶到字格右缘，
-            // 绝不横跨整列宽、绝不挤占左侧句读、绝不溢出右界栏。
-            let ruby_ink = 0x8C2B22u32;
-            if let Some(im) = crate::ruby_glyph::ruby_image(py, &rl, ruby_ink) {
+        // ── 注音外挂（v1.9.54）───────────────────────────────────────
+        // **叠加式**：拼音是一枚绝对定位的小标签，挂在字格顶端（`top = 0`、
+        // 高 `band_h` = 30% 格高，`.overflow_hidden()` 兜底），浮在主字上方
+        // 那 13.4% 的天然空当里。**它不占正文一寸空间**——主字在下面照样
+        // 居格心、照样正文字号，整列基线一笔不歪。
+        //
+        // 字号由 `ruby::layout` 的 min() 链收口（≤主字 25%、≤86% 格宽），
+        // 墨色**浅灰**降噪，逐字真字体排版（不是位图，缩放不糊）。
+        if let Some(rl) = ruby_layout {
+            if let Some(py) = rare_py.as_deref() {
+                // 容器比估宽再放宽 25%：核心 crate 的 em 宽度是查表估算，真字体
+                // 略有出入；放宽后文字永不被挤成两行（拼音里没有空格、没有
+                // 连字符，唯一的断行点就在字母之间）。
+                let box_w = (rl.block_w * 1.25 + 2.0).min(cell_w);
+                let box_left = ((cell_w - box_w) * 0.5).max(0.0);
                 cell = cell.child(
                     div()
                         .absolute()
-                        .left(px(rl.left))
+                        .left(px(box_left))
                         .top(px(rl.top))
-                        .w(px(rl.block_w))
-                        .h(px(rl.block_h))
-                        // 绝对裁剪：注音再长也绝不画到小尾巴框外（用户「Clip」要求）。
+                        .w(px(box_w))
+                        .h(px(rl.band_h))
                         .overflow_hidden()
-                        .child(gpui::img(im).w(px(rl.block_w)).h(px(rl.block_h))),
+                        .flex()
+                        .items_start()
+                        .justify_center()
+                        .text_size(px(rl.fs))
+                        // 行盒 = 拼音字号：墨迹紧贴标签框顶（与 PDF 逐字落笔同口径）。
+                        // 若按框高做行盒，文字会在框内垂直居中、往主字上多压
+                        // 两三像素——框高只在 8 列这种宽格里才有富余。
+                        .line_height(px(rl.fs))
+                        .text_color(rgba((crate::ruby::RUBY_INK << 8) | 0xE6))
+                        .child(SharedString::from(py.to_string())),
                 );
-            } else {
-                // 退化（非 macOS 无 CoreGraphics）：逐字竖排小字，按 `glyph_xy`
-                // 落位——与 macOS 位图、PDF 同一套几何，绝不横排、绝不越界。
-                let mut ruby = div()
-                    .absolute()
-                    .left(px(0.0))
-                    .top(px(0.0))
-                    .w(px(cell_w))
-                    .h(px(cell_h))
-                    .overflow_hidden();
-                for (i, ch) in py.chars().enumerate() {
-                    let (gx, gy) = rl.glyph_xy(i);
-                    ruby = ruby.child(
-                        div()
-                            .absolute()
-                            .left(px(gx))
-                            .top(px(gy))
-                            .w(px(rl.fs))
-                            .h(px(rl.fs))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(rl.fs))
-                            .text_color(rgba((ruby_ink << 8) | 0xBF))
-                            .child(SharedString::from(ch.to_string())),
-                    );
-                }
-                cell = cell.child(ruby);
             }
-            // 极细「虚」线：三点短横（GPUI 0.2.2 无 dashed 边框），
-            // 贴字格下缘右侧，只作提示、不抢正文。
-            let dots = 3usize;
-            let dw = (cell_w * 0.34) / (dots as f32 * 1.9);
-            let mut hint = div()
-                .absolute()
-                .bottom(px(cell_h * 0.055))
-                .right(px(cell_w * 0.10))
-                .flex()
-                .flex_row()
-                .gap(px(dw * 0.9));
-            for _ in 0..dots {
-                hint = hint
-                    .child(div().w(px(dw)).h(px(1.0)).bg(rgb(self.palette.note(t))));
-            }
-            cell = cell.child(hint);
         }
         // 字旁的短批注（`annotation_of`）：属于注释，注释隐藏时不画。
         if self.notes_shown {
@@ -7866,6 +7832,11 @@ impl Root {
             } else {
                 (SharedString::from(shown), ink)
             };
+            // ── 主字坐标恒定（v1.9.54）───────────────────────────────
+            // 字号恒为正文 `fs`、行盒恒为格高 `cell_h`——**注音在不在都一样**。
+            // v1.9.53 曾让主字下移让位，结果整列基线不齐（用户原话
+            // 「有拼音的字被挤下去了」）；现在主字永远落在格心，
+            // 拼音只在外面对着格顶悬挂，谁也动不了这一列的那根线。
             let glyph = div()
                     .text_size(px(fs))
                     // ── v1.59.0 首行顶格的**另一半**：行盒锁死 ──────────
@@ -7882,34 +7853,26 @@ impl Root {
             // ── 网格保护（回退专用）──────────────────────────────────
             // 首选字体走原路（继承根元素的族名、行盒锁格高），一个字节都不
             // 多加；只有**回退 / 缺字**这两个分支才加一层「物理字框」：
-            // 宽高**照抄** `cell_w × cell_h`、居中、超出的部分裁掉。
+            // 宽高**照抄** `cell_w × 行盒`、居中、超出的部分裁掉。
             //
             // 为什么必须加这一层：回退字体的 em box 与首选完全不同（某支
             // 楷体的 ascent 能顶到 1.2em），字一旦按它自己的行距落笔，竖排
             // 的整列就会往下漂——而这一列的字格总数是分页时算死的，漂出去
             // 就与下一列错位。锁死之后，回退字体只能在这个框**里面**画。
             let glyph = if pick.needs_lock() {
-                let mut boxed = div()
+                div()
                     .w(px(cell_w))
                     .h(px(cell_h))
                     .flex()
                     .items_center()
+                    .justify_center()
                     .overflow_hidden()
-                    .font_family(pick.family.clone());
-                // 注音字在字框内也贴左（与外层 justify_start + ml 同位），
-                // 否则回退字体里注音拼音会偏到字右侧很远。
-                if ruby_cell {
-                    boxed = boxed.justify_start().ml(px(crate::ruby::RUBY_CHAR_LEFT));
-                } else {
-                    boxed = boxed.justify_center();
-                }
-                boxed = boxed.child(glyph);
-                boxed
-            } else if ruby_cell {
-                glyph.ml(px(crate::ruby::RUBY_CHAR_LEFT))
+                    .font_family(pick.family.clone())
+                    .child(glyph)
             } else {
                 glyph
             };
+            // 主字入格：**一条路、无分支**——不再有「带注音就换个框」这种事。
             cell = cell.child(glyph);
         }
         // 挤压标点（列排满时排不下的那枚句读）：挂在**本格**右下角，与末字
