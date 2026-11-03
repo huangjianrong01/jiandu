@@ -408,6 +408,74 @@ fn same_glyph(a: &Glyph, b: &Glyph) -> bool {
         && a.kind == b.kind
 }
 
+/// 注文浮签的落位（纯函数，可断言）：**先钉天头，再退地脚，都不行才回锚点**。
+///
+/// * `paper`：纸面矩形 `(x, y, w, h)`（window 坐标）；
+/// * `margin_top` / `margin_bot`：天头 / 地脚留白高（px，3∶2）；
+/// * `viewport`：窗口宽高；`card`：浮签宽高；`anchor`：点击处。
+///
+/// 输出的左上角**保证**：① 横向整张卡在纸面内（两侧各留 `INSET`）；
+/// ② 若天头塞得下，卡的上下缘都在天头带内（不碰版框、不压正文）；
+/// ③ 天头塞不下则整张卡落在地脚带内；④ 两处都塞不下，才放到锚点上方
+/// （放不下则下方），并仍夹在窗口内。
+pub(crate) fn note_card_pos_in(
+    paper: (f32, f32, f32, f32),
+    margin_top: f32,
+    margin_bot: f32,
+    viewport: (f32, f32),
+    card: (f32, f32),
+    anchor: (f32, f32),
+) -> (f32, f32) {
+    const INSET: f32 = 6.0;
+    let (px0, py0, pw, ph) = paper;
+    let (_vw, vh) = viewport;
+    let (card_w, card_h) = card;
+    let (ax, ay) = anchor;
+
+    // 横向：跟随锚点居中，夹进纸面（纸比卡还窄时退化为贴左缘）。
+    let max_left = (px0 + pw - card_w - INSET).max(px0);
+    let left = (ax - card_w * 0.5).clamp(px0, max_left);
+    let clamp_top = |v: f32| v.clamp(0.0, (vh - card_h).max(0.0));
+
+    // ① 天头带：纸面上缘 → 版框上缘
+    if margin_top >= card_h + INSET * 2.0 {
+        return (left, clamp_top(py0 + (margin_top - card_h) * 0.5));
+    }
+    // ② 地脚带：版框下缘 → 纸面下缘
+    if margin_bot >= card_h + INSET * 2.0 {
+        let top = py0 + ph - margin_bot + (margin_bot - card_h) * 0.5;
+        return (left, clamp_top(top));
+    }
+    // ③ 兜底：锚点上方优先（正在读的那一行永远不会被盖住），下方次之。
+    let above = ay - card_h - 10.0;
+    let top = if above >= 4.0 { above } else { ay + 20.0 };
+    (left, clamp_top(top))
+}
+
+/// 取释义的**头一句**并截到 `max` 字——浮签只留一行，后面几义不显示。
+///
+/// 字典里的释义是一长串「①…；②…；③…」，浮签要的是「一眼知道大概」，
+/// 所以只切第一义、再按字数截断加省略号。按 `char` 数不按字节，
+/// 免得把「鬱」这类三字节字切一半炸掉。
+pub(crate) fn one_line(s: &str, max: usize) -> String {
+    let head = s
+        .split(|c| matches!(c, '。' | '；' | ';' | '，' | ',' | '\n'))
+        .next()
+        .unwrap_or(s)
+        .trim();
+    let head = head.trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '①' | '②' | '③' | '④' | '⑤' | '·')
+    });
+    let n = head.chars().count();
+    if n <= max {
+        head.to_string()
+    } else {
+        let mut out: String = head.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
 /// 把草稿按每行字符数折行（GPUI 文本不自动换行，显示侧手动折）。
 /// 返回非空 Vec；空串返回一个空串行。书架的重命名框也复用它。
 pub(crate) fn wrap_lines(s: &str, per_line: usize) -> Vec<String> {
@@ -7713,7 +7781,7 @@ impl Root {
                         // 若按框高做行盒，文字会在框内垂直居中、往主字上多压
                         // 两三像素——框高只在 8 列这种宽格里才有富余。
                         .line_height(px(rl.fs))
-                        .text_color(rgba((crate::ruby::RUBY_INK << 8) | 0xE6))
+                        .text_color(rgba((crate::ruby::RUBY_INK << 8) | 0xF2))
                         .child(SharedString::from(py.to_string())),
                 );
             }
@@ -10238,71 +10306,102 @@ impl Root {
             )
     }
 
-    /// 注文放大悬浮卡（交互层）：点行内夹注小字后弹出——现代风格半透明
-    /// 卡片，把注文放大横排显示，解决手机 / 窄屏上小字看不清的问题。
-    /// 定位在点击处附近并夹进视口；点卡片外任意处收起（root 级监听），
-    /// 卡片自身 `stop_propagation` 保住内容不被秒关。
+    /// 注文浮签（v1.9.55）：**宣纸底 + 朱砂大字**，两种用途共用一个壳。
+    ///
+    /// * **注音浮签**（`pinyin.is_some()`）：大号朱砂拼音 + 本字 + 一行首义。
+    ///   旧版那圈小字（「注音浮签」标题、「生僻字 · 竖排注音」、「第 35 葉 ·
+    ///   1 字」）**全部删掉**——浮签上只留三个信息：**读什么、什么字、什么意思**。
+    /// * **夹注放大**：原注文横排放大到 17px，右下角留一枚「重录」。
+    ///
+    /// 底色彻底不黑：改成**主题纸色**（`theme.paper()`，94% 不透明）＋ 一道近白
+    /// 玻璃边 ＋ 柔和投影。GPUI 0.2.2 没有 backdrop blur，「毛玻璃」只能靠
+    /// 「半透纸色 + 亮边 + 阴影」这三件兑出来——留 6% 透光，底下的字隐约可见，
+    /// 又不至于糊住朱砂。
+    ///
+    /// 位置见 [`Self::note_card_pos`]：**优先钉进纸面天头**，其次地脚，
+    /// 总之不压正在读的那一列。
     fn render_note_zoom(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let Some(zoom) = self.note_zoom.clone() else {
             return div();
         };
-        let vw = self.viewport_w;
-        let vh = self.viewport_h;
-
-        // 卡片宽度不超视口留边；正文字号 17px，每行字数按卡宽折。
-        // 注音浮签只是「一字一音」，无需那么宽——单独收窄、收紧内边距，
-        // 让小卡片更精致、不抢戏（v1.9.44）。
         let is_ruby = zoom.pinyin.is_some();
+
+        // ── 尺寸 ──────────────────────────────────────────────────
+        //
+        // 注音浮签的**高度预算**是被天头卡死的：默认留白档天头只有
+        // `content_h × 0.12`（12 列常规窗口 ≈ 96px），竖着堆「拼音 / 本字 /
+        // 释义」三行要 130px 往上，必然压进版框。所以改成**一行主信息**：
+        // 「拼音 + 本字」同排（像字典的一个词头），释义另起一行；
+        // 天头连释义都塞不下时，先砍释义，再砍到只剩一行。
         let card_w = if is_ruby {
-            (vw - 40.0).clamp(170.0, 230.0)
+            (self.viewport_w - 40.0).clamp(172.0, 236.0)
         } else {
-            (vw - 40.0).clamp(220.0, 380.0)
+            (self.viewport_w - 40.0).clamp(220.0, 380.0)
         };
-        let pad = if is_ruby { 10.0 } else { 14.0 };
+        let pad = if is_ruby { 8.0 } else { 15.0 };
+
+        let py_text = zoom.pinyin.clone().unwrap_or_default();
+        let py_w_em = crate::ruby::text_width_em(&py_text).max(0.1);
+        let ch_fs = 26.0;
+        // ⚠️ 34px 是**上限**：长拼音（`zhuāngzhòng`）按卡宽反算字号收下来，
+        // 绝不许撑出浮签去——与正文里的注音同一条规矩（宽定字号）。
+        // 右侧再让 18px：那是角上「×」的地盘，绝不让长拼音压到它身上。
+        let py_fs = ((card_w - pad * 2.0 - ch_fs - 12.0 - 18.0) / py_w_em).clamp(16.0, 34.0);
+        let row_h = (py_fs * 1.25).max(34.0);
+        let gl_fs = 11.5;
+        let gl_h = 15.0;
+        let gloss = if is_ruby {
+            zoom.text
+                .chars()
+                .next()
+                .and_then(crate::dict::concise_of)
+                .map(|s| one_line(s, 11))
+        } else {
+            None
+        };
+
+        // 夹注分支：正文 17px 折行。
         let body_fs = 17.0;
         let line_h = body_fs * 1.75;
         let text_w = card_w - pad * 2.0;
         let per_line = ((text_w / body_fs).floor() as usize).max(8);
         let lines = wrap_lines(&zoom.text, per_line);
-        // 注音浮签（`pinyin` 有值）：卡片内容换成「大字拼音 + 本字」，
-        // 高度按固定行算（34 拼音 + 28 本字 + 20 释义行，比旧版更紧凑）。
-        let head_h = if is_ruby { 18.0 } else { 20.0 };
-        let foot_h = if is_ruby { 14.0 } else { 16.0 };
-        let card_h = if is_ruby {
-            pad * 2.0 + head_h + 6.0 + 34.0 + 28.0 + 20.0 + foot_h
+
+        // 天头 / 地脚能不能整张容下（`INSET` 与 `note_card_pos_in` 同源）。
+        let mt = self.margin_top.max(0.0);
+        let mb = self.margin_bot.max(0.0);
+        let band_fits = |h: f32| mt >= h + 12.0 || mb >= h + 12.0;
+        let h_full = pad * 2.0 + row_h + if gloss.is_some() { 3.0 + gl_h } else { 0.0 };
+        let h_tight = pad * 2.0 + row_h;
+        let (card_h, show_gloss) = if is_ruby {
+            if gloss.is_some() && band_fits(h_full) {
+                (h_full, true)
+            } else {
+                (h_tight, false)
+            }
         } else {
-            pad * 2.0 + head_h + 8.0 + lines.len() as f32 * line_h + 6.0 + foot_h
+            (pad * 2.0 + 18.0 + lines.len() as f32 * line_h, false)
         };
 
-        // 锚点右侧下方优先，贴边时向左 / 向上翻，始终夹在视口内。
-        let mut left = zoom.x + 14.0;
-        if left + card_w > vw - 8.0 {
-            left = (zoom.x - card_w - 14.0).max(8.0);
-        }
-        let mut top = zoom.y + 18.0;
-        if top + card_h > vh - 8.0 {
-            top = (zoom.y - card_h - 12.0).max(8.0);
-        }
-        left = left.min((vw - card_w - 8.0).max(8.0));
-        top = top.min((vh - card_h - 8.0).max(8.0));
+        let (left, top) = self.note_card_pos(card_w, card_h, zoom.x, zoom.y);
 
-        // 关闭钮（v1.9.44 再收小）：18 → 14，字 10.5 → 11 且换成真正的「×」
-        // 叉形字符（U+00D7，基础 Latin-1，回退字体里不会零宽消失，比 ASCII X
-        // 更像一枚小叉）。它只是角上的一个轻轻的叉，绝不抢戏。
+        // ── 关闭：一枚很轻的小叉（U+00D7，Latin-1 基本区，回退字体不会吞掉）──
         let close = div()
             .id("note-zoom-close")
-            .w(px(14.0))
-            .h(px(14.0))
+            .absolute()
+            .top(px(6.0))
+            .right(px(6.0))
+            .w(px(18.0))
+            .h(px(18.0))
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(7.0))
-            .text_size(px(11.0))
-            .text_color(rgb(0xFFFFFFA0))
+            .rounded(px(9.0))
+            .text_size(px(12.0))
+            .text_color(rgba((t.ink_soft() << 8) | 0xB0))
             .cursor_pointer()
-            // U+00D7 × 是真正的叉形（区别于字母 X）；基础字符集，字体覆盖可靠。
-            .child(SharedString::from("×"))
+            .child(SharedString::from("\u{00D7}"))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -10312,114 +10411,46 @@ impl Root {
                 }),
             );
 
-        // 「重录」＝改写这条夹注：卡片只带文本、不带定位键，
-        // 用 `note_key_for_text` 反查它属于书稿里哪条注文，
-        // 预填进浮层编辑栏，保存时写回书稿 JSON（下次打开仍在）。
-        // 跨列流转的注文在卡里只是整条的一段，反查不到 → 提示不支持。
-        let key = self.note_key_for_text(&zoom.text);
-        let ztext = zoom.text.clone();
-        let zpos = (zoom.x, zoom.y);
-        let edit = div()
-            .id("note-zoom-edit")
-            .w(px(46.0))
-            .h(px(20.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(10.0))
-            .text_size(px(11.0))
-            .text_color(rgb(0xFFFFFFC0))
-            .border_1()
-            .border_color(rgba(0xFFFFFF40))
-            .cursor_pointer()
-            .child(SharedString::from("重录"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    match key {
-                        Some(k) => this.start_annotation_edit(k, &ztext, Some(zpos)),
-                        None => {
-                            this.notice = "该注文跨列流转，暂不支持直接改写".to_string()
-                        }
-                    }
-                    cx.notify();
-                }),
-            );
-
-        let head = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .child(
+        // ── 内容 ──────────────────────────────────────────────────
+        let mut body = div().flex().flex_col().items_center().justify_center();
+        if is_ruby {
+            // ① 主行：朱砂拼音 + 本字，同一个词头里并排——
+            //    先看见读音（最大、朱砂），再一眼确认是哪个字（墨色、略小）。
+            body = body.child(
                 div()
+                    .h(px(row_h))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
+                    .gap(px(12.0))
                     .child(
                         div()
-                            .w(px(3.0))
-                            .h(px(12.0))
-                            .rounded(px(1.5))
-                            .bg(rgb(t.accent())),
+                            .flex()
+                            .items_center()
+                            .text_size(px(py_fs))
+                            .text_color(rgb(t.zhu()))
+                            .child(SharedString::from(py_text.clone())),
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0xFFFFFFC0))
-                            .child(SharedString::from(if is_ruby {
-                                "注音浮签"
-                            } else {
-                                "夹注重录"
-                            })),
+                            .flex()
+                            .items_center()
+                            .text_size(px(ch_fs))
+                            .text_color(rgb(t.ink()))
+                            .child(SharedString::from(zoom.text.clone())),
                     ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    // 注音浮签没有「重录」——拼音来自生僻字表，不可改写。
-                    .when(!is_ruby, |d| d.child(edit))
-                    .child(close),
             );
-
-        let mut body = div().flex().flex_col().gap(px(2.0));
-        if is_ruby {
-            // 注音浮签：拼音 22px 大字 + 本字 18px + 释义行（横排，卡片里读横最清楚）。
-            // 比旧版（26/22/12）更紧凑，单列小卡不抢戏（v1.9.44）。
-            let py = zoom.pinyin.clone().unwrap_or_default();
-            body = body
-                .child(
-                    div()
-                        .h(px(34.0))
-                        .flex()
-                        .items_center()
-                        .text_size(px(22.0))
-                        .text_color(rgb(0xFFFFFFFF))
-                        .child(SharedString::from(py)),
-                )
-                .child(
-                    div()
-                        .h(px(28.0))
-                        .flex()
-                        .items_center()
-                        .text_size(px(18.0))
-                        .text_color(rgb(0xFFFFFFB0))
-                        .child(SharedString::from(zoom.text.clone())),
-                )
-                .child(
-                    div()
-                        .h(px(20.0))
-                        .flex()
-                        .items_center()
-                        .text_size(px(11.0))
-                        .text_color(rgb(0xFFFFFF90))
-                        .child(SharedString::from("生僻字 · 竖排注音")),
-                );
+            // ② 首义：一行，淡墨；没有（或天头塞不下）就不画这一行。
+            if show_gloss {
+                if let Some(g) = gloss {
+                    body = body.child(
+                        div().mt(px(3.0)).h(px(gl_h)).flex().items_center()
+                            .text_size(px(gl_fs))
+                            .text_color(rgb(t.ink_soft()))
+                            .child(SharedString::from(g)),
+                    );
+                }
+            }
         } else {
             for line in &lines {
                 body = body.child(
@@ -10428,33 +10459,63 @@ impl Root {
                         .flex()
                         .items_center()
                         .text_size(px(body_fs))
-                        .text_color(rgb(0xFFFFFFFF))
+                        .text_color(rgb(t.ink()))
                         .child(SharedString::from(line.clone())),
                 );
             }
         }
 
-        let foot = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .child(
+        // 夹注才能「重录」：卡片只带文本、不带定位键，用 `note_key_for_text`
+        // 反查它属于书稿里哪条注文，预填进浮层编辑栏，保存时写回书稿 JSON。
+        // 跨列流转的注文在卡里只是整条的一段，反查不到 → 提示不支持。
+        if !is_ruby {
+            let key = self.note_key_for_text(&zoom.text);
+            let ztext = zoom.text.clone();
+            let zpos = (zoom.x, zoom.y);
+            body = body.child(
                 div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(0xFFFFFF90))
-                    .child(SharedString::from(if is_ruby {
-                        format!("第 {} 葉 · 生字注音", zoom.page + 1)
-                    } else {
-                        format!("第 {} 葉 · 原注双行小字，此处已放大", zoom.page + 1)
-                    })),
-            )
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(0xFFFFFF90))
-                    .child(SharedString::from(format!("{} 字", zoom.text.chars().count()))),
+                    .mt(px(6.0))
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .child(
+                    div()
+                        .id("note-zoom-edit")
+                        .h(px(20.0))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .text_size(px(11.0))
+                        .text_color(rgb(t.zhu()))
+                        .border_1()
+                        .border_color(rgba((t.zhu() << 8) | 0x55))
+                        .cursor_pointer()
+                        .child(SharedString::from("重录"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                match key {
+                                    Some(k) => this.start_annotation_edit(k, &ztext, Some(zpos)),
+                                    None => {
+                                        this.notice =
+                                            "该注文跨列流转，暂不支持直接改写".to_string()
+                                    }
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                ),
             );
+        }
+
+        // 纸色 / 边色：边是纸向墨里兑 12%，比纸略深一点点，像一张压在字上的宣纸边。
+        let paper = t.paper();
+        let edge = crate::theme::mix(paper, t.ink(), 0.12);
 
         div()
             .absolute()
@@ -10463,17 +10524,20 @@ impl Root {
             .w(px(card_w))
             .flex()
             .flex_col()
-            .gap(px(8.0))
+            .items_center()
             .p(px(pad))
-            .rounded(px(14.0))
-            // 现代风格半透明：深色玻璃底 + 细亮边 + 投影。
-            .bg(rgba(0x121216E8))
+            .rounded(px(10.0))
+            // 半透宣纸底（94%）：留一丝透光＝「毛玻璃」在无 blur 环境下的替身。
+            .bg(rgba((paper << 8) | 0xF0))
             .border_1()
-            .border_color(rgba(0xFFFFFF24))
+            .border_color(rgba((edge << 8) | 0x70))
             .shadow_lg()
-            // 放大注卡同样走**批注字体**（楷体）：卡片里读的是注文，
-            // 与行内夹注小字同一副面孔，放大后仍是「注文的字」。
-            .font_family(crate::fonts::note_family(self.note_font()))
+            // 拼音是拉丁字母、汉字是正文——浮签跟**正文那副面孔**走。
+            .font_family(if is_ruby {
+                self.main_family()
+            } else {
+                crate::fonts::note_family(self.note_font())
+            })
             // ★ 阻断鼠标穿透（v1.9.39）：光 `stop_propagation` 只拦得住**冒泡**，
             //   拦不住命中测试——GPUI 会把压在卡片底下的正文字格一并算作
             //   hovered，于是卡片上这一下抬起仍会派发给正文那层：正在编辑夹注
@@ -10481,13 +10545,37 @@ impl Root {
             //   被判成单击翻页 → 卡片底下的书页自己翻过去。`.occlude()` 让命中
             //   栈在卡片处截断（与目录抽屉 / 问笺侧栏同款），卡片之外才算纸面。
             .occlude()
-            // 点卡片内容不冒泡到 root（否则会被当「点别处」秒关）。
             .on_mouse_down(MouseButton::Left, cx.listener(|_this, _, _, cx| {
                 cx.stop_propagation();
             }))
-            .child(head)
             .child(body)
-            .child(foot)
+            .child(close)
+    }
+
+    /// 注文浮签的落位：**钉在天头（上方留白）里，绝不压正文列**。
+    ///
+    /// 三档，按「离正文有多远」排：
+    ///   ① **天头带**——纸面上缘到版框上缘那一条（高 `margin_top`）。古书天头
+    ///      本就是批注的落脚处，浮签放这儿最不像「弹窗」，像一个批条贴在上面。
+    ///   ② **地脚带**——天头塞不下（字特别大的版式）时退到下方留白。
+    ///   ③ **锚点上方 / 下方**——极矮窗口里两条留白都塞不下，才回到点击处
+    ///      上下，至少不盖住正在读的那一行。
+    ///
+    /// 横向永远跟着点击处，夹在纸面内（两侧各留 6px），所以点哪个字，
+    /// 浮签就落在它正上方的天头里——视线不用离位。
+    fn note_card_pos(&self, card_w: f32, card_h: f32, ax: f32, ay: f32) -> (f32, f32) {
+        let paper = match self.page_rect.get() {
+            Some((x, y, w, h)) if w > 1.0 && h > 1.0 && w.is_finite() && h.is_finite() => (x, y, w, h),
+            _ => (0.0, 0.0, self.viewport_w, self.viewport_h),
+        };
+        note_card_pos_in(
+            paper,
+            self.margin_top.max(0.0),
+            self.margin_bot.max(0.0),
+            (self.viewport_w, self.viewport_h),
+            (card_w, card_h),
+            (ax, ay),
+        )
     }
 
     /// 右键 / 长按**用户自加夹注**弹出的「修改 / 删除」菜单。
@@ -14183,6 +14271,72 @@ mod tests {
         let (chars, red) = super::chars_in_keys(&b, (0, 1, 1), (1, 0, 1), &|k| k == (1, 0, 0), &|c| c);
         assert_eq!(chars.iter().collect::<String>(), "戊己庚");
         assert_eq!(red, vec![false, true, false], "红线标记必须逐字对齐");
+    }
+
+    // ── 注文浮签：落位与释义行（v1.9.55）──────────────────────────
+
+    /// 纸面 1200×800，天头 150、地脚 100（3∶2），浮签 220×120。
+    /// 点在第 3 列中部：浮签必须**整张落在天头带里**，横向跟着锚点且不越纸。
+    #[test]
+    fn note_card_pins_into_the_head_margin() {
+        let paper = (20.0, 10.0, 1200.0, 800.0);
+        let (left, top) = super::note_card_pos_in(paper, 150.0, 100.0, (1280.0, 860.0), (220.0, 120.0), (600.0, 400.0));
+        // 纵向：整卡在天头带 [10, 160] 之内，留出 INSET 呼吸。
+        assert!(top >= paper.1, "浮签顶 {top:.1} 越过纸面上缘");
+        assert!(
+            top + 120.0 <= paper.1 + 150.0,
+            "浮签底 {:.1} 越过天头下缘 {:.1}（会压正文）",
+            top + 120.0,
+            paper.1 + 150.0
+        );
+        // 横向：以锚点 600 为心 → 490，且在纸内。
+        assert!((left - 490.0).abs() < 0.01, "横向未跟随锚点：{left:.1}");
+        assert!(left >= paper.0 && left + 220.0 <= paper.0 + paper.2);
+    }
+
+    /// 天头塞不下（超高浮签 / 大字版式）→ 退到**地脚带**，仍不压正文。
+    #[test]
+    fn note_card_falls_back_to_the_foot_margin() {
+        let paper = (0.0, 0.0, 1200.0, 800.0);
+        let (_, top) = super::note_card_pos_in(paper, 60.0, 140.0, (1280.0, 860.0), (220.0, 120.0), (600.0, 300.0));
+        assert!(
+            top >= 800.0 - 140.0,
+            "浮签顶 {top:.1} 未进地脚带（版心底 {:.1}）",
+            800.0 - 140.0
+        );
+        assert!(top + 120.0 <= 800.0, "浮签出纸");
+    }
+
+    /// 两条留白都塞不下（矮窗口）→ 退到**锚点上方**，至少不盖正在读的那一行。
+    #[test]
+    fn note_card_never_covers_the_reading_line() {
+        let paper = (0.0, 0.0, 900.0, 500.0);
+        let (_, top) = super::note_card_pos_in(paper, 40.0, 30.0, (960.0, 520.0), (220.0, 120.0), (400.0, 300.0));
+        assert!(top + 120.0 <= 300.0, "浮签压住了点击行（底 {:.1} ≥ 300）", top + 120.0);
+        assert!(top >= 0.0);
+    }
+
+    /// 贴右边缘点字：横向必须被夹回纸内，绝不横向出纸。
+    #[test]
+    fn note_card_clamps_to_the_paper_edge() {
+        let paper = (20.0, 10.0, 1200.0, 800.0);
+        let (left, _) = super::note_card_pos_in(paper, 150.0, 100.0, (1280.0, 860.0), (220.0, 120.0), (1210.0, 400.0));
+        assert!(left + 220.0 <= paper.0 + paper.2 + 0.01, "右缘出纸：{:.1}", left + 220.0);
+        assert!(left >= paper.0);
+    }
+
+    /// 释义取**头一句**、按字截断：多义只留第一义，超出加省略号。
+    #[test]
+    fn one_line_keeps_only_the_first_sense() {
+        assert_eq!(super::one_line("①美玉。②美好的样子。", 12), "美玉");
+        assert_eq!(super::one_line("玉名；又姓。", 12), "玉名");
+        assert_eq!(super::one_line("短", 12), "短");
+        // 12 字上限：11 字 + 省略号，按 char 数切，绝不切半个汉字。
+        let long = "一二三四五六七八九十甲乙丙丁";
+        let got = super::one_line(long, 12);
+        assert_eq!(got.chars().count(), 12);
+        assert!(got.ends_with('…'));
+        assert_eq!(super::one_line("   ", 12), "");
     }
 
     /// 区间写反（反向拖选没归一）绝不 panic，也不吐半个字。

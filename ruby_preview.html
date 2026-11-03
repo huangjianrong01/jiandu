@@ -2,17 +2,18 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>笺读 · 注音外挂几何（v1.9.54）</title>
+<title>笺读 · 朱砂注音 + 宣纸浮签（v1.9.55）</title>
 <style>
   :root{
-    --paper:#F7F0DC; --paper2:#EFE6CE; --ink:#2E2A24; --ruby:#8C877E;
-    --zhu:#B0342C; --line:rgba(46,42,36,.16);
+    --paper:#F7F0DC; --paper2:#EFE6CE; --ink:#2E2A24; --zhu:#B0342C;
+    --line:rgba(46,42,36,.16);
     --mono:"SF Mono",ui-monospace,Menlo,monospace;
   }
   *{box-sizing:border-box}
-  body{margin:0;padding:34px 40px 60px;background:#E8DEC4;color:var(--ink);
+  body{margin:0;padding:34px 40px 64px;background:#E8DEC4;color:var(--ink);
     font-family:"Songti SC","STSong",serif;-webkit-font-smoothing:antialiased}
   h1{font-size:19px;font-weight:600;letter-spacing:.22em;margin:0 0 4px}
+  h2{font-size:14px;font-weight:600;letter-spacing:.18em;margin:44px 0 6px;color:#4A4234}
   .sub{font-size:12.5px;color:#6E6455;margin:0 0 26px;letter-spacing:.04em}
   .sub b{color:var(--zhu);font-weight:600}
   .grid{display:flex;gap:22px;align-items:flex-start;flex-wrap:wrap}
@@ -24,18 +25,19 @@
     letter-spacing:0;margin-left:8px}
   .strip{position:relative}
   .cell{position:relative;background:
-      linear-gradient(to bottom,rgba(140,135,126,.10) 0 var(--band),transparent var(--band));
+      linear-gradient(to bottom,rgba(176,52,44,.055) 0 var(--band),transparent var(--band));
     border:1px solid var(--line);margin-bottom:-1px}
   .cell:last-child{margin-bottom:0}
   .py{position:absolute;left:0;right:0;top:0;height:var(--band);
     display:flex;justify-content:center;align-items:flex-start;
-    color:var(--ruby);line-height:1;font-family:"Songti SC","STSong",serif;
-    letter-spacing:.02em;opacity:.95}
+    color:var(--zhu);line-height:1;letter-spacing:.02em;opacity:.96}
   .ch{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     line-height:1;color:var(--ink)}
   .base{position:absolute;border-left:1px dashed rgba(176,52,44,.85);pointer-events:none}
   .tick{position:absolute;height:0;border-top:1px dashed rgba(176,52,44,.85);pointer-events:none}
-  table{border-collapse:collapse;margin-top:26px;background:var(--paper);
+  /* 句读：格右下角那枚朱点（0.72 格高、0.72 格宽），与拼音分层 */
+  .dot{position:absolute;background:var(--zhu);border-radius:50%}
+  table{border-collapse:collapse;margin-top:18px;background:var(--paper);
     border:1px solid rgba(46,42,36,.22);font-size:12px}
   th,td{padding:7px 13px;border-bottom:1px solid rgba(46,42,36,.12);text-align:right;
     font-family:var(--mono);font-size:11.5px}
@@ -44,16 +46,36 @@
   td:first-child,th:first-child{text-align:left}
   .ok{color:#2F6B3A;font-weight:600}
   .warn{color:var(--zhu);font-weight:600}
-  .note{margin-top:22px;font-size:12.5px;line-height:1.95;color:#4A4234;max-width:1040px}
+  .note{margin-top:18px;font-size:12.5px;line-height:1.95;color:#4A4234;max-width:1040px}
   .note b{color:var(--zhu);font-weight:600}
   .note code{font-family:var(--mono);font-size:11.5px;background:var(--paper2);
     padding:1px 5px;border-radius:2px}
+  /* ── 浮签 ── */
+  .stage{position:relative;width:760px;height:250px;background:var(--paper);
+    border:1px solid rgba(46,42,36,.22);overflow:hidden;
+    box-shadow:0 6px 18px rgba(60,45,20,.10)}
+  .bandmt{position:absolute;left:0;right:0;top:0;height:96px;
+    background:rgba(176,52,44,.045);border-bottom:1px solid rgba(46,42,36,.30)}
+  .bandlabel{position:absolute;right:8px;top:6px;font-family:var(--mono);font-size:9.5px;
+    color:#9A8F7B;letter-spacing:.06em}
+  .col{position:absolute;top:96px;bottom:0;width:44px;border-right:1px solid rgba(46,42,36,.20);
+    display:flex;flex-direction:column;align-items:center;padding-top:6px;
+    font-size:26px;line-height:1.35;color:var(--ink)}
+  .card{position:absolute;background:rgba(247,240,220,.94);
+    border:1px solid rgba(46,42,36,.28);border-radius:10px;
+    box-shadow:0 10px 28px rgba(50,36,14,.22),0 1px 0 rgba(255,255,255,.75) inset;
+    display:flex;flex-direction:column;align-items:center}
+  .card .row{display:flex;align-items:center;gap:12px}
+  .card .x{position:absolute;top:6px;right:6px;width:18px;height:18px;border-radius:9px;
+    display:flex;align-items:center;justify-content:center;font-size:12px;color:rgba(46,42,36,.55)}
+  .cap{font-family:var(--mono);font-size:10px;color:#8A7F6C;margin-top:8px;letter-spacing:.04em}
 </style>
 </head>
 <body>
-<h1>注音外挂几何</h1>
-<p class="sub">v1.9.54 · 主字恒居格心 · <b>基线一笔不歪</b> · 拼音只做格顶的浅灰小标签（≤25% 正文）</p>
+<h1>朱砂注音 · 宣纸浮签</h1>
+<p class="sub">v1.9.55 · 拼音 25%→<b>30%</b>、灰→<b>朱砂 0xB0342C</b> · 浮签扔黑底改<b>宣纸 94% 半透</b>、钉天头</p>
 
+<h2>一 · 正文里的朱砂拼音</h2>
 <div class="grid" id="grid"></div>
 
 <table>
@@ -65,42 +87,77 @@
 </table>
 
 <p class="note">
-几何账：竖排 <code>格高 = 1.176 × 字号</code>，主字墨高约 <code>0.86 × 字号</code>，
-居中后顶上只剩 <code>(格高 − 0.86×字号) / 2</code> 的净空（10 列 ≈ 4.1px）。
-拼音墨高 <code>= 0.25 × 字号 × 0.78 ≈ 0.166 × 格高</code>，故 10/12/14 列各比净空高出
-<b>0.7–1.0px</b>；屏幕上行盒的半个行距还会再吃掉约 1px，<b>实际压边 2–3px（≈11% 格高）</b>。
-这是 25% 上限下无法再让的硬账——但标签只从<b>本格顶</b>往下长，而上一字的墨迹底
-离它自己的格底还有 13.4% 的空当，两者差着一个完整字格的 13%，<b>永远够不到上一字</b>。
-8 列格宽，净空 7.96px，反而富余 1.71px。
+拼音与句读是**同一支朱砂**（`RUBY_INK = 0xB0342C`，就是句读红点那只色），
+但**格内分层**：拼音只活在格顶 30% 以内，句读的心钉在 <code>0.72 格高</code>、
+半径约 0.15 → 上沿 0.57 格高。中间隔着 27% 格高的空白，两红永远糊不到一起
+（断言：<code>pinyin_ink_stays_clear_of_the_punct_zone</code>）。
+<!-- 下面每个格子里那颗朱点就是句读，可以直观看到两红之间的距离 -->
+格子里那颗朱点即句读（非标点字为示意）。30% 的拼音比 25% 那版大 20%，
+10/12/14 列压边 1.5–2.0px，屏上再吃半行距，实感约 2.5–3px——仍在你许可的
+「顶端轻微溢出」之内，且上一字墨底离格顶还有 13.4% 空当，够不到。
+</p>
+
+<h2>二 · 注音浮签（新）</h2>
+<div class="stage">
+  <div class="bandmt"></div>
+  <div class="bandlabel">天头 96px（版框以上，全是空白）</div>
+  <div class="col" style="left:120px">達視其所</div>
+  <div class="col" style="left:164px">不取五</div>
+  <div class="col" style="left:208px">侯曰先</div>
+  <div class="col" style="left:252px">君召生</div>
+  <div class="col" style="left:296px">魏成而</div>
+  <!-- 浮签：钉在天头里，横向跟着点击处 -->
+  <div class="card" style="left:252px;top:10px;width:236px;padding:8px">
+    <div class="x">×</div>
+    <div class="row" style="height:42.5px">
+      <div style="font-size:34px;color:var(--zhu);line-height:1">huáng</div>
+      <div style="font-size:26px;color:var(--ink);line-height:1">瑲</div>
+    </div>
+    <div style="height:15px;margin-top:3px;font-size:11.5px;color:#6E6455;
+         display:flex;align-items:center;line-height:1">玉声也</div>
+  </div>
+</div>
+<div class="cap">236 × 76.5px　·　整张卡落在天头带内（上下各留 6px）·　横向以点击处为心</div>
+
+<p class="note">
+**三行信息，一个不多**：朱砂拼音 34px（限宽自动缩，16 起）、本字 26px 墨色、
+一行首义 11.5px 淡墨。旧的「注音浮签」标题、「生僻字 · 竖排注音」、「第 35 葉 ·
+1 字」全部删除；角上只留一枚 18px 的「×」。
 <br>
-最关键的是那串朱色虚线短刻：<b>它穿过全部五格的正中心，一格都没偏</b>——
-v1.9.53 的「主字让位」会让第 1、3、5 格的字整体下沉，这串刻线立刻就歪了。
-现在注释有无，主字都在同一个格心、同一个字号。
+**底色**：<code>theme.paper()</code> 94% 不透明 + 纸墨兑 12% 的细边 + <code>shadow_lg</code>。
+GPUI 0.2.2 没有 backdrop blur，所谓毛玻璃就是「半透纸色 + 亮边 + 阴影」这三件，
+留 6% 透光——底下字隐约可见，又不糊住朱砂。深色主题下 <code>paper()</code> 自动变深，
+浮签跟着走，不会突然出现一块白纸。
+<br>
+**落位**：① 天头带（纸面上缘→版框上缘，高 <code>margin_top</code>）→ ② 地脚带 →
+③ 锚点上方。天头只有 96px（默认档 <code>content_h × 0.12</code>），而竖排三行要 130px，
+故改成「拼音 + 本字」同排、释义另起一行（共 76.5px）；满屏档天头 72px 时自动砍掉释义行，
+只剩 58.5px 的主行，仍钉在天头里。三档留白的落位与「绝不压正文」都有单测钉死。
 </p>
 
 <script>
 // 真实实测几何（画布 1320 宽 / 竖排 / 4% 页边 / 天头 78）
 const COLS = [
-  { cols: 8,  cw: 86.87, ch: 43.43, body: 32.00, py: 8.00, band: 13.03, bw: 14.40,
-    head: 7.96,  ink: 6.24 },
-  { cols: 10, cw: 61.00, ch: 30.50, body: 25.92, py: 6.48, band: 9.15,  bw: 11.66,
-    head: 4.10,  ink: 5.05 },
-  { cols: 12, cw: 55.51, ch: 27.75, body: 23.59, py: 5.90, band: 8.32,  bw: 10.62,
-    head: 3.73,  ink: 4.60 },
-  { cols: 14, cw: 46.97, ch: 23.48, body: 19.96, py: 4.99, band: 7.04,  bw: 8.98,
-    head: 3.16,  ink: 3.89 },
+  { cols: 8,  cw: 86.87, ch: 43.43, body: 32.00, py: 9.60, band: 13.03, bw: 17.28,
+    head: 7.96,  ink: 7.49 },
+  { cols: 10, cw: 61.00, ch: 30.50, body: 25.92, py: 7.78, band: 9.15,  bw: 14.00,
+    head: 4.10,  ink: 6.07 },
+  { cols: 12, cw: 55.51, ch: 27.75, body: 23.59, py: 7.08, band: 8.32,  bw: 12.74,
+    head: 3.73,  ink: 5.52 },
+  { cols: 14, cw: 46.97, ch: 23.48, body: 19.96, py: 5.99, band: 7.04,  bw: 10.78,
+    head: 3.16,  ink: 4.67 },
 ];
 
 // 五格：有注音 / 无注音交替——基线必须一条直线穿过去
 const CELLS = [
-  { ch: '猛', py: 'měi' },
-  { ch: '日', py: null },
-  { ch: '幢', py: 'chuáng' },
-  { ch: '月', py: null },
-  { ch: '玄', py: 'xuán' },
+  { ch: '猛', py: 'měi', dot: true },
+  { ch: '日', py: null,  dot: true },
+  { ch: '幢', py: 'chuáng', dot: false },
+  { ch: '月', py: null,  dot: true },
+  { ch: '玄', py: 'xuán', dot: false },
 ];
 
-const S = 3.0; // 放大 3 倍（真机 1px → 预览 3px）
+const S = 3.0; // 放大 3 倍
 
 const grid = document.getElementById('grid');
 for (const c of COLS) {
@@ -134,17 +191,23 @@ for (const c of COLS) {
     t.style.fontSize = c.body * S + 'px';
     t.textContent = cell.ch;
     d.appendChild(t);
+    if (cell.dot) {
+      const dd = document.createElement('div');
+      dd.className = 'dot';
+      const r = Math.max(c.body * 0.35 * 0.5, 2.2) * S;
+      dd.style.cssText += `width:${r}px;height:${r}px;left:${c.cw * 0.72 * S - r / 2}px;` +
+                          `top:${c.ch * 0.72 * S - r / 2}px;`;
+      d.appendChild(dd);
+    }
     strip.appendChild(d);
   });
 
-  // 每格中心的短刻线（朱），串起来就是那一根「列气」
   CELLS.forEach((_, i) => {
     const tick = document.createElement('div');
     tick.className = 'tick';
     tick.style.cssText += `left:${w * 0.5 - 10}px;top:${h * i + h * 0.5}px;width:20px;`;
     strip.appendChild(tick);
   });
-  // 一条细朱线把五格中心连起来（证明一条直线）
   const base = document.createElement('div');
   base.className = 'base';
   base.style.cssText += `left:${w * 0.5}px;top:${h * 0.5}px;height:${h * (CELLS.length - 1)}px;`;
