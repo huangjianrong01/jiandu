@@ -559,10 +559,15 @@ fn draw_ruby(
     let rl = crate::ruby::layout(py, fs as f32, cell_w as f32, cell_h as f32);
     // 逐字竖排落笔：每字按其 `glyph_xy` 落进右侧空当的 `fs×fs` 小格，
     // 字形在小格内居中（与屏幕位图、`ruby::glyph_xy` 逐字同位）。
+    // 绝对裁剪：整字若会画到字格下缘之外，直接跳过（与屏幕 `.overflow_hidden()` 同效）。
     for (i, c) in py.chars().enumerate() {
         let (gx, gy) = rl.glyph_xy(i); // 相对字格左上
+        let gy = gy as f64;
+        if gy + rl.fs as f64 > cell_h + 0.5 {
+            continue; // 越界裁剪，绝不画到格子外面（用户「Clip」要求）
+        }
         let cx = x + gx as f64 + rl.fs as f64 * 0.5; // 小格中心 x
-        let ty = y + gy as f64; // 小格顶（盒顶，y 向下）
+        let ty = y + gy; // 小格顶（盒顶，y 向下）
         b.glyph_at(
             c,
             cx,

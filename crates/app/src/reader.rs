@@ -7680,9 +7680,10 @@ impl Root {
         };
 
         // ── 注音（生僻字拼音 / 多字夹注）─────────────────────────
-        // 最终态（v1.9.51）：古籍双行夹注形态——带注音的字**贴字格左缘**排，注音作一摞
-        // **竖排小字**排在主字右侧的空当里（多字拆成双列竖排）。短注音 55%、多字 45%，
-        // 字号随正文字号自适应；整块垂直居中于字格、绝不与主字粘连、绝不压右边界栏。
+        // 最终态（v1.9.52）：带注音的字**贴字格左缘**排，注音作一摞**竖排小字**排在主字
+        // 右侧的空当里。**拼音 = 单列小尾巴**（字母自上而下堆叠）、字号 ≤ 主字 40%；
+        // **CJK 多字注记 = 双列竖排**（短 55% / 多 45%）。整块垂直居中、绝不粘连、
+        // 绝不压右边界栏；超出字格由 `.overflow_hidden()` 裁剪。
         // 颜色锁死朱砂红 `#8C2B22`、透明度 0.75（朱砂微微晕染宣纸的透气感，详见
         // `ruby_glyph.rs`）。GPUI 没有排版引擎，整摞竖排小字走 `ruby_glyph`：CoreGraphics
         // 离屏按 `ruby::layout` 的 `glyph_xy` 度量（**不旋转**）渲成透明位图，再用 `img`
@@ -7701,12 +7702,20 @@ impl Root {
                         .top(px(rl.top))
                         .w(px(rl.block_w))
                         .h(px(rl.block_h))
+                        // 绝对裁剪：注音再长也绝不画到小尾巴框外（用户「Clip」要求）。
+                        .overflow_hidden()
                         .child(gpui::img(im).w(px(rl.block_w)).h(px(rl.block_h))),
                 );
             } else {
                 // 退化（非 macOS 无 CoreGraphics）：逐字竖排小字，按 `glyph_xy`
                 // 落位——与 macOS 位图、PDF 同一套几何，绝不横排、绝不越界。
-                let mut ruby = div().absolute().left(px(0.0)).top(px(0.0));
+                let mut ruby = div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .w(px(cell_w))
+                    .h(px(cell_h))
+                    .overflow_hidden();
                 for (i, ch) in py.chars().enumerate() {
                     let (gx, gy) = rl.glyph_xy(i);
                     ruby = ruby.child(
