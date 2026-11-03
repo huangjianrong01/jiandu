@@ -2272,7 +2272,7 @@ impl CollationWorkspace {
                     // 「吃原图」这一套抽到 `ingest_source`，一键笺校的自动装配
                     // （`load_book_auto`）也走同一份，绝不两套逻辑。
                     if let Some(entity) = this.upgrade() {
-                        entity.update(&mut app, |this, cx| {
+                        let _ = entity.update(&mut app, |this, cx| {
                             this.ingest_source(path, cx);
                         });
                     }

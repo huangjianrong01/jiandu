@@ -3373,7 +3373,7 @@ impl Root {
             .unwrap_or(false);
         // ③ 把数据灌进工作台实体（常驻 Entity，跨会话复用同一份）。
         let collation = self.collation.clone();
-        collation.update(cx, |ws, cx| {
+        let _ = collation.update(cx, |ws, cx| {
             ws.load_book_auto(source_path, text, has_image, cx);
         });
         // ④ 切到笺校模态：`Root::render` 见 `AppMode::Collation` 直接返回工作台，
@@ -3612,7 +3612,30 @@ impl Root {
                 }
                 MenuIntent::Collation => {
                     self.ensure_window(cx);
-                    self.mode = AppMode::Collation;
+                    // 直接拉起工作台，并自动载入「最近读过的那本」——避免空工作台
+                    // 还得用户自己点【替换当前书籍】。一本都没读过则载入第一本
+                    // （有内容可校）；书架也空着才落到空工作台（此时【替换当前
+                    // 书籍】就是入口）。`enter_collation` 内部已置 `mode=Collation`。
+                    let target = self
+                        .library
+                        .books
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| e.last_read > 0)
+                        .max_by_key(|(_, e)| e.last_read)
+                        .map(|(i, _)| i)
+                        .or_else(|| {
+                            if self.library.books.is_empty() {
+                                None
+                            } else {
+                                Some(0)
+                            }
+                        });
+                    if let Some(idx) = target {
+                        self.enter_collation(idx, cx);
+                    } else {
+                        self.mode = AppMode::Collation;
+                    }
                 }
                 MenuIntent::OpenRecent(idx) => {
                     self.ensure_window(cx);
