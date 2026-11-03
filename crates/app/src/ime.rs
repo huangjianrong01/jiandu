@@ -364,11 +364,14 @@ impl<V: EntityInputHandler> IntoElement for InputField<V> {
 }
 
 impl<V: EntityInputHandler> Element for InputField<V> {
-    type RequestLayoutState = gpui::AnyElement;
+    type RequestLayoutState = ();
     type PrepaintState = ();
 
     fn id(&self) -> Option<ElementId> {
-        Some(ElementId::Name(SharedString::from("jiandu-input-field")))
+        // 不给固定 id：让 GPUI 每帧按位置派发新 id，强制重测尺寸——
+        // 否则滚动容器测一次旧内容高就缓存，正文变长也不滚（纯文本编辑器
+        // 「滚不动」的根之一）。焦点 / IME 走 `focus` 句柄与 `bounds`，不靠 id。
+        None
     }
 
     fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
@@ -382,10 +385,16 @@ impl<V: EntityInputHandler> Element for InputField<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        // 布局缓存命中时本帧不会再走这里，兜一个空元素避免 panic。
-        let mut child = self.child.take().unwrap_or_else(|| div().into_any_element());
-        let layout_id = child.request_layout(window, cx);
-        (layout_id, child)
+        // ⚠️ **不再 `take` 子元素**：GPUI 的 `overflow_y_scroll` 会对同一子元素
+        // 测两次尺寸（无约束取内容高、有约束放位置）。旧实现 `take` 后第二次
+        // 拿到 `None`、回退零高度空 div → 滚动容器误判内容 0 高（不滚）、
+        // `paint` 拿不到 bounds（IME 不注册、点击全落空）。现在子元素常驻
+        // `self.child`，prepaint / paint 直接复用，布局幂等、尺寸恒真。
+        let layout_id = match self.child.as_mut() {
+            Some(c) => c.request_layout(window, cx),
+            None => div().into_any_element().request_layout(window, cx),
+        };
+        (layout_id, ())
     }
 
     fn prepaint(
@@ -393,13 +402,15 @@ impl<V: EntityInputHandler> Element for InputField<V> {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
-        child: &mut Self::RequestLayoutState,
+        _state: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
         // 登记焦点句柄：window.focus 之后，派发树上才有本元素的节点。
         window.set_focus_handle(&self.focus, cx);
-        child.prepaint(window, cx);
+        if let Some(c) = self.child.as_mut() {
+            c.prepaint(window, cx);
+        }
     }
 
     fn paint(
@@ -407,7 +418,7 @@ impl<V: EntityInputHandler> Element for InputField<V> {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        child: &mut Self::RequestLayoutState,
+        _state: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
@@ -426,7 +437,9 @@ impl<V: EntityInputHandler> Element for InputField<V> {
             ElementInputHandler::new(bounds, self.view.clone()),
             cx,
         );
-        child.paint(window, cx);
+        if let Some(c) = self.child.as_mut() {
+            c.paint(window, cx);
+        }
     }
 }
 

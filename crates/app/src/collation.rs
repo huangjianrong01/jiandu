@@ -2943,7 +2943,12 @@ impl CollationWorkspace {
         self.text = text;
         // 毛坯文本：供【原文对照】展示。重新进书时清空旧值，避免上一本的
         // 脏数据残留到这一本（没图的书 raw 来自重新解析源文件）。
-        self.raw_text = raw_text;
+        // ⚠️ 纯文本模式（无图、`source_path` 非 PDF/PNG 或为空）时上游传来的
+        // `raw` 是 `None`——若不兜底，【原文对照】/【清洗日志】按钮会 `has=false`
+        // 被禁用、点击直接 early-return（用户实测「点了没反应」）。这里退化为
+        // 「与正文同源」，至少让按钮可点、面板有内容；有真实 Raw 时（PDF / 手选
+        // MD）上游给的 `raw` 优先，做真·Raw↔Clean 对照。
+        self.raw_text = raw_text.or_else(|| Some(self.text.clone()));
         self.show_diff = false;
         self.cursor = 0;
         self.selection = None;

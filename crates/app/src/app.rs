@@ -3331,9 +3331,12 @@ impl Root {
                 // 「设 true → 几何变 → 再设 true」的重绘死循环。单向触发是
                 // 硬规矩。
                 let leaves = self.paginate();
-                let leaf_chars = leaves.get(self.page).map_or(0, |g| g.len());
-                self.focus_mode = leaf_chars > 0;
-                self.bar_shown = false;
+                // v1.9.62：开书**默认不进专注模式**——否则纸面贴满屏幕四条边
+                // （`fit_sizes` 里 `pad=0`、无环绕天地），用户一眼看不到刻本该
+                // 有的「天宽地窄」天地留白；叠加默认大字(zoom=1.6)更显满屏。
+                // 专注模式改为顶栏一枚手动开关，想要满屏巨字沉浸感自己点。
+                self.focus_mode = false;
+                self.bar_shown = true;
                 self.close_transient_ui();
                 self.screen = Screen::Reading;
                 self.notice.clear();
