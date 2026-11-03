@@ -923,6 +923,10 @@ pub struct Root {
     pub note_boxes: Vec<crate::gloss::NoteBox>,
     /// 点注文弹出的放大卡片（None 表示未弹出）。
     pub note_zoom: Option<crate::gloss::NoteZoom>,
+    /// 浮签的**弹出序数**（v1.9.57）：`with_animation` 只在元素 id 变化时
+    /// 重播，而「点同一个生字两次」坐标一模一样、id 不变 → 第二次弹出没有
+    /// 滑入动效。每次弹签自增一次，id 必变，动效必播。
+    pub zoom_seq: u64,
     /// 右键 / 长按**用户自加夹注**弹出的「修改 / 删除」菜单（None 表示未弹出）。
     pub note_menu: Option<crate::gloss::NoteMenu>,
     /// 现代横笺的行高（由 fit_sizes 按可用高度均分 12 行算出，用来纵向铺满）。
@@ -1523,6 +1527,7 @@ impl Root {
             page_h: 480.0,
             note_boxes: Vec::new(),
             note_zoom: None,
+            zoom_seq: 0,
             note_menu: None,
             line_modern: 26.0,
             rename_test_done: false,

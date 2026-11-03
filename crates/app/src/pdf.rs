@@ -1089,25 +1089,16 @@ fn draw_punct(
 
 /// **双行夹注**：右列读在前、左列续后，两个半宽小列各占 50%。
 ///
-/// 几何全部取自阅读器 `ancient_gloss` 的同一批常量
-/// （`NOTE_PAD_RATIO` / `NOTE_EDGE_INSET` / `NOTE_PUNCT_RATIO` /
-/// `grid::GLOSS_HEAD_INSET`），故注文在 PDF 里的疏密与屏幕上逐字一致。
+/// 几何全部取自 `gloss::note_geom`（唯一源，v1.9.57）：小字 = 正文的严格
+/// 半字号、小字格 = 正文格的严格半格、行距 0、右列不短于左列。屏幕上
+/// （`reader::ancient_gloss`）读的是同一份，纸上的疏密才有意义。
 fn draw_gloss(b: &mut Brush, txt: &str, x: f64, y: f64, g: &PdfGeo, head: bool) {
-    let cell_w = g.cell_w as f64;
-    let row_h = g.cell_h as f64 * 0.5;
     let chars: Vec<char> = txt.chars().collect();
-    let nrows = chars.len().div_ceil(2).max(1);
-    let floor = if g.cols >= 10 { 10.0 } else { 7.0 };
-    // ★ 与屏幕同一个字号比（v1.9.56）：此前 PDF 写死 0.5、屏幕 0.62，
-    //   同一本书印出来小字比屏幕小两成，疏密也对不上。现在两边都取
-    //   `GLOSS_FS_RATIO`，屏幕上看着舒服的注文，印出来就是那个样子。
-    let nfs = ((g.fs as f64 * crate::reader::GLOSS_FS_RATIO as f64).max(floor))
-        .min((row_h * crate::reader::GLOSS_FS_MAX_OF_ROW as f64).max(7.0));
-    let pad = cell_w * crate::gloss::NOTE_PAD_RATIO as f64;
-    let inset = cell_w * crate::gloss::NOTE_EDGE_INSET as f64;
-    // 两列之间的呼吸缝（v1.9.56）：与屏幕 `ancient_gloss` 同一常量、同一算法。
-    let gap = ((cell_w * crate::gloss::NOTE_CHAR_GAP as f64).clamp(0.8, 2.2) as f64).max(0.0);
-    let sub_w = (cell_w - pad - inset * 2.0 - gap) * 0.5;
+    let ng = crate::gloss::note_geom(&chars, g.cell_w, g.cell_h, g.fs);
+    let nrows = ng.rows().max(1);
+    let nfs = ng.fs as f64;
+    let sub_w = ng.sub_w as f64;
+    let row_h = ng.row_h as f64;
     let block_h = crate::grid::ceil_to_cells(nrows as f32 * g.cell_h * 0.5, g.cell_h) as f64;
     // 列首夹注允许略降（缩进量不许超过取整让出的空当，否则注文被裁）；
     // 非列首给 1.5px 呼吸（与屏幕 `NOTE_TOP_BREATH` 同源）。
@@ -1121,8 +1112,8 @@ fn draw_gloss(b: &mut Brush, txt: &str, x: f64, y: f64, g: &PdfGeo, head: bool) 
     // 整块夹注会糊成黑团（v1.28.0）。
     let pfs = nfs * crate::gloss::NOTE_PUNCT_RATIO as f64;
     for r in 0..nrows {
-        // 右列读在前、左列续后 → 先落左列（第 r+rows 个）、再落右列（第 r 个）。
-        let pair = [chars.get(r + nrows).copied(), chars.get(r).copied()];
+        // 右列读在前、左列续后 → 先落左列（第 r+right 个）、再落右列（第 r 个）。
+        let pair = [chars.get(r + ng.right).copied(), chars.get(r).copied()];
         for (k, c) in pair.iter().enumerate() {
             let Some(c) = c else { continue };
             let ch = crate::types::bracket_to_quote(*c);
@@ -1131,9 +1122,11 @@ fn draw_gloss(b: &mut Brush, txt: &str, x: f64, y: f64, g: &PdfGeo, head: bool) 
             } else {
                 nfs
             };
+            // 两格紧挨着：左格贴界栏、右格右缘落在正文列中轴线上，
+            // 合起来恰好一个正文列宽（`sub_w × 2 == cell_w`）。
             b.glyph_in(
                 ch,
-                x + pad + inset + k as f64 * (sub_w + gap),
+                x + k as f64 * sub_w,
                 y + head_inset + r as f64 * row_h,
                 sub_w,
                 row_h,

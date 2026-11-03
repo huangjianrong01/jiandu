@@ -174,7 +174,12 @@ pub fn piece_units(p: &Piece) -> usize {
 /// 的 `grid::ceil_to_cells`）与命中层（`note_boxes_in_column`）都用同一口径，
 /// 故「排版账」与「画面」永不脱节。
 pub fn gloss_units(text: &str) -> usize {
-    text.chars().count().div_ceil(2).div_ceil(2) * 2
+    // v1.9.57：行数取 `note_split` 的**右列字数**（避头尾可能把左列首的
+    // 收束标点搬回右列 → 右列多一行）。分页、渲染、命中三处必须同一口径，
+    // 否则注块会比预约的半格账高出一截、把后面的正文顶出版框。
+    let chars: Vec<char> = text.chars().collect();
+    let (right, left) = note_split(&chars);
+    right.max(left).div_ceil(2) * 2
 }
 
 /// 卷首题署预留行数：把「书名·卷次 + 1 行间隔 + 署名」的字符数收敛成
@@ -760,28 +765,99 @@ pub fn layout_book_streaming<F, E>(
     }
 }
 
-/// 双行夹注块的左侧留白比（占宿主字格宽的比例）。
+/// 双行夹注的**字号**：正文的严格一半（半字号）。
 ///
-/// **v1.25.0 起为 0**：用户要求双行夹注「严格执行双行小字排版，宽度各占
-/// 50%」。原先留 1/6 空白、两小列挤在余下 5/6 里，小字偏右、左右不等宽，
-/// 一眼能看出注块没对齐界行；现在两列各自占**正中间的一半**，注块与正文
-/// 列同宽同界，行气才接得上。
-pub const NOTE_PAD_RATIO: f32 = 0.0;
+/// v1.9.57 定稿。此前为「屏幕上看得清」一路放到 0.57~0.62，两列各占半宽
+/// 之后，小字反而把半个格塞满、与界栏只剩一线。GB/T 15834 与《古籍整理
+/// 规范》对双行小注的口径都是**半字号**：小字 = 正文 50%，一格 = 正文
+/// 半格，两列合起来正好铺满一列。
+pub const NOTE_FS_OF_BODY: f32 = 0.5;
 
-/// 注块**两侧**各留这么点空隙（占正文列宽的比例）。
+/// 双行夹注的**字格**：宽高各为正文格的一半（`cell_w/2 × cell_h/2`）。
 ///
-/// 双行小字贴着界栏排会「糊」在栏线上——小字的墨迹几乎顶到界行，远看像
-/// 栏线变粗了一截。故左右各让出一丁点（5%），小字仍然居中、仍然与正文
-/// 列同宽同界，只是不再蹭着栏线。留白是**两侧对称**的，不改注块中线。
-pub const NOTE_EDGE_INSET: f32 = 0.05;
+/// 宽 50% → 两列密排正好一个正文列宽，注块与正文列**同宽同界**；
+/// 高 50% → 行距为 0（上一字的下缘即下一字的上缘），一行正文的高度
+/// 恰好容纳两枚小字。
+pub const NOTE_CELL_OF_BODY: f32 = 0.5;
 
-/// 双行小字**两列之间**的呼吸缝（占正文列宽的比例）——v1.9.56 新增。
+/// 双行夹注的几何账（唯一源 · v1.9.57）。
 ///
-/// 用户原话：「双行小字太挤了，字与字之间、夹注与正文之间完全没有呼吸
-/// 空间」。两块小字原先各占 50%、紧挨着排，左列的右缘与右列的左缘之间
-/// 只隔 0 px，远看是一整片灰；这一道缝（12 列约 1.9px）把它们分成两列，
-/// 又不至于宽到让注块散架。缝从 `sub_w` 里扣，总宽仍恒等于一个正文列。
-pub const NOTE_CHAR_GAP: f32 = 0.035;
+/// 排版的三条硬账（用户据 clreq / GB/T 定稿）：
+///   * **字号**：`fs = body_fs × 0.5`，一格 = 正文半格，绝不撑宽；
+///   * **两列各半**：右列宽 = 左列宽 = `cell_w/2`，**行距 0**，块宽恒等于
+///     一个正文列（`sub_w × 2 == cell_w`），故整体天然与正文列居中；
+///   * **长度平衡**：右列（读在前）`ceil(n/2)` 起，且恒 **≥** 左列。
+///
+/// 屏幕（`reader::ancient_gloss`）与 PDF（`pdf::draw_gloss`）都只读这一份，
+/// 两处各算一次必然走偏。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteGeom {
+    /// 小字字号（正文 × 0.5）。
+    pub fs: f32,
+    /// 单个小字的格宽（正文格宽 × 0.5）。
+    pub sub_w: f32,
+    /// 单个小字的格高（正文格高 × 0.5；行距 0）。
+    pub row_h: f32,
+    /// 右列字数（读在前，块高由它决定）。
+    pub right: usize,
+    /// 左列字数（恒 ≤ `right`）。
+    pub left: usize,
+}
+
+impl NoteGeom {
+    /// 块占几行（= 右列字数；左列不会更长）。
+    pub fn rows(&self) -> usize {
+        self.right.max(self.left)
+    }
+    /// 两列小字自身的净高（未向上取整到整字格）。
+    pub fn content_h(&self) -> f32 {
+        self.rows() as f32 * self.row_h
+    }
+}
+
+/// 一条注文切成**右列 / 左列**的断点（纯函数）。
+///
+/// 竖排右先左后：右列读在前，左列续后。规则按优先级：
+///   ① **长度平衡**（用户硬要求）：左列绝不可长于右列 —— `div_ceil` 起手，
+///      右列恒 `≥` 左列，后续调整只准 **往右列搬字**；
+///   ② **避头**：左列首字不得是收束型标点（`。，、；：？！」』）】` 等），
+///      遇到就把该字归给右列（右列变长，平衡仍然成立）；
+///   ③ **避尾**：右列末字不得是开启型标点（`「『（【《` 等）——让给左列，
+///      但**只在让完仍然平衡时**才让（否则守 ① 而让 ③，刻本也这么将就）。
+///
+/// 返回 `(右列字数, 左列字数)`，两者之和恒等于注文字数。
+pub fn note_split(chars: &[char]) -> (usize, usize) {
+    let n = chars.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let mut right = n.div_ceil(2);
+    // ② 避头：左列（或右列内部换行）不得以收束标点起头。
+    while right < n && is_head_prohibited(chars[right]) {
+        right += 1;
+    }
+    // ③ 避尾：右列末字若是开启型标点，尽量推到左列——让完仍须
+    //    `left ≤ right`（`cand ≥ n - cand`），否则宁可留它在右列末。
+    if right > 1 && is_tail_prohibited(chars[right - 1]) {
+        let cand = right - 1;
+        if cand >= n - cand {
+            right = cand;
+        }
+    }
+    (right, n - right)
+}
+
+/// 按正文格几何算出双行夹注的全部度量（纯函数，可断言）。
+pub fn note_geom(chars: &[char], cell_w: f32, cell_h: f32, body_fs: f32) -> NoteGeom {
+    let (right, left) = note_split(chars);
+    NoteGeom {
+        fs: body_fs * NOTE_FS_OF_BODY,
+        sub_w: cell_w * NOTE_CELL_OF_BODY,
+        row_h: cell_h * NOTE_CELL_OF_BODY,
+        right,
+        left,
+    }
+}
 
 /// 注入块与上一字之间的**呼吸缝**（px，只在「取整让出的空当」够时才给）——
 /// v1.9.56 新增。
@@ -1006,8 +1082,8 @@ pub fn jodu_of(c: char, mode: PunctMode) -> Option<Jodu> {
 /// `li = text_cols - 1 - i`。
 /// 列内高度按「正文每字 `cell_h`、夹注块 `ceil(n/2) * cell_h/2`」
 /// 自上而下累计（与分页同源的半格账）。
-/// bbox 同步左侧留白（见 `NOTE_PAD_RATIO`）：命中区只覆盖真正
-/// 排了小字的部分，空白纸面不误触。
+/// bbox 就是**整块字格**：v1.9.57 起两列各占半宽、行距 0，注块的总宽
+/// 严格等于一个正文列（见 `note_geom`），不再有左右留白可扣。
 /// `west_mode` 必须与分页 / 渲染取同一个值：西文成组时一段数字只占
 /// `run_cells` 格，逐字算会把下面的注块命中区整体下移。
 pub fn note_boxes_in_column(
@@ -1017,10 +1093,8 @@ pub fn note_boxes_in_column(
     cell_h: f32,
     west_mode: bool,
 ) -> Vec<NoteBox> {
-    let row_h = cell_h / 2.0;
-    // 命中区与视觉同源：左缘留白 + 两侧细隙之内才是小字真正落墨的地方。
-    let pad = cell_w * NOTE_PAD_RATIO;
-    let inset = cell_w * NOTE_EDGE_INSET;
+    let row_h = cell_h * NOTE_CELL_OF_BODY;
+    // 命中区与视觉同源：两列各占半个正文格、行距 0，故 bbox 就是整块字格。
     let mut y = 0.0f32;
     let mut out = Vec::new();
     let mut idx = 0usize;
@@ -1060,9 +1134,9 @@ pub fn note_boxes_in_column(
                 // 与渲染 / 分页同口径：注块高取整到整格（v1.56.0）。
                 let h = gloss_units(text) as f32 * row_h;
                 out.push(NoteBox {
-                    x: li as f32 * cell_w + pad + inset,
+                    x: li as f32 * cell_w,
                     y,
-                    w: cell_w - pad - inset * 2.0,
+                    w: cell_w,
                     h,
                     text: text.clone(),
                     page: 0,
@@ -1267,9 +1341,9 @@ pub struct ZCell {
 /// 竖排单列：正文与左小列 x 均为 0，右小列 x = `col_w/2`；
 /// y 游标自 0 起，正文每字推 `row_h`，注文块推 `ceil(n/2) × row_h/2`。
 pub fn z_layout(text: &str, col_w: f32, row_h: f32, fs: f32) -> Vec<ZCell> {
-    let sub_w = col_w / 2.0;
-    let sub_row = row_h / 2.0;
-    let nfs = fs * 0.5;
+    let sub_w = col_w * NOTE_CELL_OF_BODY;
+    let sub_row = row_h * NOTE_CELL_OF_BODY;
+    let nfs = fs * NOTE_FS_OF_BODY;
     let mut out: Vec<ZCell> = Vec::new();
     let mut y = 0.0f32; // 列内游标
     let mut seq = 0usize;
@@ -1293,7 +1367,9 @@ pub fn z_layout(text: &str, col_w: f32, row_h: f32, fs: f32) -> Vec<ZCell> {
             }
             Seg::Note(t) => {
                 let chars: Vec<char> = t.chars().collect();
-                let half = chars.len().div_ceil(2); // 右小列（读在前）的字数
+                // 右小列（读在前）的字数——与渲染同源（`note_split`：平衡 +
+                // 避头尾），改这里就是改屏幕与 PDF。
+                let (half, _left) = note_split(&chars);
                 let anchor = y; // 注块紧跟宿主字之后起排
                 for (i, ch) in chars.iter().enumerate() {
                     let right = i < half; // 竖排右先左后
@@ -2150,13 +2226,10 @@ mod tests {
         // 第二个注块：又排了一个正文字 + 一个整格注块。
         assert!((boxes[1].y - (51.0 + 51.0 + 51.0)).abs() < 0.01);
         assert!((boxes[1].h - 51.0).abs() < 0.01);
-        // 宽 = 列宽 − 左侧留白 − 两侧细隙（见 NOTE_PAD_RATIO / NOTE_EDGE_INSET）；
-        // x = 列序 li × 列宽 + 留白 + 左隙。
-        let pad = 46.0 * NOTE_PAD_RATIO;
-        let inset = 46.0 * NOTE_EDGE_INSET;
-        assert!((boxes[0].w - (46.0 - pad - inset * 2.0)).abs() < 0.01);
-        assert!((boxes[0].x - (2.0 * 46.0 + pad + inset)).abs() < 0.01);
-        assert!(inset > 0.0, "小字两侧要留出一线之隔，别贴着界栏");
+        // v1.9.57：两列各占半宽、行距 0，命中盒就是**整块正文列**
+        //（宽 = 列宽，x = 列序 × 列宽），与视觉严丝合缝。
+        assert!((boxes[0].w - 46.0).abs() < 0.01, "命中盒宽度不是整列");
+        assert!((boxes[0].x - 2.0 * 46.0).abs() < 0.01);
         assert_eq!(boxes[0].text, "甲乙");
         assert_eq!(boxes[1].text, "丙丁戊己");
     }
@@ -2164,17 +2237,84 @@ mod tests {
     #[test]
     fn note_boxes_reverse_order_for_vertical_text() {
         // 竖排读序列号 i=0 在最右 → flex_row 从左数的 li = text_cols-1-i，
-        // 渲染侧传进来的 li 越大 x 越大：最右列 x = (text_cols-1)*cell_w
-        //（再往后偏一个左侧留白）。
+        // 渲染侧传进来的 li 越大 x 越大：最右列 x = (text_cols-1)*cell_w。
         let col = vec![Piece::Gloss("注".into(), NoteSource::Original, ghost())];
         let (cell_w, cell_h) = (50.0, 55.0);
         let text_cols = 4;
         let rightmost = note_boxes_in_column(&col, text_cols - 1, cell_w, cell_h, true);
         let leftmost = note_boxes_in_column(&col, text_cols - 1 - 3, cell_w, cell_h, true);
-        let pad = cell_w * NOTE_PAD_RATIO + cell_w * NOTE_EDGE_INSET;
-        assert!((rightmost[0].x - (3.0 * cell_w + pad)).abs() < 0.01);
-        assert!((leftmost[0].x - pad).abs() < 0.01);
+        assert!((rightmost[0].x - 3.0 * cell_w).abs() < 0.01);
+        assert!(leftmost[0].x.abs() < 0.01);
         assert!(rightmost[0].x > leftmost[0].x);
+    }
+
+    /// v1.9.57 双行夹注几何铁律（用户据 clreq / GB/T 定稿）：
+    /// ① 字号 = 正文 50%；② 每个小字格 = 正文格 50%（两列正好铺满一列）；
+    /// ③ 左列绝不长于右列；④ 块宽恒等于一个正文列（整体与正文列居中）。
+    #[test]
+    fn note_geometry_is_half_size_and_balances() {
+        for (cols, cell_w, cell_h, fs) in [
+            (8usize, 86.87f32, 43.43f32, 32.00f32),
+            (10, 61.00, 30.50, 25.92),
+            (12, 55.51, 27.75, 23.59),
+            (14, 46.97, 23.48, 19.96),
+        ] {
+            for len in [1usize, 2, 3, 7, 12, 41] {
+                let chars: Vec<char> = "名者實之賓也故曰無名天地之始有名萬物之母".chars().cycle().take(len).collect();
+                let g = note_geom(&chars, cell_w, cell_h, fs);
+                assert!((g.fs - fs * 0.5).abs() < 1e-4, "{cols} 列注文字号不是半字号");
+                assert!((g.sub_w - cell_w * 0.5).abs() < 1e-4, "{cols} 列小字格宽不是半格");
+                assert!((g.row_h - cell_h * 0.5).abs() < 1e-4, "{cols} 列小字格高不是半格");
+                // 两列拼起来 = 一个正文列：既「密排」又「整体居中」。
+                assert!((g.sub_w * 2.0 - cell_w).abs() < 1e-3, "{cols} 列注块宽不等于正文列");
+                // 行距 0：块净高 = 行数 × 半格高，没有任何额外的行间隔。
+                assert!((g.content_h() - g.rows() as f32 * cell_h / 2.0).abs() < 1e-3);
+                // 长度平衡：左行绝不长于右行。
+                assert!(g.left <= g.right, "{cols} 列 len={len}：左列 {} 长于右列 {}", g.left, g.right);
+                assert_eq!(g.left + g.right, len, "分列丢字");
+            }
+        }
+    }
+
+    /// 一个正文字格恰好横下两个小字（50% 账），不多不少。
+    #[test]
+    fn two_note_chars_fit_exactly_one_body_cell() {
+        let g = note_geom(&['甲', '乙'], 55.51, 27.75, 23.59);
+        assert_eq!((g.right, g.left), (1, 1));
+        assert!((g.sub_w * 2.0 - 55.51).abs() < 1e-3);
+        assert!((g.content_h() - 27.75 / 2.0).abs() < 1e-3);
+    }
+
+    /// 避头：左列首字不得是收束型标点——遇到就把该字归给右列。
+    #[test]
+    fn note_split_never_opens_the_left_line_with_closing_punct() {
+        let chars: Vec<char> = "甲乙，丙".chars().collect(); // n=4 → 右 2 / 左 2，左首是「，」
+        let (right, left) = note_split(&chars);
+        assert!(right >= 3, "「，」仍落在左列首：right={right}");
+        assert!(left <= right, "避头让步破坏了长度平衡");
+        // 归位后左列首字必不是避头类。
+        let left_head = chars[right];
+        assert!(!is_head_prohibited(left_head), "左列首 {left_head} 仍是避头标点");
+    }
+
+    /// 避尾与「左行不得长于右行」冲突时——**平衡优先**（用户硬要求 ③）。
+    /// 开启型标点落在右列末时，若让给左列会让左列反超，就留在原处；
+    /// 这条锁死优先级，防止后来者为了避尾把两行的长短关系弄反。
+    #[test]
+    fn note_split_prefers_balance_over_tail_kinsoku() {
+        let chars: Vec<char> = "甲乙「丙丁".chars().collect(); // n=5 → 右 3（末字「）
+        let (right, left) = note_split(&chars);
+        assert_eq!((right, left), (3, 2));
+        assert!(left < right, "左行不得长于右行");
+    }
+
+    #[test]
+    fn note_split_is_stable_for_plain_text() {
+        let chars: Vec<char> = "名者實之賓也".chars().collect();
+        let (right, left) = note_split(&chars);
+        assert_eq!((right, left), (3, 3));
+        assert_eq!(note_split(&[]), (0, 0));
+        assert_eq!(note_split(&['注']), (1, 0));
     }
 
     #[test]
