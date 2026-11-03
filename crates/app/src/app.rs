@@ -524,6 +524,15 @@ pub struct Root {
     /// 位置改写（`bar_wants_show` / `BAR_HOT` / `BAR_GAP` 已删）。只有专注
     /// 模式会在渲染层把整块顶栏撤下。
     pub bar_shown: bool,
+    /// 专注模式「呼吸锚点」的呼吸相位（v1.9.59）。
+    ///
+    /// 锚点是一枚极淡的圆点，平时随这个计数缓慢明灭，提示「这里能唤出顶栏」。
+    /// `ensure_anchor_heartbeat` 每隔一拍把它加一并通知重绘，`with_animation`
+    /// 据不同的 id 重播出一段无缝的呼吸循环。
+    pub anchor_beat: u32,
+    /// 呼吸锚点的心跳任务是否已在跑（v1.9.59）。避免重复 spawn：只在
+    /// 「专注且顶栏收起」时跑，顶栏一出或退出专注即自停。
+    pub anchor_pulsing: bool,
     /// 字号缩放系数（A-/A+ 调节；配合视口铺满使用）。
     pub zoom: f32,
     /// 点字查字面板当前查询的字（None 表示未打开）。
@@ -767,15 +776,6 @@ pub struct Root {
     /// 只影响边框渲染层（外框恒四边 3px，变的只是内层 1px 细线画哪几边），
     /// 字格与界行一个像素不动；PDF 由 `PdfGeo::frame_style` 取同一个值。
     pub frame_style: crate::types::FrameStyle,
-    /// 一叶正文的**占位图**（浮签「就近避让」的碰撞依据 · v1.9.58）。
-    ///
-    /// 每帧由 `reader::render_leaf` 写入：每列排了多少**半格**。浮签定位时
-    /// 据它算出「哪些列、排到多高」，其余即空白。两个槽位分别对应对开的
-    /// 左半叶 / 右半叶（单叶只用右槽）。
-    pub leaf_ink: Rc<Cell<[Option<crate::reader::InkFill>; 2]>>,
-    /// 每叶**版心（界行区）**在窗口里的矩形，prepaint 时由探针写入。
-    /// 与 `page_rect` 同一套路：它是渲染帧的输出，不参与排版。
-    pub leaf_grid: [RectProbe; 2],
     /// **当前纸面（整幅双叶）在窗口内容区里的矩形** (x, y, w, h)。
     ///
     /// 由阅读视图里一枚**不绘制任何东西**的测量探针在 prepaint 时写入
@@ -932,10 +932,6 @@ pub struct Root {
     pub note_boxes: Vec<crate::gloss::NoteBox>,
     /// 点注文弹出的放大卡片（None 表示未弹出）。
     pub note_zoom: Option<crate::gloss::NoteZoom>,
-    /// 浮签的**弹出序数**（v1.9.57）：`with_animation` 只在元素 id 变化时
-    /// 重播，而「点同一个生字两次」坐标一模一样、id 不变 → 第二次弹出没有
-    /// 滑入动效。每次弹签自增一次，id 必变，动效必播。
-    pub zoom_seq: u64,
     /// 右键 / 长按**用户自加夹注**弹出的「修改 / 删除」菜单（None 表示未弹出）。
     pub note_menu: Option<crate::gloss::NoteMenu>,
     /// 现代横笺的行高（由 fit_sizes 按可用高度均分 12 行算出，用来纵向铺满）。
@@ -1411,6 +1407,8 @@ impl Root {
             page_frozen: None,
             focus_mode: false,
             bar_shown: true,
+            anchor_beat: 0,
+            anchor_pulsing: false,
             zoom: 1.0,
             lookup: None,
             lookup_key: None,
@@ -1485,8 +1483,6 @@ impl Root {
             frame_style: prefs.frame_style(),
             share_card_rect: None,
             page_rect: Rc::new(Cell::new(None)),
-            leaf_ink: Rc::new(Cell::new([None, None])),
-            leaf_grid: [Rc::new(Cell::new(None)), Rc::new(Cell::new(None))],
             popup: None,
             entity_card: None,
             more_open: false,
@@ -1538,7 +1534,6 @@ impl Root {
             page_h: 480.0,
             note_boxes: Vec::new(),
             note_zoom: None,
-            zoom_seq: 0,
             note_menu: None,
             line_modern: 26.0,
             rename_test_done: false,
@@ -3335,6 +3330,56 @@ impl Root {
                 self.notice = format!("打开失败：{e}");
             }
         }
+    }
+
+    /// **一键笺校**（v1.9.59）：从书架直达笺校工作台，并把这本书的正文与原图
+    /// （若有）**焊死**灌进工作台——绝不要求用户再点一次导入。
+    ///
+    /// 数据链完全打通：书架条目 → `source_path`（原图）/ `load_book_for`（正文）
+    /// → `CollationWorkspace::load_book_auto`。有 PDF / PNG 原图就左图右文，
+    /// 无图（纯文本 / 内置样张）就纯文本全屏模式。
+    pub fn enter_collation(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.library.books.get(idx).cloned() else {
+            return;
+        };
+        // ① 正文（ParsedDoc 纯文本）：流式书走 chapters.db，老书走一次性读取。
+        let text = match Self::load_book_for(&entry) {
+            Ok(book) => {
+                let mut s = String::new();
+                for ch in &book.chapters {
+                    for p in &ch.paragraphs {
+                        if !s.is_empty() {
+                            s.push('\n');
+                        }
+                        s.push_str(&p.text);
+                    }
+                }
+                s
+            }
+            Err(e) => {
+                eprintln!("[jiandu] 一键笺校：正文加载失败（{}）：{}", entry.title, e);
+                String::new()
+            }
+        };
+        // ② 原图（PDF / PNG）路径：只认这两种可栅格化的格式。
+        let source_path = entry.source_path.clone();
+        let has_image = source_path
+            .as_ref()
+            .and_then(|p| p.extension().and_then(|e| e.to_str()))
+            .map(|s| {
+                let s = s.to_lowercase();
+                s == "pdf" || s == "png"
+            })
+            .unwrap_or(false);
+        // ③ 把数据灌进工作台实体（常驻 Entity，跨会话复用同一份）。
+        let collation = self.collation.clone();
+        collation.update(cx, |ws, cx| {
+            ws.load_book_auto(source_path, text, has_image, cx);
+        });
+        // ④ 切到笺校模态：`Root::render` 见 `AppMode::Collation` 直接返回工作台，
+        //    不构建阅读器，对阅读零影响。
+        self.mode = AppMode::Collation;
+        cx.notify();
     }
 
     /// 「版字」面板当前页签（0 版式 / 1 装帧 / 2 校勘）。

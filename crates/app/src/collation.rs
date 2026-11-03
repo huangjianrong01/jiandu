@@ -549,6 +549,11 @@ pub struct CollationWorkspace {
     /// **掩注开关**（v1.9.54，Cmd+N）：竖排预览 / 导出时剥掉括注（夹注）小字，
     /// 只留正文。纯派生状态——`text` 一个字都不动，故随时能切回来。
     hide_gloss: bool,
+    /// **纯文本模式**（v1.9.59，一键笺校）：本书没有可栅格化的原图（PDF/PNG），
+    /// 左栏原图区隐藏、右栏正文全屏，顶栏提示「纯文本模式」。
+    pure_text_mode: bool,
+    /// **替换确认**（v1.9.59）：点【替换当前书籍】若已有校对内容，先弹此确认框。
+    replace_confirm: bool,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -732,6 +737,8 @@ impl CollationWorkspace {
             ai_panel,
             ai_open: false,
             hide_gloss: false,
+            pure_text_mode: false,
+            replace_confirm: false,
         };
         // 启动即清扫上一进程遗留的临时图（崩溃 / 强退时 `Drop` 跑不到，只能等下次
         // 启动补扫）。只认本应用自己的命名前缀，且只删「够旧」的，绝不误伤另开的
@@ -1679,7 +1686,8 @@ impl CollationWorkspace {
             )
             .child(div().w(px(18.0)))
             // 两个「渠道」并排在最左（用户口径：打开文件与导入 MD 合并到左侧）。
-            .child(self.ghost_button("打开文件", |c, _, _, cx| c.open_image_picker(cx), cx))
+            // 「替换当前书籍」：已有校对内容时先弹确认框，避免误覆盖（见 `replace_book`）。
+            .child(self.ghost_button("替换当前书籍", |c, _, _, cx| c.replace_book(cx), cx))
             .child(self.ghost_button("导入 MD", |c, _, _, cx| c.open_text_picker(cx), cx))
             // **批量导入**（v1.9.25）：一次选多个 PDF / 图片，排进识别队列。
             // 与「打开文件」的区别不是选几份，而是**选完不立刻渲染**——它只是
@@ -2253,130 +2261,189 @@ impl CollationWorkspace {
         // executor，块内同步调用 pick_file；绝不过 background_executor（会静默 None）。
         cx.spawn(
             |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
-            // AsyncApp 是 Clone：把「借用的上下文」换成「owned 句柄」，
-            // async move 块才能安全持有它跨 await（借用不能进 'static future）。
-            let mut app = app.clone();
-            async move {
-            let picked = rfd::FileDialog::new()
-                .set_title("选择原图（PDF / PNG）")
-                .add_filter("原图 (PDF / PNG)", &["pdf", "png"])
-                .add_filter("全部文件", &["*"])
-                .pick_file();
-            let Some(path) = picked else { return };
-
-            // 1) 文本层坐标抽取：**主线程同步执行**。PDFKit / Foundation 的 objc 调用
-            //    必须在主线程（且 autorelease pool 已在本函数内部包裹，见 pdf_text.rs）。
-            //    与栅格化解耦：先点亮左侧真实区域框，不阻塞 UI。
-            if let Some(entity) = this.upgrade() {
-                let _ = entity.update(&mut app, |this, cx| {
-                    // 真实坐标映射：带文本层的 PDF 用 PDFKit 抽出的文本层坐标替换 Mock；
-                    // 无文本层（扫描图 / 位图）extract 返回空 → 清空 Mock，避免高亮落
-                    // 在错误位置，由状态栏提示需 OCR。
-                    //
-                    // ⚠️ 产品边界（用户 2026-11-01 定）：扫描版 PDF **只渲染、不报错、
-                    //    不崩溃**。这里走的就是这条路——`regions` 清空（没有任何坐标），
-                    //    `image_error` 显式置 None（**不是**错误），底部状态栏挂一条
-                    //    「需 OCR」的提示（见 `image_note` 的渲染处），底图照常栅格化
-                    //    显示、照常翻页、照常导出。用户看到的是「这本书能看，只是没法
-                    //    自动定位」，而不是一个红叉。
-                    let real = crate::pdf_text::extract_pdf_text_regions(&path);
-                    // 换原图 = 上一次框选的待补文字作废（它属于旧图的坐标与文字）。
-                    this.pick_from = None;
-                    this.pick_rect = None;
-                    this.pick_text = None;
-                    this.pick_hits = 0;
-                    if !real.is_empty() {
-                        this.regions = real;
-                        this.image_error = None;
-                        this.image_note = None;
-                    } else {
-                        this.regions.clear();
-                        this.image_error = None; // 绝不把「无文本层」当错误报
-                        this.image_note = Some(
-                            "该原图无文本层（扫描图），只作底图显示，无法坐标映射——需 OCR"
-                                .to_string(),
-                        );
+                let mut app = app.clone();
+                async move {
+                    let picked = rfd::FileDialog::new()
+                        .set_title("选择原图（PDF / PNG）")
+                        .add_filter("原图 (PDF / PNG)", &["pdf", "png"])
+                        .add_filter("全部文件", &["*"])
+                        .pick_file();
+                    let Some(path) = picked else { return };
+                    // 「吃原图」这一套抽到 `ingest_source`，一键笺校的自动装配
+                    // （`load_book_auto`）也走同一份，绝不两套逻辑。
+                    if let Some(entity) = this.upgrade() {
+                        entity.update(&mut app, |this, cx| {
+                            this.ingest_source(path, cx);
+                        });
                     }
-                    cx.notify();
-                });
-            }
-
-            // 2) 最耗时的栅格化（CG 绘制该页）放到后台 executor，避免阻塞 UI；
-            //    完成后回主线程写入内存位图等字段。
-            //
-            //    画布多大的依据是左栏**实际设备像素**（`left_px`，render 每帧刷新）。
-            //    这里读一次快照带进后台：即便窗口在栅格化途中变了尺寸，本页也用
-            //    一个稳定的目标，不会算出半个画布。
-            let target_px = this
-                .upgrade()
-                .and_then(|e| e.read_with(&app, |this, _| this.left_px).ok())
-                .unwrap_or(0.0);
-            let bg = app.background_executor().clone();
-            let raster_path = path.clone();
-            let result = bg
-                .spawn(async move { rasterize_source(&raster_path, 1, target_px) })
-                .await;
-
-            if let Some(entity) = this.upgrade() {
-                let _ = entity.update(&mut app, |this, cx| {
-                    match result {
-                        Ok(r) => {
-                            // 删除上一张临时栅格化图（绝不碰用户原文件）。
-                            if let Some(old) = this.last_temp.take() {
-                                let _ = std::fs::remove_file(&old);
-                            }
-                            // PDF 页走内存位图，位图原图走文件路径——两者互斥。
-                            // 旧位图挪进 `image_gc` 等下一帧释放纹理。
-                            if let Some(old) = this.image_mem.take() {
-                                this.image_gc.push(old);
-                            }
-                            this.image_mem = r.image;
-                            this.image_path = r.path;
-                            this.last_temp = r.temp;
-                            // 记录原图自然像素尺寸（PDF 点），供真实坐标映射缩放使用。
-                            this.src_nat_w = r.nat_w as f32;
-                            this.src_nat_h = r.nat_h as f32;
-                            // 多页翻页的凭据：只有真 PDF 才记路径（位图原图翻不动）。
-                            let is_pdf = path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .map(|s| s.eq_ignore_ascii_case("pdf"))
-                                .unwrap_or(false);
-                            this.pdf_path = if is_pdf { Some(path.clone()) } else { None };
-                            // 换书 → 旧书的页缓存全部作废：页码在另一本书里毫无
-                            // 意义，留着就是拿别家的图冒充这一页。
-                            this.pdf_cache.clear();
-                            this.prefetch_busy = false;
-                            this.pdf_pages = r.total.max(1);
-                            this.pdf_page = r.page;
-                            // 换原图 = 之前联动的段 / 框全部作废（属于旧图坐标）。
-                            this.active_para_idx = None;
-                            this.active_line = None;
-                            this.match_note = None;
-                            this.left_scroll
-                                .set_offset(Point::new(px(0.0), px(0.0)));
-                            this.image_error = None;
-                            // 若此前因无文本层已设 OCR 提示则保留；否则用栅格化 note。
-                            if this.image_note.is_none() {
-                                this.image_note = r.note;
-                            }
-                            // 原生对话框刚关 → 强制重建输入焦点（见 `refocus`）。
-                            this.refocus = true;
-                            // 第 1 页已经在屏幕上：顺手把第 2 页热进缓存，用户第一次
-                            // 按 → 就是零等待（这也是「打开书就想往下看」的常见路径）。
-                            this.prefetch_pdf_page(2, cx);
-                        }
-                        Err(e) => {
-                            this.image_error = Some(e);
-                            this.image_note = None;
-                        }
-                    }
-                    cx.notify();
-                });
-            }
-        }
-        })
+                }
+            },
+        )
         .detach();
+    }
+
+    /// **替换当前书籍**（v1.9.59）：点【替换当前书籍】的入口。已有校对内容时
+    /// 先弹确认框，避免误覆盖；空工作台则直接进文件选择。
+    fn replace_book(&mut self, cx: &mut Context<Self>) {
+        if !self.text.is_empty() || self.image_path.is_some() || self.image_mem.is_some() {
+            self.replace_confirm = true;
+            cx.notify();
+        } else {
+            self.open_image_picker(cx);
+        }
+    }
+
+    /// **吃原图的核心**（v1.9.59）：给定一份原图（PDF / PNG / 位图）路径，
+    /// ① 主线程同步抽取 PDF 文本层坐标（无文本层则清空 regions 并提示需 OCR）；
+    /// ② 后台栅格化（CG 绘制该页），完成后回主线程写入内存位图等字段。
+    ///
+    /// `open_image_picker`（手动选文件）与 `load_book_auto`（一键笺校自动装配）
+    /// 共用这一份，保证两条入口行为完全一致。
+    fn ingest_source(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // ① 文本层坐标抽取（主线程同步）：带文本层的 PDF 用真实坐标替换 Mock，
+        //    无文本层（扫描图 / 位图）extract 返回空 → 清空 Mock，避免高亮落
+        //    在错误位置，由状态栏提示需 OCR。
+        //
+        //    ⚠️ 产品边界（用户 2026-11-01 定）：扫描版 PDF **只渲染、不报错、
+        //    不崩溃**——`regions` 清空、`image_error` 显式置 None（**不是**错误），
+        //    底部状态栏挂一条「需 OCR」的提示，底图照常渲染。
+        let real = crate::pdf_text::extract_pdf_text_regions(&path);
+        // 换原图 = 上一次框选的待补文字作废（它属于旧图的坐标与文字）。
+        self.pick_from = None;
+        self.pick_rect = None;
+        self.pick_text = None;
+        self.pick_hits = 0;
+        if !real.is_empty() {
+            self.regions = real;
+            self.image_error = None;
+            self.image_note = None;
+        } else {
+            self.regions.clear();
+            self.image_error = None; // 绝不把「无文本层」当错误报
+            self.image_note = Some(
+                "该原图无文本层（扫描图），只作底图显示，无法坐标映射——需 OCR"
+                    .to_string(),
+            );
+        }
+        cx.notify();
+        // ② 最耗时的栅格化（CG 绘制该页）放到后台 executor，避免阻塞 UI；
+        //    完成后回主线程写入内存位图等字段。
+        let target_px = self.left_px;
+        cx.spawn(
+            move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    let bg = app.background_executor().clone();
+                    let raster_path = path.clone();
+                    let result =
+                        bg.spawn(async move { rasterize_source(&raster_path, 1, target_px) })
+                            .await;
+                    if let Some(entity) = this.upgrade() {
+                        let _ = entity.update(&mut app, |this, cx| {
+                            match result {
+                                Ok(r) => this.apply_raster(r, &path, cx),
+                                Err(e) => {
+                                    this.image_error = Some(e);
+                                    this.image_note = None;
+                                }
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// 把栅格化结果写进工作台字段（左图各状态），并热进第 2 页缓存。
+    fn apply_raster(&mut self, r: Rasterized, path: &Path, cx: &mut Context<Self>) {
+        // 删除上一张临时栅格化图（绝不碰用户原文件）。
+        if let Some(old) = self.last_temp.take() {
+            let _ = std::fs::remove_file(&old);
+        }
+        // PDF 页走内存位图，位图原图走文件路径——两者互斥。
+        // 旧位图挪进 `image_gc` 等下一帧释放纹理。
+        if let Some(old) = self.image_mem.take() {
+            self.image_gc.push(old);
+        }
+        self.image_mem = r.image;
+        self.image_path = r.path;
+        self.last_temp = r.temp;
+        // 记录原图自然像素尺寸（PDF 点），供真实坐标映射缩放使用。
+        self.src_nat_w = r.nat_w as f32;
+        self.src_nat_h = r.nat_h as f32;
+        // 多页翻页的凭据：只有真 PDF 才记路径（位图原图翻不动）。
+        let is_pdf = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.eq_ignore_ascii_case("pdf"))
+            .unwrap_or(false);
+        self.pdf_path = if is_pdf { Some(path.to_path_buf()) } else { None };
+        // 换书 → 旧书的页缓存全部作废：页码在另一本书里毫无意义。
+        self.pdf_cache.clear();
+        self.prefetch_busy = false;
+        self.pdf_pages = r.total.max(1);
+        self.pdf_page = r.page;
+        // 换原图 = 之前联动的段 / 框全部作废（属于旧图坐标）。
+        self.active_para_idx = None;
+        self.active_line = None;
+        self.match_note = None;
+        self.left_scroll.set_offset(Point::new(px(0.0), px(0.0)));
+        self.image_error = None;
+        // 若此前因无文本层已设 OCR 提示则保留；否则用栅格化 note。
+        if self.image_note.is_none() {
+            self.image_note = r.note;
+        }
+        // 原生对话框刚关 → 强制重建输入焦点（见 `refocus`）。
+        self.refocus = true;
+        // 第 1 页已经在屏幕上：顺手把第 2 页热进缓存，用户第一次按 → 就是零等待。
+        self.prefetch_pdf_page(2, cx);
+    }
+
+    /// **一键笺校自动装配**（v1.9.59）：把书架那本书的正文与原图**焊死**灌进工作台，
+    /// 绝不要求用户再点一次导入。
+    ///
+    /// `has_image` 为真且 `source_path` 是 PDF / PNG 时左图右文；否则纯文本全屏模式。
+    pub fn load_book_auto(
+        &mut self,
+        source_path: Option<PathBuf>,
+        text: String,
+        has_image: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // 重置与「上一本书」相关的全部状态（文本 / 图像 / 联动 / 翻页缓存）。
+        self.text = text;
+        self.cursor = 0;
+        self.selection = None;
+        self.marked = None;
+        self.active_line = None;
+        self.active_para_idx = None;
+        self.match_note = None;
+        if let Some(old) = self.last_temp.take() {
+            let _ = std::fs::remove_file(&old);
+        }
+        if let Some(old) = self.image_mem.take() {
+            self.image_gc.push(old);
+        }
+        self.image_mem = None;
+        self.image_path = None;
+        self.pdf_path = None;
+        self.pdf_cache.clear();
+        self.regions.clear();
+        self.image_error = None;
+        self.left_scroll.set_offset(Point::new(px(0.0), px(0.0)));
+        self.preview_page = 0;
+        if has_image {
+            self.pure_text_mode = false;
+            if let Some(p) = source_path {
+                self.ingest_source(p, cx);
+            }
+        } else {
+            self.pure_text_mode = true;
+            self.image_note = Some("纯文本模式：本书无原图，仅显示正文".to_string());
+        }
+        cx.notify();
     }
 
     /// 导入 Markdown / 纯文本（.md / .markdown / .txt）到右侧编辑器。
@@ -3642,12 +3709,14 @@ impl CollationWorkspace {
     /// 右侧 60%：竖排预览工具条 + 原生编辑器。
     fn render_right(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
         let editor = self.render_editor(vw, cx);
+        // 纯文本模式：右栏占满整屏（无左图），否则占 60%。
+        let right_w = if self.pure_text_mode { vw } else { vw * 0.6 };
         // 原先这里还有一条**自己的**小工具条（导入 MD / 竖排预览）。v1.9.22
         // 把它并进全局那条——两栏各顶一条色带，看起来像两套软件拼在一起。
         // 现在整屏只有一条工具条，右栏从第一行字就是稿纸。
         div()
             .relative()
-            .w(px(vw * 0.6))
+            .w(px(right_w))
             .h_full()
             .flex()
             .flex_col()
@@ -4745,7 +4814,8 @@ impl Render for CollationWorkspace {
             let s = window.scale_factor();
             if s.is_finite() && s > 0.0 { s } else { 1.0 }
         };
-        let left_px = vw * 0.4 * backing;
+        // 纯文本模式（一键笺校进无图的书）：没有左栏原图，栅格化目标宽度归零。
+        let left_px = if self.pure_text_mode { 0.0 } else { vw * 0.4 * backing };
         // 左栏宽度变了（拉窗口 / 进全屏 / 挪到另一块屏）→ 缓存里那几页是按**旧**
         // 像素栅格化的，拉宽后照样贴上去就是糊的。这是缓存带来的新风险，必须显式
         // 兜住：超过 10% 才算「变宽」，像素级抖动不值得重栅格化。
@@ -4788,37 +4858,153 @@ impl Render for CollationWorkspace {
             .bg(rgb(PAPER_R))
             .track_focus(&self.preview_focus)
             .on_key_down(cx.listener(|c, event, window, cx| c.ws_key(event, window, cx)))
-            .child(self.render_header(cx))
-            .child(
-                // **视觉分割**（v1.9.24）：一条黑线都不要。
-                // 现在是「柔影（右纸的 shadow，见 render_right）+ 一根 5% 墨的
-                // 发丝线」：影子负责体积，发丝线只负责在 1x 屏上兜底——
-                // 没有那道线时，两块同族浅色在低对比屏上会糊成一片。
-                // 用绝对定位画线（不占布局），两栏仍是 40/60，不会因为多出
-                // 这 1px 而把右栏挤出去。
+            .child(self.render_header(cx));
+        // 纯文本模式：顶部一条静默提示（无原图，仅正文），不占交互。
+        if self.pure_text_mode {
+            root = root.child(
                 div()
-                    .relative()
+                    .w_full()
                     .flex()
-                    .flex_row()
-                    .flex_1()
-                    .child(self.render_left(vw, cx))
-                    .child(self.render_right(vw, cx))
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(0.0))
-                            .bottom(px(0.0))
-                            .left(px(vw * 0.4))
-                            .w(px(1.0))
-                            .bg(rgba(0x2B26200D)),
-                    ),
+                    .justify_center()
+                    .py(px(3.0))
+                    .bg(rgba(0x2B26200D))
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x9A9184))
+                    .child(SharedString::from("纯文本模式 · 本书无原图，仅显示正文")),
             );
+        }
+        root = root.child(
+            // **视觉分割**（v1.9.24）：一条黑线都不要。
+            // 现在是「柔影（右纸的 shadow，见 render_right）+ 一根 5% 墨的
+            // 发丝线」：影子负责体积，发丝线只负责在 1x 屏上兜底——
+            // 没有那道线时，两块同族浅色在低对比屏上会糊成一片。
+            // 用绝对定位画线（不占布局），两栏仍是 40/60，不会因为多出
+            // 这 1px 而把右栏挤出去。
+            div()
+                .relative()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .when(!self.pure_text_mode, |d| {
+                    d.child(self.render_left(vw, cx))
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(0.0))
+                                .bottom(px(0.0))
+                                .left(px(vw * 0.4))
+                                .w(px(1.0))
+                                .bg(rgba(0x2B26200D)),
+                        )
+                })
+                .child(self.render_right(vw, cx)),
+        );
         if self.show_preview {
             root = root.child(self.render_preview_overlay(vh, cx));
         }
         // 问小笺浮卡：压在预览之上（预览里也能接着问），点「收起」或 Esc 收。
         if self.ai_open {
             root = root.child(self.render_ai_card(vw, vh, cx));
+        }
+        // 替换当前书籍的「覆盖确认」浮层：压在最上，阻断误覆盖。
+        if self.replace_confirm {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba(0x14100A66))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|c, _, _, cx| {
+                            cx.stop_propagation();
+                            c.replace_confirm = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(14.0))
+                            .p(px(24.0))
+                            .bg(rgb(0xF3ECD9))
+                            .border_1()
+                            .border_color(rgb(0x9A6B4F))
+                            .rounded(px(4.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _, _, cx| {
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .text_color(rgb(0x2B2622))
+                                    .child(SharedString::from("替换当前书籍？")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(0x9A9184))
+                                    .child(SharedString::from(
+                                        "将覆盖当前正在校对的内容（原图与已标注的联动）。",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(12.0))
+                                    .child(
+                                        div()
+                                            .px(px(16.0))
+                                            .py(px(6.0))
+                                            .rounded(px(6.0))
+                                            .bg(rgb(0xA63A2B))
+                                            .cursor_pointer()
+                                            .text_size(px(12.5))
+                                            .text_color(rgb(0xFFFFFF))
+                                            .child(SharedString::from("确认替换"))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|c, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    c.replace_confirm = false;
+                                                    c.open_image_picker(cx);
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(16.0))
+                                            .py(px(6.0))
+                                            .rounded(px(6.0))
+                                            .border_1()
+                                            .border_color(rgb(0x9A6B4F))
+                                            .cursor_pointer()
+                                            .text_size(px(12.5))
+                                            .text_color(rgb(0x2B2622))
+                                            .child(SharedString::from("取消"))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|c, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    c.replace_confirm = false;
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    ),
+                            ),
+                    ),
+            );
         }
         root
     }

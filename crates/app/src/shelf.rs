@@ -2289,6 +2289,14 @@ impl Root {
                 ));
         } else {
             row = row
+                .child(link_button("一键笺校", CINNABAR).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.enter_collation(idx, cx);
+                        cx.notify();
+                    }),
+                ))
                 .child(link_button("归类", ink).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {

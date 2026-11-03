@@ -21,6 +21,11 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShelfEntry {
     pub path: PathBuf,
+    /// 导入时的**原始文件**路径（PDF / PNG / TXT / MD / EPUB 等）。
+    /// 「一键笺校」要用它把原图（PDF / PNG）直接喂给工作台，绝不要求重新导入；
+    /// 无图的书（纯文本 / 内置样张）为 `None`。旧存档缺此字段按 `None` 兼容。
+    #[serde(default)]
+    pub source_path: Option<PathBuf>,
     pub title: String,
     #[serde(default)]
     pub author: String,
@@ -757,6 +762,7 @@ impl Library {
         };
         self.books.push(ShelfEntry {
             path: dst,
+            source_path: Some(src.to_path_buf()),
             title: book.title.clone(),
             author: book.author.clone(),
             accent,
@@ -822,6 +828,7 @@ impl Library {
         };
         self.books.push(ShelfEntry {
             path: dst,
+            source_path: Some(src.to_path_buf()),
             title: book.title.clone(),
             author: book.author.clone(),
             accent,
@@ -990,6 +997,7 @@ pub(crate) mod tests {
     fn entry(title: &str, author: &str, category: &str) -> ShelfEntry {
         ShelfEntry {
             path: PathBuf::from("x.json"),
+            source_path: None,
             title: title.to_string(),
             author: author.to_string(),
             accent: 0,

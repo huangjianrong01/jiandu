@@ -396,212 +396,6 @@ fn same_glyph(a: &Glyph, b: &Glyph) -> bool {
 }
 
 /// 一叶最多记住几列的占位（8/10/12/14 列都够，留一倍余量）。
-pub(crate) const INK_COLS_MAX: usize = 24;
-
-/// 一叶正文的**占位图**：每列排到了多高。
-///
-/// 浮签要「就近避让」，先得知道哪儿是字、哪儿是空白（v1.9.58）。竖排正文
-/// 逐列自上而下排，故一列只需记住「排了多少**半格**」，就能算出这一列从
-/// 版心上沿到列尾的墨迹矩形——列尾之下、版心之外自然都是空白。
-///
-/// 它是渲染帧的**输出**（`render_leaf` 写），浮签定位时读，不改任何排版
-/// 坐标，也不参与分页。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InkFill {
-    /// 每列已排的半格数（0 = 空列），自右（`i = 0`）向左，与 `Page::columns` 同序。
-    pub units: [u16; INK_COLS_MAX],
-    /// 本叶的**正文列数**（不含章题列）：列序 `i` 的横向位置靠它反算。
-    pub cols: usize,
-}
-
-/// 两个矩形是否相交（边界相接不算，留一线之隔）。
-fn rects_overlap(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
-    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
-}
-
-/// **注音纸条的落位**（纯函数，可断言）：**就近避让** —— 贴着被点的字，找
-/// 第一片放得下纸条、且不压任何字与界栏的空白。
-///
-/// 用户口径（v1.9.58 定调）：「不要硬飞到底部，也不要遮挡正文……在当前字的
-/// 上下左右 1 到 4 个字距的范围内，去找一个能够容纳浮签、且绝对不遮挡任何
-/// 正文汉字和界栏线的空白缝隙」。
-///
-/// 弹序（先近后远）：
-///   ① **当前列正下方**——列已排完，下方就是空白（最贴心的那一处）；
-///   ② **当前字正下方**——本列字未尽时，碰撞会否掉它；
-///   ③ **左右界栏外侧**——竖中对齐被点的字，探一探隔壁列空不空；
-///   ④ **由近及远扫各列**：空列 → 与字同高（最近）或贴列顶；半满列 → 贴其
-///      列尾。竖排的空白多在末叶／末章的短列旁，这一档才找得到；
-///   ⑤ **本列上下 1–4 字距**；
-///   ⑥ 最后才退到**天头 / 地脚**（版框之外的留白带；取离字更近的那条）。
-///
-/// 碰撞体有两类：**每列已排的墨迹**，以及**版框四周那圈框线**——后者保证
-/// 纸条绝不像旧版那样骑在下框线上。每一处候选都先夹进纸面与窗口（防越界）
-/// 再检测，整页真的挤满时返回 ⑥，**绝不回头压字**。
-///
-/// 参数（window 坐标）：
-///   * `paper` 纸面矩形；`viewport` 窗口宽高；`cell` 字格宽高；`card` 纸条宽高；
-///   * `glyph` 被点字的字格矩形；`art` 版心上沿 / 下沿的 y（界行的起止）；
-///   * `columns` **每列**的 `(列左缘 x, 已排高度)`，自左向右，0 高即空列。
-pub(crate) fn ruby_card_nearest(
-    paper: (f32, f32, f32, f32),
-    viewport: (f32, f32),
-    cell: (f32, f32),
-    card: (f32, f32),
-    glyph: (f32, f32, f32, f32),
-    art: (f32, f32),
-    columns: &[(f32, f32)],
-) -> (f32, f32) {
-    /// 纸条与字 / 界栏之间那道缝：留出来才看得出「它是另贴上去的一小条」。
-    const GAP: f32 = 6.0;
-    /// 纸条离纸边的安全距。
-    const INSET: f32 = 6.0;
-    /// 碰撞检测的**膨胀量**：字有墨晕，贴到笔画边上也算压字。
-    const BREATH: f32 = 2.0;
-    /// 版框（外粗内细）从版心再往外占的厚度：8 内衬 + 1 内线 + 3 外衬 + 3 外框。
-    const FRAME: f32 = 15.0;
-
-    let (px0, py0, pw, ph) = paper;
-    let (vw, vh) = viewport;
-    let (cell_w, cell_h) = cell;
-    let (cw, ch) = card;
-    let (gx, gy, gw, gh) = glyph;
-    let (art_top, art_bot) = art;
-    let (art_bot, art_h) = (art_bot.max(art_top), (art_bot - art_top).max(0.0));
-    let art_left = columns.first().map(|c| c.0).unwrap_or(gx);
-    let art_right = columns.last().map(|c| c.0 + cell_w).unwrap_or(gx + gw);
-
-    // 碰撞体：每列已排的墨迹 + 版框四周那圈框线。
-    let mut occupied: Vec<(f32, f32, f32, f32)> = columns
-        .iter()
-        .filter(|(_, h)| *h > 0.0)
-        .map(|(x, h)| (*x, art_top, cell_w, *h))
-        .collect();
-    occupied.push((px0, art_top - FRAME, pw, FRAME)); // 上框
-    occupied.push((px0, art_bot, pw, FRAME)); // 下框
-    occupied.push((art_left - FRAME, art_top, FRAME, art_h)); // 左框
-    occupied.push((art_right, art_top, FRAME, art_h)); // 右框
-
-    // 合法落位区间：纸条整张在纸内、且在窗内（防越界 · 用户第 4 条）。
-    let lo_x = (px0 + INSET).max(0.0);
-    let hi_x = ((px0 + pw - INSET - cw).min(vw - cw)).max(lo_x);
-    let lo_y = (py0 + INSET).max(0.0);
-    let hi_y = ((py0 + ph - INSET - ch).min(vh - ch)).max(lo_y);
-
-    // 落位判定：夹回合法区之后，是否与任何碰撞体相交。
-    let ok = |l: f32, t: f32| -> Option<(f32, f32)> {
-        let l = l.clamp(lo_x, hi_x);
-        let t = t.clamp(lo_y, hi_y);
-        let r = (l, t, cw, ch);
-        let hit = occupied.iter().any(|o| {
-            let fat = (
-                o.0 - BREATH,
-                o.1 - BREATH,
-                o.2 + BREATH * 2.0,
-                o.3 + BREATH * 2.0,
-            );
-            rects_overlap(r, fat)
-        });
-        if hit { None } else { Some((l, t)) }
-    };
-
-    let cx_g = gx + gw * 0.5;
-    let cy_g = gy + gh * 0.5;
-    // 被点字所在列（按字格中心 x 定位；找不到就当成独立一列）。
-    let ci = columns
-        .iter()
-        .position(|(x, _)| cx_g >= *x && cx_g <= *x + cell_w)
-        .unwrap_or(0);
-    let (colx, colh) = columns.get(ci).copied().unwrap_or((gx, cell_h));
-    let col_bottom = art_top + colh.max(cell_h);
-
-    let mut cands: Vec<(f32, f32)> = Vec::new();
-    // ① 当前列正下方（列已排完 → 这一处就是空白）。
-    cands.push((colx + (cell_w - cw) * 0.5, col_bottom + GAP));
-    cands.push((cx_g - cw * 0.5, col_bottom + GAP));
-    // ② 当前字正下方（本列字未尽时会被碰撞否掉）。
-    cands.push((cx_g - cw * 0.5, gy + gh + GAP));
-    // ③ 左右界栏外侧，竖中对齐当前字。
-    cands.push((colx - GAP - cw, cy_g - ch * 0.5));
-    cands.push((colx + cell_w + GAP, cy_g - ch * 0.5));
-    // ④ 由近及远扫各列（先左后右：竖排往左读，左边更顺）。
-    for d in 1..columns.len() {
-        let mut picks: Vec<usize> = Vec::new();
-        if let Some(j) = ci.checked_sub(d) {
-            picks.push(j);
-        }
-        if ci + d < columns.len() {
-            picks.push(ci + d);
-        }
-        for j in picks {
-            let (x, h) = columns[j];
-            if h <= 0.0 {
-                // 整列空着：尽量落在**这一整片空列的正中**——纸条比一个列宽
-                // 还宽（14 列时 62 > 46），贴着单列放必然骑界栏线；居中于
-                // 空列连片，跨的就只有最外侧那一道，甚至一道都不跨。
-                let mut a = j;
-                while a > 0 && columns[a - 1].1 <= 0.0 {
-                    a -= 1;
-                }
-                let mut b = j;
-                while b + 1 < columns.len() && columns[b + 1].1 <= 0.0 {
-                    b += 1;
-                }
-                let run_w = (b - a + 1) as f32 * cell_w;
-                let run_x = columns[a].0;
-                let l = if run_w >= cw + 2.0 {
-                    run_x + (run_w - cw) * 0.5
-                } else {
-                    x + (cell_w - cw) * 0.5
-                };
-                // 先试与字同高（视线不动），再试贴列顶。
-                cands.push((l, cy_g - ch * 0.5));
-                cands.push((l, art_top + GAP));
-            } else {
-                // 半满的列：贴它的列尾。
-                cands.push((x + (cell_w - cw) * 0.5, art_top + h + GAP));
-            }
-        }
-    }
-    // ⑤ 本列上下 1–4 字距。
-    for k in 1..=4usize {
-        let dy = k as f32 * cell_h;
-        cands.push((cx_g - cw * 0.5, gy - dy - GAP - ch));
-        cands.push((cx_g - cw * 0.5, gy + gh + dy + GAP));
-    }
-    for (l, t) in cands {
-        if let Some(p) = ok(l, t) {
-            return p;
-        }
-    }
-
-    // ⑥ 天头 / 地脚：版框之外的两条留白带，取离当前字更近的那条。
-    let top_lo = py0 + INSET;
-    let top_hi = art_top - FRAME - ch;
-    let bot_lo = art_bot + FRAME;
-    let bot_hi = py0 + ph - INSET - ch;
-    let band_top = (cx_g - cw * 0.5, top_lo + (top_hi - top_lo).max(0.0) * 0.5);
-    let band_bot = (cx_g - cw * 0.5, bot_lo + (bot_hi - bot_lo).max(0.0) * 0.5);
-    let d_top = (gy - top_lo).abs();
-    let d_bot = (bot_lo - gy).abs();
-    let bands = if d_bot < d_top {
-        [band_bot, band_top]
-    } else {
-        [band_top, band_bot]
-    };
-    for (l, t) in bands {
-        if let Some(p) = ok(l, t) {
-            return p;
-        }
-    }
-
-    // 极端兜底：窗口连一条留白带都容不下（纸条比窗口还高）。仍夹在画内，
-    // 至少让它看得见——这是唯一一处可能在物理上压到字的情形。
-    (
-        (cx_g - cw * 0.5).clamp(lo_x, hi_x),
-        (gy + gh + GAP).clamp(lo_y, hi_y),
-    )
-}
 
 /// 注文浮签的落位（纯函数，可断言）：**先钉天头，再退地脚，都不行才回锚点**。
 ///
@@ -1474,8 +1268,6 @@ impl Root {
         self.fit_sizes();
         // 占位图每帧重记（本帧的叶一渲染就写，见 `render_leaf`）；版心探针
         // 是 prepaint 写的，**不能在这里清**——清了本帧读到的永远是 None。
-        // 空槽由 `leaf_ink_at` 的「探针与占位图都在才算数」自然挡掉。
-        self.leaf_ink.set([None, None]);
         // 自动列数刚换过档（拉窗口跨了档）：几何已更新，此刻才能按新排版
         // 把阅读位置找回来，免得「拉一下窗口就跳到别处」。
         if let Some(anchor) = self.pending_anchor.take() {
@@ -1735,11 +1527,11 @@ impl Root {
                         // 抬起事件却一路冒到 body，且 body 只在正文上挂监听
                         // （顶栏是它的兄弟，不会被误伤）。
                         this.more_menu = false;
-                        if !this.focus_mode
-                            && uy > BAR_H
+                        if uy > BAR_H
                             && !(this.show_style || this.show_search || this.show_ai)
                         {
                             this.bar_shown = false;
+                            this.ensure_anchor_heartbeat(cx);
                         }
                         // ★ 天头眉批（v1.37.0）：按下落在天头 → 抬起就地开写。
                         //   必须排在最前：天头那一下不能翻页、不能弹工具条。
@@ -2013,11 +1805,12 @@ impl Root {
                 // 点纸面即收顶栏（v1.86.0）：天头是「要用才下来」的，点正文
                 // 就说明用户已经回到书里，栏该退回去。**点在栏身上不算**
                 // （y ≤ BAR_H 的空白处），否则点栏内的空当会把栏自己收掉。
-                if !this.focus_mode
-                    && event.position.y.to_f64() as f32 > BAR_H
+                // v1.9.59：专注模式同样适用（用户点正文 = 收起刚唤出的顶栏）。
+                if event.position.y.to_f64() as f32 > BAR_H
                     && !(this.show_style || this.show_search || this.show_ai)
                 {
                     this.bar_shown = false;
+                    this.ensure_anchor_heartbeat(cx);
                 }
                 // 导出收尾话看完即走：下一次点纸面就清（v1.52.3）。
                 this.toast = None;
@@ -2038,20 +1831,23 @@ impl Root {
         //      正在调字号，鼠标一往下，入口连同面板的「归属感」一起消失。
         root = root.on_mouse_move(cx.listener(
             |this, event: &MouseMoveEvent, _window, cx| {
+                let x = event.position.x.to_f64() as f32;
+                let y = event.position.y.to_f64() as f32;
+                // 顶栏显隐：两种模式都受天头悬停驱动（v1.9.59 专注模式也能唤出）。
+                let pinned = this.more_menu
+                    || this.show_style
+                    || this.show_search
+                    || this.show_ai;
+                let want = pinned
+                    || y <= BAR_HOT
+                    || (this.bar_shown && y <= BAR_H + BAR_GAP);
+                if this.bar_shown != want {
+                    this.bar_shown = want;
+                    // 顶栏刚收起且仍在专注：重启呼吸锚点心跳。
+                    this.ensure_anchor_heartbeat(cx);
+                    cx.notify();
+                }
                 if !this.focus_mode {
-                    let x = event.position.x.to_f64() as f32;
-                    let y = event.position.y.to_f64() as f32;
-                    let pinned = this.more_menu
-                        || this.show_style
-                        || this.show_search
-                        || this.show_ai;
-                    let want = pinned
-                        || y <= BAR_HOT
-                        || (this.bar_shown && y <= BAR_H + BAR_GAP);
-                    if this.bar_shown != want {
-                        this.bar_shown = want;
-                        cx.notify();
-                    }
                     this.probe_hover(x, y, cx);
                 }
             },
@@ -2059,15 +1855,14 @@ impl Root {
         // 键盘总入口不挂在这里：GPUI 只把按键派发给「焦点节点 → 根元素」这条
         // 路径上的监听器，而本函数是根元素的子层（见 app.rs 的 Render::render）。
 
-        if !self.focus_mode {
-            // 顶栏是**浮层**（绝对定位、贴顶、默认收到天头外），所以排在正文
-            // 之后画、盖在纸面之上；正文因此能一直铺到屏幕顶端。
-            root = root
-                .child(body)
-                .child(self.render_reading_status(total, cx))
-                .child(toolbar);
-        } else {
-            root = root.child(body);
+        // 顶栏：两种模式都渲染，只靠 `bar_shown` 决定滑出 / 收起。专注模式下
+        // 它默认收在天头外，靠「天头悬停 / 呼吸锚点 / Cmd+T·Esc」三管齐下唤出
+        // （见 v1.9.59 专注模式唤醒机制），绝不喧宾夺主。
+        root = root
+            .child(body)
+            .child(self.render_reading_status(total, cx))
+            .child(toolbar);
+        if self.focus_mode {
             // 退出专注：**右上角一枚极小的 ✕**（v1.9.36，用户点名改）
             //
             // 原来是左上角一枚 13px 的「退出专注」胶囊，纸底细框，压在天头
@@ -2077,7 +1872,8 @@ impl Root {
             //
             // 现在只留一个 20×20 的 ✕：不着底色、不描边框、平时是淡墨，
             // 鼠标拂过才转朱砂。退出还有三条路，都不必摸鼠标——
-            //   Esc、⌘Z（专注键本身）、再点一次「更多 → 專注」。
+            //   ⌘Z（专注键本身）、再点一次「更多 → 專注」、或右上角这枚 ✕。
+            //   （专注模式下 Esc 已被改作「唤出 / 收起顶栏」，见 v1.9.59）
             root = root.child(
                 div()
                     .id("focus-exit")
@@ -2100,10 +1896,17 @@ impl Root {
                         cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             this.focus_mode = false;
+                            // 退出专注：顶栏回到「贴顶露一息」的非专注态。
+                            this.bar_shown = true;
                             cx.notify();
                         }),
                     ),
             );
+            // 呼吸锚点（v1.9.59）：专注且顶栏收起时，天头正中一枚极淡的呼吸
+            // 圆点——触屏 / 全局备用入口，点一下即唤出顶栏。
+            if !self.bar_shown {
+                root = root.child(self.render_focus_anchor(cx));
+            }
         }
 
         // ---- 聽：阅读界面正下方一枚小图标（v1.9.41）----
@@ -2309,7 +2112,6 @@ impl Root {
         // 与避让，不影响正常交互（只在 `bubble` 为空时生效一次）。
         self.dev_lookup_once();
         self.dev_menu_once();
-        self.dev_ruby_once();
         // 内购相位轮询（v1.9.23）：StoreKit 的回调在别的栈里落，UI 每帧看一眼
         // 原子量有没有变；变了才 notify，不变什么都不做（否则自激）。
         self.poll_unlock(cx);
@@ -2715,8 +2517,25 @@ impl Root {
                         return;
                     }
 
-                    // ② Esc：退出专注模式，并收起全部浮层与选区。
+                    // ②′ ⌘T / Ctrl+T：一键切换顶栏显隐（v1.9.59 三管齐下之一）。
+                    //    专注模式下它把收起的顶栏唤出 / 收回；非专注模式同样可用，
+                    //    与天头悬停互为备份。不抢其它 ⌘ 组合的位置。
+                    if (k == "t" || k == "T") && (mods.platform || mods.control) {
+                        self.bar_shown = !self.bar_shown;
+                        self.ensure_anchor_heartbeat(cx);
+                        cx.notify();
+                        return;
+                    }
+
+                    // ② Esc：专注模式下先唤出 / 收起顶栏（v1.9.59 三管齐下之一）；
+                    //    非专注模式才走「退出专注 + 收浮层」旧逻辑。
                     if k == "escape" || k == "Escape" || k == "esc" {
+                        if self.focus_mode {
+                            self.bar_shown = !self.bar_shown;
+                            self.ensure_anchor_heartbeat(cx);
+                            cx.notify();
+                            return;
+                        }
                         self.focus_mode = false;
                         self.close_side();
                         self.show_style = false;
@@ -2852,7 +2671,14 @@ impl Root {
                 self.show_help = false;
                 if self.focus_mode {
                     self.close_transient_ui();
+                    // v1.9.59：进专注＝净室，顶栏先收起，露呼吸锚点待唤。
+                    self.bar_shown = false;
+                    self.ensure_anchor_heartbeat(cx);
+                } else {
+                    // 退出专注：顶栏回到「贴顶露一息」的非专注态。
+                    self.bar_shown = true;
                 }
+                cx.notify();
             }
             A::Cards => {
                 self.side_tab = SideTab::Note;
@@ -5293,6 +5119,95 @@ impl Root {
         bar.into_any_element()
     }
 
+    // ── 专注模式「呼吸锚点」心跳（v1.9.59）────────────────────────────
+    //
+    // 专注模式下顶栏默认收起，只留天头正中一枚极淡的呼吸圆点作唤出入口。
+    // 这颗点需要「活着」地明灭，但 GPUI 0.2.2 没有可循环的 with_animation，
+    // 故这里用一枚自终止的后台心跳：每 1.4s 翻转一次 `anchor_beat` 并通知
+    // 重绘，`render_focus_anchor` 据此重播出一段无缝呼吸。`anchor_pulsing`
+    // 充当「只跑一个」的闸门；顶栏一出或退出专注，下一拍检测即自行 break。
+    fn ensure_anchor_heartbeat(&mut self, cx: &mut Context<Self>) {
+        if self.anchor_pulsing || !self.focus_mode || self.bar_shown {
+            return;
+        }
+        self.anchor_pulsing = true;
+        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+            loop {
+                // GPUI 原生定时器（GPUI 把它自己的后台执行器上的 timer 直接
+                // 暴露出来，与 window.rs / img.rs 内部用法一致）。本任务跑在
+                // GPUI 后台执行器上，用这套 timer 才不会被挂起——tokio 的
+                // time 驱动不在这个执行器里，会永远 Pending 导致死锁。
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1400))
+                    .await;
+                let keep = this
+                    .update(&mut cx, |this, cx| {
+                        if this.focus_mode && !this.bar_shown {
+                            this.anchor_beat = this.anchor_beat.wrapping_add(1);
+                            cx.notify();
+                            true
+                        } else {
+                            this.anchor_pulsing = false;
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+            }
+        })
+        .detach();
+    }
+
+    /// 专注模式的「呼吸锚点」（v1.9.59）：天头正中一枚极小、极淡的圆点，
+    /// 像书签露在书页外的线头。它是触屏 / 全局备用的顶栏入口——点一下
+    /// 立刻滑出顶栏。平时随 `anchor_beat` 缓慢明灭（呼吸），绝不抢视线。
+    fn render_focus_anchor(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        let beat = self.anchor_beat;
+        let phase = SharedString::from(format!("focus-anchor-{beat}"));
+        div()
+            .id("focus-anchor")
+            .absolute()
+            .top(px(5.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .h(px(14.0))
+            .flex()
+            .items_start()
+            .justify_center()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.bar_shown = true;
+                this.ensure_anchor_heartbeat(cx); // 顶栏已出，心跳下一拍自停
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .w(px(5.0))
+                    .h(px(5.0))
+                    .rounded_full()
+                    .bg(rgb(t.ink_soft()))
+                    .with_animation(
+                        phase,
+                        Animation::new(std::time::Duration::from_millis(1400)),
+                        |el, delta| {
+                            // 三角波：delta 0 → 最淡，0.5 → 最亮，1 → 最淡，
+                            // 形成一段无缝的「吸—呼」。opacity 区间压得很窄，
+                            // 远看只是纸上一点将明将暗的灰，绝不抢正文。
+                            let tri = 1.0 - (2.0 * delta - 1.0).abs();
+                            el.opacity(0.12 + 0.24 * tri)
+                        },
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// **「更多」菜单的唯一派发入口**（v1.9.21）。
     ///
     /// 原先十一条菜单项各自内联一段 `catch_unwind` + 一次调用，分组重排时极易
@@ -5458,31 +5373,6 @@ impl Root {
         let start = page.map(|p| p.start_chapter).unwrap_or(false);
         let columns: Vec<Vec<Piece>> = page.map(|p| p.columns.clone()).unwrap_or_default();
 
-        // ── 占位图（v1.9.58）──────────────────────────────────────────
-        // 浮签要「就近避让」，得先知道这一叶哪些列排到多高。逐列按 `Piece`
-        // 的半格账累加即得：正文 2 半格、夹注向上取整到整格、挤压句读与
-        // 书名号 0（与分页同一口径 `piece_units`）。这只是一次 O(字数) 的
-        // 求和，且只在取到新叶时才走一遍；不参与任何排版坐标。
-        {
-            let mut units = [0u16; INK_COLS_MAX];
-            for (i, col) in columns.iter().enumerate().take(INK_COLS_MAX) {
-                let u: usize = col.iter().map(crate::gloss::piece_units).sum();
-                units[i] = u.min(u16::MAX as usize) as u16;
-            }
-            let total = if start {
-                self.grid.columns.saturating_sub(1)
-            } else {
-                self.grid.columns
-            };
-            // 槽位：对开的左半叶 → 0，右半叶 / 单叶 → 1（见 `Root::leaf_ink`）。
-            let slot = usize::from(matches!(edge, LeafHalf::Left));
-            let mut all = self.leaf_ink.get();
-            all[slot] = Some(InkFill {
-                units,
-                cols: total.max(1),
-            });
-            self.leaf_ink.set(all);
-        }
         // 章末统计：本章在此收尾（下一葉即新章首，或已是全书末葉）时，
         // 把「篇 / 章 / 字」小表排在正文之后的第一片空列里。
         let stats: Vec<ChapStat> = self
@@ -6012,31 +5902,6 @@ impl Root {
             ));
         }
 
-        // ── 版心探针（v1.9.58）───────────────────────────────────────
-        // 浮签要知道「字格网格这一帧落在窗口何处」才能就近避让。这里挂一枚
-        // **什么都不画**的隐形 canvas（与 `page_rect` 同一套路），prepaint 时
-        // 记下版心矩形；包一层 `relative` 只为给探针一个定位父级，尺寸由
-        // grid 自身撑出，布局分毫不动。
-        let grid_probe = self.leaf_grid[usize::from(matches!(edge, LeafHalf::Left))].clone();
-        let grid = div().relative().child(grid).child(
-            canvas(
-                move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
-                    let unit = px(1.0);
-                    grid_probe.set(Some((
-                        bounds.origin.x / unit,
-                        bounds.origin.y / unit,
-                        bounds.size.width / unit,
-                        bounds.size.height / unit,
-                    )));
-                },
-                |_bounds, _state, _window, _cx| {},
-            )
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0)),
-        );
 
         // 地脚：章首页的叶码在中缝（对开）/ 居中（单页），此处不重复；
         // 地脚叶码：每一叶都补一枚小字叶码（居中）——章题列里放的是
@@ -8318,27 +8183,6 @@ impl Root {
                             if this.sel_anchor.is_some() {
                                 this.dragging = false;
                                 this.sel_focus = Some(key);
-                                // 单击（未拖选）带注音的字：直接呼出「注音浮签」，
-                                // 大字显示拼音与本字；拖选仍走原来的选区工具条。
-                                if this.sel_anchor == this.sel_focus {
-                                    if let Some(py) = rare_py.clone() {
-                                        this.popup = None;
-                                        // 序数自增：让纸条每次弹出都换一个
-                                        // 元素 id，滑入动效才会重播（见
-                                        // `Root::zoom_seq` 的注释）。
-                                        this.zoom_seq = this.zoom_seq.wrapping_add(1);
-                                        this.note_zoom = Some(crate::gloss::NoteZoom {
-                                            text: g.ch.to_string(),
-                                            pinyin: Some(py.to_string()),
-                                            x: event.position.x.to_f64() as f32,
-                                            y: event.position.y.to_f64() as f32,
-                                            page: this.page,
-                                        });
-                                        cx.stop_propagation();
-                                        cx.notify();
-                                        return;
-                                    }
-                                }
                                 this.more_open = false;
                                 this.popup = Some(GlyphHit {
                                     key,
@@ -9213,60 +9057,6 @@ impl Root {
     ///
     /// 不写死坐标——列数 / 留白 / 窗口尺寸一变，固定点就落到界栏上了；
     /// 这里用 `glyph_hit_at` 从右向左、自上而下试，命中第一个字就收工。
-    /// 开发用（`JIANDU_RUBY=1`）：给本叶第一个带注音的字**自动弹一张浮签**。
-    ///
-    /// 合成点击 / AppleScript 激活被 TCC 拦，真机截图只能靠钩子：它按
-    /// 半格账算出那个字的字格中心当锚点，走的仍是正常的 `note_zoom` 路径
-    /// 与「就近避让」定位，所以截到的就是真机上的样子。
-    fn dev_ruby_once(&mut self) {
-        if std::env::var("JIANDU_RUBY").is_err() || self.note_zoom.is_some() {
-            return;
-        }
-        let fills = self.leaf_ink.get();
-        let slot = if self.leaf_grid[1].get().is_some() { 1 } else { 0 };
-        let (Some((gx, gy, _gw, _gh)), Some(fill)) = (self.leaf_grid[slot].get(), fills[slot])
-        else {
-            return;
-        };
-        let Some(pg) = self.page_at(self.page) else {
-            return;
-        };
-        let (cell_w, cell_h) = (self.col_w.max(1.0), self.row_h.max(1.0));
-        let cols = fill.cols.clamp(1, INK_COLS_MAX);
-        // 按半格账走一遍本叶的列：找到第一个「有注音」的正文格，顺带拿到
-        // 它的行号（列内第几格），据此算出字格中心。
-        let mut found: Option<(usize, usize, String, char)> = None;
-        'outer: for (ci, col) in pg.columns.iter().enumerate().take(cols) {
-            let mut units = 0usize;
-            for p in col {
-                if let Piece::Main(g) = p {
-                    if !is_punct(g.ch) {
-                        if let Some(py) = self
-                            .ruby_pinyin(*g)
-                            .or_else(|| dict::auto_pinyin(g.ch))
-                        {
-                            found = Some((ci, units / 2, py, g.ch));
-                            break 'outer;
-                        }
-                    }
-                }
-                units += crate::gloss::piece_units(p);
-            }
-        }
-        let Some((ci, row, py, ch)) = found else {
-            return;
-        };
-        let x = gx + (cols - 1 - ci) as f32 * cell_w + cell_w * 0.5;
-        let y = gy + row as f32 * cell_h + cell_h * 0.5;
-        self.zoom_seq = self.zoom_seq.wrapping_add(1);
-        self.note_zoom = Some(crate::gloss::NoteZoom {
-            text: ch.to_string(),
-            pinyin: Some(py),
-            x,
-            y,
-            page: self.page,
-        });
-    }
 
     fn dev_lookup_once(&mut self) {
         if std::env::var("JIANDU_LOOKUP").is_err() || self.bubble.is_some() {
@@ -10645,55 +10435,10 @@ impl Root {
         let Some(zoom) = self.note_zoom.clone() else {
             return div().into_any_element();
         };
-        let is_ruby = zoom.pinyin.is_some();
 
-        // ── 尺寸 ──────────────────────────────────────────────────
-        //
-        // 注音浮签（v1.9.57 定稿）：**一张刚刚包住一行字的小纸条**，
-        // 落在**当前字列下方的地脚空白**里。
-        // 用户硬要求：① 绝不放天头、吸附在地脚；② 绝不许压任何一个字；
-        // ③ 拼音约汉字一半、垂直居中；④ 极细的暗色边框，像纸不像弹窗。
-        //
-        // 「拼音 + 本字」同排即全部内容——释义、标题、叶码一概不要。
-        let card_w = if is_ruby {
-            0.0 // 占位，下面按内容反算
-        } else {
-            (self.viewport_w - 40.0).clamp(220.0, 380.0)
-        };
-        let mut pad = if is_ruby { 9.0 } else { 15.0 };
-
-        let py_text = zoom.pinyin.clone().unwrap_or_default();
-        let py_w_em = crate::ruby::text_width_em(&py_text).max(0.1);
-        // 汉字 22px，拼音**正好一半**（11px）——「一行极简的注记」的比例。
-        let mut ch_fs: f32 = 22.0;
-        // 地脚太窄（小窗 / 大字号）时纸条整张收一号：先收内边距，再收字号。
-        // 宁可小一号，也绝不越出纸底去糊在深色背景上、更不回头压正文。
-        if is_ruby {
-            let band = (self.margin_bot.max(0.0) - 14.0).max(24.0);
-            if pad * 2.0 + ch_fs * 1.45 > band {
-                pad = 6.0;
-                if pad * 2.0 + ch_fs * 1.45 > band {
-                    ch_fs = (((band - pad * 2.0) / 1.45).max(13.0)).min(ch_fs);
-                }
-            }
-        }
-        let gap = 6.0;
-        const RUBY_CARD_MAX_W: f32 = 176.0;
-        // 边界保护（用户 v1.9.57 ③）：窗口再窄，纸条宽也不许探出屏幕。
-        let ruby_max_w = RUBY_CARD_MAX_W.min(self.viewport_w - 32.0).max(64.0);
-        // 长拼音（`zhuāngzhòng`）按可用宽度反算字号收下来，绝不撑出纸条。
-        let py_fs = (ch_fs * 0.5)
-            .min((ruby_max_w - pad * 2.0 - gap - ch_fs).max(24.0) / py_w_em)
-            .max(8.0);
-        // 宽 = 内边距 + 拼音 + 缝 + 本字（纸条的宽由字定，不留空）。
-        let card_w = if is_ruby {
-            (pad * 2.0 + py_fs * py_w_em + gap + ch_fs)
-                .min(ruby_max_w)
-                .max(48.0)
-        } else {
-            card_w
-        };
-        let row_h = ch_fs * 1.45;
+        // 夹注大卡尺寸（与旧版一致）：卡片宽随窗口，限制在 220~380。
+        let card_w = (self.viewport_w - 40.0).clamp(220.0, 380.0);
+        let pad = 15.0;
 
         // 夹注分支：正文 17px 折行。
         let body_fs = 17.0;
@@ -10702,116 +10447,63 @@ impl Root {
         let per_line = ((text_w / body_fs).floor() as usize).max(8);
         let lines = wrap_lines(&zoom.text, per_line);
 
-        let card_h = if is_ruby {
-            pad * 2.0 + row_h
-        } else {
-            pad * 2.0 + 18.0 + lines.len() as f32 * line_h
-        };
+        let card_h = pad * 2.0 + 18.0 + lines.len() as f32 * line_h;
 
-        // 注音纸条**就近避让**（贴字找空白，绝不压字）；夹注大卡仍走「天头优先」。
-        let (left, top) = if is_ruby {
-            let paper = match self.page_rect.get() {
-                Some((x, y, w, h)) if w > 1.0 && h > 1.0 && w.is_finite() && h.is_finite() => {
-                    (x, y, w, h)
-                }
-                _ => (0.0, 0.0, self.viewport_w, self.viewport_h),
-            };
-            self.ruby_card_spot(paper, (card_w, card_h), (zoom.x, zoom.y))
-        } else {
-            self.note_card_pos(card_w, card_h, zoom.x, zoom.y)
-        };
+        // 夹注大卡仍走「天头优先」。
+        let (left, top) = self.note_card_pos(card_w, card_h, zoom.x, zoom.y);
 
-        // ── 关闭：夹注大卡留一枚很轻的小叉；注音纸条**不画叉**──────────
-        //
-        // 纸条上挂一个「×」立刻就成了「网页弹窗」，用户要的是「飘在书页上的
-        // 小纸条」。所以纸条约 40px 高、点它自己就收（见末尾的 `on_mouse_down`），
-        // Esc 与点纸面同样收——三种最自然的关法，不必留一个按钮。
-        let close = if is_ruby {
-            div()
-        } else {
-            div()
-                .absolute()
-                .top(px(6.0))
-                .right(px(6.0))
-                .w(px(18.0))
-                .h(px(18.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(9.0))
-                .text_size(px(12.0))
-                .text_color(rgba((t.ink_soft() << 8) | 0xB0))
-                .cursor_pointer()
-                .child(SharedString::from("\u{00D7}"))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.note_zoom = None;
-                        cx.notify();
-                    }),
-                )
-        };
+        // 关闭：夹注大卡留一枚很轻的小叉。
+        let close = div()
+            .absolute()
+            .top(px(6.0))
+            .right(px(6.0))
+            .w(px(18.0))
+            .h(px(18.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(9.0))
+            .text_size(px(12.0))
+            .text_color(rgba((t.ink_soft() << 8) | 0xB0))
+            .cursor_pointer()
+            .child(SharedString::from("\u{00D7}"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.note_zoom = None;
+                    cx.notify();
+                }),
+            );
 
         // ── 内容 ──────────────────────────────────────────────────
         let mut body = div().flex().flex_col().items_center().justify_center();
-        if is_ruby {
-            // 全部内容就这一行：**朱砂小拼音 + 墨色本字**，`items_center` 让
-            // 两段文字的中线对齐（拼音只有汉字一半高，靠基线对齐会明显偏高）。
+        for line in &lines {
             body = body.child(
                 div()
-                    .h(px(row_h))
+                    .h(px(line_h))
                     .flex()
-                    .flex_row()
                     .items_center()
-                    .gap(px(gap))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .text_size(px(py_fs))
-                            .text_color(rgb(t.zhu()))
-                            .child(SharedString::from(py_text.clone())),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .text_size(px(ch_fs))
-                            .text_color(rgb(t.ink()))
-                            .child(SharedString::from(zoom.text.clone())),
-                    ),
+                    .text_size(px(body_fs))
+                    .text_color(rgb(t.ink()))
+                    .child(SharedString::from(line.clone())),
             );
-        } else {
-            for line in &lines {
-                body = body.child(
-                    div()
-                        .h(px(line_h))
-                        .flex()
-                        .items_center()
-                        .text_size(px(body_fs))
-                        .text_color(rgb(t.ink()))
-                        .child(SharedString::from(line.clone())),
-                );
-            }
         }
 
         // 夹注才能「重录」：卡片只带文本、不带定位键，用 `note_key_for_text`
         // 反查它属于书稿里哪条注文，预填进浮层编辑栏，保存时写回书稿 JSON。
-        // 跨列流转的注文在卡里只是整条的一段，反查不到 → 提示不支持。
-        if !is_ruby {
-            let key = self.note_key_for_text(&zoom.text);
-            let ztext = zoom.text.clone();
-            let zpos = (zoom.x, zoom.y);
-            body = body.child(
-                div()
-                    .mt(px(6.0))
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_end()
-                    .child(
+        let key = self.note_key_for_text(&zoom.text);
+        let ztext = zoom.text.clone();
+        let zpos = (zoom.x, zoom.y);
+        body = body.child(
+            div()
+                .mt(px(6.0))
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .child(
                     div()
                         .id("note-zoom-edit")
                         .h(px(20.0))
@@ -10841,15 +10533,12 @@ impl Root {
                             }),
                         ),
                 ),
-            );
-        }
+        );
 
-        // 纸色 / 边色：边是纸向**墨**里兑深一档（0.42），不是兑 12% 的浅灰——
-        // 用户要「极细的暗色边框」，深到像纸的裁切边，浅了就成网页卡片的描边。
+        // 纸色 / 边色：夹注大卡是「极细暗色边框」。
         let paper = t.paper();
-        let edge = crate::theme::mix(paper, t.ink(), if is_ruby { 0.42 } else { 0.12 });
-        // 纸角：纸条是**裁出来的一小片**，圆角一大就成了 App 弹窗（10px → 3px）。
-        let corner = if is_ruby { 3.0 } else { 10.0 };
+        let edge = crate::theme::mix(paper, t.ink(), 0.12);
+        let corner = 10.0;
 
         let card = div()
             .absolute()
@@ -10861,57 +10550,19 @@ impl Root {
             .items_center()
             .p(px(pad))
             .rounded(px(corner))
-            // 半透宣纸底（95%）：留一丝透光＝「毛玻璃」在无 blur 环境下的替身。
             .bg(rgba((paper << 8) | 0xF2))
             .border_1()
-            .border_color(rgba((edge << 8) | if is_ruby { 0x8C } else { 0x70 }))
-            // 一道柔影把纸条**托离纸面**（用户：「让它有真正悬浮起来的层次感」）。
+            .border_color(rgba((edge << 8) | 0x70))
             .shadow_lg()
-            // 拼音是拉丁字母、汉字是正文——浮签跟**正文那副面孔**走。
-            .font_family(if is_ruby {
-                self.main_family()
-            } else {
-                crate::fonts::note_family(self.note_font())
-            })
-            // ★ 阻断鼠标穿透（v1.9.39）：光 `stop_propagation` 只拦得住**冒泡**，
-            //   拦不住命中测试——GPUI 会把压在卡片底下的正文字格一并算作
-            //   hovered，于是卡片上这一下抬起仍会派发给正文那层：正在编辑夹注
-            //   时它被判成「点纸面 = 自动保存」→ 编辑框一按就关；不在编辑时则
-            //   被判成单击翻页 → 卡片底下的书页自己翻过去。`.occlude()` 让命中
-            //   栈在卡片处截断（与目录抽屉 / 问笺侧栏同款），卡片之外才算纸面。
+            .font_family(crate::fonts::note_family(self.note_font()))
             .occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                // 命中栈在此截断（底下正文不算被点）；纸条**点自己就收**，
-                // 没有「×」也不至于关不掉。
                 cx.stop_propagation();
-                if this.note_zoom.as_ref().map(|z| z.pinyin.is_some()).unwrap_or(false) {
-                    this.note_zoom = None;
-                    cx.notify();
-                }
             }))
             .child(body)
             .child(close);
 
-        if is_ruby {
-            // ── 平滑滑入（用户 v1.9.57 ④）────────────────────────────
-            //
-            // 从「落位再低 10px」滑到落位，同时 0.55 → 1 淡入。60fps 下
-            // 10px/170ms 是很轻的一下——纸条是「贴上纸面」的，不是「弹出」
-            // 的，所以绝不缩放、不弹跳。id 带弹出序数，每次弹签都重播。
-            let seq = self.zoom_seq;
-            card.with_animation(
-                SharedString::from(format!("ruby-card-{seq}")),
-                Animation::new(Duration::from_millis(170)),
-                move |el, delta| {
-                    let d = delta.clamp(0.0, 1.0);
-                    el.top(px(top + 10.0 * (1.0 - d)))
-                        .opacity(0.55 + 0.45 * d)
-                },
-            )
-            .into_any_element()
-        } else {
-            card.into_any_element()
-        }
+        card.into_any_element()
     }
 
     /// 注文浮签的落位：**钉在天头（上方留白）里，绝不压正文列**。
@@ -10938,83 +10589,6 @@ impl Root {
             (card_w, card_h),
             (ax, ay),
         )
-    }
-
-    /// 注音纸条的落位（v1.9.58）：把当帧的**占位图**翻成字格坐标，交给纯函数
-    /// `ruby_card_nearest` 做「就近碰撞检测 + 空白吸附」。
-    ///
-    /// 三步：
-    ///   ① 取锚点所在那一叶的**版心矩形**与**占位图**（对开时两叶各一份，
-    ///      按锚点横向落在哪一叶来挑）；
-    ///   ② 锚点 floor 进网格 → 被点字的字格矩形；该列已排高度 → 列矩形；
-    ///   ③ 逐列把「已排半格」翻成 `(列左缘, 已排高)`，空列即「高 0」——
-    ///      纯函数据此知道哪一片是空白。
-    ///
-    /// 探针尚未就绪（首帧 / 非竖排视图）时退回「字下方一格」——宁可差一点，
-    /// 也不能不弹。
-    fn ruby_card_spot(
-        &self,
-        paper: (f32, f32, f32, f32),
-        card: (f32, f32),
-        anchor: (f32, f32),
-    ) -> (f32, f32) {
-        let (ax, ay) = anchor;
-        let cell_w = self.col_w.max(1.0);
-        let cell_h = self.row_h.max(1.0);
-        let Some(((gx, gy, _gw, gh), fill)) = self.leaf_ink_at(ax) else {
-            return (ax - card.0 * 0.5, ay + cell_h + 6.0);
-        };
-        let cols = fill.cols.clamp(1, INK_COLS_MAX);
-        // 锚点 → 自左数第 k 列（网格的列序 i 自右数，故 k = cols-1-i）。
-        let k = (((ax - gx) / cell_w).floor()).clamp(0.0, (cols - 1) as f32) as usize;
-        let ri = (((ay - gy) / cell_h).floor()).max(0.0) as usize;
-        let glyph = (
-            gx + k as f32 * cell_w,
-            gy + ri as f32 * cell_h,
-            cell_w,
-            cell_h,
-        );
-        // 每列（**自左向右**）：列左缘 + 已排高度（0 = 空列，正是一片可用的空白）。
-        let columns: Vec<(f32, f32)> = (0..cols)
-            .rev()
-            .map(|j| {
-                (
-                    gx + (cols - 1 - j) as f32 * cell_w,
-                    fill.units[j] as f32 * cell_h * 0.5,
-                )
-            })
-            .collect();
-        ruby_card_nearest(
-            paper,
-            (self.viewport_w, self.viewport_h),
-            (cell_w, cell_h),
-            card,
-            glyph,
-            (gy, gy + gh),
-            &columns,
-        )
-    }
-
-    /// 锚点所在那一叶的版心矩形与占位图（对开时取离锚点最近的一叶）。
-    fn leaf_ink_at(&self, ax: f32) -> Option<((f32, f32, f32, f32), InkFill)> {
-        let fills = self.leaf_ink.get();
-        let mut best: Option<((f32, f32, f32, f32), InkFill, f32)> = None;
-        for slot in 0..2 {
-            let (Some(g), Some(f)) = (self.leaf_grid[slot].get(), fills[slot]) else {
-                continue;
-            };
-            let d = if ax < g.0 {
-                g.0 - ax
-            } else if ax > g.0 + g.2 {
-                ax - g.0 - g.2
-            } else {
-                0.0
-            };
-            if best.map(|b| d < b.2).unwrap_or(true) {
-                best = Some((g, f, d));
-            }
-        }
-        best.map(|(g, f, _)| (g, f))
     }
 
     /// 右键 / 长按**用户自加夹注**弹出的「修改 / 删除」菜单。
@@ -13731,6 +13305,12 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                         // 进专注：先收浮层、再收这张纸（否则纸还摊在屏上）。
                         this.close_transient_ui();
                         this.show_style = false;
+                        // v1.9.59：净室＝顶栏收起，露呼吸锚点。
+                        this.bar_shown = false;
+                        this.ensure_anchor_heartbeat(cx);
+                    } else {
+                        // 退出专注：顶栏回到贴顶露一息。
+                        this.bar_shown = true;
                     }
                     cx.notify();
                 }),
@@ -14733,191 +14313,6 @@ mod tests {
         assert!(left >= paper.0 && left + 220.0 <= paper.0 + paper.2);
     }
 
-    // ── 浮签「就近避让」（v1.9.58）────────────────────────────────
-    //
-    // 一叶 12 列的实测几何：字格 55.51 × 27.75，版心从 (120, 120) 起，
-    // 24 行排到 y = 786。纸条 62 × 50。
-    const T_CELL: (f32, f32) = (55.51, 27.75);
-    const T_CARD: (f32, f32) = (62.0, 50.0);
-    const T_GX: f32 = 120.0;
-    const T_GY: f32 = 120.0;
-    const T_COLS: usize = 12;
-    const T_ROWS: usize = 24;
-
-    /// 一叶的列账（**自左向右**）：每列排了几行 → `(列左缘, 已排高)`。
-    fn leaf_cols(rows: &[usize]) -> Vec<(f32, f32)> {
-        (0..T_COLS)
-            .map(|k| {
-                let r = *rows.get(k).unwrap_or(&0);
-                (
-                    T_GX + k as f32 * T_CELL.0,
-                    r as f32 * T_CELL.1,
-                )
-            })
-            .collect()
-    }
-
-    fn glyph_at(k: usize, row: usize) -> (f32, f32, f32, f32) {
-        (
-            T_GX + k as f32 * T_CELL.0,
-            T_GY + row as f32 * T_CELL.1,
-            T_CELL.0,
-            T_CELL.1,
-        )
-    }
-
-    fn art() -> (f32, f32) {
-        (T_GY, T_GY + T_ROWS as f32 * T_CELL.1)
-    }
-
-    /// 纸条与任一墨迹 / 版框线都不相交。
-    fn no_ink(pos: (f32, f32), cols: &[(f32, f32)]) -> bool {
-        let r = (pos.0, pos.1, T_CARD.0, T_CARD.1);
-        let (art_top, art_bot) = art();
-        let hit_ink = cols.iter().any(|(x, h)| {
-            *h > 0.0 && super::rects_overlap(r, (*x, art_top, T_CELL.0, *h))
-        });
-        let hit_frame = super::rects_overlap(r, (40.0, art_top - 15.0, 800.0, 15.0))
-            || super::rects_overlap(r, (40.0, art_bot, 800.0, 15.0));
-        !hit_ink && !hit_frame
-    }
-
-    /// ① 整叶只排了 10 行就收尾（末叶常态）→ 纸条落在**当前列正下方**。
-    #[test]
-    fn card_sits_right_below_the_column_that_ended() {
-        let cols = leaf_cols(&vec![10usize; T_COLS]);
-        let g = glyph_at(3, 9); // 该列最后一字
-        let (left, top) = super::ruby_card_nearest(
-            (40.0, 40.0, 800.0, 880.0),
-            (900.0, 1000.0),
-            T_CELL,
-            T_CARD,
-            g,
-            art(),
-            &cols,
-        );
-        let col_bottom = T_GY + 10.0 * T_CELL.1;
-        assert!(
-            (top - (col_bottom + 6.0)).abs() < 0.5,
-            "没贴住列尾：top={top:.1}，期望 {:.1}",
-            col_bottom + 6.0
-        );
-        assert!(
-            (left - (g.0 + g.2 * 0.5 - T_CARD.0 * 0.5)).abs() < 0.5,
-            "横向没对准当前列：{left:.1}"
-        );
-        assert!(no_ink((left, top), &cols), "纸条压到了字或版框");
-    }
-
-    /// 右侧排满、左侧整片空列（末章末叶常态）→ 纸条落在那片空列的**正中**，
-    /// 与字同高（视线不用离位），且不压界栏。
-    #[test]
-    fn card_crosses_the_rule_into_the_blank_columns() {
-        let mut rows = vec![0usize; T_COLS];
-        for r in rows.iter_mut().skip(6) {
-            *r = T_ROWS;
-        }
-        let cols = leaf_cols(&rows);
-        let g = glyph_at(8, 5);
-        let (left, top) = super::ruby_card_nearest(
-            (40.0, 40.0, 800.0, 800.0), // 天头地脚都塞不下纸条
-            (900.0, 900.0),
-            T_CELL,
-            T_CARD,
-            g,
-            art(),
-            &cols,
-        );
-        // 空列是 k = 0..5（六列连成一片）：62px 宽的纸条应从这片正中落下。
-        let run_x = T_GX;
-        let run_w = 6.0 * T_CELL.0;
-        assert!(
-            (left - (run_x + (run_w - T_CARD.0) * 0.5)).abs() < 1.0,
-            "没落在空白正中：left={left:.1}"
-        );
-        assert!(
-            (top - (g.1 + g.3 * 0.5 - T_CARD.1 * 0.5)).abs() < 0.5,
-            "没与字同高：top={top:.1}"
-        );
-        assert!(no_ink((left, top), &cols), "纸条压到了字或版框");
-    }
-
-    /// 整叶排满、两条留白带也太窄 → 仍落到**天头 / 地脚**（版框之外），
-    /// 且不骑框线（旧版正是栽在这里）。
-    #[test]
-    fn card_falls_back_to_the_nearer_margin_band() {
-        let cols = leaf_cols(&vec![T_ROWS; T_COLS]);
-        let g = glyph_at(6, 2); // 靠上 → 应落天头
-        let (left, top) = super::ruby_card_nearest(
-            (40.0, 40.0, 800.0, 900.0),
-            (900.0, 1000.0),
-            T_CELL,
-            T_CARD,
-            g,
-            art(),
-            &cols,
-        );
-        assert!(top + T_CARD.1 <= T_GY - 15.0 + 0.5, "压到上框线：top={top:.1}");
-        assert!(left >= 40.0 + 6.0 - 0.5);
-        assert!(left + T_CARD.0 <= 840.0 - 6.0 + 0.5);
-        assert!(no_ink((left, top), &cols), "纸条压到了字或版框");
-    }
-
-    /// 无论点在哪一格，纸条都不与任何字、任何框线相交，且整张留在纸内窗外。
-    #[test]
-    fn card_never_covers_ink_nor_leaves_the_window() {
-        // 参差不齐的一叶：右侧排满、左侧只排几行（末叶常态）。
-        let mut rows = vec![0usize; T_COLS];
-        for (k, r) in rows.iter_mut().enumerate() {
-            *r = if k >= 7 {
-                T_ROWS
-            } else if k >= 4 {
-                12
-            } else {
-                0
-            };
-        }
-        let cols = leaf_cols(&rows);
-        let (vw, vh) = (900.0f32, 1100.0f32);
-        let paper = (40.0, 40.0, 800.0, 1000.0);
-        for k in 0..T_COLS {
-            for row in 0..rows[k] {
-                let g = glyph_at(k, row);
-                let (left, top) = super::ruby_card_nearest(
-                    paper, (vw, vh), T_CELL, T_CARD, g, art(), &cols,
-                );
-                assert!(
-                    no_ink((left, top), &cols),
-                    "第 {k} 列第 {row} 行：纸条压字或压框（{left:.1}, {top:.1}）"
-                );
-                assert!(left >= 0.0 && top >= 0.0, "出画：{left:.1}, {top:.1}");
-                assert!(
-                    left + T_CARD.0 <= vw + 0.5 && top + T_CARD.1 <= vh + 0.5,
-                    "出画：{:.1}, {:.1}",
-                    left + T_CARD.0,
-                    top + T_CARD.1
-                );
-                assert!(left >= 40.0 && left + T_CARD.0 <= 840.0 + 0.5, "出纸");
-            }
-        }
-    }
-
-    /// 极窄窗口：纸条夹回画内。
-    #[test]
-    fn card_never_leaves_a_narrow_viewport() {
-        let cols = leaf_cols(&vec![T_ROWS; T_COLS]);
-        let (left, top) = super::ruby_card_nearest(
-            (0.0, 0.0, 200.0, 300.0),
-            (200.0, 300.0),
-            T_CELL,
-            T_CARD,
-            glyph_at(3, 4),
-            art(),
-            &cols,
-        );
-        assert!(left >= -0.01 && left + T_CARD.0 <= 200.01, "横向出画：{left:.1}");
-        assert!(top >= -0.01 && top + T_CARD.1 <= 300.01, "纵向出画：{top:.1}");
-    }
 
     /// 天头塞不下（超高浮签 / 大字版式）→ 退到**地脚带**，仍不压正文。
     #[test]
