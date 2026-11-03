@@ -1098,17 +1098,24 @@ fn draw_gloss(b: &mut Brush, txt: &str, x: f64, y: f64, g: &PdfGeo, head: bool) 
     let chars: Vec<char> = txt.chars().collect();
     let nrows = chars.len().div_ceil(2).max(1);
     let floor = if g.cols >= 10 { 10.0 } else { 7.0 };
-    let nfs = ((g.fs as f64 * 0.5).max(floor)).min(row_h.max(7.0));
+    // ★ 与屏幕同一个字号比（v1.9.56）：此前 PDF 写死 0.5、屏幕 0.62，
+    //   同一本书印出来小字比屏幕小两成，疏密也对不上。现在两边都取
+    //   `GLOSS_FS_RATIO`，屏幕上看着舒服的注文，印出来就是那个样子。
+    let nfs = ((g.fs as f64 * crate::reader::GLOSS_FS_RATIO as f64).max(floor))
+        .min((row_h * crate::reader::GLOSS_FS_MAX_OF_ROW as f64).max(7.0));
     let pad = cell_w * crate::gloss::NOTE_PAD_RATIO as f64;
     let inset = cell_w * crate::gloss::NOTE_EDGE_INSET as f64;
-    let sub_w = (cell_w - pad - inset * 2.0) * 0.5;
+    // 两列之间的呼吸缝（v1.9.56）：与屏幕 `ancient_gloss` 同一常量、同一算法。
+    let gap = ((cell_w * crate::gloss::NOTE_CHAR_GAP as f64).clamp(0.8, 2.2) as f64).max(0.0);
+    let sub_w = (cell_w - pad - inset * 2.0 - gap) * 0.5;
     let block_h = crate::grid::ceil_to_cells(nrows as f32 * g.cell_h * 0.5, g.cell_h) as f64;
-    // 列首夹注允许略降（缩进量不许超过取整让出的空当，否则注文被裁）。
+    // 列首夹注允许略降（缩进量不许超过取整让出的空当，否则注文被裁）；
+    // 非列首给 1.5px 呼吸（与屏幕 `NOTE_TOP_BREATH` 同源）。
     let slack = (block_h - nrows as f64 * row_h).max(0.0);
     let head_inset = if head {
         (g.cell_h as f64 * crate::grid::GLOSS_HEAD_INSET as f64).min(slack)
     } else {
-        0.0
+        slack.min(crate::gloss::NOTE_TOP_BREATH as f64)
     };
     // 注文里的句读再收一档：全角句号与注文同号时一个点顶半颗字，
     // 整块夹注会糊成黑团（v1.28.0）。
@@ -1126,7 +1133,7 @@ fn draw_gloss(b: &mut Brush, txt: &str, x: f64, y: f64, g: &PdfGeo, head: bool) 
             };
             b.glyph_in(
                 ch,
-                x + pad + inset + k as f64 * sub_w,
+                x + pad + inset + k as f64 * (sub_w + gap),
                 y + head_inset + r as f64 * row_h,
                 sub_w,
                 row_h,

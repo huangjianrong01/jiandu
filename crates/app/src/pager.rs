@@ -171,7 +171,10 @@ impl Pager {
             p.notes
                 .iter()
                 .find(|n| n.at == g.offset && n.kind == NoteKind::Note)
-                .map(|n| (n.text.clone(), n.source, *g))
+                // ★ 注文自身也可能带壳（旧稿里 `…之子虔[注]虎` 这种嵌套残留）：
+                //   夹注是**双行小字**，壳一漏进去就是四个小括号印在注文里。
+                //   此处按掩码剥壳、留下壳内的字（v1.9.56）。
+                .map(|n| (jiandu_core::cleaner::strip_note_tags(&n.text), n.source, *g))
         };
         layout_book_from_opts(
             &flow,

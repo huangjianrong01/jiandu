@@ -111,17 +111,17 @@ pub const HEAD_NOTE_FS_RATIO: f32 = 0.58;
 /// 0.65×21.5 = 14 恰好等于下限，等于这份比例参数在默认字号下根本没生效。
 /// 收到 12.5 之后，比例才真的说了算，眉批也才退得到正文的六成以下。
 pub const HEAD_NOTE_FS_MIN: f32 = 12.5;
-/// **双行夹注（小字）字号 = 正文的 62%**（v1.9.40 由写死的 0.5 上调）。
+/// **双行夹注（小字）字号 = 正文的 57%**（v1.9.40 由 0.5 上调，v1.9.56 回调到 0.57）。
 ///
-/// 为什么是 62%：注块两行共占**一个整字格**（半格账 `gloss::Filler`
-/// 记的就是 `ceil(行数 × 0.5)`），所以每行只有半格高 ≈ 0.59×正文字号。
-/// 字号可以略大于行高——汉字字面（ink）只占 em 框的 ~0.88，em 多出来的
-/// 上下内白正好吃掉那点溢出，笔画本身不会碰到格线，也不会与相邻行粘连。
+/// 为什么是 57%：注块两行共占**一个整字格**（半格账 `gloss::Filler`
+/// 记的就是 `ceil(行数 × 0.5)`），所以每行只有半格高 ≈ 0.588×正文字号。
+/// 汉字字面（ink）只占 em 框的 ~0.88，em 多出来的上下内白吃掉那点溢出。
 ///
-/// 62% × 1.06（见 [`GLOSS_FS_MAX_OF_ROW`]）= 0.657 em，字面 0.58，仍在
-/// 半格（0.588）之内——**这是「注块不吃第二格」前提下的上限**。再往上，
-/// 两行就要占 1.5 格，行款与分页账全得改（那是版式决定，不是调参）。
-pub const GLOSS_FS_RATIO: f32 = 0.62;
+/// v1.9.56 从 0.62 收回 0.57：用户「双行小字太挤了，字与字之间完全没有
+/// 呼吸空间」。0.62 时字面 0.546 em 对上半格 0.588 em，上下只剩 0.04 em
+/// （12 列约 1px），两个小字几乎连成一条墨线；0.57 的字面 0.50 em，上下
+/// 让出 0.088 em（≈2px），一行一行才分得开。
+pub const GLOSS_FS_RATIO: f32 = 0.57;
 /// 注文行高的**溢出容差**：字号最多到「半格 × 此值」。
 ///
 /// 1.06 = 字面内白的余量（em 框高出 ink 的这一截）。超过它，笔画就会
@@ -406,6 +406,58 @@ fn same_glyph(a: &Glyph, b: &Glyph) -> bool {
         && a.offset == b.offset
         && a.ch == b.ch
         && a.kind == b.kind
+}
+
+/// **注音纸条的落位**（纯函数，可断言）：钉在生字的**右下方**。
+///
+/// 用户口径（v1.9.56）：「浮签应该位于注音字的右下方向」。所以首选就是锚点
+/// 右下 —— 与阅读视线成 45°，余光一扫就能看见，又不像天头那样要抬头找。
+///
+/// 三档避让，按「纸面边界」排：
+///   ① **右下**——默认。纸条贴着字的右下角，隔一道 8px 的缝。
+///   ② **左下**——右侧贴到纸边（竖排最右一列就是正文第一列，很常见）。
+///   ③ **右上**——下方贴到纸边（末一列 / 矮窗口）。
+///
+/// 两处都溢出（极窄窗口）才硬夹进纸面。无论如何都**整张留在纸内**，
+/// 绝不半截出纸。
+///
+/// 参数：`paper` 纸面矩形 `(x, y, w, h)`（window 坐标）、`viewport` 窗口宽高、
+/// `card` 纸条宽高、`anchor` 点击处（≈ 生字的位置）。
+pub(crate) fn ruby_card_pos_in(
+    paper: (f32, f32, f32, f32),
+    viewport: (f32, f32),
+    card: (f32, f32),
+    anchor: (f32, f32),
+) -> (f32, f32) {
+    /// 纸条与字之间的缝：够看出「这是给旁边这个字的」，又不至于隔太远。
+    const GAP: f32 = 8.0;
+    /// 纸条离纸边的安全距：纸是裁切过的，纸条不该压到纸缘之外。
+    const INSET: f32 = 6.0;
+
+    let (px0, py0, pw, ph) = paper;
+    let (vw, vh) = viewport;
+    let (card_w, card_h) = card;
+    let (ax, ay) = anchor;
+
+    let right = px0 + pw - INSET;
+    let bottom = py0 + ph - INSET;
+
+    // ① 右下（默认）
+    let mut left = ax + GAP;
+    let mut top = ay + GAP;
+    // ② 右缘塞不下 → 翻到左侧（同一个高度，眼睛不用上下找）
+    if left + card_w > right {
+        left = ax - GAP - card_w;
+    }
+    // ③ 下缘塞不下 → 翻到上方
+    if top + card_h > bottom {
+        top = ay - GAP - card_h;
+    }
+    // ④ 两处都溢出 → 硬夹（窄窗口下的兜底，宁可压一点纸边也不出画）
+    let max_left = (right - card_w).max(px0);
+    let left = left.clamp(px0, max_left.max(px0));
+    let top = top.clamp(py0.max(0.0), (vh - card_h).max(0.0).max(py0.max(0.0)));
+    (left, top)
 }
 
 /// 注文浮签的落位（纯函数，可断言）：**先钉天头，再退地脚，都不行才回锚点**。
@@ -5405,7 +5457,11 @@ impl Root {
         //   卷第一」的复读机。导入 / 开卷两处已洗过，这里再剥一次是给
         //   「标题列 / 中缝 / 目录 / 分享」四条渲染路同一个口径——它们各自
         //   取章题，谁也不许把书名带成两遍。
-        jiandu_core::cleaner::clean_title(&self.book_title(), &ch.title)
+        // ★ 标记壳先行（v1.9.56）：旧稿的章题里带着 `[注]周纪三[/注]`——
+        //   题署 / 中缝 / 目录 / 分享四条路都从这里取题，壳一漏就是纸面上
+        //   排出「卷第三 [ 注 ] 周纪三 …」。先剥壳留字，再走书名去重。
+        let title = jiandu_core::cleaner::strip_note_tags(&ch.title);
+        jiandu_core::cleaner::clean_title(&self.book_title(), &title)
             .chars()
             .map(crate::types::bracket_to_quote)
             .collect()
@@ -5427,8 +5483,11 @@ impl Root {
             .map(|p| p.text.as_str())
             .unwrap_or("");
         // 书耳（中缝题签）与篇题同源：同样先剥重复书名与分节符，
-        // 否则左书口会出现两遍「資治通鑑」。
-        let ear = jiandu_core::cleaner::clean_title(&book.title, &ch.title);
+        // 否则左书口会出现两遍「資治通鑑」。标记壳也一并剥（v1.9.56）。
+        let ear = jiandu_core::cleaner::clean_title(
+            &book.title,
+            &jiandu_core::cleaner::strip_note_tags(&ch.title),
+        );
         crate::types::ear_label(&ear, book.chapters.len(), chapter, opening)
     }
 
@@ -6537,7 +6596,10 @@ impl Root {
         // 两侧各让出极窄一道（见 `NOTE_EDGE_INSET`）：小字不蹭界栏，
         // 两个小列仍各占余下宽度的一半，注块中线不变。
         let inset = cell_w * crate::gloss::NOTE_EDGE_INSET;
-        let sub_w = (cell_w - pad - inset * 2.0) * 0.5;
+        // ★ 呼吸缝（v1.9.56）：两列小字之间空出 1–2px，别糊成一整片。
+        //   缝从两列的宽度里扣，所以「注块 = 一个正文列」这条账不变。
+        let gap = (cell_w * crate::gloss::NOTE_CHAR_GAP).clamp(0.8, 2.2);
+        let sub_w = (cell_w - pad - inset * 2.0 - gap) * 0.5;
         // 注文小字色：墨色 × 纸色自动推导（永远比正文淡一档）。
         // **用户自加夹注例外**：改深朱砂红（#C62828），与原本夹注一眼可辨。
         let note_color = if is_user {
@@ -6566,11 +6628,15 @@ impl Root {
         let block_h = crate::grid::ceil_to_cells(rows as f32 * row_h, cell_h);
         // 列首夹注：注文比正文低一号，略降一点更像刻本。**缩进量不许超过
         // 取整让出的空当**——否则注文会被自己的固定高裁掉。
+        //
+        // v1.9.56：非列首也给 1.5px（`NOTE_TOP_BREATH`）——取整多出来的空当
+        // 原先全留在块底，注文第一个字就顶着上一字的墨迹。先给块顶一线，
+        // 剩下的才留给块底，注文与正文之间这才透得过气。
         let slack = (block_h - rows as f32 * row_h).max(0.0);
         let head_inset = if head {
             (cell_h * crate::grid::GLOSS_HEAD_INSET).min(slack)
         } else {
-            0.0
+            slack.min(crate::gloss::NOTE_TOP_BREATH)
         };
         let mut block = div()
             .w(px(cell_w))
@@ -6663,7 +6729,11 @@ impl Root {
             line = line.child(div().w(px(pad)).h(px(row_h)));
             // 左隙：小字与界栏之间的一线之隔。
             line = line.child(div().w(px(inset)).h(px(row_h)));
-            for c in pair {
+            for (ci, c) in pair.into_iter().enumerate() {
+                // 两列之间留一道缝（v1.9.56）：从 `sub_w` 扣出的那 1–2px 落在这里。
+                if ci == 1 {
+                    line = line.child(div().w(px(gap)).h(px(row_h)));
+                }
                 line = line.child(match c {
                     // 注文里的【】同样显作「」（夹注不过 shown，这里单独过一道）。
                     Some(ch) => {
@@ -7641,12 +7711,12 @@ impl Root {
         // 悬停联动（v1.55.0）：鼠标停在天头某条眉批上 → 它锚定的那个字衬
         // 一层朱红。只比一次键，不查书稿——字格渲染里这是最省的判据。
         let margin_hit = g.kind == GlyphKind::Char && self.margin_hover_key == Some(key);
-        // ── 注音几何（v1.9.54）────────────────────────────────────────
-        // **汉字纹丝不动、拼音做小巧外挂**。主字恒在格心、恒用正文字号、
+        // ── 注音几何（v1.9.56）────────────────────────────────────────
+        // **汉字纹丝不动、拼音悬挂在字缝里**。主字恒在格心、恒用正文字号、
         // 行盒恒等于格高——有没有注音都一样（v1.9.53 的「主字让位」把整列
-        // 基线挤歪了，已废）。拼音只是一枚贴在格顶的浅灰小标签，
-        // 全部度量只认 `jiandu_core::ruby::layout`（那里**没有**任何主字字段），
-        // 屏幕与 PDF 同源。
+        // 基线挤歪了，已废）。拼音是一枚骑在格线上的朱砂小标签：一半在格里、
+        // 一半在上一字的下空当，**零占正文空间**。全部度量只认
+        // `jiandu_core::ruby::layout`（那里**没有**任何主字字段），屏 PDF 同源。
         let ruby_layout = rare_py
             .as_deref()
             .map(|py| crate::ruby::layout(py, fs, cell_w, cell_h));
@@ -7750,14 +7820,14 @@ impl Root {
             base_ink
         };
 
-        // ── 注音外挂（v1.9.54）───────────────────────────────────────
-        // **叠加式**：拼音是一枚绝对定位的小标签，挂在字格顶端（`top = 0`、
-        // 高 `band_h` = 30% 格高，`.overflow_hidden()` 兜底），浮在主字上方
-        // 那 13.4% 的天然空当里。**它不占正文一寸空间**——主字在下面照样
-        // 居格心、照样正文字号，整列基线一笔不歪。
+        // ── 注音外挂（v1.9.56）───────────────────────────────────────
+        // **悬挂式**：拼音是一枚绝对定位的小标签，行盒上缘 `top = −fs/2`，
+        // 于是墨心**正好落在 y = 0 的格线**上——一半在格里、一半在上一字的
+        // 下空当里，骑在两字之间的那道 7px 字缝正中。**它不占正文一寸空间**，
+        // 主字照样居格心、照样正文字号，整列基线一笔不歪。
         //
-        // 字号由 `ruby::layout` 的 min() 链收口（≤主字 25%、≤86% 格宽），
-        // 墨色**浅灰**降噪，逐字真字体排版（不是位图，缩放不糊）。
+        // 字号由 `ruby::layout` 的 min() 链收口（≤主字 26%、≤86% 格宽），
+        // 墨色**朱砂**，逐字真字体排版（不是位图，缩放不糊）。
         if let Some(rl) = ruby_layout {
             if let Some(py) = rare_py.as_deref() {
                 // 容器比估宽再放宽 25%：核心 crate 的 em 宽度是查表估算，真字体
@@ -10329,37 +10399,39 @@ impl Root {
 
         // ── 尺寸 ──────────────────────────────────────────────────
         //
-        // 注音浮签的**高度预算**是被天头卡死的：默认留白档天头只有
-        // `content_h × 0.12`（12 列常规窗口 ≈ 96px），竖着堆「拼音 / 本字 /
-        // 释义」三行要 130px 往上，必然压进版框。所以改成**一行主信息**：
-        // 「拼音 + 本字」同排（像字典的一个词头），释义另起一行；
-        // 天头连释义都塞不下时，先砍释义，再砍到只剩一行。
+        // 注音浮签（v1.9.56 大改）：**一张刚刚包住一行字的小纸条**。
+        // 用户的三条硬要求：① 落在生字的**右下方**；② 拼音约汉字的一半、
+        // 与汉字垂直居中对齐；③ 极细的暗色边框，像纸不像弹窗。
+        //
+        // 「拼音 + 本字」同排即全部内容——释义、标题、叶码一概不要，
+        // 高度只有一行（22px 字 + 上下 8px 内边距 ≈ 40px），
+        // 压在正文上也只碰到半个字格，读的时候不必先移开它。
         let card_w = if is_ruby {
-            (self.viewport_w - 40.0).clamp(172.0, 236.0)
+            0.0 // 占位，下面按内容反算
         } else {
             (self.viewport_w - 40.0).clamp(220.0, 380.0)
         };
-        let pad = if is_ruby { 8.0 } else { 15.0 };
+        let pad = if is_ruby { 9.0 } else { 15.0 };
 
         let py_text = zoom.pinyin.clone().unwrap_or_default();
         let py_w_em = crate::ruby::text_width_em(&py_text).max(0.1);
-        let ch_fs = 26.0;
-        // ⚠️ 34px 是**上限**：长拼音（`zhuāngzhòng`）按卡宽反算字号收下来，
-        // 绝不许撑出浮签去——与正文里的注音同一条规矩（宽定字号）。
-        // 右侧再让 18px：那是角上「×」的地盘，绝不让长拼音压到它身上。
-        let py_fs = ((card_w - pad * 2.0 - ch_fs - 12.0 - 18.0) / py_w_em).clamp(16.0, 34.0);
-        let row_h = (py_fs * 1.25).max(34.0);
-        let gl_fs = 11.5;
-        let gl_h = 15.0;
-        let gloss = if is_ruby {
-            zoom.text
-                .chars()
-                .next()
-                .and_then(crate::dict::concise_of)
-                .map(|s| one_line(s, 11))
+        // 汉字 22px，拼音**正好一半**（11px）——「一行极简的注记」的比例。
+        let ch_fs: f32 = 22.0;
+        let gap = 6.0;
+        const RUBY_CARD_MAX_W: f32 = 176.0;
+        // 长拼音（`zhuāngzhòng`）按可用宽度反算字号收下来，绝不撑出纸条。
+        let py_fs = (ch_fs * 0.5)
+            .min((RUBY_CARD_MAX_W - pad * 2.0 - gap - ch_fs).max(24.0) / py_w_em)
+            .max(8.0);
+        // 宽 = 内边距 + 拼音 + 缝 + 本字（纸条的宽由字定，不留空）。
+        let card_w = if is_ruby {
+            (pad * 2.0 + py_fs * py_w_em + gap + ch_fs)
+                .min(RUBY_CARD_MAX_W)
+                .max(48.0)
         } else {
-            None
+            card_w
         };
+        let row_h = ch_fs * 1.45;
 
         // 夹注分支：正文 17px 折行。
         let body_fs = 17.0;
@@ -10368,61 +10440,74 @@ impl Root {
         let per_line = ((text_w / body_fs).floor() as usize).max(8);
         let lines = wrap_lines(&zoom.text, per_line);
 
-        // 天头 / 地脚能不能整张容下（`INSET` 与 `note_card_pos_in` 同源）。
-        let mt = self.margin_top.max(0.0);
-        let mb = self.margin_bot.max(0.0);
-        let band_fits = |h: f32| mt >= h + 12.0 || mb >= h + 12.0;
-        let h_full = pad * 2.0 + row_h + if gloss.is_some() { 3.0 + gl_h } else { 0.0 };
-        let h_tight = pad * 2.0 + row_h;
-        let (card_h, show_gloss) = if is_ruby {
-            if gloss.is_some() && band_fits(h_full) {
-                (h_full, true)
-            } else {
-                (h_tight, false)
-            }
+        let card_h = if is_ruby {
+            pad * 2.0 + row_h
         } else {
-            (pad * 2.0 + 18.0 + lines.len() as f32 * line_h, false)
+            pad * 2.0 + 18.0 + lines.len() as f32 * line_h
         };
 
-        let (left, top) = self.note_card_pos(card_w, card_h, zoom.x, zoom.y);
+        // 注音纸条钉在**生字右下方**；夹注大卡仍走「天头优先」的老落位。
+        let (left, top) = if is_ruby {
+            let paper = match self.page_rect.get() {
+                Some((x, y, w, h)) if w > 1.0 && h > 1.0 && w.is_finite() && h.is_finite() => {
+                    (x, y, w, h)
+                }
+                _ => (0.0, 0.0, self.viewport_w, self.viewport_h),
+            };
+            ruby_card_pos_in(
+                paper,
+                (self.viewport_w, self.viewport_h),
+                (card_w, card_h),
+                (zoom.x, zoom.y),
+            )
+        } else {
+            self.note_card_pos(card_w, card_h, zoom.x, zoom.y)
+        };
 
-        // ── 关闭：一枚很轻的小叉（U+00D7，Latin-1 基本区，回退字体不会吞掉）──
-        let close = div()
-            .id("note-zoom-close")
-            .absolute()
-            .top(px(6.0))
-            .right(px(6.0))
-            .w(px(18.0))
-            .h(px(18.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(9.0))
-            .text_size(px(12.0))
-            .text_color(rgba((t.ink_soft() << 8) | 0xB0))
-            .cursor_pointer()
-            .child(SharedString::from("\u{00D7}"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.note_zoom = None;
-                    cx.notify();
-                }),
-            );
+        // ── 关闭：夹注大卡留一枚很轻的小叉；注音纸条**不画叉**──────────
+        //
+        // 纸条上挂一个「×」立刻就成了「网页弹窗」，用户要的是「飘在书页上的
+        // 小纸条」。所以纸条约 40px 高、点它自己就收（见末尾的 `on_mouse_down`），
+        // Esc 与点纸面同样收——三种最自然的关法，不必留一个按钮。
+        let close = if is_ruby {
+            div()
+        } else {
+            div()
+                .absolute()
+                .top(px(6.0))
+                .right(px(6.0))
+                .w(px(18.0))
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(9.0))
+                .text_size(px(12.0))
+                .text_color(rgba((t.ink_soft() << 8) | 0xB0))
+                .cursor_pointer()
+                .child(SharedString::from("\u{00D7}"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.note_zoom = None;
+                        cx.notify();
+                    }),
+                )
+        };
 
         // ── 内容 ──────────────────────────────────────────────────
         let mut body = div().flex().flex_col().items_center().justify_center();
         if is_ruby {
-            // ① 主行：朱砂拼音 + 本字，同一个词头里并排——
-            //    先看见读音（最大、朱砂），再一眼确认是哪个字（墨色、略小）。
+            // 全部内容就这一行：**朱砂小拼音 + 墨色本字**，`items_center` 让
+            // 两段文字的中线对齐（拼音只有汉字一半高，靠基线对齐会明显偏高）。
             body = body.child(
                 div()
                     .h(px(row_h))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(12.0))
+                    .gap(px(gap))
                     .child(
                         div()
                             .flex()
@@ -10440,17 +10525,6 @@ impl Root {
                             .child(SharedString::from(zoom.text.clone())),
                     ),
             );
-            // ② 首义：一行，淡墨；没有（或天头塞不下）就不画这一行。
-            if show_gloss {
-                if let Some(g) = gloss {
-                    body = body.child(
-                        div().mt(px(3.0)).h(px(gl_h)).flex().items_center()
-                            .text_size(px(gl_fs))
-                            .text_color(rgb(t.ink_soft()))
-                            .child(SharedString::from(g)),
-                    );
-                }
-            }
         } else {
             for line in &lines {
                 body = body.child(
@@ -10513,9 +10587,12 @@ impl Root {
             );
         }
 
-        // 纸色 / 边色：边是纸向墨里兑 12%，比纸略深一点点，像一张压在字上的宣纸边。
+        // 纸色 / 边色：边是纸向**墨**里兑深一档（0.42），不是兑 12% 的浅灰——
+        // 用户要「极细的暗色边框」，深到像纸的裁切边，浅了就成网页卡片的描边。
         let paper = t.paper();
-        let edge = crate::theme::mix(paper, t.ink(), 0.12);
+        let edge = crate::theme::mix(paper, t.ink(), if is_ruby { 0.42 } else { 0.12 });
+        // 纸角：纸条是**裁出来的一小片**，圆角一大就成了 App 弹窗（10px → 3px）。
+        let corner = if is_ruby { 3.0 } else { 10.0 };
 
         div()
             .absolute()
@@ -10526,11 +10603,12 @@ impl Root {
             .flex_col()
             .items_center()
             .p(px(pad))
-            .rounded(px(10.0))
-            // 半透宣纸底（94%）：留一丝透光＝「毛玻璃」在无 blur 环境下的替身。
-            .bg(rgba((paper << 8) | 0xF0))
+            .rounded(px(corner))
+            // 半透宣纸底（95%）：留一丝透光＝「毛玻璃」在无 blur 环境下的替身。
+            .bg(rgba((paper << 8) | 0xF2))
             .border_1()
-            .border_color(rgba((edge << 8) | 0x70))
+            .border_color(rgba((edge << 8) | if is_ruby { 0x8C } else { 0x70 }))
+            // 一道柔影把纸条**托离纸面**（用户：「让它有真正悬浮起来的层次感」）。
             .shadow_lg()
             // 拼音是拉丁字母、汉字是正文——浮签跟**正文那副面孔**走。
             .font_family(if is_ruby {
@@ -10545,8 +10623,14 @@ impl Root {
             //   被判成单击翻页 → 卡片底下的书页自己翻过去。`.occlude()` 让命中
             //   栈在卡片处截断（与目录抽屉 / 问笺侧栏同款），卡片之外才算纸面。
             .occlude()
-            .on_mouse_down(MouseButton::Left, cx.listener(|_this, _, _, cx| {
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                // 命中栈在此截断（底下正文不算被点）；纸条**点自己就收**，
+                // 没有「×」也不至于关不掉。
                 cx.stop_propagation();
+                if this.note_zoom.as_ref().map(|z| z.pinyin.is_some()).unwrap_or(false) {
+                    this.note_zoom = None;
+                    cx.notify();
+                }
             }))
             .child(body)
             .child(close)
@@ -14292,6 +14376,63 @@ mod tests {
         // 横向：以锚点 600 为心 → 490，且在纸内。
         assert!((left - 490.0).abs() < 0.01, "横向未跟随锚点：{left:.1}");
         assert!(left >= paper.0 && left + 220.0 <= paper.0 + paper.2);
+    }
+
+    /// 注音纸条默认钉在**生字右下方**（用户 v1.9.56 铁律）。
+    #[test]
+    fn ruby_card_sits_at_the_lower_right_of_the_char() {
+        let paper = (20.0, 10.0, 1200.0, 800.0);
+        let (left, top) = super::ruby_card_pos_in(
+            paper,
+            (1280.0, 860.0),
+            (80.0, 40.0),
+            (600.0, 400.0),
+        );
+        assert!(left > 600.0 && left < 620.0, "横向没落在字的右侧：{left:.1}");
+        assert!(top > 400.0 && top < 420.0, "纵向没落在字的下方：{top:.1}");
+    }
+
+    /// 贴着纸的右缘点字（竖排第一列就在右边）→ 纸条翻到**左侧**，仍不出纸。
+    #[test]
+    fn ruby_card_flips_left_at_the_paper_edge() {
+        let paper = (20.0, 10.0, 1200.0, 800.0);
+        let (left, _) = super::ruby_card_pos_in(
+            paper,
+            (1280.0, 860.0),
+            (80.0, 40.0),
+            (1190.0, 400.0),
+        );
+        assert!(left + 80.0 <= 20.0 + 1200.0 - 6.0 + 0.01, "右缘出纸：{:.1}", left + 80.0);
+        assert!(left < 1190.0, "没翻到字的左侧：{left:.1}");
+    }
+
+    /// 贴着纸的下缘点字 → 纸条翻到**上方**，仍不出纸。
+    #[test]
+    fn ruby_card_flips_up_at_the_foot() {
+        let paper = (20.0, 10.0, 1200.0, 800.0);
+        let (_, top) = super::ruby_card_pos_in(
+            paper,
+            (1280.0, 860.0),
+            (80.0, 40.0),
+            (600.0, 790.0),
+        );
+        assert!(top + 40.0 <= 10.0 + 800.0 - 6.0 + 0.01, "下缘出纸：{:.1}", top + 40.0);
+        assert!(top < 790.0, "没翻到字的上方：{top:.1}");
+    }
+
+    /// 极窄纸面（比纸条还窄）→ 硬夹，绝不返回负坐标把纸条推出画外。
+    #[test]
+    fn ruby_card_never_leaves_the_paper() {
+        let paper = (0.0, 0.0, 60.0, 50.0);
+        let (left, top) = super::ruby_card_pos_in(
+            paper,
+            (80.0, 60.0),
+            (80.0, 40.0),
+            (30.0, 25.0),
+        );
+        assert!(left >= paper.0 - 0.01, "左缘出纸：{left:.1}");
+        assert!(top >= -0.01, "上缘出画：{top:.1}");
+        assert!(top + 40.0 <= 60.0 + 0.01, "下缘出画：{:.1}", top + 40.0);
     }
 
     /// 天头塞不下（超高浮签 / 大字版式）→ 退到**地脚带**，仍不压正文。

@@ -5734,7 +5734,9 @@ fn anki_push_card(
             .as_ref()
             .and_then(|b| b.chapters.get(chapter))
             .and_then(|c| c.paragraphs.get(para))
-            .map(|p| p.text.clone())
+            // 摘录会落进卡片匣（Anki / Obsidian / 朱批录），标记壳绝不能
+            // 跟着卡片走到用户手里（v1.9.56）。
+            .map(|p| jiandu_core::cleaner::strip_note_tags(&p.text))
         else {
             return String::new();
         };

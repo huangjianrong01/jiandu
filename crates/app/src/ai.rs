@@ -2251,7 +2251,9 @@ fn ai_refs(
             if let Ok(Some(ch)) = jiandu_core::store::load_chapter(&c, &sid, idx) {
                 let mut text = String::new();
                 for p in &ch.paragraphs {
-                    text.push_str(&p.text);
+                    // 交给模型的引文必须是干净正文：`[注]`/`[/注]` 这类标记
+                    // 进了 prompt 只会让模型对着括号说话（v1.9.56）。
+                    text.push_str(&jiandu_core::cleaner::strip_note_tags(&p.text));
                 }
                 if text.trim().is_empty() {
                     continue;
@@ -2259,7 +2261,7 @@ fn ai_refs(
                 let chap = if ch.title.trim().is_empty() {
                     cur_chapter.clone()
                 } else {
-                    ch.title.clone()
+                    jiandu_core::cleaner::strip_note_tags(&ch.title)
                 };
                 let snip = snippet_around(&text, q, REF_SNIPPET);
                 out.push(format!("{title}·{chap}：{snip}"));

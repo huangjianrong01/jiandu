@@ -1426,7 +1426,15 @@ impl Book {
             return out;
         };
         for (pi, p) in ch.paragraphs.iter().enumerate() {
+            // ★ 标记壳闸（v1.9.56）：`[注]` `[/注]` 这类自家标记**绝不进字流**。
+            //   导入管线那一侧收干净是「应该」，这里跳字是「保证」——旧版本
+            //   导进来的书稿正文里还留着 `[/注]`，少了这一道就是四枚大字竖着
+            //   排下来（真机已见）。掩码为空表时 `get` 恒 None，热路径零成本。
+            let tag_mask = crate::cleaner::note_tag_mask(&p.text);
             for (oi, c) in p.text.chars().enumerate() {
+                if tag_mask.get(oi).copied().unwrap_or(false) {
+                    continue;
+                }
                 if !show_punct && is_punct(c) {
                     continue;
                 }
@@ -1455,7 +1463,12 @@ impl Book {
         let mut out = Vec::new();
         for (ci, ch) in self.chapters.iter().enumerate() {
             for (pi, p) in ch.paragraphs.iter().enumerate() {
+                // 与 `flow_of_chapter` 同一条闸：标记壳不进字流（v1.9.56）。
+                let tag_mask = crate::cleaner::note_tag_mask(&p.text);
                 for (oi, c) in p.text.chars().enumerate() {
+                    if tag_mask.get(oi).copied().unwrap_or(false) {
+                        continue;
+                    }
                     // 标点显隐：关闭时不产出标点字（offset 仍按原文计数，注文定位不受影响）。
                     if !show_punct && is_punct(c) {
                         continue;
@@ -2081,6 +2094,39 @@ pub struct GlyphHit {
 mod tests {
     use super::*;
     use crate::types::{Chapter, NoteKind, Paragraph};
+
+    /// **标记壳绝不上纸**（v1.9.56）：旧稿正文里残留 `[注]` `[/注]` 时，
+    /// 字流里一个括号都不许出现（真机上曾是四枚大字竖排下来，整页废掉）。
+    /// 同时钉住：**壳外的正文一个字不少、偏移仍是原偏**（注文定位不受影响）。
+    #[test]
+    fn flow_never_emits_note_tag_shells() {
+        let mut b = Book::new("資治通鑑", "司馬光");
+        b.chapters.push(Chapter {
+            title: "卷第三[注]周纪三[/注]".into(),
+            paragraphs: vec![Paragraph::plain("周人遂引以為謚法[注]分，扶問翻[/注]。立之。")],
+        });
+        let flat = b.to_flow(true);
+        let text: String = flat.iter().map(|g| g.ch).collect();
+        for bad in ['[', ']'] {
+            assert!(
+                !text.contains(bad),
+                "标记壳 `{bad}` 漏进字流：{text}"
+            );
+        }
+        assert!(text.contains("周人遂引以為謚法"), "正文被吞：{text}");
+        assert!(text.contains("。立之。"), "壳后的正文被吞：{text}");
+        // 偏移仍按原文字符计：`周` 是 0，`立` 落在原文第 20 字。
+        assert_eq!(flat[0].offset, 0);
+        let li = flat.iter().find(|g| g.ch == '立').expect("立 不在字流里");
+        let raw: Vec<char> = b.chapters[0].paragraphs[0].text.chars().collect();
+        assert_eq!(raw[li.offset], '立', "偏移错位，注文会挂到别的字上");
+
+        // 单章路径（分页引擎真正走的那条）同一口径。
+        let one = b.flow_of_chapter(0, true);
+        let text1: String = one.iter().map(|g| g.ch).collect();
+        assert!(!text1.contains('[') && !text1.contains(']'), "单章字流漏壳：{text1}");
+    }
+
 
     /// v1.84.0：思源黑体 / 尚古等宽两款现代体**下架**——面板不再陈列。
     ///

@@ -54,9 +54,12 @@ pub fn to_txt(book: &Book) -> String {
 
     out.push_str("\n——— 正文 ———\n");
     for ch in &book.chapters {
-        out.push_str(&format!("\n{}\n\n", ch.title));
+        out.push_str(&format!(
+            "\n{}\n\n",
+            jiandu_core::cleaner::strip_note_tags(&ch.title)
+        ));
         for p in &ch.paragraphs {
-            out.push_str(&p.text);
+            out.push_str(&jiandu_core::cleaner::strip_note_tags(&p.text));
             out.push('\n');
             // 注释随段输出，读文本时不必回翻。
             for n in &p.notes {
@@ -101,7 +104,10 @@ pub fn to_markdown(book: &Book) -> String {
 
     let mut footnote_counter: usize = 0;
     for (ci, ch) in book.chapters.iter().enumerate() {
-        out.push_str(&format!("## {}\n\n", ch.title));
+        out.push_str(&format!(
+            "## {}\n\n",
+            jiandu_core::cleaner::strip_note_tags(&ch.title)
+        ));
         let mut defs: Vec<(usize, String)> = Vec::new();
         for p in &ch.paragraphs {
             let (body, mut fs) = md_with_footnotes(&p.text, &p.notes, &mut footnote_counter);

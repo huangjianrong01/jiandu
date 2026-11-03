@@ -666,6 +666,83 @@ pub fn note_content_only(s: &str) -> String {
     cur.replace(['[', ']'], "")
 }
 
+/// **自家标记壳的位置掩码**（v1.9.56）：`[注]` `[/注]` `[疏]` `[/疏]`
+/// `[高亮]` `[/高亮]` `[note]` `[/note]` `[拼音:…]` `[数字:…]` 的**每一个
+/// 字符**都标 `true`，其余 `false`；返回的向量与 `s.chars()` **逐位对齐**。
+///
+/// 这是「标签绝不许进排版网格」的最后一道闸。此前只有导入管线负责把壳收
+/// 干净，一旦某本书稿是**旧版本**导入的（`Paragraph.text` 里还留着
+/// `[/注]`），`Book::to_flow` 就会把 `[` `/` `注` `]` 当正文逐字塞进列里
+/// ——真机上是四枚大字竖着排下来，整页书就废了。分页引擎在**造字流**时不
+/// 再信任上游，照这张掩码跳字：正文干净与否是导入的事，**能不能上纸是排版
+/// 的事**，两者必须各守一条线。
+///
+/// 掩码只盖**壳**、不盖壳里的字：`[注]周纪三[/注]` → 只挡 7 个字符，
+/// `周纪三` 原样留在正文里（剥壳 ≠ 吞字）。
+///
+/// `s` 中没有 `[` 时返回空表（热路径：99.9% 的段落走这一支，零分配）。
+pub fn note_tag_mask(s: &str) -> Vec<bool> {
+    if !s.contains('[') {
+        return Vec::new();
+    }
+    let cs: Vec<char> = s.chars().collect();
+    let mut mask = vec![false; cs.len()];
+    let mut i = 0usize;
+    while i < cs.len() {
+        if cs[i] != '[' {
+            i += 1;
+            continue;
+        }
+        // 收口最多向前看 12 字：最长的 `[拼音:zhōng]` 也不过这个量级。
+        let close = (i + 1..(i + 13).min(cs.len())).find(|&j| cs[j] == ']');
+        let Some(j) = close else {
+            i += 1;
+            continue;
+        };
+        // 归一化判据与 `normalize_note_shells` 同口径：去空白、全角斜杠折半角。
+        let key: String = cs[i + 1..j]
+            .iter()
+            .filter(|c| !matches!(c, ' ' | '\t' | '\u{3000}' | '\u{00A0}'))
+            .map(|c| if *c == '／' { '/' } else { *c })
+            .collect();
+        let low = key.to_lowercase();
+        let is_tag = matches!(
+            low.as_str(),
+            "注" | "疏" | "/注" | "/疏" | "高亮" | "/高亮" | "note" | "/note"
+        ) || low.starts_with("拼音:")
+            || low.starts_with("拼音：")
+            || low.starts_with("数字:")
+            || low.starts_with("数字：");
+        if is_tag {
+            for m in &mut mask[i..=j] {
+                *m = true;
+            }
+            i = j + 1;
+        } else {
+            // 不是自家壳（`[1]` 年份注、正文里的方括号）：一个字符都不许挡。
+            i += 1;
+        }
+    }
+    mask
+}
+
+/// **剥掉自家标记壳、留下壳内的字**：`[注]周纪三[/注]` → `周纪三`。
+///
+/// 与 [`note_content_only`] 的区别：那个还要拆 `[拼音:x]` 取内容、清残余
+/// 括号；这个只做一件事——按 [`note_tag_mask`] 把壳的字符删掉，一个正文
+/// 字都不动。用于章题、注文、目录这些**已经取出内容**、只剩壳的地方。
+pub fn strip_note_tags(s: &str) -> String {
+    let mask = note_tag_mask(s);
+    if mask.is_empty() {
+        return s.to_string();
+    }
+    s.chars()
+        .enumerate()
+        .filter(|(i, _)| !mask.get(*i).copied().unwrap_or(false))
+        .map(|(_, c)| c)
+        .collect()
+}
+
 /// **剥离落单的书名号**（v1.68.1）：跨行 / 跨段被截断的《》直接删掉。
 ///
 /// 正常成对出现的《…》不动（它们会被 [`crate::vclean`] 转成竖排的 ︽︾，
@@ -2374,6 +2451,61 @@ mod tests {
         assert_eq!(b.chapters[0].paragraphs[0].text, "周紀一。");
         assert!(b.chapters[0].paragraphs[1].text.starts_with("臣光曰"));
         assert_eq!(b.chapters[0].paragraphs[2].text, "道可道，非常道。");
+    }
+
+    // ── 标记壳闸（v1.9.56）──────────────────────────────────────────
+
+    /// 壳剥干净、壳里的字一个不少——这是「剥壳 ≠ 吞字」的边界。
+    #[test]
+    fn strip_note_tags_keeps_the_words_inside() {
+        assert_eq!(
+            strip_note_tags("卷第三[注]周纪三[/注]起重光赤奋若"),
+            "卷第三周纪三起重光赤奋若"
+        );
+        assert_eq!(strip_note_tags("甲[疏]疏曰[/疏]乙"), "甲疏曰乙");
+        assert_eq!(strip_note_tags("[高亮]道[/高亮]可道"), "道可道");
+        // 空壳：什么都不剩，也绝不吐括号。
+        assert_eq!(strip_note_tags("道[注][/注]可道"), "道可道");
+        // 没有壳的段落原样返回（热路径不复制内容也不改一字）。
+        assert_eq!(strip_note_tags("道可道，非常道。"), "道可道，非常道。");
+    }
+
+    /// **不是自家壳的方括号一个都不许动**：`[1]` 是年份注、`[[…]]` 是
+    /// 文献里常见的引文标记，都是正文的一部分。
+    #[test]
+    fn strip_note_tags_never_touches_foreign_brackets() {
+        assert_eq!(strip_note_tags("見[1]注"), "見[1]注");
+        assert_eq!(strip_note_tags("案[案]云"), "案[案]云");
+        // 唯一的例外是自家那三对壳，它们藏在别处也必须被剥。
+        assert_eq!(strip_note_tags("見[1][注]注[/注]"), "見[1]注");
+    }
+
+    /// 掩码与字符**逐位对齐**：只盖壳、不盖壳里的字，且长度恒等于字数。
+    #[test]
+    fn note_tag_mask_is_char_aligned() {
+        let s = "甲[注]乙[/注]丙";
+        let m = note_tag_mask(s);
+        assert_eq!(m.len(), s.chars().count(), "掩码长度必须等于字数");
+        let masked: String = s
+            .chars()
+            .enumerate()
+            .filter(|(i, _)| m[*i])
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(masked, "[注][/注]");
+        // 无 `[` 的段落返回空表（零分配快路）。
+        assert!(note_tag_mask("道可道").is_empty());
+    }
+
+    /// 空格 / 全角斜杠 / 大小写都认：`[ / 注 ]` `[／疏]` `[/NOTE]`。
+    #[test]
+    fn note_tag_mask_tolerates_spaces_and_full_width_slash() {
+        assert_eq!(strip_note_tags("甲[ / 注 ]乙[／注]丙"), "甲乙丙");
+        assert_eq!(strip_note_tags("甲[/NOTE]乙"), "甲乙");
+        // `[拼音:…]` / `[数字:…]` 是**带参标记**：壳与参数一起下纸，
+        // 参数绝不能当正文排（`dào` 三个拉丁字母竖着摞成三格是灾难）。
+        assert_eq!(strip_note_tags("道[拼音:dào]可道"), "道可道");
+        assert_eq!(strip_note_tags("凡[数字:35]葉"), "凡葉");
     }
 
 }
