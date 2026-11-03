@@ -395,56 +395,212 @@ fn same_glyph(a: &Glyph, b: &Glyph) -> bool {
         && a.kind == b.kind
 }
 
-/// **注音纸条的落位**（纯函数，可断言）：**吸附在当前字列下方的地脚空白里**。
+/// 一叶最多记住几列的占位（8/10/12/14 列都够，留一倍余量）。
+pub(crate) const INK_COLS_MAX: usize = 24;
+
+/// 一叶正文的**占位图**：每列排到了多高。
 ///
-/// 用户口径（v1.9.57 最终定调）：「不要放在天头，直接让它吸附在当前字列的
-/// 下方（地脚位置）或者版心空白处……浮签的顶部边界必须低于页面正文的底部
-/// 边界，绝对不允许压住任何一个字」。
+/// 浮签要「就近避让」，先得知道哪儿是字、哪儿是空白（v1.9.58）。竖排正文
+/// 逐列自上而下排，故一列只需记住「排了多少**半格**」，就能算出这一列从
+/// 版心上沿到列尾的墨迹矩形——列尾之下、版心之外自然都是空白。
 ///
-/// 于是规则只剩一条主轴 + 两条护栏：
-///   ① **底部吸附**——横向以锚点（当前列）为中线，纵向贴住**正文下沿**
-///      （`paper.bottom − margin_bot`）往下 `GAP`，落在天头/地脚的那条空白里；
-///   ② **绝不压字**——纸条顶边恒 `≥ 正文下沿`。地脚带塞不下时**向上收**，
-///      收到贴住正文下沿为止，永不越过版框进正文；
-///   ③ **边界保护**——横向夹进纸面、再夹进窗口（窄屏下纸条不甩出画外）；
-///      纵向夹进窗口，窗口比纸条还矮时也保证卡顶在正文之下。
+/// 它是渲染帧的**输出**（`render_leaf` 写），浮签定位时读，不改任何排版
+/// 坐标，也不参与分页。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InkFill {
+    /// 每列已排的半格数（0 = 空列），自右（`i = 0`）向左，与 `Page::columns` 同序。
+    pub units: [u16; INK_COLS_MAX],
+    /// 本叶的**正文列数**（不含章题列）：列序 `i` 的横向位置靠它反算。
+    pub cols: usize,
+}
+
+/// 两个矩形是否相交（边界相接不算，留一线之隔）。
+fn rects_overlap(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+}
+
+/// **注音纸条的落位**（纯函数，可断言）：**就近避让** —— 贴着被点的字，找
+/// 第一片放得下纸条、且不压任何字与界栏的空白。
 ///
-/// 参数：`paper` 纸面矩形 `(x, y, w, h)`（window 坐标）、`margin_bot` 地脚留白高、
-/// `viewport` 窗口宽高、`card` 纸条宽高、`anchor` 点击处（≈ 当前列的位置）。
-pub(crate) fn ruby_card_pos_in(
+/// 用户口径（v1.9.58 定调）：「不要硬飞到底部，也不要遮挡正文……在当前字的
+/// 上下左右 1 到 4 个字距的范围内，去找一个能够容纳浮签、且绝对不遮挡任何
+/// 正文汉字和界栏线的空白缝隙」。
+///
+/// 弹序（先近后远）：
+///   ① **当前列正下方**——列已排完，下方就是空白（最贴心的那一处）；
+///   ② **当前字正下方**——本列字未尽时，碰撞会否掉它；
+///   ③ **左右界栏外侧**——竖中对齐被点的字，探一探隔壁列空不空；
+///   ④ **由近及远扫各列**：空列 → 与字同高（最近）或贴列顶；半满列 → 贴其
+///      列尾。竖排的空白多在末叶／末章的短列旁，这一档才找得到；
+///   ⑤ **本列上下 1–4 字距**；
+///   ⑥ 最后才退到**天头 / 地脚**（版框之外的留白带；取离字更近的那条）。
+///
+/// 碰撞体有两类：**每列已排的墨迹**，以及**版框四周那圈框线**——后者保证
+/// 纸条绝不像旧版那样骑在下框线上。每一处候选都先夹进纸面与窗口（防越界）
+/// 再检测，整页真的挤满时返回 ⑥，**绝不回头压字**。
+///
+/// 参数（window 坐标）：
+///   * `paper` 纸面矩形；`viewport` 窗口宽高；`cell` 字格宽高；`card` 纸条宽高；
+///   * `glyph` 被点字的字格矩形；`art` 版心上沿 / 下沿的 y（界行的起止）；
+///   * `columns` **每列**的 `(列左缘 x, 已排高度)`，自左向右，0 高即空列。
+pub(crate) fn ruby_card_nearest(
     paper: (f32, f32, f32, f32),
-    margin_bot: f32,
     viewport: (f32, f32),
+    cell: (f32, f32),
     card: (f32, f32),
-    anchor: (f32, f32),
+    glyph: (f32, f32, f32, f32),
+    art: (f32, f32),
+    columns: &[(f32, f32)],
 ) -> (f32, f32) {
-    /// 纸条与正文之间那道缝：留出来才看得出「它是纸面上另贴的一小条」。
-    const GAP: f32 = 8.0;
-    /// 纸条离纸边的安全距：纸是裁切过的，纸条不该压到纸缘之外。
+    /// 纸条与字 / 界栏之间那道缝：留出来才看得出「它是另贴上去的一小条」。
+    const GAP: f32 = 6.0;
+    /// 纸条离纸边的安全距。
     const INSET: f32 = 6.0;
+    /// 碰撞检测的**膨胀量**：字有墨晕，贴到笔画边上也算压字。
+    const BREATH: f32 = 2.0;
+    /// 版框（外粗内细）从版心再往外占的厚度：8 内衬 + 1 内线 + 3 外衬 + 3 外框。
+    const FRAME: f32 = 15.0;
 
     let (px0, py0, pw, ph) = paper;
     let (vw, vh) = viewport;
-    let (card_w, card_h) = card;
-    let (ax, _ay) = anchor;
+    let (cell_w, cell_h) = cell;
+    let (cw, ch) = card;
+    let (gx, gy, gw, gh) = glyph;
+    let (art_top, art_bot) = art;
+    let (art_bot, art_h) = (art_bot.max(art_top), (art_bot - art_top).max(0.0));
+    let art_left = columns.first().map(|c| c.0).unwrap_or(gx);
+    let art_right = columns.last().map(|c| c.0 + cell_w).unwrap_or(gx + gw);
 
-    // 正文下沿 = 版框下缘（纸面底 − 地脚留白）。纸条的顶边**恒不低于**这条线。
-    let text_bottom = py0 + ph - margin_bot.max(0.0);
-    // 三条线：贴纸底、贴正文底、窗口底。取「最保守」的那个当下界与上界。
-    let lo = text_bottom.max(0.0);
-    let hard = (py0 + ph - INSET - card_h).max(lo);
-    let win = (vh - card_h).max(lo);
+    // 碰撞体：每列已排的墨迹 + 版框四周那圈框线。
+    let mut occupied: Vec<(f32, f32, f32, f32)> = columns
+        .iter()
+        .filter(|(_, h)| *h > 0.0)
+        .map(|(x, h)| (*x, art_top, cell_w, *h))
+        .collect();
+    occupied.push((px0, art_top - FRAME, pw, FRAME)); // 上框
+    occupied.push((px0, art_bot, pw, FRAME)); // 下框
+    occupied.push((art_left - FRAME, art_top, FRAME, art_h)); // 左框
+    occupied.push((art_right, art_top, FRAME, art_h)); // 右框
 
-    // ① 横向：以当前列为中线；夹进纸面（两侧各留 INSET）再夹进窗口。
-    let paper_lo = px0 + INSET;
-    let paper_hi = (px0 + pw - card_w - INSET).max(paper_lo);
-    let left = (ax - card_w * 0.5)
-        .clamp(paper_lo, paper_hi)
-        .clamp(0.0, (vw - card_w - INSET).max(0.0));
+    // 合法落位区间：纸条整张在纸内、且在窗内（防越界 · 用户第 4 条）。
+    let lo_x = (px0 + INSET).max(0.0);
+    let hi_x = ((px0 + pw - INSET - cw).min(vw - cw)).max(lo_x);
+    let lo_y = (py0 + INSET).max(0.0);
+    let hi_y = ((py0 + ph - INSET - ch).min(vh - ch)).max(lo_y);
 
-    // ② 纵向：贴住正文下沿往下 GAP；地脚带不够高就向上收（仍不进正文）。
-    let top = (text_bottom + GAP).min(hard).clamp(lo, hard).min(win);
-    (left, top)
+    // 落位判定：夹回合法区之后，是否与任何碰撞体相交。
+    let ok = |l: f32, t: f32| -> Option<(f32, f32)> {
+        let l = l.clamp(lo_x, hi_x);
+        let t = t.clamp(lo_y, hi_y);
+        let r = (l, t, cw, ch);
+        let hit = occupied.iter().any(|o| {
+            let fat = (
+                o.0 - BREATH,
+                o.1 - BREATH,
+                o.2 + BREATH * 2.0,
+                o.3 + BREATH * 2.0,
+            );
+            rects_overlap(r, fat)
+        });
+        if hit { None } else { Some((l, t)) }
+    };
+
+    let cx_g = gx + gw * 0.5;
+    let cy_g = gy + gh * 0.5;
+    // 被点字所在列（按字格中心 x 定位；找不到就当成独立一列）。
+    let ci = columns
+        .iter()
+        .position(|(x, _)| cx_g >= *x && cx_g <= *x + cell_w)
+        .unwrap_or(0);
+    let (colx, colh) = columns.get(ci).copied().unwrap_or((gx, cell_h));
+    let col_bottom = art_top + colh.max(cell_h);
+
+    let mut cands: Vec<(f32, f32)> = Vec::new();
+    // ① 当前列正下方（列已排完 → 这一处就是空白）。
+    cands.push((colx + (cell_w - cw) * 0.5, col_bottom + GAP));
+    cands.push((cx_g - cw * 0.5, col_bottom + GAP));
+    // ② 当前字正下方（本列字未尽时会被碰撞否掉）。
+    cands.push((cx_g - cw * 0.5, gy + gh + GAP));
+    // ③ 左右界栏外侧，竖中对齐当前字。
+    cands.push((colx - GAP - cw, cy_g - ch * 0.5));
+    cands.push((colx + cell_w + GAP, cy_g - ch * 0.5));
+    // ④ 由近及远扫各列（先左后右：竖排往左读，左边更顺）。
+    for d in 1..columns.len() {
+        let mut picks: Vec<usize> = Vec::new();
+        if let Some(j) = ci.checked_sub(d) {
+            picks.push(j);
+        }
+        if ci + d < columns.len() {
+            picks.push(ci + d);
+        }
+        for j in picks {
+            let (x, h) = columns[j];
+            if h <= 0.0 {
+                // 整列空着：尽量落在**这一整片空列的正中**——纸条比一个列宽
+                // 还宽（14 列时 62 > 46），贴着单列放必然骑界栏线；居中于
+                // 空列连片，跨的就只有最外侧那一道，甚至一道都不跨。
+                let mut a = j;
+                while a > 0 && columns[a - 1].1 <= 0.0 {
+                    a -= 1;
+                }
+                let mut b = j;
+                while b + 1 < columns.len() && columns[b + 1].1 <= 0.0 {
+                    b += 1;
+                }
+                let run_w = (b - a + 1) as f32 * cell_w;
+                let run_x = columns[a].0;
+                let l = if run_w >= cw + 2.0 {
+                    run_x + (run_w - cw) * 0.5
+                } else {
+                    x + (cell_w - cw) * 0.5
+                };
+                // 先试与字同高（视线不动），再试贴列顶。
+                cands.push((l, cy_g - ch * 0.5));
+                cands.push((l, art_top + GAP));
+            } else {
+                // 半满的列：贴它的列尾。
+                cands.push((x + (cell_w - cw) * 0.5, art_top + h + GAP));
+            }
+        }
+    }
+    // ⑤ 本列上下 1–4 字距。
+    for k in 1..=4usize {
+        let dy = k as f32 * cell_h;
+        cands.push((cx_g - cw * 0.5, gy - dy - GAP - ch));
+        cands.push((cx_g - cw * 0.5, gy + gh + dy + GAP));
+    }
+    for (l, t) in cands {
+        if let Some(p) = ok(l, t) {
+            return p;
+        }
+    }
+
+    // ⑥ 天头 / 地脚：版框之外的两条留白带，取离当前字更近的那条。
+    let top_lo = py0 + INSET;
+    let top_hi = art_top - FRAME - ch;
+    let bot_lo = art_bot + FRAME;
+    let bot_hi = py0 + ph - INSET - ch;
+    let band_top = (cx_g - cw * 0.5, top_lo + (top_hi - top_lo).max(0.0) * 0.5);
+    let band_bot = (cx_g - cw * 0.5, bot_lo + (bot_hi - bot_lo).max(0.0) * 0.5);
+    let d_top = (gy - top_lo).abs();
+    let d_bot = (bot_lo - gy).abs();
+    let bands = if d_bot < d_top {
+        [band_bot, band_top]
+    } else {
+        [band_top, band_bot]
+    };
+    for (l, t) in bands {
+        if let Some(p) = ok(l, t) {
+            return p;
+        }
+    }
+
+    // 极端兜底：窗口连一条留白带都容不下（纸条比窗口还高）。仍夹在画内，
+    // 至少让它看得见——这是唯一一处可能在物理上压到字的情形。
+    (
+        (cx_g - cw * 0.5).clamp(lo_x, hi_x),
+        (gy + gh + GAP).clamp(lo_y, hi_y),
+    )
 }
 
 /// 注文浮签的落位（纯函数，可断言）：**先钉天头，再退地脚，都不行才回锚点**。
@@ -1316,6 +1472,10 @@ impl Root {
         }
         // 按当前窗口视口把字格缩放到铺满屏。
         self.fit_sizes();
+        // 占位图每帧重记（本帧的叶一渲染就写，见 `render_leaf`）；版心探针
+        // 是 prepaint 写的，**不能在这里清**——清了本帧读到的永远是 None。
+        // 空槽由 `leaf_ink_at` 的「探针与占位图都在才算数」自然挡掉。
+        self.leaf_ink.set([None, None]);
         // 自动列数刚换过档（拉窗口跨了档）：几何已更新，此刻才能按新排版
         // 把阅读位置找回来，免得「拉一下窗口就跳到别处」。
         if let Some(anchor) = self.pending_anchor.take() {
@@ -2149,6 +2309,7 @@ impl Root {
         // 与避让，不影响正常交互（只在 `bubble` 为空时生效一次）。
         self.dev_lookup_once();
         self.dev_menu_once();
+        self.dev_ruby_once();
         // 内购相位轮询（v1.9.23）：StoreKit 的回调在别的栈里落，UI 每帧看一眼
         // 原子量有没有变；变了才 notify，不变什么都不做（否则自激）。
         self.poll_unlock(cx);
@@ -5296,6 +5457,32 @@ impl Root {
         let glyphs: Vec<Glyph> = page.map(|p| p.glyphs.clone()).unwrap_or_default();
         let start = page.map(|p| p.start_chapter).unwrap_or(false);
         let columns: Vec<Vec<Piece>> = page.map(|p| p.columns.clone()).unwrap_or_default();
+
+        // ── 占位图（v1.9.58）──────────────────────────────────────────
+        // 浮签要「就近避让」，得先知道这一叶哪些列排到多高。逐列按 `Piece`
+        // 的半格账累加即得：正文 2 半格、夹注向上取整到整格、挤压句读与
+        // 书名号 0（与分页同一口径 `piece_units`）。这只是一次 O(字数) 的
+        // 求和，且只在取到新叶时才走一遍；不参与任何排版坐标。
+        {
+            let mut units = [0u16; INK_COLS_MAX];
+            for (i, col) in columns.iter().enumerate().take(INK_COLS_MAX) {
+                let u: usize = col.iter().map(crate::gloss::piece_units).sum();
+                units[i] = u.min(u16::MAX as usize) as u16;
+            }
+            let total = if start {
+                self.grid.columns.saturating_sub(1)
+            } else {
+                self.grid.columns
+            };
+            // 槽位：对开的左半叶 → 0，右半叶 / 单叶 → 1（见 `Root::leaf_ink`）。
+            let slot = usize::from(matches!(edge, LeafHalf::Left));
+            let mut all = self.leaf_ink.get();
+            all[slot] = Some(InkFill {
+                units,
+                cols: total.max(1),
+            });
+            self.leaf_ink.set(all);
+        }
         // 章末统计：本章在此收尾（下一葉即新章首，或已是全书末葉）时，
         // 把「篇 / 章 / 字」小表排在正文之后的第一片空列里。
         let stats: Vec<ChapStat> = self
@@ -5824,6 +6011,32 @@ impl Root {
                 fs,
             ));
         }
+
+        // ── 版心探针（v1.9.58）───────────────────────────────────────
+        // 浮签要知道「字格网格这一帧落在窗口何处」才能就近避让。这里挂一枚
+        // **什么都不画**的隐形 canvas（与 `page_rect` 同一套路），prepaint 时
+        // 记下版心矩形；包一层 `relative` 只为给探针一个定位父级，尺寸由
+        // grid 自身撑出，布局分毫不动。
+        let grid_probe = self.leaf_grid[usize::from(matches!(edge, LeafHalf::Left))].clone();
+        let grid = div().relative().child(grid).child(
+            canvas(
+                move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+                    let unit = px(1.0);
+                    grid_probe.set(Some((
+                        bounds.origin.x / unit,
+                        bounds.origin.y / unit,
+                        bounds.size.width / unit,
+                        bounds.size.height / unit,
+                    )));
+                },
+                |_bounds, _state, _window, _cx| {},
+            )
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0)),
+        );
 
         // 地脚：章首页的叶码在中缝（对开）/ 居中（单页），此处不重复；
         // 地脚叶码：每一叶都补一枚小字叶码（居中）——章题列里放的是
@@ -9000,6 +9213,61 @@ impl Root {
     ///
     /// 不写死坐标——列数 / 留白 / 窗口尺寸一变，固定点就落到界栏上了；
     /// 这里用 `glyph_hit_at` 从右向左、自上而下试，命中第一个字就收工。
+    /// 开发用（`JIANDU_RUBY=1`）：给本叶第一个带注音的字**自动弹一张浮签**。
+    ///
+    /// 合成点击 / AppleScript 激活被 TCC 拦，真机截图只能靠钩子：它按
+    /// 半格账算出那个字的字格中心当锚点，走的仍是正常的 `note_zoom` 路径
+    /// 与「就近避让」定位，所以截到的就是真机上的样子。
+    fn dev_ruby_once(&mut self) {
+        if std::env::var("JIANDU_RUBY").is_err() || self.note_zoom.is_some() {
+            return;
+        }
+        let fills = self.leaf_ink.get();
+        let slot = if self.leaf_grid[1].get().is_some() { 1 } else { 0 };
+        let (Some((gx, gy, _gw, _gh)), Some(fill)) = (self.leaf_grid[slot].get(), fills[slot])
+        else {
+            return;
+        };
+        let Some(pg) = self.page_at(self.page) else {
+            return;
+        };
+        let (cell_w, cell_h) = (self.col_w.max(1.0), self.row_h.max(1.0));
+        let cols = fill.cols.clamp(1, INK_COLS_MAX);
+        // 按半格账走一遍本叶的列：找到第一个「有注音」的正文格，顺带拿到
+        // 它的行号（列内第几格），据此算出字格中心。
+        let mut found: Option<(usize, usize, String, char)> = None;
+        'outer: for (ci, col) in pg.columns.iter().enumerate().take(cols) {
+            let mut units = 0usize;
+            for p in col {
+                if let Piece::Main(g) = p {
+                    if !is_punct(g.ch) {
+                        if let Some(py) = self
+                            .ruby_pinyin(*g)
+                            .or_else(|| dict::auto_pinyin(g.ch))
+                        {
+                            found = Some((ci, units / 2, py, g.ch));
+                            break 'outer;
+                        }
+                    }
+                }
+                units += crate::gloss::piece_units(p);
+            }
+        }
+        let Some((ci, row, py, ch)) = found else {
+            return;
+        };
+        let x = gx + (cols - 1 - ci) as f32 * cell_w + cell_w * 0.5;
+        let y = gy + row as f32 * cell_h + cell_h * 0.5;
+        self.zoom_seq = self.zoom_seq.wrapping_add(1);
+        self.note_zoom = Some(crate::gloss::NoteZoom {
+            text: ch.to_string(),
+            pinyin: Some(py),
+            x,
+            y,
+            page: self.page,
+        });
+    }
+
     fn dev_lookup_once(&mut self) {
         if std::env::var("JIANDU_LOOKUP").is_err() || self.bubble.is_some() {
             return;
@@ -10440,7 +10708,7 @@ impl Root {
             pad * 2.0 + 18.0 + lines.len() as f32 * line_h
         };
 
-        // 注音纸条**吸附在当前字列下方的地脚空白**；夹注大卡仍走「天头优先」。
+        // 注音纸条**就近避让**（贴字找空白，绝不压字）；夹注大卡仍走「天头优先」。
         let (left, top) = if is_ruby {
             let paper = match self.page_rect.get() {
                 Some((x, y, w, h)) if w > 1.0 && h > 1.0 && w.is_finite() && h.is_finite() => {
@@ -10448,13 +10716,7 @@ impl Root {
                 }
                 _ => (0.0, 0.0, self.viewport_w, self.viewport_h),
             };
-            ruby_card_pos_in(
-                paper,
-                self.margin_bot.max(0.0),
-                (self.viewport_w, self.viewport_h),
-                (card_w, card_h),
-                (zoom.x, zoom.y),
-            )
+            self.ruby_card_spot(paper, (card_w, card_h), (zoom.x, zoom.y))
         } else {
             self.note_card_pos(card_w, card_h, zoom.x, zoom.y)
         };
@@ -10676,6 +10938,83 @@ impl Root {
             (card_w, card_h),
             (ax, ay),
         )
+    }
+
+    /// 注音纸条的落位（v1.9.58）：把当帧的**占位图**翻成字格坐标，交给纯函数
+    /// `ruby_card_nearest` 做「就近碰撞检测 + 空白吸附」。
+    ///
+    /// 三步：
+    ///   ① 取锚点所在那一叶的**版心矩形**与**占位图**（对开时两叶各一份，
+    ///      按锚点横向落在哪一叶来挑）；
+    ///   ② 锚点 floor 进网格 → 被点字的字格矩形；该列已排高度 → 列矩形；
+    ///   ③ 逐列把「已排半格」翻成 `(列左缘, 已排高)`，空列即「高 0」——
+    ///      纯函数据此知道哪一片是空白。
+    ///
+    /// 探针尚未就绪（首帧 / 非竖排视图）时退回「字下方一格」——宁可差一点，
+    /// 也不能不弹。
+    fn ruby_card_spot(
+        &self,
+        paper: (f32, f32, f32, f32),
+        card: (f32, f32),
+        anchor: (f32, f32),
+    ) -> (f32, f32) {
+        let (ax, ay) = anchor;
+        let cell_w = self.col_w.max(1.0);
+        let cell_h = self.row_h.max(1.0);
+        let Some(((gx, gy, _gw, gh), fill)) = self.leaf_ink_at(ax) else {
+            return (ax - card.0 * 0.5, ay + cell_h + 6.0);
+        };
+        let cols = fill.cols.clamp(1, INK_COLS_MAX);
+        // 锚点 → 自左数第 k 列（网格的列序 i 自右数，故 k = cols-1-i）。
+        let k = (((ax - gx) / cell_w).floor()).clamp(0.0, (cols - 1) as f32) as usize;
+        let ri = (((ay - gy) / cell_h).floor()).max(0.0) as usize;
+        let glyph = (
+            gx + k as f32 * cell_w,
+            gy + ri as f32 * cell_h,
+            cell_w,
+            cell_h,
+        );
+        // 每列（**自左向右**）：列左缘 + 已排高度（0 = 空列，正是一片可用的空白）。
+        let columns: Vec<(f32, f32)> = (0..cols)
+            .rev()
+            .map(|j| {
+                (
+                    gx + (cols - 1 - j) as f32 * cell_w,
+                    fill.units[j] as f32 * cell_h * 0.5,
+                )
+            })
+            .collect();
+        ruby_card_nearest(
+            paper,
+            (self.viewport_w, self.viewport_h),
+            (cell_w, cell_h),
+            card,
+            glyph,
+            (gy, gy + gh),
+            &columns,
+        )
+    }
+
+    /// 锚点所在那一叶的版心矩形与占位图（对开时取离锚点最近的一叶）。
+    fn leaf_ink_at(&self, ax: f32) -> Option<((f32, f32, f32, f32), InkFill)> {
+        let fills = self.leaf_ink.get();
+        let mut best: Option<((f32, f32, f32, f32), InkFill, f32)> = None;
+        for slot in 0..2 {
+            let (Some(g), Some(f)) = (self.leaf_grid[slot].get(), fills[slot]) else {
+                continue;
+            };
+            let d = if ax < g.0 {
+                g.0 - ax
+            } else if ax > g.0 + g.2 {
+                ax - g.0 - g.2
+            } else {
+                0.0
+            };
+            if best.map(|b| d < b.2).unwrap_or(true) {
+                best = Some((g, f, d));
+            }
+        }
+        best.map(|(g, f, _)| (g, f))
     }
 
     /// 右键 / 长按**用户自加夹注**弹出的「修改 / 删除」菜单。
@@ -14394,74 +14733,190 @@ mod tests {
         assert!(left >= paper.0 && left + 220.0 <= paper.0 + paper.2);
     }
 
-    /// 注音纸条吸附在**正文下沿之下的地脚空白**，横向以当前列为中线。
+    // ── 浮签「就近避让」（v1.9.58）────────────────────────────────
+    //
+    // 一叶 12 列的实测几何：字格 55.51 × 27.75，版心从 (120, 120) 起，
+    // 24 行排到 y = 786。纸条 62 × 50。
+    const T_CELL: (f32, f32) = (55.51, 27.75);
+    const T_CARD: (f32, f32) = (62.0, 50.0);
+    const T_GX: f32 = 120.0;
+    const T_GY: f32 = 120.0;
+    const T_COLS: usize = 12;
+    const T_ROWS: usize = 24;
+
+    /// 一叶的列账（**自左向右**）：每列排了几行 → `(列左缘, 已排高)`。
+    fn leaf_cols(rows: &[usize]) -> Vec<(f32, f32)> {
+        (0..T_COLS)
+            .map(|k| {
+                let r = *rows.get(k).unwrap_or(&0);
+                (
+                    T_GX + k as f32 * T_CELL.0,
+                    r as f32 * T_CELL.1,
+                )
+            })
+            .collect()
+    }
+
+    fn glyph_at(k: usize, row: usize) -> (f32, f32, f32, f32) {
+        (
+            T_GX + k as f32 * T_CELL.0,
+            T_GY + row as f32 * T_CELL.1,
+            T_CELL.0,
+            T_CELL.1,
+        )
+    }
+
+    fn art() -> (f32, f32) {
+        (T_GY, T_GY + T_ROWS as f32 * T_CELL.1)
+    }
+
+    /// 纸条与任一墨迹 / 版框线都不相交。
+    fn no_ink(pos: (f32, f32), cols: &[(f32, f32)]) -> bool {
+        let r = (pos.0, pos.1, T_CARD.0, T_CARD.1);
+        let (art_top, art_bot) = art();
+        let hit_ink = cols.iter().any(|(x, h)| {
+            *h > 0.0 && super::rects_overlap(r, (*x, art_top, T_CELL.0, *h))
+        });
+        let hit_frame = super::rects_overlap(r, (40.0, art_top - 15.0, 800.0, 15.0))
+            || super::rects_overlap(r, (40.0, art_bot, 800.0, 15.0));
+        !hit_ink && !hit_frame
+    }
+
+    /// ① 整叶只排了 10 行就收尾（末叶常态）→ 纸条落在**当前列正下方**。
     #[test]
-    fn ruby_card_hugs_the_foot_below_the_text() {
-        let paper = (20.0, 10.0, 1200.0, 800.0);
-        let mb = 70.0;
-        let text_bottom = 10.0 + 800.0 - mb; // 740
-        let (left, top) = super::ruby_card_pos_in(
-            paper,
-            mb,
-            (1280.0, 860.0),
-            (80.0, 40.0),
-            (600.0, 300.0),
+    fn card_sits_right_below_the_column_that_ended() {
+        let cols = leaf_cols(&vec![10usize; T_COLS]);
+        let g = glyph_at(3, 9); // 该列最后一字
+        let (left, top) = super::ruby_card_nearest(
+            (40.0, 40.0, 800.0, 880.0),
+            (900.0, 1000.0),
+            T_CELL,
+            T_CARD,
+            g,
+            art(),
+            &cols,
         );
-        assert!((left - 560.0).abs() < 0.01, "横向没以当前列为中线：{left:.1}");
-        assert!(top >= text_bottom, "纸条压进了正文：{top:.1} < {text_bottom:.1}");
-        assert!(top <= text_bottom + 9.0, "没贴住正文下沿：{top:.1}");
-        assert!(top + 40.0 <= 10.0 + 800.0, "纸条出了纸底");
-    }
-
-    /// 点的是**最末一行**的字（锚点就在页脚边上）→ 纸条仍在地脚，绝不与字重叠。
-    #[test]
-    fn ruby_card_never_covers_the_last_line() {
-        let paper = (20.0, 10.0, 1200.0, 800.0);
-        let (_, top) = super::ruby_card_pos_in(
-            paper,
-            70.0,
-            (1280.0, 860.0),
-            (80.0, 40.0),
-            (600.0, 735.0),
+        let col_bottom = T_GY + 10.0 * T_CELL.1;
+        assert!(
+            (top - (col_bottom + 6.0)).abs() < 0.5,
+            "没贴住列尾：top={top:.1}，期望 {:.1}",
+            col_bottom + 6.0
         );
-        assert!(top >= 740.0, "压住了末行字：{top:.1}");
-    }
-
-    /// 贴着纸右缘的列（竖排第一列就在右边）→ 纸条向左平移，整张留在纸内。
-    #[test]
-    fn ruby_card_shifts_inside_at_the_right_edge() {
-        let paper = (20.0, 10.0, 1200.0, 800.0);
-        let (left, _) = super::ruby_card_pos_in(
-            paper,
-            70.0,
-            (1280.0, 860.0),
-            (80.0, 40.0),
-            (1190.0, 300.0),
+        assert!(
+            (left - (g.0 + g.2 * 0.5 - T_CARD.0 * 0.5)).abs() < 0.5,
+            "横向没对准当前列：{left:.1}"
         );
-        assert!(left >= 20.0 + 6.0 - 0.01, "左缘出纸：{left:.1}");
-        assert!(left + 80.0 <= 1220.0 - 6.0 + 0.01, "右缘出纸：{:.1}", left + 80.0);
-        assert!(left < 1190.0 - 40.0 + 0.01, "没往左让：{left:.1}");
+        assert!(no_ink((left, top), &cols), "纸条压到了字或版框");
     }
 
-    /// 地脚窄到装不下纸条 → 顶边仍不低于正文下沿（宁可少露一截纸边，也不压字）。
+    /// 右侧排满、左侧整片空列（末章末叶常态）→ 纸条落在那片空列的**正中**，
+    /// 与字同高（视线不用离位），且不压界栏。
     #[test]
-    fn ruby_card_stays_below_text_even_in_a_short_foot() {
-        let paper = (20.0, 10.0, 1200.0, 800.0);
-        let (_, top) =
-            super::ruby_card_pos_in(paper, 30.0, (1280.0, 860.0), (80.0, 40.0), (600.0, 300.0));
-        assert!(top >= 780.0 - 0.01, "压进正文：{top:.1}");
+    fn card_crosses_the_rule_into_the_blank_columns() {
+        let mut rows = vec![0usize; T_COLS];
+        for r in rows.iter_mut().skip(6) {
+            *r = T_ROWS;
+        }
+        let cols = leaf_cols(&rows);
+        let g = glyph_at(8, 5);
+        let (left, top) = super::ruby_card_nearest(
+            (40.0, 40.0, 800.0, 800.0), // 天头地脚都塞不下纸条
+            (900.0, 900.0),
+            T_CELL,
+            T_CARD,
+            g,
+            art(),
+            &cols,
+        );
+        // 空列是 k = 0..5（六列连成一片）：62px 宽的纸条应从这片正中落下。
+        let run_x = T_GX;
+        let run_w = 6.0 * T_CELL.0;
+        assert!(
+            (left - (run_x + (run_w - T_CARD.0) * 0.5)).abs() < 1.0,
+            "没落在空白正中：left={left:.1}"
+        );
+        assert!(
+            (top - (g.1 + g.3 * 0.5 - T_CARD.1 * 0.5)).abs() < 0.5,
+            "没与字同高：top={top:.1}"
+        );
+        assert!(no_ink((left, top), &cols), "纸条压到了字或版框");
     }
 
-    /// 极窄窗口：纸条夹回窗口内（横向不出画；纵向只在物理上放不下时才让路给正文）。
+    /// 整叶排满、两条留白带也太窄 → 仍落到**天头 / 地脚**（版框之外），
+    /// 且不骑框线（旧版正是栽在这里）。
     #[test]
-    fn ruby_card_never_leaves_the_viewport() {
-        let paper = (0.0, 0.0, 60.0, 50.0);
-        let (left, top) =
-            super::ruby_card_pos_in(paper, 10.0, (90.0, 100.0), (80.0, 40.0), (30.0, 25.0));
-        assert!(left >= -0.01, "左缘出画：{left:.1}");
-        assert!(left + 80.0 <= 90.0 + 0.01, "右缘出画：{:.1}", left + 80.0);
-        assert!(top >= 40.0 - 0.01, "压进正文：{top:.1}");
-        assert!(top + 40.0 <= 100.0 + 0.01, "下缘出画：{:.1}", top + 40.0);
+    fn card_falls_back_to_the_nearer_margin_band() {
+        let cols = leaf_cols(&vec![T_ROWS; T_COLS]);
+        let g = glyph_at(6, 2); // 靠上 → 应落天头
+        let (left, top) = super::ruby_card_nearest(
+            (40.0, 40.0, 800.0, 900.0),
+            (900.0, 1000.0),
+            T_CELL,
+            T_CARD,
+            g,
+            art(),
+            &cols,
+        );
+        assert!(top + T_CARD.1 <= T_GY - 15.0 + 0.5, "压到上框线：top={top:.1}");
+        assert!(left >= 40.0 + 6.0 - 0.5);
+        assert!(left + T_CARD.0 <= 840.0 - 6.0 + 0.5);
+        assert!(no_ink((left, top), &cols), "纸条压到了字或版框");
+    }
+
+    /// 无论点在哪一格，纸条都不与任何字、任何框线相交，且整张留在纸内窗外。
+    #[test]
+    fn card_never_covers_ink_nor_leaves_the_window() {
+        // 参差不齐的一叶：右侧排满、左侧只排几行（末叶常态）。
+        let mut rows = vec![0usize; T_COLS];
+        for (k, r) in rows.iter_mut().enumerate() {
+            *r = if k >= 7 {
+                T_ROWS
+            } else if k >= 4 {
+                12
+            } else {
+                0
+            };
+        }
+        let cols = leaf_cols(&rows);
+        let (vw, vh) = (900.0f32, 1100.0f32);
+        let paper = (40.0, 40.0, 800.0, 1000.0);
+        for k in 0..T_COLS {
+            for row in 0..rows[k] {
+                let g = glyph_at(k, row);
+                let (left, top) = super::ruby_card_nearest(
+                    paper, (vw, vh), T_CELL, T_CARD, g, art(), &cols,
+                );
+                assert!(
+                    no_ink((left, top), &cols),
+                    "第 {k} 列第 {row} 行：纸条压字或压框（{left:.1}, {top:.1}）"
+                );
+                assert!(left >= 0.0 && top >= 0.0, "出画：{left:.1}, {top:.1}");
+                assert!(
+                    left + T_CARD.0 <= vw + 0.5 && top + T_CARD.1 <= vh + 0.5,
+                    "出画：{:.1}, {:.1}",
+                    left + T_CARD.0,
+                    top + T_CARD.1
+                );
+                assert!(left >= 40.0 && left + T_CARD.0 <= 840.0 + 0.5, "出纸");
+            }
+        }
+    }
+
+    /// 极窄窗口：纸条夹回画内。
+    #[test]
+    fn card_never_leaves_a_narrow_viewport() {
+        let cols = leaf_cols(&vec![T_ROWS; T_COLS]);
+        let (left, top) = super::ruby_card_nearest(
+            (0.0, 0.0, 200.0, 300.0),
+            (200.0, 300.0),
+            T_CELL,
+            T_CARD,
+            glyph_at(3, 4),
+            art(),
+            &cols,
+        );
+        assert!(left >= -0.01 && left + T_CARD.0 <= 200.01, "横向出画：{left:.1}");
+        assert!(top >= -0.01 && top + T_CARD.1 <= 300.01, "纵向出画：{top:.1}");
     }
 
     /// 天头塞不下（超高浮签 / 大字版式）→ 退到**地脚带**，仍不压正文。

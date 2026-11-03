@@ -767,6 +767,15 @@ pub struct Root {
     /// 只影响边框渲染层（外框恒四边 3px，变的只是内层 1px 细线画哪几边），
     /// 字格与界行一个像素不动；PDF 由 `PdfGeo::frame_style` 取同一个值。
     pub frame_style: crate::types::FrameStyle,
+    /// 一叶正文的**占位图**（浮签「就近避让」的碰撞依据 · v1.9.58）。
+    ///
+    /// 每帧由 `reader::render_leaf` 写入：每列排了多少**半格**。浮签定位时
+    /// 据它算出「哪些列、排到多高」，其余即空白。两个槽位分别对应对开的
+    /// 左半叶 / 右半叶（单叶只用右槽）。
+    pub leaf_ink: Rc<Cell<[Option<crate::reader::InkFill>; 2]>>,
+    /// 每叶**版心（界行区）**在窗口里的矩形，prepaint 时由探针写入。
+    /// 与 `page_rect` 同一套路：它是渲染帧的输出，不参与排版。
+    pub leaf_grid: [RectProbe; 2],
     /// **当前纸面（整幅双叶）在窗口内容区里的矩形** (x, y, w, h)。
     ///
     /// 由阅读视图里一枚**不绘制任何东西**的测量探针在 prepaint 时写入
@@ -1476,6 +1485,8 @@ impl Root {
             frame_style: prefs.frame_style(),
             share_card_rect: None,
             page_rect: Rc::new(Cell::new(None)),
+            leaf_ink: Rc::new(Cell::new([None, None])),
+            leaf_grid: [Rc::new(Cell::new(None)), Rc::new(Cell::new(None))],
             popup: None,
             entity_card: None,
             more_open: false,
