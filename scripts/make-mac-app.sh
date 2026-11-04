@@ -230,7 +230,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
          古籍、或把 PDF 导出到这些目录时，系统会弹一次 TCC 授权框。没有这三条
          说明，弹框里只有干巴巴的「笺读 想访问你的「下载」文件夹」；有了它，
          用户看到的是「需要读取你选的古籍文件」，点「允许」的概率高得多。
-         导出走的是 `rfd` 保存面板（用户亲手选路径），所以**不需要**任何沙盒
+         导出走的是 rfd 保存面板（用户亲手选路径），所以**不需要**任何沙盒
+         （注：此处禁用反引号——这是未加引号的 heredoc，反引号会被当命令执行）
          例外权限；沙盒版另有 entitlements 里的 files.user-selected.read-write。 -->
     <key>NSDocumentsFolderUsageDescription</key>
     <string>需要读取「文稿」里的古籍文件，也用于把校勘稿导出成 PDF / 图片。</string>
