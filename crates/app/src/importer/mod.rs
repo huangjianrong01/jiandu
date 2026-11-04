@@ -291,7 +291,11 @@ pub fn import_file_with(
             let raw = crate::pdf_text::pages_to_text(&pages);
             // `pdf_regions` 仍只装**第 1 页**：它服务的是校对台左侧参考图，
             // 一次只显示一页，坐标系必须与当前页一致，跨页坐标没有意义。
-            let first = pages.first().cloned().unwrap_or_default();
+            // ⚠️ 走「单页抽取」的老路径（`for_book = false`）：整本入书的页文本
+            //    现在带 `[注]…[/注]` 契约标签，若把这串也塞进 region.text，左图
+            //    框选按文字回链时就会与屏幕上已吸成夹注的干净正文失配。
+            //    老路径不带标签，联动匹配与 v1.9.86 完全一致。
+            let first = crate::pdf_text::extract_pdf_text_regions_on(path, 0);
             (raw, Some(first))
         }
     };

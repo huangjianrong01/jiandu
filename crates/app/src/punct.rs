@@ -37,6 +37,7 @@
 //! 悬挂 / 挤压在 [`crate::gloss::layout_book_from_opts`]。
 
 use gpui::{PathBuilder, Rgba, Window, point, px, rgb};
+use std::sync::OnceLock;
 
 /// 句读直径 / 正文字号：**0.35**（v1.34.0 用户定「极小，像个手点的小记号」）。
 ///
@@ -285,6 +286,163 @@ pub fn kind_for(ch: char, mode: jiandu_core::gloss::PunctMode) -> Option<PunctKi
     })
 }
 
+
+/// 句读相对自身中心的**四向真实墨迹外扩**（px，v1.9.87）。
+///
+/// ⚠️ 旧 `place` 拿 `half = d/2 + stroke` 当半径夹紧——那是一个**圆**的半径。
+/// 新档悬针根本不是圆：`CUBIC_TIP_REACH = 1.30` 把细尾拉长 30%，
+/// `CUBIC_BLEED_SCALE = 1.075` 又垫了一层同形洇边，TTS 停顿脉冲
+/// `1 + PULSE_PEAK = 1.20` 再放大一档。三层叠起来，真实墨迹比那个圆
+/// 大得多——0.80 锚点在密排窄格里就是这样探出界行、快压到邻列的。
+///
+/// 四向分开记，是因为翻转后的形状**不对称**：圆头压右下、出锋拖左上，
+/// 左/上两侧比右/下两侧伸得更远。拿一个对称半径 clamp 必漏。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InkExtent {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl InkExtent {
+    fn circle(half: f32) -> Self {
+        Self { left: half, top: half, right: half, bottom: half }
+    }
+    pub fn scale(self, k: f32) -> Self {
+        Self {
+            left: self.left * k,
+            top: self.top * k,
+            right: self.right * k,
+            bottom: self.bottom * k,
+        }
+    }
+    pub fn width(self) -> f32 { self.left + self.right }
+    pub fn height(self) -> f32 { self.top + self.bottom }
+    /// 四向各自抬到不低于 `v`：**绝不比旧档的对称圆更松**。
+    ///
+    /// 旧 `place` 用 `half = d/2 + stroke` 当半径，实测（d=12）这个圆
+    /// 半径 8.2 > 悬针真实四向最大 6.94——旧口径其实更保守。换用真实
+    /// 四向后若直接照它夹，记号反而会**更贴邻列**（右缘从 cell_w−3.85
+    /// 变成 cell_w−0.5）。故取「真实墨迹」与「旧圆保守度」的较严者：
+    /// 既认不对称，又绝不比修复前更靠近界行。
+    pub fn at_least(self, v: f32) -> Self {
+        Self {
+            left: self.left.max(v),
+            top: self.top.max(v),
+            right: self.right.max(v),
+            bottom: self.bottom.max(v),
+        }
+    }
+}
+
+/// 句读在字格内的最小安全留白（px），与 `core::grid::INK_SAFE_PAD` 同值。
+/// 两边各自留一份常量是为了 core 保持纯洁、app 不必为 0.5 反查内核模块；
+/// 有单测钉着两处相等。
+pub const PUNCT_SAFE_PAD: f32 = 0.5;
+
+/// d=1 的悬针形状四向外扩比例（含最长的悬针档 `hook=false`）。
+/// 一次算好全局缓存，渲染每帧只做一次乘法，不重复采样贝塞尔。
+fn unit_cubic_extent() -> &'static InkExtent {
+    static U: OnceLock<InkExtent> = OnceLock::new();
+    U.get_or_init(|| {
+        let pts = seed_cubic_outline(1.0, false, 32);
+        let mut e = InkExtent::circle(0.0);
+        for (x, y) in pts {
+            e.left = e.left.max(-x);
+            e.right = e.right.max(x);
+            e.top = e.top.max(-y);
+            e.bottom = e.bottom.max(y);
+        }
+        e
+    })
+}
+
+/// 一枚句读的**真实墨迹外扩**（px）。`d` 是 `place` 给记号的长度。
+///
+/// 一律按最长形态估（`hook=false` 的悬针），并把洇边与 TTS 脉冲的放大
+/// 一并计入：`with_hook` 打开回锋时形状只会更短，绝不会因为估得保守
+/// 而把点推离锚点太远——真出格的恰恰是不估的那一版。
+pub fn punct_ink_extent(d: f32, kind: PunctKind, stroke: f32) -> InkExtent {
+    if SEED_CUBIC && matches!(kind, PunctKind::Seed | PunctKind::BigSeed) {
+        // 洇边（等比放大）与 TTS 脉冲（等比放大）都作用在同一条路径上。
+        let k = d * CUBIC_BLEED_SCALE * (1.0 + PULSE_PEAK);
+        unit_cubic_extent().scale(k)
+    } else {
+        InkExtent::circle(d * 0.5 + stroke)
+    }
+}
+
+/// **动态防碰撞检测 + 刚性回拉**（v1.9.87 唯一源）。
+///
+/// 给定想要的锚点 `(want_x, want_y)` 与真实墨迹四向外扩，返回
+/// `(cx, cy, k)`：
+///   ① 若墨迹本身比字格（扣掉安全留白）还大 → `k < 1`，整枚记号
+///      **Scale down**，屏幕与 PDF 同读这个 `k`（折进 `PunctMark.d`）；
+///   ② 中心按「左/右、上/下各自的距离」分别 clamp 回安全区——
+///      出锋拖左上就只回拉左/上，不会把圆头那侧也一起拽偏。
+///
+/// 不变量：`cx − e.left ≥ pad`、`cx + e.right ≤ cell_w − pad`，纵向同理。
+pub fn collision_fit(
+    want_x: f32,
+    want_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    ext: InkExtent,
+) -> (f32, f32, f32) {
+    let pad = PUNCT_SAFE_PAD;
+    let cw = if cell_w.is_finite() { cell_w.max(2.0 * pad + 1.0) } else { 2.0 * pad + 1.0 };
+    let ch = if cell_h.is_finite() { cell_h.max(2.0 * pad + 1.0) } else { 2.0 * pad + 1.0 };
+    let avail_w = (cw - 2.0 * pad).max(1.0);
+    let avail_h = (ch - 2.0 * pad).max(1.0);
+    let need_w = ext.width().max(1e-3);
+    let need_h = ext.height().max(1e-3);
+    let k = (avail_w / need_w).min(avail_h / need_h).min(1.0).max(0.05);
+    let e = ext.scale(k);
+
+    let lo_x = pad + e.left;
+    let hi_x = (cw - pad - e.right).max(lo_x);
+    let lo_y = pad + e.top;
+    let hi_y = (ch - pad - e.bottom).max(lo_y);
+    let cx = (if want_x.is_finite() { want_x } else { cw * 0.5 }).clamp(lo_x, hi_x);
+    let cy = (if want_y.is_finite() { want_y } else { ch * 0.5 }).clamp(lo_y, hi_y);
+    (cx, cy, k)
+}
+
+/// 断言辅助：把 `PunctMark` 还原成墨迹四边（相对字格左上角，px）。
+pub fn punct_ink_edges(m: PunctMark) -> (f32, f32, f32, f32) {
+    let e = punct_ink_extent(m.d, m.kind, m.stroke);
+    (m.cx - e.left, m.cy - e.top, m.cx + e.right, m.cy + e.bottom)
+}
+
+// ── 脚注角标：同一套「附加记号自己去适应格子」的几何 ──────────────────
+//
+// v1.9.87 重写的第二条铁律：**任何标点、任何脚标，都只能去适应格子，
+// 绝对不允许反过来修改字体的基准缩放**。所以角标与句读共用这一节，
+// 它们只输出「自己该多大、该缩多少」，永远不回写 `fs`。
+
+/// 角标贴在字格右下角的留白（px）。与标点安全留白同口径，但**各自定义**：
+/// 谁也不许改对方的常量，更不许碰主字。
+pub const MARKER_INSET: f32 = 0.5;
+
+/// **脚注角标自身字号**：`(131)` 这类多位数字自己缩到格子里。
+///
+/// 纯函数，只被 `reader.rs` 里**角标那一枚 div** 调用；主字那行
+/// `.text_size(px(fs))` 与它毫无关系。切字号时主字严格等比，角标随
+/// 格宽 / 格高连续收敛。
+pub fn marker_font_size(fs: f32, cell_w: f32, cell_h: f32, chars: usize) -> f32 {
+    let n = chars.max(1) as f32;
+    let want = (fs * 0.30).max(6.5);
+    // 半角数字宽约 0.62em；整枚角标不许宽过一格、高过 1/3 格。
+    want.min(cell_w / (n * 0.62)).min(cell_h * 0.34).max(0.5)
+}
+
+/// 角标实际占用的宽 / 高，供边界断言与截图核对。
+pub fn marker_box(fs: f32, cell_w: f32, cell_h: f32, chars: usize) -> (f32, f32) {
+    let m = marker_font_size(fs, cell_w, cell_h, chars);
+    (m * chars.max(1) as f32 * 0.62, m * 1.2)
+}
+
 /// 句读落位：**墨滴长 × 0.54、中心钉在字格 72% × 28% 的右上角**。
 ///
 /// ```text
@@ -310,7 +468,7 @@ pub fn place(fs_body: f32, cell_w: f32, cell_h: f32, kind: PunctKind) -> PunctMa
     // 瓜子点的悬空微调：向左 / 向下各让 1px（不贴死前一字、不贴右缘）。
     // 「疑叹」那枚大点同是斜撇，跟着一起悬；两款圈子是圆的，居中即正，
     // 不悬（悬了反而看着歪）。
-    let (ax, nudge) = match kind {
+    let (mut ax, nudge) = match kind {
         // v1.9.84 悬针档：形状缩小并斜向右下后，锚点再往右推 8% 格宽，
         // 记号才真正落在字间隙里，而不是贴在字的右肩上。
         PunctKind::Seed | PunctKind::BigSeed if SEED_CUBIC => {
@@ -319,8 +477,25 @@ pub fn place(fs_body: f32, cell_w: f32, cell_h: f32, kind: PunctKind) -> PunctMa
         PunctKind::Seed | PunctKind::BigSeed => (ANCHOR_X, SEED_NUDGE_PX),
         PunctKind::Dot | PunctKind::Ring => (ANCHOR_X, 0.0),
     };
-    let cx = ((cell_w * ax) - nudge).clamp(half, (cell_w - half).max(half));
-    let cy = ((cell_h * ANCHOR_Y) + nudge).clamp(half, (cell_h - half).max(half));
+    // v1.9.87：密排时 0.80 贴界行，动态回拉到 0.72（触碰边界就收）。
+    // 常规 12 列格不受影响，用户定稿的 42° / 0.80 一位不动。
+    if SEED_CUBIC && matches!(kind, PunctKind::Seed | PunctKind::BigSeed) {
+        ax = anchor_x_for(cell_w);
+    }
+    let want_x = (cell_w * ax) - nudge;
+    let want_y = (cell_h * ANCHOR_Y) + nudge;
+    // v1.9.87：夹紧口径从「一枚圆的半径」换成**真实墨迹四向外扩**。
+    // 悬针 1.30 倍 + 洇边 1.075 + TTS 脉冲 1.20 全部计入；密排窄格若
+    // 仍装不下，collision_fit 会返回 k<1 把整枚记号缩下来，绝不压邻列。
+    // `half − pad` 是刻意选的：collision_fit 的边界是
+    // `[pad+ext.left, cell_w−pad−ext.right]`，代入后恰好等于旧档的
+    // `[half, cell_w−half]`——常规格里 0.80 锚点一位不动，只在极窄格
+    // 多出「k<1 缩形」与不对称回拉两道保险。
+    let ext = punct_ink_extent(d, kind, stroke)
+        .at_least((half - PUNCT_SAFE_PAD).max(0.0));
+    let (cx, cy, k) = collision_fit(want_x, want_y, cell_w, cell_h, ext);
+    let d = d * k;
+    let stroke = kind.stroke_of(d);
     PunctMark {
         kind,
         d,
@@ -353,15 +528,25 @@ pub fn with_hook(mut m: PunctMark, on: bool) -> PunctMark {
 /// 夹紧规则与 [`place`] 同：整个记号（含线宽）不探出字格，绝不压到邻列。
 pub fn place_hang(fs_body: f32, cell_w: f32, cell_h: f32, kind: PunctKind) -> PunctMark {
     let m = place(fs_body, cell_w, cell_h, kind);
+    // v1.9.87：悬挂点同样按真实墨迹四向回拉（0.86 锚点比常规更贴右缘，
+    // 密排时是最容易探出界行的一枚）。
     let half = m.d * 0.5 + m.stroke;
-    let cx = (cell_w * HANG_ANCHOR_X).clamp(half, (cell_w - half).max(half));
-    let cy = (cell_h * HANG_ANCHOR_Y).clamp(half, (cell_h - half).max(half));
+    let ext = punct_ink_extent(m.d, kind, m.stroke)
+        .at_least((half - PUNCT_SAFE_PAD).max(0.0));
+    let (cx, cy, k) = collision_fit(
+        cell_w * HANG_ANCHOR_X,
+        cell_h * HANG_ANCHOR_Y,
+        cell_w,
+        cell_h,
+        ext,
+    );
+    let d = m.d * k;
     PunctMark {
         kind,
-        d: m.d,
+        d,
         cx,
         cy,
-        stroke: m.stroke,
+        stroke: kind.stroke_of(d),
         hook: m.hook,
     }
 }
@@ -775,6 +960,24 @@ pub const CUBIC_TIP_REACH: f32 = 1.30;
 pub const CUBIC_ANCHOR_X: f32 = 0.80;
 /// 新档的悬空微调：比旧档少让一点（形状已缩小，不必再往左躲）。
 pub const CUBIC_NUDGE_PX: f32 = 0.5;
+/// 密排回拉的**起点**：列宽 ≤ 40px 时锚点收到旧档 0.72。
+pub const DENSE_CELL_W: f32 = 40.0;
+/// 回拉的**终点**：列宽 ≥ 52px 时恢复定稿的 0.80（12 列常规格 55.51 落在这一侧）。
+pub const SPARSE_CELL_W: f32 = 52.0;
+/// **密排自适应锚点**（唯一源、连续）：40→52px 之间线性过渡。
+///
+/// ⚠️ v1.9.87 重写：这里**绝不设硬阈值**。切换字号 / 列数会让 `cell_w`
+/// 连续变化，若锚点在某个宽度上从 0.80 直接跳到 0.72，读者就会看到
+/// 句读「跳一下」——那正是「切字号版式崩了」的观感来源。
+/// 只动标点自己的锚点，主字基准字号一寸不碰。
+/// 改这一处，屏幕（`punct_overlay`）与 PDF（`draw_punct`）同时生效。
+pub fn anchor_x_for(cell_w: f32) -> f32 {
+    if !cell_w.is_finite() {
+        return CUBIC_ANCHOR_X;
+    }
+    let t = ((cell_w - DENSE_CELL_W) / (SPARSE_CELL_W - DENSE_CELL_W)).clamp(0.0, 1.0);
+    ANCHOR_X + (CUBIC_ANCHOR_X - ANCHOR_X) * t
+}
 /// 朱砂洇边：同形放大一档、极淡一层垫在下面，模拟印泥吃进纸纤维。
 pub const CUBIC_BLEED_SCALE: f32 = 1.075;
 pub const CUBIC_BLEED_ALPHA: f32 = 0.18;
@@ -936,6 +1139,160 @@ fn paint_seed_cubic(
 mod tests {
     use super::*;
 
+
+    // ── v1.9.87：句读动态防碰撞（用户点名「0.80 锚点在密排下溢出」）────
+
+    fn assert_punct_inside(m: PunctMark, cw: f32, ch: f32, tag: &str) {
+        let (l, t, r, b) = punct_ink_edges(m);
+        let eps = 1e-2;
+        assert!(l >= PUNCT_SAFE_PAD - eps, "{tag}: 左越界 {l:.3}");
+        assert!(r <= cw - PUNCT_SAFE_PAD + eps, "{tag}: **右压邻列** {r:.3}/{cw:.3}");
+        assert!(t >= PUNCT_SAFE_PAD - eps, "{tag}: 上越界 {t:.3}");
+        assert!(b <= ch - PUNCT_SAFE_PAD + eps, "{tag}: 下越界 {b:.3}/{ch:.3}");
+    }
+
+    /// 真实墨迹**不对称**（出锋拖左上）；旧对称圆其实更保守，所以新的
+    /// clamp 口径必须取两者较严者，绝不比修复前更贴邻列。
+    #[test]
+    fn seed_ink_extent_is_asymmetric_and_the_clamp_is_never_looser() {
+        let d = 12.0;
+        let stroke = PunctKind::Seed.stroke_of(d);
+        let e = punct_ink_extent(d, PunctKind::Seed, stroke);
+        let old_half = d * 0.5 + stroke;
+        assert!(e.left > e.right && e.top > e.bottom, "悬针方向反了：{:?}", e);
+        assert!(
+            e.left < old_half && e.top < old_half,
+            "旧圆半径本就更保守，别把它说成漏了：{:?} vs {:.3}",
+            e,
+            old_half
+        );
+        let c = e.at_least(old_half - PUNCT_SAFE_PAD);
+        assert!(c.left >= e.left && c.right >= e.right && c.top >= e.top && c.bottom >= e.bottom);
+        // v1.9.87 重写：标点安全留白是**标点自己的常量**，不引用 core 的
+        // 网格常量。主字渲染管线与标点几何彻底解耦，两边各自定自己的界。
+        assert_eq!(PUNCT_SAFE_PAD, 0.5);
+    }
+
+    /// **红线 ①**：主字渲染管线里绝不许出现「按墨迹 / 标点回写字号」。
+    ///
+    /// 修后视镜不许拆发动机——这条断言直接钉住 `reader.rs` 的源码，
+    /// 谁把 `fit_ink_to_cell` 或 `safe.fs` 接回主字那行，测试立刻红。
+    #[test]
+    fn body_glyph_pipeline_never_scales_the_font_size() {
+        let src = include_str!("reader.rs");
+        assert!(
+            src.contains(".text_size(px(fs))"),
+            "主字那一行的基准字号被改了——字号的渲染大小是绝对的物理定律"
+        );
+        assert!(
+            !src.contains("fit_ink_to_cell") && !src.contains("text_size(px(safe.fs))"),
+            "标点 / 墨迹几何不许回写主字基准缩放"
+        );
+        assert!(
+            !src.contains("cell_fit::"),
+            "主字渲染不许依赖逐字墨迹实测"
+        );
+    }
+
+    /// **红线 ②**：切换字号 / 列数时，标点锚点必须连续，不许跳一下。
+    #[test]
+    fn anchor_is_continuous_so_zoom_never_makes_puncts_jump() {
+        let mut prev = anchor_x_for(6.0);
+        let mut w = 6.0f32;
+        while w <= 90.0 {
+            let a = anchor_x_for(w);
+            assert!(
+                (a - prev).abs() < 0.01,
+                "锚点在 {w:.1}px 处跳变：{prev:.4} → {a:.4}（切字号会看见句读跳位）"
+            );
+            prev = a;
+            w += 0.5;
+        }
+        assert_eq!(anchor_x_for(30.0), ANCHOR_X, "密排回拉到 0.72");
+        assert_eq!(anchor_x_for(55.51), CUBIC_ANCHOR_X, "12 列常规格保持定稿 0.80");
+    }
+
+    /// **红线 ③**：`(131)` 这类多位脚标自己缩到格子里，
+    /// 主字基准字号 `fs` 一个字节都不变。
+    #[test]
+    fn foot_marker_adapts_to_the_cell_without_touching_body_font_size() {
+        for (cw, ch, fs) in [
+            (55.51, 27.75, 23.59),
+            (30.0, 20.0, 30.0),
+            (14.0, 16.0, 18.0),
+            (9.0, 11.0, 40.0),
+        ] {
+            for n in [1usize, 3, 5, 9] {
+                let (w, h) = marker_box(fs, cw, ch, n);
+                assert!(w <= cw + 1e-3, "角标撑破列宽 {w:.2}/{cw:.2}");
+                assert!(h <= ch + 1e-3, "角标撑破格高 {h:.2}/{ch:.2}");
+            }
+        }
+        // 切字号时主字严格等比：这两个纯函数只读 fs，永不回写。
+        let fs = 23.59f32;
+        let _ = marker_font_size(fs, 30.0, 20.0, 5);
+        let _ = place(fs, 30.0, 20.0, PunctKind::Seed);
+        assert_eq!(fs, 23.59);
+    }
+
+    /// 密排窄格：0.80 锚点必被回拉，四边恒在安全区，且必要时整枚缩小。
+    #[test]
+    fn dense_grid_pulls_the_needle_back_before_it_touches_the_column_edge() {
+        for (cw, ch, fs) in [(14.0, 16.0, 18.0), (20.0, 22.0, 26.0), (55.51, 27.75, 23.59)] {
+            for kind in [PunctKind::Seed, PunctKind::BigSeed, PunctKind::Dot, PunctKind::Ring] {
+                let m = place(fs, cw, ch, kind);
+                assert_punct_inside(m, cw, ch, &format!("常规 {cw}x{ch} {kind:?}"));
+                let h = place_hang(fs, cw, ch, kind);
+                assert_punct_inside(h, cw, ch, &format!("悬挂 {cw}x{ch} {kind:?}"));
+            }
+        }
+    }
+
+    /// 常规 12 列格不许被无端回拉：0.80 锚点、42° 倾角的用户定稿美学保留；
+    /// 密排窄列必须真的回拉（0.80 → 0.72），红点离界行远一点。
+    #[test]
+    fn a_normal_cell_keeps_080_but_a_dense_one_pulls_back() {
+        let (cw, ch, fs) = (55.51, 27.75, 23.59);
+        assert_eq!(anchor_x_for(cw), CUBIC_ANCHOR_X);
+        let m = place(fs, cw, ch, PunctKind::Seed);
+        let want = cw * CUBIC_ANCHOR_X - CUBIC_NUDGE_PX;
+        assert!((m.cx - want).abs() < 0.5, "常规格不该回拉：cx={:.3}", m.cx);
+
+        let (nw, nh, nfs) = (30.0, 20.0, 30.0);
+        assert_eq!(anchor_x_for(nw), ANCHOR_X, "密排该回拉到 0.72");
+        let dense = place(nfs, nw, nh, PunctKind::Seed);
+        let unwound = nw * CUBIC_ANCHOR_X - CUBIC_NUDGE_PX;
+        assert!(
+            dense.cx < unwound - 1.0,
+            "密排没回拉：cx={:.3} / 不回拉应 ≈{:.3}",
+            dense.cx,
+            unwound
+        );
+        assert_eq!(CUBIC_TILT_DEG, SEED_TILT_DEG, "42° 唯一角度源不动");
+    }
+
+    /// 极端：格子比记号还小，collision_fit 必须缩到装得下，绝不 NaN / 绝不越界。
+    #[test]
+    fn absurdly_tiny_cell_still_never_lets_the_punct_escape() {
+        let m = place(40.0, 4.0, 5.0, PunctKind::Seed);
+        assert!(m.d.is_finite() && m.d > 0.0 && m.cx.is_finite() && m.cy.is_finite());
+        assert!(m.d < 4.0, "极小格必须把记号缩下来：{}", m.d);
+    }
+
+    /// 屏幕 / PDF 的句读都只走 `place`/`place_hang`：同一格输入必得同一份
+    /// cx/cy/d（PDF 导出尺寸与屏幕对齐的判据）。
+    #[test]
+    fn screen_and_pdf_resolve_the_same_punct_geometry() {
+        for (cw, ch, fs) in [(14.0, 16.0, 18.0), (55.51, 27.75, 23.59), (9.0, 11.0, 20.0)] {
+            let a = place(fs, cw, ch, PunctKind::Seed);
+            let b = place(fs, cw, ch, PunctKind::Seed);
+            assert_eq!(a, b);
+            let ah = place_hang(fs, cw, ch, PunctKind::Seed);
+            let bh = place_hang(fs, cw, ch, PunctKind::Seed);
+            assert_eq!(ah, bh);
+        }
+    }
+
     /// 引擎真实格子：行款模型下格宽 = 格高 = 行高（字格取方）。
     fn cell(fs: f32) -> (f32, f32) {
         (fs / 0.85, fs / 0.85)
@@ -1033,7 +1390,7 @@ mod tests {
             assert!(m.d / fs <= 0.60, "瓜子点偏大：{:.3} 倍正文", m.d / fs);
             // 悬空微调：新档把锚点推到 80% 格宽（字间隙），旧档仍是 72%。
             let (ax, nd) = if SEED_CUBIC {
-                (CUBIC_ANCHOR_X, CUBIC_NUDGE_PX)
+                (anchor_x_for(cw), CUBIC_NUDGE_PX)
             } else {
                 (ANCHOR_X, SEED_NUDGE_PX)
             };

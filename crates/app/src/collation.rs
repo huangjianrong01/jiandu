@@ -1448,11 +1448,53 @@ fn splice_chars(text: &str, pos: usize, from_len: usize, to: &str) -> (String, u
     (next.into_iter().collect(), cursor)
 }
 
+/// **竖排预览剥壳**（不改编辑器）：把笺读标准 `[注]…[/注]` 换成古籍里本就
+/// 顺眼的全角括注 `（…）`。
+///
+/// 笺校台编辑器是**源码视图**——`[注]…[/注]` 必须看得见、改得着（「所见即所改」
+/// 是校对精度的根）。但 `share_layout::clean_md` 只认 Markdown，不认这两个标签：
+/// 直接喂进去会把 `[`、`]`、`/` 一字一格排进竖排书页，正是最刺眼的那种脏版。
+///
+/// 所以只在**离屏出图前**换壳，编辑器里的原文一个字不动。换成全角括号还有
+/// 两个好处：① 竖排里括注自带视觉边界，注文不再糊进正文；② 掩注 [`strip_gloss`]
+/// 本来就认全角括号，⌘N 一按就能把注文整段隐去。
+///
+/// 半个壳 / 孤立收壳一律只丢壳、绝不吞字；外来方括号 `[1]`、`[玄黃]` 不碰。
+fn strip_note_shells(src: &str) -> String {
+    const OPEN: &str = "[注]";
+    const CLOSE: &str = "[/注]";
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let Some(i) = rest.find(OPEN) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..i]);
+        let after = &rest[i + OPEN.len()..];
+        if let Some(j) = after.find(CLOSE) {
+            out.push('（');
+            out.push_str(after[..j].trim());
+            out.push('）');
+            rest = &after[j + CLOSE.len()..];
+        } else {
+            // 只有开壳：丢壳，余字照抄，绝不把后文整段吞掉。
+            rest = after;
+        }
+    }
+    // 用户手删了开壳、只剩收壳时，`/` 也不许留在字格里。
+    if out.contains(CLOSE) {
+        return out.replace(CLOSE, "");
+    }
+    out
+}
+
 /// **掩注**（⌘N）的纯计算：剥掉括注 / 夹注，只留正文。
 ///
-/// 认两种写法，都是古稿里真在用的：
+/// 认三种写法，都是古稿里真在用的：
 ///  ① 全角 / 半角圆括号括注：`（注文）`、`(gloss)`——可嵌套，整段一起剥；
-///  ② 方头注记：`[注:…]`、`[註:…]`（Markdown 稿里最常见的一种）。
+///  ② 方头注记：`[注:…]`、`[註:…]`（Markdown 稿里最常见的一种）；
+///  ③ 笺读自家标签：`[注]…[/注]`（JSON 展开 / core 导入产出的注疏）。
 ///
 /// 只删注文、**不动正文字序**；括号本身也不留（掩注就是「当它没写过」）。
 /// 抽成自由函数是为了可单测——它是纯字符串活，不该只能开窗口按键才验得到。
@@ -1462,6 +1504,28 @@ fn strip_gloss(src: &str) -> String {
     let mut i = 0usize;
     while i < chars.len() {
         let c = chars[i];
+        // ③ 笺读自家标签 `[注]…[/注]`：找到收壳整段剥；没找到只丢开壳，
+        //    余字照抄（宁可少隐两个字，也绝不把后文吞光）。
+        if c == '['
+            && chars.get(i + 1) == Some(&'注')
+            && chars.get(i + 2) == Some(&']')
+        {
+            let mut j = i + 3;
+            let mut end = None;
+            while j < chars.len() {
+                if chars[j] == '['
+                    && chars.get(j + 1) == Some(&'/')
+                    && chars.get(j + 2) == Some(&'注')
+                    && chars.get(j + 3) == Some(&']')
+                {
+                    end = Some(j + 4);
+                    break;
+                }
+                j += 1;
+            }
+            i = end.unwrap_or(i + 3);
+            continue;
+        }
         // ② `[注:…]` / `[註:…]`：整段连同方括号一起剥。
         if c == '[' {
             let is_note = matches!(chars.get(i + 1), Some('注') | Some('註'))
@@ -3995,7 +4059,8 @@ impl CollationWorkspace {
             // 旧版只有一枚【导入 MD】，而它的选择器把 PDF 全置灰——用户想导原图
             // 时根本找不到入口（只能去点「替换当前书籍」，那会把整本书换掉）。
             // 现在：
-            //   · 【导入文本】**只收 .md / .txt** —— 换校对稿，正文变、原图不动；
+            //   · 【导入文本】**只收 .md / .txt / .json** —— 换校对稿，正文变、原图不动
+            //     （.json 会先按 core::jsonkit 展开成段落流，注疏以 [注]…[/注] 就位）；
             //   · 【导入原图】**只收 .pdf / 图片** —— 给当前稿配底图，正文一个字不动，
             //     选中即渲染到左栏并切「左图右文」分屏。
             // 两个按钮都**不换书**；真要整本换掉才用【替换当前书籍】（带覆盖确认）。
@@ -4243,9 +4308,10 @@ impl CollationWorkspace {
             .child(line("③ 笺校", "书架卡片右下【一键笺校】直达工作台，自动带上原图与正文。"))
             // ② 工作台操作
             .child(head("工作台操作"))
-            .child(line("导入文本", "顶栏【导入文本】只收 .md / .txt：换稿子，原图不动。"))
+            .child(line("导入文本", "顶栏【导入文本】收 .md / .txt / .json：换稿子，原图不动。"))
+            .child(line("JSON 注疏", ".json 的 note / 注释 / 集解 等字段会展开成 [注]…[/注] 留在编辑器里，可逐条查看、修改；竖排预览自动剥去标签壳，⌘N 掩注可整段隐藏。"))
             .child(line("导入原图", "顶栏【导入原图】只收 .pdf / 图片：配底图，正文不动，自动切左图右文。"))
-            .child(line("拖拽", "把 PDF / 图片 / .txt 直接拖进工作台，按扩展名自动分流。"))
+            .child(line("拖拽", "把 PDF / 图片 / .txt / .json 直接拖进工作台，按扩展名自动分流。"))
             .child(line("定位", "单击落光标；双击选句；三击选整段；⇧ 点击从上一落点扩选。"))
             .child(line("框选补字", "在左图上拖一个框，命中的字会拼成待补文字，点【补入】插到光标处。"))
             .child(line("撤销", "⌘Z 撤销、⌘⇧Z 重做。连打字算一步，不会一个字退一次。"))
@@ -5620,11 +5686,15 @@ impl CollationWorkspace {
         .detach();
     }
 
-    /// 导入 Markdown / 纯文本（.md / .markdown / .txt）到右侧编辑器。
+    /// 导入 Markdown / 纯文本 / JSON（.md / .markdown / .txt / .json）到右侧编辑器。
     ///
     /// **「源码编辑 + 预览解析」策略的前半步**：这里一个字都不清洗——`#`、
     /// `**`、`---` 原样进编辑器，用户校的是原文、改的也是原文（校对精度靠
     /// 「所见即所改」保住）。清洗放在竖排预览出图前（`share_layout::clean_md`）。
+    ///
+    /// `.json` 是唯一例外：它必须先经 [`parse_json_collation`] 从结构化字段里
+    /// 展开成段落流（含 `[注]…[/注]`），否则用户看到的是一整坨 JSON 语法。
+    /// 展开用的是 core 的 `jsonkit`，**与书籍导入同一口径**。
     ///
     /// 不卡死的三道做法：
     ///  ① rfd 同步对话框**前台直调**（走 background 会静默 None，见 reader.rs 笔记）；
@@ -5635,19 +5705,21 @@ impl CollationWorkspace {
             |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
                 let mut app = app.clone();
                 async move {
-                    // **只收 .md / .txt**（v1.9.71 用户口径）：去掉「全部文件」这一档，
+                    // **只收校对稿**（v1.9.71 用户口径）：去掉「全部文件」这一档，
                     // 否则选择器里所有 PDF 都是可点的，用户以为「导入文本」也能吃 PDF。
                     // rfd 的过滤器拦不住手打文件名，落盘后还要再验一次扩展名。
                     let picked = rfd::FileDialog::new()
-                        .set_title("导入文本（Markdown / 纯文本）")
-                        .add_filter("Markdown / 纯文本", &["md", "markdown", "txt"])
+                        .set_title("导入文本（Markdown / 纯文本 / JSON）")
+                        .add_filter("Markdown / 纯文本 / JSON", &["md", "markdown", "txt", "json"])
                         .pick_file();
                     let Some(path) = picked else { return };
                     if !is_text_path(&path) {
                         if let Some(entity) = this.upgrade() {
                             let _ = entity.update(&mut app, |this, cx| {
-                                this.text_note =
-                                    Some(format!("「{}」不是文本稿（只收 .md / .txt）", file_display_name(&path)));
+                                this.text_note = Some(format!(
+                                    "「{}」不是校对稿（只收 .md / .txt / .json）",
+                                    file_display_name(&path)
+                                ));
                                 this.text_err = true;
                                 cx.notify();
                             });
@@ -5726,7 +5798,7 @@ impl CollationWorkspace {
     /// **把文件拖进工作台**（v1.9.71）：一份文件顶两条入口。
     ///
     ///   * PDF / 图片 → 给它配底图，并**自动切成「左图右文」分屏**；
-    ///   * `.md` / `.txt` → 换校对稿（后台读盘，同 `apply_text_file` 一条链）；
+    ///   * `.md` / `.txt` / `.json` → 换校对稿（后台读盘，同 `apply_text_file` 一条链）；
     ///   * 其它 → 一声不响地不处理是最坏的选择，明确回一句「不支持」。
     ///
     /// GPUI 0.2.2 已经把系统拖拽接好了：`platform/mac/window.rs` 实现了
@@ -5781,7 +5853,7 @@ impl CollationWorkspace {
             return;
         }
         self.text_note = Some(format!(
-            "「{}」不能用在笺校台：文本要 .md / .txt，原图要 .pdf / 图片",
+            "「{}」不能用在笺校台：文本要 .md / .txt / .json，原图要 .pdf / 图片",
             file_display_name(&path)
         ));
         self.text_err = true;
@@ -5878,7 +5950,11 @@ impl CollationWorkspace {
         hide_gloss: bool,
         path: &Path,
     ) -> Result<(usize, usize, bool), String> {
-        let src = if hide_gloss { strip_gloss(text) } else { text.to_string() };
+        // **出图前剥壳**：编辑器里的 `[注]…[/注]` 是源码，一个字不动；这里只把
+        // 出图副本换成全角括注，免得 `clean_md` 把 `[` `]` `/` 排成三个正文字。
+        // 顺序不能反：先剥壳再掩注，⌘N 才认得出这批注文。
+        let shelled = strip_note_shells(text);
+        let src = if hide_gloss { strip_gloss(&shelled) } else { shelled };
         let cleaned = clean_md(&src);
         if cleaned.body.is_empty() {
             return Err("正文为空（清洗后一个字都没有）".to_string());
@@ -6099,9 +6175,12 @@ impl CollationWorkspace {
         binding: Binding,
         hide_gloss: bool,
     ) -> Result<(Vec<PathBuf>, Option<String>), String> {
-        // **掩注**（⌘N，v1.9.54）：先把括注 / 夹注剥掉再进排版——它在 clean_md
-        // 之前做，因为括号里的字也是正文流的一部分，必须整段一起消失。
-        let src = if hide_gloss { strip_gloss(text) } else { text.to_string() };
+        // **出图前剥壳**（见 `strip_note_shells`）：编辑器原文不动，只把出图副本
+        // 里的 `[注]…[/注]` 换成全角括注，免得 `[` `]` `/` 被排成三个正文字格。
+        // **掩注**（⌘N，v1.9.54）排在剥壳之后：括号里的字也是正文流的一部分，
+        // 必须整段一起消失，且顺序反了 ⌘N 就认不出这批注文。
+        let shelled = strip_note_shells(text);
+        let src = if hide_gloss { strip_gloss(&shelled) } else { shelled };
         let t0 = std::time::Instant::now();
         // **Markdown 清洗**（预览解析）：编辑器里存的是源码（`#`、`**`、`---`
         // 原样可见），出图前才洗成「干净文字 + 标题/加粗装饰位」。清洗器在
@@ -6289,6 +6368,23 @@ impl CollationWorkspace {
         self.pure_text_mode = false;
         self.ingest_source(path, cx);
         cx.notify();
+    }
+
+    /// **开发用**（`JIANDU_COLLATION_JSON=<path>`）：开机把一份古籍整理 JSON
+    /// 走「导入文本」的**同一条链**装进工作台，供截图核对「注疏可见 + 预览不脏」。
+    /// 绝不另写解析：直接调 [`read_text_file`] → [`Self::apply_text_file`]。
+    pub fn dev_load_json_file(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        // ⚠️ 先断落盘闸门，再走导入链：`apply_text_file` 末尾会 `touch()`，
+        //    顺序反了会把示例 JSON 写回用户书库（同 `dev_setup_highlight_demo`）。
+        self.store_id = None;
+        match read_text_file(&path) {
+            Ok((body, note)) => self.apply_text_file(path, body, note, cx),
+            Err(e) => {
+                self.text_note = Some(e);
+                self.text_err = true;
+                cx.notify();
+            }
+        }
     }
 
     pub fn dev_open_preview(&mut self, cx: &mut Context<Self>) {
@@ -8906,13 +9002,17 @@ fn file_display_name(path: &Path) -> String {
         .unwrap_or_else(|| "（未命名）".to_string())
 }
 
-/// 是不是**校对稿**（`.md` / `.markdown` / `.txt`）。
+/// 是不是**校对稿**（`.md` / `.markdown` / `.txt` / `.json`）。
 ///
 /// 与 [`is_image_path`] 严格互斥：一个文件只能进一个入口。这是 v1.9.71 那条
 /// 「【导入文本】的选择器把 PDF 全置灰」投诉的根子——以前两个按钮共用一份
 /// 宽松过滤器，谁也不专一，用户自然找不到导原图的路。
+///
+/// `.json` 是后补的第四种：古籍整理 JSON 里的 `note` / `注释` / `集解` 等字段
+/// 正是用户要查看的东西。它走 [`read_text_file`] 的 JSON 分支，与书籍导入
+/// **共用 `jiandu_core::jsonkit`**，绝不在这里另造一套解析。
 fn is_text_path(path: &Path) -> bool {
-    ext_eq(path, &["md", "markdown", "txt"])
+    ext_eq(path, &["md", "markdown", "txt", "json"])
 }
 
 /// 是不是**原图**（PDF / 位图）。见 [`is_text_path`] 的分工说明。
@@ -8960,9 +9060,36 @@ fn read_bytes_capped(path: &Path, name: &str, hard: u64) -> Result<Vec<u8>, Stri
     Ok(bytes)
 }
 
+/// **JSON → 校对稿**（纯函数，恒在后台 executor 上跑）。
+///
+/// 展开口径**与书籍导入完全相同**：都走 `jiandu_core::jsonkit::flatten_text`，
+/// 共用同一份正文键表、同一套注疏包壳规则（`note` / `注释` / `集解` … →
+/// `[注]…[/注]`）。这里绝不另造一份解析——两套口径迟早分家，表现出来就是
+/// 「书架里导入的注疏在笺校台里没了」。
+///
+/// 返回的注疏条数只用于状态栏说明，**不参与任何排版 / 字数判据**。
+fn parse_json_collation(bytes: &[u8], name: &str) -> Result<(String, usize), String> {
+    // BOM / CRLF 先归一：BOM 会让 `serde_json` 直接报「expected value at line 1」。
+    let src = String::from_utf8_lossy(bytes)
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let value: serde_json::Value = serde_json::from_str(src.trim())
+        .map_err(|e| format!("「{}」不是合法 JSON：{}", name, e))?;
+    let text = jiandu_core::jsonkit::flatten_text(&value).trim().to_string();
+    if text.is_empty() {
+        return Err(format!(
+            "「{}」里没找到正文（认 content / text / 正文 / 段落 等字段）",
+            name
+        ));
+    }
+    let notes = text.matches("[注]").count();
+    Ok((text, notes))
+}
+
 /// 读入校对稿，返回 `(源码文本, 给用户看的提示)`。
 ///
-/// 三条纪律：
+/// 四条纪律：
 ///  ① **原样读**：不清洗、不转繁简、不删空行——编辑器要显示的就是原文
 ///    （`.md` 的 `#` / `**` / `---` 必须看得见，抄校才有依据）；
 ///  ② 编码宽松：`from_utf8_lossy` 兜住 GBK 老稿的零星坏字节，绝不为一个
@@ -8970,34 +9097,49 @@ fn read_bytes_capped(path: &Path, name: &str, hard: u64) -> Result<Vec<u8>, Stri
 ///  ③ 超长截断并**说清楚**：编辑器逐行自绘，字数是唯一会拖慢首帧的量；
 ///  ④ **本函数恒在后台 executor 上跑**（调用点见 `open_text_picker` 的
 ///    `bg.spawn`）——读盘 + 解码 + 数字数三步都是 IO/CPU，一步都不许压主线程。
-///    产品边界（用户 2026-11-01 定）：>8 MB / >8 万字的稿子照样能进来，只是
-///    读盘在后台、超出 8 万字的部分按字截断并在状态栏挑明「只载入了前 N 字」。
+///
+/// `.json` 是唯一需要先「结构化展开」的格式（见 [`parse_json_collation`]）：
+/// 展开完仍走**同一套**字数 / 截断口径，绝不两条账。
 fn read_text_file(path: &Path) -> Result<(String, String), String> {
     let name = file_display_name(path);
     let bytes = read_bytes_capped(path, &name, TEXT_IMPORT_HARD_BYTES)?;
-    // BOM 与 CRLF 归一：否则首字会是个看不见的 U+FEFF，行尾多一个 '\r'。
-    let text = String::from_utf8_lossy(&bytes)
-        .trim_start_matches('\u{feff}')
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    let is_json = ext_eq(path, &["json"]);
+    let (text, json_notes) = if is_json {
+        parse_json_collation(&bytes, &name)?
+    } else {
+        // BOM 与 CRLF 归一：否则首字会是个看不见的 U+FEFF，行尾多一个 '\r'。
+        let t = String::from_utf8_lossy(&bytes)
+            .trim_start_matches('\u{feff}')
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        (t, 0)
+    };
     let total = text.chars().count();
     if total == 0 {
         return Err(format!("「{}」是空文件", name));
     }
+    let suffix = if is_json {
+        // 注疏是用户导入 JSON 最想看的东西，条数必须报出来；同时讲清
+        // 「编辑器里怎么找、预览里怎么不脏」，别让人对着 [注] 标签发愣。
+        format!("　{} 条注疏（[注]…[/注] 可逐条查看；竖排预览剥壳，⌘N 掩注）", json_notes)
+    } else {
+        "（源码原样显示）".to_string()
+    };
     if total > TEXT_MAX_CHARS {
         let cut: String = text.chars().take(TEXT_MAX_CHARS).collect();
         return Ok((
             cut,
             format!(
-                "「{}」共 {} 万字，超过单册上限 {} 万字：已载入前 {} 万字，其余部分请按卷导入",
+                "「{}」共 {} 万字，超过单册上限 {} 万字：已载入前 {} 万字，其余部分请按卷导入{}",
                 name,
                 total / 10_000,
                 TEXT_MAX_CHARS / 10_000,
-                TEXT_MAX_CHARS / 10_000
+                TEXT_MAX_CHARS / 10_000,
+                suffix
             ),
         ));
     }
-    Ok((text, format!("已载入「{}」　{} 字（源码原样显示）", name, total)))
+    Ok((text, format!("已载入「{}」　{} 字{}", name, total, suffix)))
 }
 
 /// 临时 PNG 输出路径（系统 temp 目录，按纳秒时间戳唯一命名，避免缓存串图）。
@@ -10648,6 +10790,92 @@ mod punct_bar_tests {
         let out = strip_gloss("猛（měng）虎");
         assert_eq!(out, "猛虎");
         assert_eq!(out.chars().count(), 2);
+    }
+
+    // ── 笺校台 JSON 导入（与书籍导入共用 core::jsonkit）──────────────────
+
+    #[test]
+    fn is_text_path_accepts_json_but_never_pdf() {
+        assert!(is_text_path(Path::new("資治通鑑.校注.json")));
+        assert!(is_text_path(Path::new("資治通鑑.JSON")), "扩展名大小写不敏感");
+        assert!(is_text_path(Path::new("a.md")));
+        assert!(is_text_path(Path::new("a.txt")));
+        assert!(!is_text_path(Path::new("a.pdf")), "PDF 永远走原图入口");
+        assert!(!is_text_path(Path::new("a.json.bak")));
+    }
+
+    /// 正文 / 注疏的展开口径必须与书籍导入一致：`jsonkit::flatten_text`。
+    #[test]
+    fn parse_json_collation_expands_body_and_wraps_notes() {
+        // ⚠️ 中文不能进 `br#"…"#`（原始**字节**串只收 ASCII）；用普通原始串 + `.as_bytes()`。
+        let j = r#"{"title":"學而","content":"子曰：學而時習之。","note":"疏：習，鷹乃學習。"}"#.as_bytes();
+        let (text, n) = parse_json_collation(j, "學而.json").unwrap();
+        assert_eq!(text, "學而\n子曰：學而時習之。[注]疏：習，鷹乃學習。[/注]");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn parse_json_collation_reaches_deep_chinese_fields() {
+        let j = r#"{"chapters":[{"title":"周紀一","paragraphs":[{"text":"初命晉大夫爲諸侯。","注释":"案：此溫公書法所由始也。"}]}]}"#.as_bytes();
+        let (text, n) = parse_json_collation(j, "z.json").unwrap();
+        assert!(text.contains("初命晉大夫爲諸侯。"), "{text}");
+        assert!(text.contains("[注]案：此溫公書法所由始也。[/注]"), "{text}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn parse_json_collation_tolerates_bom_crlf_and_rejects_bad_json() {
+        let j = "\u{feff}{\r\n  \"正文\": \"天地玄黃\"\r\n}".as_bytes();
+        let (text, n) = parse_json_collation(j, "bom.json").unwrap();
+        assert_eq!(text, "天地玄黃");
+        assert_eq!(n, 0);
+
+        let e = parse_json_collation(b"{oops", "壞.json").unwrap_err();
+        assert!(e.contains("不是合法 JSON") && e.contains("壞.json"), "{e}");
+        // 只有元数据、没有正文：明确报错，绝不塞一页空白给用户。
+        let e2 = parse_json_collation(r#"{"meta":{"author":"佚名"}}"#.as_bytes(), "空.json")
+            .unwrap_err();
+        assert!(e2.contains("没找到正文"), "{e2}");
+    }
+
+    /// **两条入口（选择器 / 拖拽）共用的那一个函数**必须真的吃到 JSON 分支。
+    #[test]
+    fn read_text_file_routes_json_through_one_entry() {
+        let dir = std::env::temp_dir().join(format!("jiandu_json_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("周紀.json");
+        std::fs::write(
+            &p,
+            r#"{"title":"周紀","content":"威烈王二十三年。","note":"胡三省音注：初命晉大夫。"}"#.as_bytes(),
+        )
+        .unwrap();
+        let (body, note) = read_text_file(&p).unwrap();
+        assert!(body.contains("[注]胡三省音注：初命晉大夫。[/注]"), "{body}");
+        assert!(note.contains("1 条注疏"), "{note}");
+        assert!(note.contains("周紀.json"), "{note}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_note_shells_becomes_fullwidth_gloss_in_preview_only() {
+        assert_eq!(
+            strip_note_shells("天地[注]玄黃：水氣也[/注]宇宙[1]"),
+            "天地（玄黃：水氣也）宇宙[1]"
+        );
+        assert_eq!(strip_note_shells("甲[注]乙丙"), "甲乙丙", "半壳不吞字");
+        assert_eq!(strip_note_shells("甲乙[/注]丙"), "甲乙丙", "孤收壳不排斜杠");
+        assert_eq!(strip_note_shells("甲[玄黃]乙"), "甲[玄黃]乙", "外来方括号不动");
+        assert_eq!(strip_note_shells("天地玄黃"), "天地玄黃");
+    }
+
+    #[test]
+    fn strip_gloss_hides_jiandu_note_tags_too() {
+        assert_eq!(strip_gloss("天地[注]玄黃[/注]宇宙"), "天地宇宙");
+        assert_eq!(strip_gloss("天地[注]玄黃宇宙"), "天地玄黃宇宙", "半壳只丢壳");
+        // 预览链路：先剥壳、再掩注，注文必须整段消失且正文一字不少。
+        let shelled = strip_note_shells("子曰[注]疏：習，鷹乃學習。[/注]。");
+        assert_eq!(shelled, "子曰（疏：習，鷹乃學習。）。");
+        assert_eq!(strip_gloss(&shelled), "子曰。");
     }
 
     #[test]

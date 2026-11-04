@@ -8409,14 +8409,30 @@ impl Root {
                 cell = cell.child(self.title_mark_overlay(c, cell_w, cell_h, fs, back, false));
             }
         }
-        // 脚注模式下补圈号角标（注释隐藏时不补：正文只留纯文字）。
+        // 脚注模式下补圈号角标（v1.9.87 重写）：**角标自己去适应格子**。
+        // 旧写法是 `cell` 的流内子元素，`(131)` 这类多位数字会和主字一起
+        // 把 `flex_row` 撑出列宽。现在独立绝对定位在格右下角，字号由
+        // `punct::marker_font_size` 按格宽 / 格高连续收敛。
+        // ⚠️ 上面主字那行 `.text_size(px(fs))` 与这里毫无关系，一寸不动：
+        //    字号的渲染大小是绝对的物理定律，任何脚标都只能反过来适应它。
         if !self.notes_inline && self.show_notes && self.notes_shown {
             if let Some(n) = note_index.get(&(g.chapter, g.para, g.offset)) {
-                cell = cell.child(
+                let marker = circled(*n);
+                let mfs = crate::punct::marker_font_size(
+                    fs,
+                    cell_w,
+                    cell_h,
+                    marker.chars().count(),
+                );
+                cell = cell.relative().child(
                     div()
-                        .text_size(px((fs * 0.3).max(6.5)))
+                        .absolute()
+                        .right(px(crate::punct::MARKER_INSET))
+                        .bottom(px(crate::punct::MARKER_INSET))
+                        .text_size(px(mfs))
+                        .line_height(px(mfs * 1.2))
                         .text_color(rgb(t.accent()))
-                        .child(SharedString::from(circled(*n))),
+                        .child(SharedString::from(marker)),
                 );
             }
         }

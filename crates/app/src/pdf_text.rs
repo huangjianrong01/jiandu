@@ -160,7 +160,7 @@ pub fn extract_pdf_pages(
                 if page.is_null() {
                     return vec![];
                 }
-                regions_of_page(page)
+                regions_of_page(page, true)
             });
             chars += regions.iter().map(|r| r.text.chars().count()).sum::<usize>();
             out.push(regions);
@@ -180,12 +180,198 @@ pub fn extract_pdf_pages(
     vec![]
 }
 
+// ───────────── 版面分层规则：竖排古籍「大字正文 + 双行小注」 ─────────────
+//
+// **为什么规则能加在这一层而不动架构**（2026-11-04 实测《資治通鑑》周纪五卷-蓝.pdf，
+// 168 页矢量竖排，PDFKit `selectionsByLine` 第 5 / 20 页逐段框高）：
+//
+//   h≈72      → 76pt 正文大字     （第 5 页 238 段）
+//   h≈64 / 65 → 60pt 胡三省双行小注（240 段）
+//   h≈58      → 句读点            （24 段）
+//   h≈48 / 38 → 书眉、汉字页码    （14 段）
+//
+// 版面语义**一直都在 `Chunk.w/h` 里**，从未在抽取时丢失；丢的是 `cluster` 之后
+// 的 `SourceRegion` —— 它把同一列里的大字与小注一视同仁按 x 聚成一整条文本，
+// 于是「繁纓以朝…繁纓。馬飾也繁。」混成一行，断章层再把小注碎片认成篇题
+// （实测直导 206 章，章题「夫音」「彼列」「先悉」全是反切碎片）。
+//
+// 所以规则接在 **cluster 之前**：按相对框高把 Chunk 分成正文层 / 注文层 /
+// 版式噪声层，各自聚类；注文以项目既有的 `[注]…[/注]` 文本契约挂回正文列尾，
+// 下游 `paragraph_of → split_body_marks` 自然吸成真双行夹注。
+//
+// 三条硬边界（用户口径：不影响架构 / 字体 / 三大主线）：
+//  ① `SourceRegion` 字段、`pages_to_text`、`strip_running_lines`、`cluster`、
+//     导入路由、`crates/core` 一字不动；`reader.rs` 与字号管线零触碰；
+//  ② **只有整本入书**（`extract_pdf_pages`）启用；左图联动的单页抽取走原路径，
+//     框选匹配一字不差；
+//  ③ 横排 / 单峰字号 / 层数不足 / 两层 x 不交错 → **原样降级**，普通 PDF 零回归。
+#[cfg(target_os = "macos")]
+const SCALE_LAYER_MIN_CHUNKS: usize = 40;
+/// 小层高度 / 大层高度：太接近是单峰，差太离谱是退化盒或缩印页，都不冒险。
+#[cfg(target_os = "macos")]
+const SCALE_RATIO_MIN: f64 = 0.45;
+#[cfg(target_os = "macos")]
+const SCALE_RATIO_MAX: f64 = 0.90;
+/// 低于大层这个比例的算书眉 / 页码（版式噪声），不进正文也不进夹注。
+#[cfg(target_os = "macos")]
+const SCALE_TRIM_FLOOR: f64 = 0.68;
+/// 小层至少占两层的 15%（`n_note * 20 >= n_all * 3`）。
+#[cfg(target_os = "macos")]
+const SCALE_NOTE_MIN_NUM: usize = 3;
+#[cfg(target_os = "macos")]
+const SCALE_NOTE_MIN_DEN: usize = 20;
+
+/// 与 `cluster` 完全同口径的方向判定。**特意不复用**：不碰 `cluster` 一行，
+/// 才能保证老路径在任何平台上行为逐字节一致。
+#[cfg(target_os = "macos")]
+fn chunks_vertical(chunks: &[Chunk]) -> bool {
+    let (mut dx, mut dy) = (0.0f64, 0.0f64);
+    for w in chunks.windows(2) {
+        dx += (w[1].x - w[0].x).abs();
+        dy += (w[1].y - w[0].y).abs();
+    }
+    dy > dx
+}
+
+/// 已升序切片的中位数。
+#[cfg(target_os = "macos")]
+fn median_sorted(v: &[f64]) -> f64 {
+    let n = v.len();
+    if n == 0 {
+        0.0
+    } else if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) * 0.5
+    }
+}
+
+/// 把一页的片段按**相对框高**分成 `(正文层, 注文层)`。
+///
+/// 返回 `(chunks, vec![])` 即「降级走老路」，此时 `chunks` 原样归还，一个字不少。
+/// 抽成纯函数是为了可单测——闸门逻辑绝不能只靠开窗口看某种 PDF 才验得到。
+#[cfg(target_os = "macos")]
+fn split_chunks_by_scale(chunks: Vec<Chunk>, vertical: bool) -> (Vec<Chunk>, Vec<Chunk>) {
+    if !vertical || chunks.len() < SCALE_LAYER_MIN_CHUNKS * 2 {
+        return (chunks, Vec::new());
+    }
+    let mut hs: Vec<f64> = chunks
+        .iter()
+        .filter(|c| !c.is_blank() && c.w > 0.0 && c.h > 0.0)
+        .map(|c| c.h)
+        .collect();
+    if hs.len() < SCALE_LAYER_MIN_CHUNKS * 2 {
+        return (chunks, Vec::new());
+    }
+    hs.sort_by(|a, b| a.total_cmp(b));
+    // 用分位数而不是极值：几个特大标题 / 一枚退化盒都不该把阈值带偏。
+    let q = |p: f64| hs[((hs.len() - 1) as f64 * p) as usize];
+    let hi = q(0.85);
+    let lo = q(0.20);
+    if hi <= 0.0 {
+        return (chunks, Vec::new());
+    }
+    let ratio = lo / hi;
+    if ratio < SCALE_RATIO_MIN || ratio > SCALE_RATIO_MAX {
+        return (chunks, Vec::new());
+    }
+    let cut = (hi + lo) * 0.5;
+    let floor = hi * SCALE_TRIM_FLOOR;
+
+    // **先只数不搬**：闸门不过就原样返回，降级路径一个片段都不会丢。
+    // h<=0 是退化盒（兜底路径产物），归正文层，绝不因为「尺寸不明」丢字。
+    let (mut n_body, mut n_note) = (0usize, 0usize);
+    for c in &chunks {
+        if c.h >= cut || c.h <= 0.0 {
+            n_body += 1;
+        } else if c.h >= floor {
+            n_note += 1;
+        }
+    }
+    let n_all = n_body + n_note;
+    if n_body < SCALE_LAYER_MIN_CHUNKS
+        || n_note < SCALE_LAYER_MIN_CHUNKS
+        || n_note * SCALE_NOTE_MIN_DEN < n_all * SCALE_NOTE_MIN_NUM
+        || n_note > n_body * 3
+    {
+        return (chunks, Vec::new());
+    }
+
+    // 双行小注与正文**同列交错**：两层 x 中位数必须几乎重合。若小字整片偏在
+    // 页面另一侧（独立注释栏、页脚注），说明不是双行夹注，降级更诚实。
+    let mut bx: Vec<f64> = chunks
+        .iter()
+        .filter(|c| c.h >= cut || c.h <= 0.0)
+        .map(|c| c.x)
+        .collect();
+    let mut nx: Vec<f64> = chunks
+        .iter()
+        .filter(|c| c.h < cut && c.h >= floor)
+        .map(|c| c.x)
+        .collect();
+    bx.sort_by(|a, b| a.total_cmp(b));
+    nx.sort_by(|a, b| a.total_cmp(b));
+    if (median_sorted(&bx) - median_sorted(&nx)).abs() > hi * 2.0 {
+        return (chunks, Vec::new());
+    }
+
+    let (body, rest): (Vec<Chunk>, Vec<Chunk>) = chunks
+        .into_iter()
+        .partition(|c| c.h >= cut || c.h <= 0.0);
+    // `rest` 里低于 floor 的书眉 / 页码在这里被丢弃——它们本来就是版式噪声，
+    // 留着会被断章层抄成章题或正文。
+    let (note, _trim): (Vec<Chunk>, Vec<Chunk>) =
+        rest.into_iter().partition(|c| c.h >= floor);
+    (body, note)
+}
+
+/// 注文列 → `[注]…[/注]` 挂到 x 最近（且 y 区间有交叠者优先）的正文列尾。
+///
+/// **标签必须在同一行内闭合**：app 层 `cleaner::close_notes` 按行收口，跨行
+/// 会补出落单的 `[/注]`，那四个标签字符反而会印进正文格（v1.9.71 老坑）。
+/// 找不到正文列时另起一条带标签的区域，宁可位置不准也**绝不丢注文**。
+#[cfg(target_os = "macos")]
+fn attach_note_regions(body: &mut Vec<SourceRegion>, notes: Vec<SourceRegion>) {
+    for nr in notes {
+        let t = nr.text.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let tag = format!("[注]{t}[/注]");
+        let mut best: Option<usize> = None;
+        let mut best_cost = f64::MAX;
+        for (i, b) in body.iter().enumerate() {
+            let dx = (b.x as f64 - nr.x as f64).abs();
+            let overlap = b.y as f64 <= (nr.y + nr.h) as f64
+                && nr.y as f64 <= (b.y + b.h) as f64;
+            let cost = dx + if overlap { 0.0 } else { 10_000.0 };
+            if cost < best_cost {
+                best_cost = cost;
+                best = Some(i);
+            }
+        }
+        match best {
+            Some(i) => body[i].text.push_str(&tag),
+            None => body.push(SourceRegion {
+                x: nr.x,
+                y: nr.y,
+                w: nr.w,
+                h: nr.h,
+                text: tag,
+            }),
+        }
+    }
+}
+
 /// 单页 → 文本层区域。**调用方自己持有 autoreleasepool 与 PDFKIT_LOCK**。
 ///
 /// 抽出来是为了让「逐页」与「整本」两条路用同一份判读逻辑：方向判断、退化盒
 /// 修复、聚类、旋转，任何一处改动都同时作用于两条路，不会各自漂移。
+///
+/// `for_book` = 整本入书：启用上面的版面分层规则。左图联动的单页抽取传 false，
+/// 走与 v1.9.86 完全相同的老路径，保证框选文字匹配不因标签而失配。
 #[cfg(target_os = "macos")]
-unsafe fn regions_of_page(page: *mut Object) -> Vec<SourceRegion> {
+unsafe fn regions_of_page(page: *mut Object, for_book: bool) -> Vec<SourceRegion> {
     // 页面高度（PDF 坐标，y 向上）；用于把包围盒翻转为位图坐标（y 向下）。
     let mb: NSRect = msg_send![page, boundsForBox: 0usize]; // kPDFDisplayBoxMediaBox
     let page_h = mb.y + mb.h;
@@ -207,7 +393,19 @@ unsafe fn regions_of_page(page: *mut Object) -> Vec<SourceRegion> {
     //    `cluster` 靠 Δx/Δy 判竖排还是横排；旋转 90° 的页若先转坐标，
     //    Δx 与 Δy 的角色会互换，竖排古籍会被当成横排去按 y 分桶，整页糊成一团。
     //    未旋转坐标才是内容的**原始**排布方向，判断必须在那里做。
-    let regions = cluster(chunks, page_h);
+    //
+    // 版面分层只在整本入书时做，且必须在聚类之前：分层后两层各自聚列，
+    // 大字层不再被双行小注拦腰截断，小注层整体挂回正文列尾成夹注。
+    let vertical = chunks_vertical(&chunks);
+    let (body_chunks, note_chunks) = if for_book {
+        split_chunks_by_scale(chunks, vertical)
+    } else {
+        (chunks, Vec::new())
+    };
+    let mut regions = cluster(body_chunks, page_h);
+    if !note_chunks.is_empty() {
+        attach_note_regions(&mut regions, cluster(note_chunks, page_h));
+    }
     // 图被 `CGPDFPageGetDrawingTransform` 按 /Rotate 转正了，坐标必须跟着转；
     // 不转就是「图正着、框躺着」，高亮整片错位。
     let rotation: i64 = msg_send![page, rotation];
@@ -258,7 +456,7 @@ pub fn extract_pdf_text_regions_on(path: &Path, page_index: usize) -> Vec<Source
         if page.is_null() {
             return vec![];
         }
-        regions_of_page(page)
+        regions_of_page(page, false)
     })
 }
 
@@ -1195,6 +1393,157 @@ pub(crate) fn tiny_pdf(rotate: i32) -> Vec<u8> {
         xref_at
     ));
     out.into_bytes()
+}
+
+/// 版面分层规则的红线（macOS 专属：`Chunk` / PDFKit 几何）。
+#[cfg(all(test, target_os = "macos"))]
+mod layout_tests {
+    use super::*;
+
+    fn chunk(x: f64, y: f64, h: f64, text: &str) -> Chunk {
+        Chunk {
+            x,
+            y,
+            w: h,
+            h,
+            text: text.to_string(),
+        }
+    }
+
+    fn region(x: f32, y: f32, text: &str) -> SourceRegion {
+        SourceRegion {
+            x,
+            y,
+            w: 64.0,
+            h: 200.0,
+            text: text.to_string(),
+        }
+    }
+
+    /// 一页「72pt 大字正文 + 64/65pt 双行小注 + 48pt 书眉」：同列交错。
+    fn layered_page() -> Vec<Chunk> {
+        let mut v = Vec::new();
+        for col in 0..12u32 {
+            let x = 800.0 - col as f64 * 60.0;
+            for row in 0..30u32 {
+                let y = 2000.0 - row as f64 * 80.0;
+                if row % 3 == 0 {
+                    v.push(chunk(x + 12.0, y, 64.0, "音"));
+                    v.push(chunk(x + 12.0, y - 30.0, 65.0, "翻"));
+                } else {
+                    v.push(chunk(x, y, 72.0, "文"));
+                }
+            }
+            v.push(chunk(x, 2100.0, 48.0, "卷")); // 书眉：该丢
+        }
+        v
+    }
+
+    #[test]
+    fn layered_page_splits_body_note_and_drops_running_heads() {
+        let all = layered_page();
+        let total = all.len();
+        let vert = chunks_vertical(&all);
+        assert!(vert, "构造的竖排页必须被判为竖排");
+        let (body, note) = split_chunks_by_scale(all, vert);
+        assert_eq!(body.len(), 240, "大字层：12 列 × 20 字");
+        assert_eq!(note.len(), 240, "小注层：12 列 × 20 字");
+        assert_eq!(body.len() + note.len(), total - 12, "12 枚书眉该被丢掉");
+        assert!(body.iter().all(|c| c.h >= 68.0));
+        assert!(note.iter().all(|c| (64.0..=65.0).contains(&c.h)));
+    }
+
+    /// **零回归红线**：横排 / 单峰字号的普通 PDF 一个片段都不许变。
+    #[test]
+    fn plain_pdf_never_enters_layout_rules() {
+        let v: Vec<Chunk> = (0..120)
+            .map(|i| chunk(i as f64 * 18.0, 500.0, 20.0, "字"))
+            .collect();
+        let (body, note) = split_chunks_by_scale(v, false);
+        assert!(note.is_empty() && body.len() == 120, "横排必须原样降级");
+
+        let v2: Vec<Chunk> = (0..120)
+            .map(|i| chunk(300.0, 2000.0 - i as f64 * 80.0, 72.0, "字"))
+            .collect();
+        let (b2, n2) = split_chunks_by_scale(v2, true);
+        assert!(n2.is_empty() && b2.len() == 120, "单峰字号必须原样降级");
+    }
+
+    /// 小字整片偏在页面另一侧（独立注释栏）→ 降级，不误当双行夹注。
+    #[test]
+    fn detached_small_text_does_not_become_gloss() {
+        let mut v = Vec::new();
+        for i in 0..120 {
+            v.push(chunk(300.0, 2000.0 - i as f64 * 80.0, 72.0, "文"));
+        }
+        for i in 0..120 {
+            v.push(chunk(3000.0, 2000.0 - i as f64 * 60.0, 64.0, "注"));
+        }
+        let vert = chunks_vertical(&v);
+        let (b, n) = split_chunks_by_scale(v, vert);
+        assert!(n.is_empty(), "x 不交错必须降级");
+        assert_eq!(b.len(), 240, "降级时一个片段都不能少");
+    }
+
+    /// 标签**同行闭合**、挂回正文列尾、绝不多出孤立行（孤立行会被断章认成篇题）。
+    #[test]
+    fn note_regions_are_attached_as_closed_inline_tags() {
+        let mut body = vec![region(300.0, 100.0, "初命晉大夫")];
+        let notes = vec![
+            region(312.0, 200.0, "夫音扶"),
+            region(900.0, 900.0, "別彼列翻"),
+        ];
+        attach_note_regions(&mut body, notes);
+        assert_eq!(body.len(), 1, "不许多出孤立行");
+        assert_eq!(
+            body[0].text,
+            "初命晉大夫[注]夫音扶[/注][注]別彼列翻[/注]"
+        );
+        assert_eq!(
+            body[0].text.matches("[注]").count(),
+            body[0].text.matches("[/注]").count()
+        );
+    }
+
+    #[test]
+    fn note_only_page_keeps_every_character() {
+        let mut body = Vec::new();
+        attach_note_regions(&mut body, vec![region(1.0, 2.0, "音蒲官翻")]);
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0].text, "[注]音蒲官翻[/注]");
+    }
+
+    /// **三条主线的源码级红线**：架构 / 字体 / 阅读器主字号一寸不动。
+    #[test]
+    fn pdf_rules_never_touch_the_three_main_lines() {
+        let src = include_str!("pdf_text.rs");
+        // ① 数据契约：`SourceRegion` 仍是 x/y/w/h/text 五字段，没加 font/color/layer。
+        let decl = src
+            .split("pub struct SourceRegion")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert_eq!(decl.matches("pub ").count(), 5, "SourceRegion 被扩字段了：{decl}");
+        // ② PDF 层绝不出现字号渲染，字体与缩放归阅读器。
+        //    ⚠️ 字面量必须拆开写：否则 `include_str!` 会把**断言自己这一行**
+        //    也数进去，红线永远失败（自指陷阱）。
+        let needle = concat!("text_", "size(");
+        assert!(!src.contains(needle), "PDF 层不许出现字号渲染");
+        // ③ 主字号基准与三大祖训所在的 reader.rs 不被本规则改写。
+        let reader = include_str!("reader.rs");
+        // 同样拆开：这行本身就在 `src` 里，写成整串会让上面的红线自指命中。
+        let main = concat!(".text_", "size(px(fs))");
+        assert!(reader.contains(main), "主字号基准被改了");
+        assert!(!reader.contains("fit_ink_to_cell") && !reader.contains("safe.fs"));
+        // ④ PDF 断章策略仍是「不升格圆括号」那条，不许偷偷换管线。
+        let imp = include_str!("importer/mod.rs");
+        assert!(
+            imp.contains("parse_str_keeping_brackets"),
+            "PDF 断章策略被换了"
+        );
+    }
 }
 
 /// 整本入书的回归（**不 gate 平台**：纯文本处理，任何平台都该跑）。

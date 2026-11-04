@@ -1841,6 +1841,12 @@ impl Root {
         // v1.9.38：开局先把「今日读了几叶 / 连续几日」按账本算好，
         // 书架第一帧就有数，不必等第一次翻页。
         root.refresh_read_stats();
+        // 开发用：JIANDU_IMPORT_BOOK=<path> 走**真实导入链**刻一本，用于核对
+        // 「某份文件直接导入后究竟排成什么样」。配 JIANDU_HOME=<临时目录> 使用，
+        // 绝不碰用户书库。导入在后台线程，落库后退出，再起一次 AUTO_READ 看版式。
+        if let Ok(p) = std::env::var("JIANDU_IMPORT_BOOK") {
+            root.add_import(std::path::PathBuf::from(p));
+        }
         // 开发用：JIANDU_SHELF=list 以书脊列表开局、JIANDU_SHELF_Q=词 预填搜索、
         // JIANDU_SHELF_CAT=史 预选分类，便于逐态截图核对书架。
         if let Ok(v) = std::env::var("JIANDU_SHELF") {
@@ -1981,6 +1987,16 @@ impl Root {
         // 能靠这一手把界面摆到目标状态。
         if std::env::var("JIANDU_COLLATION").is_ok() && !root.library.books.is_empty() {
             root.enter_collation(0, cx);
+            // ⚠️ 顺序有讲究：装稿必须在开预览**之前**。`apply_text_file` 换稿会
+            //    把 `preview_sig` / 旧页图清场，先开预览只会拿到上一份稿的图。
+            // 开发用：JIANDU_COLLATION_JSON=<path> 走「导入文本」同一条链装一份
+            // 古籍整理 JSON，截图核对 [注]…[/注] 可见、竖排预览不把标签排成字格。
+            if let Ok(p) = std::env::var("JIANDU_COLLATION_JSON") {
+                let ws = root.collation.clone();
+                ws.update(cx, |w, cx| {
+                    w.dev_load_json_file(std::path::PathBuf::from(p), cx)
+                });
+            }
             if std::env::var("JIANDU_PREVIEW").is_ok() {
                 let ws = root.collation.clone();
                 ws.update(cx, |w, cx| w.dev_open_preview(cx));
@@ -2005,6 +2021,24 @@ impl Root {
             if let Ok(n) = v.parse::<usize>() {
                 root.set_columns(n);
             }
+        }
+        // 开发用（v1.9.87 重写核对）：JIANDU_ZOOM_LEVEL=small|normal|large
+        // 走**真的** `set_zoom_level`（与版字面板同一条路）切字级三档，
+        // 用来截图核对「切字号不崩版式」。只摆初始状态，不碰渲染管线。
+        if let Ok(v) = std::env::var("JIANDU_ZOOM_LEVEL") {
+            let lvl = match v.as_str() {
+                "small" => crate::types::ZoomLevel::Small,
+                "normal" => crate::types::ZoomLevel::Normal,
+                "large" => crate::types::ZoomLevel::Large,
+                "huge" => crate::types::ZoomLevel::Huge,
+                _ => crate::types::ZoomLevel::Normal,
+            };
+            root.set_zoom_level(lvl);
+        }
+        // 开发用：JIANDU_FOOTNOTES=1 直接进脚注模式，摆出 `(131)` 这类
+        // 多位角标，核对「角标自己适应格子、不撑列宽、不碰主字」。
+        if std::env::var("JIANDU_FOOTNOTES").is_ok() && root.book.is_some() {
+            root.set_notes_inline(false);
         }
         // 开发用：JIANDU_THEME=keben 直接进仿刻本（脚本点不到版字面板里的
         // 那颗纸色小点）。走 `set_theme` 而不是就地改 `theme`——字体 / 句读
