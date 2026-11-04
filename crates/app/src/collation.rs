@@ -127,6 +127,14 @@ const HEADER_H: f32 = 44.0;
 const SAVE_LED_DOT: f32 = 4.5;
 /// 微光指示器的**恒宽**容器。亮 / 灭都不改宽度，右侧按钮一位都不许挪。
 const SAVE_LED_W: f32 = 52.0;
+/// **竖排预览样式抽屉**的宽度（v1.9.74）。
+///
+/// 232px 是「四枚短胶囊刚好排得下一行」的临界宽度（10.5px 字 + 7px 内边距 × 4
+/// + 5px 间距 × 3 ≈ 197 ≤ 232 − 2×12）。再窄，「仿刻本」「十四列」就会各自
+/// 掉到第二行——那不是「简洁」，是参差。
+const STYLE_DRAWER_W: f32 = 232.0;
+/// 抽屉收起时留在右边缘的**抓手**宽度：12px，只够画一颗 4px 的滑块。
+const STYLE_HANDLE_W: f32 = 12.0;
 /// **快捷标点栏**的高度（v1.9.25）。
 ///
 /// 它是**布局常量**不是视觉常量：标点栏夹在状态条与正文之间，所以
@@ -956,8 +964,14 @@ pub struct CollationWorkspace {
     export_busy: bool,
     /// 导出结果 / 错误（浮层底部状态条，与预览状态条同一套视觉语言）。
     export_note: Option<String>,
-    /// 样式选择面板是否展开。
+    /// 样式选择面板是否展开（**常开**开关，顶栏【样式】控制）。
     show_style_panel: bool,
+    /// **抽屉悬停态**（v1.9.74）：鼠标停在右边缘抓手上时临时滑出。
+    ///
+    /// 与 `show_style_panel` 取**或**：顶栏【样式】是「按住不放」（常开），
+    /// 抓手悬停是「借一眼」（临时）。两者分开记，所以悬停离开不会关掉用户
+    /// 手动钉住的那一层。
+    style_hover: bool,
     /// **原图高亮框显隐**（v1.9.25）——顶栏「注」那一枚说了算，默认开。
     ///
     /// 关掉时左图只剩底图：区域参考框与联动高亮矩形一概不画。它是「校对
@@ -1370,6 +1384,7 @@ impl CollationWorkspace {
             preview_frame: ShareFrame::Red,
             preview_columns: 12,
             show_style_panel: false,
+            style_hover: false,
             // 出厂显示高亮框：校对时它是「这一段落在原图哪一处」的唯一凭据。
             show_region_box: true,
             active_line: None,
@@ -3443,14 +3458,39 @@ impl CollationWorkspace {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         div()
-            .px(px(10.0))
-            .py(px(4.0))
-            .mr(px(6.0))
-            .mb(px(8.0))
-            .rounded(px(6.0))
+            // **等宽格子**（v1.9.74）：三组选项都是四枚，宽度定死 46px 后三行
+            // 上下对齐成一张规整的表。让它们按字数自己撑，就会出现「仿刻本」
+            // 掉到第二行那种参差——字数一样宽，排出来却不一样宽，最伤观感。
+            .w(px(46.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .py(px(3.0))
+            .mr(px(5.0))
+            .mb(px(6.0))
+            .rounded(px(5.0))
+            .border_1()
+            // 选中态改用**淡朱底 + 朱砂描边**，不再实底白字（v1.9.74）：
+            // 三行各有一枚选中，三个实心红块并排会把整块面板压得又重又吵；
+            // 朱砂该当**标记**，不该当背景。
+            .border_color(if selected {
+                rgba(0x8c2b2266)
+            } else {
+                rgba(0x2B26201A)
+            })
             .cursor_pointer()
-            .bg(if selected { rgb(0x8c2b22) } else { rgba(0x8c2b221f) })
-            .text_color(if selected { rgb(0xf4ecd8) } else { rgb(0x8c2b22) })
+            .text_size(px(10.5))
+            .bg(if selected {
+                rgba(0x8c2b221A)
+            } else {
+                rgba(0x2B262000)
+            })
+            .text_color(if selected {
+                rgb(0x8c2b22)
+            } else {
+                rgba(0x2B262099)
+            })
+            .hover(|s| s.border_color(rgba(0x8c2b2259)).text_color(rgb(0x8c2b22)))
             .child(SharedString::from(label))
             .on_mouse_down(
                 MouseButton::Left,
@@ -6015,6 +6055,20 @@ impl CollationWorkspace {
     ///   任何解码 / 纹理开销立刻停止。故无论后台排到哪一步，关闭都能当场生效。
     /// 旧页路径挪进 `temp_gc`，**下一帧**才真的删盘（本帧 img 可能还在异步读它，
     /// 当帧删除会让图片加载报错；隔一帧则元素树已换，删了也无人引用）。
+    /// **开发用**（v1.9.74，`JIANDU_PREVIEW=1`）：开机直接展开竖排预览 + 样式
+    /// 抽屉，供 `screencapture` 核对版式。
+    ///
+    /// 为什么需要它：合成点击被 TCC 拦死（AppleScript / cliclick 都拿不到事件），
+    /// 版面回归只能靠「环境变量把界面摆到目标状态，再纯截图看」。与
+    /// `JIANDU_PANEL` / `JIANDU_THEME` 同一套路，只在开发机上用，不影响发行版。
+    pub fn dev_open_preview(&mut self, cx: &mut Context<Self>) {
+        self.show_preview = true;
+        // `JIANDU_STYLE=0` → 只看**收起态**（右边缘那颗 4px 滑块）。
+        self.show_style_panel = std::env::var("JIANDU_STYLE").map(|v| v != "0").unwrap_or(true);
+        self.request_preview(cx);
+        cx.notify();
+    }
+
     fn close_preview(&mut self) {
         self.show_preview = false;
         self.preview_gen += 1;
@@ -6022,6 +6076,9 @@ impl CollationWorkspace {
         self.temp_gc.append(&mut self.preview_paths);
         self.preview_sig = None;
         self.preview_page = 0;
+        // 抽屉的悬停态是「浮层的浮层」：浮层收掉时必须一起归零，否则下次打开
+        // 预览会带着上次的残留状态（鼠标早就不在那儿了）直接弹出来。
+        self.style_hover = false;
     }
 
     /// 后台结果回来时，是否已经**过期**（预览已关 / 又发起了新的一批）。
@@ -7447,6 +7504,16 @@ impl CollationWorkspace {
     /// 化）+ 底部状态条（仅栅格化错误，如缺中文字体）。长文自动按页切块，用顶部
     /// 「← 第 X / Y 页 →」翻页（见 [`regenerate_preview`]）。
     fn render_preview_overlay(&self, vh: f32, cx: &mut Context<Self>) -> gpui::Div {
+        // **抽屉开着时，书页自动左让**（v1.9.74）。
+        //
+        // 做法不是给图加负偏移（那要自己算居中），而是给滚动容器留**等宽右内边距**：
+        // `justify_center` 于是在 `[0, vw − drawer_pad]` 里重新居中，抽屉永远不会
+        // 压在字上。收起态只留抓手那 12px，画面基本不动。
+        let drawer_pad = if self.show_style_panel || self.style_hover {
+            STYLE_DRAWER_W + STYLE_HANDLE_W
+        } else {
+            STYLE_HANDLE_W
+        };
         div()
             .absolute()
             .top(px(HEADER_H))
@@ -7545,6 +7612,8 @@ impl CollationWorkspace {
                     .items_center()
                     .justify_center()
                     .overflow_y_scroll()
+                    // 右内边距 = 抽屉占位（见本函数开头的 `drawer_pad`）。
+                    .pr(px(drawer_pad))
                     .child({
                         let idx = self.preview_page.min(self.preview_paths.len().saturating_sub(1));
                         match self.preview_paths.get(idx) {
@@ -7597,7 +7666,7 @@ impl CollationWorkspace {
                         }
                     }),
             )
-            .child(self.render_style_panel(cx))
+            .child(self.render_style_drawer(cx))
             .child(match self.render_preview_status() {
                 Some(s) => s,
                 None => div().h(px(0.0)),
@@ -7608,13 +7677,30 @@ impl CollationWorkspace {
             })
     }
 
-    /// 样式选择面板（浮在预览图之上）：底色 / 版框 / 列数三组切换。
-    /// 每个选项点下即设置对应样式并 [`regenerate_preview`] 重栅格化；选中态
-    /// 高亮（朱底白字），当前列数随 `norm_columns` 吸附到 8/10/12/14 四档。
-    fn render_style_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
-        if !self.show_style_panel {
-            return div();
-        }
+    /// **样式抽屉**（v1.9.74，用户实报「位置太反人类，挡住了左侧正文」）。
+    ///
+    /// 旧版是 `absolute().left(PAD)` 的一块 252px 硬卡片，直接压在预览图左上——
+    /// 用户调「列数」时想看的恰好是被它盖住的那半页。现在改成**贴右边缘的侧边
+    /// 抽屉**：
+    ///
+    ///   · **收起态**只留右边缘一条 12px 抓手 + 一颗 4px 滑块，一点不占地；
+    ///   · **悬停**抓手 / 抽屉即滑出（`style_hover`），离开即收；
+    ///   · **顶栏【样式】**是常开开关（`show_style_panel`），两者取或；
+    ///   · 点任意一枚选项即**钉住**（见 `style_option` 的闭包写 `show_style_panel`）
+    ///     ——正在调样式的人不该被一次鼠标移开打断；
+    ///   · 抽屉打开时预览图**自动左让**：不是浮在图上，而是滚动容器右侧留出
+    ///     等宽内边距（`render_preview_overlay` 的 `drawer_pad`），A4 因此在剩余
+    ///     空间里重新居中，一行字都不会被盖住。
+    ///
+    /// 质感与清洗日志抽屉同一套：半透明宣纸 + 左侧一道 1px 淡墨 + 向左的柔影
+    ///（GPUI 0.2.2 没有 `backdrop-filter`，靠层次而不是模糊骗过眼睛）。
+    /// 返回 `AnyElement`：抽屉带 `.id()`（悬停需要元素状态），类型与 `Div` 不同。
+    fn render_style_drawer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let open = self.show_style_panel || self.style_hover;
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
 
         // —— 底色行 ——
         let mut bg_row = div()
@@ -7623,9 +7709,9 @@ impl CollationWorkspace {
             .child(
                 div()
                     .w_full()
-                    .mb(px(4.0))
-                    .text_color(rgb(0x8c2b22))
-                    .text_size(px(13.0))
+                    .mb(px(5.0))
+                    .text_size(px(10.5))
+                    .text_color(rgba(0x8c2b22A6))
                     .child(SharedString::from("底色")),
             );
         for b in ShareBg::ALL {
@@ -7634,6 +7720,9 @@ impl CollationWorkspace {
                 b.label(),
                 move |c, _, _, cx| {
                     c.preview_bg = b;
+                    // 点了就**钉住**：正在调样式的人手一移开抽屉就缩回去，等于
+                    // 逼他反复去够那个抓手。
+                    c.show_style_panel = true;
                     c.request_preview(cx);
                     cx.notify();
                 },
@@ -7648,9 +7737,9 @@ impl CollationWorkspace {
             .child(
                 div()
                     .w_full()
-                    .mb(px(4.0))
-                    .text_color(rgb(0x8c2b22))
-                    .text_size(px(13.0))
+                    .mb(px(5.0))
+                    .text_size(px(10.5))
+                    .text_color(rgba(0x8c2b22A6))
                     .child(SharedString::from("版框")),
             );
         for f in ShareFrame::ALL {
@@ -7659,6 +7748,7 @@ impl CollationWorkspace {
                 f.label(),
                 move |c, _, _, cx| {
                     c.preview_frame = f;
+                    c.show_style_panel = true;
                     c.request_preview(cx);
                     cx.notify();
                 },
@@ -7673,9 +7763,9 @@ impl CollationWorkspace {
             .child(
                 div()
                     .w_full()
-                    .mb(px(4.0))
-                    .text_color(rgb(0x8c2b22))
-                    .text_size(px(13.0))
+                    .mb(px(5.0))
+                    .text_size(px(10.5))
+                    .text_color(rgba(0x8c2b22A6))
                     .child(SharedString::from("列数")),
             );
         for cols in [8usize, 10, 12, 14] {
@@ -7690,6 +7780,7 @@ impl CollationWorkspace {
                 },
                 move |c, _, _, cx| {
                     c.preview_columns = cols;
+                    c.show_style_panel = true;
                     c.request_preview(cx);
                     cx.notify();
                 },
@@ -7697,17 +7788,115 @@ impl CollationWorkspace {
             ));
         }
 
+        // ── 抽屉本体（收起时给空 div，让抓手独占位置）───────────────────────
+        let card = if open {
+            div()
+                .w(px(STYLE_DRAWER_W))
+                // 半透明宣纸：92% 不透明，压在书页边上仍看得见底下那层纸的明暗，
+                // 又不至于把正文字透上来「脏」了面板——与清洗日志抽屉同一条线。
+                .bg(rgba(0xF3ECD9F2))
+                // 只描**左**边一道：右边贴屏幕，描了就是一条悬空的黑线。
+                .border_l_1()
+                .border_color(rgba(0x9A6B4F59))
+                .shadow(vec![BoxShadow {
+                    color: rgba(0x2B262021).into(),
+                    offset: gpui::point(px(-8.0), px(0.0)),
+                    blur_radius: px(24.0),
+                    spread_radius: px(-2.0),
+                }])
+                .p(px(12.0))
+                .flex()
+                .flex_col()
+                // 只圆左边：右边贴着屏幕，圆了就漏出一条缝。
+                .rounded_l(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .mb(px(9.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_family(song.clone())
+                                .text_size(px(11.0))
+                                .text_color(rgba(0x2B262066))
+                                .child(SharedString::from("预览样式")),
+                        )
+                        // 收起（只收「钉住」那一层；悬停层跟着鼠标走，不用管）。
+                        .child(
+                            div()
+                                .px(px(5.0))
+                                .py(px(1.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .text_size(px(10.5))
+                                .text_color(rgba(0x2B26204D))
+                                .hover(|s| s.text_color(rgb(0x8c2b22)))
+                                .child(SharedString::from("收起 ›"))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|c, _, _, cx| {
+                                        c.show_style_panel = false;
+                                        c.style_hover = false;
+                                        cx.notify();
+                                    }),
+                                ),
+                        ),
+                )
+                .child(bg_row)
+                .child(frame_row)
+                .child(col_row)
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+
+        // ── 右边缘抓手：收起态唯一可见的东西 ───────────────────────────────
+        let handle = div()
+            .w(px(STYLE_HANDLE_W))
+            .h_full()
+            // 展开时**压在抽屉右沿上**（负外边距）：抽屉必须真正贴住屏幕右边，
+            // 否则中间永远隔着一道 12px 的暗缝，看起来像浮卡而不像抽屉。
+            .ml(px(if open { -STYLE_HANDLE_W } else { 0.0 }))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .child(if open {
+                // 抽屉开着时不画滑块：那颗点会正好落在面板中段，读起来像一根
+                // 多余的进度条。收起态才需要它——那是唯一的「这里能拉出来」提示。
+                div()
+            } else {
+                div()
+                    .w(px(4.0))
+                    .h(px(44.0))
+                    .rounded(px(2.0))
+                    .bg(rgba(0x2B262040))
+            });
+
+        // 抓手与抽屉**同一个 hover 宿主**：鼠标从抓手滑到抽屉上时不会「离开」，
+        // 抽屉因此不会在鼠标刚移进去的一瞬间往回缩。
         div()
+            .id(SharedString::from("style-drawer-dock"))
             .absolute()
-            .top(px(HEADER_H + 6.0))
-            .left(px(PAD))
-            .w(px(252.0))
-            .bg(rgb(0xf4ecd8))
-            .rounded(px(8.0))
-            .p(px(12.0))
-            .child(bg_row)
-            .child(frame_row)
-            .child(col_row)
+            .top(px(HEADER_H))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .flex_row()
+            .items_start()
+            .on_hover(cx.listener(|c, hovered: &bool, _w, cx| {
+                // 只在状态**真变**时重绘：hover 回调按事件来，但拖动时可能反复触发。
+                if c.style_hover != *hovered {
+                    c.style_hover = *hovered;
+                    cx.notify();
+                }
+            }))
+            .child(card)
+            .child(handle)
+            .into_any_element()
     }
 
     /// 翻页器：多页时显示「← 第 X / Y 页 →」，单页（或无图）时返回空 div。

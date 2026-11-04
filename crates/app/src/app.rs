@@ -1756,6 +1756,16 @@ impl Root {
                 }
             }
         }
+        // 开发用：JIANDU_COLLATION=1 直接进笺校工作台；再给 JIANDU_PREVIEW=1
+        // 就连竖排预览 + 样式抽屉一起展开——合成点击过不了 TCC，截图核对只
+        // 能靠这一手把界面摆到目标状态。
+        if std::env::var("JIANDU_COLLATION").is_ok() && !root.library.books.is_empty() {
+            root.enter_collation(0, cx);
+            if std::env::var("JIANDU_PREVIEW").is_ok() {
+                let ws = root.collation.clone();
+                ws.update(cx, |w, cx| w.dev_open_preview(cx));
+            }
+        }
         // 开发用：JIANDU_COLUMNS=n 指定初始列数（8/10/12/14），便于逐列截图核对。
         if let Ok(v) = std::env::var("JIANDU_COLUMNS") {
             if let Ok(n) = v.parse::<usize>() {
