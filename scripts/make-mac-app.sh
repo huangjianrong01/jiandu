@@ -21,8 +21,8 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP_NAME="笺读"
 BUNDLE_ID="com.jiandu.app"
-VERSION="1.9.64"
-BUILD_NUM="272"
+VERSION="1.9.66"
+BUILD_NUM="273"
 MIN_MACOS="12.0"
 ARCH="${ARCH:-native}"
 
@@ -123,6 +123,17 @@ if [ -d "$ROOT/crates/core/resources/books" ] && ls "$ROOT/crates/core/resources
     echo "✓ 已打包内置书目：$(ls "$APP/Contents/Resources/books" | tr '\n' ' ')"
 else
     echo "· 无 crates/core/resources/books/（内置书目将缺失，首启书架会空）"
+fi
+
+# ---- 4.6) 随包用户指南（v1.9.66） ----
+# 工作台顶栏【？】是内嵌的精简说明；完整版（这篇 USER_GUIDE.md）必须跟着包走，
+# 否则用户想「看详细一点」时无处可看。放在 Resources 根下，双击即用系统默认
+# 应用打开，不需要 App 起任何子进程（沙盒合规）。
+if [ -f "$ROOT/USER_GUIDE.md" ]; then
+    cp "$ROOT/USER_GUIDE.md" "$APP/Contents/Resources/USER_GUIDE.md"
+    echo "✓ 已随包用户指南：Resources/USER_GUIDE.md"
+else
+    echo "⚠️ 缺 USER_GUIDE.md（包内帮助将只剩顶栏【？】的精简版）"
 fi
 
 # ---- 5) App 图标：PNG → icns ----

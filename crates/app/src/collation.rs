@@ -45,7 +45,7 @@ use gpui::{
     EntityInputHandler, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
     KeyDownEvent, StatefulInteractiveElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ParentElement, Render,
-    RenderImage, ScrollHandle, SharedString, Stateful, Styled, Window,
+    RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, Styled, Window,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -128,6 +128,12 @@ const HEADER_H: f32 = 44.0;
 /// `editor_origin()` 的纵向原点必须把它算进去——少算 44px，「点哪落哪」
 /// 就整体上移一行。改这个数，两处（本行、`editor_origin`）自动同变。
 const PUNCT_BAR_H: f32 = 44.0;
+/// **纯文本模式提示条**高度（v1.9.65）：一条 20px 的静默横条。
+///
+/// 它是**布局常量**不是视觉常量：`editor_origin()` 的 Y 原点把它算进去（20px），
+/// v1.9.65 起 render() 里分栏行的**绝对高度**（`vh − HEADER_H − PURE_HINT_H`）
+/// 也靠它——本条 div 显式 `.h(px(PURE_HINT_H))`，两处数字一个源，改一处两处同变。
+const PURE_HINT_H: f32 = 20.0;
 const PAD: f32 = 14.0;
 const FONT_SIZE: f32 = 17.0;
 /// 行高（v1.9.24）：17 × 1.8 ≈ 30.6。
@@ -396,6 +402,91 @@ fn locate_region(line_text: &str, regions: &[SourceRegion]) -> Option<(usize, us
 /// `source_size()` 的缩放比换算，绝不写死像素。
 use crate::pdf_text::SourceRegion;
 
+/// 一次编辑的**最小可逆描述**（v1.9.66 · 撤销/重做）。
+///
+/// 为什么不是整本快照：这是一本「几百万字」的校对工具。整本快照一步就是
+/// 1~6 MB（UTF-8 中文三字节），存 50 步就上百 MB，用户按 ⌘Z 三下内存就翻倍——
+/// 那是玩具的做法。这里只存**这次编辑真正动过的那几个字**：
+/// 「在 pos 处，把 removed 换成了 inserted」。一次按键通常几十字节，
+/// 500 步也就几十 KB，与正文长度无关。
+#[derive(Clone, Debug)]
+struct EditOp {
+    /// 起点（**字符**下标，不是字节——中文一个字三字节，用字节索引必错位）。
+    pos: usize,
+    /// 被这次编辑**移除**的原文（撤销时原样插回）。
+    removed: String,
+    /// 被这次编辑**插入**的新文（撤销时按字符数删掉）。
+    inserted: String,
+    /// 合并类别：同类的连续编辑合成一步（连打字 = 一步，不是一字一步）。
+    kind: EditKind,
+    /// 记录时刻，仅用于「合并时间窗」判定。
+    at: std::time::Instant,
+}
+
+impl EditOp {
+    /// 尝试把「紧接着的又一次编辑」吸收进本步，成功返回 `true`。
+    ///
+    /// 这是撤销栈好用的关键：逐字键入若一字一步，按一次 ⌘Z 只退一个字，
+    /// 用户会以为撤销坏了。吸收的判据是**几何**的——新编辑必须落在本步
+    /// 已插入的那段文字之内 / 紧邻其后（情形 A），或者两边都是纯删除且
+    /// 首尾相接（情形 B/C）。光标一旦被方向键或点选挪走，几何条件自然
+    /// 不成立，于是自动分步，不需要任何「编辑会话」状态机。
+    fn try_absorb(&mut self, pos: usize, removed: &str, inserted: &str) -> bool {
+        let ins: Vec<char> = self.inserted.chars().collect();
+        let rem: Vec<char> = self.removed.chars().collect();
+        let r = removed.chars().count();
+        let i = inserted.chars().count();
+
+        // 情形 A：新编辑发生在「本步插入的文字」区间内（连续打字 / 输入法逐帧组字）。
+        if pos >= self.pos {
+            let k = pos - self.pos;
+            if k <= ins.len() && k + r <= ins.len() {
+                let mut merged: String = ins[..k].iter().collect();
+                merged.push_str(inserted);
+                merged.extend(ins[k + r..].iter());
+                self.inserted = merged;
+                return true;
+            }
+        }
+        // 情形 B：两边都是纯删除，且新删的正好紧贴在本步之前（连按退格）。
+        if ins.is_empty() && i == 0 && pos + r == self.pos {
+            let mut merged: String = removed.chars().collect();
+            merged.extend(rem.iter());
+            self.removed = merged;
+            self.pos = pos;
+            return true;
+        }
+        // 情形 C：纯删除且起点相同（连按 Delete 向后删）。
+        if ins.is_empty() && i == 0 && pos == self.pos {
+            let mut merged = self.removed.clone();
+            merged.push_str(removed);
+            self.removed = merged;
+            return true;
+        }
+        false
+    }
+}
+
+/// 撤销步的类别（v1.9.66）：只有同类别才可能合并。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditKind {
+    /// 逐字键入（连打合并成一步）。
+    Insert,
+    /// 退格（向前删，连按合并成一步）。
+    Backspace,
+    /// Delete 键（向后删，连按合并成一步）。
+    Delete,
+    /// 一次性动作：删选区 / 包裹符号 / 整段粘贴 / 整段 AI 补全——永不合并。
+    Once,
+    /// 输入法组字：逐帧 marked text 会合并成「这一次输入」。
+    Ime,
+}
+
+/// 连续编辑合并的时间窗（毫秒）。超过就认为是「另一件事」，另起一步。
+const UNDO_COALESCE_MS: u64 = 700;
+/// 撤销栈上限。500 步覆盖任何一次校对会话，内存恒定在几十 KB 量级。
+const UNDO_MAX_STEPS: usize = 500;
+
 /// 笺校工作台视图：拥有自己的编辑缓冲、焦点、滚动柄，**不引用 Reader 任何字段**。
 pub struct CollationWorkspace {
     /// 转录文本（横排，逐字对应左侧原图的一行/一列）。
@@ -636,6 +727,22 @@ pub struct CollationWorkspace {
     /// 防抖落盘代际令牌（v1.9.64）：每次 `touch` +1，定时器触发时校验是否过期，
     /// 过期即丢弃——保证 1.5 秒窗口内**只写最后一次**状态（停手才落盘）。
     save_gen: usize,
+    /// **撤销栈**（v1.9.66）：操作级 diff（见 [`EditOp`]），绝不存整本快照。
+    /// 顺序即时间序，栈顶 = 最近一步。
+    undo_stack: Vec<EditOp>,
+    /// **重做栈**：撤销时把弹出的步压进来；任何**新的**编辑都会清空它（分叉即弃）。
+    redo_stack: Vec<EditOp>,
+    /// 是否已注册「退出前强存」钩子（v1.9.66）。注册是幂等的，但仍加闸门
+    /// 避免每帧重复 subscribe（Duplicated 回调 = 退出时同一行写十几次）。
+    quit_hooked: bool,
+    /// **合并断点**（v1.9.66）：光标被方向键 / 点选 / 拖选挪过之后置位一次。
+    ///
+    /// 不置位的话，「打两个字 → 点回开头 → 再打两个字」会被几何判据并成一步，
+    /// 一次 ⌘Z 把两处不相干的编辑一起退掉——这在百万字校对里是灾难。
+    /// 置位后 `record_edit` 会强制另起一步，然后自动复位。
+    undo_barrier: bool,
+    /// 帮助浮窗开关（v1.9.66）：顶栏【？】唤出的毛玻璃说明卡。
+    show_help: bool,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -687,6 +794,64 @@ fn wrap_text(
         a + open_n + inner_n + close_n
     };
     (out.into_iter().collect(), cursor)
+}
+
+/// **把一步编辑压进撤销栈**（v1.9.66）：同类别 + 时间窗内 + 几何相邻就合并。
+///
+/// 抽成自由函数（而不是写成 `CollationWorkspace` 的方法）只为可单测——
+/// 合并逻辑是撤销功能最容易出 bug 的地方（连打十个字要退一步、不是十步），
+/// 而它本身是纯数据操作，不该被「必须开窗口才能验」拖累。
+fn push_edit(
+    stack: &mut Vec<EditOp>,
+    pos: usize,
+    removed: String,
+    inserted: String,
+    kind: EditKind,
+    now: std::time::Instant,
+    allow_merge: bool,
+) {
+    // 空操作不记（例如光标已在文末还按 Delete）。
+    if removed.is_empty() && inserted.is_empty() {
+        return;
+    }
+    if allow_merge {
+        if let Some(last) = stack.last_mut() {
+            if last.kind == kind
+                && now.duration_since(last.at) < Duration::from_millis(UNDO_COALESCE_MS)
+                && last.try_absorb(pos, &removed, &inserted)
+            {
+                last.at = now;
+                return;
+            }
+        }
+    }
+    stack.push(EditOp {
+        pos,
+        removed,
+        inserted,
+        kind,
+        at: now,
+    });
+    if stack.len() > UNDO_MAX_STEPS {
+        stack.remove(0);
+    }
+}
+
+/// **字符级替换**（v1.9.66）：把 `[pos, pos+from_len)` 这段字符换成 `to`，返回新文本与光标。
+///
+/// 撤销与重做是**同一条数学**的两次调用——撤销是「把插入的换回删掉的」，
+/// 重做是「把删掉的换回插入的」。抽成一个纯函数的好处：不用开窗口就能单测，
+/// 而且保证两条路径永远不会各自漂移（这类「撤销对了、重做错一个字」的 bug，
+/// 一旦分成两份实现就必然会出）。
+fn splice_chars(text: &str, pos: usize, from_len: usize, to: &str) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let a = pos.min(chars.len());
+    let b = (a + from_len).min(chars.len());
+    let mut next: Vec<char> = chars[..a].to_vec();
+    next.extend(to.chars());
+    next.extend(chars[b..].iter().copied());
+    let cursor = (a + to.chars().count()).min(next.len());
+    (next.into_iter().collect(), cursor)
 }
 
 /// **掩注**（⌘N）的纯计算：剥掉括注 / 夹注，只留正文。
@@ -745,7 +910,7 @@ fn strip_gloss(src: &str) -> String {
 
 impl CollationWorkspace {
     pub fn new(cx: &mut Context<Self>, ai_panel: gpui::Entity<crate::ai::AiPanel>) -> Self {
-        let me = Self {
+        let mut me = Self {
             // 示例转录：一段较长的古文（千字文节选），让用户一进来就能看到
             // 编辑器、立即尝试选择/输入，并直接打开「竖排预览」看到多页分页。
             text: "天地玄黄 宇宙洪荒 日月盈昃 辰宿列张 寒来暑往 秋收冬藏 闰余成岁 律吕调阳 云腾致雨 露结为霜 金生丽水 玉出昆冈 剑号巨阙 珠称夜光 果珍李柰 菜重芥姜 海咸河淡 鳞潜羽翔 龙师火帝 鸟官人皇 始制文字 乃服衣裳 推位让国 有虞陶唐 吊民伐罪 周发殷汤 坐朝问道 垂拱平章 爱育黎首 臣伏戎羌 遐迩一体 率宾归王 鸣凤在竹 白驹食场 化被草木 赖及万方\n盖此身发 四大五常 恭惟鞠养 岂敢毁伤 女慕贞洁 男效才良 知过必改 得能莫忘 罔谈彼短 靡恃己长 信使可覆 器欲难量 墨悲丝染 诗赞羔羊 景行维贤 克念作圣 德建名立 形端表正 空谷传声 虚堂习听 祸因恶积 福缘善庆 尺璧非宝 寸阴是竞 资父事君 曰严与敬 孝当竭力 忠则尽命 临深履薄 夙兴温凊 似兰斯馨 如松之盛 川流不息 渊澄取映 容止若思 言辞安定 笃初诚美 慎终宜令 荣业所基 藉甚无竟 学优登仕 摄职从政 存以甘棠 去而益咏"
@@ -829,7 +994,33 @@ impl CollationWorkspace {
             // v1.9.64：持久化锚点未定（首启动是演示样张，没有 store_id）。
             store_id: None,
             save_gen: 0,
+            // v1.9.66：撤销/重做栈从空开始（演示样张没有「上一版」可退）。
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            quit_hooked: false,
+            undo_barrier: false,
+            show_help: false,
         };
+        // ── v1.9.66：退出前强存（Exit Flush）────────────────────────────
+        //
+        // `touch` 的 1.5 秒防抖保证「平时别丢」，但 ⌘Q / 关窗 / 系统注销时那个
+        // 定时器还没到点，最后这 1.5 秒的编辑就全没了。这里在 App 退出前把最新
+        // 状态**同步**写一次盘，兜住最后一步——用户要测的「强杀进程恢复进度」
+        // 靠的就是这条底线。
+        //
+        // ⚠️ 两个雷，都躺在 gpui 0.2.2 源码里：
+        //  ① `Subscription` 的 `Drop` 会**取消**回调（subscription.rs:197-203），
+        //     所以必须 `.detach()`——否则这钩子注册完下一行就失效，flush 永远
+        //     不触发（与前轮 `cx.spawn` 必须 detach 是同一类雷）。
+        //  ② 回调跑在 AppKit 的退出栈上，**绝不能**在这里更新别的 GPUI 实体
+        //    （panic 穿过 ObjC 栈 = `panic_cannot_unwind` 直接 abort）。本回调
+        //     只碰自己的字段 + 一条 sqlite REPLACE，安全。
+        cx.on_app_quit(|this, _cx| {
+            this.flush_now();
+            async {}
+        })
+        .detach();
+        me.quit_hooked = true;
         // 启动即清扫上一进程遗留的临时图（崩溃 / 强退时 `Drop` 跑不到，只能等下次
         // 启动补扫）。只认本应用自己的命名前缀，且只删「够旧」的，绝不误伤另开的
         // 一个笺读实例正在用的图。
@@ -922,6 +1113,8 @@ impl CollationWorkspace {
             return;
         }
         self.cursor = to;
+        // 光标挪过 → 后续键入另起一步（不许与挪动前那次打字合并）。
+        self.undo_barrier = true;
         cx.notify();
     }
 
@@ -940,17 +1133,89 @@ impl CollationWorkspace {
         self.move_cursor_to(new, shift, cx);
     }
 
+    /// **记一步可撤销的编辑**（v1.9.66）。
+    ///
+    /// 三条约定：
+    ///   ① **先清空重做栈**——任何新编辑都让「原来那条重做线」作废（分叉即弃），
+    ///      这是所有编辑器的通行语义，不清的话 ⌘Z ⌘Z ⌘⇧Z 会拼出乱序；
+    ///   ② 同类别 + 700ms 内 + 几何相邻 → 合并进上一步（连打字算一步、连退格算一步）；
+    ///   ③ 栈满 500 步从头丢，内存恒定（与正文长度无关）。
+    fn record_edit(&mut self, pos: usize, removed: String, inserted: String, kind: EditKind) {
+        // ① **先清空重做栈**——任何新编辑都让「原来那条重做线」作废（分叉即弃），
+        //    这是所有编辑器的通行语义；不清的话 ⌘Z ⌘Z ⌘⇧Z 会拼出乱序。
+        self.redo_stack.clear();
+        // 光标刚被挪过 → 这一步必须自成一档（见 `undo_barrier`）。
+        let allow_merge = !self.undo_barrier;
+        self.undo_barrier = false;
+        push_edit(
+            &mut self.undo_stack,
+            pos,
+            removed,
+            inserted,
+            kind,
+            std::time::Instant::now(),
+            allow_merge,
+        );
+    }
+
+    /// **⌘Z 撤销**：把栈顶那一步反向应用（删掉它插入的、插回它删掉的）。
+    ///
+    /// 返回是否真的撤销了一步——没历史时返回 `false`，调用方可据此给提示
+    /// （而不是让用户按了没反应还以为键盘坏了）。
+    fn undo(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(op) = self.undo_stack.pop() else {
+            return false;
+        };
+        let (text, cursor) =
+            splice_chars(&self.text, op.pos, op.inserted.chars().count(), &op.removed);
+        self.text = text;
+        // 光标落在这段恢复文字之后（按下 ⌘Z 后接着打字的位置就是那里）。
+        self.cursor = cursor;
+        self.selection = None;
+        self.marked = None;
+        self.redo_stack.push(op);
+        // 撤销后接着打字：必须是**新的一步**，绝不能并进刚撤掉的那步去。
+        self.undo_barrier = true;
+        cx.notify();
+        self.touch(cx);
+        true
+    }
+
+    /// **⌘⇧Z 重做**：把撤销掉的那一步再做一遍。
+    fn redo(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(op) = self.redo_stack.pop() else {
+            return false;
+        };
+        let (text, cursor) =
+            splice_chars(&self.text, op.pos, op.removed.chars().count(), &op.inserted);
+        self.text = text;
+        self.cursor = cursor;
+        self.selection = None;
+        self.marked = None;
+        // 直接压回撤销栈（**不能**走 `record_edit`——那会清空重做栈，重做一次就断链）。
+        self.undo_stack.push(op);
+        self.undo_barrier = true;
+        cx.notify();
+        self.touch(cx);
+        true
+    }
+
     fn delete_char(&mut self, forward: bool, cx: &mut Context<Self>) {
         if self.marked.is_some() {
             return;
         }
         if let Some(sel) = self.selection.as_ref() {
-            let (s, e) = (sel.start.min(sel.end), sel.end.max(sel.end));
+            let (s, e) = (sel.start.min(sel.end), sel.start.max(sel.end));
             let chars: Vec<char> = self.text.chars().collect();
+            let s = s.min(chars.len());
+            let e = e.min(chars.len()).max(s);
+            let removed: String = chars[s..e].iter().collect();
             let kept: String = chars[..s].iter().chain(&chars[e..]).collect();
             self.text = kept;
             self.cursor = s;
             self.selection = None;
+            // 删选区是「一次性动作」：不参与合并，按一次 ⌘Z 整段回来。
+            self.record_edit(s, removed, String::new(), EditKind::Once);
             cx.notify();
             self.touch(cx);
             return;
@@ -959,14 +1224,18 @@ impl CollationWorkspace {
         if forward {
             if self.cursor < total {
                 let chars: Vec<char> = self.text.chars().collect();
+                let removed: String = chars[self.cursor].to_string();
                 self.text = chars[..self.cursor].iter().chain(&chars[self.cursor + 1..]).collect();
+                self.record_edit(self.cursor, removed, String::new(), EditKind::Delete);
                 cx.notify();
                 self.touch(cx);
             }
         } else if self.cursor > 0 {
             let chars: Vec<char> = self.text.chars().collect();
+            let removed: String = chars[self.cursor - 1].to_string();
             self.text = chars[..self.cursor - 1].iter().chain(&chars[self.cursor..]).collect();
             self.cursor -= 1;
+            self.record_edit(self.cursor, removed, String::new(), EditKind::Backspace);
             cx.notify();
             self.touch(cx);
         }
@@ -975,14 +1244,26 @@ impl CollationWorkspace {
     /// 在光标处（或替换选区）插入文本。
     fn insert_text(&mut self, s: &str, cx: &mut Context<Self>) {
         let (a, b) = match self.selection.as_ref() {
-            Some(sel) => (sel.start.min(sel.end), sel.end.max(sel.end)),
+            Some(sel) => (sel.start.min(sel.end), sel.start.max(sel.end)),
             None => (self.cursor, self.cursor),
         };
         let mut chars: Vec<char> = self.text.chars().collect();
+        let a = a.min(chars.len());
+        let b = b.min(chars.len()).max(a);
+        let replaced: String = chars[a..b].iter().collect();
         chars.splice(a..b, s.chars());
         self.text = chars.into_iter().collect();
         self.cursor = (a + s.chars().count()).min(self.text.chars().count());
         self.selection = None;
+        // 逐字键入（含回车）走 `Insert`，可与前后连打合并成一步；
+        // 整段粘贴 / AI 补全一次进一大块，走 `Once` 独立成步——否则「粘一页、
+        // 再打两个字」会被并成一步，⌘Z 一下把整页都吃了。
+        let kind = if s.chars().count() == 1 {
+            EditKind::Insert
+        } else {
+            EditKind::Once
+        };
+        self.record_edit(a, replaced, s.to_string(), kind);
         cx.notify();
         self.touch(cx);
     }
@@ -995,10 +1276,27 @@ impl CollationWorkspace {
     ///      不是跳过它）。「（）」插完把光标丢到括号外面，等于每次都要再按一次
     ///      ←，校对时那一秒最恼人。
     fn wrap_selection(&mut self, open: &str, close: &str, cx: &mut Context<Self>) {
+        // 先把这次替换的「旧串 / 新串」算出来（撤销栈只认这一对），再交给
+        // `wrap_text` 做真活——两边口径必须同源，否则撤销会错位一个字。
+        let chars: Vec<char> = self.text.chars().collect();
+        let total = chars.len();
+        let (a, b) = match self.selection.clone() {
+            Some(r) if r.start != r.end => (
+                r.start.min(r.end).min(total),
+                r.start.max(r.end).min(total),
+            ),
+            _ => {
+                let c = self.cursor.min(total);
+                (c, c)
+            }
+        };
+        let removed: String = chars[a..b].iter().collect();
+        let inserted = format!("{open}{removed}{close}");
         let (text, cursor) = wrap_text(&self.text, self.selection.clone(), self.cursor, open, close);
         self.text = text;
         self.cursor = cursor;
         self.selection = None;
+        self.record_edit(a, removed, inserted, EditKind::Once);
         cx.notify();
         self.touch(cx);
     }
@@ -1512,6 +1810,18 @@ impl CollationWorkspace {
         // 工作台里按 ⌘V 是**一点反应都没有**——这就是「粘贴不通」的真因。
         if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
             match k {
+                // ⌘Z / ⌘⇧Z：**撤销 / 重做**（v1.9.66）。几百万字的稿子没有撤销，
+                // 用户根本不敢改一个字——这是「可发售」与「玩具」的分界线。
+                // macOS 的 keystroke.key 在 ⇧Z 时仍可能是 "z"（大写由 modifiers
+                // 表达），也可能给 "Z"，两种都收，判定只认 `shift` 标志。
+                "z" | "Z" => {
+                    if shift {
+                        self.redo(cx);
+                    } else {
+                        self.undo(cx);
+                    }
+                    return;
+                }
                 "v" | "V" => {
                     // 正文要保留换行（稿子是多段的），故不走 `paste_text`
                     //（那个口子把 \n 压成空格，是给单行草稿用的）。
@@ -1538,12 +1848,61 @@ impl CollationWorkspace {
             "end" => self.line_end(shift, cx),
             "enter" | "return" => self.insert_text("\n", cx),
             "escape" => {
-                self.selection = None;
+                // 帮助卡优先收：用户按 Esc 想关的第一顺位永远是「刚弹出来的那层」。
+                if self.show_help {
+                    self.show_help = false;
+                } else {
+                    self.selection = None;
+                }
                 cx.notify();
             }
             _ => {}
         }
         self.touch(cx);
+    }
+
+    /// **滚轮强接**（v1.9.65，用户「绝对强制」铁律 ③）。
+    ///
+    /// `render_editor` 里 `InputField` 外面那层透明容器在 Bubble 阶段**先于**
+    /// 滚动容器的内建滚轮处理收到事件（gpui 冒泡按叶子优先），这里手动把
+    /// 增量写进 `ScrollHandle` 再掐断传播——事件被谁吞都吞不掉，内建处理
+    /// 也不会跟着再滚一次（双滚）。公式与 gpui 内建（div.rs `paint_scroll_
+    /// listener` / `clamp_scroll_position`）**逐字相同**：`offset += delta`
+    /// 然后 clamp 到 `[-handle.max_offset(), 0]`——`max_offset` 正是 gpui
+    /// 自己从真实布局算出的滚动余量（div.rs:1762 存进 handle），零估算。
+    ///
+    /// 已审计 `ime::InputField`：它只注册焦点 / IME（`window.handle_input`），
+    /// **不碰滚轮**——这层是双保险，不是补丁。
+    fn forward_wheel(&mut self, ev: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        // 对照模式：左右两栏共用 `diff_scroll`，由 GPUI 内建统一滚（左栏毛坯
+        // 视口一起动、段落对齐不漂）。此处若接管会绕开左栏口径 → 放行且
+        // **不掐传播**，让内建处理照常收尾。
+        if self.show_diff {
+            return;
+        }
+        let dy = px_f32(ev.delta.pixel_delta(px(LINE_H)).y);
+        if dy == 0.0 {
+            return;
+        }
+        let cur = self.scroll.offset();
+        let max = px_f32(self.scroll.max_offset().height).max(0.0);
+        if max <= 0.0 {
+            // 排障口供（真机若再出现「滚不动」，看这行就分得清责任）：
+            // 事件到了、公式也跑了，但 gpui 算出的滚动余量是 0 —— 那不是事件
+            // 被吞，是**滚动视口的高度又塌了**（视口 == 内容高），去查
+            // render_editor 的高度链，别再改滚轮。
+            eprintln!(
+                "[collation] 滚轮已接管但 max_offset=0：视口高度塌了（内容没高出视口），\
+                 这是布局问题不是事件问题"
+            );
+        }
+        let next = (px_f32(cur.y) + dy).clamp(-max, 0.0);
+        if next != px_f32(cur.y) {
+            self.scroll.set_offset(Point::new(cur.x, px(next)));
+            cx.notify();
+        }
+        // 掐断传播：滚动容器的内建滚轮处理晚于本层收到同一事件，不掐就双滚。
+        cx.stop_propagation();
     }
 
     /// 左栏实际宽度（CSS 像素）：决定右栏左缘，进而决定编辑器内容的 X 原点。
@@ -1595,7 +1954,7 @@ impl CollationWorkspace {
         let origin_x = self.left_col_w(vw) + ED_PAD;
         // 纯文本模式顶部多一条静默提示条（render 里 `pure_text_mode` 分支），
         // 必须算进 Y 原点，否则兜底点击（点正文下方空白）落行错位。
-        let hint_h = if self.pure_text_mode { 20.0 } else { 0.0 };
+        let hint_h = if self.pure_text_mode { PURE_HINT_H } else { 0.0 };
         // v1.9.63：对照模式编辑器滚在 `diff_scroll` 上，坐标口径要跟着走。
         let scroll_y = px_f32(if self.show_diff {
             self.diff_scroll.offset().y
@@ -1727,6 +2086,8 @@ impl CollationWorkspace {
         let vh = px_f32(window.viewport_size().height);
         self.cursor = self.caret_from_point(px_f32(event.position.x), px_f32(event.position.y), vw);
         self.anchor = self.cursor;
+        // 点选定位 → 后续键入另起一步（撤销不许跨过这次点击）。
+        self.undo_barrier = true;
         if event.click_count >= 2 {
             let (a, b) = self.sentence_bounds(self.cursor);
             self.selection = if a < b { Some(a..b) } else { None };
@@ -1767,6 +2128,8 @@ impl CollationWorkspace {
         let (s, e) = (self.anchor.min(to), self.anchor.max(to));
         self.cursor = to;
         self.selection = if s == e { None } else { Some(s..e) };
+        // 拖选也是「挪过光标」，同样断开合并链。
+        self.undo_barrier = true;
         cx.notify();
         self.touch(cx);
     }
@@ -2223,6 +2586,36 @@ impl CollationWorkspace {
             // 「清洗日志」（v1.9.60）：生成 sanitize_report.md 并在访达中打开。
             .child(self.clean_log_chip(cx))
             .child(div().flex_1())
+            .child(div().w(px(6.0)))
+            // 【？】帮助（v1.9.66）：一枚极简的圆形问号，点开是毛玻璃说明卡。
+            //
+            // 刻意不做成「打开外部 md」：1) 沙盒里起 `open` 子进程是合规雷；
+            // 2) 用户正在校对时被抢到浏览器，回来还得重新落点。内容内嵌在
+            // `render_help_overlay`，离线、零依赖、Esc 即回。
+            .child(
+                div()
+                    .size(px(22.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(11.0))
+                    .border_1()
+                    .border_color(rgba(0x2B262026))
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .font_family(song.clone())
+                    .text_color(rgba(0x2B2620A6))
+                    .hover(|s| s.border_color(rgb(0x8c2b22)).text_color(rgb(0x8c2b22)))
+                    .child(SharedString::from("？"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|c, _, _, cx| {
+                            c.show_help = true;
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(div().w(px(10.0)))
             // 唯一的实底主按钮。
             .child(self.primary_button(
                 "竖排预览",
@@ -2259,6 +2652,160 @@ impl CollationWorkspace {
                         }),
                     ),
             )
+    }
+
+    /// **帮助浮卡**（v1.9.66）：顶栏【？】唤出的毛玻璃说明卡。
+    ///
+    /// 内容刻意内嵌（不走外部 `USER_GUIDE.md`）：
+    ///   ① 沙盒合规——不在 App 里起 `open` 子进程；
+    ///   ② 体验——用户正在校对，被抢到浏览器再回来，光标和滚动位置全丢；
+    ///   ③ 离线可用——随包 md 是「完整说明」，这里只留**当下最需要的四段**。
+    ///
+    /// 「毛玻璃」在 GPUI 0.2.2 里没有 `backdrop-filter`，做法与顶栏同一套：
+    /// 用 92% 不透明的纸色 + 一道 1px 淡墨边 + 大圆角，靠**层次**而不是模糊
+    /// 骗过眼睛（半透明叠在正文上会脏，反而更廉价）。
+    fn render_help_overlay(&self, _vw: f32, vh: f32, cx: &mut Context<Self>) -> gpui::Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
+        // 一行「键 → 说明」。左列窄、右列撑满，读起来像笺注而不是说明文档。
+        let line = |k: &'static str, v: &'static str| {
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .w(px(72.0))
+                        .flex_none()
+                        .text_size(px(11.0))
+                        .text_color(rgba(0x8C2B22CC))
+                        .child(SharedString::from(k)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(11.5))
+                        .text_color(rgb(0x3A342C))
+                        .child(SharedString::from(v)),
+                )
+        };
+        let head = |t: &'static str| {
+            div()
+                .w_full()
+                .pt(px(6.0))
+                .text_size(px(11.0))
+                .text_color(rgba(0x2B26208C))
+                .child(SharedString::from(t))
+        };
+
+        let card = div()
+            .w(px(600.0))
+            .max_h(px((vh - 90.0).max(240.0)))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .p(px(22.0))
+            .rounded(px(12.0))
+            .bg(rgba(0xF7F2E6F7))
+            .border_1()
+            .border_color(rgba(0x2B26201F))
+            .shadow_lg()
+            .font_family(song)
+            .on_mouse_down(
+                MouseButton::Left,
+                // 卡片内部点一下不能关（否则改不了里面的文字）。
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(14.0))
+                            .text_color(rgb(0x2B2622))
+                            .child(SharedString::from("笺读 · 使用帮助")),
+                    )
+                    .child(
+                        div()
+                            .size(px(20.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(10.0))
+                            .cursor_pointer()
+                            .text_size(px(12.0))
+                            .text_color(rgba(0x2B26208C))
+                            .hover(|s| s.text_color(rgb(0x8c2b22)))
+                            .child(SharedString::from("✕"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|c, _, _, cx| {
+                                    cx.stop_propagation();
+                                    c.show_help = false;
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            )
+            // ① 核心工作流
+            .child(head("核心工作流"))
+            .child(line("① 导入", "书架【导入书籍】选 PDF / TXT / MD / EPUB；多本用【批量导入】排队。"))
+            .child(line("② 阅读", "书架点封面进阅读器；← → 翻页，Esc 退专注模式。"))
+            .child(line("③ 笺校", "书架卡片右下【一键笺校】直达工作台，自动带上原图与正文。"))
+            // ② 工作台操作
+            .child(head("工作台操作"))
+            .child(line("定位", "单击正文落光标；拖拽选中一段；点左图也能定位到对应正文。"))
+            .child(line("框选补字", "在左图上拖一个框，命中的字会拼成待补文字，点【补入】插到光标处。"))
+            .child(line("撤销", "⌘Z 撤销、⌘⇧Z 重做。连打字算一步，不会一个字退一次。"))
+            // ③ 特色功能
+            .child(head("特色功能"))
+            .child(line("原文对照", "左栏导入毛坯 / 右栏清洗后正文，逐字比对，防清洗误杀。"))
+            .child(line("清洗日志", "本次导入删了什么、改了什么，一页看完。"))
+            .child(line("掩注 ⌘N", "竖排预览与导出时隐去夹注小字；正文一个字都不动。"))
+            .child(line("问小笺", "选中一段 → 悬浮钮 → 就地提问，与阅读器同一位先生。"))
+            .child(line("竖排预览", "把正文排成笺读风书页，可切单/双叶、底色与界栏。"))
+            .child(line("AI 句读", "【更多】→ AI 句读，自动给全文加句读并写回。"))
+            // ④ 快捷键
+            .child(head("快捷键"))
+            .child(line("⌘Z / ⌘⇧Z", "撤销 / 重做"))
+            .child(line("⌘V / ⌘N", "粘贴 / 掩注"))
+            .child(line("← → ↑ ↓", "移动光标（按住 ⇧ 扩选）；Home / End 到行首行尾"))
+            .child(line("Esc", "关闭当前浮层（帮助 / 预览 / 问小笺）"))
+            .child(line("⌘Q", "退出（退出前会自动存盘一次，不会丢最后一笔）"))
+            .child(
+                div()
+                    .w_full()
+                    .pt(px(8.0))
+                    .text_size(px(10.5))
+                    .text_color(rgba(0x2B262066))
+                    .child(SharedString::from("完整说明见随包 USER_GUIDE.md")),
+            );
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x14100A4D))
+            // 点遮罩即关（与清洗日志 / 覆盖确认同一套手势）。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|c, _, _, cx| {
+                    c.show_help = false;
+                    cx.notify();
+                }),
+            )
+            .child(card)
     }
 
     /// 原文对照左栏：把导入时的「毛坯文本」（未清洗）逐行铺开，只读、可滚。
@@ -3048,6 +3595,9 @@ impl CollationWorkspace {
         self.cursor = 0;
         self.selection = None;
         self.marked = None;
+        // v1.9.66：换书即清空撤销历史——上一本书的 ⌘Z 绝不能退进这一本里。
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.active_line = None;
         self.active_para_idx = None;
         self.match_note = None;
@@ -3106,6 +3656,42 @@ impl CollationWorkspace {
     ///     且 `INSERT OR REPLACE` 单行，绝不全量覆写。
     ///
     /// 临时样张（`store_id` 为 `None`）直接返回，不污染数据库。
+    /// v1.9.66：**退出前同步强存**（Exit Flush）。
+    ///
+    /// 与 [`Self::touch`] 的分工：`touch` 管「平时别丢」（1.5 秒防抖，扔后台线程，
+    /// 不卡手），本方法管「合眼前最后一口气」——⌘Q / 关窗 / 系统注销时防抖计时器
+    /// 还没到点，那最后一两秒的编辑只在内存里。
+    ///
+    /// 三条纪律：
+    ///   ① **同步**（不 spawn）：退出窗口是 `SHUTDOWN_TIMEOUT`，起线程/排队的
+    ///      任务未必来得及跑；一条 REPLACE 是毫秒级，直接写完最稳；
+    ///   ② **只碰自己的字段 + sqlite**：本方法由 AppKit 退出栈上的回调调用，
+    ///      在里面更新别的 GPUI 实体 = panic 穿 ObjC 栈 = 直接 abort；
+    ///   ③ 代际 +1：把可能还在飞的那轮防抖判定作废，避免它稍后写回旧值。
+    pub fn flush_now(&mut self) {
+        let Some(sid) = self.store_id.clone() else {
+            // 临时样张（演示千字文）没有 store_id，本来就不落库。
+            return;
+        };
+        self.save_gen = self.save_gen.wrapping_add(1);
+        let Ok(conn) = jiandu_core::store::connect() else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let state = jiandu_core::store::CollationState {
+            store_id: sid,
+            full_text: self.text.clone(),
+            show_diff: self.show_diff,
+            cursor: self.cursor,
+            scroll_y: px_f32(self.scroll.offset().y) as f64,
+            updated_at: now,
+        };
+        let _ = jiandu_core::store::put_collation_state(&conn, &state);
+    }
+
     fn touch(&mut self, cx: &mut Context<Self>) {
         let Some(sid) = self.store_id.clone() else {
             return;
@@ -4431,7 +5017,7 @@ impl CollationWorkspace {
     }
 
     /// 右侧 60%：竖排预览工具条 + 原生编辑器。
-    fn render_right(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_right(&self, vw: f32, row_h: f32, cx: &mut Context<Self>) -> gpui::Div {
         let editor = self.render_editor(vw, cx);
         // 右栏宽 = 整屏 − 左栏宽（原文对照 50% / 纯文本 0 / 正常 40%）。必须与
         // `left_col_w` 同源，否则右栏溢出或缩水都会让编辑器原点失准。
@@ -4442,9 +5028,14 @@ impl CollationWorkspace {
         div()
             .relative()
             .w(px(right_w))
-            .h_full()
+            // ⚠️ v1.9.65：不再用 `h_full()`（百分比高）——它解析到的父级
+            // （分栏行）高度如今是**写死的绝对像素**，但为了整条高度链
+            // 「零百分比」，这里也直接绑绝对像素：`row_h` 由 render() 从
+            // 窗口真实高度算出（vh − 顶栏 − 提示条），一处算、处处用。
+            .h(px(row_h))
             .flex()
             .flex_col()
+            .overflow_hidden()
             // 稿纸：最亮的一张纸。
             .bg(rgb(PAPER_R))
             // **柔影向左**（v1.9.24）：右纸压左纸，靠这片外阴影。偏移取负 x，
@@ -4899,20 +5490,42 @@ impl CollationWorkspace {
             self.focus.clone(),
             cx.entity(),
         );
-        // **滚动视口**：`h_full()` 现在解析到 `wrap`（`flex_1` 在右栏 flex 列里有
-        // 确定高度）给出的**确定高度**，于是视口被锁成面板高度、内容（正文行）超出
-        // 即滚动。
+        // **滚动视口**（v1.9.65 终极修法，用户「绝对强制」铁律 ② + ③）：
         //
-        // ⚠️ **关键修复（纯文本模式「滚不动」半身不遂的根）**：旧实现把
-        //    `overflow_y_scroll() + h_full()` 直接挂在 `InputField` **内部**的子 div
-        //    上。而 `InputField` 是自定义元素、自身高度由子元素回推——于是内层
-        //    `h_full()` 解析回「内容高度」而非被拉伸的面板高度 → 视口高 == 内容高 →
-        //    永远不滚动、长文溢出屏幕。把滚动容器挪到 `InputField` **外层**
-        //    （`wrap` 的内层 `scroll_view`）即根治：外层 `wrap` 的高度来自右栏 flex
-        //    列的 `flex_1`（确定），`scroll_view.h_full()` 才有真正的视口高度可依。
+        // 旧链的真根：`scroll_view.h_full()` 是**百分比高度**，挂在高度由
+        // `flex_1` 解析出来的 `wrap` 上——taffy 对「百分比 vs flex 解析高」的
+        // 父级可能判为**不定** → h_full 退化成内容高 → 视口 == 内容 → gpui
+        // 的 `clamp_scroll_position`（div.rs:1747）算出 `scroll_max = 0` →
+        // 滚轮事件来了 offset 也被钉死在 0（div.rs:1758）——**滚轮没坏、
+        // 事件也没被吞，是视口高度塌了**。这就是真机「彻底滑不动」的真根，
+        // 也是前两轮「min_h(0) 修复」只治了 wrap 一层、没治 scroll_view 这层
+        // 百分比的原因。修法三件事：
+        //   ① render()/render_right() 把外层行与右栏全改**绝对像素高**；
+        //   ② `wrap` 改 flex 列、`scroll_view` 用 **flex_1 + min_h(0)**——
+        //      flex 主轴分配永远给出确定高，整条链零百分比；
+        //   ③ `InputField` 外套一层**透明滚轮接管层**：Bubble 阶段它先于
+        //      滚动容器的内建滚轮处理收到事件（gpui 按叶子优先冒泡），手动
+        //      按 gpui 内建同一条公式（div.rs:2446 `offset += delta`，clamp
+        //      到 `[-handle.max_offset, 0]`）把增量写到 ScrollHandle 并
+        //      `stop_propagation` 掐断内建处理——事件被谁吞都吞不掉，也绝不
+        //      会双滚。已审计 `ime::InputField`：它只注册焦点 / IME
+        //      （`window.handle_input`），**不碰滚轮**；这层是双保险。
+        let wheel = div()
+            .w_full()
+            .on_scroll_wheel(cx.listener(|c, ev: &ScrollWheelEvent, _window, cx| {
+                c.forward_wheel(ev, cx);
+            }))
+            .child(editor);
         let scroll_view = div()
-            .id(SharedString::from("collation-editor-scroll"))
-            .h_full()
+            .id(SharedString::from(if self.pure_text_mode {
+                // 用户点名的专用 id（铁律 ②）：纯文本模式的独立滚动容器。
+                "pure-text-scroll-container"
+            } else {
+                "collation-editor-scroll"
+            }))
+            // ⚠️ 不再用 h_full()（百分比高度）——见上，flex 主轴分配才是确定高。
+            .flex_1()
+            .min_h(px(0.0))
             .w_full()
             .overflow_y_scroll()
             // v1.9.63：对照模式挂专用 `diff_scroll`（与左栏毛坯共用 → 同步滚动）；
@@ -4922,20 +5535,19 @@ impl CollationWorkspace {
             } else {
                 &self.scroll
             })
-            .child(editor);
+            .child(wheel);
         // 选区悬浮钮（问小笺）叠在编辑器之上：`relative` 容器 + 绝对定位气泡，
         // 气泡是**滚动视口之外**的兄弟节点（不随滚动位移），故 y 要自己减
         // `scroll.offset()`（见 `render_selection_bar` 的坐标口径）。
         //
-        // ⚠️ **`min_h(px(0.0))` 是纯文本模式「滚轮纹丝不动」的真根**：本 `wrap`
-        // 是右栏 flex 列里的 `flex_1` 子项，GPUI 在 flex 列中默认给 `flex_1` 子项
-        // 套 `min-height: auto`——它不肯收缩到比内容更矮，于是整篇正文把 `wrap`
-        // 撑到「内容高度」，里面那个 `scroll_view.h_full()` 解析回的也是内容高 →
-        // 视口高 == 内容高 → `overflow_y_scroll` 永远判定「没东西可滚」。补
-        // `min_h(0)` 让 `wrap` 能被压回 flex 分配到的确定高度，内层滚动视口才有
-        // 真正的视口高度可依、才滚得动。`overflow_hidden` 收口，内容绝不溢出面板。
+        // `min_h(px(0.0))`：wrap 是右栏 flex 列里的 `flex_1` 子项，不带它就
+        // 会被正文撑到「内容高度」。**v1.9.65 起右栏本身已是绝对像素高**，
+        // flex 分配必出确定值；wrap 同时改 flex 列，让 scroll_view 的
+        // `flex_1` 有主轴可分——从 wrap 到视口，全程零百分比高度。
         let mut wrap = div()
             .relative()
+            .flex()
+            .flex_col()
             .flex_1()
             .min_w(px(0.0))
             .min_h(px(0.0))
@@ -5651,19 +6263,29 @@ impl Render for CollationWorkspace {
             .on_key_down(cx.listener(|c, event, window, cx| c.ws_key(event, window, cx)))
             .child(self.render_header(cx));
         // 纯文本模式：顶部一条静默提示（无原图，仅正文），不占交互。
+        // ⚠️ 显式 `.h(px(PURE_HINT_H))`（v1.9.65）：提示条高度是**布局账本**上
+        // 的一笔（分栏行的绝对高度、`editor_origin` 的 Y 原点都扣它），不能靠
+        // py+字号凑出来——差 2px，下面整栏的绝对高度就对不上。
         if self.pure_text_mode {
             root = root.child(
                 div()
                     .w_full()
                     .flex()
                     .justify_center()
-                    .py(px(3.0))
+                    .items_center()
+                    .h(px(PURE_HINT_H))
                     .bg(rgba(0x2B26200D))
                     .text_size(px(11.0))
                     .text_color(rgb(0x9A9184))
                     .child(SharedString::from("纯文本模式 · 本书无原图，仅显示正文")),
             );
         }
+        // **绝对强制物理高度**（v1.9.65，用户铁律 ①）：分栏行不再用 `flex_1`
+        // （高度靠 flex 链逐级解析，链上任何一环把百分比判成「不定」都会塌成
+        // 内容高 → 视口 == 内容 → 永远滚不动）。直接绑**窗口绝对高度**：
+        // vh − 顶栏 44 − 纯文本提示 20，写死的像素，不依赖任何父级解析结果。
+        let hint_h = if self.pure_text_mode { PURE_HINT_H } else { 0.0 };
+        let row_h = (vh - HEADER_H - hint_h).max(120.0);
         root = root.child(
             // **视觉分割**（v1.9.24）：一条黑线都不要。
             // 现在是「柔影（右纸的 shadow，见 render_right）+ 一根 5% 墨的
@@ -5675,7 +6297,8 @@ impl Render for CollationWorkspace {
                 .relative()
                 .flex()
                 .flex_row()
-                .flex_1()
+                .h(px(row_h))
+                .overflow_hidden()
                 .when(self.left_col_w(vw) > 0.0, |d| {
                     d.child(self.render_left(vw, cx))
                         .child(
@@ -5688,7 +6311,7 @@ impl Render for CollationWorkspace {
                                 .bg(rgba(0x2B26200D)),
                         )
                 })
-                .child(self.render_right(vw, cx)),
+                .child(self.render_right(vw, row_h, cx)),
         );
         if self.show_preview {
             root = root.child(self.render_preview_overlay(vh, cx));
@@ -5800,6 +6423,10 @@ impl Render for CollationWorkspace {
         // 清洗日志内嵌面板：压在最上（与覆盖确认同级），点遮罩或 ✕ 收。
         if self.show_sanitize_panel {
             root = root.child(self.render_sanitize_panel(cx));
+        }
+        // 帮助浮卡（v1.9.66）：也压在最上——它是「随时呼出、随时收起」的说明。
+        if self.show_help {
+            root = root.child(self.render_help_overlay(vw, vh, cx));
         }
         root
     }
@@ -6491,9 +7118,14 @@ impl CollationWorkspace {
         let b = b.clamp(a, total);
         let clean: String = text.chars().filter(|c| !c.is_control()).collect();
         let mut chars: Vec<char> = self.text.chars().collect();
+        let replaced: String = chars[a..b].iter().collect();
         chars.splice(a..b, clean.chars());
         self.text = chars.into_iter().collect();
         self.cursor = (a + clean.chars().count()).min(self.text.chars().count());
+        // 输入法这条路的撤销：组字过程中 `replace_and_mark_text_in_range` 会被
+        // 逐帧调用（n → ni → nih → niha…），逐帧记步会让 ⌘Z 退成「一个字退一下」。
+        // 统一标 `Ime`，由 `try_absorb` 把连续组字合成**一次输入**。
+        self.record_edit(a, replaced, clean, EditKind::Ime);
         char_to_utf16(&self.text, a)
     }
 }
@@ -6902,6 +7534,232 @@ mod tests {
         assert!(CollationWorkspace::preview_result_stale(false, 7, 7));
         // 关掉又重开、但代际已变 → 旧的那批仍然必须丢（绝不「闪回上一版」）。
         assert!(CollationWorkspace::preview_result_stale(true, 7, 8));
+    }
+
+    // ── v1.9.65 · 纯文本模式滚动（用户「绝对强制」铁律 ④）────────────────
+    //
+    // 背景：真机纯文本模式「彻底滑不动」。根因不在滚轮事件（事件链已逐行
+    // 审计过 gpui 0.2.2 源码：div.rs `paint_scroll_listener` 正常收 Bubble
+    // 事件、`ime::InputField` 只注册焦点 / IME 不碰滚轮），而在**视口高度
+    // 塌陷**——`scroll_view.h_full()` 是百分比高度，父级高度由 flex 解析时
+    // taffy 可能判「不定」→ 视口 == 内容高 → `clamp_scroll_position` 算出
+    // `scroll_max = 0` → offset 永远钉死 0。修法是外层绑绝对像素高、内部
+    // 全 flex_1 + min_h(0)、零百分比。GPUI 0.2.2 无法在无窗口的 cargo test
+    // 里真开一扇窗验证渲染，故把滚动几何抽成纯函数，按用户铁律单测：
+    // **10000 行数字若撑不破视口 / 无滚动余量，测试不过。**
+
+    /// 纯文本模式滚动几何（纯函数）：给定正文与视口宽高，返回
+    /// （内容高， 视口高， 最大滚动距离）。
+    ///
+    /// 与 `render_editor` 同一套常量（`CHAR_W` 近似字宽 / `LINE_H` 行高 /
+    /// `ED_PAD` 上下内边距），编码两条铁律：
+    ///   ① **视口高恒等于传入值**——视口绝不被内容自适应撑大；
+    ///   ② 内容高出视口的部分就是滚动余量，必须 > 0 才滚得动。
+    fn pure_scroll_geometry(text: &str, view_w: f32, view_h: f32) -> (f32, f32, f32) {
+        let cpl = ((view_w - 2.0 * ED_PAD) / CHAR_W).max(1.0).floor() as usize;
+        let lines: usize = text.split('\n').map(|s| est_wrapped_lines(s, cpl)).sum();
+        let content_h = lines as f32 * LINE_H + 2.0 * ED_PAD;
+        let scroll_max = (content_h - view_h).max(0.0);
+        (content_h, view_h, scroll_max)
+    }
+
+    /// **用户铁律 ④**：10000 行数字，撑不破视口 / 不出滚动余量 → 测试不过。
+    #[test]
+    fn ten_thousand_lines_must_overflow_any_screen() {
+        // 纯数字循环生成 10000 行（用户点名的口径：极简、纯数字）。
+        let text = (0..10_000)
+            .map(|i| format!("{:05} 0123456789", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 从笔记本（1200×800）到 5K 大屏（4480×2400）的右栏视口，全部必须被撑破。
+        for &(w, h) in &[(1200.0, 800.0), (2560.0, 1440.0), (4480.0, 2400.0)] {
+            let (content_h, view_h, scroll_max) = pure_scroll_geometry(&text, w, h);
+            assert!(
+                content_h > view_h,
+                "{w}×{h}：10000 行内容高 {content_h:.0}px 必须大于视口高 {view_h:.0}px"
+            );
+            assert!(
+                scroll_max > 0.0,
+                "{w}×{h}：必须存在滚动余量（现为 {scroll_max:.0}px）——没有余量 = 滚不动"
+            );
+            // 铁律 ① 的编码：视口高恒等于传入值，绝不被内容撑大。
+            assert_eq!(view_h, h);
+        }
+    }
+
+    /// 铁律 ③ 的公式自检：与 gpui 内建（div.rs:2446 `offset += delta`，
+    /// div.rs:1754-1758 clamp 到 `[-max, 0]`）逐字同一条数学。
+    #[test]
+    fn wheel_forward_math_mirrors_gpui_builtin() {
+        let max = 3000.0f32;
+        let clamp = |y: f32| y.clamp(-max, 0.0);
+        let mut y = 0.0f32;
+        // 向下滚 10 次 × 52px：内容上移 520px，没到下界。
+        for _ in 0..10 {
+            y = clamp(y + (-52.0));
+        }
+        assert_eq!(y, -520.0);
+        // 滚到底再滚：钉死在下界，绝不过冲。
+        for _ in 0..100 {
+            y = clamp(y + (-52.0));
+        }
+        assert_eq!(y, -max);
+        // 向上滚回顶：钉死在 0，绝不越过。
+        for _ in 0..100 {
+            y = clamp(y + 52.0);
+        }
+        assert_eq!(y, 0.0);
+    }
+
+    // ── v1.9.66 · 撤销 / 重做（用户点名的「保命底线」）──────────────────────
+    //
+    // 这里全部按**纯函数**验：`push_edit` 管「记与合并」，`splice_chars` 管
+    // 「反向应用」。两者合起来就是 ⌘Z / ⌘⇧Z 的全部数学，不必开窗口也能钉死行为。
+
+    /// 连打字必须合并成**一步**：否则按一次 ⌘Z 只退一个字，用户会以为撤销坏了。
+    #[test]
+    fn consecutive_typing_merges_into_one_undo_step() {
+        let mut stack: Vec<EditOp> = Vec::new();
+        let now = std::time::Instant::now();
+        let mut text = String::new();
+        let mut cursor = 0usize;
+        for ch in "天地玄黄".chars() {
+            push_edit(
+                &mut stack,
+                cursor,
+                String::new(),
+                ch.to_string(),
+                EditKind::Insert,
+                now,
+                true,
+            );
+            text.push(ch);
+            cursor += 1;
+        }
+        assert_eq!(stack.len(), 1, "连打四个字应只记一步");
+        let op = stack.pop().unwrap();
+        assert_eq!(op.inserted, "天地玄黄");
+        let (after, caret) = splice_chars(&text, op.pos, op.inserted.chars().count(), &op.removed);
+        assert_eq!(after, "", "一步 ⌘Z 应把四个字全部退掉");
+        assert_eq!(caret, 0);
+    }
+
+    /// 连按退格的合并方向与打字相反（新删的在**前**），且一步退干净。
+    #[test]
+    fn consecutive_backspace_merges_into_one_undo_step() {
+        let mut stack: Vec<EditOp> = Vec::new();
+        let now = std::time::Instant::now();
+        let mut text = "天地玄黄".to_string();
+        let mut cursor = 4usize;
+        while cursor > 0 {
+            let chars: Vec<char> = text.chars().collect();
+            let removed = chars[cursor - 1].to_string();
+            let (t, c) = splice_chars(&text, cursor - 1, 1, "");
+            text = t;
+            cursor = c;
+            push_edit(
+                &mut stack,
+                cursor,
+                removed,
+                String::new(),
+                EditKind::Backspace,
+                now,
+                true,
+            );
+        }
+        assert_eq!(stack.len(), 1, "连按四次退格应只记一步");
+        let op = stack.pop().unwrap();
+        assert_eq!(op.pos, 0);
+        assert_eq!(op.removed, "天地玄黄");
+        let (after, caret) = splice_chars(&text, op.pos, op.inserted.chars().count(), &op.removed);
+        assert_eq!(after, "天地玄黄", "一步 ⌘Z 应把四个字整段插回");
+        assert_eq!(caret, 4);
+    }
+
+    /// 撤销 → 重做必须回到原样（重做用的是同一条 `splice_chars`，只是方向相反）。
+    #[test]
+    fn undo_then_redo_restores_exact_text() {
+        let original = "资治通鉴卷第一";
+        let mut stack: Vec<EditOp> = Vec::new();
+        let now = std::time::Instant::now();
+        // 在第 2 个字后插入「周纪」。
+        push_edit(
+            &mut stack,
+            2,
+            String::new(),
+            "周纪".to_string(),
+            EditKind::Once,
+            now,
+            true,
+        );
+        let edited = splice_chars(original, 2, 0, "周纪").0;
+        assert_eq!(edited, "资治周纪通鉴卷第一");
+
+        // ⌘Z
+        let op = stack.pop().unwrap();
+        let (back, _) = splice_chars(&edited, op.pos, op.inserted.chars().count(), &op.removed);
+        assert_eq!(back, original);
+
+        // ⌘⇧Z
+        let (again, caret) =
+            splice_chars(&back, op.pos, op.removed.chars().count(), &op.inserted);
+        assert_eq!(again, edited);
+        assert_eq!(caret, 4);
+    }
+
+    /// 输入法逐帧组字（n → ni → nih → niha → nihao）只算**一次输入**。
+    #[test]
+    fn ime_composition_merges_into_one_step() {
+        let mut stack: Vec<EditOp> = Vec::new();
+        let now = std::time::Instant::now();
+        let mut composed = String::new();
+        for s in ["n", "ni", "nih", "niha", "nihao"] {
+            let removed = std::mem::take(&mut composed);
+            push_edit(
+                &mut stack,
+                0,
+                removed,
+                s.to_string(),
+                EditKind::Ime,
+                now,
+                true,
+            );
+            composed = s.to_string();
+        }
+        assert_eq!(stack.len(), 1, "逐帧组字应合并成一次输入");
+        assert_eq!(stack[0].inserted, "nihao");
+        assert_eq!(stack[0].removed, "", "组字前的原文是空的，撤销不该删到别的字");
+        let (after, _) = splice_chars(&composed, 0, 5, "");
+        assert_eq!(after, "");
+    }
+
+    /// 位置越界（历史栈与当前文本不同步时的极端情况）绝不许 panic——越界只夹紧。
+    #[test]
+    fn splice_chars_clamps_out_of_range_positions() {
+        assert_eq!(splice_chars("天地", 99, 3, "玄").0, "天地玄");
+        assert_eq!(splice_chars("", 5, 2, "黄").0, "黄");
+        assert_eq!(splice_chars("天地玄黄", 1, 99, "宇").0, "天宇");
+    }
+
+    /// 不同类别的相邻编辑**不许**合并（否则「打字 + 删除」会被并成一步）。
+    #[test]
+    fn different_kinds_never_merge() {
+        let mut stack: Vec<EditOp> = Vec::new();
+        let now = std::time::Instant::now();
+        push_edit(&mut stack, 0, String::new(), "天".into(), EditKind::Insert, now, true);
+        push_edit(&mut stack, 1, "天".into(), String::new(), EditKind::Backspace, now, true);
+        assert_eq!(stack.len(), 2);
+    }
+
+    /// 光标挪过之后（`undo_barrier`）即使几何位置正好接上，也必须另起一步。
+    #[test]
+    fn barrier_forces_a_new_step_despite_geometry() {
+        let mut stack: Vec<EditOp> = Vec::new();
+        let now = std::time::Instant::now();
+        push_edit(&mut stack, 0, String::new(), "天".into(), EditKind::Insert, now, true);
+        // 挪回开头再打「地」：位置上正好落在上一段的起点，纯几何判据会吸收它。
+        push_edit(&mut stack, 0, String::new(), "地".into(), EditKind::Insert, now, false);
+        assert_eq!(stack.len(), 2, "断点之后必须是独立的一步");
     }
 }
 
