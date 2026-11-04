@@ -24,8 +24,26 @@
 //! objc 往返。`characterBoundsAtIndex:` 只留作**兜底**（极少数 PDF 上 selection
 //! 可能返回空），这样两条路都断的页面才彻底放弃。
 //!
-//! ⚠️ 旋转页（`/Rotate` 非 0）未做坐标变换，当前按未旋转页空间处理；古籍 PDF
-//! 多为 0 旋转，少数旋转页的映射会有偏移，留待后续补旋转矩阵。
+//! ## 旋转页（`/Rotate` 90 / 180 / 270）
+//!
+//! **已做**（v1.9.3x 起），且顺序不能反：`cluster` 必须在**未旋转**坐标里判
+//! 竖排 / 横排——先转坐标的话 Δx 与 Δy 的角色互换，竖排古籍会被当成横排按 y
+//! 分桶，整页糊成一团；聚类结束后才由 [`rotate_regions`] 把整批矩形搬到显示
+//! 坐标。位图那一半在 `collation::rasterize_source`：宽高互换 + 把 `rotation`
+//! 传给 `CGPDFPageGetDrawingTransform`。两边必须读同一个 `/Rotate`，否则就是
+//! 「图正着、框躺着」。
+//!
+//! ## 为什么不用纯 Rust 的 pdf-extract / lopdf（2026-11-04 评估，别再翻案）
+//!
+//! `extract_text` / `extract_text_by_pages` 只吐字符串，**没有任何坐标**。唯一
+//! 带几何的入口是自定义 `OutputDev::output_character(trm, width, spacing,
+//! font_size, char)`——给的是**文本渲染矩阵 + 前进宽度**，没有字身框高、没有
+//! ascent/descent；要画高亮框得自己读 `/Ascent /Descent /FontBBox`、竖排再读
+//! `/W2 /DW2`，等于重写 PDFKit 的排版引擎。
+//! 竖排与 CID 恰好是它最弱处：取字顺序 = 内容流 `Tj/TJ` 的出现序（一页多列常
+//! 乱序），CID 的 Unicode 只靠 `/ToUnicode`（古籍 PDF 大量 Identity-H 没有这张
+//! 表）。而我们的 `SourceRegion` 靠**文字匹配**回链，文本来自 A、坐标来自 B，
+//! 差一个空格就整页错位。结论：**不引入**，连 feature flag 都不加。
 
 use std::os::raw::c_void;
 use std::path::Path;
@@ -1538,6 +1556,30 @@ mod tests {
                     "rotation={rot} 有区域越界：{r:?}（显示 {dw}×{dh}）"
                 );
             }
+        }
+    }
+
+    /// **两边同一把尺**：整页矩形转完必须精确等于显示尺寸。
+    ///
+    /// 「90/270 宽高互换」这条规则在两个模块里各写了一遍：`collation::rasterize_source`
+    /// 用它决定画布大小，`rotate_regions` 用它搬矩形。只要一边改了另一边没改，
+    /// 整页高亮就会**系统性**偏移（不是个别区域，是每一页都偏），而且很难一眼看出
+    /// 是坐标问题。这条测试专门把两半钉在一起：整页作为输入，输出必须严丝合缝。
+    #[test]
+    fn full_page_rect_matches_the_display_size_used_for_raster() {
+        let (w, h) = (300.0f32, 400.0f32);
+        for rot in [0, 90, 180, 270] {
+            let (dw, dh) = if rot % 180 == 90 { (h, w) } else { (w, h) };
+            let out = rotate_regions(vec![region(0.0, 0.0, w, h)], rot, w, h);
+            let r = &out[0];
+            assert!(
+                r.x.abs() < 0.01 && r.y.abs() < 0.01,
+                "rotation={rot} 整页原点没归零：{r:?}"
+            );
+            assert!(
+                (r.w - dw).abs() < 0.01 && (r.h - dh).abs() < 0.01,
+                "rotation={rot} 整页尺寸与画布不一致：{r:?} vs {dw}×{dh}"
+            );
         }
     }
 
