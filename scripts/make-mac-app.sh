@@ -21,8 +21,8 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP_NAME="笺读"
 BUNDLE_ID="com.jiandu.app"
-VERSION="1.9.74"
-BUILD_NUM="281"
+VERSION="1.9.75"
+BUILD_NUM="282"
 MIN_MACOS="12.0"
 ARCH="${ARCH:-native}"
 
@@ -226,6 +226,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>${BUILD_NUM}</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 Jiandu. All rights reserved.</string>
+    <!-- **文件权限的「说明书」**（v1.9.75）：用户从「文稿 / 下载 / 桌面」导入
+         古籍、或把 PDF 导出到这些目录时，系统会弹一次 TCC 授权框。没有这三条
+         说明，弹框里只有干巴巴的「笺读 想访问你的「下载」文件夹」；有了它，
+         用户看到的是「需要读取你选的古籍文件」，点「允许」的概率高得多。
+         导出走的是 `rfd` 保存面板（用户亲手选路径），所以**不需要**任何沙盒
+         例外权限；沙盒版另有 entitlements 里的 files.user-selected.read-write。 -->
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>需要读取「文稿」里的古籍文件，也用于把校勘稿导出成 PDF / 图片。</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>需要读取「下载」里的古籍文件，也用于把生成的 PDF 存到这里。</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>需要读取「桌面」上的古籍文件，也用于把校勘稿导出到桌面。</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.books</string>
     <!-- 不用任何非豁免加密（无网络、无 HTTPS、无加密存档）：声明后

@@ -5858,7 +5858,24 @@ impl CollationWorkspace {
                                         path.display()
                                     )
                                 }
-                                Err(e) => format!("导出失败：{e}"),
+                                // 写不进去时给**可操作**的一句话（v1.9.75）：用户
+                                // 最怕的不是失败，是「导出失败：Operation not
+                                // permitted」这种看不出下一步该干什么的原文。
+                                Err(e) => {
+                                    let denied = e.contains("ermission")
+                                        || e.contains("denied")
+                                        || e.contains("只读")
+                                        || e.contains("Read-only");
+                                    if denied {
+                                        format!(
+                                            "导出失败：目标文件夹不让写（{e}）\n\
+                                             → 换一个位置另存，或到「系统设置 → 隐私与安全性 → 文件与文件夹」\
+                                             里允许「笺读」访问该文件夹后重试。"
+                                        )
+                                    } else {
+                                        format!("导出失败：{e}")
+                                    }
+                                }
                             });
                             cx.notify();
                         });

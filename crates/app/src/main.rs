@@ -184,7 +184,8 @@ fn main() {
     // 一旦处理器 panic，Rust 展开无法越过这条 FFI 边界，运行时会直接
     // `panic_cannot_unwind` 强杀进程（abort 不打印、不展开），表现为
     // 「点一下就整个退出、什么都没留下」却看不到任何报错。此钩子在 abort
-    // 之前把确切位置与回溯写进 ~/.jiandu/panic.log，同时前台也打印一份。
+    // 之前把确切位置与回溯写进数据目录的 `logs/crash-<时间>.txt`（一次一枚，
+    // 只留最近 10 枚），同时前台也打印一份。
     install_panic_logger();
 
     // 内存护栏的探针（v1.81.0）：越早装越好——批量导入与 FTS5 建索引都在
@@ -388,13 +389,10 @@ fn zen_window_options(bounds: Bounds<gpui::Pixels>) -> WindowOptions {
 /// 同时向前台（stderr）也打印一份，确保无终端的 GUI 启动也能拿到证据。
 fn install_panic_logger() {
     let home = Library::home();
-    let _ = std::fs::create_dir_all(&home);
-    let log_path = home.join("panic.log");
+    let dir = home.join("logs");
+    let _ = std::fs::create_dir_all(&dir);
     std::panic::set_hook(Box::new(move |info| {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let (file_stamp, human_stamp) = local_stamps();
         let loc = info
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
@@ -406,14 +404,74 @@ fn install_panic_logger() {
         } else {
             "非字符串 panic 负载".to_string()
         };
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("未命名线程");
         let bt = std::backtrace::Backtrace::force_capture();
         let entry = format!(
-            "==== panic @ {secs} (unix) ====\n位置：{loc}\n信息：{msg}\n回溯：\n{bt}\n\n"
+            "笺读 {ver} · 崩溃报告\n\
+             ========================================\n\
+             时间：{stamp}\n\
+             版本：{ver}（{profile} 构建）\n\
+             系统：{os} / {arch}\n\
+             线程：{thread}\n\
+             位置：{loc}\n\
+             信息：{msg}\n\
+             ========================================\n\
+             回溯：\n{bt}\n",
+            ver = env!("CARGO_PKG_VERSION"),
+            profile = if cfg!(debug_assertions) { "debug" } else { "release" },
+            os = std::env::consts::OS,
+            arch = std::env::consts::ARCH,
+            stamp = human_stamp,
         );
-        // 落盘优先；写失败也不影响打印。
-        let _ = std::fs::write(&log_path, &entry);
+        // **一枚崩溃一份文件**（v1.9.75）：旧实现固定写 `panic.log`，`fs::write`
+        // 整份覆盖——用户连崩两次，第一次的证据就没了；而「导入奇葩古籍闪退」
+        // 往往正是连着崩的那几次。落盘失败也不影响前台打印。
+        let path = dir.join(format!("crash-{file_stamp}.txt"));
+        let _ = std::fs::write(&path, &entry);
+        // 只留最近 10 枚：崩溃报告是**证据**不是日志，攒多了没人看还会占空间。
+        prune_crash_logs(&dir, 10);
         eprintln!("{entry}");
+        eprintln!("[jiandu] 崩溃报告：{}", path.display());
     }));
+}
+
+/// (文件名时间戳 `YYYYMMDD-HHMMSS`, 人读时间 `YYYY-MM-DD HH:MM:SS`)，均取**本地**时区。
+///
+/// 不用 UTC：用户报「昨晚十点崩了」时，UTC 会差 8 小时，对不上号。
+fn local_stamps() -> (String, String) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::localtime_r(&secs, &mut tm) };
+    if ok.is_null() {
+        return (format!("{secs}"), format!("{secs} (unix)"));
+    }
+    let (y, mo, d) = (tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    let (h, mi, s) = (tm.tm_hour, tm.tm_min, tm.tm_sec);
+    (
+        format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}"),
+        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}"),
+    )
+}
+
+/// 崩溃报告只留最近 `keep` 枚（按文件名里的时间戳排序，天然有序）。
+fn prune_crash_logs(dir: &std::path::Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+        .filter(|n| n.starts_with("crash-") && n.ends_with(".txt"))
+        .collect();
+    if names.len() <= keep {
+        return;
+    }
+    names.sort();
+    for old in &names[..names.len() - keep] {
+        let _ = std::fs::remove_file(dir.join(old));
+    }
 }
 
 /// 处理命令行；返回 `Some(退出码)` 表示是 CLI 任务，不必开窗口。
