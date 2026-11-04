@@ -58,6 +58,66 @@ fn px_f32(p: Pixels) -> f32 {
     p / px(1.0)
 }
 
+/// **左图「Fit + 居中」的唯一公式**（纯函数，可单测）。
+///
+/// 输入：原图自然尺寸（PDF 点 / 位图像素）、左栏可见宽高（CSS px）、呼吸边。
+/// 输出：`(scale, ox, oy, dw, dh)`——`ox / oy` 是页面相对**视口左上角**的偏移。
+///
+/// 两条硬纪律：
+///   ① **contain 不是 cover**：宽、高两个比值取**小**，页面永远整页可见。
+///      历史实现只按宽算，横放页面（16:9 讲稿、`/Rotate` 插页）就「宽填满、
+///      高溢出」，纵向只能滚——真机看着就是「页面缩在左下角」。
+///   ② 留白**平分**：`(pane − disp) × 0.5`，左右 / 上下各自居中。留白只给
+///      一边，读起来就是「页面贴底」。
+///
+/// 返回 `scale` 而不只返回尺寸，是因为「屏幕坐标 ÷ scale = 原图坐标」这条
+/// 反算必须用**同一个**系数——分开算就是红框飘几十像素的经典死因。
+fn fit_page_in(
+    nw: f32,
+    nh: f32,
+    pane_w: f32,
+    pane_h: f32,
+    gap: f32,
+) -> (f32, f32, f32, f32, f32) {
+    // 尺寸还没量出来（首帧 / 无图）时退回 1:1，绝不产出 0 宽 0 高的空盒子。
+    if nw <= 0.0 || nh <= 0.0 || pane_w <= 0.0 || pane_h <= 0.0 {
+        return (1.0, 0.0, 0.0, nw.max(1.0), nh.max(1.0));
+    }
+    // 呼吸边两侧都要留，所以可用宽高各减 `2×gap`；视口比 gap 还窄时兜到 1px，
+    // 让 scale 变成一个极小的正数而不是负数（负 scale 会画出镜像）。
+    let avail_w = (pane_w - gap * 2.0).max(1.0);
+    let avail_h = (pane_h - gap * 2.0).max(1.0);
+    let scale = (avail_w / nw).min(avail_h / nh);
+    let dw = nw * scale;
+    let dh = nh * scale;
+    let ox = ((pane_w - dw) * 0.5).max(0.0);
+    let oy = ((pane_h - dh) * 0.5).max(0.0);
+    (scale, ox, oy, dw, dh)
+}
+
+/// **屏幕坐标 → 原图自然坐标**（纯函数，可单测）。
+///
+/// 这是用户点名的「致命红线」：图片被放大后，鼠标拿到的 x / y 是屏幕像素，
+/// 必须**先减页面原点、再除以 scale** 才能回到 PDF 原图坐标。少减原点，红框
+/// 整体平移；少除 scale，红框按缩放比放大——两种都表现为「点字不齐」。
+fn natural_from_point(
+    x0: f32,
+    y0: f32,
+    scale: f32,
+    scroll_y: f32,
+    x: f32,
+    y: f32,
+) -> (f32, f32) {
+    let s = if scale.is_finite() && scale.abs() > 1e-6 {
+        scale
+    } else {
+        1.0
+    };
+    // 夹到 0：点在页面外的留白上时，宁可给 0 也不要负的原图坐标
+    //（`PickRect` 与 region 命中都按「左上为原点」的比较，负数会把整页都算进去）。
+    (((x - x0) / s).max(0.0), ((y - y0 - scroll_y) / s).max(0.0))
+}
+
 /// 当前本地时间戳（紧凑 `YYYY-MM-DD HH:MM`），纯标准库实现，不引入额外依赖。
 fn ts_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -123,6 +183,12 @@ pub enum CollationEvent {
 
 // ── 视觉常量（骨架阶段，先写死；接入主题系统前不改）──
 const HEADER_H: f32 = 44.0;
+/// 左图 Fit 之后四周留的**呼吸边**（CSS px，v1.9.76）。
+///
+/// 不留边，A 系列页面在窄窗口里会四条边都亲着面板，看着像被裁掉了一角；
+/// 12px 刚好够看出一圈纸边，又不至于浪费版面。这个数同时进
+/// `left_scale`（可用宽高）与 `left_page_rect`（居中留白），**只此一份**。
+const LEFT_FIT_GAP: f32 = 12.0;
 /// **已保存微光**的米点直径（v1.9.73）：4.5px ≈ 一粒米，在 44px 顶栏里不抢眼。
 const SAVE_LED_DOT: f32 = 4.5;
 /// 微光指示器的**恒宽**容器。亮 / 灭都不改宽度，右侧按钮一位都不许挪。
@@ -4507,25 +4573,49 @@ impl CollationWorkspace {
             )
     }
 
-    /// 左图内容：已载入原图则贴 `img`（按宽自适应高度），否则画占位页（按
-    /// `source_size()` 自然尺寸等比缩放），两种情况都叠加 `regions` 区域参考框与
-    /// 当前联动段的高亮矩形——高亮坐标全部来自 `SourceRegion` 的真实 (x,y,w,h)
-    /// 自然像素，按 `src_nat` 缩放后落到显示坐标（彻底告别 N*BAND_H Mock）。
+    /// 左图内容：已载入原图则贴 `img`（**按容器双向 Fit + 绝对居中**），否则画
+    /// 占位页，两种情况都叠加 `regions` 区域参考框与当前联动段的高亮矩形——高亮
+    /// 坐标全部来自 `SourceRegion` 的真实 (x,y,w,h) 自然像素，按 `left_scale`
+    /// 缩放后落到显示坐标（彻底告别 N*BAND_H Mock）。
     fn render_left_content(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
-        let (_nw, nh) = self.source_size();
-        // 缩放比与 `scroll_region_to_center` **同源**（都走 `left_scale`）。
-        // 一旦两处各算各的，框就会整体偏移几十像素——「框飘了」的经典死因。
+        // 缩放比与 `left_page_rect` / `natural_from_window` **同源**（都走
+        // `left_scale`）。一旦几处各算各的，框就会整体偏移几十像素。
         let scale = self.left_scale(vw);
-        let disp_h = nh * scale;
-        let mut page = div().relative().w_full().h(px(disp_h)).bg(rgb(0xf1e8cf));
+        let (_x0, _y0, dw, dh) = self.left_page_rect(vw);
+        let mut page = div().relative().w(px(dw)).h(px(dh)).bg(rgb(0xf1e8cf));
+        // 排障用（`JIANDU_FIT_DEBUG=1`）：给页面描一圈红边，好让截图能直接量出
+        // 「画出来的框」与 `left_page_rect` 算出来的矩形是不是同一个——红框不齐
+        // 这类 bug 只有把两个矩形并排量才看得出来。
+        if std::env::var("JIANDU_FIT_DEBUG").is_ok() {
+            page = page.border_1().border_color(rgb(0xff0000));
+        }
 
         // 两种源二选一：PDF 页走**内存位图**（`ImageSource::Render`，零解码零 IO），
         // 位图原图走文件路径（`gpui::img` 自带解码器）。绝不同时画两张。
+        //
+        // ⚠️ 宽高必须**同时**写死（v1.9.76）。只给 `.w()` 时，`Img::request_layout`
+        //    会把「高度 auto」填成**位图自身的像素高**（不是按比例算的显示高），
+        //    于是元素盒比页面高一截，`ObjectFit::Contain` 再把图画在这个高盒的
+        //    正中——真机表现就是「页面掉到左下半截、上面一大片空」。这不是缩放
+        //    没生效，是**布局盒**没跟上缩放。
         let has_source = self.image_path.is_some() || self.image_mem.is_some();
+        if std::env::var("JIANDU_FIT_DEBUG").is_ok() && self.frame_count < 4 {
+            let (nw, nh) = self.source_size();
+            eprintln!(
+                "[fit] nat={nw:.1}x{nh:.1} scale={scale:.4} dw={dw:.1} dh={dh:.1} \
+                 pane_w={:.1} pane_h={:.1} vw={vw:.1} vh={:.1} img={:?}",
+                self.left_col_w(vw),
+                self.left_view_h(self.viewport_h),
+                self.viewport_h,
+                self.image_mem
+                    .as_ref()
+                    .map(|m| (m.size(0).width.0, m.size(0).height.0)),
+            );
+        }
         if let Some(m) = &self.image_mem {
-            page = page.child(img(m.clone()).w_full());
+            page = page.child(img(m.clone()).w(px(dw)).h(px(dh)));
         } else if let Some(p) = &self.image_path {
-            page = page.child(img(p.clone()).w_full());
+            page = page.child(img(p.clone()).w(px(dw)).h(px(dh)));
         }
         // 区域参考框：无原图时画出全部 regions（验证映射数学），有原图时仅画
         // 当前联动段（避免遮挡整图）；真实文本层接入后这些框即原图真实文本位置。
@@ -4613,27 +4703,40 @@ impl CollationWorkspace {
                 MouseButton::Left,
                 cx.listener(move |c, _e, _w, cx| c.pick_finish(cx)),
             );
-        page
+
+        // **强制居中**：页面比视口窄 / 矮时，多出来的空间左右、上下平分。
+        // 高度写**绝对像素**（不写 `size_full`）——滚动容器的内容高若也用百分比，
+        // 会与「容器高由内容撑开」互相依赖，GPUI 会把它判成 0 高（视口塌陷的
+        // 经典成因，见滚轮处理里那条 eprintln）。
+        let pane_h = self.left_view_h(self.viewport_h);
+        div()
+            .w_full()
+            .h(px(pane_h))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(page)
     }
 
     // ── 左图框选 → 补入右文（v1.9.33）─────────────────────────────────────
 
     /// 窗口坐标 → **原图自然坐标**。
     ///
-    /// 三件事必须一起算，漏任何一个框都会整体偏一截：
+    /// 四件事必须一起算，漏任何一个框都会整体偏一截：
     ///  ① 左栏起点：窗口最左（x = 0）、全局天头之下（y = `HEADER_H`）；
-    ///  ② 滚动偏移（`left_scroll`，向下滚为**负**）；
-    ///  ③ `left_scale`——与画框、与滚动定位**同一个**缩放比。
+    ///  ② **页面居中让出来的留白**（`left_page_rect` 的 x0 / y0）——Fit 之后
+    ///     页面不再是「左上角贴齐」的那张纸，少减这一笔，红框就整体下移半个
+    ///     留白，而且窗口越扁偏得越多（这正是本次真机 bug 的同类死因）；
+    ///  ③ 滚动偏移（`left_scroll`，向下滚为**负**）；
+    ///  ④ `left_scale`——与画框、与排版**同一个**缩放比。
     ///
-    /// 这和 `editor_origin` 是同一类坑：量出来的原点和画出来的原点一旦分叉，
-    /// 高亮就会落在错的字上，而且只在某些窗口尺寸下才错，极难复现。
+    /// 这就是用户点名的「致命红线」：图片放大了，屏幕坐标必须**除以 scale**
+    /// 才能回到 PDF 原图坐标，否则右侧点字时左侧红框必然不齐。
     fn natural_from_window(&self, x: f32, y: f32, vw: f32) -> (f32, f32) {
-        let scale = self.left_scale(vw).max(1e-6);
+        let scale = self.left_scale(vw);
+        let (x0, y0, _dw, _dh) = self.left_page_rect(vw);
         let scroll_y = px_f32(self.left_scroll.offset().y);
-        (
-            (x / scale).max(0.0),
-            ((y - HEADER_H - scroll_y) / scale).max(0.0),
-        )
+        natural_from_point(x0, y0, scale, scroll_y, x, y)
     }
 
     /// 松手：把框里的字提出来，等用户点【补入】。
@@ -6078,6 +6181,17 @@ impl CollationWorkspace {
     /// 为什么需要它：合成点击被 TCC 拦死（AppleScript / cliclick 都拿不到事件），
     /// 版面回归只能靠「环境变量把界面摆到目标状态，再纯截图看」。与
     /// `JIANDU_PANEL` / `JIANDU_THEME` 同一套路，只在开发机上用，不影响发行版。
+    /// **开发用**（`JIANDU_SOURCE=<path>`）：直接导入一张原图 / 一页 PDF，
+    /// 让「左图右文」在开机时就是目标状态。
+    ///
+    /// 与 [`Self::dev_open_preview`] 同一套路——左栏的缩放 / 居中是纯几何，
+    /// 合成点击过不了 TCC，只能靠环境变量摆位 + 截图核对。
+    pub fn dev_load_source(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.pure_text_mode = false;
+        self.ingest_source(path, cx);
+        cx.notify();
+    }
+
     pub fn dev_open_preview(&mut self, cx: &mut Context<Self>) {
         self.show_preview = true;
         // `JIANDU_STYLE=0` → 只看**收起态**（右边缘那颗 4px 滑块）。
@@ -6667,41 +6781,76 @@ impl CollationWorkspace {
 
     /// 把 `regions[ri]` 滚到左侧视野**正中**。
     ///
-    /// 上一次是「顶部对齐」（`-(r.y*scale)`）：短区域会贴到屏幕上沿，长区域
-    /// 一半落在视野外，看着像「框没对准」。居中之后，无论区域多高，它都在
-    /// 视线中央。
+    /// Fit（contain）之后整页**恒在视野内**，`scroll_max` 就是 0——所以这里
+    /// 常态是「一帧都不滚」。保留函数只为一种边界：状态条突然多出一条、
+    /// 或拿到的视口高比预想的小，页面真高过视野时才按区域居中。
     ///
-    /// ⚠️ 缩放比必须与 `render_left_content` **同源**：左栏宽 `vw*0.4`、
-    /// 原图自然宽 `source_size().0`。两处一旦分叉，框就会整体偏移——这正是
-    /// 「框飘了」的经典死因，所以这里只写一次公式、两边都调它。
-    fn scroll_region_to_center(&mut self, ri: usize, vw: f32, vh: f32) {
+    /// ⚠️ 缩放比必须与 `render_left_content` **同源**：两边各算一个系数，
+    /// 框就会整体偏移——这正是「框飘了」的经典死因。
+    fn scroll_region_to_center(&mut self, ri: usize, vw: f32, _vh: f32) {
         let Some(r) = self.regions.get(ri) else {
             return;
         };
         let scale = self.left_scale(vw);
-        let top = r.y * scale;
+        let (_, y0, _, disp_h) = self.left_page_rect(vw);
+        let pane_h = self.left_view_h(self.viewport_h);
+        let overflow = (disp_h - pane_h).max(0.0);
+        if overflow <= 0.0 {
+            self.left_scroll.set_offset(Point::new(px(0.0), px(0.0)));
+            return;
+        }
+        // 页面本身已居中：区域在页面内的位置要叠加页面原点（含居中留白）。
+        let top = (y0 - HEADER_H) + r.y * scale;
         let h = r.h * scale;
-        // 左侧可视高度：视口减去全局天头与底部状态条（有状态条时会矮一截，
-        // 这里按最常见的一条 24px 估；偏几像素不影响「居中」这件事）。
-        let view_h = (vh - HEADER_H - 24.0).max(160.0);
-        let target = (top + h * 0.5 - view_h * 0.5).max(0.0);
+        let target = (top + h * 0.5 - pane_h * 0.5).clamp(0.0, overflow);
         self.left_scroll
             .set_offset(Point::new(px(0.0), px(-target)));
     }
 
-    /// 左栏「原图自然坐标 → 屏幕像素」的唯一缩放比。
+    /// 左栏**可见视口高度**（CSS px）：分栏行高 − 底部状态条。
     ///
-    /// 高亮矩形的绘制（`render_left_content`）与滚动定位（上一函数）都调它。
-    /// 分开算过一次，两处差一个 `vw*0.4` 的取整就会让框整体偏几十像素。
-    fn left_scale(&self, vw: f32) -> f32 {
-        let (nw, _nh) = self.source_size();
-        if nw > 0.0 {
-            (vw * 0.4) / nw
+    /// 与 `render_left` 的布局链同源：外层 `h_full()` 撑满分栏行（`vh − HEADER_H`），
+    /// 状态条是固定 24px 的兄弟节点，原图区拿的就是剩下的 `flex_1`。
+    /// 这个数字同时喂给「Fit 缩放」和「页面居中留白」，两处必须一模一样。
+    fn left_view_h(&self, vh: f32) -> f32 {
+        let row_h = (vh - HEADER_H).max(120.0);
+        let status = if self.image_error.is_some() || self.image_note.is_some() {
+            24.0
         } else {
-            1.0
-        }
+            0.0
+        };
+        (row_h - status).max(1.0)
     }
 
+    /// 左图「**Fit 容器**」的唯一缩放比：宽高**双向取小**（contain）。
+    ///
+    /// 旧实现只按宽度算（`左栏宽 / 原图宽`），一页横放的 PDF（16:9 讲稿、
+    /// `/Rotate` 过的插页、mediabox 不是 A 系列的扫描件）就被逼到「宽填满、
+    /// 高溢出」，纵向只能滚；再叠上 `img` 布局盒那笔高度误差，真机表现就是
+    /// 「整页缩在左下角、上面一大片空白」。contain 之后页面**恒整页可见**，
+    /// 多出来的空间由居中平分——这才是「Fit」该有的样子。
+    ///
+    /// ⚠️ 高亮矩形、页面居中、鼠标坐标反算三处都调它。
+    fn left_scale(&self, vw: f32) -> f32 {
+        let (nw, nh) = self.source_size();
+        let pane_w = self.left_col_w(vw);
+        let pane_h = self.left_view_h(self.viewport_h);
+        fit_page_in(nw, nh, pane_w, pane_h, LEFT_FIT_GAP).0
+    }
+
+    /// 左图**页面矩形**：窗口绝对坐标下的左上角 + 显示尺寸。
+    ///
+    /// 渲染（`render_left_content`）与坐标反算（`natural_from_window`）**共用**
+    /// 这一个函数。这两个数一旦在两处分头算，红框就会整体飘——而且只在某些
+    /// 窗口尺寸下才飘，极难复现。
+    fn left_page_rect(&self, vw: f32) -> (f32, f32, f32, f32) {
+        let (nw, nh) = self.source_size();
+        let pane_w = self.left_col_w(vw);
+        let pane_h = self.left_view_h(self.viewport_h);
+        let (_s, ox, oy, dw, dh) = fit_page_in(nw, nh, pane_w, pane_h, LEFT_FIT_GAP);
+        // `oy` 相对视口，而视口从全局天头之下开始 → 换成窗口绝对 y。
+        (ox, HEADER_H + oy, dw, dh)
+    }
 
     /// 取右文第 `idx` 段的纯文本（用于与原图区域文字做字面相似度校验）。
     fn paragraph_text(&self, idx: usize) -> String {
@@ -10362,6 +10511,110 @@ mod radical_fold_tests {
         let (ri, n) = locate_region("靡恃己长，信使可覆", &regions).expect("应当命中部首字形");
         assert_eq!(ri, 1, "该落在第二列");
         assert!(n >= 6, "连续重合 {n} 字");
+    }
+}
+
+/// **左图 Fit / 居中 / 坐标反算**的护栏（v1.9.76）。
+///
+/// 真机事故：整页缩在左下角、上面一大片空白，点字时红框也跟着偏。三件事各自
+/// 都有独立的死法，所以分开断言：
+///   ① 只按宽算 → 横放页面「宽填满、高溢出」（页面掉下去的真因之一）；
+///   ② `img` 布局盒没跟上缩放（真因之二，见 `render_left_content` 的注释）；
+///   ③ 屏幕坐标忘了减页面原点 / 除以 scale（红框整体漂的死因）。
+#[cfg(test)]
+mod fit_geometry_tests {
+    use super::*;
+
+    /// A3 竖版（实务中最常见的一档古籍影印尺寸，单位 PDF 点）。
+    const A3: (f32, f32) = (841.92, 1191.12);
+
+    #[test]
+    fn portrait_page_fits_by_height_and_centers_horizontally() {
+        // 真机实测的那一组：左栏 502.4 × 642，呼吸边 12。
+        let (scale, ox, oy, dw, dh) = fit_page_in(A3.0, A3.1, 502.4, 642.0, 12.0);
+        assert!((dh - 618.0).abs() < 0.5, "高度应先撞线（642−24）：实得 {dh}");
+        assert!(dw <= 502.4 - 24.0 + 0.01, "宽不得超出可用宽：{dw}");
+        assert!((ox - (502.4 - dw) * 0.5).abs() < 0.01, "水平必须居中：{ox}");
+        assert!((oy - 12.0).abs() < 0.01, "上下各留一条呼吸边：{oy}");
+        // 只准等比缩放——变形会让字口忽宽忽窄。
+        assert!(
+            (dw / dh - A3.0 / A3.1).abs() < 0.001,
+            "比例被拉歪：{:.4}",
+            dw / dh
+        );
+        assert!(scale > 0.0 && scale.is_finite(), "scale 必须是正有限数");
+    }
+
+    #[test]
+    fn landscape_page_fits_by_width_and_centers_vertically() {
+        // 16:9 讲稿 / 被 /Rotate 过的插页：竖着放会「高溢出」，必须按宽收。
+        let (scale, ox, oy, dw, dh) = fit_page_in(960.0, 540.0, 502.4, 642.0, 12.0);
+        assert!((dw - 478.4).abs() < 0.5, "宽应先撞线（502.4−24）：实得 {dw}");
+        assert!((ox - 12.0).abs() < 0.01, "左右各留一条呼吸边：{ox}");
+        assert!((oy - (642.0 - dh) * 0.5).abs() < 0.01, "垂直必须居中：{oy}");
+        assert!(dh < 642.0, "横放页面绝不该撑满高");
+        assert!(scale > 0.0 && scale < 1.0);
+    }
+
+    /// 任意窗口尺寸下，页面都**整页可见**、且两块留白相等。
+    #[test]
+    fn fitted_page_never_exceeds_the_pane_at_any_size() {
+        let pages = [A3, (960.0, 540.0), (595.0, 842.0), (2000.0, 800.0)];
+        let panes = [
+            (502.4, 642.0),
+            (320.0, 900.0),
+            (1200.0, 300.0),
+            (60.0, 60.0),
+            (2560.0, 1440.0),
+        ];
+        for &(nw, nh) in &pages {
+            for &(pw, ph) in &panes {
+                let (_, ox, oy, dw, dh) = fit_page_in(nw, nh, pw, ph, 12.0);
+                assert!(dw <= pw + 0.01, "{nw}×{nh} 在 {pw}×{ph} 里超出宽度 {dw}");
+                assert!(dh <= ph + 0.01, "{nw}×{nh} 在 {pw}×{ph} 里超出高度 {dh}");
+                assert!(ox >= 0.0 && oy >= 0.0);
+                // 留白必须是「两边平分」，不是全堆在一边（那就是「贴左下角」）。
+                assert!((ox * 2.0 + dw - pw).abs() < 0.02, "左留白 {ox} 与宽不合");
+                assert!((oy * 2.0 + dh - ph).abs() < 0.02, "上留白 {oy} 与高不合");
+            }
+        }
+    }
+
+    /// **致命红线**：屏幕坐标先减原点、再除 scale，必须原路回到原图坐标。
+    #[test]
+    fn screen_point_maps_back_to_the_same_natural_point() {
+        let (scale, ox, oy, _, _) = fit_page_in(A3.0, A3.1, 502.4, 642.0, 12.0);
+        // 页面原点在窗口里的绝对坐标（天头之下）。
+        let x0 = ox;
+        let y0 = 44.0 + oy;
+        for &(nx, ny) in &[(0.0, 0.0), (120.0, 300.0), (420.0, 700.0), (841.0, 1190.0)] {
+            let sx = x0 + nx * scale;
+            let sy = y0 + ny * scale;
+            let (bx, by) = natural_from_point(x0, y0, scale, 0.0, sx, sy);
+            assert!((bx - nx).abs() < 0.01, "x 反算 {bx} ≠ {nx}");
+            assert!((by - ny).abs() < 0.01, "y 反算 {by} ≠ {ny}");
+        }
+        // 反例护栏：**不除 scale** 会偏出去一大截（这就是红框不齐的那个 bug）。
+        let sx = x0 + 400.0 * scale;
+        assert!((sx - x0 - 400.0).abs() > 100.0, "屏幕坐标与自然坐标本就差一个 scale");
+    }
+
+    /// 滚动量为负（向下滚）时，反算要把滚动量补回去。
+    #[test]
+    fn scroll_offset_is_added_back() {
+        let (bx, by) = natural_from_point(0.0, 44.0, 0.5, -100.0, 0.0, 44.0 + 150.0);
+        assert!((bx - 0.0).abs() < 0.01);
+        assert!((by - 500.0).abs() < 0.01, "视口内 150px + 已滚 100px = 自然 500");
+    }
+
+    /// 尺寸没量出来（首帧 / 无图）时退回 1:1，绝不产出 NaN 或 0 宽空盒。
+    #[test]
+    fn degenerate_inputs_fall_back_to_one_to_one() {
+        assert_eq!(fit_page_in(0.0, 0.0, 500.0, 600.0, 12.0), (1.0, 0.0, 0.0, 1.0, 1.0));
+        let (scale, _, _, dw, dh) = fit_page_in(800.0, 1100.0, 0.0, 600.0, 12.0);
+        assert_eq!((scale, dw, dh), (1.0, 800.0, 1100.0));
+        let (bx, by) = natural_from_point(0.0, 0.0, 0.0, 0.0, 10.0, 20.0);
+        assert_eq!((bx, by), (10.0, 20.0), "scale=0 时按 1:1，不许除出 inf");
     }
 }
 

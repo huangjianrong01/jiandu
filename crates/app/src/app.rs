@@ -1766,6 +1766,15 @@ impl Root {
                 ws.update(cx, |w, cx| w.dev_open_preview(cx));
             }
         }
+        // 开发用：JIANDU_SOURCE=<path> 直接把一张原图 / 一页 PDF 灌进工作台左栏
+        // （左栏的 scale / 居中是纯几何，合成点击过不了 TCC，只能靠环境变量摆位）。
+        if let Ok(p) = std::env::var("JIANDU_SOURCE") {
+            root.mode = AppMode::Collation;
+            let ws = root.collation.clone();
+            ws.update(cx, |w, cx| {
+                w.dev_load_source(std::path::PathBuf::from(p), cx)
+            });
+        }
         // 开发用：JIANDU_COLUMNS=n 指定初始列数（8/10/12/14），便于逐列截图核对。
         if let Ok(v) = std::env::var("JIANDU_COLUMNS") {
             if let Ok(n) = v.parse::<usize>() {
