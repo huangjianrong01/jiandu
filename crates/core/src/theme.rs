@@ -122,6 +122,22 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         zhu: 0xFF7A66,   // 亮朱（8.2:1）：0xB0342C 这种沉朱在黑底上只有 3.4:1
         border: 0x8A8A8A, // 界行 6.1:1——1px 细线在黑底上不能更淡
     },
+    // ── v1.9.83 · 护眼（黑底黄字）────────────────────────────────
+    // 与「高对比夜」看着像、目的不同：那一档是**视弱**要极致对比（纯白
+    // 21:1），这一档是**久读**要少蓝光——649nm 以上的暖黄几乎不触发
+    // 黑视素，夜里读两小时眼睛不涩；纯黑底配 OLED 还能真省电。
+    //
+    // 黄不是越亮越好：#FFFF00 对黑 19.6:1，但那是荧光笔的黄，盯久了
+    // 发花。取 #FFD24A（14.6:1）——仍远超 AAA，又保留一点暖。
+    PaperTheme {
+        id: "huyan",
+        name: "护眼",
+        paper: 0x000000, // 纯黑
+        text: 0xFFD24A,  // 暖黄（14.6:1）
+        note: 0xC9A24A,  // 暗金（8.9:1）：夹注仍要退一档，否则小字抢正文
+        zhu: 0xFF9A70,   // 亮朱（深底再兑 0.20 后约 4.9:1）
+        border: 0x8A7A4A, // 暗金界行（兑下去 4.2:1）
+    },
 ];
 
 /// **无障碍高对比的「朗读高亮」三色**（v1.9.82）。
@@ -189,6 +205,18 @@ impl PaperTheme {
     /// 是否深底（由纸色亮度推导，不写死枚举）。
     pub fn is_dark(&self) -> bool {
         luma(self.paper) < DARK_LUMA
+    }
+
+    /// **纸色是不是「纯黑 / 纯白」**——没有「再亮 / 再暗一档」的余地。
+    ///
+    /// 这不是「是不是无障碍档」的同义词：护眼档纸也是纯黑。要问的是
+    /// **物理事实**（还推不推得动），而不是标签——按标签问，就会在下一个
+    /// 纯色主题上重演「顶栏与纸糊成一片」。
+    ///
+    /// 用到它的地方：界面底 / 界面分隔线 / 界面字（三处都要「偏一档」，
+    /// 但纯色没有可偏的余量）、纸背（深底本该更暗，纯黑只能反向提亮）。
+    pub fn is_pure(&self) -> bool {
+        matches!(self.paper, 0x000000 | 0xFFFFFF)
     }
 }
 
@@ -262,12 +290,17 @@ pub enum Theme {
     A11yDay,
     /// **无障碍高对比 · 夜间**（v1.9.82）：纯黑纸 + 纯白字（21:1）。
     A11yNight,
+    /// **护眼**（v1.9.83）：纯黑纸 + 暖黄字（14.6:1）——久读不刺眼。
+    ///
+    /// 与 [`Theme::A11yNight`] 的区别是**目的**而不是深浅：那一档为视弱
+    /// 要极致对比，这一档为久读要少蓝光。菜单栏「高对比护眼模式」进的是它。
+    Huyan,
 }
 
 
 impl Theme {
     /// 顺序必须与 [`PAPER_THEMES`] 完全一致——下标即主题编号。
-    pub const ALL: [Theme; 7] = [
+    pub const ALL: [Theme; 8] = [
         Theme::Xuan,
         Theme::Mi,
         Theme::Qing,
@@ -275,6 +308,7 @@ impl Theme {
         Theme::Ke,
         Theme::A11yDay,
         Theme::A11yNight,
+        Theme::Huyan,
     ];
 
     /// 面板上显示的名字（直接取配置表，免得两套名字不同步）。
@@ -292,7 +326,28 @@ impl Theme {
             Theme::Ke => 4,
             Theme::A11yDay => 5,
             Theme::A11yNight => 6,
+            Theme::Huyan => 7,
         }
+    }
+
+    /// **是否护眼档**（v1.9.83）：黑底黄字，菜单栏一键进出。
+    ///
+    /// 只此一处判定。与 [`Self::is_a11y`] 并列而不是合并：两者的界面
+    /// 规矩不同（护眼不换上无障碍高亮实色块，仍用朱砂淡染——黄字配深蓝
+    /// 实色块会打架）。
+    pub fn is_huyan(self) -> bool {
+        matches!(self, Theme::Huyan)
+    }
+
+    /// 「一键进 / 出护眼档」：在档里就回 `back`，否则进护眼。
+    ///
+    /// 与 [`Self::toggle_a11y`] 同一套「原样还原」纪律：退出时回用户
+    /// 进档前那套纸色，不擅自猜一套近似的。
+    pub fn toggle_huyan(self, back: Option<Theme>) -> Theme {
+        if self.is_huyan() {
+            return back.unwrap_or(Theme::Xuan);
+        }
+        Theme::Huyan
     }
 
     /// **是否无障碍高对比档**（v1.9.82）。
@@ -348,10 +403,12 @@ impl Theme {
     /// 用户随后仍可手动把墨色切到任意一套（手动覆盖默认联动）。
     pub fn linked_palette(self) -> InkPalette {
         match self {
-            // 无障碍档恒连锁「墨朱」= 直接取纸主题的 `text`，即纯黑 / 纯白。
-            // 若这里放行别的墨色组（赭朱、暗金），正文就不再是纯色，
-            // 7:1 的承诺当场作废。
-            Theme::Xuan | Theme::Ke | Theme::A11yDay | Theme::A11yNight => InkPalette::Ink,
+            // 无障碍档与护眼档恒连锁「墨朱」= 直接取纸主题的 `text`，
+            // 即纯黑 / 纯白 / 暖黄。若这里放行别的墨色组（赭朱、暗金），
+            // 正文就不再是那个承诺的色，对比度与「黑底黄字」当场作废。
+            Theme::Xuan | Theme::Ke | Theme::A11yDay | Theme::A11yNight | Theme::Huyan => {
+                InkPalette::Ink
+            }
             Theme::Mi => InkPalette::Ochre,
             Theme::Qing => InkPalette::Forest,
             Theme::Ye => InkPalette::Gold,
@@ -377,10 +434,14 @@ impl Theme {
     pub fn paper_back(self) -> u32 {
         let p = self.paper_theme();
         if p.is_dark() {
-            // 深底：往纯黑再压一档。**但纯黑已经压不动了**（无障碍夜），
+            // 深底：往纯黑再压一档。**但纯黑已经压不动了**（无障碍夜 / 护眼），
             // 那时反过来向正文提一档——目标始终是「两叶分得开」，不是
             // 「一定更黑」。
-            mix(p.paper, if self.is_a11y() { p.text } else { 0x000000 }, if self.is_a11y() { 0.05 } else { 0.07 })
+            if p.is_pure() {
+                mix(p.paper, p.text, 0.05)
+            } else {
+                mix(p.paper, 0x000000, 0.07)
+            }
         } else {
             mix(p.paper, p.text, 0.07)
         }
@@ -560,10 +621,10 @@ impl Theme {
     /// 永远与纸面同调，不另起一套色；深底自动更暗、浅底自动更亮。
     pub fn chrome(self) -> u32 {
         let p = self.paper_theme();
-        if self.is_a11y() {
-            // **纯白 / 纯黑没有「再亮一档」的余地**：无障碍档把界面底往
-            // 正文方向偏一档。深浅两种情况都成立，画面永远是「纸 + 一条
-            // 比纸偏一档的横带」，绝不出现「顶栏与纸同色、浑然一片」。
+        if p.is_pure() {
+            // **纯白 / 纯黑没有「再亮一档」的余地**：往正文方向偏一档。
+            // 深浅两种情况都成立，画面永远是「纸 + 一条比纸偏一档的横带」，
+            // 绝不出现「顶栏与纸同色、浑然一片」（护眼档黑纸黑栏就是这么来的）。
             return mix(p.paper, p.text, 0.07);
         }
         if p.is_dark() {
@@ -576,9 +637,9 @@ impl Theme {
     /// 界面分隔线——向对比色压一档（深底提亮、浅底压暗）。
     pub fn chrome_line(self) -> u32 {
         let p = self.paper_theme();
-        if self.is_a11y() {
-            // 高对比的界面分隔线不许是「一档淡灰」：0.55 兑下去 ≈ #737373，
-            // 对白纸 4.7:1，一条线就立得住。
+        if p.is_pure() {
+            // 纯色纸的界面分隔线不许是「一档淡灰」：0.55 兑下去 ≈ #737373，
+            // 对白纸 4.7:1、对黑纸约 4.0:1，一条线就立得住。
             return mix(p.paper, p.text, 0.55);
         }
         if p.is_dark() {
@@ -592,9 +653,9 @@ impl Theme {
     /// 绝不出现白底白字 / 黑底黑字。
     pub fn chrome_text(self) -> u32 {
         let p = self.paper_theme();
-        if self.is_a11y() {
-            // 界面字 = 正文色（纯黑 / 纯白）。`chrome()` 只偏了 7%，所以
-            // 18:1 上下——顶栏的字与书页的字一样黑，视弱用户不用切换眼睛。
+        if p.is_pure() {
+            // 界面字 = 正文色（纯黑 / 纯白 / 暖黄）。`chrome()` 只偏了 7%，
+            // 所以 13:1 上下——顶栏的字与书页的字同色，眼睛不用切换。
             return p.text;
         }
         if p.is_dark() {
@@ -858,6 +919,46 @@ mod tests {
         }
     }
 
+    /// **护眼档：黑底必须是黄字，且每一项都可断言**（v1.9.83）。
+    ///
+    /// 菜单栏「高对比护眼模式」一键进的就是这一档。测三件事：
+    ///   ① 纸真是纯黑（不是深棕）——OLED 才省电，蓝光才少；
+    ///   ② 字真是暖黄（不是白）——红通道要显著高于蓝通道，否则就是
+    ///      换了名字的高对比夜；
+    ///   ③ 正文 / 夹注 / 句读 / 界面字四路对比度达标——「护眼」不许
+    ///      变成「看不清」的委婉说法。
+    #[test]
+    fn z_huyan_is_black_on_amber_and_readable() {
+        let t = Theme::Huyan;
+        assert!(t.is_huyan() && t.is_dark());
+        assert_eq!(t.paper(), 0x000000, "护眼档纸必须是纯黑");
+
+        let ink = t.ink();
+        let r = (ink >> 16) & 0xFF;
+        let b = ink & 0xFF;
+        assert!(r >= b + 100, "护眼正文要是暖黄而非白：{ink:06X}");
+        let body = contrast_ratio(ink, t.paper());
+        assert!(body >= 7.0, "护眼正文对纸只有 {body:.2}:1");
+
+        // 夹注是小字，7:1 才配得上「护眼」这两个字。
+        let note = contrast_ratio(t.note(), t.paper());
+        assert!(note >= 7.0, "护眼夹注对纸只有 {note:.2}:1");
+
+        // 句读取 `zhu()`（深底会兑 20% 纸色），按图形线 3:1 卡。
+        let zhu = contrast_ratio(t.zhu(), t.paper());
+        assert!(zhu >= 3.0, "护眼角读对纸只有 {zhu:.2}:1");
+
+        // 界面带被纯黑逼着向正文偏了 7%，字仍是正文色——顶栏不糊。
+        let chrome = contrast_ratio(t.chrome_text(), t.chrome());
+        assert!(chrome >= 7.0, "护眼界面字对界面底只有 {chrome:.2}:1");
+
+        // 一键进 / 出：进档恒 Huyan，出档原样回进档前那套。
+        assert_eq!(Theme::Mi.toggle_huyan(None), Theme::Huyan);
+        assert_eq!(Theme::Huyan.toggle_huyan(Some(Theme::Mi)), Theme::Mi);
+        // 冷启动就在档里（没有 back）回默认宣纸，而不是卡在档里出不来。
+        assert_eq!(Theme::Huyan.toggle_huyan(None), Theme::Xuan);
+    }
+
     /// **无障碍档不能被墨色组顶掉**（v1.9.82）。
     ///
     /// 读者若把墨色切到「赭朱 / 暗金」，正文就不再是纯黑纯白，7:1 立刻失真。
@@ -969,7 +1070,7 @@ mod tests {
     fn paper_themes_are_registered_and_indexed() {
         // 主题数与配置表严格同长：加一套配色，两边必须同时加。
         assert_eq!(Theme::ALL.len(), PAPER_THEMES.len());
-        assert_eq!(PAPER_THEMES.len(), 7);
+        assert_eq!(PAPER_THEMES.len(), 8);
         assert_eq!(InkPalette::ALL.len(), 4);
         for (i, t) in Theme::ALL.iter().copied().enumerate() {
             let p = t.paper_theme();
@@ -989,11 +1090,12 @@ mod tests {
         // 摒弃高饱和刺眼色：纸 / 正文 / 界栏一律低饱和（通道极差受限）。
         // 夹注朱色是朱印语汇，可以比纸「艳」，但仍不许染成荧光。
         //
-        // **无障碍两套不在此列**（v1.9.82）：那一档的指标是对比度而不是
-        // 饱和度，纯黄 / 深蓝本来就是高饱和的——硬拿这条去卡，等于要求
-        // 「弱视看得清」与「看着不刺眼」同时成立，而前者优先。
+        // **无障碍两套与护眼档不在此列**（v1.9.82 / v1.9.83）：那几档的
+        // 指标是对比度而不是饱和度，纯黄 / 深蓝 / 暖黄本来就是高饱和的——
+        // 硬拿这条去卡，等于要求「看得清」与「看着不刺眼」同时成立，
+        // 而前者优先。判据用「纯色纸」这个物理事实，不贴标签。
         for t in Theme::ALL {
-            if t.is_a11y() {
+            if t.paper_theme().is_pure() {
                 continue;
             }
             let p = t.paper_theme();
@@ -1013,9 +1115,9 @@ mod tests {
             // 正文与纸面同样要有可辨对比。
             let di = (luma(t.ink()) - luma(t.paper())).abs();
             assert!(di > 60.0, "{} 正文与纸对比不足：{di:.1}", t.label());
-            if t.is_a11y() {
-                // 无障碍档：纸是纯白 / 纯黑的一端，「更亮 / 更暗」这个方向
-                // 已经不成立（白到顶、黑到底）。改为要求「界面底必须与纸
+            if t.is_a11y() || t.is_huyan() {
+                // 无障碍 / 护眼档：纸是纯白 / 纯黑的一端，「更亮 / 更暗」这个
+                // 方向已经不成立（白到顶、黑到底）。改为要求「界面底必须与纸
                 // 分得开」+「界面字照 AAA 正文级」。
                 assert_ne!(
                     luma(t.chrome()),
@@ -1060,16 +1162,28 @@ mod tests {
 
     #[test]
     fn paper_themes_are_the_single_source_of_truth() {
-        assert_eq!(PAPER_THEMES.len(), 7);
+        assert_eq!(PAPER_THEMES.len(), 8);
         let ids: Vec<&str> = PAPER_THEMES.iter().map(|p| p.id).collect();
         assert_eq!(
             ids,
-            vec!["xuanzhi", "mihuang", "qingjian", "yedou", "keben", "a11y_day", "a11y_night"]
+            vec![
+                "xuanzhi", "mihuang", "qingjian", "yedou", "keben", "a11y_day", "a11y_night",
+                "huyan"
+            ]
         );
         let names: Vec<&str> = PAPER_THEMES.iter().map(|p| p.name).collect();
         assert_eq!(
             names,
-            vec!["宣纸", "米黄", "青简", "夜读", "仿刻本", "高对比日", "高对比夜"]
+            vec![
+                "宣纸",
+                "米黄",
+                "青简",
+                "夜读",
+                "仿刻本",
+                "高对比日",
+                "高对比夜",
+                "护眼"
+            ]
         );
         // 四色齐全、互不重复（纸 / 正文 / 夹注 / 界栏）。
         for p in PAPER_THEMES {
@@ -1218,7 +1332,7 @@ mod tests {
             let p = t.paper();
             let b = t.paper_back();
             assert_ne!(p, b);
-            if t.is_a11y() {
+            if t.paper_theme().is_pure() {
                 // 纯白 / 纯黑已经在一端，背叶只能**反向**偏一档（夜档向白提
                 // 5%）。要的是「两叶分得开」，不是「一定更黑」。
                 continue;

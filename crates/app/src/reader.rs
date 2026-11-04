@@ -14080,6 +14080,36 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         };
     }
 
+    /// **一键进出护眼档**（v1.9.83）：菜单栏「高对比护眼模式」的落地。
+    ///
+    /// 护眼档是**黑底黄字**（`Theme::Huyan`，纸纯黑、字 #FFD24A，14.6:1），
+    /// 与 ⌘⇧A 的无障碍档是两回事：那一档为**视弱**要极致对比（纯白 21:1），
+    /// 这一档为**久读**要少蓝光。所以各有各的入口，互不覆盖。
+    ///
+    /// 出档纪律与 [`Self::toggle_a11y`] 一模一样：**原样还原**进档前那套纸色，
+    /// `huyan_back` 为空（冷启动就在档里）才回默认宣纸。
+    ///
+    /// 两档的「来处」分开记（`a11y_back` / `huyan_back`）：若共用一个槽，
+    /// 从护眼档按 ⌘⇧A 再退出来，就会把用户原来的宣纸换成护眼档的纸色。
+    pub(crate) fn toggle_huyan(&mut self) {
+        let entering = !self.theme.is_huyan();
+        let back = if entering {
+            Some(self.theme)
+        } else {
+            self.huyan_back
+        };
+        let next = self.theme.toggle_huyan(back);
+        self.set_theme(next.index());
+        // 顺序不能反：`set_theme` 已经把 `theme` 换掉了，上面那句进档判断
+        // 必须读换之前的值（与 `toggle_a11y` 同一个坑）。
+        self.huyan_back = if entering { back } else { None };
+        self.notice = if next.is_huyan() {
+            "護眼：黑底黃字（再點一次退出）".to_string()
+        } else {
+            "已退出護眼配色".to_string()
+        };
+    }
+
     /// 切到第 `i` 套纸面主题（配置表 `PAPER_THEMES` 下标）。
     /// 换纸即重排（纸色变了、夹注兑淡基点也变）；并智能联动墨色——
     /// 每套纸都有默认墨色配对（宣纸→墨朱 / 米黄→赭朱 / 青简→松墨 /

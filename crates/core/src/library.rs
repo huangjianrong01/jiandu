@@ -292,6 +292,16 @@ pub struct ReadDay {
     /// 菜单栏「今日阅卷 X 字」用的就是它（v1.9.44）。
     #[serde(default)]
     pub chars: usize,
+    /// **当日累计阅读秒数**（v1.9.83）。
+    ///
+    /// 菜单栏顶部那行「今日阅读 X 分钟」读的就是它。与 `leaves` / `chars`
+    /// 不同：那两个是**结果**（读了多少），这个是**投入**（坐了多久）。
+    /// 只记前台阅读界面的时长，书架的浏览不算——否则「打开软件挂一天」
+    /// 也能刷出八小时。
+    ///
+    /// 老存档没有这一项 → `0`，自动兼容（跟 `chars` 同一套 `serde(default)`）。
+    #[serde(default)]
+    pub secs: u64,
 }
 
 /// 读叶账留多少天：一年有余。够数「连续」，也够将来做「近来」的曲线；
@@ -552,6 +562,7 @@ impl Library {
             day: day.to_string(),
             leaves,
             chars,
+            secs: 0,
         });
         // 按日期升序（新的一天追加在末尾是常态，这里只在跨日 / 系统时间倒拨
         // 之后才真的动一次），再削掉最老的。
@@ -578,6 +589,48 @@ impl Library {
             .iter()
             .find(|r| r.day == day)
             .map(|r| r.chars)
+            .unwrap_or(0)
+    }
+
+    /// **记当日阅读时长**（v1.9.83）：壳子按「这一拍坐了多久」累加进来。
+    ///
+    /// 与 [`Self::bump_read`] 分开而不是扩参数，是因为两者的调用时机不同：
+    /// 读叶是**事件**（翻页时一次），时长是**涓流**（每几十秒一次）。混成
+    /// 一个函数，调用方就得在翻页那次硬塞一个 `0`，读起来像有 bug。
+    ///
+    /// 三条口径：
+    ///   * `secs == 0` 直接返回——空拍不建账（否则「开着软件没看书」也
+    ///     会凭空多出一行 `0 叶 0 字 0 秒` 的账）；
+    ///   * 日期键不合法直接返回（与 `bump_read` 同一条闸）；
+    ///   * **只加不写库**——落盘交给 `touch()` / `save()`，这条与读叶一致。
+    pub fn add_read_secs(&mut self, day: &str, secs: u64) {
+        if secs == 0 || day_epoch(day).is_none() {
+            return;
+        }
+        if let Some(r) = self.read_days.iter_mut().find(|r| r.day == day) {
+            r.secs = r.secs.saturating_add(secs);
+            return;
+        }
+        self.read_days.push(ReadDay {
+            day: day.to_string(),
+            leaves: 0,
+            chars: 0,
+            secs,
+        });
+        self.read_days
+            .sort_by_key(|r| day_epoch(&r.day).unwrap_or(i64::MIN));
+        if self.read_days.len() > READ_DAYS_KEEP {
+            let cut = self.read_days.len() - READ_DAYS_KEEP;
+            self.read_days.drain(..cut);
+        }
+    }
+
+    /// 某一天读了多少秒（`0` = 那天没读 / 没记账）。
+    pub fn secs_on(&self, day: &str) -> u64 {
+        self.read_days
+            .iter()
+            .find(|r| r.day == day)
+            .map(|r| r.secs)
             .unwrap_or(0)
     }
 
@@ -1243,5 +1296,50 @@ pub(crate) mod tests {
             serde_json::from_str(r#"{"books":[],"read_days":[{"day":"2026-11-02","leaves":3}]}"#)
                 .unwrap();
         assert_eq!(old.chars_on("2026-11-02"), 0, "缺省 chars = 0");
+    }
+
+    /// **阅读时长账**（v1.9.83）：菜单栏「今日阅读 X 分钟」的唯一数据源。
+    ///
+    /// 这条账比字数账更容易写错，因为它**没有事件**——只有涓流。所以
+    /// 测试要把三个坑钉住：空拍不建账、同日累加、老存档不炸。
+    #[test]
+    fn read_seconds_accumulate_and_survive_reload() {
+        let mut lib = Library::default();
+        // ① 空拍（0 秒）不许凭空造出一行账——否则「开着软件没看书」
+        //    也会显示「今日有记录」。
+        lib.add_read_secs("2026-11-02", 0);
+        assert!(lib.read_days.is_empty(), "0 秒不该建账");
+
+        // ② 同日累加：三次 30 秒 = 90 秒。
+        lib.add_read_secs("2026-11-02", 30);
+        lib.add_read_secs("2026-11-02", 30);
+        lib.add_read_secs("2026-11-02", 30);
+        assert_eq!(lib.secs_on("2026-11-02"), 90);
+        // 他日分桶，互不串味。
+        lib.add_read_secs("2026-11-01", 600);
+        assert_eq!(lib.secs_on("2026-11-02"), 90);
+        assert_eq!(lib.secs_on("2026-11-01"), 600);
+        assert_eq!(lib.secs_on("2026-10-31"), 0, "没读就是 0");
+
+        // ③ 时长与读叶账**共用同一行**：两个方向都要对。
+        lib.bump_read("2026-11-02", 2, 300);
+        assert_eq!(lib.secs_on("2026-11-02"), 90, "记叶不许清掉时长");
+        assert_eq!(lib.chars_on("2026-11-02"), 300, "记时长不许清掉字数");
+        assert_eq!(lib.read_on("2026-11-02"), 2);
+
+        // ④ 日期键不合法（系统时间被拨到乱七八糟）直接丢，不建账。
+        lib.add_read_secs("2026-02-30 上午", 10);
+        assert!(lib.read_days.iter().all(|r| r.day != "2026-02-30 上午"));
+
+        // ⑤ 落档往返，秒数不丢。
+        let json = serde_json::to_string(&lib).unwrap();
+        let back: Library = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.secs_on("2026-11-02"), 90);
+
+        // ⑥ 老存档（ReadDay 没有 secs 字段）缺省为 0，不炸。
+        let old: Library =
+            serde_json::from_str(r#"{"books":[],"read_days":[{"day":"2026-11-02","leaves":3}]}"#)
+                .unwrap();
+        assert_eq!(old.secs_on("2026-11-02"), 0, "缺省 secs = 0");
     }
 }

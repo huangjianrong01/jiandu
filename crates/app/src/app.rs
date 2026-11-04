@@ -106,6 +106,84 @@ impl DictTab {
 
 }
 
+/// **把当前进程换成磁盘上最新的那份 .app**（v1.9.83，菜单栏「重启并更新」用）。
+///
+/// 顺序是**先拉起新的、再退旧的**（后者由调用方 `cx.shutdown()` 做）。反过来
+/// 会有一段「应用没了」的空白窗，用户以为崩了又去 Dock 点一次，开出两个实例。
+///
+/// 拉起走 `open -n` 而不是直接 spawn 可执行文件：`open` 会带上 LaunchServices
+/// 的语境，Dock 图标、前台激活、单实例策略才正常；直接 spawn
+/// `Contents/MacOS/jiandu` 虽然也能跑，但新进程不在 bundle 语境里，资源路径与
+/// 激活行为都可能不对。
+///
+/// 从 `cargo run` 直接跑（没有 .app 外壳）时退回「原路重启」，保住开发态可用。
+#[cfg(target_os = "macos")]
+fn relaunch_self() -> std::io::Result<()> {
+    use std::process::Command;
+    let exe = std::env::current_exe()?;
+    // .../笺读.app/Contents/MacOS/jiandu → 0=exe 1=MacOS 2=Contents 3=*.app
+    let bundle = exe
+        .ancestors()
+        .nth(3)
+        .filter(|p| p.extension().is_some_and(|e| e == "app"));
+    match bundle {
+        Some(app) => {
+            Command::new("/usr/bin/open").arg("-n").arg(app).spawn()?;
+        }
+        None => {
+            Command::new(&exe).spawn()?;
+        }
+    }
+    Ok(())
+}
+
+/// 本平台没有菜单栏这条路（`install()` 是空实现，没人会走到这里）。
+#[cfg(not(target_os = "macos"))]
+fn relaunch_self() -> std::io::Result<()> {
+    Err(std::io::Error::other("此平台不支持重启"))
+}
+
+/// 阅读计时的一拍怎么结（纯函数，见 [`Root::account_reading_time`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadSettle {
+    /// 这一拍该记多少秒（`0` = 不记）。
+    pub take: u64,
+    /// 计时基准要不要前推到「现在」。
+    ///
+    /// **`false` 只在一种情况出现：不足一秒。** 这一位是整个计时正确性的关键：
+    /// 该函数每帧被调（60Hz 下一拍不到 17ms），无条件前推基准就等于每秒六十次
+    /// 把闹钟拨回原点，时间永远攒不起来。宁可让差一点点累积，也不能拨表。
+    pub advance: bool,
+}
+
+/// **阅读计时结算**（纯函数）：给定「距上次结账多少秒」与「现在算不算在读」，
+/// 决定「记多少」和「基准动不动」。
+///
+/// | secs | reading | take | advance | 为什么 |
+/// |---|---|---|---|---|
+/// | `0` | 任意 | `0` | **false** | 不足一秒，基准原地不动，让下一帧接着攒 |
+/// | `1..=300` | true | `secs` | true | 正常结账 |
+/// | `1..=300` | false | `0` | true | 不在阅读界面，这段空档不许留到回来再算 |
+/// | `>300` | 任意 | `0` | true | 合盖 / 切走一整段，丢掉；基准仍要前推，否则一直背着这个差 |
+pub fn read_time_settle(secs: u64, reading: bool) -> ReadSettle {
+    if secs == 0 {
+        return ReadSettle {
+            take: 0,
+            advance: false,
+        };
+    }
+    if secs > 300 || !reading {
+        return ReadSettle {
+            take: 0,
+            advance: true,
+        };
+    }
+    ReadSettle {
+        take: secs,
+        advance: true,
+    }
+}
+
 /// 当前所在界面。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
@@ -333,8 +411,24 @@ pub struct Root {
     /// 结果**，由 [`Root::refresh_read_stats`] 在「进书架 / 翻一叶 / 隔一会儿」
     /// 三个时机刷新（见 `shelf::render_shelf_top`）。
     pub read_today: usize,
-    /// 今日读过的字数（标点不计，只数 `GlyphKind::Char`）。菜单栏「今日阅卷 X 字」用。
+    /// 今日读过的字数（标点不计，只数 `GlyphKind::Char`）。书架「今日 … 字」用。
     pub read_chars_today: usize,
+    /// **今日阅读秒数**（v1.9.83）：菜单栏「今日阅读 X 分钟」的唯一数据源。
+    ///
+    /// 与 `read_today` / `read_chars_today` 一样是**算好的结果**，由
+    /// [`Root::account_reading_time`] 的涓流累加、开局 [`Root::refresh_read_stats`]
+    /// 从账本读回。菜单在 AppKit 侧构建，拿不到实体，只能靠这个数穿过去。
+    pub read_secs_today: u64,
+    /// **阅读计时的上一拍时刻**（v1.9.83）。
+    ///
+    /// 计时不用累加器而用「两次 Instant 之差」：GPUI 只在有事发生时才重绘，
+    /// 读者盯着页面不动时可能几十秒没有一帧——累加器会少算，而时间差
+    /// 天然把空档补回来。见 [`Root::account_reading_time`]。
+    read_tick_at: std::time::Instant,
+    /// 阅读计时心跳是否已经挂上（只挂一次）。
+    read_ticking: bool,
+    /// 菜单意图帧源是否已经挂上（只挂一次）。见 [`Root::ensure_menu_pump`]。
+    menu_pumping: bool,
     /// 连续阅读天数（含今日；今日未读则从昨日往前数）。
     pub read_streak: usize,
     /// 今天已经数过叶的 `(书序号, 叶序号)`。
@@ -921,6 +1015,12 @@ pub struct Root {
     /// 不该被一次快捷键抹掉。`None` 表示「不在档里」，或冷启动就直接停在
     /// 无障碍档（那时没有来处，退出回默认宣纸）。
     pub a11y_back: Option<jiandu_core::theme::Theme>,
+    /// **进护眼档之前用的是哪套主题**（v1.9.83）。
+    ///
+    /// 与 [`Self::a11y_back`] **分开两个槽**，不是懒：两档各有各的入口
+    /// （⌘⇧A 与菜单栏「高对比护眼模式」），若共用一个槽，从护眼档按 ⌘⇧A
+    /// 再退出来，就会把用户原来的宣纸「还原」成护眼档自己那张黑纸。
+    pub huyan_back: Option<jiandu_core::theme::Theme>,
     /// **「聽書」浮层**开着没（v1.9.41）。
     ///
     /// 语速原先挂在「版字」面板第一屏，和列数、纸色挤在一张纸上——那是一张
@@ -1433,6 +1533,10 @@ impl Root {
             // 今日读叶账（v1.9.38）：开局先按账本算一遍，书架第一帧就有数。
             read_today: 0,
             read_chars_today: 0,
+            read_secs_today: 0,
+            read_tick_at: std::time::Instant::now(),
+            read_ticking: false,
+            menu_pumping: false,
             read_streak: 0,
             read_seen: std::collections::HashSet::new(),
             read_day: String::new(),
@@ -1623,6 +1727,7 @@ impl Root {
             tts_lean: false,
             tts_lag: 0,
             a11y_back: None,
+            huyan_back: None,
             show_tts: false,
             tts_scope: String::new(),
             key_hint: None,
@@ -1925,6 +2030,17 @@ impl Root {
             root.toggle_a11y();
             if v == "2" {
                 root.toggle_a11y();
+            }
+        }
+        // 开发用（v1.9.83）：`JIANDU_HUYAN=1` 走**真**的护眼开关
+        // （`toggle_huyan` 而不是 `set_theme`——要连 `huyan_back` 一起验）；
+        // `=2` 进档再出档，核对「退出去纸色原样还回来」。
+        // 与 `JIANDU_A11Y` 同一个理由：菜单项点不动（合成点击过不了 TCC），
+        // 只能从环境变量走同一条函数。
+        if let Ok(v) = std::env::var("JIANDU_HUYAN") {
+            root.toggle_huyan();
+            if v == "2" {
+                root.toggle_huyan();
             }
         }
         // 开发用：JIANDU_PAGE=3 直接翻到第 3 叶（0 基），便于核对章首版心。
@@ -3870,11 +3986,135 @@ impl Root {
         }
         self.read_today = self.library.read_on(&self.read_day);
         self.read_chars_today = self.library.chars_on(&self.read_day);
+        self.read_secs_today = self.library.secs_on(&self.read_day);
         self.read_streak = self.library.streak(&self.read_day);
         self.read_stats_at = Some(std::time::Instant::now());
     }
 
-    /// 读叶账要不要重算。
+    /// **阅读计时的一拍**（v1.9.83）：把「这一拍坐了多久」记进账本。
+    ///
+    /// 为什么不用累加器：GPUI 只在**有事发生**时重绘，读者盯着页面不动时
+    /// 可能几十秒没有一帧——累加器（每帧 +16ms）会少算一大截。用两次
+    /// `Instant` 之差，空档天然被补回来，帧率是多少都不影响总时长。
+    ///
+    /// 四条闸门：
+    ///   * **只在阅读界面**：书架 / 工作台不算阅读。否则「打开软件挂一天」
+    ///     也能刷出八小时，那这个数字就没有意义了；
+    ///   * **有书**：空书架时 `screen` 可能还停在 `Reading`（关书动画期间）；
+    ///   * **不足 1 秒不记、也绝不挪基准**：这一句是全函数的关键，见下；
+    ///   * **`secs > 300` 整段丢弃**：合盖一夜、切走开会，回来第一帧的间隔
+    ///     会是一个巨大的数。宁可少记这几分钟，也不把「一夜」记成阅读。
+    ///
+    /// # 为什么「不足一秒不挪基准」
+    ///
+    /// 这个函数挂在 `render` 里，**每帧都被调**（60Hz 下每秒六十次）。原来的
+    /// 写法是无条件 `read_tick_at = now` 再判 `dt == 0` 就 return——看着没毛病，
+    /// 其实**时间永远攒不起来**：每一帧都只有 16ms，`as_secs()` 恒为 0，而基准
+    /// 已经被挪到「刚才」，下一帧又是 16ms……只要界面在动（移鼠标、翻页动画、
+    /// 听书高亮），整整一分钟过去账上还是 0。
+    ///
+    /// 正确的做法是「攒够一秒才结账」：不足一秒直接返回，**基准原地不动**，
+    /// 让下一帧接着攒。攒够了才把基准推到 `now`，并把这一秒记上。
+    ///
+    /// 崩点在于基准必须在**判定界面之后**才推吗？不。基准要**先推**：书架上看
+    /// 了十分钟再回正文，那十分钟不该算进阅读——先推基准等于把这段空档吃掉。
+    ///
+    /// 只加不落库（与 `bump_read` 同口径）：真落盘走 `touch()` / `save()`。
+    pub fn account_reading_time(&mut self, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        let secs = now.saturating_duration_since(self.read_tick_at).as_secs();
+        let settle = read_time_settle(secs, self.screen == Screen::Reading && self.book.is_some());
+        if !settle.advance {
+            // **不挪基准**：这一帧只是「还没攒够一秒」。
+            return;
+        }
+        self.read_tick_at = now;
+        if settle.take == 0 {
+            return;
+        }
+        self.library.add_read_secs(&self.read_day, settle.take);
+        self.read_secs_today = self.library.secs_on(&self.read_day);
+        cx.notify();
+    }
+
+    /// **阅读计时心跳**（v1.9.83）：每 30 秒要一帧，把静坐的时间也记上。
+    ///
+    /// 没有它也不会记错总额（时间差会补），但菜单栏的「今日阅读 X 分钟」
+    /// 会停在最后一次重绘的时刻——读者盯着一页看十分钟不动，打开菜单还是
+    /// 十分钟前的数。30 秒一次，`Instant::now()` 的开销可以忽略。
+    ///
+    /// 定时器必须是 GPUI 原生 `background_executor().timer`（与
+    /// `ensure_tts_beat` / `ensure_anchor_heartbeat` 同款纪律）：tokio 的
+    /// time 驱动不在这个执行器上，会永远 Pending。
+    fn ensure_read_tick(&mut self, cx: &mut Context<Self>) {
+        if self.read_ticking {
+            return;
+        }
+        self.read_ticking = true;
+        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(30))
+                        .await;
+                    let keep = this
+                        .update(&mut cx, |this, cx| {
+                            this.account_reading_time(cx);
+                        })
+                        .is_ok();
+                    if !keep {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// **菜单意图的帧源**（v1.9.83）：每 100ms 看一眼队列里有没有东西。
+    ///
+    /// 为什么非它不可（真机实测才发现的）：菜单项回调把意图塞进队列之后，
+    /// **GPUI 没有任何理由再画一帧**——AppKit 那边的一次点击，对 GPUI 来说
+    /// 不是「有事发生」。于是 `poll_menu_intents`（挂在 `render` 里）再也
+    /// 不会被调用，意图就烂在队列里：菜单看得见、点下去 `sendAction:` 也返回
+    /// YES、回调也确实入队了，**界面上什么都不动**。这正是 v1.9.78「点了没
+    /// 反应」的同一个症状，只是根因不同（那次是 tag 丢了）。
+    ///
+    /// 先查 `has_pending()`（一个原子读）再决定要不要取锁、要不要重绘：
+    /// 平时每拍只花一次原子读，10Hz 的代价可以忽略；有意图时立刻取空并要帧。
+    /// 100ms 是「点下去到看见反应」的上限——再长就能感觉到迟滞了。
+    fn ensure_menu_pump(&mut self, cx: &mut Context<Self>) {
+        if self.menu_pumping {
+            return;
+        }
+        self.menu_pumping = true;
+        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(100))
+                        .await;
+                    let keep = this
+                        .update(&mut cx, |this, cx| {
+                            if crate::menubar::has_pending() {
+                                this.poll_menu_intents(cx);
+                                cx.notify();
+                            }
+                            true
+                        })
+                        .is_ok();
+                    if !keep {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+/// 读叶账要不要重算。
     ///
     /// 书架每帧都会问这一句，故**不能每帧都去问系统时钟**（`localtime_r` +
     /// 一次格式化，60Hz 下纯属白烧）：距上次刷新满 30 秒才重算一次。
@@ -4006,24 +4246,47 @@ impl Root {
     /// 只把意图塞进队列（见 [`crate::menubar`]），这里在主线程每帧取空、执行。
     /// 顺带把菜单需要的「今日字数 / 最近打开」刷进共享区，供下次开菜单时读。
     pub fn poll_menu_intents(&mut self, cx: &mut Context<Self>) {
-        // 把「今日字数 / 最近打开」刷进菜单栏共享区（菜单在 AppKit 侧构建）。
+        // 把「今日时长 / 听书态 / 护眼态 / 最近阅读」刷进菜单栏共享区
+        // （菜单在 AppKit 侧构建，拿不到实体，只能靠这份快照）。
+        //
+        // 最近阅读按 `last_read` **降序**：第一条就是「继续阅读」要打开的那本，
+        // 子菜单的顺序也才符合直觉（最近的在最上面）。旧版只过滤不排序，
+        // 结果「最近项目」里是书架顺序——用户说的「最近」和它显示的不是一回事。
+        let mut recents: Vec<(String, usize)> = self
+            .library
+            .books
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.last_read > 0)
+            .map(|(i, e)| (e.title.clone(), i))
+            .collect();
+        recents.sort_by(|a, b| {
+            let ka = self.library.books[a.1].last_read;
+            let kb = self.library.books[b.1].last_read;
+            kb.cmp(&ka)
+        });
         crate::menubar::refresh_menu_data(MenuData {
-            today_chars: self.read_chars_today,
-            recents: self
-                .library
-                .books
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.last_read > 0)
-                .map(|(i, e)| (e.title.clone(), i))
-                .collect(),
+            today_secs: self.read_secs_today,
+            tts_on: self.show_tts,
+            huyan_on: self.theme.is_huyan(),
+            recent: recents.first().cloned(),
+            recents,
         });
 
         let intents = crate::menubar::take_intents();
         if intents.is_empty() {
             return;
         }
+        let dbg = std::env::var("JIANDU_MENU_DEBUG").is_ok();
         for intent in intents {
+            if dbg {
+                eprintln!(
+                    "[menu] 收到 {intent:?} book={} screen={:?} tts={}",
+                    self.book.is_some(),
+                    self.screen,
+                    self.show_tts
+                );
+            }
             match intent {
                 MenuIntent::OpenShelf => {
                     self.ensure_window(cx);
@@ -4060,6 +4323,52 @@ impl Root {
                     self.ensure_window(cx);
                     self.open_book(idx);
                 }
+                MenuIntent::ContinueReading => {
+                    self.ensure_window(cx);
+                    // 「继续阅读」的核心承诺是**落到正文**，不是「打开这本书」。
+                    // 没有最近阅读就退到书架 + 一句话，绝不静默无反应
+                    // （菜单看得见、点了没动静是最难查的一类 bug）。
+                    match self.latest_book() {
+                        Some(idx) => self.open_book(idx),
+                        None => {
+                            self.screen = Screen::Shelf;
+                            self.notice = "书架上还没有书，先导入一本吧".to_string();
+                        }
+                    }
+                }
+                MenuIntent::ToggleTts => {
+                    self.ensure_window(cx);
+                    // 没开书时先替用户开最近那本——从菜单栏按「开始听书」的
+                    // 人，想听的是「上次没读完的那段」，不该再被丢回书架自己点。
+                    if self.book.is_none() {
+                        match self.latest_book() {
+                            Some(idx) => self.open_book(idx),
+                            None => {
+                                self.screen = Screen::Shelf;
+                                self.notice = "书架上还没有书，无法朗读".to_string();
+                            }
+                        }
+                    }
+                    // 走开书那条失败的路径时 `book` 仍为空，此时不再调 `set_tts_active`
+                    // ——它会把听书卡画出来却念不出一个字（`speak_current_leaf`
+                    // 只会提示「没有可朗读的正文」）。
+                    if self.book.is_some() {
+                        let on = !self.show_tts;
+                        self.set_tts_active(on, cx);
+                        self.notice = if on {
+                            "聽書：開".to_string()
+                        } else {
+                            "聽書：停".to_string()
+                        };
+                    }
+                }
+                MenuIntent::ToggleHuyan => {
+                    self.ensure_window(cx);
+                    self.toggle_huyan();
+                }
+                MenuIntent::RestartUpdate => {
+                    self.restart_and_update(cx);
+                }
                 MenuIntent::ImportVariants => {
                     self.ensure_window(cx);
                     self.import_variant_dict_dialog(cx);
@@ -4075,6 +4384,38 @@ impl Root {
             }
         }
         cx.notify();
+    }
+
+    /// **最近读过的那本**（`last_read` 最大）；一本都没读过给 `None`。
+    ///
+    /// 「读过」的判据是 `last_read > 0`，不是「书架里有」：刚导入还没打开过的
+    /// 新书不该被「继续阅读」选中——那读的是一本陌生人。
+    pub fn latest_book(&self) -> Option<usize> {
+        self.library
+            .books
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.last_read > 0)
+            .max_by_key(|(_, e)| e.last_read)
+            .map(|(i, _)| i)
+    }
+
+    /// **重启并更新**（v1.9.83）：菜单栏「重启并更新」的落地。
+    ///
+    /// 「更新」目前是**诚实的空操作**：本项目没有自动更新源（官网版靠用户
+    /// 重下 DMG，商店版靠 App Store 审核下发），所以这里唯一能做、也该做的
+    /// 事，是把当前进程换成**磁盘上最新的那份 .app** 再跑起来。用户替换了
+    /// .app 之后点这一项，新版本直接生效，不用自己去 Dock 里退一次再开。
+    ///
+    /// 绝不假装「正在检查更新…」转个圈——那是在骗人。真要做自动更新，
+    /// 得先有更新源与签名校验，那是另一件事。
+    fn restart_and_update(&mut self, cx: &mut Context<Self>) {
+        // 先落盘：进度、书签、墨色都还没写出去，重启就会丢。
+        self.persist();
+        match relaunch_self() {
+            Ok(()) => cx.shutdown(),
+            Err(e) => self.notice = format!("重启失败：{e}"),
+        }
     }
 
     /// **导入外部异体字表**（v1.9.78）：菜单栏「导入异体字表…」的落地。
@@ -8341,6 +8682,14 @@ impl Render for Root {
         // 之后每帧只是一次原子读 + 一次取空队列。
         crate::dropzone::arm_once();
         self.poll_dropped(cx);
+        // v1.9.83：阅读计时。**必须排在 `poll_menu_intents` 前面**——菜单栏
+        // 顶部那行「今日阅读 X 分钟」读的是这里刷出来的数，反了就会永远
+        // 慢一拍（菜单里显示的还是上一帧的时长）。
+        self.account_reading_time(cx);
+        self.ensure_read_tick(cx);
+        // 菜单意图的帧源：AppKit 点击不会让 GPUI 重绘，没有这一条，
+        // 意图会烂在队列里（见 `ensure_menu_pump` 的注释）。
+        self.ensure_menu_pump(cx);
         // v1.9.44：菜单栏意图（唤起工作台 / 书架 / 最近打开 / 退出）。每帧取空队列。
         self.poll_menu_intents(cx);
         // v1.9.80：听书「读完了」→ 自动续下一叶。与菜单栏同一条纪律：
@@ -9074,6 +9423,63 @@ mod tests {
         assert_eq!(tts_cell_ink(false, true, false, true, 1.0), 0.0, "降级后不许留旧词");
         assert!((tts_cell_ink(false, false, true, false, 1.0) - 0.12).abs() < 1e-6);
         assert_eq!(tts_cell_ink(false, false, false, false, 1.0), 0.0);
+    }
+
+    /// **阅读计时：60Hz 下也得攒得起来**（v1.9.83）。
+    ///
+    /// 这个函数挂在 `render` 里，每帧调一次。第一版的写法是无条件
+    /// `read_tick_at = now` 再判 `dt == 0` 就返回——看着合理，实则**时间永远
+    /// 攒不起来**：每帧只有 16ms，`as_secs()` 恒为 0，而基准每帧都被拨回
+    /// 「刚才」。界面一动（移鼠标、翻页动画、听书高亮）账上就永远是 0。
+    ///
+    /// 这不是推理，是算得出来的：下面第二段用同一台虚拟时钟跑老写法，
+    /// 六十秒过去攒出 **0 秒**。
+    #[test]
+    fn reading_time_accrues_even_at_sixty_hertz() {
+        // 虚拟时钟：每帧 16ms，跑满 60 秒（3750 帧）。基准只在「结账」时前推。
+        let mut base: u64 = 0;
+        let mut total: u64 = 0;
+        for frame in 1..=3750u64 {
+            let now = frame * 16;
+            let settle = read_time_settle((now - base) / 1000, true);
+            if settle.advance {
+                base = now;
+            }
+            total += settle.take;
+        }
+        // 60 秒里最后一次「不满一秒」的尾巴不结账，故 59 或 60 都算对。
+        assert!(
+            (59..=60).contains(&total),
+            "60Hz 下跑满 60 秒应记 59~60 秒，实际 {total}"
+        );
+
+        // 反证：老写法（每帧无条件前推基准）。同样的时钟，攒出 0。
+        let mut base: u64 = 0;
+        let mut bad: u64 = 0;
+        for frame in 1..=3750u64 {
+            let now = frame * 16;
+            let secs = (now - base) / 1000;
+            base = now;
+            if secs > 0 && secs <= 300 {
+                bad += secs;
+            }
+        }
+        assert_eq!(bad, 0, "老写法在 60Hz 下必然攒出 0——这就是那条 bug");
+
+        // 一秒以下不结账，也绝不挪基准（`advance == false`）。
+        assert_eq!(read_time_settle(0, true), ReadSettle { take: 0, advance: false });
+        assert_eq!(read_time_settle(0, false), ReadSettle { take: 0, advance: false });
+
+        // 正常结账。
+        assert_eq!(read_time_settle(1, true), ReadSettle { take: 1, advance: true });
+        assert_eq!(read_time_settle(300, true), ReadSettle { take: 300, advance: true });
+
+        // 不在阅读界面：一秒都不记，但基准要前推（这段空档不许留到回来看书再算）。
+        assert_eq!(read_time_settle(120, false), ReadSettle { take: 0, advance: true });
+
+        // 合盖 / 切走一整段：整段丢弃，基准同样前推。
+        assert_eq!(read_time_settle(301, true), ReadSettle { take: 0, advance: true });
+        assert_eq!(read_time_settle(8 * 3600, true), ReadSettle { take: 0, advance: true });
     }
 
     /// **交接时长与缓动**（v1.9.81）：走满要几拍、两端要慢。
