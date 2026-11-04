@@ -208,12 +208,95 @@ fn main() {
             .cloned()
             .unwrap_or_else(|| "床前明月光，疑是地上霜。举头望明月，低头思故乡。".to_string());
         eprintln!("[tts-probe] running on main thread (main())");
-        let ok = crate::tts::speak(&text, 1.0);
-        eprintln!("[tts-probe] speak() returned {}", ok);
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        // 探针打一个非 0 的号：回调把这个号带回来，才证明「读完自动续读」
+        // 这条信号链（delegate → 队列 → 主线程取空）真的通了，而不只是能出声。
+        let tag: u64 = 42;
+        // `--tts-probe-stop`：念到一半按「停」，再等 4 秒**断言没有** didFinish。
+        // 这是续读最危险的失效模式：停了还自己往下翻，用户会以为书被鬼翻。
+        let stop_early = args.iter().any(|a| a == "--tts-probe-stop");
+        let ok = crate::tts::speak_tagged(&text, 1.0, tag);
+        eprintln!("[tts-probe] speak_tagged returned {ok} (tag={tag})");
+        let t0 = std::time::Instant::now();
+        let mut got: Option<u64> = None;
+        if stop_early {
+            // 真的等够 1 秒（`runMode:beforeDate:` 没事件时立刻返回，是空转，
+            // 不能拿它计时），并确认引擎**确实在出声**——否则「停了没回调」
+            // 是因为压根没开始念，这个测试就等于没测。
+            while t0.elapsed().as_secs_f64() < 1.0 {
+                crate::tts::pump_once(0.1);
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            let speaking = crate::tts::is_speaking();
+            eprintln!(
+                "[tts-probe] stop early at {:.1}s, isSpeaking={speaking}",
+                t0.elapsed().as_secs_f64()
+            );
+            if !speaking {
+                eprintln!("[tts-probe] 没在念，这次「停」不算数（换更长的文本重试）");
+                std::process::exit(6);
+            }
+            let stopped = crate::tts::stop();
+            eprintln!("[tts-probe] stop() returned {stopped}");
+            let t1 = std::time::Instant::now();
+            while t1.elapsed().as_secs_f64() < 4.0 {
+                crate::tts::pump_once(0.2);
+                if let Some(t) = crate::tts::take_finished() {
+                    got = Some(t);
+                    break;
+                }
+            }
+            match got {
+                None => {
+                    eprintln!("[tts-probe] 停之后 4s 内无迟到回调 —— 正确，不会自动续读");
+                    std::process::exit(0);
+                }
+                Some(t) => {
+                    eprintln!("[tts-probe] 停之后仍收到 didFinish tag={t} —— 会误续读！");
+                    std::process::exit(5);
+                }
+            }
+        }
+        // 必须**转 runloop** 等回调：delegate 由主队列投递，sleep 等不到。
+        // 顺手把逐字进度也收下来——能收到，才证明「卡拉 OK 高亮」有信号源；
+        // 再把换算出的子串打出来，子串能读通，才证明 UTF-16 → char 没算错。
+        let u16map = crate::app::utf16_char_map(&text);
+        let mut pos: Vec<(u64, usize, usize)> = Vec::new();
+        while t0.elapsed().as_secs_f64() < 30.0 {
+            crate::tts::pump_once(0.2);
+            while let Some(p) = crate::tts::take_speak_pos() {
+                pos.push(p);
+            }
+            if let Some(t) = crate::tts::take_finished() {
+                got = Some(t);
+                break;
+            }
+        }
+        eprintln!("[tts-probe] 逐字进度回调 {} 次", pos.len());
+        let (f, r) = crate::tts::added_methods();
+        eprintln!("[tts-probe] delegate 方法: didFinish={f} willSpeakRange={r}");
+        for (i, (tag, loc, len)) in pos.iter().take(6).enumerate() {
+            let s = crate::app::char_range_from_utf16(&u16map, *loc, *len);
+            let slice: String = match s {
+                Some((a, b)) => text.chars().skip(a).take(b - a).collect(),
+                None => "<越界，不高亮>".to_string(),
+            };
+            eprintln!("[tts-probe]   #{i} tag={tag} loc={loc} len={len} → 「{slice}」");
+        }
+        match got {
+            Some(t) if t == tag => eprintln!(
+                "[tts-probe] didFinish tag={t} in {:.1}s —— 续读信号打通",
+                t0.elapsed().as_secs_f64()
+            ),
+            Some(t) => eprintln!("[tts-probe] didFinish tag={t} 与期望 {tag} 不符（串号！）"),
+            None => eprintln!("[tts-probe] 30s 内未收到 didFinish —— delegate 没接上"),
+        }
         let stopped = crate::tts::stop();
-        eprintln!("[tts-probe] stop() returned {}; survived, exiting", stopped);
-        std::process::exit(if ok { 0 } else { 2 });
+        eprintln!("[tts-probe] stop() returned {stopped}; survived, exiting");
+        std::process::exit(match got {
+            Some(t) if t == tag => 0,
+            Some(_) => 3,
+            None => 4,
+        });
     }
 
     // `jiandu --zen`：直接打开原生 GPUI 竖笺演示窗口（天头地脚非对称 + Canvas 网格

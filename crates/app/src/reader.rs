@@ -2588,6 +2588,43 @@ impl Root {
                         return;
                     }
 
+                    // ②″ 听书无障碍快捷键（v1.9.80）。弱视 / 视障用户看不见听书卡
+                    //    上那排小字按钮，语速与开关必须有键可打：
+                    //      · ⌘⌥[ / ⌘⌥]  语速慢一档 / 快一档（不绕圈，到端即停）
+                    //      · ⌘⌥R         重念本叶（卡片不关，换一叶也不打断）
+                    //      · ⌘⌥K         續讀 开 / 关
+                    //    刻意都用 `⌘⌥`：不与 ⌘T / ⌘F / ⌘S 等既有单修饰键冲突。
+                    if mods.alt && (mods.platform || mods.control) {
+                        match k {
+                            "[" => {
+                                self.bump_tts_rate(-1);
+                                cx.notify();
+                                return;
+                            }
+                            "]" => {
+                                self.bump_tts_rate(1);
+                                cx.notify();
+                                return;
+                            }
+                            "r" | "R" => {
+                                self.speak_current_leaf();
+                                cx.notify();
+                                return;
+                            }
+                            "k" | "K" => {
+                                self.tts_auto = !self.tts_auto;
+                                self.notice = if self.tts_auto {
+                                    "續讀：開（讀完自動下一葉）".to_string()
+                                } else {
+                                    "續讀：關（讀完這一葉就停）".to_string()
+                                };
+                                cx.notify();
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // ② Esc：专注模式下先唤出 / 收起顶栏（v1.9.59 三管齐下之一）；
                     //    非专注模式才走「退出专注 + 收浮层」旧逻辑。
                     if k == "escape" || k == "Escape" || k == "esc" {
@@ -3093,33 +3130,58 @@ impl Root {
     /// 拍板「原文必须保留」），**数数必须数原文**——否则切到简体档，「生僻字」
     /// 的个数会跟着变，那才是真错。
     fn leaf_text(&self) -> String {
+        self.leaf_span().0
+    }
+
+    /// 本叶可朗读正文 **+ 每个字对应的字键**（`(章, 段, 段内偏移)`）。
+    ///
+    /// 两件事共用一次遍历：
+    ///   * **朗读过滤**（v1.9.80）——只收 `GlyphKind::Char`：
+    ///     `Indent` 是空占位；`Attach` 是书名号 `︽︾` 这类**排版记号**，
+    ///     TTS 会一字一字念成「左书名号」，纯噪音，排到它跟着的字旁边已经
+    ///     表达了意思；`Hang` 是挤进末字格右下的句读，读序里本就是 `Char`，照收。
+    ///     页眉 / 页脚 / 页码**从来不在 `Page::glyphs` 里**（版心与地脚各画各的），
+    ///     所以这里不必再排一遍——这条注释留着，免得日后有人来「补一个页码过滤」。
+    ///   * **字键**——卡拉 OK 高亮靠它把「引擎报到第 N 个字」翻译回「版面上哪一格」。
+    ///     字键是天然有序的三元组，故高亮判据只需一次区间比较，不必建映射表。
+    fn leaf_span(&self) -> (String, Vec<(usize, usize, usize)>) {
         let pages = self.paginate();
-        if let Some((a, b)) = self.selection_range() {
-            let mut out = String::new();
-            for pg in [self.page, self.page + 1] {
-                if let Some(gs) = pages.get(pg) {
-                    for g in gs {
-                        if g.is_indent() {
-                            continue;
-                        }
-                        let k = (g.chapter, g.para, g.offset);
-                        if k >= a && k <= b {
-                            out.push(g.ch);
+        let sel = self.selection_range();
+        let mut out = String::new();
+        let mut keys: Vec<(usize, usize, usize)> = Vec::new();
+        let mut eat = |g: &Glyph| {
+            if g.kind != jiandu_core::types::GlyphKind::Char {
+                return;
+            }
+            let k = (g.chapter, g.para, g.offset);
+            if let Some((a, b)) = sel {
+                if k < a || k > b {
+                    return;
+                }
+            }
+            out.push(g.ch);
+            keys.push(k);
+        };
+        match sel {
+            // 有选区：跨本叶与下一面（对开左半叶）都收。
+            Some(_) => {
+                for pg in [self.page, self.page + 1] {
+                    if let Some(gs) = pages.get(pg) {
+                        for g in gs {
+                            eat(g);
                         }
                     }
                 }
             }
-            return out;
+            None => {
+                if let Some(gs) = pages.get(self.page) {
+                    for g in gs {
+                        eat(g);
+                    }
+                }
+            }
         }
-        pages
-            .get(self.page)
-            .map(|gs| {
-                gs.iter()
-                    .filter(|g| !g.is_indent())
-                    .map(|g| g.ch)
-                    .collect::<String>()
-            })
-            .unwrap_or_default()
+        (out, keys)
     }
 
     /// **算出一份分析结果**（纯读，不改任何状态）。
@@ -7781,6 +7843,34 @@ impl Root {
                 );
         }
         let key = (g.chapter, g.para, g.offset);
+        // 听书高亮（v1.9.80 起，v1.9.81 加交接）：**三层**——当前句淡带、
+        // 当前词浓格（卡拉 OK）、以及交接期里正在退场的上一词/上一句。
+        //
+        // 不做「整叶淡染」：试过 0.10，整张纸立刻泛粉，纸色毁了，而且全页一样
+        // 深浅等于没有信息。现在只在句内落一层 0.12，当前词 0.34。
+        //
+        // 判据只用三元组区间比较（`tts_span_has`），不建映射表、不查书稿：
+        // 这是全界面最热的循环（一叶几百格、每帧重算），任何哈希都不划算。
+        // `Char` 以外的单元不染：句读（Hang）与书名号（Attach）本身不是「字」。
+        //
+        // **浓度不由这里算**，统一交给 `tts_cell_ink`：它是纯函数，有单测，
+        // 而且是「跨列时不会画出飞线」的根据——见那边的说明。
+        let is_char = g.kind == jiandu_core::types::GlyphKind::Char;
+        let tts_cur_word = is_char && crate::app::tts_span_has(self.tts_mark, key);
+        // 上一层只在「不是当前词」时才看，省一次区间比较，也天然避免同格画两层。
+        let tts_prev_word =
+            is_char && !tts_cur_word && crate::app::tts_span_has(self.tts_prev, key);
+        let tts_cur_line = is_char && crate::app::tts_span_has(self.tts_line, key);
+        let tts_prev_line =
+            is_char && !tts_cur_line && crate::app::tts_span_has(self.tts_line_prev, key);
+        let tts_k = crate::app::tts_cell_ink(
+            tts_cur_word,
+            tts_prev_word,
+            tts_cur_line,
+            tts_prev_line,
+            self.tts_cur,
+        );
+        let tts_here = tts_k > 0.001;
         let marked = self.underlines.contains(&key);
         // 注音：**书里的永远显示，字典只补空缺**。
         //   * `NoteKind::Ruby` —— EPUB `<ruby><rt>` / `[拼音:…]` 导入的读音，
@@ -7849,9 +7939,44 @@ impl Root {
             .items_center()
             // 主字（与拼音）都居中于字格：竖排一列的字必须同轴，否则列气歪斜。
             .justify_center();
-        if marked || rare_py.is_some() || mark_line.is_some() || hit.is_some() || emph || margin_hit
+        if marked
+            || rare_py.is_some()
+            || mark_line.is_some()
+            || hit.is_some()
+            || emph
+            || margin_hit
+            || tts_here
         {
             cell = cell.relative();
+        }
+        if tts_here && hit.is_none() && !margin_hit {
+            // 浓度已由 `tts_cell_ink` 算定（纯函数、有单测）：
+            //   * 当前词 0.12→0.34 —— 起手浅、随交接走满，换词不闪眼；
+            //   * 本句其余 0.12 —— 只圈出范围，绝不抢正文的墨色；
+            //   * 交接中的上一词 / 上一句 —— 同一套曲线反向退场。
+            //
+            // 分层靠**绘制顺序**而不是混合模式：这枚衬底是 cell 的第一个子节点，
+            // 正文（与注音、句读）都排在它之后，天然压在它上面。GPUI 0.2.2
+            // 没有 `blend_mode`，硬做混合反而会把纸纹和墨色一起搅浑。
+            // 「不互相污染」靠的是**每格只画一层**：四层浓度先合成一个数，
+            // 再由这一个数决定这一格画不画、多深——不存在两层叠在同一格。
+            let paper = if back { t.paper_back() } else { t.paper() };
+            if tts_cur_word && crate::app::tts_debug() {
+                eprintln!("[tts] paint cell={key:?} k={tts_k:.2} t={:.2}", self.tts_cur);
+            }
+            // 淡出层单独打点：这一层是「交接」的证据——没有它，旧词是一下消失的。
+            if tts_prev_word && crate::app::tts_debug() {
+                eprintln!("[tts] fade  cell={key:?} k={tts_k:.2} t={:.2}", self.tts_cur);
+            }
+            cell = cell.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .w(px(cell_w))
+                    .h(px(cell_h))
+                    .bg(rgb(crate::theme::mix(paper, t.accent(), tts_k))),
+            );
         }
         if let Some(is_cur) = hit {
             // 朱砂兑纸色：当前命中重一档，其它命中轻一档。
@@ -12463,6 +12588,8 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         };
         let speed = div()
             .cursor_pointer()
+            .px(px(6.0))
+            .py(px(4.0))
             .text_size(px(12.5))
             .text_color(rgb(zhu))
             .child(SharedString::from(rate_label.to_string()))
@@ -12477,9 +12604,15 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             );
 
         // 小字按钮（再讀 / 停）：极淡墨、hover 转朱。
+        //
+        // v1.9.80 无障碍：字号仍是 11.5（不抢戏），但**补上 6×4 的内边距**——
+        // 视觉不变、命中区从一行字高变成 ~22px，弱视用户手抖也点得中；
+        // 键盘另有 ⌘⌥R / ⌘⌥K 兜底（见 `handle_reading_key`）。
         let action = |label: &str, z: u32| {
             div()
                 .cursor_pointer()
+                .px(px(6.0))
+                .py(px(4.0))
                 .text_size(px(11.5))
                 .text_color(rgb(t.ink_soft()))
                 .hover(|s| s.text_color(rgb(z)))
@@ -12499,6 +12632,32 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 })),
         );
         row = row.child(speed);
+        // 續讀（v1.9.80）：读完这一叶自动翻下一叶接着念。开＝朱砂，关＝淡墨。
+        // 关掉仍是原来的「读本叶一遍」，一个字都不改。
+        let auto_on = self.tts_auto;
+        row = row.child(
+            div()
+                .cursor_pointer()
+                .px(px(6.0))
+                .py(px(4.0))
+                .text_size(px(11.5))
+                .text_color(if auto_on { rgb(zhu) } else { rgb(t.ink_soft()) })
+                .hover(|s| s.text_color(rgb(zhu)))
+                .child(SharedString::from(if auto_on { "續讀·開" } else { "續讀·關" }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.tts_auto = !this.tts_auto;
+                        this.notice = if this.tts_auto {
+                            "讀完自動續下一葉".to_string()
+                        } else {
+                            "讀完這一葉就停".to_string()
+                        };
+                        cx.notify();
+                    }),
+                ),
+        );
         // 分隔细线，把「设置」与「操作」两簇分开。
         row = row.child(div().w(px(1.0)).h(px(13.0)).bg(rgba(hair)));
         row = row.child(
@@ -12575,17 +12734,35 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
     /// 抽出来是为了让两条入口说同一句话：有选区读选区、没有就读整叶；
     /// 没正文就说「没有可朗读的正文」，不出声也不报错。
     pub(crate) fn speak_current_leaf(&mut self) {
-        let sel = self.selected_text();
-        let (text, whole) = if !sel.is_empty() {
-            (sel, false)
-        } else {
-            (self.leaf_text(), true)
-        };
+        let whole = self.selection_range().is_none();
+        // 一次遍历同时拿到「念什么」与「每个字在哪一格」（见 `leaf_span`）。
+        let (text, keys) = self.leaf_span();
         if text.is_empty() {
             self.notice = "这一叶没有可朗读的正文".to_string();
             return;
         }
-        crate::tts::speak(&text, self.tts_rate);
+        // 整叶的朗读区间：先让全叶淡染（读者一眼看出「正在读这一屏」），
+        // 再靠逐字回调把浓的那一格往前推——这就是卡拉 OK 的两层。
+        self.tts_keys = keys;
+        self.tts_chars = text.chars().collect();
+        self.tts_u16 = crate::app::utf16_char_map(&text);
+        self.tts_span = crate::app::tts_key_span(&self.tts_keys);
+        // 换叶重念 = 新的一轮：交接状态全清，起手直接「稳态」（t = 1）。
+        // 这里**不做**淡入——新一叶的第一格若从 0.12 爬到 0.34，读者会以为
+        // 上一叶还有一格没读完。降级标记也在这里复位（换叶是重新观察帧率
+        // 的最好时机：宁可先试一次动画，也别一直瞬移下去）。
+        self.tts_mark = None;
+        self.tts_line = None;
+        self.tts_prev = None;
+        self.tts_line_prev = None;
+        self.tts_cur = 1.0;
+        self.tts_lean = false;
+        self.tts_lag = 0;
+        self.tts_mark_at = std::time::Instant::now();
+        // 每一轮都换号：「读完了」的回调把号带回来，号对不上就当没发生
+        // （v1.9.80 续读的唯一防串机制）。
+        self.tts_gen = self.tts_gen.wrapping_add(1);
+        crate::tts::speak_tagged(&text, self.tts_rate, self.tts_gen);
         self.tts_scope = if whole {
             "本葉".to_string()
         } else {

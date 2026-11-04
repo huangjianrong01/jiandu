@@ -856,6 +856,65 @@ pub struct Root {
     /// 只作**进程内**记忆（不落盘）——语速是临时偏好，重启回到 1.0 无伤大雅；
     /// 也免得为它动 `Prefs` 的存档迁移。
     pub tts_rate: f32,
+    /// **续读的轮次号**（v1.9.80）：每念一段 +1。tts 的「读完了」回调会把号
+    /// 带回来，只有号与当前轮相等才认——`stopSpeakingAtBoundary:` 之后旧
+    /// utterance 的迟到回调因此不会把书又翻一叶。
+    pub tts_gen: u64,
+    /// **读完自动续下一叶**（v1.9.80）：听书卡上的「續讀」开关。默认开——
+    /// 听书的默认期待就是「一直读下去」，读到末叶自然停。
+    pub tts_auto: bool,
+    /// 本轮朗读的**字键序列**：第 i 个字在版面上的哪一格（`(章, 段, 偏移)`）。
+    /// 引擎报到「第 N 个字起、共 M 个」时，靠它翻回版面坐标。
+    pub tts_keys: Vec<(usize, usize, usize)>,
+    /// 本轮朗读文本的 **UTF-16 码元 → char 下标** 对照表（见 [`utf16_char_map`]）。
+    pub tts_u16: Vec<usize>,
+    /// 本轮朗读的**整叶区间**（半开）——留作判「高亮是否属于本叶」。
+    pub tts_span: Option<((usize, usize, usize), (usize, usize, usize))>,
+    /// **当前正在念的那几个字**（半开）：卡拉 OK 的浓色格。
+    pub tts_mark: Option<((usize, usize, usize), (usize, usize, usize))>,
+    /// **当前这一句**（半开）：淡色带，给弱视用户一个「读到哪一句」的落点。
+    ///
+    /// 为什么要有这一层：只有一格发亮时，视线要在一整叶几百字里重新找它；
+    /// 一句的淡带把搜索范围缩到十来个字。两层深浅也不同（0.34 / 0.12），
+    /// 一眼分得出「正在念这个字」与「这一句读到这儿」。
+    pub tts_line: Option<((usize, usize, usize), (usize, usize, usize))>,
+    /// 本轮朗读文本的字符序列（判句读边界用，与 `tts_keys` 一一对应）。
+    pub tts_chars: Vec<char>,
+    /// **朗读心跳是否在跑**（v1.9.80）。同一时刻只许一个心跳任务。
+    pub tts_beating: bool,
+    /// **交叉淡化的进度** 0→1（v1.9.81）。换词时归零，走到 1 即交接完毕。
+    ///
+    /// 一条进度同时驱动三个量（见 [`tts_cell_ink`]）：当前词 0→满、上一词
+    /// 满→0、上一句的淡带 1→0。所以「旧的一下没了、新的一下亮了」这两次
+    /// 突变合成一段连续的交接——跨列时就是上一列暗下去、下一列亮起来。
+    pub tts_cur: f32,
+    /// **上一词的区间**：交接期内还在淡出的那一格。
+    ///
+    /// 只做淡入不做淡出，观感是两次硬跳；有这一层，新词涨到 0.34 的同时
+    /// 旧词正从 0.34 退走，中间没有任何一帧是「全无高亮」。
+    pub tts_prev: Option<((usize, usize, usize), (usize, usize, usize))>,
+    /// **上一句的区间**：跨句（通常是跨列）时旧淡带退场用。
+    ///
+    /// 只在句子真的换掉时才有值，同一句内推进恒为 `None`——所以它不参与
+    /// 常规换词，专治「换列时整条带子瞬间消失」。旧列 0.12→0 与新列的
+    /// 0.12 同时发生，视线是被「水」带过去的，不是被拽过去的。
+    pub tts_line_prev: Option<((usize, usize, usize), (usize, usize, usize))>,
+    /// **本段交接的时长（毫秒）**：由两次报词的间隔自适应（[`tts_fade_ms`]）。
+    ///
+    /// 固定 100ms 在高倍速下会出事：词 60ms 一个，100ms 的过渡永远走不完，
+    /// 屏幕上同时挂着三四个半亮不亮的格，正是「残影」。这里让过渡**恒短于
+    /// 词间隔**，既保住 1.0x 的从容，又在快读时自动收紧。
+    pub tts_fade_ms: f32,
+    /// 上一次「换词」的时刻，用来量词间隔。
+    pub tts_mark_at: std::time::Instant,
+    /// **降级模式**（v1.9.81）：这一台机器画不及 60fps，已关掉所有过渡。
+    ///
+    /// 一经置位就只在**重新开读**（`show_tts` 关上再开、或换叶重念）时复位。
+    /// 不做「自动恢复」：掉电模式下帧率是抖的，反复开关过渡会变成一串
+    /// 一顿一顿的重启，比一直瞬移更难受。
+    pub tts_lean: bool,
+    /// 连续掉了几拍（连中两拍才降级，单次抖动不算）。
+    pub tts_lag: u8,
     /// **「聽書」浮层**开着没（v1.9.41）。
     ///
     /// 语速原先挂在「版字」面板第一屏，和列数、纸色挤在一张纸上——那是一张
@@ -1541,6 +1600,22 @@ impl Root {
             png_ratio: prefs.png_ratio,
             style_presets: Vec::new(),
             tts_rate: 1.0,
+            tts_gen: 0,
+            tts_auto: true,
+            tts_keys: Vec::new(),
+            tts_u16: Vec::new(),
+            tts_span: None,
+            tts_mark: None,
+            tts_line: None,
+            tts_chars: Vec::new(),
+            tts_beating: false,
+            tts_cur: 1.0,
+            tts_prev: None,
+            tts_line_prev: None,
+            tts_fade_ms: TTS_FADE_BASE_MS as f32,
+            tts_mark_at: std::time::Instant::now(),
+            tts_lean: false,
+            tts_lag: 0,
             show_tts: false,
             tts_scope: String::new(),
             key_hint: None,
@@ -1757,6 +1832,22 @@ impl Root {
                 .min(root.library.books.len() - 1);
             root.open_book(idx);
             root.screen = Screen::Reading;
+        }
+        // v1.9.80 开发用：`JIANDU_TTS=1` 开卷即开听书（续读端到端核对）。
+        // 必须在 `JIANDU_AUTO_READ` **之后**——`open_book` 会 `close_transient_ui()`
+        // 把前面摆好的浮层清掉，顺序反了听书卡就永远不出现。
+        // 摆位不调 `set_tts_active`：那条路要 `cx` 且会 `notify`，建实体期间调不稳；
+        // 这里只置两个字段 + 直接开念，渲染下一帧自会 `fit_sizes`。
+        if std::env::var("JIANDU_TTS").is_ok() && root.book.is_some() {
+            root.show_tts = true;
+            root.tts_auto = true;
+            root.speak_current_leaf();
+            // 开发用：`JIANDU_TTS_LEAN=1` 强制进降级档（低配机/掉电模式的观感
+            // 核对）。必须在 `speak_current_leaf` **之后**——那里会把降级标记
+            // 复位（换叶重念 = 重新观察帧率的机会）。
+            if std::env::var("JIANDU_TTS_LEAN").is_ok() {
+                root.tts_lean = true;
+            }
         }
         // 「更多」下拉（v1.82.0 调试口子）：必须在 `JIANDU_AUTO_READ` **之后**
         // 再置一次——打开一本书会 `close_transient_ui()`，把前面设好的浮层清掉。
@@ -3216,9 +3307,228 @@ impl Root {
         if on {
             self.speak_current_leaf();
         } else {
+            // 先作废这一轮，再停引擎：停止会触发 didCancel，若号还相等，
+            // 迟到的回调可能被当成「读完」而自动续读下一叶（v1.9.80）。
+            self.tts_gen = self.tts_gen.wrapping_add(1);
+            self.tts_mark = None;
+            self.tts_line = None;
+            self.tts_span = None;
+            // 交接态一并清：关掉再开是新的一轮，不能拿上一轮的「上一词」续戏。
+            self.tts_prev = None;
+            self.tts_line_prev = None;
+            self.tts_cur = 1.0;
             crate::tts::stop();
         }
         cx.notify();
+    }
+
+    /// **收「读完了」并自动续下一叶**（v1.9.80）。
+    ///
+    /// 与 [`Self::poll_menu_intents`] 同一条纪律：delegate 回调跑在 ObjC 栈上，
+    /// 只把号塞进队列（见 [`crate::tts`]），这里在主线程每帧取空再动实体。
+    ///
+    /// 三处闸门缺一不可：
+    ///   * 号必须与当前轮相等 —— 否则是上一句的迟到回调（按过「停」/ 换过页）；
+    ///   * 听书卡必须还开着、续读开关必须还开着；
+    ///   * 必须真的还有下一叶 —— 末叶只给一句提示，绝不回头重读。
+    ///
+    /// 翻页走 [`Self::step`]，对开时自动跨两叶、末叶自动钳位、并把这一叶记进
+    /// 「今日阅卷」——与手翻完全同一条路，不另开一套页码算术。
+    pub fn poll_tts_finished(&mut self, cx: &mut Context<Self>) {
+        // 先取空再看闸门：关着卡时也要把队列排掉，免得下次开卡时捡到旧号。
+        let Some(tag) = crate::tts::take_finished() else {
+            return;
+        };
+        if tag == 0 || tag != self.tts_gen || !self.show_tts || !self.tts_auto {
+            return;
+        }
+        if self.book.is_none() {
+            return;
+        }
+        let delta = if self.duplex == Duplex::Facing { 2 } else { 1 };
+        let dbg = std::env::var("JIANDU_TTS_DEBUG").is_ok();
+        match tts_advance(self.page, self.max_page(), delta) {
+            TtsAdvance::AtEnd => {
+                if dbg {
+                    eprintln!("[tts] finish tag={tag} page={}/{} → 末叶，停", self.page, self.max_page());
+                }
+                // 末叶：读完就停在这，不再念、不再翻。号作废，防末叶回调重入。
+                self.tts_gen = self.tts_gen.wrapping_add(1);
+                self.notice = "已讀到末葉".to_string();
+                cx.notify();
+            }
+            TtsAdvance::Next => {
+                if dbg {
+                    eprintln!("[tts] finish tag={tag} page={} → 翻到 {}", self.page, self.page + delta);
+                }
+                // 翻页自己会「掐断 + 重念」（见 `step`），这里不再补一句，
+                // 否则同一叶会被念两遍。
+                self.step(true, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// **朗读心跳**（v1.9.80 起，v1.9.81 改为变速）：听书开着时主动要帧。
+    ///
+    /// 为什么非它不可：`poll_tts_mark` / `poll_tts_finished` 都挂在 `render` 里，
+    /// 而 GPUI 只在「有事发生」时重绘——队列一取空，就再没有任何一帧去取新
+    /// 回调，逐字高亮会**停在第一个词上**（本项目实测：日志里只有 1 条 pos，
+    /// 其后全静默，看着像引擎不报进度）。心跳把「取队列」从被动等重绘变成
+    /// 主动定时，顺带给衬底的渐变提供帧。
+    ///
+    /// **两档周期**（v1.9.81）：交接期 16ms（约 60fps），静止期 90ms。
+    /// 一档 90ms 配不上 100ms 的过渡——一拍就把整段走完了，等于没有过渡；
+    /// 而一直 16ms 又会为了让一个不动的画面动起来白烧电池。
+    ///
+    /// **掉帧兜底**（v1.9.81）：真机上 `render` 一叶几百格，低配机跑不满
+    /// 60fps 是常态。连续两拍「实际间隔 > 请求间隔 × 2.5」就判定跟不上，
+    /// 从此关掉过渡、转速退回 90ms——高亮变成瞬移，但阅读本身不卡。
+    /// 动画是糖，糖不能把正餐拖死。
+    ///
+    /// 定时器必须是 GPUI 原生 `background_executor().timer`——tokio 的 time 驱动
+    /// 不在这个执行器上，会永远 Pending（与 `ensure_anchor_heartbeat` 同款纪律）。
+    fn ensure_tts_beat(&mut self, cx: &mut Context<Self>) {
+        if self.tts_beating || !self.show_tts {
+            return;
+        }
+        self.tts_beating = true;
+        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let mut asked = TTS_BEAT_IDLE_MS;
+                let mut last = std::time::Instant::now();
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(asked))
+                        .await;
+                    let now = std::time::Instant::now();
+                    // 真实间隔与请求间隔的比值，就是这台机器跑不跑得动的证据。
+                    let elapsed = now.saturating_duration_since(last).as_millis() as f32;
+                    last = now;
+                    let next = this
+                        .update(&mut cx, |this, cx| {
+                            if !this.show_tts {
+                                this.tts_beating = false;
+                                return None;
+                            }
+                            // ① 掉帧判定（一旦降级就不再判，省一次比较）。
+                            if !this.tts_lean {
+                                if tts_lagging(elapsed, asked as f32) {
+                                    this.tts_lag = this.tts_lag.saturating_add(1);
+                                    if tts_should_degrade(this.tts_lag) {
+                                        this.tts_lean = true;
+                                        this.tts_cur = 1.0;
+                                        this.tts_prev = None;
+                                        this.tts_line_prev = None;
+                                        if tts_debug() {
+                                            eprintln!(
+                                                "[tts] 掉帧 {elapsed:.0}ms/{asked}ms → 关过渡"
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    this.tts_lag = 0;
+                                }
+                            }
+                            // ② 取进度、取「读完了」。
+                            this.poll_tts_mark(cx);
+                            this.poll_tts_finished(cx);
+                            // ③ 交接期把进度往前推一格，并保持快档。
+                            let mut asked_next = TTS_BEAT_IDLE_MS;
+                            if !this.tts_lean && this.tts_cur < 1.0 {
+                                this.tts_cur =
+                                    tts_step(this.tts_cur, TTS_BEAT_FAST_MS as f32, this.tts_fade_ms);
+                                asked_next = TTS_BEAT_FAST_MS;
+                                cx.notify();
+                            }
+                            Some(asked_next)
+                        })
+                        .ok()
+                        .flatten();
+                    match next {
+                        Some(ms) => asked = ms,
+                        None => break,
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// **卡拉 OK 高亮**（v1.9.80）：把「引擎正念到第几个字」翻成版面上哪一格。
+    ///
+    /// 与 [`Self::poll_tts_finished`] 同一个队列纪律：delegate 只入队，实体在这动。
+    /// 三处闸门：「号要对」「卡要开着」「下标别越界（换页瞬间可能对不上）」。
+    pub fn poll_tts_mark(&mut self, cx: &mut Context<Self>) {
+        let Some((tag, loc, len)) = crate::tts::take_speak_pos() else {
+            return;
+        };
+        let dbg = std::env::var("JIANDU_TTS_DEBUG").is_ok();
+        if dbg {
+            eprintln!(
+                "[tts] pos tag={tag} gen={} loc={loc} len={len} keys={} u16={} show={}",
+                self.tts_gen,
+                self.tts_keys.len(),
+                self.tts_u16.len(),
+                self.show_tts
+            );
+        }
+        if len == 0 || tag != self.tts_gen || !self.show_tts {
+            return;
+        }
+        // 引擎给的是 **UTF-16 码元**区间（NSRange），先换成 char 区间
+        // ——扩展 B 区的生僻字在 UTF-16 里是代理对，直接拿 loc 当角色标
+        // 会在第一个生僻字之后整体偏一位。
+        let Some((s, e)) = crate::app::char_range_from_utf16(&self.tts_u16, loc, len) else {
+            return;
+        };
+        let (Some(first), Some(last)) = (self.tts_keys.get(s), self.tts_keys.get(e - 1)) else {
+            return;
+        };
+        let next = (*first, (last.0, last.1, last.2 + 1));
+        let mut dirty = false;
+        // 同一句里推进时不重算带子（一句十来个字，省下的是每帧一次扫描）。
+        let line = sentence_key_span(&self.tts_chars, &self.tts_keys, s)
+            .filter(|l| Some(*l) != self.tts_line);
+        let line_changed = line.is_some();
+        let old_line = self.tts_line;
+        if let Some(l) = line {
+            self.tts_line = Some(l);
+            dirty = true;
+        }
+        if self.tts_mark != Some(next) {
+            let old_mark = self.tts_mark;
+            self.tts_mark = Some(next);
+            let now = std::time::Instant::now();
+            let gap = now.saturating_duration_since(self.tts_mark_at).as_millis();
+            self.tts_mark_at = now;
+            if self.tts_lean || gap < TTS_FADE_MIN_MS {
+                // 高倍速（词间隔已经短于过渡下限）或已降级：任何过渡都只剩
+                // 残影，直接定位。这是「倍数越高越干脆」的那一半逻辑。
+                self.tts_cur = 1.0;
+                self.tts_prev = None;
+                self.tts_line_prev = None;
+            } else {
+                // 交接：新词 0→满、旧词 满→0，时长由这次的真实间隔定。
+                self.tts_fade_ms = tts_fade_ms(gap) as f32;
+                self.tts_cur = 0.0;
+                self.tts_prev = old_mark;
+                // 旧带子只在**真的换句**（竖排里通常是换列）时才留一份退场；
+                // 同句推进不留——否则每一格都要多一次区间比较。
+                self.tts_line_prev = if line_changed { old_line } else { None };
+            }
+            if dbg {
+                eprintln!(
+                    "[tts] 换词 gap={gap}ms fade={:.0}ms lean={}",
+                    self.tts_fade_ms, self.tts_lean
+                );
+            }
+            dirty = true;
+        }
+        if dirty {
+            cx.notify();
+        }
     }
 
     /// **一键显隐注释**（v1.9.25 起，v1.9.37 改为**真重排**）。
@@ -5567,6 +5877,21 @@ fn anki_push_card(
         self.notice = format!("语速：{}（{:.2}×）", label, r);
     }
 
+    /// **语速上下拨一档**（v1.9.80 · 无障碍）：`dir` 为 -1 慢、+1 快。
+    ///
+    /// 键盘入口（⌘⌥[ / ⌘⌥]）专为看不见那排小按钮的人准备——
+    /// 语速若只能靠点，弱视用户就得先找到按钮；有了键，闭着眼也能调。
+    /// 已到两端不绕圈（0.8 → 再慢仍是 0.8），否则「到底了没」无法凭听感判断。
+    pub fn bump_tts_rate(&mut self, dir: i32) {
+        const RATES: [f32; 3] = [0.8, 1.0, 1.25];
+        let idx = RATES
+            .iter()
+            .position(|&r| (self.tts_rate - r).abs() < 1e-3)
+            .unwrap_or(1);
+        let next = (idx as i32 + dir).clamp(0, RATES.len() as i32 - 1) as usize;
+        self.set_tts_rate(RATES[next]);
+    }
+
     /// 把**当前**样式抄进第 `slot` 个用户槽位。
     pub fn save_preset(&mut self, slot: usize) {
         let mut prefs = crate::prefs::Prefs::load();
@@ -6647,6 +6972,19 @@ fn anki_push_card(
         self.toast = None;
         // 窄屏引导也跟着走：用户已经在读书了，不用再教（v1.52.3）。
         self.narrow_hint = false;
+        // **打断机制**（v1.9.80）：听书开着时翻页 = 换一叶念。
+        // 立即掐断当前朗读（不等 didFinish——那一句可能还有半页没念完），
+        // 从新叶第一段重新开念。`tts::stop` 会顺手把 CUR_UTT 置 0，
+        // 所以旧 utterance 的迟到回调连队都进不来；这里再把号 +1，
+        // 双保险挡住已经躺在队列里的那几枚。
+        if self.show_tts {
+            self.tts_gen = self.tts_gen.wrapping_add(1);
+            self.tts_mark = None;
+            self.tts_line = None;
+            self.tts_span = None;
+            crate::tts::stop();
+            self.speak_current_leaf();
+        }
         // v1.9.38：先把这一叶记进「今日」账，再一次性落盘——顺序不能反，
         // 反了这叶就得等下一叶才写进 json。
         //
@@ -7974,6 +8312,15 @@ impl Render for Root {
         self.poll_dropped(cx);
         // v1.9.44：菜单栏意图（唤起工作台 / 书架 / 最近打开 / 退出）。每帧取空队列。
         self.poll_menu_intents(cx);
+        // v1.9.80：听书「读完了」→ 自动续下一叶。与菜单栏同一条纪律：
+        // ObjC 回调只入队，实体只在这里动。
+        self.poll_tts_finished(cx);
+        // v1.9.80：听书逐字高亮（卡拉 OK）。同样每帧取空，只在有新位置时重绘。
+        self.poll_tts_mark(cx);
+        // 心跳：听书开着才需要（没有它，队列一空就再没人来取新回调）。
+        if self.show_tts {
+            self.ensure_tts_beat(cx);
+        }
         // v1.77.0：每帧探一眼批量导入（点检 / 上架 / 收工）与后台建索引。
         self.poll_batch(cx);
         self.poll_fts();
@@ -8145,6 +8492,265 @@ pub fn open_external(url: &str) -> bool {
     r.is_ok()
 }
 
+/// 续读裁决（v1.9.80）：读完一叶之后，下一页该不该念。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtsAdvance {
+    /// 还有下一叶，翻过去接着念。
+    Next,
+    /// 已在末叶，停在这（不回头、不重读）。
+    AtEnd,
+}
+
+/// **续读的页码算术**（纯函数，唯一一处判「还有没有下一叶」）。
+///
+/// `delta` 由版式决定：单叶 1、对开 2（对开一次跨两叶，与 [`Root::step`] 同源）。
+/// 抽出来单测的理由：这段判据一旦算错，表现是「读到末叶后从卷首重来」——
+/// 用户会以为书被人翻过，而且很难在真机上复现定位。
+pub fn tts_advance(page: usize, last: usize, delta: usize) -> TtsAdvance {
+    if page.saturating_add(delta) > last {
+        TtsAdvance::AtEnd
+    } else {
+        TtsAdvance::Next
+    }
+}
+
+/// 一串字键 → 半开区间 `[首字, 末字 + 1)`；空串给 `None`（一格都不染）。
+///
+/// `+1` 是**故意**的：区间用「左闭右开」，判据就退化成一次 `>=` 与一次 `<`，
+/// 渲染时每个字格只做两次比较、不建任何映射表。字键的三段互不相邻（章 / 段
+/// 各自从 0 数），但**字典序恰好等于读序**，所以这套比较成立。
+pub fn tts_key_span(
+    keys: &[(usize, usize, usize)],
+) -> Option<((usize, usize, usize), (usize, usize, usize))> {
+    let first = *keys.first()?;
+    let last = *keys.last()?;
+    Some((first, (last.0, last.1, last.2 + 1)))
+}
+
+/// 这个字格在不在区间里（半开）。`span` 为 `None` 时恒 false。
+pub fn tts_span_has(
+    span: Option<((usize, usize, usize), (usize, usize, usize))>,
+    key: (usize, usize, usize),
+) -> bool {
+    span.is_some_and(|(a, b)| key >= a && key < b)
+}
+
+// ── 交叉淡化（v1.9.81）────────────────────────────────────────────────
+//
+// 「心跳」这一层从前只有**淡入**：换词时把浓度归零再涨回去，于是每一格
+// 都经历「亮 → 灭 → 亮」——灭的那一瞬就是用户说的「生硬、跳动感太强」。
+// 现在补上淡出：新词涨的同时旧词退，中间没有一帧是空的。跨列时旧列整条
+// 淡带一起退，视线是被带过去的，不是被拽过去的。
+
+/// 交接期的基准时长（毫秒）。1.0x 下每个字约 200–300ms，100ms 的交接足够
+/// 看清「从上一格漫到这一格」，又不至于让视线追不上字。
+pub const TTS_FADE_BASE_MS: u128 = 100;
+/// 交接期的下限：比这更短就只能算位移，不算过渡了。
+pub const TTS_FADE_MIN_MS: u128 = 40;
+/// 交接期的心跳周期（约 60fps）。
+pub const TTS_BEAT_FAST_MS: u64 = 16;
+/// 静止期的心跳周期：只为「把回调从队列里取出来」，不驱动任何动画。
+pub const TTS_BEAT_IDLE_MS: u64 = 90;
+
+/// **本段交接该走多久**（纯函数）：基准 100ms，但**不得长过两个词的间隔**。
+///
+/// 这条约束是「高倍速无残影」的全部秘密。固定 100ms 时，词间隔一旦短于
+/// 100ms（2.0x 以上很常见），上一个过渡还没走完下一个就来了，屏幕上同时
+/// 挂着三四个半亮不亮的格——那不是过渡，那是拖影。让时长恒 ≤ 词间隔
+/// （再减掉一拍的心跳延迟），就保证**任一时刻至多一个词在交接**。
+pub fn tts_fade_ms(gap_ms: u128) -> u128 {
+    gap_ms
+        .saturating_sub(TTS_BEAT_FAST_MS as u128)
+        .clamp(TTS_FADE_MIN_MS, TTS_FADE_BASE_MS)
+}
+
+/// **缓入缓出**（smoothstep）：两端导数为 0，起手与收手都不「噔」一下。
+///
+/// 线性过渡在浅色纸面上会露出「匀速变深」的机器感；三次平滑让浓度变化
+/// 集中在中段，看起来更像墨在宣纸上洇开。
+pub fn tts_ease(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// **一拍之后交接走到哪**（纯函数）。
+pub fn tts_step(t: f32, beat_ms: f32, fade_ms: f32) -> f32 {
+    if fade_ms <= 0.0 {
+        return 1.0;
+    }
+    (t + beat_ms / fade_ms).clamp(0.0, 1.0)
+}
+
+/// 掉帧判据的倍率：实际间隔超过请求间隔这么多倍，就算这一拍没画出来。
+///
+/// 取 2.5 而不是 1.5：定时器本身有调度抖动（macOS 上 ±8ms 很常见），
+/// 拿 16ms 的请求去卡 1.5 倍会天天误判。
+pub const TTS_LAG_RATIO: f32 = 2.5;
+/// 连中几拍才降级。单次卡顿（比如切到别的窗口）不该把动画永久关掉。
+pub const TTS_LAG_STRIKES: u8 = 2;
+
+/// **这一拍掉了吗**（纯函数）。
+///
+/// 判据只有一条：真实间隔 ÷ 请求间隔。比值大说明「我要的是 16ms 一帧，
+/// 实际过了 60ms」——帧被系统吞了，动画在拖时间而不是在走时间。
+///
+/// `asked` 为 0 时恒 false（除零保护；也避免首拍就拿 0 去判）。
+pub fn tts_lagging(elapsed_ms: f32, asked_ms: f32) -> bool {
+    asked_ms > 0.0 && elapsed_ms > asked_ms * TTS_LAG_RATIO
+}
+
+/// **掉了几拍就该降级**（纯函数）。
+///
+/// 抽出来单测，是因为这个判据一旦差一，用户看到的是「动画时有时无」——
+/// 比从来没有动画更像 bug。
+pub fn tts_should_degrade(strikes: u8) -> bool {
+    strikes >= TTS_LAG_STRIKES
+}
+
+/// **一个字的衬底浓度**（纯函数，全界面唯一决定染色深浅的地方）。
+///
+/// 四层由深到浅：当前词 0.34 · 上一词（交接中）0.34→0 · 本句淡带 0.12 ·
+/// 上一句淡带 0.12→0。合成方式是 **带子 + 词的加量**，不是「取大」：
+///   * `band`  —— 在当前句：0.12；否则若在上一句：0.12 × (1−e)；
+///   * `extra` —— 当前词 +0.22×e；否则上一词 +0.22×(1−e)。
+///
+/// **稳态（e = 1）逐像素等于没有动画的旧版**：当前词 0.12+0.22 = 0.34，
+/// 同句其余 0.12，其余 0。这条是回归护栏——动画只许改变交接的那 100ms，
+/// 不许改动任何静止画面。
+///
+/// 为什么不用「取大」：跨句时上一句的带子和新一句的带子会**相撞**，取大
+/// 等于把「旧的退场」整个吃掉，退场那一下又退回硬切了。
+pub fn tts_cell_ink(
+    cur_word: bool,
+    prev_word: bool,
+    cur_line: bool,
+    prev_line: bool,
+    t: f32,
+) -> f32 {
+    let e = tts_ease(t);
+    let q = 1.0 - e;
+    let band = if cur_line {
+        0.12
+    } else if prev_line {
+        0.12 * q
+    } else {
+        0.0
+    };
+    let extra = if cur_word {
+        0.22 * e
+    } else if prev_word {
+        0.22 * q
+    } else {
+        0.0
+    };
+    band + extra
+}
+
+/// `JIANDU_TTS_DEBUG` 只读一次。
+///
+/// 渲染热循环（一叶几百格、每帧都跑）里每格调一次 `env::var` 是不可接受的，
+/// 所以在首次询问时把开关缓存下来。
+pub fn tts_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JIANDU_TTS_DEBUG").is_ok())
+}
+
+/// 句读边界（读完这几个字就该换气）。判据只认**字符本身**，不查 gloss：
+/// 渲染层画句读用的也是这批字符（`punct::kind_for`），两处同源。
+fn is_sentence_break(c: char) -> bool {
+    matches!(
+        c,
+        '，' | '、'
+            | '；'
+            | '：'
+            | '。'
+            | '？'
+            | '！'
+            | '…'
+            | '·'
+            | ','
+            | ';'
+            | ':'
+            | '.'
+            | '?'
+            | '!'
+    )
+}
+
+/// **当前读的那一句**在版面上的字键区间（半开）。
+///
+/// 从 `idx` 出发向两侧走到最近的句读边界：左边走到「前一个字是句读」为止，
+/// 右边走到「本字是句读」为止，**两端都把句读包含进来**——句读是这句话的
+/// 收尾，把它留在带子里，读者才知道这句断在哪。
+///
+/// 与 `tts_mark`（当前几个字）共用字键判据，渲染层只多做一次区间比较。
+/// `keys` 与 `chars` 必须等长（都由 `leaf_span` 一次遍历产出），不等长直接
+/// 放弃——宁可这一帧不画带子，也不画一条错位的带子。
+pub fn sentence_key_span(
+    chars: &[char],
+    keys: &[(usize, usize, usize)],
+    idx: usize,
+) -> Option<((usize, usize, usize), (usize, usize, usize))> {
+    if chars.len() != keys.len() || idx >= chars.len() {
+        return None;
+    }
+    let mut s = idx;
+    while s > 0 && !is_sentence_break(chars[s - 1]) {
+        s -= 1;
+    }
+    let mut e = idx;
+    while e + 1 < chars.len() && !is_sentence_break(chars[e]) {
+        e += 1;
+    }
+    let last = keys[e];
+    Some((keys[s], (last.0, last.1, last.2 + 1)))
+}
+
+/// **UTF-16 码元下标 → `char` 下标**。
+///
+/// 这张表存在的原因不是「性能」，是**单位对不上**：
+/// `AVSpeechSynthesizer` 通过 `willSpeakRangeOfSpeechString:` 报回来的是
+/// `NSRange`，它的单位是 **UTF-16 码元**（NSString 的计数方式）——
+/// * 不是**字节**（UTF-8 的 `len()`），所以按字节换算会把中文全切错；
+/// * 也不是 Rust 的 `char`，所以直接拿 `loc` 当角色标会**在生僻字处错位**。
+///
+/// 一个异体字 / 生僻字若在 BMP 内（绝大多数：U+4E00–U+9FFF、扩展 A），
+/// `len_utf16() == 1`，两者恰好相等；但**扩展 B 区**（U+20000 起，如 `𠀀`）
+/// 在 UTF-16 里是**代理对，占 2 个码元**。古籍里这类字并不罕见（尔雅、说文
+/// 的冷字，以及 cjk 表里 42699 个扩展 B 字），只要出现一个，其后所有位置
+/// 就会整体偏移 1——表现为「高亮永远滞后一个字」，而且越读越偏。
+///
+/// 表长 = 该串的 UTF-16 长度（一叶正文几百，可忽略）。
+pub fn utf16_char_map(text: &str) -> Vec<usize> {
+    let mut m: Vec<usize> = Vec::with_capacity(text.len());
+    for (ci, ch) in text.chars().enumerate() {
+        for _ in 0..ch.len_utf16() {
+            m.push(ci);
+        }
+    }
+    m
+}
+
+/// `NSRange`（UTF-16 码元）→ `char` 半开区间 `[start, end)`。
+///
+/// 三条兜底，缺一不可——它们都是「宁可这一帧不高亮，也不要高亮错格」：
+///   * `loc` 越界（换页瞬间读到的旧区间）→ `None`；
+///   * `len == 0` → `None`；
+///   * `len` 越大越界也钳到最后（引擎偶尔报末尾多一位）。
+///
+/// `loc + len - 1` 只取**末一个码元**再 `+1`，所以区间**横跨代理对**时
+/// 结果自然正确：`𠀀道` 报 `(0,2)` → `(0,2)`（两个字都亮），
+/// 而不是 `(0,1)` 只亮半个字。
+pub fn char_range_from_utf16(map: &[usize], loc: usize, len: usize) -> Option<(usize, usize)> {
+    if len == 0 || map.is_empty() {
+        return None;
+    }
+    let start = *map.get(loc)?;
+    let last = loc.saturating_add(len - 1).min(map.len() - 1);
+    let end = map[last] + 1;
+    (end > start).then_some((start, end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8152,8 +8758,333 @@ mod tests {
     // 的三模式分派（非测试代码一律走 `calculate_grid` 这个唯一入口）。
     use crate::grid::compute_grid;
 
-    /// **今日读叶**的记账规矩（v1.9.38）：单面翻一叶记一叶；对开一次进展
-    /// 两叶都记（右页与左页同时在眼前）；末叶之后不许越界虚报。
+    /// **续读的页码判据**（v1.9.80）：读错的表现是「末叶之后从卷首重来」，
+    /// 所以把四种边界钉死——单叶中间 / 单叶末叶 / 对开跨两叶越界 / 一叶书。
+    #[test]
+    fn tts_advance_covers_single_and_facing_edges() {
+        // 单叶：第 3 叶、全书 9 叶 → 当然还有下一叶。
+        assert_eq!(tts_advance(3, 9, 1), TtsAdvance::Next);
+        // 单叶末叶：已经没得翻了。
+        assert_eq!(tts_advance(9, 9, 1), TtsAdvance::AtEnd);
+        // 对开：第 8 叶一步跨两叶 → 10 > 9，末步不对开、就地停。
+        assert_eq!(tts_advance(8, 9, 2), TtsAdvance::AtEnd);
+        // 对开正好收在末叶（最后一屏仍有左半叶）→ 该翻，翻完才停。
+        assert_eq!(tts_advance(8, 10, 2), TtsAdvance::Next);
+        // 只有一叶的书：开口即末叶。
+        assert_eq!(tts_advance(0, 0, 1), TtsAdvance::AtEnd);
+    }
+
+    /// **UTF-16 码元 → char 下标**（v1.9.80 卡拉 OK 同步的核心换算）。
+    ///
+    /// 这条必须钉死的理由：`AVSpeechSynthesizer` 报的 `NSRange` 单位是
+    /// UTF-16 码元。BMP 内的字两者恰好相等，一旦混进**扩展 B 区的生僻字**
+    /// （UTF-16 里是代理对、占 2 个码元），后面每个字都会差一位——
+    /// 表现是「高亮永远比声音慢半拍」，且越读越偏，极难归因。
+    #[test]
+    fn utf16_map_handles_surrogate_pairs() {
+        // 纯 BMP：一个中文一个字，一一对应。
+        let m = utf16_char_map("道德經");
+        assert_eq!(m, vec![0, 1, 2], "BMP 汉字应一对一");
+
+        // 扩展 B 区 `𠀀`(U+20000) 占两个码元：它的两个码元都指向 char 0，
+        // 紧随其后的 `道` 才是 char 1。这就是「错位」的来源。
+        let m = utf16_char_map("𠀀道");
+        assert_eq!(m, vec![0, 0, 1], "代理对的两个码元必须都指向同一个 char");
+
+        // ASCII 与中文混排：各算各的。
+        let m = utf16_char_map("a道");
+        assert_eq!(m, vec![0, 1]);
+    }
+
+    /// `NSRange` → char 区间：正常、跨代理对、越界、空区间四种情形。
+    #[test]
+    fn nsrange_to_char_range_is_safe() {
+        let m = utf16_char_map("𠀀道經");
+        // 引擎报「从第 2 个码元起、1 个码元」= `道`（char 1）。
+        assert_eq!(char_range_from_utf16(&m, 2, 1), Some((1, 2)));
+        // 报「从 0 起、2 个码元」= 整个代理对 → 只该亮 char 0 这一个字。
+        assert_eq!(char_range_from_utf16(&m, 0, 2), Some((0, 1)));
+        // 跨过一个代理对再往后一个：`𠀀道` → char 0..2 两个字都亮。
+        assert_eq!(char_range_from_utf16(&m, 0, 3), Some((0, 2)));
+        // 越界（换页瞬间读到上一叶的区间）：不许 panic，直接不高亮。
+        assert_eq!(char_range_from_utf16(&m, 9, 1), None);
+        // 空区间：引擎偶尔报 0 长度，视为「没有进度」。
+        assert_eq!(char_range_from_utf16(&m, 0, 0), None);
+        // 末尾多报一位：钳到最后一个字，不许越界。
+        assert_eq!(char_range_from_utf16(&m, 3, 5), Some((2, 3)));
+        // 空文本：什么都没有。
+        assert_eq!(char_range_from_utf16(&[], 0, 1), None);
+    }
+
+    /// **区间 → 版面字格**（v1.9.80）：字键区间判据。
+    /// 渲染热循环里每格只做两次比较，所以这条判据错一位，表现为
+    /// 「高亮罩住了下一段的第一字」——看着像排版错，其实是区间算错。
+    #[test]
+    fn key_span_maps_char_range_onto_cells() {
+        // 一段 3 字 + 下一段 2 字（段落之间偏移归零，字典序仍等于读序）。
+        let keys = vec![(0, 0, 5), (0, 0, 6), (0, 0, 7), (0, 1, 0), (0, 1, 1)];
+        let span = tts_key_span(&keys).expect("非空必有区间");
+        assert_eq!(span.0, (0, 0, 5));
+        assert_eq!(span.1, (0, 1, 2), "末字偏移 +1 才是右开边界");
+
+        // 跨段：第 3 个字到第 4 个字。
+        let mid = (keys[2], (keys[3].0, keys[3].1, keys[3].2 + 1));
+        assert!(!tts_span_has(Some(mid), keys[1]), "段内前一格不该亮");
+        assert!(tts_span_has(Some(mid), keys[2]), "起点必须含");
+        assert!(tts_span_has(Some(mid), keys[3]), "跨段那一格必须含");
+        assert!(!tts_span_has(Some(mid), keys[4]), "右开：末字之后不算");
+
+        // 空区间 / None：一格都不亮。
+        assert_eq!(tts_key_span(&[]), None);
+        assert!(!tts_span_has(None, keys[0]));
+    }
+
+    /// **当前句的淡带**（v1.9.80）：句读是边界，且**两端都含**。
+    ///
+    /// 算错的表现很具体：淡带会跨到相邻那句去，读者看到「两个半句一起亮」，
+    /// 反而不知道该看哪——比不画更糟。
+    #[test]
+    fn sentence_span_stops_at_punctuation() {
+        let chars: Vec<char> = "道可道，非常道。名可名".chars().collect();
+        let keys: Vec<(usize, usize, usize)> =
+            (0..chars.len()).map(|i| (0usize, 0usize, i)).collect();
+
+        // 念到「道可道」的第二个字：应停在「，」上，含句读。
+        let (a, b) = sentence_key_span(&chars, &keys, 1).expect("非空");
+        assert_eq!(a, (0, 0, 0));
+        assert_eq!(b, (0, 0, 4), "半开右界 = 「，」(下标 3) 之后");
+
+        // 念到「非常道」中间：左界从「，」之后起，右界含「。」。
+        let (a, b) = sentence_key_span(&chars, &keys, 5).expect("非空");
+        assert_eq!(a, (0, 0, 4), "左界从「，」之后那一个字起");
+        assert_eq!(b, (0, 0, 8), "含句末「。」");
+
+        // 停在最后一个字（句末无句读）也不许越界。
+        let (_, b) = sentence_key_span(&chars, &keys, chars.len() - 1).expect("非空");
+        assert_eq!(b, (0, 0, chars.len()));
+
+        // 长度不匹配（理论上不该发生）：宁可不画，也不画错位的带子。
+        assert_eq!(sentence_key_span(&chars, &keys[..3], 0), None);
+        assert_eq!(sentence_key_span(&chars, &keys, 99), None);
+    }
+
+    /// **折行 / 跨段 / 空格 / 标点**四处边界（v1.9.80）。
+    ///
+    /// 竖排的「折行」= 换到下一列，字键从 `(章,0,9)` 跳到 `(章,1,0)`——
+    /// 中间**没有**任何一格属于别的句子，所以字典序区间天然把两列接起来，
+    /// 不需要专门写「拼接」逻辑。这条测试就是把这个结论钉住：
+    /// 谁要是哪天改成「按列存区间」，这里会立刻红。
+    #[test]
+    fn sentence_span_survives_column_break_and_spaces() {
+        // 一句跨两段（= 竖排跨两列），段中夹一个全角空格。
+        let chars: Vec<char> = "學而時習之不亦說乎　有朋自遠方來".chars().collect();
+        let keys: Vec<(usize, usize, usize)> = chars
+            .iter()
+            .enumerate()
+            .map(|(i, _)| (7usize, i / 8, i % 8))
+            .collect();
+
+        // 念到第 2 字：整句（这里没有句读，故一直走到串尾）。
+        let (a, b) = sentence_key_span(&chars, &keys, 2).expect("非空");
+        assert_eq!(a, keys[0], "左界从首字起");
+        assert_eq!(b, (keys[chars.len() - 1].0, keys[chars.len() - 1].1, 7 + 1), "右界收在末字之后");
+
+        // 折列处的那一格必须落在区间里（跨列拼接成立）。
+        let cross = keys[8]; // (7,1,0) —— 第二列第一个字
+        assert_ne!(cross.1, keys[7].1, "这一格确实换了列");
+        assert!(tts_span_has(Some((a, b)), cross), "跨列的那一格必须在带子里");
+
+        // 空格所在格：仍算「在句内」（它只是排版，不切断句子）。
+        let space_idx = chars.iter().position(|c| *c == '　').unwrap();
+        assert!(tts_span_has(Some((a, b)), keys[space_idx]), "空格不该切断句子");
+
+        // 标点之后必须断开：句号那一格是本句最后一格，下一字属于下一句。
+        let chars2: Vec<char> = "學而。人不知".chars().collect();
+        let keys2: Vec<(usize, usize, usize)> = (0..chars2.len()).map(|i| (0, 0, i)).collect();
+        let (_, b2) = sentence_key_span(&chars2, &keys2, 0).expect("非空");
+        assert_eq!(b2, (0, 0, 3), "右界停在句号之后（含句号）");
+        assert!(!tts_span_has(Some((keys2[0], b2)), keys2[3]), "「人」不该亮");
+    }
+
+    /// **3.0x 极速 + 竖直跨列：不许有「飞线」、不许有残影**（v1.9.81）。
+    ///
+    /// 「飞线」是个真实的风险：如果实现方式改成「按时间在旧格和新格之间
+    /// 插值坐标」，那么从第一列末尾跳到第二列开头时，两列之间的**空白列缝**
+    /// 会被扫出一条渐亮的轨迹——竖排里那正好是版心，看着像纸裂了。
+    ///
+    /// 本项目从根上排除了它：浓度是**逐格**由这一格自己的归属算出来的
+    /// （在不在当前词 / 上一词 / 当前句 / 上一句），从来没有「位置」这个量，
+    /// 也就没有「中间」。下面这条断言就是那个结构性结论的钉子。
+    #[test]
+    fn crossfade_never_paints_between_columns() {
+        // 竖排右起：列 0 末两字 → 列 1 头两字（字典序 = 读序）。
+        // 跨列必然换句，所以旧带子留一份退场（`tts_line_prev`）。
+        let mut prev_ink = f32::MAX;
+        let mut cur_ink = f32::MIN;
+        for i in 0..=10 {
+            let t = i as f32 / 10.0;
+            // ① 两列**都不属于**的格（缝隙、页边、无字段落）：恒为 0。
+            //    一格都不画，自然连不成线。
+            assert_eq!(
+                tts_cell_ink(false, false, false, false, t),
+                0.0,
+                "t={t}：两侧皆无归属的格必须完全无染"
+            );
+            // ② 旧词只退不进（含它所在的旧带子一起退）。
+            let a = tts_cell_ink(false, true, false, true, t);
+            // ③ 新词只进不退（新带子已经在 0.12 上等着它）。
+            let b = tts_cell_ink(true, false, true, false, t);
+            assert!(a <= prev_ink + 1e-6, "t={t}：旧词不许回涨（回涨就是残影）");
+            assert!(b >= cur_ink - 1e-6, "t={t}：新词不许回落（回落就是闪）");
+            // ④ 同一时刻，两格加起来也不该「两处都浓」——否则眼睛不知跟哪。
+            assert!(a + b < 0.7, "t={t}：交接期两处同时过浓（a={a:.2} b={b:.2}）");
+            prev_ink = a;
+            cur_ink = b;
+        }
+        assert_eq!(prev_ink, 0.0, "交接结束，旧列必须彻底退净");
+        assert!((cur_ink - 0.34).abs() < 1e-6, "新词必须收在满浓度");
+
+        // ⑤ 过渡恒短于词间隔 —— 这条保证「任一时刻至多一个词在交接」，
+        //    也就是高倍速下不会出现三四个半亮的格挂在一起。
+        for gap in 40u128..=400 {
+            let fade = tts_fade_ms(gap);
+            assert!(fade <= gap, "gap={gap}ms 的过渡 {fade}ms 会跨过下一次换词");
+            assert!((TTS_FADE_MIN_MS..=TTS_FADE_BASE_MS).contains(&fade));
+        }
+        // 间隔已短于下限（约 4x 以上）：不做过渡，由调用方直接定位。
+        assert!(39 < TTS_FADE_MIN_MS);
+    }
+
+    /// **超长句跨三列 + 句号/逗号**（v1.9.81）：带子要**含**句读，不挖洞。
+    ///
+    /// 这里定的是产品口径：句读含在带子里，且**当前词即使落在句读上，也照常
+    /// 升到 0.34**，不特殊对待。
+    ///
+    /// 为什么是「含」不是「绕」：
+    ///   * 绕（句读格不染）会在一条连续的带子上**开一个洞**，看起来像渲染坏了；
+    ///   * 不特殊对待，是因为引擎把停顿也报成当前位置——给句读开特例，每读到
+    ///     一个句号光标就消失一拍，卡拉 OK 会「眨眼」，比染色更难看；
+    ///   * 朱印不会因此消失：衬底是 cell 的**第一个子节点**，朱砂红圈画在它
+    ///     之上、且是满浓度（0.34 的兑色 vs 100% 的朱砂），对比仍在。
+    #[test]
+    fn long_sentence_band_keeps_punctuation_inside() {
+        // 三列各 10 格；逗号落在第 3 列，句号在下一句的列里。
+        let text = "學而時習之不亦說乎有朋自遠方來不亦樂乎人不知而不慍不亦君子乎，此之謂也。下句起";
+        let chars: Vec<char> = text.chars().collect();
+        let keys: Vec<(usize, usize, usize)> = (0..chars.len())
+            .map(|i| (5usize, i / 10, i % 10))
+            .collect();
+        let comma = chars.iter().position(|c| *c == '，').expect("有逗号");
+        let period = chars.iter().position(|c| *c == '。').expect("有句号");
+        assert!(keys[comma].1 >= 2, "这个逗号本来就落在第三列（本测的就是跨列长句）");
+
+        // ①② 念在句首：带子从左界一路含到逗号，逗号**在里面**，逗号之后断开。
+        let (a, b) = sentence_key_span(&chars, &keys, 2).expect("非空");
+        assert_eq!(a, keys[0], "左界从首字起");
+        assert_eq!(b, (keys[comma].0, keys[comma].1, keys[comma].2 + 1), "右界含逗号");
+        assert!(tts_span_has(Some((a, b)), keys[comma]), "逗号格不许被挖掉");
+        assert!(
+            !tts_span_has(Some((a, b)), keys[comma + 1]),
+            "逗号之后必须断开，否则两句一起亮"
+        );
+        // 跨列：第 2 列、第 3 列的字都在同一条带子里（字典序天然接得上）。
+        let col2 = keys.iter().position(|k| k.1 == 2).expect("有第 3 列");
+        assert!(tts_span_has(Some((a, b)), keys[col2]));
+
+        // ③ 下一句：左界从逗号之后起，右界含句号；句号之后绝不外溢。
+        let (a2, b2) = sentence_key_span(&chars, &keys, comma + 1).expect("非空");
+        assert_eq!(a2, keys[comma + 1]);
+        assert_eq!(b2, (keys[period].0, keys[period].1, keys[period].2 + 1));
+        assert!(tts_span_has(Some((a2, b2)), keys[period]), "句号格子必须含");
+        assert!(
+            !tts_span_has(Some((a2, b2)), keys[period + 1]),
+            "句号之后的下一句不许被带进来"
+        );
+
+        // ④ 句读当当前词：与普通字同一档，不做特例（否则光标会「眨眼」）。
+        let punct_ink = tts_cell_ink(true, false, true, false, 1.0);
+        let char_ink = tts_cell_ink(true, false, true, false, 1.0);
+        assert_eq!(punct_ink, char_ink, "句读格与普通字必须同档");
+        assert!((punct_ink - 0.34).abs() < 1e-6);
+        // ⑤ 两档必须拉开距离，否则「读到这一句」与「正在念这个字」分不出。
+        let band_only = tts_cell_ink(false, false, true, false, 1.0);
+        assert!((band_only - 0.12).abs() < 1e-6);
+        assert!(punct_ink - band_only > 0.2, "浓染与淡带要差得出来");
+    }
+
+    /// **性能兜底：跑不满 60fps 就退化成瞬移**（v1.9.81）。
+    ///
+    /// 判据只有一条：真实间隔 ÷ 请求间隔。比值大 = 我要的是 16ms 一帧、
+    /// 系统给了我 60ms，动画在拖时间而不是在走时间。此时的正确选择不是
+    /// 「把过渡做慢一点补偿」（那只会更卡），而是**直接不要过渡**——
+    /// 核心是「看清读到哪」，动画只是糖。
+    #[test]
+    fn slow_frames_degrade_to_instant_highlight() {
+        // ① 正常抖动不许误判：请求 16ms、实际 16–30ms 都算健康。
+        for e in [16.0f32, 18.0, 20.0, 30.0] {
+            assert!(!tts_lagging(e, 16.0), "elapsed={e} 不该判成掉帧");
+        }
+        // ② 真的卡：16ms 的请求过了 45ms 以上（掉电模式 / 低配机一叶几百格）。
+        assert!(tts_lagging(45.0, 16.0));
+        assert!(!tts_lagging(40.0, 16.0), "恰好 2.5 倍不算（边界取严）");
+        // ③ 静止档不许自己判自己：90ms 的请求正好 90ms 到达。
+        assert!(!tts_lagging(90.0, 90.0));
+        // ④ 除零保护（首拍 `asked` 尚未赋值时）。
+        assert!(!tts_lagging(500.0, 0.0));
+
+        // ⑤ 连中两拍才降级：一次抖动（切窗口、Spotlight 弹起来）不该永久关动画。
+        assert!(!tts_should_degrade(0));
+        assert!(!tts_should_degrade(TTS_LAG_STRIKES - 1));
+        assert!(tts_should_degrade(TTS_LAG_STRIKES));
+
+        // ⑥ 降级后的画面**逐像素等于稳态**：只剩 0.34 / 0.12 / 0 三档，
+        //    与没有动画的旧版完全一致——阅读不受影响，只是不再有过渡。
+        assert!((tts_cell_ink(true, false, true, false, 1.0) - 0.34).abs() < 1e-6);
+        assert_eq!(tts_cell_ink(false, true, false, true, 1.0), 0.0, "降级后不许留旧词");
+        assert!((tts_cell_ink(false, false, true, false, 1.0) - 0.12).abs() < 1e-6);
+        assert_eq!(tts_cell_ink(false, false, false, false, 1.0), 0.0);
+    }
+
+    /// **交接时长与缓动**（v1.9.81）：走满要几拍、两端要慢。
+    #[test]
+    fn crossfade_finishes_within_one_word_gap() {
+        // 3.0x：词间隔 45ms → 过渡 40ms → 16ms 一拍，三拍内必须走满。
+        let fade = tts_fade_ms(45) as f32;
+        assert_eq!(fade, TTS_FADE_MIN_MS as f32, "快读要收紧到下限");
+        let mut t = 0.0;
+        let mut beats = 0;
+        while t < 1.0 && beats < 20 {
+            t = tts_step(t, TTS_BEAT_FAST_MS as f32, fade);
+            beats += 1;
+        }
+        assert_eq!(t, 1.0, "必须走满，不许停在半亮");
+        assert!(beats <= 3, "3 拍内走满，实际 {beats} 拍");
+
+        // 1.0x：词间隔 250ms → 过渡用基准 100ms（从容，但不是 100→无限）。
+        assert_eq!(tts_fade_ms(250), TTS_FADE_BASE_MS);
+        assert_eq!(tts_fade_ms(400), TTS_FADE_BASE_MS);
+
+        // 缓动：两端平、中间快，单调不过界。
+        assert_eq!(tts_ease(0.0), 0.0);
+        assert_eq!(tts_ease(1.0), 1.0);
+        assert!((tts_ease(0.5) - 0.5).abs() < 1e-6);
+        assert!(tts_ease(0.25) < 0.25, "起手要慢");
+        assert!(tts_ease(0.75) > 0.75, "收手要慢");
+        let mut last = -1.0;
+        for i in 0..=100 {
+            let e = tts_ease(i as f32 / 100.0);
+            assert!(e >= last, "缓动必须单调");
+            last = e;
+        }
+        // 引擎偶发报越界下标：钳住，不许把浓度算出界。
+        assert_eq!(tts_ease(2.0), 1.0);
+        assert_eq!(tts_ease(-1.0), 0.0);
+
+        // 时长为 0（异常路径）：直接判完，不许悬在 0.5 上永远不动。
+        assert_eq!(tts_step(0.4, 16.0, 0.0), 1.0);
+    }
+
+    /// **今日读叶**的记账规矩（v1.9.38）：单面翻一叶记一叶；对开一次进展    /// 两叶都记（右页与左页同时在眼前）；末叶之后不许越界虚报。
     ///
     /// 这条规矩错一点，书架上那个数目就是假的——而「假数目」比没有更伤：
     /// 用户会觉得这软件连自己读了几页都数不明白。
