@@ -301,10 +301,47 @@ fn dirty_json_nested_and_truncated() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **智能 JSON 兼容层**（v1.9.77）：走到 `ParsedDoc` 这一步，注疏必须已经
+/// 是真正的 `Note`（双行小字夹注），而且……
+///
+/// * 深嵌套（`chapters[].sections[].paragraphs[].text`）要抽得出来；
+/// * `[注]` / `[/注]` 一个字都不许留在正文里（那是排版事故的根源）；
+/// * `null` 注疏跳过，不留空壳。
+#[test]
+fn json_notes_turn_into_parsed_doc_glosses() {
+    let dir = tmpdir("json-notes");
+    let j = r#"{"book":"史記","chapters":[{"title":"五帝本紀第一","sections":[
+        {"paragraphs":[
+            {"text":"黃帝者，少典之子。","note":"集解：譙周曰，有熊國君。"},
+            {"text":"姓公孫，名曰軒轅。","annotation":null}
+        ]}
+    ]}]}"#;
+    let p = write_bytes(&dir, "三家注.json", j.as_bytes());
+    let doc = import_file(&p).expect("带注疏的 JSON 应能导入");
+    let b = doc.book.to_book();
+    let t = all_text(&doc);
+    assert_clean(&t);
+    assert!(t.contains("黃帝者"), "深嵌套正文丢了：{t}");
+    assert!(t.contains("姓公孫"), "同级第二段丢了：{t}");
+    assert!(!t.contains("[注]"), "开标签漏进正文：{t}");
+    assert!(!t.contains("[/注]"), "收标签漏进正文：{t}");
+    assert!(!t.contains("集解"), "注文混进正文大字：{t}");
+
+    let notes: Vec<&str> = b
+        .chapters
+        .iter()
+        .flat_map(|c| c.paragraphs.iter())
+        .flat_map(|p| p.notes.iter())
+        .map(|n| n.text.as_str())
+        .collect();
+    assert_eq!(notes.len(), 1, "注文没变成夹注：{notes:?}");
+    assert!(notes[0].contains("集解"), "注家名丢了：{notes:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ----------------------------------------------------------------------
 // 八、漏斗本身的契约（不在用户点名的七条里，但必须钉死）
-// ----------------------------------------------------------------------
-#[test]
+// ----------------------------------------------------------------------#[test]
 fn unsupported_extension_is_a_readable_error() {
     let dir = tmpdir("ext");
     // PDF 自 v1.9.25 起是**正式格式**（统一漏斗里的一等公民），不再是「不支持

@@ -1,13 +1,9 @@
 //! JSON：书稿 / 剪藏 / 备份都可能长成 JSON，而**每家的键名都不一样**。
 //!
-//! 所以这里不用 `serde` 反序列化成固定结构（一条字段对不上就整本失败），
-//! 而是走 `serde_json::Value` **容错遍历**：
-//!
-//! * 认得 `content` / `text` / `paragraphs` / `body` / `chapters` 这几组常见键；
-//! * 对象里同时有 `title` 与正文键时，**先出标题再出正文**（章名不能掉到章尾）；
-//! * 认不出的对象就递归往下翻——多收不漏；
-//! * 整份 JSON 语法就坏了（截断、缺右括号）时，退化成正则捞 `"content": "..."`
-//!   的字符串值，能救多少救多少——这就是「忽略所有解析失败的节点」。
+//! 本文件只负责**字节 → 字符串**（编码识别 + 语法坏掉时的正则抢救）。
+//! 结构怎么认、注疏怎么转 `[注]…[/注]`、嵌套多深才降级为纯文本——那是
+//! [`jiandu_core::jsonkit`] 的事，core 导入路径与本路径**共用同一份实现**，
+//! 同一条脏数据从书架进来和从工作台进来不会得到两本书。
 
 use std::path::Path;
 
@@ -36,23 +32,17 @@ impl FormatParser for JsonParser {
 
 /// 从 JSON 文本里抠出正文（语法坏了也不报错，能救多少救多少）。
 ///
-/// v1.69.0：**结构化提取，绝不无脑遍历**。开源古籍 JSON 里 `pinyin`
-/// `book` `volume` `author` 这些字段和 `content` 平级躺着，旧版「认不出
-/// 就递归翻一遍」会把它们连同正文一起收进来——于是拼音被**一个字母一格**
-/// 竖着排成人间惨剧。现在只认键名：正文键收正文，其余一律当元数据丢掉。
+/// v1.9.77：**正文抽取本身不在这个文件里了**——统一交给
+/// [`jiandu_core::jsonkit`]（智能 JSON 兼容层）。这里只剩「字节 → 字符串」与
+/// 「语法坏掉时的正则抢救」两件事。
+///
+/// 为什么不再自己写一份：同一套键名表在 core 与 app 各存一份，迟早会分叉
+/// （core 那边已经会认注疏字段、会往下递归四层，app 这份还停在「只认第一层 +
+/// 把 `note` 当元数据丢掉」）。两处口径必须**同一个函数**，否则同一份 JSON 从
+/// 书架进来和从工作台进来会得到两本书。
 pub fn extract_json(src: &str) -> String {
     match serde_json::from_str::<Value>(src) {
-        Ok(v) => {
-            let mut paras: Vec<String> = Vec::new();
-            collect(&v, &mut paras);
-            // 一个字都没抠到：说明这份 JSON 的正文键我们没认出来（小众
-            // schema）。这时**退回宽松遍历**兜底——有字胜过无字，反正
-            // 下游 `cleaner` 还会把拼音 / 站名再洗一遍。
-            if paras.is_empty() {
-                collect_lenient(&v, &mut paras);
-            }
-            paras.join("\n")
-        }
+        Ok(v) => jiandu_core::jsonkit::flatten_text(&v),
         // 整份不成立：正则 Salvage（只认带正文语义的键）。
         Err(_) => salvage_by_regex(src).join("\n"),
     }
@@ -125,77 +115,7 @@ fn scan_meta(
     }
 }
 
-/// 正文键（认得出就用这个顺序）。
-const BODY_KEYS: [&str; 11] = [
-    "content", "text", "paragraphs", "body", "chapters", "paragraph", "sentences", "lines",
-    // 中文 schema 里常见的正文键。
-    "原文", "正文", "内容",
-];
-
-/// 题名键（先出标题再出正文，章名才不会掉到章尾）。
-const TITLE_KEYS: [&str; 6] = ["title", "name", "标题", "篇", "章", "章题"];
-
-fn collect(v: &Value, out: &mut Vec<String>) {
-    match v {
-        // 走到这里的 `Value::String` 只可能是**正文键**递下来的（顶层裸串
-        // 同理），元数据键在下面已经被拦掉了。
-        Value::String(s) => push_para(out, s),
-        Value::Array(a) => a.iter().for_each(|x| collect(x, out)),
-        Value::Object(m) => {
-            let body = find_body(m);
-            if let Some(b) = body {
-                // ① 有正文键：先出题名（章名不能掉到章尾），再出正文。
-                //    其余键（pinyin / book / volume / author …）**一律不收**。
-                if let Some(Value::String(ts)) = find_title(m) {
-                    push_para(out, ts);
-                }
-                collect(b, out);
-                return;
-            }
-            // ② 没有正文键：只往下翻**数组 / 对象**——不认识的键名下的
-            //    字符串一律丢弃（那正是「佚名」「卷三」「lùn yǔ」这类
-            //    元数据混进正文的入口，v1.69.0）。
-            for (k, val) in m {
-                if is_meta_key(k) {
-                    continue;
-                }
-                match val {
-                    Value::Array(_) | Value::Object(_) => collect(val, out),
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// 兜底遍历（只在**严格提取一无所获**时才跑）：认不出键名就把所有字符串
-/// 都捞一遍。宁可脏一点，也不能整本导入成空白。
-fn collect_lenient(v: &Value, out: &mut Vec<String>) {
-    match v {
-        Value::String(s) => push_para(out, s),
-        Value::Array(a) => a.iter().for_each(|x| collect_lenient(x, out)),
-        Value::Object(m) => {
-            for (k, val) in m {
-                if is_meta_key(k) {
-                    continue;
-                }
-                collect_lenient(val, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// 只在顶层对象里找正文键（大小写不敏感）。
-fn find_body(m: &serde_json::Map<String, Value>) -> Option<&Value> {
-    BODY_KEYS.iter().find_map(|k| get_ci(m, k))
-}
-
-fn find_title(m: &serde_json::Map<String, Value>) -> Option<&Value> {
-    TITLE_KEYS.iter().find_map(|k| get_ci(m, k))
-}
-
+/// 只在顶层对象里按大小写不敏感取键（元数据认书名的几十行仍在用）。
 fn get_ci<'a>(m: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a Value> {
     if let Some(v) = m.get(key) {
         return Some(v);
@@ -205,37 +125,15 @@ fn get_ci<'a>(m: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a Va
         .map(|(_, v)| v)
 }
 
-/// 元信息字段：**绝不进正文流**。
+/// 收一段（只给下面的正则抢救用）：去掉首尾空白、压掉纯空白段。
 ///
-/// v1.69.0 大扩军：开源古籍 JSON 的元数据字段多到离谱（`pinyin`、
-/// `book`、`volume`、`author`、`translator`…），旧表只认得 `id`/`author`
-/// 那几个，剩下的全被当正文收进来了——竖排里就是「拼音字母竖着排」、
-/// 「佚名」占一列、「卷三」混在正文中间。
-fn is_meta_key(k: &str) -> bool {
-    matches!(
-        k.to_ascii_lowercase().as_str(),
-        "id" | "uuid" | "isbn" | "author" | "authors" | "meta" | "metadata" | "toc" | "cover"
-            | "language" | "lang" | "date" | "publisher" | "version" | "created" | "updated"
-            | "url" | "source" | "site" | "tags" | "icon" | "css" | "style"
-            // —— 以下 v1.69.0 新增：古籍 JSON 的元数据四件套 ——
-            | "pinyin" | "py" | "pron" | "pronunciation" | "phonetic" | "zhuyin" | "注音"
-            | "拼音" | "romaji" | "tone" | "tones"
-            | "book" | "books" | "书名" | "volume" | "vol" | "juan" | "卷" | "卷名"
-            | "chapter_no" | "chapter_num" | "num" | "index" | "idx" | "order" | "序号"
-            | "translator" | "dynasty" | "editor" | "annotator" | "series" | "category"
-            | "keywords" | "commentary" | "annotation" | "note" | "notes" | "注释" | "译文"
-            | "translation" | "meaning" | "explain" | "shiyi" | "english" | "en"
-            | "simplified" | "traditional"
-    )
-}
-
-/// 收一段：去掉首尾空白、压掉纯空白段；内部换行原样保留（一段里可以有多句）。
+/// 正常路径的段落清洗在 `jiandu_core::jsonkit` 里（含 HTML 标签与实体处理），
+/// 这里只管「半截文件里捞出来的裸字符串」。
 fn push_para(out: &mut Vec<String>, s: &str) {
     let t = s.trim();
     if t.is_empty() {
         return;
     }
-    // 一坨里如果自带换行，按行拆开——下游按行断段。
     for line in t.split('\n') {
         let l = line.trim();
         if !l.is_empty() {

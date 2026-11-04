@@ -55,6 +55,13 @@ pub trait ChapterSink {
     fn drop_at(&mut self, idxs: &[usize]);
     /// 改写章题（目录润色之后题名才定得下来，那时正文早已落盘）。
     fn set_title(&mut self, idx: usize, title: &str);
+    /// 导入期的**非致命提示**：「事成了，但用户该知道代价」。
+    ///
+    /// 只送这类话（例：JSON 结构太复杂、已降级为纯文本），**绝不用它报错**——
+    /// 错误走 `Result`，让导入整本失败、由 UI 明确弹出。
+    ///
+    /// 默认丢弃：不是每个 sink 都需要把提示送到用户眼前。
+    fn notice(&mut self, _msg: &str) {}
 }
 
 /// 往 SQLite 里落的 sink（生产用）。
@@ -68,6 +75,10 @@ pub struct DbSink {
     total_hint: usize,
     done_hint: usize,
     chars: usize,
+    /// 导入期的非致命提示（去重后按发生顺序留），由 [`import_streaming_reported`]
+    /// 取走交给 UI。放在 sink 里而不是返回值里：提示是在**解析过程中**冒出来的
+    /// （`import_into` 内部），那时还没有可返回值。
+    notices: Vec<String>,
 }
 
 impl DbSink {
@@ -86,6 +97,7 @@ impl DbSink {
             total_hint: total_hint.max(1),
             done_hint: 0,
             chars: 0,
+            notices: Vec::new(),
         };
         // 整本一个事务：千章级的书不再「每章一次 fsync」（见 store::begin_bulk）。
         // 失败也不致命——退回逐章自动提交，只是慢一点。
@@ -106,6 +118,11 @@ impl DbSink {
     /// 全书字数（导入报告用）。
     pub fn chars(&self) -> usize {
         self.chars
+    }
+
+    /// 取走导入期的非致命提示（供 [`import_streaming_reported`] 转交 UI）。
+    pub fn notices(&self) -> Vec<String> {
+        self.notices.clone()
     }
 
     /// 底层连接（单测要直接查库验证「确实写进去了」）。
@@ -252,6 +269,15 @@ impl ChapterSink for DbSink {
     fn set_title(&mut self, idx: usize, title: &str) {
         let _ = store::set_title(&self.conn, &self.id, idx, title);
     }
+    fn notice(&mut self, msg: &str) {
+        if msg.trim().is_empty() {
+            return;
+        }
+        // 同一句只留一次：一条链路上多个章节各自降级时，别把同一句堆十遍。
+        if !self.notices.iter().any(|m| m == msg) {
+            self.notices.push(msg.to_string());
+        }
+    }
 }
 
 /// 导入一整本书（流式）：解析、清洗、切片、落盘一气呵成。
@@ -265,6 +291,18 @@ pub fn import_streaming(
     path: &Path,
     on_progress: Option<Box<dyn Fn(f32, String) + Send>>,
 ) -> Result<(Book, String)> {
+    import_streaming_reported(path, on_progress).map(|(book, id, _)| (book, id))
+}
+
+/// 与 [`import_streaming`] 相同，另外把**导入期的非致命提示**带回来
+/// （目前只有一条：JSON 结构太复杂、已降级为纯文本）。
+///
+/// 单开一个函数而不是改原签名：批处理等只需要「成没成」的调用点
+/// 一个字都不用动。
+pub fn import_streaming_reported(
+    path: &Path,
+    on_progress: Option<Box<dyn Fn(f32, String) + Send>>,
+) -> Result<(Book, String, Vec<String>)> {
     let id = store_id_for(path);
     let conn = store::connect()?;
     let file_len = std::fs::metadata(path)
@@ -300,7 +338,8 @@ pub fn import_streaming(
         let c = store::connect()?;
         store::put_book(&c, &id, &book.title, &book.author, &meta)?;
     }
-    Ok((book, id))
+    let notices = sink.notices();
+    Ok((book, id, notices))
 }
 
 /// 取回一章的正文（虚拟化读路径）。
@@ -655,6 +694,44 @@ mod tests {
             .collect();
         assert!(!skeleton.chapter_loaded(0), "骨架模式下第 0 章是空的");
         assert!(skeleton.is_virtual());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **JSON 降级提示要一路走到 sink**（v1.9.77）。
+    ///
+    /// 结构认不出来的 JSON 不许报错——捞字符串当纯文本读，但要留一句
+    /// 「已降级为纯文本导入」，由 UI 在成功上架时告诉用户代价。
+    /// 这条测的是「core 内部 → sink」那一段，`import_json_into` 里冒出来的
+    /// 提示必须真的被 sink 收下（默认实现是丢弃，很容易写漏）。
+    #[test]
+    fn json_downgrade_notice_reaches_the_sink() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("jiandu-json-notice-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("奇葩.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(r#"{"payload":{"unknown":{"blob":["道可道，非常道。",null,7]}}}"#.as_bytes())
+            .unwrap();
+
+        let conn = store::connect_in_memory().expect("内存库");
+        let mut sink = DbSink::new(conn, "test-json-notice", 1, None);
+        let book = crate::importer::import_json_into(&path, &mut sink).expect("奇葩结构不该报错");
+        assert!(!book.title.is_empty());
+        assert_eq!(sink.len(), 1, "应落成 1 章");
+
+        let notices = sink.notices();
+        assert_eq!(notices.len(), 1, "降级提示没送到 sink：{notices:?}");
+        assert_eq!(notices[0], crate::importer::JSON_DOWNGRADED_NOTICE);
+        assert!(notices[0].contains("降级为纯文本"), "{notices:?}");
+
+        // 正文确实还在（降级是「丢了结构」，不是「丢了字」）。
+        let ch = store::load_chapter(sink.conn(), "test-json-notice", 0)
+            .unwrap()
+            .expect("第 0 章应在库里");
+        let body: String = ch.paragraphs.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(body, "道可道，非常道。");
 
         std::fs::remove_file(&path).ok();
     }

@@ -1145,6 +1145,9 @@ pub struct ImportJob {
     pct: std::sync::Arc<std::sync::Mutex<f32>>,
     label: std::sync::Arc<std::sync::Mutex<String>>,
     done: std::sync::Arc<std::sync::Mutex<Option<ImportOutcome>>>,
+    /// 导入期的**非致命提示**（例：「此 JSON 格式过于复杂，已降级为纯文本导入」）。
+    /// 由 core 的 sink 一路带回来，主线程成功上架时取走并弹给用户。
+    notices: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// 起刻时刻（v1.69.0 看门狗用）。
     started: std::time::Instant,
     /// 上一次**观测到进度有推进**的时刻。
@@ -1181,11 +1184,13 @@ impl ImportJob {
         let pct = std::sync::Arc::new(std::sync::Mutex::new(0.0f32));
         let label = std::sync::Arc::new(std::sync::Mutex::new("雕版刻印中".to_string()));
         let done = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let p = path.clone();
         let pct2 = pct.clone();
         let lab2 = label.clone();
         let done2 = done.clone();
+        let notes2 = notices.clone();
         std::thread::spawn(move || {
             let cb = move |v: f32, s: String| {
                 if let Ok(mut g) = pct2.lock() {
@@ -1208,8 +1213,14 @@ impl ImportJob {
                 // 兜底：v1.62.0 的多格式漏斗——脏编码 TXT / 畸形 EPUB /
                 // 半截 JSON 这类「主路读不动」的稿子，换漏斗再试一次
                 // （整本入库，store_id 留空）。
-                match crate::stream::import_streaming(&p, Some(Box::new(cb))) {
-                    Ok((book, id)) => Ok((book, id, p.clone())),
+                match crate::stream::import_streaming_reported(&p, Some(Box::new(cb))) {
+                    Ok((book, id, notes)) => {
+                        // 非致命提示（JSON 结构太复杂等）随结果带出去，由主线程弹。
+                        if let Ok(mut g) = notes2.lock() {
+                            *g = notes;
+                        }
+                        Ok((book, id, p.clone()))
+                    }
                     Err(main_err) => {
                         // 兜底路径同样要心跳（v1.9.34）：PDF 整本抽取要一页页来，
                         // 没有 `cb` 推进度，看门狗 3 秒不见变化就会判「文件损坏」
@@ -1235,6 +1246,7 @@ impl ImportJob {
             pct,
             label,
             done,
+            notices,
             started: now,
             moved: now,
             // 初始签名 = 「0% + 初始文案」：这样第一帧比下来是「没推进」，
@@ -1259,6 +1271,11 @@ impl ImportJob {
     /// 取走结果（只可能成功一次；没完成返回 `None`）。
     pub fn take_done(&self) -> Option<std::result::Result<(Book, String, PathBuf), String>> {
         self.done.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// 导入期的非致命提示（目前只有「JSON 结构太复杂，已降级为纯文本」）。
+    pub fn notices(&self) -> Vec<String> {
+        self.notices.lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
 
@@ -4039,6 +4056,9 @@ impl Root {
             cx.notify();
             return;
         };
+        // 后端带回来的非致命提示（JSON 结构太复杂、已降级为纯文本…）。
+        // 必须在 `job` 还在手上时取——它随 ImportJob 一起被 take 掉了。
+        let notices = job.notices();
         match res {
             Ok((book, sid, src)) => {
                 let title = book.title.clone();
@@ -4053,7 +4073,13 @@ impl Root {
                         // 索引不在这里建：推给后台慢慢补，首屏不为它等。
                         self.mark_shelf_birth(&sid, book.store_id.as_deref(), &book.title);
                         self.enqueue_fts(sid);
-                        self.notice = format!("已上架：{title}");
+                        // 有提示就先说提示（用户最需要知道「这本进来的是降级稿」），
+                        // 上架结果缩进括号里当后缀。
+                        self.notice = if notices.is_empty() {
+                            format!("已上架：{title}")
+                        } else {
+                            format!("{}（已上架：{title}）", notices.join("；"))
+                        };
                     }
                     Err(e) => self.notice = format!("导入失败：{e}"),
                 }

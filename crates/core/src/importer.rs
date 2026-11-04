@@ -628,10 +628,24 @@ pub fn import_docx(path: &Path) -> Result<Book> {
 }
 
 pub fn import_json(path: &Path) -> Result<Book> {
+    import_json_report(path).map(|(book, _)| book)
+}
+
+/// 与 [`import_json`] 相同，另外交出 JSON 兼容层的体检报告。
+///
+/// `ingest_inline_notes` 必须在这里跑：兼容层产出的是 `[注]…[/注]` **字面标签**，
+/// 只有吸成 `Paragraph::notes` 之后，排版层才会把它们排成双行小字；
+/// 留在 `text` 里就会被当「[」「注」「]」四个正文字排进字格（v1.36 的老坑）。
+fn import_json_report(path: &Path) -> Result<(Book, crate::jsonkit::JsonReport)> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("读取 json 失败: {}", path.display()))?;
-    parse_json_book(&text, &file_stem(path))
+    let (mut book, rep) = adapt_json_book_report(&text, &file_stem(path))?;
+    book.ingest_inline_notes();
+    Ok((book, rep))
 }
+
+/// 结构认不出来时的提示语（原样交给 UI 弹，别在中间改字）。
+pub const JSON_DOWNGRADED_NOTICE: &str = "此 JSON 格式过于复杂，已降级为纯文本导入";
 
 /// JSON **流式**导入：整本读入 → core 数据适配器归一为统一 `Book` → 逐章
 /// 交 sink 落盘、随即释放。
@@ -644,7 +658,11 @@ pub fn import_json_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
     sink.tick(0.05, "雕版 读取 JSON");
     // 读整本 + 反序列化（JSON 天然是一棵对象，不能像 EPUB 那样逐篇流式；
     // 但只读一次、反序列化后即逐章落盘释放，峰值内存只多「一份原文」）。
-    let full = import_json(path)?;
+    let (full, rep) = import_json_report(path)?;
+    // 结构没认出来、退化成「把字符串都捞一遍」：**不报错**，但要告诉用户代价。
+    if rep.downgraded {
+        sink.notice(JSON_DOWNGRADED_NOTICE);
+    }
     sink.tick(
         0.6,
         &format!("雕版 {} 章 · 落盘", full.chapters.len().max(1)),
@@ -698,6 +716,17 @@ pub fn parse_json_book(text: &str, fallback_title: &str) -> Result<Book> {
 pub const ERR_JSON_FORMAT: &str = "此卷竹简散乱，无法识读（JSON 格式有误）";
 
 pub fn adapt_json_book(raw: &str, fallback_title: &str) -> Result<Book> {
+    adapt_json_book_report(raw, fallback_title).map(|(book, _)| book)
+}
+
+/// 与 [`adapt_json_book`] 相同，另外交出[体检报告](crate::jsonkit::JsonReport)。
+///
+/// 导入层靠这份报告判断「结构没认出来、只好降级为纯文本」，好向用户解释代价。
+pub fn adapt_json_book_report(
+    raw: &str,
+    fallback_title: &str,
+) -> Result<(Book, crate::jsonkit::JsonReport)> {
+    let mut rep = crate::jsonkit::JsonReport::default();
     let v: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => {
@@ -707,7 +736,7 @@ pub fn adapt_json_book(raw: &str, fallback_title: &str) -> Result<Book> {
                 return Err(anyhow!(ERR_JSON_FORMAT));
             }
             // 纯文本兜底：包成「无题 · 正文」单章。
-            return Ok(plain_text_book(raw));
+            return Ok((plain_text_book(raw), rep));
         }
     };
 
@@ -717,20 +746,22 @@ pub fn adapt_json_book(raw: &str, fallback_title: &str) -> Result<Book> {
             let mut book = Book::new(fallback_title, "");
             book.cover.title = fallback_title.to_string();
             for ch in &items {
-                book.chapters.push(value_to_chapter(ch));
+                book.chapters.push(value_to_chapter_report(ch, &mut rep));
             }
             if book.chapters.is_empty() {
                 return Err(anyhow!(ERR_JSON_FORMAT));
             }
-            Ok(book)
+            Ok((book, rep))
         }
+        // 根就是一串字（`"道可道"`）：当纯文本读，别报错。
+        serde_json::Value::String(s) => Ok((plain_text_book(&s), rep)),
         serde_json::Value::Object(_) => {
             // 形态 1：完整 Book 直用（章节 / 夹注 / 题署齐全）。
             if let Ok(mut book) = serde_json::from_str::<Book>(raw) {
                 if book.cover.title.is_empty() {
                     book.cover.title = book.title.clone();
                 }
-                return Ok(book);
+                return Ok((book, rep));
             }
             // v1.69.0：书名键**按优先级认**——开源古籍 JSON 常把书名放在
             // `book` 字段（另有 `volume` / `pinyin` 等一堆元数据）。旧版只
@@ -774,71 +805,66 @@ pub fn adapt_json_book(raw: &str, fallback_title: &str) -> Result<Book> {
             if let Some(chs) = v.get("chapters").and_then(|x| x.as_array()) {
                 // 形态 2：标准多章。
                 for ch in chs {
-                    book.chapters.push(value_to_chapter(ch));
+                    book.chapters.push(value_to_chapter_report(ch, &mut rep));
                 }
             } else if let Some(ch) = v.get("chapter") {
                 // 形态 3：单数章节 —— 自动包成 [chapter]。
-                book.chapters.push(value_to_chapter(ch));
+                book.chapters.push(value_to_chapter_report(ch, &mut rep));
             } else {
                 // 形态 4：根节点本身就是一章。
-                book.chapters.push(value_to_chapter(&v));
+                book.chapters.push(value_to_chapter_report(&v, &mut rep));
             }
 
             if book.chapters.is_empty() {
                 return Err(anyhow!(ERR_JSON_FORMAT));
             }
-            Ok(book)
+            Ok((book, rep))
         }
         _ => Err(anyhow!(ERR_JSON_FORMAT)),
     }
 }
 
 /// 把单个章节值（来自 chapters 数组 / 单数 chapter / 根节点）归一为 `Chapter`。
-/// 正文支持两种写法：`paragraphs:[...]` 或 `content:"..."`（按换行切段）。
+///
+/// v1.9.77：正文抽取整条交给 [`crate::jsonkit`]（智能 JSON 兼容层）——
+/// 它认得 `content` / `text` / `body` / `paragraphs` 等正文字段，会一层层往
+/// 下递归（`chapters[].sections[].paragraphs[].text` 也照收），并把注疏字段
+/// （`note` / `annotation` / `注释` / 三家注）就地包成 `[注]…[/注]`。
+/// 标签随后由 `ingest_inline_notes` 吸成真正的双行小字夹注——**一个字都不进正文格**。
 fn value_to_chapter(ch: &serde_json::Value) -> Chapter {
+    value_to_chapter_report(ch, &mut crate::jsonkit::JsonReport::default())
+}
+
+/// 带体检报告的同款：`rep` 累计「降级 / 注文条数」，供导入层提示用户。
+fn value_to_chapter_report(
+    ch: &serde_json::Value,
+    rep: &mut crate::jsonkit::JsonReport,
+) -> Chapter {
     let ct = ch
         .get("title")
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    let mut paragraphs: Vec<Paragraph> = Vec::new();
-    // v1.9.9：JSON 里的内容字段常常整段塞着 `<p>正文</p>`，先洗净再入段。
-    if let Some(ps) = ch.get("paragraphs").and_then(|x| x.as_array()) {
-        for p in ps {
-            match p {
-                serde_json::Value::String(s) => {
-                    paragraphs.push(para_of(&crate::dclean::strip_html_residue(s)))
-                }
-                serde_json::Value::Object(_) => {
-                    if let Ok(pp) = serde_json::from_value::<Paragraph>(p.clone()) {
-                        paragraphs.push(pp);
-                    }
-                }
-                _ => {}
-            }
-        }
-    } else if let Some(content) = ch.get("content").and_then(|x| x.as_str()) {
-        let washed = crate::dclean::strip_html_residue(content);
-        for seg in washed.split('\n') {
-            let seg = seg.trim();
-            if !seg.is_empty() {
-                paragraphs.push(para_of(seg));
-            }
+    // ① 整章就是**本工程自己的** `Paragraph` 形状（`{text, notes:[{at,…}]}`）：
+    //    直接反序列化，锚点一字不动。压成 `[注]` 只能挂在段末，精确的
+    //    `at` 下标会丢——同一段三枚注会全糊到段尾，那是排版事故。
+    if crate::jsonkit::is_structured_paragraphs(ch) {
+        if let Ok(full) = serde_json::from_value::<Chapter>(ch.clone()) {
+            return Chapter {
+                title: ct,
+                paragraphs: full.paragraphs,
+            };
         }
     }
-    // v1.9.9 **递归字段寻址兜底**：结构千奇百怪（正文埋在
-    // `data.list[].body.text` 这种地方），取不到就全局捞一遍像正文的字段。
-    if paragraphs.is_empty() {
-        for s in crate::dclean::deep_pick_text(ch) {
-            for seg in s.split('\n') {
-                let seg = seg.trim();
-                if !seg.is_empty() {
-                    paragraphs.push(para_of(seg));
-                }
-            }
-        }
+    // ② 兼容层：深递归抽正文 + 注疏转 `[注]…[/注]`。
+    let paragraphs: Vec<Paragraph> = crate::jsonkit::paragraphs_of(ch, rep)
+        .iter()
+        .map(|line| para_of(line))
+        .collect();
+    Chapter {
+        title: ct,
+        paragraphs,
     }
-    Chapter { title: ct, paragraphs }
 }
 
 /// 纯文本（非 JSON）兜底：包成 `{title:"无题", chapters:[{title:"正文", content: 文本}]}`。
@@ -2329,5 +2355,95 @@ mod tests {
         assert!(sink.pushes >= 100, "大书应拆成多章，实际 {} 章", sink.pushes);
         assert!(!book.title.is_empty());
         std::fs::remove_file(&path).ok();
+    }
+
+    // ── JSON 智能兼容层（v1.9.77）───────────────────────────────────────
+
+    /// 段落正文拼起来（比对用）。
+    fn joined_text(b: &Book) -> String {
+        b.chapters
+            .iter()
+            .flat_map(|c| c.paragraphs.iter())
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// **主诉**：注疏字段 → 真夹注。标签一个字都不许留在正文里。
+    #[test]
+    fn json_notes_become_real_glosses() {
+        let raw = r#"{"book":"史記","chapters":[{"title":"五帝本紀","paragraphs":[
+            {"text":"黃帝者，少典之子。","note":"集解：譙周曰，有熊國君。"}
+        ]}]}"#;
+        let b = parse_json_book(raw, "史記").expect("应能解析");
+        let p = &b.chapters[0].paragraphs[0];
+        assert_eq!(p.text, "黃帝者，少典之子。", "标签漏进正文：{:?}", p.text);
+        assert_eq!(p.notes.len(), 1, "注文没吸成夹注：{:?}", p.notes);
+        assert!(p.notes[0].text.contains("集解"), "{:?}", p.notes[0].text);
+        assert_eq!(
+            p.notes[0].at,
+            p.text.chars().count() - 1,
+            "注该锚在宿主段末字上"
+        );
+    }
+
+    /// **递归到底**：`chapters[].sections[].paragraphs[].text` 四层也要抽到。
+    #[test]
+    fn json_deep_nesting_is_reached() {
+        let raw = r#"{"chapters":[{"title":"卷一","sections":[
+            {"paragraphs":[{"text":"甲。","note":"注甲。"},{"text":"乙。"}]}
+        ]}]}"#;
+        let b = parse_json_book(raw, "x").expect("深嵌套应能解析");
+        let ps = &b.chapters[0].paragraphs;
+        assert_eq!(ps.len(), 2, "深嵌套正文没抽全：{:?}", joined_text(&b));
+        assert_eq!(ps[1].text, "乙。");
+        assert_eq!(ps[0].notes.len(), 1);
+    }
+
+    /// `null` 注疏 / 空字符串：跳过，绝不留空壳、绝不 panic。
+    #[test]
+    fn json_null_notes_are_skipped() {
+        let raw = r#"{"paragraphs":[
+            {"text":"甲。","note":null},
+            {"text":"乙。","note":""},
+            {"text":"丙。","annotation":[]}
+        ]}"#;
+        let b = parse_json_book(raw, "x").expect("空值不该报错");
+        let ps = &b.chapters[0].paragraphs;
+        assert_eq!(ps.len(), 3);
+        for p in ps {
+            assert!(p.notes.is_empty(), "空注文留下了壳：{:?}", p.notes);
+            assert!(!p.text.contains('['), "标签漏进正文：{:?}", p.text);
+        }
+    }
+
+    /// HTML 标签 / 实体绝不能流到排版层。
+    #[test]
+    fn json_html_residue_never_reaches_paragraphs() {
+        let raw = r#"{"content":"<p>道可道，<b>非常</b>道。</p><p>名可名。<br/>非常名。</p>"}"#;
+        let b = parse_json_book(raw, "x").expect("应能解析");
+        let joined = joined_text(&b);
+        assert!(!joined.contains('<'), "标签漏进正文：{joined}");
+        assert!(!joined.contains("&nbsp;"), "实体漏进正文：{joined}");
+        assert!(joined.contains("道可道，非常道。"), "{joined}");
+        assert!(joined.contains("非常名。"), "{joined}");
+    }
+
+    /// **静默降级**：认不出结构的奇葩 JSON 不报错，捞字符串当纯文本，并置标记。
+    #[test]
+    fn weird_json_degrades_silently_with_a_report() {
+        let raw = r#"{"payload":{"unknown":{"blob":["道可道，非常道。",null,3]}}}"#;
+        let (b, rep) = adapt_json_book_report(raw, "无题").expect("奇葩结构不该报错");
+        assert!(rep.downgraded, "应标记为降级");
+        assert_eq!(joined_text(&b), "道可道，非常道。");
+        assert!(JSON_DOWNGRADED_NOTICE.contains("降级为纯文本"));
+    }
+
+    /// 结构认得出时**不许**误报降级（否则每本 JSON 都弹一句废话）。
+    #[test]
+    fn normal_json_is_not_reported_as_downgraded() {
+        let raw = r#"{"chapters":[{"title":"學而","content":"子曰：學而時習之。"}]}"#;
+        let (_, rep) = adapt_json_book_report(raw, "論語").expect("应能解析");
+        assert!(!rep.downgraded);
     }
 }
