@@ -25,6 +25,27 @@ use std::path::PathBuf;
 /// 5000 字对古籍是「一卷」的量级，切在句读处，读起来仍是完整的段落。
 pub const MAX_CHAPTER_CHARS: usize = 5000;
 
+/// **本书笺校进度快照**（v1.9.64）。
+///
+/// 与 `chapters`（整本书权威数据，按章存、段落数绝不可漂移）**彻底隔离**——
+/// 这里是「用户在校对工作台对本书的编辑产物 + 阅读进度」，独立成表、整本转录
+/// 文本存成一行。百万字也只是**一行** `INSERT OR REPLACE`，零结构风险、零全量覆写。
+#[derive(Debug, Clone)]
+pub struct CollationState {
+    /// 本书在 `chapters` 里的 `store_id`（临时样张没有，故不落此表）。
+    pub store_id: String,
+    /// 校对后的**整本转录全文**（用户在校对台改过的、所见即所存的那个 `text`）。
+    pub full_text: String,
+    /// 是否处在【原文对照】模式（下次打开恢复 50/50 分屏）。
+    pub show_diff: bool,
+    /// 光标字符下标（UTF 字符数口径，与 `CollationWorkspace::cursor` 同源）。
+    pub cursor: usize,
+    /// 滚动偏移（像素，向下为负；与 `ScrollHandle::offset().y` 同源）。
+    pub scroll_y: f64,
+    /// 写入时的 Unix 秒（调试 / 将来「最近编辑」排序用）。
+    pub updated_at: i64,
+}
+
 /// 仓库文件：`Library::home()/chapters.db`（与书架索引**同一处**）。
 ///
 /// v1.70.0 起**必须与书架同源**：旧制这里硬拼 `~/.jiandu`，而书架走
@@ -123,6 +144,20 @@ fn init(c: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_chapters_book ON chapters(store_id);",
     )
     .context("建章节仓库表失败")?;
+    // v1.9.64：笺校进度表（与 chapters 彻底隔离，整本转录快照只占一行）。
+    // 绝不碰 chapters——那张表是整本书权威结构，段落数漂移会破坏分页；这里
+    // 只存「用户对本书的编辑产物 + 阅读进度」，百万字也只是一行 REPLACE。
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS collation_state(
+             store_id   TEXT PRIMARY KEY,
+             full_text  TEXT NOT NULL,
+             show_diff  INTEGER NOT NULL,
+             cursor     INTEGER NOT NULL,
+             scroll_y   REAL NOT NULL,
+             updated_at INTEGER NOT NULL
+         );",
+    )
+    .context("建笺校进度表失败")?;
     // v1.74.0：卡片匣与章节同库（`IF NOT EXISTS`，老库升级自动补表，零迁移）。
     crate::cards::init(c)?;
     // v1.75.0：全文检索索引。失败**静默降级**——没有 FTS5 只是退回线性扫描，
@@ -176,6 +211,54 @@ pub fn put_chapter(
         params![id, idx as i64, title, chars as i64, json],
     )?;
     Ok(())
+}
+
+/// 写（或覆盖）本书的笺校进度（v1.9.64）。
+///
+/// `INSERT OR REPLACE`：**整本转录快照只占一行**，主键 `store_id`。百万字也只是
+/// 一次单行 REPLACE，绝不重写 `chapters`、绝不全量覆写——这正是「不碰结构」的
+/// 代价为零的根。写盘一律走**新的连接**（每次操作各开一条，见 [`connect`]），
+/// 不与主线程读连接 / 后台导入写连接抢同一条 `Connection`。
+pub fn put_collation_state(c: &Connection, s: &CollationState) -> Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO collation_state(store_id,full_text,show_diff,cursor,scroll_y,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            s.store_id,
+            s.full_text,
+            s.show_diff as i64,
+            s.cursor as i64,
+            s.scroll_y,
+            s.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+/// 读回本书的笺校进度（v1.9.64）。没有（首次打开 / 临时样张）返回 `None`。
+///
+/// 走读连接缓存（`with_read_conn`）——读路径上千次调用零开库开销。返回的是
+/// 整行快照：转录全文 + 对照模式 + 光标 + 滚动，下次打开据此「完美恢复进度」。
+pub fn get_collation_state(id: &str) -> Option<CollationState> {
+    with_read_conn(|c| {
+        c.query_row(
+            "SELECT store_id,full_text,show_diff,cursor,scroll_y,updated_at \
+             FROM collation_state WHERE store_id=?1",
+            params![id],
+            |r| {
+                Ok(CollationState {
+                    store_id: r.get::<_, String>(0)?,
+                    full_text: r.get::<_, String>(1)?,
+                    show_diff: r.get::<_, i64>(2)? != 0,
+                    cursor: r.get::<_, i64>(3)? as usize,
+                    scroll_y: r.get::<_, f64>(4)?,
+                    updated_at: r.get::<_, i64>(5)?,
+                })
+            },
+        )
+        .ok()
+    })
+    .flatten()
 }
 
 /// 取回**第 n 章**（按章号排序后的第 n 条，从 0 起；没有返回 `None`）。

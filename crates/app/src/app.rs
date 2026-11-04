@@ -3407,8 +3407,11 @@ impl Root {
             .as_ref()
             .and_then(|p| crate::importer::import_raw_text(p));
         let collation = self.collation.clone();
+        // v1.9.64：把本书 store_id 传给工作台，作为 collation_state 持久化的锚点
+        // （临时样张 store_id 为 None，不落库）。
+        let store_id = entry.store_id.clone();
         let _ = collation.update(cx, |ws, cx| {
-            ws.load_book_auto(source_path, text, has_image, raw, cx);
+            ws.load_book_auto(source_path, text, has_image, raw, store_id, cx);
         });
         // ④ 切到笺校模态：`Root::render` 见 `AppMode::Collation` 直接返回工作台，
         //    不构建阅读器，对阅读零影响。

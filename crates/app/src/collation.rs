@@ -630,6 +630,12 @@ pub struct CollationWorkspace {
     show_diff: bool,
     /// 是否弹出【清洗日志】内嵌面板（极简统计浮卡，不离开 App）。
     show_sanitize_panel: bool,
+    /// 持久化锚点（v1.9.64）：本书在 `chapters.db` 的 `store_id`。
+    /// `None` = 临时样张（演示用千字文，没有 `store_id`），不落 `collation_state`。
+    store_id: Option<String>,
+    /// 防抖落盘代际令牌（v1.9.64）：每次 `touch` +1，定时器触发时校验是否过期，
+    /// 过期即丢弃——保证 1.5 秒窗口内**只写最后一次**状态（停手才落盘）。
+    save_gen: usize,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -820,6 +826,9 @@ impl CollationWorkspace {
             raw_text: None,
             show_diff: false,
             show_sanitize_panel: false,
+            // v1.9.64：持久化锚点未定（首启动是演示样张，没有 store_id）。
+            store_id: None,
+            save_gen: 0,
         };
         // 启动即清扫上一进程遗留的临时图（崩溃 / 强退时 `Drop` 跑不到，只能等下次
         // 启动补扫）。只认本应用自己的命名前缀，且只删「够旧」的，绝不误伤另开的
@@ -943,6 +952,7 @@ impl CollationWorkspace {
             self.cursor = s;
             self.selection = None;
             cx.notify();
+            self.touch(cx);
             return;
         }
         let total = self.text.chars().count();
@@ -951,12 +961,14 @@ impl CollationWorkspace {
                 let chars: Vec<char> = self.text.chars().collect();
                 self.text = chars[..self.cursor].iter().chain(&chars[self.cursor + 1..]).collect();
                 cx.notify();
+                self.touch(cx);
             }
         } else if self.cursor > 0 {
             let chars: Vec<char> = self.text.chars().collect();
             self.text = chars[..self.cursor - 1].iter().chain(&chars[self.cursor..]).collect();
             self.cursor -= 1;
             cx.notify();
+            self.touch(cx);
         }
     }
 
@@ -972,6 +984,7 @@ impl CollationWorkspace {
         self.cursor = (a + s.chars().count()).min(self.text.chars().count());
         self.selection = None;
         cx.notify();
+        self.touch(cx);
     }
 
     /// **用一对符号包裹选区**（快捷标点栏的「夹注括号」「方括号」两枚）。
@@ -987,6 +1000,7 @@ impl CollationWorkspace {
         self.cursor = cursor;
         self.selection = None;
         cx.notify();
+        self.touch(cx);
     }
 
     /// **⌘N：掩注**（v1.9.54）——把括注 / 夹注小字从**预览与导出**里隐去。
@@ -1016,6 +1030,7 @@ impl CollationWorkspace {
             self.diff_scroll.set_offset(Point::new(px(0.0), px(0.0)));
         }
         cx.notify();
+        self.touch(cx);
     }
 
     /// 切换【清洗日志】内嵌面板的显隐（极简浮卡，不离开 App）。
@@ -1528,6 +1543,7 @@ impl CollationWorkspace {
             }
             _ => {}
         }
+        self.touch(cx);
     }
 
     /// 左栏实际宽度（CSS 像素）：决定右栏左缘，进而决定编辑器内容的 X 原点。
@@ -1729,6 +1745,7 @@ impl CollationWorkspace {
         } else {
             cx.notify();
         }
+        self.touch(cx);
         cx.stop_propagation();
     }
 
@@ -1751,6 +1768,7 @@ impl CollationWorkspace {
         self.cursor = to;
         self.selection = if s == e { None } else { Some(s..e) };
         cx.notify();
+        self.touch(cx);
     }
 
     // ── 渲染 ─────────────────────────────────────────────────────────────
@@ -2312,11 +2330,14 @@ impl CollationWorkspace {
             // 左「纸」压深一档（与正常左栏同款），两张纸靠明度差分开。
             .bg(rgb(PAPER_L))
             // 与右栏同样的滚动容器：长文可滚，命中区才不会错位。
+            // ⚠️ `min_h(px(0.0))`：本滚动容器是左栏 flex 列的 `flex_1` 子项，
+            // 不设它会被正文撑开、滚轮失效；与右栏编辑器同理（见 `render_editor`）。
             .child(
                 div()
                     .id(SharedString::from("collation-raw-scroll"))
                     .flex_1()
                     .min_w(px(0.0))
+                    .min_h(px(0.0))
                     .w_full()
                     .h_full()
                     .overflow_y_scroll()
@@ -2369,6 +2390,7 @@ impl CollationWorkspace {
                 div()
                     .relative()
                     .flex_1()
+                    .min_h(px(0.0))
                     .child(body)
                     // PDF 多页时浮出页码条（左下角）。
                     .child(
@@ -3009,6 +3031,7 @@ impl CollationWorkspace {
         text: String,
         has_image: bool,
         raw_text: Option<String>,
+        store_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
         // 重置与「上一本书」相关的全部状态（文本 / 图像 / 联动 / 翻页缓存）。
@@ -3042,6 +3065,24 @@ impl CollationWorkspace {
         self.image_error = None;
         self.left_scroll.set_offset(Point::new(px(0.0), px(0.0)));
         self.diff_scroll.set_offset(Point::new(px(0.0), px(0.0)));
+        // v1.9.64：记住本书 store_id（临时样张为 None，不落库）。
+        self.store_id = store_id.clone();
+        // v1.9.64：从 `collation_state` 恢复进度（若有且是真书）。
+        // 只在「导入文本 + 重置状态」之后做——用快照里的**编辑后全文**覆盖刚
+        // 导入的原文，并恢复对照模式 / 光标 / 滚动。毛坯 `raw_text` 不动（仍取
+        // 自源文件），这样【原文对照】永远比的是「原稿 vs 你校过的稿」。
+        if let Some(sid) = store_id {
+            if let Some(saved) = jiandu_core::store::get_collation_state(&sid) {
+                if !saved.full_text.is_empty() {
+                    self.text = saved.full_text;
+                }
+                self.show_diff = saved.show_diff;
+                self.cursor = saved.cursor.min(self.text.chars().count());
+                let y = px(saved.scroll_y as f32);
+                self.scroll.set_offset(Point::new(px(0.0), y));
+                self.diff_scroll.set_offset(Point::new(px(0.0), y));
+            }
+        }
         self.preview_page = 0;
         if has_image {
             self.pure_text_mode = false;
@@ -3053,6 +3094,74 @@ impl CollationWorkspace {
             self.image_note = Some("纯文本模式：本书无原图，仅显示正文".to_string());
         }
         cx.notify();
+    }
+
+    /// v1.9.64：**标脏 + 1.5 秒防抖落盘**。任何编辑 / 光标 / 模式切换后调用。
+    ///
+    /// 三条铁律（与用户确认）：
+    ///  ① **绝不碰 `chapters.db`**——写的是独立的 `collation_state` 一行；
+    ///  ② **1.5 秒防抖**——`on_change` 高频触发时只 +1 代际令牌、不写盘；停手 1.5 秒
+    ///     后**只写最后一次**状态（`save_gen` 校验，过期即丢弃）；
+    ///  ③ **主线程零卡顿**——落盘在后台 executor 跑，百万字（≈ 1MB 串）也不占主线程；
+    ///     且 `INSERT OR REPLACE` 单行，绝不全量覆写。
+    ///
+    /// 临时样张（`store_id` 为 `None`）直接返回，不污染数据库。
+    fn touch(&mut self, cx: &mut Context<Self>) {
+        let Some(sid) = self.store_id.clone() else {
+            return;
+        };
+        // 代际 +1：本轮定时器触发时若已不等于此值，说明又有了新的编辑，丢弃旧轮。
+        self.save_gen = self.save_gen.wrapping_add(1);
+        let gen = self.save_gen;
+        let exec = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    // 停手 1.5 秒才落盘（高频 on_change 只会不断把上面的 gen 顶掉）。
+                    exec.timer(std::time::Duration::from_millis(1500)).await;
+                    // 校验代际 + 实时读最新状态（含最新滚动偏移，避免在 touch 时刻抓旧值）。
+                    let snapshot = match this.upgrade() {
+                        Some(e) => e.update(&mut app, |ws, _cx| {
+                            if gen != ws.save_gen {
+                                return None;
+                            }
+                            Some((
+                                ws.text.clone(),
+                                ws.show_diff,
+                                ws.cursor,
+                                px_f32(ws.scroll.offset().y),
+                            ))
+                        }),
+                        None => Ok(None),
+                    };
+                    let Ok(Some((text, show_diff, cursor, scroll_y))) = snapshot else {
+                        return;
+                    };
+                    // 落盘扔后台线程：一条 REPLACE 最多写 ≈1MB（百万字），别卡主线程。
+                    let _ = exec
+                        .spawn(async move {
+                            if let Ok(conn) = jiandu_core::store::connect() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs() as i64)
+                                    .unwrap_or(0);
+                                let state = jiandu_core::store::CollationState {
+                                    store_id: sid,
+                                    full_text: text,
+                                    show_diff,
+                                    cursor,
+                                    scroll_y: scroll_y as f64,
+                                    updated_at: now,
+                                };
+                                let _ = jiandu_core::store::put_collation_state(&conn, &state);
+                            }
+                        })
+                        .await;
+                }
+            },
+        )
+        .detach();
     }
 
     /// 导入 Markdown / 纯文本（.md / .markdown / .txt）到右侧编辑器。
@@ -3119,6 +3228,8 @@ impl CollationWorkspace {
                                 }
                             }
                             cx.notify();
+                            // v1.9.64：换稿 / 改稿后标脏，1.5 秒防抖落盘（覆盖全文快照）。
+                            this.touch(cx);
                         });
                     }
                 }
@@ -4815,10 +4926,20 @@ impl CollationWorkspace {
         // 选区悬浮钮（问小笺）叠在编辑器之上：`relative` 容器 + 绝对定位气泡，
         // 气泡是**滚动视口之外**的兄弟节点（不随滚动位移），故 y 要自己减
         // `scroll.offset()`（见 `render_selection_bar` 的坐标口径）。
+        //
+        // ⚠️ **`min_h(px(0.0))` 是纯文本模式「滚轮纹丝不动」的真根**：本 `wrap`
+        // 是右栏 flex 列里的 `flex_1` 子项，GPUI 在 flex 列中默认给 `flex_1` 子项
+        // 套 `min-height: auto`——它不肯收缩到比内容更矮，于是整篇正文把 `wrap`
+        // 撑到「内容高度」，里面那个 `scroll_view.h_full()` 解析回的也是内容高 →
+        // 视口高 == 内容高 → `overflow_y_scroll` 永远判定「没东西可滚」。补
+        // `min_h(0)` 让 `wrap` 能被压回 flex 分配到的确定高度，内层滚动视口才有
+        // 真正的视口高度可依、才滚得动。`overflow_hidden` 收口，内容绝不溢出面板。
         let mut wrap = div()
             .relative()
             .flex_1()
             .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
             .w_full()
             .child(scroll_view);
         if let Some(bar) = self.render_selection_bar(vw, cx) {
@@ -6326,6 +6447,7 @@ impl EntityInputHandler for CollationWorkspace {
         self.apply_replace_utf16(eff, text);
         self.selection = None;
         cx.notify();
+        self.touch(cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -6347,6 +6469,7 @@ impl EntityInputHandler for CollationWorkspace {
         };
         self.selection = None;
         cx.notify();
+        self.touch(cx);
     }
 }
 

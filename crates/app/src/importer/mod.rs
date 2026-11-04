@@ -297,7 +297,7 @@ pub fn import_file_with(
     };
 
     // ③ 全局唯一清洗出口（把换行 / 乱码 / 假夹注彻底洗掉）
-    let text = cleaner::clean(&raw);
+    let mut text = cleaner::clean(&raw);
 
     let stem = jiandu_core::importer::file_stem(path);
     let (kind, source) = fmt.kinds();
@@ -310,18 +310,8 @@ pub fn import_file_with(
         });
     }
 
-    // ④ core 既有管线（一字未改）
-    //    ⚠️ PDF 走**不升格全角括号**的那条：印刷品的 `【题解】` / `（注）` 是
-    //    章节标签与现代括号，升格成双行夹注就是正文缺一段（尔雅式 PDF 的老 bug）。
-    let chapters = if fmt == Format::Pdf {
-        jiandu_core::pipeline::parse_str_keeping_brackets(&text)
-    } else {
-        parse_str(kind, &text)
-    }
-    .map_err(|e| ImportError::Parse(e.to_string()))?;
-
     // ④ JSON 的元数据（`book` / `author` 字段）**单独提出来**当书名 / 作者
-    // （v1.69.0）——它们既不该混进正文流，也不该退化成文件名。
+    // （v1.69.0）——它们既不该混进正文流，也不该退化成文件名。不依赖正文顺序，先提。
     let json_meta = if fmt == Format::Json {
         match json_parser::extract_json_meta(&std::fs::read_to_string(path).unwrap_or_default()) {
             (Some(t), a) => (Some(t), a),
@@ -339,6 +329,8 @@ pub fn import_file_with(
     };
 
     // ⑤ 标题 / 作者：先从正文首两行认（「书名 · 作者」的排法），认不出用文件名。
+    //    ⚠️ 必须在去重**之前**做：书名是从正文首行认出来的，认完才能拿它去删正文里
+    //    那枚重复的书名（见下方 `strip_leading_title_duplicates`）。
     let (t, a0) = jiandu_core::importer::detect_title_author(&text);
     let t = json_meta.0.or(epub_title).unwrap_or(t);
     let mut a = json_meta.1.unwrap_or(a0);
@@ -358,6 +350,23 @@ pub fn import_file_with(
         title
     };
     let author = jiandu_core::vclean::tidy_meta_title(&jiandu_core::vclean::strip_meta_junk(&a));
+
+    // ★ 标题去重（v1.9.64）：正文开头若把书名本身又抄了一遍——`资治通鉴` 既在版心
+    // 书口显示一次，正文首行又是一枚 `资治通鉴`，视觉上成了两个一模一样的书名。
+    // 删掉开头**整行精确等于书名**（含《》包裹）的连续行，让书名只在版心出现一次。
+    // 严格限制「开头 + 精确匹配」，正文中间任何同名文字绝不动（见 cleaner 单测）。
+    text = cleaner::strip_leading_title_duplicates(&text, &title);
+
+    // ④ core 既有管线（一字未改）
+    //    ⚠️ PDF 走**不升格全角括号**的那条：印刷品的 `【题解】` / `（注）` 是
+    //    章节标签与现代括号，升格成双行夹注就是正文缺一段（尔雅式 PDF 的老 bug）。
+    let chapters = if fmt == Format::Pdf {
+        jiandu_core::pipeline::parse_str_keeping_brackets(&text)
+    } else {
+        parse_str(kind, &text)
+    }
+    .map_err(|e| ImportError::Parse(e.to_string()))?;
+
     Ok(ParsedDoc {
         book: BookIR::from_chapters(&title, &author, source, &chapters),
         pdf_regions,

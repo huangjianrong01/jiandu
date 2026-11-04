@@ -530,3 +530,141 @@ fn is_cjk(c: char) -> bool {
         | 0x20000..=0x2FA1F // 扩展 B~F
     )
 }
+
+// ----------------------------------------------------------------------
+// 三、标题去重（v1.9.64）
+// ----------------------------------------------------------------------
+
+/// 书名包裹符：电子书正文首行常把书名裹在这些符号里（`《资治通鉴》` /
+/// `【资治通鉴】` / `(资治通鉴)`）。比对时要先剥掉，否则正文 `《资治通鉴》`
+/// 与元数据 `资治通鉴` 永远差一层壳，去重失败、脏书名照样混进版心。
+const TITLE_WRAPPERS: &[char] = &[
+    '《', '》', '【', '】', '[', ']', '(', ')', '（', '）', '〈', '〉', '"', '\'', '“', '”', '‘', '’',
+];
+
+/// 把书名可能有的包裹符与首尾空白剥掉，露出纯书名核心。
+fn strip_title_wrappers(s: &str) -> String {
+    let mut t = s.trim().to_string();
+    loop {
+        let before = t.len();
+        t = t
+            .trim_matches(|c| TITLE_WRAPPERS.contains(&c))
+            .trim()
+            .to_string();
+        if t.len() == before {
+            break;
+        }
+    }
+    t
+}
+
+/// **标题去重**：导入 TXT / EPUB 时，正文开头经常把书名本身又抄了一遍——
+/// `资治通鉴` 既在版心书口显示一次，正文首行又是一枚 `资治通鉴`，视觉上成了
+/// 两个一模一样的书名（甚至连续两行都是书名）。这里把开头**整行精确等于书名**
+/// 的连续行删掉，让书名只在版心出现一次。
+///
+/// 严格三道闸门（宁可不删，绝不误伤正文）：
+///
+/// 1. **只在开头**：只检查前 3 行（防御性上限，绝不往后扫），正文里任何一处
+///    出现与书名相同的字都**完全不动**。
+/// 2. **精确匹配**：去首尾空白 + 剥书名包裹符后，**整行完全等于书名**才删；
+///    模糊匹配、包含关系、前缀关系一律不删（「资治通鉴卷一」不会因等于
+///    「资治通鉴」被误删）。
+/// 3. **连续才删**：开头若连着好几行都是书名（文件头重复了一次标题），一并清掉；
+///    一旦遇到不等于书名的行立即停手，后面是正文。
+///
+/// ⚠️ 不改动书名本身、不碰正文任何其它字；书名过短（≤1 字）或正文为空则原样返回。
+pub fn strip_leading_title_duplicates(text: &str, title: &str) -> String {
+    let title = strip_title_wrappers(title);
+    if title.is_empty() || title.chars().count() <= 1 {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+
+    // 从开头数连续等于书名的行（只看前 3 行，防御性上限）。
+    let mut skip = 0usize;
+    for (i, &line) in lines.iter().enumerate() {
+        if i >= 3 {
+            break;
+        }
+        if strip_title_wrappers(line) == title {
+            skip += 1;
+        } else {
+            break;
+        }
+    }
+    if skip == 0 {
+        return text.to_string();
+    }
+
+    // 删掉这 `skip` 行，并把开头可能残留的空行（tidy_blocks 以 \n\n 分段）一并清掉。
+    let mut rest: Vec<&str> = lines.into_iter().skip(skip).collect();
+    while rest.first().map_or(false, |s| s.trim().is_empty()) {
+        rest.remove(0);
+    }
+    if rest.is_empty() {
+        return String::new();
+    }
+    rest.join("\n")
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    #[test]
+    fn strips_exact_title_at_start() {
+        let text = "资治通鉴\n\n正文第一句。\n\n正文第二句。";
+        let out = strip_leading_title_duplicates(text, "资治通鉴");
+        assert!(!out.starts_with("资治通鉴"), "书名首行未被删掉: {out}");
+        assert!(out.contains("正文第一句"), "正文被误伤: {out}");
+    }
+
+    #[test]
+    fn strips_consecutive_title_twice() {
+        let text = "资治通鉴\n资治通鉴\n\n正文。";
+        let out = strip_leading_title_duplicates(text, "资治通鉴");
+        assert!(!out.starts_with("资治通鉴"), "连续书名未被删干净: {out}");
+        assert!(out.contains("正文"), "正文被误伤: {out}");
+    }
+
+    #[test]
+    fn handles_bracket_wrappers() {
+        let text = "《资治通鉴》\n\n正文。";
+        let out = strip_leading_title_duplicates(text, "资治通鉴");
+        assert!(
+            !out.starts_with("资治通鉴") && !out.starts_with('《'),
+            "带书名号的脏数据未被去重: {out}"
+        );
+        assert!(out.contains("正文"), "正文被误伤: {out}");
+    }
+
+    #[test]
+    fn keeps_when_not_matching() {
+        let text = "序言\n\n正文。";
+        let out = strip_leading_title_duplicates(text, "资治通鉴");
+        assert_eq!(out, text, "非书名首行不应被删");
+    }
+
+    #[test]
+    fn does_not_touch_body_occurrence() {
+        let text = "正文开头。\n\n中间一段也写了资治通鉴不算。\n\n结尾。";
+        let out = strip_leading_title_duplicates(text, "资治通鉴");
+        assert_eq!(out, text, "正文中间的同名文字绝不可动");
+    }
+
+    #[test]
+    fn keeps_heading_with_volume_suffix() {
+        // 「资治通鉴卷一」不等于「资治通鉴」——那是真章回标题，宁可留着。
+        let text = "资治通鉴卷一\n\n正文。";
+        let out = strip_leading_title_duplicates(text, "资治通鉴");
+        assert_eq!(out, text, "带卷次的标题不应被误删");
+    }
+
+    #[test]
+    fn short_title_is_noop() {
+        let text = "书\n\n正文。";
+        let out = strip_leading_title_duplicates(text, "书");
+        assert_eq!(out, text, "过短书名不应触发去重");
+    }
+}
