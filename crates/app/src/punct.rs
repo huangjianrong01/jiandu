@@ -374,11 +374,27 @@ pub fn place_hang(fs_body: f32, cell_w: f32, cell_h: f32, kind: PunctKind) -> Pu
 /// 全程只读传入的几何与颜色，不碰任何状态——canvas 的 paint 闭包签名
 /// （`&mut Window`）也从类型上保证了「绘制不改状态」。
 pub fn paint_mark(window: &mut Window, cx: f32, cy: f32, m: PunctMark, ink: u32) {
+    paint_mark_pulsed(window, cx, cy, m, ink, 0.0);
+}
+
+/// 带 **TTS 停顿脉冲**的那一版：只有读类墨滴认 `pulse`（0..1），圈类照旧。
+///
+/// PDF 导出走 [`paint_mark`]（脉冲恒 0）——纸上不需要也不会有动画。
+pub fn paint_mark_pulsed(
+    window: &mut Window,
+    cx: f32,
+    cy: f32,
+    m: PunctMark,
+    ink: u32,
+    pulse: f32,
+) {
     let color = rgb(ink);
     match m.kind {
         PunctKind::Dot => paint_ring(window, cx, cy, m, color),
         PunctKind::Ring => paint_classic_ring(window, cx, cy, m, color),
-        PunctKind::Seed | PunctKind::BigSeed => paint_seed(window, cx, cy, m, color),
+        PunctKind::Seed | PunctKind::BigSeed => {
+            paint_seed(window, cx, cy, m, color, pulse)
+        }
     }
 }
 
@@ -477,7 +493,12 @@ const RING_OVERLAP_DEG: f32 = 18.0;
 /// （v1.80.0 离线高分辨率逐档比对定稿，见 `seed_anchors`）。
 ///
 /// 只碰几何，不碰排版：调用方已经把记号中心算在「格右上 + 悬空微调」处。
-fn paint_seed(window: &mut Window, cx: f32, cy: f32, m: PunctMark, color: Rgba) {
+fn paint_seed(window: &mut Window, cx: f32, cy: f32, m: PunctMark, color: Rgba, pulse: f32) {
+    if SEED_CUBIC {
+        paint_seed_cubic(window, cx, cy, m, color, pulse);
+        return;
+    }
+    let _ = pulse; // 旧档不响应 TTS 脉冲
     // 几何全部来自 `seed_anchors_for` / `seed_controls_for`（纯函数、有单测），
     // 这里只负责串路径——「画出什么形」不在这里定。
     let a = seed_anchors_for(m.d, m.hook); // 7 个锚点（第 8 个即回到 a[0]）
@@ -574,7 +595,11 @@ fn seed_controls_at(d: f32, hook: bool, belly: f32) -> [(f32, f32); 7] {
 /// 纸上与屏幕上**逐字同位、同形**——`STEPS` 取 12，一段 12 根折线在
 /// d≈9px 下与真曲线的偏差远小于 0.1px（肉眼与印刷都看不出）。
 pub fn seed_outline(d: f32, hook: bool) -> Vec<(f32, f32)> {
-    seed_outline_belly(d, hook, SEED_BELLY_AT)
+    if SEED_CUBIC {
+        seed_cubic_outline(d, hook, 24)
+    } else {
+        seed_outline_belly(d, hook, SEED_BELLY_AT)
+    }
 }
 
 /// 指定**最宽处**的那一版（A/B 用）：见 [`SEED_BELLY_AT`]。
@@ -675,6 +700,195 @@ fn seed_anchors_at(d: f32, hook: bool, belly: f32) -> [(f32, f32); 7] {
 /// 只改**尾尖一点**（[`seed_anchors_hook`]）与它的两个控制点，头的圆润
 /// 与整体斜度不受影响。
 pub const SEED_HOOK: bool = false;
+
+// ── v1.9.84 「悬针」档：两段真·三次贝塞尔 ────────────────────────────
+//
+// 旧档（`seed_anchors_at` / `seed_controls_at`）是 7 段**二次**贝塞尔：每段
+// 只有一个控制点，一条抛物线的两侧曲率被锁死，放大看就是一枚「规则的
+// 水滴」。这一档整个换掉，只用 **2 段 `cubic_bezier_to`** 闭成一个环：
+//
+// ```text
+//              ╭────────────╮        ← A 顶心：两侧切线共水平线 → 圆润饱满
+//           c4╯              ╰c1         （c1 = +1.25hw, c4 = −1.10hw，不等宽）
+//            ╱                ╲
+//           ╱                  ╲      ← 右缘先鼓后急收，左缘收得更早
+//          ╱                    ╲
+//         ╲        c2  c3       ╱     ← 两控制点贴着中轴、悬在尖点上方
+//          ╲        ·  ·       ╱         → 针长 0.58hh，开口仅 ~17°
+//           ╲        ╲╱       ╱
+//            ╲        B      ╱        ← B 底尖：进入/离开切线折返，悬针出锋
+//             ╰───────▼─────╯
+// ```
+//
+// * **顶圆**：A 处段 1 的出切线 `c1 − A` 与段 2 的入切线 `A − c4` 都近乎
+//   水平同向，接头是 G1 光滑的，不是半圆也不是尖；
+// * **极锐出锋**：`c2` / `c3` 都压在 B 上方且紧贴中轴，于是 B 处两条切线
+//   几乎 **180° 折返**，只剩约 17° 的开口——毛笔悬针竖那一提；
+// * **不对称**：c1 / c4 一宽一窄，c2 / c3 一右一左，A 偏左、B 偏右；
+// * **微小倾斜**：整体顺时针 [`CUBIC_TILT_DEG`] = 15°，加上 A→B 的脊柱
+//   弯曲，是「刚滴落、还没晕开」那一瞬，不是静止的对称水滴。
+//
+// 全部坐标都是 `hh = d/2`、`hw = hh × CUBIC_W_OF_H` 的倍数，`d` 来自
+// `fs × PunctKind::fs_ratio()`——**纯矢量**，字号放大只是等比放大。最后做
+// 一次面积形心归零，让重心精确落在 `place` 给的锚点（竖排字间隙规范位）。
+//
+// ⚠️ 旧 7 段二次档**一行未删**：`SEED_CUBIC = false` 立即回到上一版，A/B
+// 与旧档形制单测（走向 / 宽度剖面 / 钝口 / 回锋）全部原样保留。
+
+/// 出货档：true = 两段三次贝塞尔「悬针」，false = 旧版 7 段二次墨滴。
+pub const SEED_CUBIC: bool = true;
+/// 新档的半宽 / 半长：撑住饱满的顶，同时不让它胖成一块红饼。
+pub const CUBIC_W_OF_H: f32 = 0.55;
+/// 新档整体倾角（度，顺时针）：**15°**，一点点就够灵动。
+pub const CUBIC_TILT_DEG: f32 = 15.0;
+/// 朱砂洇边：同形放大一档、极淡一层垫在下面，模拟印泥吃进纸纤维。
+pub const CUBIC_BLEED_SCALE: f32 = 1.075;
+pub const CUBIC_BLEED_ALPHA: f32 = 0.18;
+/// TTS 停顿脉冲：时长（ms）与峰值放大（1.0 → 1.2 → 1.0）。
+pub const PULSE_MS: f32 = 130.0;
+pub const PULSE_PEAK: f32 = 0.20;
+
+/// 一段三次贝塞尔（相对记号中心，**已含倾角与质心校正**）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CubicSeg {
+    pub c1: (f32, f32),
+    pub c2: (f32, f32),
+    pub to: (f32, f32),
+}
+
+/// 把两段三次贝塞尔采样成折线（PDF 的 CG 只吃折线；面积形心也用它量）。
+fn cubic_sample(a0: (f32, f32), segs: &[CubicSeg; 2], steps: usize) -> Vec<(f32, f32)> {
+    let mut out = Vec::with_capacity(2 * steps);
+    let mut p0 = a0;
+    for sg in segs {
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            let u = 1.0 - t;
+            let (a, b, c, e) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+            out.push((
+                a * p0.0 + b * sg.c1.0 + c * sg.c2.0 + e * sg.to.0,
+                a * p0.1 + b * sg.c1.1 + c * sg.c2.1 + e * sg.to.1,
+            ));
+        }
+        p0 = sg.to;
+    }
+    out
+}
+
+/// 闭合多边形的**面积形心**（鞋带公式）。
+fn polygon_centroid(pts: &[(f32, f32)]) -> (f32, f32) {
+    let (mut cross, mut sx, mut sy) = (0.0f32, 0.0f32, 0.0f32);
+    for i in 0..pts.len() {
+        let ((x0, y0), (x1, y1)) = (pts[i], pts[(i + 1) % pts.len()]);
+        let w = x0 * y1 - x1 * y0;
+        cross += w;
+        sx += (x0 + x1) * w;
+        sy += (y0 + y1) * w;
+    }
+    if cross.abs() < 1e-9 {
+        return (0.0, 0.0);
+    }
+    (sx / (3.0 * cross), sy / (3.0 * cross))
+}
+
+/// **新档的路径**：顶心 A + 2 段三次贝塞尔（第 2 段的 `to` 回到 A）。
+///
+/// 返回的所有坐标都相对记号中心、已旋转 15°、已质心归零；屏幕走原生
+/// `cubic_bezier_to`，PDF 读 [`seed_cubic_outline`] 的同一份采样，两边同形。
+/// `hook`（回锋）只把针收短一档、并把 c2/c3 微微撑开成钝口。
+pub fn cubic_path(d: f32, hook: bool) -> ((f32, f32), [CubicSeg; 2]) {
+    let hh = d * 0.5;
+    let hw = hh * CUBIC_W_OF_H;
+    let (s, c) = CUBIC_TILT_DEG.to_radians().sin_cos();
+    let p = |x: f32, y: f32| {
+        let (rx, ry) = (x * hw, y * hh);
+        (rx * c - ry * s, rx * s + ry * c)
+    };
+    let (tip_y, n2x, n3x) = if hook {
+        (0.86, 0.26, -0.06) // 回锋：锋尖回收、开口略钝
+    } else {
+        (1.00, 0.20, 0.02) // 悬针：两点紧贴中轴，开口约 17°
+    };
+    let a = p(-0.06, -1.00); // 顶心：略偏左
+    let b = p(0.12, tip_y); // 底尖：略偏右 → 脊柱带弧
+    let segs = [
+        // 顶心 → 底尖（右半）：c1 水平远推撑圆头，c2 贴轴收出悬针
+        CubicSeg { c1: p(1.25, -1.02), c2: p(n2x, 0.42), to: b },
+        // 底尖 → 顶心（左半）：c3 贴轴折返，c4 水平回收，左缘比右缘窄
+        CubicSeg { c1: p(n3x, 0.42), c2: p(-1.10, -1.02), to: a },
+    ];
+    // 上宽下窄的形状天然「头重」，不校正重心就飘在锚点上方。
+    let g = polygon_centroid(&cubic_sample(a, &segs, 32));
+    let shift = |q: (f32, f32)| (q.0 - g.0, q.1 - g.1);
+    let segs = segs.map(|sg| CubicSeg {
+        c1: shift(sg.c1),
+        c2: shift(sg.c2),
+        to: shift(sg.to),
+    });
+    (shift(a), segs)
+}
+
+/// 新档轮廓的折线采样：**PDF 唯一入口**（屏幕走原生 `cubic_bezier_to`）。
+pub fn seed_cubic_outline(d: f32, hook: bool, steps: usize) -> Vec<(f32, f32)> {
+    let (a0, segs) = cubic_path(d, hook);
+    cubic_sample(a0, &segs, steps.max(2))
+}
+
+/// TTS 换词瞬间的极短脉冲：`0 → 1 → 0`，`PULSE_MS` 之外恒为 0。
+///
+/// 纯函数、无时钟依赖：调用方把 `tts_mark_at.elapsed()` 传进来即可。
+pub fn punct_pulse(elapsed_ms: f32) -> f32 {
+    if !(0.0..PULSE_MS).contains(&elapsed_ms) {
+        return 0.0;
+    }
+    (std::f32::consts::PI * elapsed_ms / PULSE_MS).sin()
+}
+
+/// 用 GPUI 原生三次贝塞尔落一整条闭合路径。`k` = 整体缩放（洇边 / TTS 脉冲）。
+fn paint_cubic_path(
+    window: &mut Window,
+    cx: f32,
+    cy: f32,
+    a0: (f32, f32),
+    segs: &[CubicSeg; 2],
+    k: f32,
+    color: Rgba,
+) {
+    let at = |q: (f32, f32)| point(px(cx + q.0 * k), px(cy + q.1 * k));
+    let mut b = PathBuilder::fill();
+    b.move_to(at(a0));
+    for sg in segs {
+        b.cubic_bezier_to(at(sg.to), at(sg.c1), at(sg.c2));
+    }
+    b.close();
+    if let Ok(p) = b.build() {
+        window.paint_path(p, color);
+    }
+}
+
+/// 新档的绘制：洇边（极淡、放大一档）→ 实色本体。`pulse` 来自 TTS。
+fn paint_seed_cubic(
+    window: &mut Window,
+    cx: f32,
+    cy: f32,
+    m: PunctMark,
+    color: Rgba,
+    pulse: f32,
+) {
+    let scale = 1.0 + PULSE_PEAK * pulse.clamp(0.0, 1.0);
+    let (a0, segs) = cubic_path(m.d * scale, m.hook);
+    // GPUI 0.2.2 的 `paint_path` 只吃单色，没有渐变：两层同形填充模拟
+    // 「中心浓、边缘洇」——底下那层放大 7.5% 且只有 18% 不透明度，露出来
+    // 的正好是极窄的一圈朱砂毛边。
+    let bleed = Rgba {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+        a: color.a * CUBIC_BLEED_ALPHA,
+    };
+    paint_cubic_path(window, cx, cy, a0, &segs, CUBIC_BLEED_SCALE, bleed);
+    paint_cubic_path(window, cx, cy, a0, &segs, 1.0, color);
+}
 
 #[cfg(test)]
 mod tests {
@@ -1030,4 +1244,136 @@ mod tests {
             }
         }
     }
+
+    // ── v1.9.84 两段三次贝塞尔「悬针」档 ──────────────────────────────
+    fn angle_deg(u: (f32, f32), v: (f32, f32)) -> f32 {
+        let dot = u.0 * v.0 + u.1 * v.1;
+        let n = (u.0 * u.0 + u.1 * u.1).sqrt() * (v.0 * v.0 + v.1 * v.1).sqrt();
+        if n < 1e-9 {
+            return 0.0;
+        }
+        (dot / n).clamp(-1.0, 1.0).acos().to_degrees()
+    }
+
+    /// 把所有控制点摊平，便于跨字号逐点比较。
+    fn flat(d: f32, hook: bool) -> Vec<(f32, f32)> {
+        let (a, segs) = cubic_path(d, hook);
+        let mut out = vec![a];
+        for sg in segs {
+            out.push(sg.c1);
+            out.push(sg.c2);
+            out.push(sg.to);
+        }
+        out
+    }
+
+    #[test]
+    fn cubic_seed_closes_in_exactly_two_segments() {
+        let (a0, segs) = cubic_path(9.27, false);
+        assert_eq!(segs.len(), 2, "只要上下两段，不许冗余节点");
+        assert_eq!(segs[1].to, a0, "第二段必须回到顶心，闭合成环");
+    }
+
+    #[test]
+    fn cubic_top_is_g1_round_and_bottom_is_a_needle() {
+        for d in [4.0f32, 9.27, 24.0] {
+            let (a0, segs) = cubic_path(d, false);
+            // 顶心：段 1 出切线与段 2 入切线同向 → 光滑圆头（不是尖）。
+            let top_out = (segs[0].c1.0 - a0.0, segs[0].c1.1 - a0.1);
+            let top_in = (a0.0 - segs[1].c2.0, a0.1 - segs[1].c2.1);
+            assert!(
+                angle_deg(top_out, top_in) < 5.0,
+                "顶心有折角，不够圆润：{:.1}° / d={d}",
+                angle_deg(top_out, top_in)
+            );
+            // 底尖：进入 / 离开切线近乎 180° 折返 → 悬针出锋。
+            let vin = (
+                segs[0].to.0 - segs[0].c2.0,
+                segs[0].to.1 - segs[0].c2.1,
+            );
+            let vout = (
+                segs[1].c1.0 - segs[0].to.0,
+                segs[1].c1.1 - segs[0].to.1,
+            );
+            let open = 180.0 - angle_deg(vin, vout);
+            assert!(open < 20.0, "底尖不够锐：开口 {open:.1}° / d={d}");
+            // 针要够长，不然只是个圆底收了个角。
+            let needle = (vin.0 * vin.0 + vin.1 * vin.1).sqrt();
+            assert!(needle > d * 0.20, "悬针太短：{needle:.2} / d={d}");
+        }
+    }
+
+    #[test]
+    fn cubic_seed_scales_purely_with_font_size() {
+        // 纯矢量：任何字号下「归一化控制点」逐点相同，字号变大不会变成红块。
+        let base = flat(9.27, false);
+        for d in [4.0f32, 17.0, 44.0] {
+            let got = flat(d, false);
+            for (i, (b, g)) in base.iter().zip(got.iter()).enumerate() {
+                assert!(
+                    (b.0 / 9.27 - g.0 / d).abs() < 1e-5
+                        && (b.1 / 9.27 - g.1 / d).abs() < 1e-5,
+                    "第 {i} 个控制点没按比例缩放：d={d}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cubic_seed_centroid_sits_on_the_anchor() {
+        // 竖排的锚点是字间隙规范位；形状头重，不做质心归零就会浮在锚点上方。
+        for d in [4.0f32, 9.27, 24.0] {
+            let g = polygon_centroid(&seed_cubic_outline(d, false, 64));
+            assert!(
+                g.0.abs() < d * 0.005 && g.1.abs() < d * 0.005,
+                "重心偏出锚点：{g:?} / d={d}"
+            );
+        }
+    }
+
+    #[test]
+    fn cubic_seed_is_not_mirror_symmetric() {
+        let (a0, segs) = cubic_path(9.27, false);
+        // 右半与左半的外推控制点不等宽：绝无镜像轴。口径必须**相对顶心**——
+        // 质心归零是整体平移，拿「到原点距离」比会被平移抹平。
+        let rv = (segs[0].c1.0 - a0.0, segs[0].c1.1 - a0.1);
+        let lv = (segs[1].c2.0 - a0.0, segs[1].c2.1 - a0.1);
+        let r = (rv.0 * rv.0 + rv.1 * rv.1).sqrt();
+        let l = (lv.0 * lv.0 + lv.1 * lv.1).sqrt();
+        assert!((r - l).abs() > 9.27 * 0.02, "左右对称回去了：{r} / {l}");
+        // 15° 倾斜确实落到了路径上：顶心与底尖不同 x。
+        let (a0, _) = cubic_path(9.27, false);
+        let (_, s2) = cubic_path(9.27, false);
+        assert!((s2[0].to.0 - a0.0).abs() > 9.27 * 0.02, "没有倾斜弧度");
+    }
+
+    #[test]
+    fn screen_and_pdf_read_the_same_cubic_path() {
+        // 屏幕走 `cubic_bezier_to`，PDF 走 `seed_outline` 折线；两边必须是
+        // 同一条曲线，否则纸上与屏上的句读会是两个形状。
+        let (d, hook) = (9.27f32, false);
+        let via_pdf = seed_outline(d, hook);
+        let via_screen = seed_cubic_outline(d, hook, 24);
+        assert_eq!(via_pdf.len(), via_screen.len());
+        for (a, b) in via_pdf.iter().zip(via_screen.iter()) {
+            assert!((a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6);
+        }
+        let (a0, _) = cubic_path(d, hook);
+        let last = via_pdf.last().unwrap();
+        assert!(
+            (last.0 - a0.0).abs() < 1e-5 && (last.1 - a0.1).abs() < 1e-5,
+            "PDF 折线没闭合回顶心"
+        );
+    }
+
+    #[test]
+    fn punct_pulse_is_one_short_bump() {
+        assert_eq!(punct_pulse(-1.0), 0.0);
+        assert_eq!(punct_pulse(0.0), 0.0);
+        assert!((punct_pulse(PULSE_MS * 0.5) - 1.0).abs() < 1e-6);
+        assert_eq!(punct_pulse(PULSE_MS), 0.0);
+        assert_eq!(punct_pulse(PULSE_MS * 3.0), 0.0);
+        assert!((PULSE_PEAK - 0.20).abs() < 1e-6, "峰值应是 1.0 → 1.2");
+    }
+
 }

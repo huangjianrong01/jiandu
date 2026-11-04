@@ -7751,6 +7751,8 @@ impl Root {
         // 朱砂句读落在深蓝上只剩 1.6:1——那不是「朱点」，是块脏印。
         // `Some` 时用它（= 色块的前景色），`None` 走原来的朱砂。
         force_ink: Option<u32>,
+        // TTS 停顿脉冲（0..1）：只作用于读类墨滴，见 `punct::punct_pulse`。
+        pulse: f32,
     ) -> Div {
         // 几何（纯函数、有单测）：读类手绘**瓜子点**（高 0.28 倍正文），
         // 句类画空心圈；中心钉在格内 72% × 28% 的**右上角**，再向左下让
@@ -7787,7 +7789,9 @@ impl Root {
                     move |bounds: Bounds<gpui::Pixels>, _state: (), window: &mut Window, _cx: &mut App| {
                         let ox = f32::from(bounds.origin.x);
                         let oy = f32::from(bounds.origin.y);
-                        crate::punct::paint_mark(window, ox + m.cx, oy + m.cy, m, ink);
+                        crate::punct::paint_mark_pulsed(
+                            window, ox + m.cx, oy + m.cy, m, ink, pulse,
+                        );
                     },
                 )
                 .w(px(cell_w))
@@ -7894,6 +7898,16 @@ impl Root {
             self.tts_cur,
         );
         let tts_here = tts_k > 0.001;
+        // v1.9.84：TTS 读到句读处的极短「悬针一顿」。只有落在当前朗读句
+        // 内的那一枚会亮，且严格由 `tts_mark_at` 的 130ms 半波包络收口——
+        // 不会整页一起闪，也不会长亮。
+        let tts_punct_pulse = if self.show_tts
+            && crate::app::tts_span_has(self.tts_line, key)
+        {
+            crate::punct::punct_pulse(self.tts_mark_at.elapsed().as_millis() as f32)
+        } else {
+            0.0
+        };
         // **无障碍档换一套画法**（v1.9.82）：淡染是给常视力「看一眼就够」的
         // 提示，对弱视等于没画——0.12 的朱砂兑在白纸上只是一片几乎看不出的
         // 粉。这一档改成两块**实色**：句 = 深蓝底白字，词 = 纯黄底黑字。
@@ -8270,7 +8284,9 @@ impl Root {
             // 这里就画谁，两处不再各判一次。
             cell = cell
                 .relative()
-                .child(self.punct_overlay(g.ch, cell_w, cell_h, fs, back, false, a11y_ink));
+                .child(self.punct_overlay(
+                    g.ch, cell_w, cell_h, fs, back, false, a11y_ink, tts_punct_pulse,
+                ));
         } else if crate::west::is_west_hyphen(g.ch) {
             // 单独出现的连字符：竖排里旋转成一道竖线（丨）。
             cell = cell.child(
@@ -8370,7 +8386,9 @@ impl Root {
         if let Some(h) = hang {
             cell = cell
                 .relative()
-                .child(self.punct_overlay(h.ch, cell_w, cell_h, fs, back, true, a11y_ink));
+                .child(self.punct_overlay(
+                    h.ch, cell_w, cell_h, fs, back, true, a11y_ink, tts_punct_pulse,
+                ));
         }
         // 书名号：0.7 倍正文，**开号占上半格、闭号占下半格**（v1.9.26）。
         // 开号在本格（书名首字）、闭号也在本格（书名末字）——一格至多各一枚，
@@ -13542,7 +13560,11 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 ("通假", self.show_tongjia, StyleAct::Tong),
                 ("标点", self.show_punct, StyleAct::Punct),
                 ("生僻字", self.show_rare, StyleAct::Rare),
-                ("数字汉字", self.han_digits, StyleAct::Han),
+                // v1.9.84：「数字汉字」入口**只在此隐藏**。底层 `han_digits`
+                // 链路（偏好 / 预设 / 竖排分页 / PDF 落字）原样保留、默认关：
+                // 它牵动分页的半格账与出图落字，物理删除风险太大。将来要
+                // 恢复入口，取消本行注释即可，不必改任何底层代码。
+                // ("数字汉字", self.han_digits, StyleAct::Han),
                 ("注释", self.notes_shown, StyleAct::Notes),
             ],
             cx,
