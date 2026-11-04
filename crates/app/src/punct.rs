@@ -310,11 +310,16 @@ pub fn place(fs_body: f32, cell_w: f32, cell_h: f32, kind: PunctKind) -> PunctMa
     // 瓜子点的悬空微调：向左 / 向下各让 1px（不贴死前一字、不贴右缘）。
     // 「疑叹」那枚大点同是斜撇，跟着一起悬；两款圈子是圆的，居中即正，
     // 不悬（悬了反而看着歪）。
-    let nudge = match kind {
-        PunctKind::Seed | PunctKind::BigSeed => SEED_NUDGE_PX,
-        PunctKind::Dot | PunctKind::Ring => 0.0,
+    let (ax, nudge) = match kind {
+        // v1.9.84 悬针档：形状缩小并斜向右下后，锚点再往右推 8% 格宽，
+        // 记号才真正落在字间隙里，而不是贴在字的右肩上。
+        PunctKind::Seed | PunctKind::BigSeed if SEED_CUBIC => {
+            (CUBIC_ANCHOR_X, CUBIC_NUDGE_PX)
+        }
+        PunctKind::Seed | PunctKind::BigSeed => (ANCHOR_X, SEED_NUDGE_PX),
+        PunctKind::Dot | PunctKind::Ring => (ANCHOR_X, 0.0),
     };
-    let cx = ((cell_w * ANCHOR_X) - nudge).clamp(half, (cell_w - half).max(half));
+    let cx = ((cell_w * ax) - nudge).clamp(half, (cell_w - half).max(half));
     let cy = ((cell_h * ANCHOR_Y) + nudge).clamp(half, (cell_h - half).max(half));
     PunctMark {
         kind,
@@ -725,8 +730,8 @@ pub const SEED_HOOK: bool = false;
 // * **极锐出锋**：`c2` / `c3` 都压在 B 上方且紧贴中轴，于是 B 处两条切线
 //   几乎 **180° 折返**，只剩约 17° 的开口——毛笔悬针竖那一提；
 // * **不对称**：c1 / c4 一宽一窄，c2 / c3 一右一左，A 偏左、B 偏右；
-// * **微小倾斜**：整体顺时针 [`CUBIC_TILT_DEG`] = 15°，加上 A→B 的脊柱
-//   弯曲，是「刚滴落、还没晕开」那一瞬，不是静止的对称水滴。
+// * **42° 倾斜**：整枚顺时针转 [`CUBIC_TILT_DEG`] = 42°，圆头在左上、
+//   悬针尖甩向右下；再加 A→B 的脊柱弯曲，是顿笔出锋那一瞬的物理感。
 //
 // 全部坐标都是 `hh = d/2`、`hw = hh × CUBIC_W_OF_H` 的倍数，`d` 来自
 // `fs × PunctKind::fs_ratio()`——**纯矢量**，字号放大只是等比放大。最后做
@@ -738,9 +743,24 @@ pub const SEED_HOOK: bool = false;
 /// 出货档：true = 两段三次贝塞尔「悬针」，false = 旧版 7 段二次墨滴。
 pub const SEED_CUBIC: bool = true;
 /// 新档的半宽 / 半长：撑住饱满的顶，同时不让它胖成一块红饼。
-pub const CUBIC_W_OF_H: f32 = 0.55;
-/// 新档整体倾角（度，顺时针）：**15°**，一点点就够灵动。
-pub const CUBIC_TILT_DEG: f32 = 15.0;
+pub const CUBIC_W_OF_H: f32 = 0.62;
+/// 新档整体倾角（度，顺时针）：**精确 42°**。
+///
+/// 直接取旧档 [`SEED_TILT_DEG`]（42.0）——那是用户量精刻本照片 PCA
+/// 得 41.4° 后定的值，两档共用**唯一源**，永不会各写各的漂开。
+/// 与旧档 `seed_anchors_at` 同向：`rot(x,y) = (x·c + y·s, −x·s + y·c)`，
+/// 局部的「下」被甩向**右下**——圆头落在左上、悬针尖指向右下，
+/// 正是刻本读点那一斜。首版用了反方向 15°、尖直挺挺朝下，真机成
+/// 一排「朝天椒」，已废弃。三角函数只算一次 `sin_cos()`，f32 全程。
+pub const CUBIC_TILT_DEG: f32 = SEED_TILT_DEG;
+/// 新档整体缩到 `place` 给的长度的 **68%**：它是一枚「点」，不是一根辣椒。
+/// 只缩几何、`PunctMark.d` 不动（clamp 仍按原尺寸算，更保守，不会出格）。
+pub const CUBIC_H_SCALE: f32 = 0.68;
+/// 新档的横向锚点：从 0.72 推到 **0.80**，让记号真正落在字间隙右侧，
+/// 不压在字身上。屏幕与 PDF 都走 `place`，改这一处两边同步。
+pub const CUBIC_ANCHOR_X: f32 = 0.80;
+/// 新档的悬空微调：比旧档少让一点（形状已缩小，不必再往左躲）。
+pub const CUBIC_NUDGE_PX: f32 = 0.5;
 /// 朱砂洇边：同形放大一档、极淡一层垫在下面，模拟印泥吃进纸纤维。
 pub const CUBIC_BLEED_SCALE: f32 = 1.075;
 pub const CUBIC_BLEED_ALPHA: f32 = 0.18;
@@ -793,16 +813,21 @@ fn polygon_centroid(pts: &[(f32, f32)]) -> (f32, f32) {
 
 /// **新档的路径**：顶心 A + 2 段三次贝塞尔（第 2 段的 `to` 回到 A）。
 ///
-/// 返回的所有坐标都相对记号中心、已旋转 15°、已质心归零；屏幕走原生
-/// `cubic_bezier_to`，PDF 读 [`seed_cubic_outline`] 的同一份采样，两边同形。
-/// `hook`（回锋）只把针收短一档、并把 c2/c3 微微撑开成钝口。
+/// 返回的所有坐标都相对记号中心、已缩放、已旋转 [`CUBIC_TILT_DEG`]、
+/// 已质心归零；屏幕走原生 `cubic_bezier_to`，PDF 读 [`seed_cubic_outline`]
+/// 的同一份采样，两边同形。`hook` 只把针收短一档、并把 c2/c3 撑开成钝口。
+///
+/// ⚠️ 项目里**没有独立的 transform 矩阵**（GPUI 0.2.2 的 `paint_path` 不收
+/// 变换）：旋转就在下面这个 `rot` 闭包里，与旧档 `seed_anchors_at` 同款。
 pub fn cubic_path(d: f32, hook: bool) -> ((f32, f32), [CubicSeg; 2]) {
+    let d = d * CUBIC_H_SCALE;
     let hh = d * 0.5;
     let hw = hh * CUBIC_W_OF_H;
     let (s, c) = CUBIC_TILT_DEG.to_radians().sin_cos();
     let p = |x: f32, y: f32| {
         let (rx, ry) = (x * hw, y * hh);
-        (rx * c - ry * s, rx * s + ry * c)
+        // 顺时针 42°：局部的「下」→ 屏幕的「右下」（旧档同一支公式）。
+        (rx * c + ry * s, -rx * s + ry * c)
     };
     let (tip_y, n2x, n3x) = if hook {
         (0.86, 0.26, -0.06) // 回锋：锋尖回收、开口略钝
@@ -989,17 +1014,19 @@ mod tests {
             assert!(m.d > m.d * SEED_W_OF_H, "瓜子点应是竖长形：{m:?}");
             // 整体仍是一粒记号，绝不抢格心（≤ 0.60 倍正文）。
             assert!(m.d / fs <= 0.60, "瓜子点偏大：{:.3} 倍正文", m.d / fs);
-            // 悬空微调：中心比「72%×28%」再左、再下各 1px。
-            assert!(
-                (m.cx - (cw * ANCHOR_X - SEED_NUDGE_PX)).abs() < 0.01,
-                "未向左让出悬空：{}",
-                m.cx
-            );
-            assert!(
-                (m.cy - (ch * ANCHOR_Y + SEED_NUDGE_PX)).abs() < 0.01,
-                "未向下让出悬空：{}",
-                m.cy
-            );
+            // 悬空微调：新档把锚点推到 80% 格宽（字间隙），旧档仍是 72%。
+            let (ax, nd) = if SEED_CUBIC {
+                (CUBIC_ANCHOR_X, CUBIC_NUDGE_PX)
+            } else {
+                (ANCHOR_X, SEED_NUDGE_PX)
+            };
+            // 与 `place` 同一条夹紧规则：小格子里 0.80 会被拉回格右缘内，
+            // 这是「句读绝不探出字格、压到邻列」的兜底，不是落点算错。
+            let half = m.d * 0.5 + m.stroke;
+            let want_x = (cw * ax - nd).clamp(half, (cw - half).max(half));
+            let want_y = (ch * ANCHOR_Y + nd).clamp(half, (ch - half).max(half));
+            assert!((m.cx - want_x).abs() < 0.01, "横向落点错：{} / 应 {}", m.cx, want_x);
+            assert!((m.cy - want_y).abs() < 0.01, "纵向落点错：{} / 应 {}", m.cy, want_y);
         }
     }
 
@@ -1299,7 +1326,7 @@ mod tests {
             assert!(open < 20.0, "底尖不够锐：开口 {open:.1}° / d={d}");
             // 针要够长，不然只是个圆底收了个角。
             let needle = (vin.0 * vin.0 + vin.1 * vin.1).sqrt();
-            assert!(needle > d * 0.20, "悬针太短：{needle:.2} / d={d}");
+            assert!(needle > d * 0.15, "悬针太短：{needle:.2} / d={d}");
         }
     }
 
@@ -1341,7 +1368,7 @@ mod tests {
         let r = (rv.0 * rv.0 + rv.1 * rv.1).sqrt();
         let l = (lv.0 * lv.0 + lv.1 * lv.1).sqrt();
         assert!((r - l).abs() > 9.27 * 0.02, "左右对称回去了：{r} / {l}");
-        // 15° 倾斜确实落到了路径上：顶心与底尖不同 x。
+        // 42° 倾斜确实落到了路径上：顶心与底尖不同 x。
         let (a0, _) = cubic_path(9.27, false);
         let (_, s2) = cubic_path(9.27, false);
         assert!((s2[0].to.0 - a0.0).abs() > 9.27 * 0.02, "没有倾斜弧度");
@@ -1364,6 +1391,26 @@ mod tests {
             (last.0 - a0.0).abs() < 1e-5 && (last.1 - a0.1).abs() < 1e-5,
             "PDF 折线没闭合回顶心"
         );
+    }
+
+    #[test]
+    fn cubic_tip_points_down_right_at_forty_two_degrees() {
+        // 用户明确退货的一版：尖直挺挺朝下 / 朝上，像一排朝天椒。
+        // 这一条把方向钉死：尖必须在圆头的**右下**，主轴落在 40~55°，
+        // 且角度常量就是 42°（与旧档同一个唯一源）。
+        for d in [4.0f32, 9.27, 24.0] {
+            let (a0, segs) = cubic_path(d, false);
+            let tip = segs[0].to;
+            let (dx, dy) = (tip.0 - a0.0, tip.1 - a0.1);
+            assert!(dx > 0.0 && dy > 0.0, "尖没指向右下：({dx:.2},{dy:.2})");
+            let deg = (dx / dy).atan().to_degrees();
+            assert!((CUBIC_TILT_DEG - 42.0).abs() < 1e-6, "倾角必须是 42°");
+            assert_eq!(CUBIC_TILT_DEG, SEED_TILT_DEG, "两档必须同角度");
+            assert!((40.0..55.0).contains(&deg), "主轴 {deg:.1}° 不在 40~55°");
+            // 整体缩小：成品长必须明显短于 `place` 给的 d。
+            let span = (dx * dx + dy * dy).sqrt();
+            assert!(span < d * 0.80, "没缩小，还是一根辣椒：{span:.2} / d={d}");
+        }
     }
 
     #[test]
