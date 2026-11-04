@@ -730,8 +730,9 @@ pub const SEED_HOOK: bool = false;
 // * **极锐出锋**：`c2` / `c3` 都压在 B 上方且紧贴中轴，于是 B 处两条切线
 //   几乎 **180° 折返**，只剩约 17° 的开口——毛笔悬针竖那一提；
 // * **不对称**：c1 / c4 一宽一窄，c2 / c3 一右一左，A 偏左、B 偏右；
-// * **42° 倾斜**：整枚顺时针转 [`CUBIC_TILT_DEG`] = 42°，圆头在左上、
-//   悬针尖甩向右下；再加 A→B 的脊柱弯曲，是顿笔出锋那一瞬的物理感。
+// * **42° 倾斜 + 与旧档同向**：整枚顺时针转 42° 再翻 180°，落到
+//   「圆头压右下、悬针尖拖左上」；加上 A→B 的脊柱弯曲与两侧针根
+//   不同高，是一滴正在流动的朱砂，不是静止对称的红豆。
 //
 // 全部坐标都是 `hh = d/2`、`hw = hh × CUBIC_W_OF_H` 的倍数，`d` 来自
 // `fs × PunctKind::fs_ratio()`——**纯矢量**，字号放大只是等比放大。最后做
@@ -748,14 +749,27 @@ pub const CUBIC_W_OF_H: f32 = 0.62;
 ///
 /// 直接取旧档 [`SEED_TILT_DEG`]（42.0）——那是用户量精刻本照片 PCA
 /// 得 41.4° 后定的值，两档共用**唯一源**，永不会各写各的漂开。
-/// 与旧档 `seed_anchors_at` 同向：`rot(x,y) = (x·c + y·s, −x·s + y·c)`，
-/// 局部的「下」被甩向**右下**——圆头落在左上、悬针尖指向右下，
-/// 正是刻本读点那一斜。首版用了反方向 15°、尖直挺挺朝下，真机成
-/// 一排「朝天椒」，已废弃。三角函数只算一次 `sin_cos()`，f32 全程。
+/// 与旧档 `seed_anchors_at` 同向：`rot(x,y) = (x·c + y·s, −x·s + y·c)`。
+/// 三角函数只算一次 `sin_cos()`，f32 全程。
+///
+/// ⚠️ **朝向**：旧档是「顿笔圆头压**右下**、细尾拖**左上**」。局部形状
+/// 「上圆下尖」按 42° 落地会正好反 180°，故再用 [`CUBIC_FLIP_TO_WOODBLOCK`]
+/// 整枚翻过来。首版反方向 15° 成「朝天椒」、第二版没翻 180° 又成
+/// 「圆头在左上」，两次都是方向错，不是角度错。
 pub const CUBIC_TILT_DEG: f32 = SEED_TILT_DEG;
-/// 新档整体缩到 `place` 给的长度的 **68%**：它是一枚「点」，不是一根辣椒。
-/// 只缩几何、`PunctMark.d` 不动（clamp 仍按原尺寸算，更保守，不会出格）。
-pub const CUBIC_H_SCALE: f32 = 0.68;
+/// 整枚翻 180°，与旧档刻本走向一致：**圆头右下、出锋左上**。
+pub const CUBIC_FLIP_TO_WOODBLOCK: bool = true;
+/// 新档整体缩到 `place` 给的长度的 **82%**。
+///
+/// v1.9.84 第二版曾压到 68%，针被等比磨短成一枚「红豆」——错在等比：
+/// 圆头和悬针该分开管。现在回放到 82%，并靠 [`CUBIC_TIP_REACH`] 只把
+/// **针**往外拉；`PunctMark.d` 不动，clamp 仍按原尺寸算。针尖最远点
+/// 约 0.53d，而夹紧半径是 0.5d + stroke ≈ 0.57d——正好贴着字格边缘
+/// 试探，绝不探出去压邻列。
+pub const CUBIC_H_SCALE: f32 = 0.82;
+/// 悬针尖的纵向拉伸（单位 `hh`）：从 1.00 拉到 **1.30**。
+/// 圆头仍在 −1.00，所以多出来的 30% 全长都归那道出锋。
+pub const CUBIC_TIP_REACH: f32 = 1.30;
 /// 新档的横向锚点：从 0.72 推到 **0.80**，让记号真正落在字间隙右侧，
 /// 不压在字身上。屏幕与 PDF 都走 `place`，改这一处两边同步。
 pub const CUBIC_ANCHOR_X: f32 = 0.80;
@@ -824,23 +838,26 @@ pub fn cubic_path(d: f32, hook: bool) -> ((f32, f32), [CubicSeg; 2]) {
     let hh = d * 0.5;
     let hw = hh * CUBIC_W_OF_H;
     let (s, c) = CUBIC_TILT_DEG.to_radians().sin_cos();
+    let flip = if CUBIC_FLIP_TO_WOODBLOCK { -1.0 } else { 1.0 };
     let p = |x: f32, y: f32| {
         let (rx, ry) = (x * hw, y * hh);
-        // 顺时针 42°：局部的「下」→ 屏幕的「右下」（旧档同一支公式）。
-        (rx * c + ry * s, -rx * s + ry * c)
+        // 顺时针 42°（旧档同一支公式），再整枚翻 180°：局部「上圆下尖」
+        // 落到屏幕的「圆头右下、出锋左上」。
+        (flip * (rx * c + ry * s), flip * (-rx * s + ry * c))
     };
     let (tip_y, n2x, n3x) = if hook {
-        (0.86, 0.26, -0.06) // 回锋：锋尖回收、开口略钝
+        (1.10, 0.22, 0.00) // 回锋：锋尖回收一档、开口略钝
     } else {
-        (1.00, 0.20, 0.02) // 悬针：两点紧贴中轴，开口约 17°
+        (CUBIC_TIP_REACH, 0.17, 0.05) // 悬针：两点紧贴中轴，开口约 5°
     };
-    let a = p(-0.06, -1.00); // 顶心：略偏左
-    let b = p(0.12, tip_y); // 底尖：略偏右 → 脊柱带弧
+    let a = p(-0.06, -1.00); // 顶心：略偏左（圆头仍在原位，不跟着拉长）
+    let b = p(0.12, tip_y); // 底尖：外拉到 1.30hh，略偏右 → 脊柱带弧
     let segs = [
-        // 顶心 → 底尖（右半）：c1 水平远推撑圆头，c2 贴轴收出悬针
-        CubicSeg { c1: p(1.25, -1.02), c2: p(n2x, 0.42), to: b },
-        // 底尖 → 顶心（左半）：c3 贴轴折返，c4 水平回收，左缘比右缘窄
-        CubicSeg { c1: p(n3x, 0.42), c2: p(-1.10, -1.02), to: a },
+        // 顶心 → 底尖（右半）：c1 水平远推撑圆头，c2 贴轴收出长针
+        CubicSeg { c1: p(1.25, -1.02), c2: p(n2x, 0.40), to: b },
+        // 底尖 → 顶心（左半）：c3 比 c2 低 0.08hh —— 两侧针根不同高，
+        // 拖尾于是有一点 S 形的流动感，而不是静止对称的一颗红豆。
+        CubicSeg { c1: p(n3x, 0.48), c2: p(-1.10, -1.02), to: a },
     ];
     // 上宽下窄的形状天然「头重」，不校正重心就飘在锚点上方。
     let g = polygon_centroid(&cubic_sample(a, &segs, 32));
@@ -1394,22 +1411,42 @@ mod tests {
     }
 
     #[test]
-    fn cubic_tip_points_down_right_at_forty_two_degrees() {
+    fn cubic_tip_points_up_left_like_the_original_woodblock_dot() {
         // 用户明确退货的一版：尖直挺挺朝下 / 朝上，像一排朝天椒。
-        // 这一条把方向钉死：尖必须在圆头的**右下**，主轴落在 40~55°，
-        // 且角度常量就是 42°（与旧档同一个唯一源）。
+        // 与旧档同向：尖（细尾）必须在圆头（顿笔）的**左上**，
+        // 主轴落在 40~55°，角度常量就是 42°（唯一源）。
         for d in [4.0f32, 9.27, 24.0] {
             let (a0, segs) = cubic_path(d, false);
             let tip = segs[0].to;
             let (dx, dy) = (tip.0 - a0.0, tip.1 - a0.1);
-            assert!(dx > 0.0 && dy > 0.0, "尖没指向右下：({dx:.2},{dy:.2})");
+            assert!(dx < 0.0 && dy < 0.0, "尖没拖向左上（与旧档反向了）：({dx:.2},{dy:.2})");
             let deg = (dx / dy).atan().to_degrees();
             assert!((CUBIC_TILT_DEG - 42.0).abs() < 1e-6, "倾角必须是 42°");
             assert_eq!(CUBIC_TILT_DEG, SEED_TILT_DEG, "两档必须同角度");
             assert!((40.0..55.0).contains(&deg), "主轴 {deg:.1}° 不在 40~55°");
-            // 整体缩小：成品长必须明显短于 `place` 给的 d。
+            // 整体仍是一枚「点」：全长不超过 `place` 给的 d。
             let span = (dx * dx + dy * dy).sqrt();
-            assert!(span < d * 0.80, "没缩小，还是一根辣椒：{span:.2} / d={d}");
+            assert!(span < d * 1.02, "又涨成一根辣椒：{span:.2} / d={d}");
+        }
+    }
+
+    #[test]
+    fn cubic_needle_is_long_and_sharp_not_a_red_bean() {
+        // 这一条专治「等比缩小把针磨平」：针根 → 尖必须占全长三成以上，
+        // 且尖口小于 12°。红豆 / 小瓜子会卡在第一关。
+        for d in [4.0f32, 9.27, 24.0] {
+            let (a0, segs) = cubic_path(d, false);
+            let tip = segs[0].to;
+            let vin = (tip.0 - segs[0].c2.0, tip.1 - segs[0].c2.1);
+            let vout = (segs[1].c1.0 - tip.0, segs[1].c1.1 - tip.1);
+            let needle = (vin.0 * vin.0 + vin.1 * vin.1).sqrt();
+            let span = ((tip.0 - a0.0).powi(2) + (tip.1 - a0.1).powi(2)).sqrt();
+            assert!(
+                needle / span > 0.30,
+                "针被磨成红豆了：针 {needle:.2} / 全长 {span:.2}",
+            );
+            let open = 180.0 - angle_deg(vin, vout);
+            assert!(open < 12.0, "尖端不够锐：开口 {open:.1}°");
         }
     }
 
