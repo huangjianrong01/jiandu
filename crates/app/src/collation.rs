@@ -226,6 +226,23 @@ const ED_PAD: f32 = 40.0;
 /// 落光标 / 选区估算，不影响左图高亮精度——左图高亮走 `SourceRegion` 真实映射）。
 const CHAR_W: f32 = FONT_SIZE * 0.95;
 
+/// **选区 / 当前行 / 查找命中**（v1.9.86）：自绘编辑器没有系统 selection，
+/// 底色一律由 [`line_highlights`] 算物理矩形、再交给 `gpui::canvas` 手绘。
+/// 蓝是 macOS 系统选区蓝，压到 40% 让 #333 的墨仍读得清；朱砂留给
+/// 「对照模式的差异段」，两者绝不混色——旧档把选区也画成朱砂 20%，
+/// 在对照模式的朱砂段底上根本看不出来，真机就是「拖了选却没高亮」。
+const SEL_BG: u32 = 0x2F6FED66;
+/// 当前行：约 6% 黑的一层极浅灰，只做「眼睛不跟丢」的引路，不抢字。
+const ACTIVE_LINE_BG: u32 = 0x0000000F;
+/// ⌘F 命中：暖黄，与用户亲手拖出的蓝色选区明确区分（沿用旧值）。
+const FIND_BG: u32 = 0xD9A44155;
+/// 对照模式单段最多为「段落对齐」补几行（v1.9.86）。
+/// 右栏按 Enter 拆段后，段号与毛坯整体错位，半段会被拿去对齐毛坯的
+/// **整段**（几百字 → 十几视觉行），补出一大截空白——这正是真机
+/// 「按回车换行产生巨大间隙」的根因。设上限后，清洗造成的 1~2 行
+/// 高低差仍能对齐（v1.9.63 的卖点保住），异常错位不再糊住正文。
+const DIFF_ALIGN_MAX_PAD: usize = 2;
+
 /// 估算一段文本在「每行约 `cpl` 字」下的视觉行数（对照模式段落对齐用）。
 ///
 /// 中文近等宽，`whitespace_normal` 几乎处处可断，故按「字数 ÷ 每行字数」上取整即可；
@@ -435,7 +452,17 @@ impl LineIndex {
             let rv = raw_line
                 .map(|r| est_wrapped_lines(r, cpl))
                 .unwrap_or(v);
-            al += v.max(rv);
+            // v1.9.86：右栏按 Enter 拆段后段号与毛坯整体错位，半段会被拿去
+            // 对齐毛坯的**整段**（几百字 → 十几视觉行），render 里就补出
+            // 一大截空白——真机「按回车换行产生巨大间隙」的根因。
+            // 空段（刚敲出来的空行）更不该被撑高：它本身只占 1 行。
+            // 上限只砍异常错位，清洗造成的 1~2 行高低差照旧能对齐。
+            let rv_cap = if n == 0 {
+                v
+            } else {
+                rv.min(v.saturating_add(DIFF_ALIGN_MAX_PAD))
+            };
+            al += v.max(rv_cap);
             idx.vis.push(vis);
             idx.aligned.push(al);
         }
@@ -553,6 +580,74 @@ fn visual_spans(a: usize, b: usize, cpl: usize) -> Vec<(usize, usize, usize)> {
         let end = b.min((k + 1) * cpl);
         out.push((k, p, end));
         p = end;
+    }
+    out
+}
+
+/// 一行高亮层的三种底色，按「当前行 → 查找命中 → 选区」叠（数组顺序即绘制顺序）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HlKind {
+    ActiveLine,
+    FindHit,
+    Selection,
+}
+
+/// 相对**行盒左上角**的物理矩形（CSS px）。`w = None` 表示撑满整行宽，
+/// 由 Canvas 在 paint 时拿自己的 `bounds.size.width` 填上。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HlRect {
+    x: f32,
+    y: f32,
+    w: Option<f32>,
+    h: f32,
+    kind: HlKind,
+}
+
+/// **字符区间 → 物理矩形**（v1.9.86 唯一真相，可单测）。
+///
+/// ## 为什么必须自己画
+/// GPUI 0.2.2 **没有内置 Editor**；`crate::ime::InputField` 只负责注册焦点与
+/// 接住 IME 回传，正文是普通 `div().child(SharedString)`。系统那层蓝色选区
+/// 是 NSTextView / 内置 TextInput 拿 `selected_range` 自己画的——本工作台里
+/// 它**根本不存在**，所以拖选不会有「系统默认蓝色底色」，不是绑定漏了。
+///
+/// `CollationWorkspace::selection` / `cursor` 都只是**字符下标**，必须在这里
+/// 用 `visual_spans`（软换行口径）+ 实测 `adv`（`measure_char_adv`，与
+/// `caret_at` 同源）换算成像素，再由 `render_line` 的 Canvas 画出来。
+/// 抽成纯函数就是为了「物理坐标对不对」可以断言，而不是开窗口拿眼估。
+fn line_highlights(
+    sel: Option<(usize, usize)>,
+    find: Option<(usize, usize)>,
+    active_visual: Option<usize>,
+    cpl: usize,
+    adv: f32,
+    box_top: f32,
+    box_h: f32,
+) -> Vec<HlRect> {
+    let mut out = Vec::new();
+    if let Some(k) = active_visual {
+        out.push(HlRect {
+            x: 0.0,
+            y: k as f32 * LINE_H,
+            w: None,
+            h: LINE_H,
+            kind: HlKind::ActiveLine,
+        });
+    }
+    for (range, kind) in [(find, HlKind::FindHit), (sel, HlKind::Selection)] {
+        let Some((a, b)) = range else { continue };
+        if b <= a {
+            continue;
+        }
+        for (k, sa, sb) in visual_spans(a, b, cpl) {
+            out.push(HlRect {
+                x: (sa - k * cpl) as f32 * adv,
+                y: box_top + k as f32 * LINE_H,
+                w: Some((sb - sa) as f32 * adv),
+                h: box_h,
+                kind,
+            });
+        }
     }
     out
 }
@@ -4290,7 +4385,11 @@ impl CollationWorkspace {
             } else {
                 rgba(0x2B262004)
             };
-            let pad = max_lines.saturating_sub(seg_lines) as f32 * LINE_H;
+            // v1.9.86：与 LineIndex 同一上限，双保险，绝不补出巨大空白。
+            let pad = max_lines
+                .saturating_sub(seg_lines)
+                .min(DIFF_ALIGN_MAX_PAD) as f32
+                * LINE_H;
             content = content.child(
                 div()
                     .w_full()
@@ -6200,6 +6299,49 @@ impl CollationWorkspace {
         cx.notify();
     }
 
+    /// **开发用**（v1.9.86，`JIANDU_HL_DEMO=1`）：开机把工作台摆成
+    /// 「原文对照 + 蓝色选区 + 当前行浅灰 + 按过 Enter 的拆段」目标状态，
+    /// 供 `screencapture` 核对。合成点击过不了 TCC，选区与对照只能靠
+    /// 环境变量直接摆位——与 `dev_open_preview` 同一套路，不影响发行版。
+    pub fn dev_setup_highlight_demo(&mut self, cx: &mut Context<Self>) {
+        let raw = concat!(
+            "【題解】史記卷一　五帝本紀第一\n",
+            "黃帝者，少典之子，姓公孫，名曰軒轅。生而神靈，弱而能言，幼而徇齊，長而敦敏，成而聰明。軒轅之時，神農氏世衰，諸侯相侵伐，暴虐百姓，而神農氏弗能征。\n",
+            "於是軒轅乃習用干戈，以征不享，諸侯咸來賓從。而蚩尤最為暴，莫能伐。炎帝欲侵陵諸侯，諸侯咸歸軒轅。\n",
+            "軒轅乃修德振兵，治五氣，蓺五種，撫萬民，度四方，教熊羆貔貅貙虎，以與炎帝戰於阪泉之野。\n",
+            "三戰，然後得其志。蚩尤作亂，不用帝命。於是黃帝乃徵師諸侯，與蚩尤戰於涿鹿之野，遂禽殺蚩尤。\n",
+        );
+        // 清洗后改两处字（对照段会打极弱朱砂底），并在第二段中间按一次
+        // Enter —— 正是用户报「右编辑器换行产生巨大间隙」的那个动作。
+        let text = raw
+            .replace("黃帝者，少典之子", "黃帝者少典之子")
+            .replace("諸侯相侵伐", "諸矦相侵伐")
+            .replace("生而神靈，弱而能言", "生而神靈\n弱而能言");
+        let char_before = |needle: &str| -> usize {
+            text.split(needle).next().unwrap_or("").chars().count()
+        };
+        let a = char_before("弱而能言，幼而徇齊");
+        let b = a + "弱而能言，幼而徇齊".chars().count();
+        self.set_text(text);
+        // ⚠️ **绝不污染书库**：`flush_now` / `save_now` / `touch` 全以 `store_id`
+        // 为闸门（None = 临时样张）。`enter_collation(0)` 刚把第 0 本书的
+        // store_id 绑上，这里必须切断，否则退出强存会把这段《史記》示例
+        // 写回用户那本书的 `collation_state`。
+        self.store_id = None;
+        self.raw_text = Some(raw.to_string());
+        self.show_diff = true;
+        self.pure_text_mode = false;
+        self.show_preview = false;
+        self.show_help = false;
+        self.find_open = false;
+        self.sanitize_card = None;
+        self.selection = Some(a..b);
+        self.anchor = a;
+        self.cursor = b;
+        self.diff_scroll.set_offset(Point::new(px(0.0), px(0.0)));
+        cx.notify();
+    }
+
     fn close_preview(&mut self) {
         self.show_preview = false;
         self.preview_gen += 1;
@@ -7322,6 +7464,35 @@ impl CollationWorkspace {
         let box_h = (FONT_SIZE * 1.42).min(LINE_H);
         let box_top = (LINE_H - box_h) * 0.5;
 
+        // v1.9.86：selection / cursor 在这里只是**字符下标**，系统不会替自绘
+        // 编辑器画蓝色选区。一次算清所有物理矩形，交给 Canvas（见下）。
+        let caret_visual = caret_col.map(|col| {
+            // 行尾恰好落在折行边界时归上一视觉行（与下面的光标竖线同口径）。
+            if col > 0 && col % cpl == 0 && col == line_len {
+                col / cpl - 1
+            } else {
+                col / cpl
+            }
+        });
+        let find_range = if self.find_open {
+            self.find_sel.as_ref().map(|r| {
+                let a = r.start.max(line_start).min(line_end) - line_start;
+                let b = r.end.max(line_start).min(line_end) - line_start;
+                (a.min(b), a.max(b))
+            })
+        } else {
+            None
+        };
+        let rects = line_highlights(
+            (sel_b > sel_a).then_some((sel_a, sel_b)),
+            find_range,
+            caret_visual,
+            cpl,
+            adv,
+            box_top,
+            box_h,
+        );
+
         let mut row = div()
             .relative()
             .min_h(px(LINE_H))
@@ -7351,47 +7522,45 @@ impl CollationWorkspace {
                 }),
             );
 
-        // ② 选区底色：绝对定位，**在文本之前** add（GPUI 按子元素顺序作画，
-        //    后加的盖在上面），因此永远压在字下面，不遮墨色。
+        // ② **Canvas 高亮层**（v1.9.86）——选区蓝 / 当前行浅灰 / ⌘F 暖黄。
         //
-        // ⚠️ **逐视觉行**画（v1.9.67）：一行只要折了行，整行一块就会盖住折行后的
-        // 空白、压到下一段行距上。`visual_spans` 按每行字数切开，每块只覆盖真正
-        // 有字的那一段——这才是「贴在字上」的选区，而不是一块段落色卡。
-        if sel_b > sel_a {
-            for (k, a, b) in visual_spans(sel_a, sel_b, cpl) {
-                row = row.child(
-                    div()
-                        .absolute()
-                        .top(px(box_top + k as f32 * LINE_H))
-                        .left(px((a - k * cpl) as f32 * adv))
-                        .w(px((b - a) as f32 * adv))
-                        .h(px(box_h))
-                        .bg(rgba(0x8c2b2233)),
-                );
-            }
-        }
-
-        // ②′ 查找命中（v1.9.68，⌘F）：整段泛黄，与朱砂选区区分开——
-        //    查找要「一眼看到在哪」，不能和用户亲手拖出来的选区同色，
-        //    否则按 ⌘G 跳下一个时根本分不清哪一处是刚跳到的。
-        if self.find_open {
-            if let Some(r) = self.find_sel.as_ref() {
-                let a = r.start.max(line_start).min(line_end) - line_start;
-                let b = r.end.max(line_start).min(line_end) - line_start;
-                if b > a {
-                    for (k, sa, sb) in visual_spans(a, b, cpl) {
-                        row = row.child(
-                            div()
-                                .absolute()
-                                .top(px(box_top + k as f32 * LINE_H))
-                                .left(px((sa - k * cpl) as f32 * adv))
-                                .w(px((sb - sa) as f32 * adv))
-                                .h(px(box_h))
-                                .bg(rgba(0xD9A44155)),
-                        );
-                    }
-                }
-            }
+        //    画在文本**之前** add，GPUI 按子元素顺序作画，故永远压在字下面，
+        //    不遮墨色。用 `canvas` 而不是一叠绝对定位 div 的三个理由：
+        //      ① 用户要的「按选区范围手绘高亮矩形」就是 `paint_quad(fill(..))`；
+        //      ② Canvas 不注册 hitbox（`request_layout` 传空 children），不会
+        //         重演 v1.9.65「多一层 hitbox → 编辑器变只读」；
+        //      ③ 矩形坐标由纯函数 [`line_highlights`] 给，可单测、不与 render
+        //         里的估算分家。四边 inset 0 是**绝对定位**，不碰 h_full 那类
+        //         百分比高度（那正是滚动视口塌陷的老雷）。
+        if !rects.is_empty() {
+            row = row.child(
+                gpui::canvas(
+                    move |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        let o = bounds.origin;
+                        for r in &rects {
+                            let color = match r.kind {
+                                HlKind::ActiveLine => rgba(ACTIVE_LINE_BG),
+                                HlKind::FindHit => rgba(FIND_BG),
+                                HlKind::Selection => rgba(SEL_BG),
+                            };
+                            let w = r.w.unwrap_or(px_f32(bounds.size.width));
+                            window.paint_quad(gpui::fill(
+                                Bounds {
+                                    origin: gpui::point(o.x + px(r.x), o.y + px(r.y)),
+                                    size: gpui::size(px(w), px(r.h)),
+                                },
+                                color,
+                            ));
+                        }
+                    },
+                )
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0)),
+            );
         }
 
         // ① 文本：整行一个节点。单列、软换行，不受任何覆盖物影响。
@@ -7521,7 +7690,11 @@ impl CollationWorkspace {
                     } else {
                         rgba(0x2B262004)
                     };
-                    let pad = max_lines.saturating_sub(seg_lines) as f32 * LINE_H;
+                    // v1.9.86：与 LineIndex 同一上限，双保险。
+                    let pad = max_lines
+                        .saturating_sub(seg_lines)
+                        .min(DIFF_ALIGN_MAX_PAD) as f32
+                        * LINE_H;
                     content = content.child(
                         div()
                             .w_full()
@@ -9455,6 +9628,81 @@ impl CollationWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── v1.9.86：Canvas 高亮物理坐标 + 对照段落补齐上限 ────────────────
+
+    /// 选区跨软换行必须切成多块：x 相对视觉行首、y 逐行下移、宽 = 字数 ×
+    /// 实测字宽；当前行只亮光标那一条视觉行且撑满整行宽。
+    #[test]
+    fn line_highlights_maps_char_range_to_pixel_rects() {
+        let adv = 17.0;
+        let box_top = 4.0;
+        let box_h = 24.0;
+        let rects = line_highlights(Some((2, 12)), None, Some(1), 5, adv, box_top, box_h);
+        assert_eq!(rects[0].kind, HlKind::ActiveLine);
+        assert_eq!(rects[0].w, None, "当前行要撑满整行");
+        assert_eq!(rects[0].y, LINE_H);
+        assert_eq!(rects[0].h, LINE_H);
+        let sel: Vec<_> = rects.iter().filter(|r| r.kind == HlKind::Selection).collect();
+        assert_eq!(sel.len(), 3);
+        assert_eq!((sel[0].x, sel[0].y, sel[0].w), (2.0 * adv, box_top, Some(3.0 * adv)));
+        assert_eq!((sel[1].x, sel[1].y, sel[1].w), (0.0, box_top + LINE_H, Some(5.0 * adv)));
+        assert_eq!((sel[2].x, sel[2].y, sel[2].w), (0.0, box_top + 2.0 * LINE_H, Some(2.0 * adv)));
+        for r in &sel {
+            assert_eq!(r.h, box_h);
+        }
+    }
+
+    /// 叠放顺序：当前行 → 查找命中 → 用户选区（选区压最上，不被黄色盖掉）。
+    #[test]
+    fn selection_is_drawn_above_find_hit_and_active_line() {
+        let rects = line_highlights(Some((0, 3)), Some((1, 4)), Some(0), 10, 17.0, 4.0, 24.0);
+        let kinds: Vec<_> = rects.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![HlKind::ActiveLine, HlKind::FindHit, HlKind::Selection]);
+        assert_eq!(SEL_BG, 0x2F6FED66, "系统蓝是产品口径，不许悄悄改回朱砂");
+        assert_ne!(SEL_BG, 0x8c2b2233, "选区与对照差异段绝不同色");
+    }
+
+    /// 无选区 / 空选区不产生选区矩形；只有当前行时仍要亮一行。
+    #[test]
+    fn empty_selection_emits_no_selection_rect() {
+        assert!(line_highlights(None, None, None, 5, 17.0, 4.0, 24.0).is_empty());
+        assert!(line_highlights(Some((3, 3)), None, None, 5, 17.0, 4.0, 24.0).is_empty());
+        let r = line_highlights(None, None, Some(0), 5, 17.0, 4.0, 24.0);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].kind, HlKind::ActiveLine);
+    }
+
+    /// ⚠️ **回归**：右栏按 Enter 拆段后，段号与毛坯错位。旧实现让半段去对齐
+    /// 毛坯的整段（300 字 = 15 视觉行），一段补出 14 × 30.6 ≈ 428px 空白，
+    /// 真机就是「按回车换行产生巨大间隙」。现在单段补齐有硬上限。
+    #[test]
+    fn diff_alignment_never_pads_a_huge_gap_after_enter() {
+        let cpl = 20;
+        let raw = "古".repeat(300);
+        let idx_before = LineIndex::build(&raw, Some(&raw), cpl, 1, true);
+        // 第 10 字后按一次 Enter：右栏两段（10 / 290 字），毛坯仍是一整段。
+        let after = format!("{}\n{}", "古".repeat(10), "古".repeat(290));
+        let idx_after = LineIndex::build(&after, Some(&raw), cpl, 2, true);
+        for li in 0..idx_after.lines() {
+            let own = idx_after.vis[li + 1] - idx_after.vis[li];
+            let aligned = idx_after.aligned[li + 1] - idx_after.aligned[li];
+            assert!(
+                aligned.saturating_sub(own) <= DIFF_ALIGN_MAX_PAD,
+                "第 {li} 段补了 {} 行（上限 {}）",
+                aligned.saturating_sub(own),
+                DIFF_ALIGN_MAX_PAD
+            );
+        }
+        // 旧实现一次回车把总高抬 14 行；现在最多「1 行新段 + 2 行补齐」。
+        let grew = idx_after.total_aligned() as isize - idx_before.total_aligned() as isize;
+        assert!(grew <= 3, "一次回车不该把总高抬 {grew} 行");
+        // 连按两次回车，中间那行空段只占 1 行，不许拿毛坯整段来撑。
+        let with_blank = format!("{}\n\n{}", "古".repeat(10), "古".repeat(290));
+        let idx_blank = LineIndex::build(&with_blank, Some(&raw), cpl, 3, true);
+        assert_eq!(idx_blank.vis[2] - idx_blank.vis[1], 1);
+        assert_eq!(idx_blank.aligned[2] - idx_blank.aligned[1], 1, "空行不许被撑高");
+    }
 
     /// 右文带 Markdown 记号时，**剥记号再比**必须仍然命中同一段原图文字。
     ///

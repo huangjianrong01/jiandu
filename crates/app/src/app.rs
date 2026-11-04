@@ -1985,6 +1985,11 @@ impl Root {
                 let ws = root.collation.clone();
                 ws.update(cx, |w, cx| w.dev_open_preview(cx));
             }
+            // v1.9.86：核对「蓝色选区 / 当前行浅灰 / 回车拆段」的目标状态。
+            if std::env::var("JIANDU_HL_DEMO").is_ok() {
+                let ws = root.collation.clone();
+                ws.update(cx, |w, cx| w.dev_setup_highlight_demo(cx));
+            }
         }
         // 开发用：JIANDU_SOURCE=<path> 直接把一张原图 / 一页 PDF 灌进工作台左栏
         // （左栏的 scale / 居中是纯几何，合成点击过不了 TCC，只能靠环境变量摆位）。
