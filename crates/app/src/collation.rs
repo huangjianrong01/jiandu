@@ -167,6 +167,56 @@ fn est_wrapped_lines(s: &str, cpl: usize) -> usize {
     }
 }
 
+/// **点 → 字符下标**（纯函数，v1.9.67）：屏幕点击与单测共用同一口径。
+///
+/// 正文是**软换行**的：一个逻辑行（`\n` 分隔）在屏幕上可能占 2~4 个视觉行。
+/// 旧实现把「鼠标 y ÷ 行高」直接当**逻辑**行号用——只要有一段折行，后面所有
+/// 行号就整体错位：点屏幕第 3 屏会被算成第 12 个逻辑行，光标瞬移到几十行外
+/// （真机表现就是「点不出光标」，因为光标落在屏幕外），拖拽终点同样飞走
+/// （「稍微一动就整段巨大色块」）。这里三步走：
+///   ① y → **视觉行号**；② 逐逻辑行扣掉它占的视觉行数，落进哪一行就是哪一行；
+///   ③ 行内列 = 该逻辑行内的第几条视觉行 × 每行字数 + x ÷ 字宽。
+/// 越界一律夹紧到文末，绝不返回越界下标。
+fn caret_at(text: &str, cpl: usize, local_x: f32, local_y: f32) -> usize {
+    let cpl = cpl.max(1);
+    let visual = (local_y.max(0.0) / LINE_H).floor() as usize;
+    let col_in_visual = (local_x.max(0.0) / CHAR_W).floor() as usize;
+    let mut start = 0usize;
+    let mut remain = visual;
+    for line in text.split('\n') {
+        let len = line.chars().count();
+        let lines = est_wrapped_lines(line, cpl);
+        if remain < lines {
+            return start + (remain * cpl + col_in_visual).min(len);
+        }
+        remain -= lines;
+        start += len + 1;
+    }
+    // 点在最后一行下方：落到文末（而不是行首，更不是越界）。
+    text.chars().count()
+}
+
+/// 把「一行内的列区间 `[a, b)`」按软换行切成若干**视觉行**片段，
+/// 返回 `(视觉行序号, 起始列, 结束列)`（列号仍以逻辑行行首为 0）。
+///
+/// 选区底色必须**逐视觉行**画：整行画一块的话，一行文字只要折了行，色块就会
+/// 盖住折行后的空白、压到下一段的行距上——真机看着就是「把段落 Padding 和
+/// 行距都变成了丑陋的大色块」。切段之后每一块只覆盖真正有字的那一段。
+fn visual_spans(a: usize, b: usize, cpl: usize) -> Vec<(usize, usize, usize)> {
+    let cpl = cpl.max(1);
+    let (a, b) = (a.min(b), a.max(b));
+    let mut out = Vec::new();
+    let mut p = a;
+    while p < b {
+        let k = p / cpl;
+        let end = b.min((k + 1) * cpl);
+        out.push((k, p, end));
+        p = end;
+    }
+    out
+}
+
+
 // ── 「一张木桌，两张纸」（v1.9.24 视觉定稿）─────────────────────────
 //
 // 分屏不靠线，靠**明度差 + 一道柔影**：左纸（原图）压深一档，右纸（稿纸）最亮，
@@ -516,6 +566,14 @@ pub struct CollationWorkspace {
     anchor: usize,
     /// 是否正在拖拽选择。
     dragging: bool,
+    /// **按下点**（窗口坐标，v1.9.67）：拖选只认「在本编辑器里按下过的这一只手」。
+    ///
+    /// 之前 `extend_selection_from_drag` 只判「左键按着 + 鼠标在动」，于是**任何**
+    /// 左键拖动（哪怕按下点在标点栏 / 空白 / 别的栏）都会拿旧的 `anchor` 去扩展——
+    /// 锚点若是 0，一拖就是「从文首到鼠标」的整段大色块，这就是真机说的
+    /// 「稍微一动就整段全选」。现在按下时记原点、离开原点超过阈值才允许起选，
+    /// 抬起即清空：没有按下点就绝不改选区。
+    drag_origin: Option<(f32, f32)>,
     /// 竖排预览开关（骨架阶段只切占位浮层；真实栅格化在下一步）。
     show_preview: bool,
     /// 位图原图（真正的 PNG / JPG）路径：由 `gpui::img` 自己解码，不预栅格化。
@@ -925,6 +983,7 @@ impl CollationWorkspace {
             diff_scroll: ScrollHandle::new(),
             anchor: 0,
             dragging: false,
+            drag_origin: None,
             show_preview: false,
             image_path: None,
             image_mem: None,
@@ -1741,8 +1800,20 @@ impl CollationWorkspace {
         });
         let panel_w = vw - self.left_col_w(vw);
         // 气泡贴选区末行的下一行；右缘留 8px，越界则往回顶。
-        let x = (ED_PAD + col as f32 * CHAR_W + 4.0).min((panel_w - 108.0).max(ED_PAD));
-        let y = (ED_PAD + (li as f32 + 1.0) * LINE_H - scroll_y + 4.0).max(4.0);
+        //
+        // ⚠️ 行距要按**视觉行**算（v1.9.67）：`li` 是逻辑行号，软换行后一个逻辑行
+        // 可能占两三屏行——直接用 `li * LINE_H` 会让气泡浮到选区上方好几行去。
+        let cpl = self.chars_per_line(vw);
+        let visual_before: usize = self
+            .text
+            .split('\n')
+            .take(li)
+            .map(|l| est_wrapped_lines(l, cpl))
+            .sum();
+        let col_in_visual = col % cpl;
+        let visual_here = col / cpl;
+        let x = (ED_PAD + col_in_visual as f32 * CHAR_W + 4.0).min((panel_w - 108.0).max(ED_PAD));
+        let y = (ED_PAD + (visual_before + visual_here + 1) as f32 * LINE_H - scroll_y + 4.0).max(4.0);
         Some(
             div()
                 .absolute()
@@ -1967,23 +2038,28 @@ impl CollationWorkspace {
         )
     }
 
-    /// 由点击/拖拽位置（窗口坐标）近似推出字符下标。
+    /// 每行可容纳的字符数（软换行口径）。
+    ///
+    /// `render_line` 画选区、`caret_at` 落光标、`render_editor` 估折行**必须同源**：
+    /// 差一个字，色块就会比字长一截或短一截，点第 N 个视觉行也会落错列。
+    fn chars_per_line(&self, vw: f32) -> usize {
+        let content_w = (vw - self.left_col_w(vw) - 2.0 * ED_PAD).max(CHAR_W);
+        (content_w / CHAR_W).floor().max(1.0) as usize
+    }
+
+    /// 由点击/拖拽位置（窗口坐标）推出字符下标。
     ///
     /// 右文编辑器内用「固定行高 + 平均字宽」估算（仅用于编辑器内落光标 / 选区）；
     /// 左图高亮坐标则来自 `SourceRegion` 的真实自然像素映射，二者互不影响。
+    /// 换算本身在 [`caret_at`]（纯函数，已覆盖折行 / 越界 / 空文单测）。
     fn caret_from_point(&self, x: f32, y: f32, vw: f32) -> usize {
         let (origin_x, origin_y) = self.editor_origin(vw);
-        let local_x = (x - origin_x).max(0.0);
-        let local_y = (y - origin_y).max(0.0);
-        let line_idx = (local_y / LINE_H).floor() as usize;
-        let ranges = self.line_ranges();
-        let idx = line_idx.min(ranges.len().saturating_sub(1));
-        let (s, e) = match ranges.get(idx) {
-            Some(&(s, e)) => (s, e),
-            None => (0, self.text.chars().count()),
-        };
-        let in_line = (local_x / CHAR_W).floor() as usize;
-        s + in_line.min(e - s)
+        caret_at(
+            &self.text,
+            self.chars_per_line(vw),
+            (x - origin_x).max(0.0),
+            (y - origin_y).max(0.0),
+        )
     }
 
     /// 双击选「句」：以 `pos` 为中心，向前后扩张到最近的句读 / 空白边界，
@@ -2050,16 +2126,18 @@ impl CollationWorkspace {
         line_start: usize,
         line_len: usize,
         x: f32,
+        y: f32,
         vw: f32,
         vh: f32,
         click_count: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 行内列位：仍按平均字宽估（中文等宽，误差 < 1 字），但**行号不估**。
-        let (origin_x, _) = self.editor_origin(vw);
-        let col = ((x - origin_x).max(0.0) / CHAR_W).round() as usize;
-        self.cursor = line_start + col.min(line_len);
+        // 行号**不估**（由 render_line 在渲染时绑好），列位按真实点算：走
+        // `caret_from_point` 才能认出「本行折行后的第几条视觉行」；再用本行的
+        // 字符区间夹一次，保证绝不落到别的段落去（预估值抖动也不出这一行）。
+        let to = self.caret_from_point(x, y, vw);
+        self.cursor = to.clamp(line_start, line_start + line_len);
         self.anchor = self.cursor;
         if click_count >= 2 {
             // 双击：选中光标所在的「句」（到前后最近标点 / 空白边界）。
@@ -2070,9 +2148,13 @@ impl CollationWorkspace {
             // 连带把原生 macOS 的蓝色选区招出来、吃掉光标焦点。
             self.selection = None;
         }
+        // 记下按下点：拖选必须先有「在正文里按下」这一手（v1.9.67）。
+        self.drag_origin = Some((x, y));
         self.dragging = false;
-        Self::hard_refocus(window, &self.focus);
+        Self::focus_for_typing(window, &self.focus);
         self.link_to_paragraph(li, vw, vh, cx);
+        // 无论联动是否命中都必须重绘：光标位置变了，屏幕上要立刻见到。
+        cx.notify();
         cx.stop_propagation();
     }
 
@@ -2084,7 +2166,9 @@ impl CollationWorkspace {
     ) {
         let vw = px_f32(window.viewport_size().width);
         let vh = px_f32(window.viewport_size().height);
-        self.cursor = self.caret_from_point(px_f32(event.position.x), px_f32(event.position.y), vw);
+        let x = px_f32(event.position.x);
+        let y = px_f32(event.position.y);
+        self.cursor = self.caret_from_point(x, y, vw);
         self.anchor = self.cursor;
         // 点选定位 → 后续键入另起一步（撤销不许跨过这次点击）。
         self.undo_barrier = true;
@@ -2095,17 +2179,19 @@ impl CollationWorkspace {
             // 单击只落光标，绝不当拖拽。
             self.selection = None;
         }
+        self.drag_origin = Some((x, y));
         self.dragging = false;
-        // 点进编辑器 = 用户想打字。这里走硬重建（而不是裸 focus）：原生对话框
-        // 关掉后平台侧可能已经丢了输入上下文，而 GPUI 仍以为聚焦（见 hard_refocus）。
-        Self::hard_refocus(window, &self.focus);
+        // 点进编辑器 = 用户想打字。**用轻量聚焦**而不是 `hard_refocus`：后者为了
+        // 救「原生对话框回来后平台丢了输入上下文」，会先 `blur()` 再 `focus()`；
+        // 放在每次点击上就是每次点都拆一次输入上下文（闪烁 + 可能丢 first responder）。
+        // 点击只需要「确保聚焦」，重建上下文留给 `refocus` 那条专门的路径。
+        Self::focus_for_typing(window, &self.focus);
         // 兜底路径：没落在任何一行上（点的是正文下方的空白）时，仍按估算行号联动，
         // 绝不让「点了没反应」出现。
         if let Some(li) = self.line_of(self.cursor) {
             self.link_to_paragraph(li, vw, vh, cx);
-        } else {
-            cx.notify();
         }
+        cx.notify();
         self.touch(cx);
         cx.stop_propagation();
     }
@@ -2116,15 +2202,24 @@ impl CollationWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 只在左键**按住**时扩展选区：单击（按下即抬起、无移动）永远不会进入这里，
-        // 于是「单击变整段蓝选」的根因被彻底掐断。拖拽状态由「按钮是否还按着」
-        // 实时决定，不再靠 mousedown 时瞎置 `dragging=true`。
+        // 只在左键**按住**时扩展选区。
         if event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        // ① **必须**先在正文里按下过（`drag_origin` 由 click_line / place_caret 置位）。
+        //    没有按下点就改选区 = 拿旧的 `anchor` 瞎扩，锚点若是 0 就是「一拖全选」。
+        let Some((ox, oy)) = self.drag_origin else {
+            return;
+        };
+        let x = px_f32(event.position.x);
+        let y = px_f32(event.position.y);
+        // ② 3px 死区：手抖不算拖选（用户口径「稍微一动就全选」的最后一层保险）。
+        if !self.dragging && (x - ox).abs() < 3.0 && (y - oy).abs() < 3.0 {
             return;
         }
         self.dragging = true;
         let vw = px_f32(window.viewport_size().width);
-        let to = self.caret_from_point(px_f32(event.position.x), px_f32(event.position.y), vw);
+        let to = self.caret_from_point(x, y, vw);
         let (s, e) = (self.anchor.min(to), self.anchor.max(to));
         self.cursor = to;
         self.selection = if s == e { None } else { Some(s..e) };
@@ -2152,6 +2247,20 @@ impl CollationWorkspace {
         }
         window.activate_window();
         window.blur();
+        window.focus(focus);
+    }
+
+    /// **点击时的轻量聚焦**（v1.9.67）：只确保「键盘归编辑器」，**不拆输入上下文**。
+    ///
+    /// 与 [`Self::hard_refocus`] 的分工：
+    ///   * 这里 = 用户拿鼠标点正文。焦点本来就常在编辑器上，`Window::focus()`
+    ///     自身会短路；窗口不是 key 时补一次 `activate_window()` 即可。
+    ///   * `hard_refocus` = 原生对话框 / 菜单刚关掉，平台侧 first responder 被
+    ///     系统收走过，**必须** blur 再 focus 才能重建 IME。那条路只在
+    ///     `refocus` 标记为真时走一次，绝不能挂在每次点击上——否则每点一下
+    ///     就拆一次输入法上下文，中文输入会时断时续。
+    fn focus_for_typing(window: &mut Window, focus: &FocusHandle) {
+        window.activate_window();
         window.focus(focus);
     }
 
@@ -5286,11 +5395,13 @@ impl CollationWorkspace {
         line: &str,
         line_start: usize,
         li: usize,
+        vw: f32,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let line_len = line.chars().count();
         let line_end = line_start + line_len;
 
+        let cpl = self.chars_per_line(vw);
         // 选区在本行内的列区间 `[a, b)`（列号从行首算）。
         let (sel_a, sel_b) = match self.selection.as_ref() {
             Some(r) if r.start != r.end => {
@@ -5306,12 +5417,18 @@ impl CollationWorkspace {
         } else {
             None
         };
+        // **字符行盒**（v1.9.67）：选区色带与光标只占「字身」这一段高度，在行盒里
+        // 垂直居中。以前色带和光标都取整行 `LINE_H`（= 1.8 倍字高），一行紧贴一行时
+        // 看着就成了「把行距和段落留白一起涂成色块」——用户点名要 Inline 就是这个。
+        let box_h = (FONT_SIZE * 1.42).min(LINE_H);
+        let box_top = (LINE_H - box_h) * 0.5;
 
         let mut row = div()
             .relative()
             .min_h(px(LINE_H))
             .w_full()
             .min_w(px(0.0))
+            .cursor_text()
             // 行身点击直达联动（v1.9.23）：行号在渲染时就绑好，
             // 不再靠「鼠标 y ÷ 行高」反推——那正是「点哪高亮哪」错行的死因。
             .on_mouse_down(
@@ -5324,6 +5441,7 @@ impl CollationWorkspace {
                         line_start,
                         line_len,
                         px_f32(event.position.x),
+                        px_f32(event.position.y),
                         vw,
                         vh,
                         event.click_count,
@@ -5335,16 +5453,22 @@ impl CollationWorkspace {
 
         // ② 选区底色：绝对定位，**在文本之前** add（GPUI 按子元素顺序作画，
         //    后加的盖在上面），因此永远压在字下面，不遮墨色。
+        //
+        // ⚠️ **逐视觉行**画（v1.9.67）：一行只要折了行，整行一块就会盖住折行后的
+        // 空白、压到下一段行距上。`visual_spans` 按每行字数切开，每块只覆盖真正
+        // 有字的那一段——这才是「贴在字上」的选区，而不是一块段落色卡。
         if sel_b > sel_a {
-            row = row.child(
-                div()
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(sel_a as f32 * CHAR_W))
-                    .w(px((sel_b - sel_a) as f32 * CHAR_W))
-                    .h(px(LINE_H))
-                    .bg(rgba(0x8c2b2233)),
-            );
+            for (k, a, b) in visual_spans(sel_a, sel_b, cpl) {
+                row = row.child(
+                    div()
+                        .absolute()
+                        .top(px(box_top + k as f32 * LINE_H))
+                        .left(px((a - k * cpl) as f32 * CHAR_W))
+                        .w(px((b - a) as f32 * CHAR_W))
+                        .h(px(box_h))
+                        .bg(rgba(0x8c2b2233)),
+                );
+            }
         }
 
         // ① 文本：整行一个节点。单列、软换行，不受任何覆盖物影响。
@@ -5356,15 +5480,22 @@ impl CollationWorkspace {
                 .child(SharedString::from(line.to_string())),
         );
 
-        // ③ 光标：最后一根竖线，绝对定位压在字上。
+        // ③ 光标：最后一根竖线，绝对定位压在字上（同样只占字身高）。
         if let Some(col) = caret_col {
+            // 行尾恰好落在折行边界时（col 是 cpl 的整数倍且等于行长），光标属于
+            // **上一视觉行的右缘**，不能掉到下一段去。
+            let (k, vcol) = if col > 0 && col % cpl == 0 && col == line_len {
+                (col / cpl - 1, cpl)
+            } else {
+                (col / cpl, col % cpl)
+            };
             row = row.child(
                 div()
                     .absolute()
-                    .top(px(0.0))
-                    .left(px(col as f32 * CHAR_W))
+                    .top(px(box_top + k as f32 * LINE_H))
+                    .left(px(vcol as f32 * CHAR_W))
                     .w(px(2.0))
-                    .h(px(LINE_H))
+                    .h(px(box_h))
                     .bg(rgb(0x8c2b22)),
             );
         }
@@ -5410,9 +5541,7 @@ impl CollationWorkspace {
             // 包进带底色的块 + 尾部等高填充，编辑交互不受任何影响。
             // 「差异高亮」：本段被清洗引擎修改过（raw_seg != clean_seg）→ 极弱朱砂底，
             // 一眼看出哪些段被改了；未改动段沿用与左栏一致的隔段浅色底纹（眼睛不丢）。
-            let cpl = ((self.left_col_w(vw) - 2.0 * ED_PAD) / CHAR_W)
-                .max(1.0)
-                .floor() as usize;
+            let cpl = self.chars_per_line(vw);
             let raw_text = self.raw_text.clone().unwrap_or_default();
             let raw_segs: Vec<&str> = raw_text.split('\n').collect();
             let clean_segs: Vec<&str> = self.text.split('\n').collect();
@@ -5433,7 +5562,7 @@ impl CollationWorkspace {
                     div()
                         .w_full()
                         .bg(band)
-                        .child(self.render_line(seg, char_start, i, cx))
+                        .child(self.render_line(seg, char_start, i, vw, cx))
                         .child(div().h(px(pad))), // 等高填充 → 段落对齐
                 );
                 char_start += seg.chars().count() + 1;
@@ -5441,7 +5570,7 @@ impl CollationWorkspace {
         } else {
             for (li, line) in self.text.split('\n').enumerate() {
                 let lc = line.chars().count();
-                content = content.child(self.render_line(line, char_start, li, cx));
+                content = content.child(self.render_line(line, char_start, li, vw, cx));
                 char_start += lc + 1;
             }
         }
@@ -5471,21 +5600,20 @@ impl CollationWorkspace {
                 .text_color(rgb(0x333333))
                 .font_family(song.clone())
                 .line_height(px(LINE_H))
+                // 文本光标（I 形）——「这里能打字」的第一眼线索。
+                .cursor_text()
+                // **滚轮强接**（v1.9.65 铁律 ③，v1.9.67 并回本层）：
+                // 原先它在 `InputField` 外面套了一层**只有滚轮监听**的透明 div。
+                // 那层会额外插一个 hitbox、并在焦点路径上多插一级——真机表现就是
+                // 点不进、打不出（只读）。现在滚轮 / 焦点 / 鼠标 / 键盘**挂在同一个
+                // 元素**上：一个 hitbox、一条焦点路径，零竞争。
+                .on_scroll_wheel(cx.listener(|c, ev: &ScrollWheelEvent, _window, cx| {
+                    c.forward_wheel(ev, cx);
+                }))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|c, event, window, cx| c.place_caret_from_click(event, window, cx)),
                 )
-                .on_mouse_move(
-                    cx.listener(|c, event, window, cx| c.extend_selection_from_drag(event, window, cx)),
-                )
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|c, _, _, cx| {
-                        c.dragging = false;
-                        cx.notify();
-                    }),
-                )
-                .on_key_down(cx.listener(|c, event, _window, cx| c.handle_key(event, cx)))
                 .child(content),
             self.focus.clone(),
             cx.entity(),
@@ -5499,23 +5627,14 @@ impl CollationWorkspace {
         // 滚轮事件来了 offset 也被钉死在 0（div.rs:1758）——**滚轮没坏、
         // 事件也没被吞，是视口高度塌了**。这就是真机「彻底滑不动」的真根，
         // 也是前两轮「min_h(0) 修复」只治了 wrap 一层、没治 scroll_view 这层
-        // 百分比的原因。修法三件事：
+        // 百分比的原因。修法：
         //   ① render()/render_right() 把外层行与右栏全改**绝对像素高**；
         //   ② `wrap` 改 flex 列、`scroll_view` 用 **flex_1 + min_h(0)**——
         //      flex 主轴分配永远给出确定高，整条链零百分比；
-        //   ③ `InputField` 外套一层**透明滚轮接管层**：Bubble 阶段它先于
-        //      滚动容器的内建滚轮处理收到事件（gpui 按叶子优先冒泡），手动
-        //      按 gpui 内建同一条公式（div.rs:2446 `offset += delta`，clamp
-        //      到 `[-handle.max_offset, 0]`）把增量写到 ScrollHandle 并
-        //      `stop_propagation` 掐断内建处理——事件被谁吞都吞不掉，也绝不
-        //      会双滚。已审计 `ime::InputField`：它只注册焦点 / IME
-        //      （`window.handle_input`），**不碰滚轮**；这层是双保险。
-        let wheel = div()
-            .w_full()
-            .on_scroll_wheel(cx.listener(|c, ev: &ScrollWheelEvent, _window, cx| {
-                c.forward_wheel(ev, cx);
-            }))
-            .child(editor);
+        //   ③ 滚轮接管层**并进编辑器那一层**（v1.9.67）：v1.9.65 曾在
+        //      `InputField` 外单独套一个只挂 `on_scroll_wheel` 的 div，结果多出
+        //      一个 hitbox / 一级焦点路径，真机上编辑器直接变**只读**（点不进、
+        //      打不出）。滚轮监听现已挂回编辑器自身，见上。
         let scroll_view = div()
             .id(SharedString::from(if self.pure_text_mode {
                 // 用户点名的专用 id（铁律 ②）：纯文本模式的独立滚动容器。
@@ -5535,7 +5654,19 @@ impl CollationWorkspace {
             } else {
                 &self.scroll
             })
-            .child(wheel);
+            // **兜底点击**（v1.9.67）：正文比视口短时，最后一行之下是一大片空白，
+            // 那里不属于编辑器内容盒（它的高度 = 内容高），点了没反应最像「坏了」。
+            // 视口这一层接住它：落光标 + 聚焦（落点由 `caret_at` 夹到文末）。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|c, event, window, cx| c.place_caret_from_click(event, window, cx)),
+            )
+            // **键盘挂在这一层**（v1.9.67）：`track_focus` 的句柄由 `InputField`
+            // 与内层 div 两处登记，焦点路径最终落在哪一级取决于登记顺序；挂在
+            // **共同祖先**（视口）上，则无论哪一级拿到焦点，按键都必达编辑逻辑。
+            // ⚠️ 只能挂这一处：内层若也挂，退格一次会删两个字。
+            .on_key_down(cx.listener(|c, event, _window, cx| c.handle_key(event, cx)))
+            .child(editor);
         // 选区悬浮钮（问小笺）叠在编辑器之上：`relative` 容器 + 绝对定位气泡，
         // 气泡是**滚动视口之外**的兄弟节点（不随滚动位移），故 y 要自己减
         // `scroll.offset()`（见 `render_selection_bar` 的坐标口径）。
@@ -5544,6 +5675,10 @@ impl CollationWorkspace {
         // 会被正文撑到「内容高度」。**v1.9.65 起右栏本身已是绝对像素高**，
         // flex 分配必出确定值；wrap 同时改 flex 列，让 scroll_view 的
         // `flex_1` 有主轴可分——从 wrap 到视口，全程零百分比高度。
+        //
+        // **拖选监听挂在面板层**（v1.9.67）：拖到正文内容盒之外（短稿的下方空白、
+        // 或横向拖出一点）仍要继续扩选。挂在内容盒上会因为「鼠标离开了该 hitbox」
+        // 而中断；挂在铺满面板的这一层，手感才连续。
         let mut wrap = div()
             .relative()
             .flex()
@@ -5553,6 +5688,17 @@ impl CollationWorkspace {
             .min_h(px(0.0))
             .overflow_hidden()
             .w_full()
+            .on_mouse_move(
+                cx.listener(|c, event, window, cx| c.extend_selection_from_drag(event, window, cx)),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|c, _, _, cx| {
+                    c.dragging = false;
+                    c.drag_origin = None;
+                    cx.notify();
+                }),
+            )
             .child(scroll_view);
         if let Some(bar) = self.render_selection_bar(vw, cx) {
             wrap = wrap.child(bar);
@@ -7609,6 +7755,71 @@ mod tests {
             y = clamp(y + 52.0);
         }
         assert_eq!(y, 0.0);
+    }
+
+    // ── v1.9.67 · 点击落点 / 拖选 / 选区行盒（真机「只读 + 一整段大色块」）──
+    //
+    // 这三条都是纯函数级的：命中换算、折行切段、行盒几何。屏幕上的点击与单测
+    // 走**同一个** `caret_at`，所以这些断言就是真机行为的合同。
+
+    /// 折行后点第 2、3 个**视觉行**，必须落到对应逻辑行的对应列。
+    ///
+    /// 旧实现把 y ÷ 行高当逻辑行号：`abcdefghij`（10 字 / 每行 5 字）占 2 个视觉行，
+    /// 点它的第二行会被算成「第 2 个逻辑行」= `klm` 的段首——错 5 个字起步；
+    /// 长文里就是「点一下，光标跑到几十行外」。
+    #[test]
+    fn caret_at_counts_wrapped_visual_lines() {
+        let text = "abcdefghij\nklm";
+        let cpl = 5;
+        // 第 1 视觉行第 2 列 → 2。
+        assert_eq!(caret_at(text, cpl, CHAR_W * 2.0 + 1.0, 1.0), 2);
+        // 第 2 视觉行第 1 列 → 5 + 1 = 6（仍是第一段，不是第二段）。
+        assert_eq!(caret_at(text, cpl, CHAR_W * 1.0 + 1.0, LINE_H + 1.0), 6);
+        // 第 3 视觉行（第二段第一行）第 0 列 → 段首 11。
+        assert_eq!(caret_at(text, cpl, 1.0, LINE_H * 2.0 + 1.0), 11);
+        // 更下方 → 文末，绝不越界。
+        assert_eq!(caret_at(text, cpl, 1.0, LINE_H * 9.0), text.chars().count());
+    }
+
+    /// 点在行尾右侧的空白：夹到**本行**行尾，不许串到下一行。
+    #[test]
+    fn caret_at_clamps_to_line_end() {
+        let text = "abc\ndefg";
+        assert_eq!(caret_at(text, 5, CHAR_W * 20.0, 1.0), 3);
+        assert_eq!(caret_at(text, 5, CHAR_W * 20.0, LINE_H + 1.0), 8);
+    }
+
+    /// 空文 / 空行不 panic，落点恒为 0。
+    #[test]
+    fn caret_at_handles_empty_text() {
+        assert_eq!(caret_at("", 8, 100.0, 100.0), 0);
+        assert_eq!(caret_at("\n\n", 8, 100.0, LINE_H * 1.5), 1);
+    }
+
+    /// 选区按软换行切段：12 个字、每行 5 字 → 三段，最后一段只有 2 个字。
+    ///
+    /// 整行画一块就会把折行后的空白也涂上，真机看着就是「段落 Padding 变成大色块」；
+    /// 切段后每块宽度严格等于「这一段真正有字的字数 × 字宽」。
+    #[test]
+    fn selection_spans_split_on_wrap() {
+        assert_eq!(visual_spans(0, 12, 5), vec![(0, 0, 5), (1, 5, 10), (2, 10, 12)]);
+        // 空选区不画块（否则每个空行都变成一条色带）。
+        assert!(visual_spans(3, 3, 5).is_empty());
+        // 区间反着给也不出错。
+        assert_eq!(visual_spans(6, 1, 5), vec![(0, 1, 5), (1, 5, 6)]);
+    }
+
+    /// 选区 / 光标的**行盒**必须窄于行高，且完整落在行内。
+    ///
+    /// 这是用户「Inline」那条口径的编码：色带 = 字身高，上下各留一点行距，
+    /// 绝不把行距与段落留白一起涂掉。
+    #[test]
+    fn selection_box_stays_inline() {
+        let box_h = (FONT_SIZE * 1.42).min(LINE_H);
+        let box_top = (LINE_H - box_h) * 0.5;
+        assert!(box_h < LINE_H, "行盒 {box_h} 必须窄于行高 {LINE_H}");
+        assert!(box_top > 0.0, "行盒必须上下留出行距，不能贴边");
+        assert!(box_top + box_h <= LINE_H + 0.001, "行盒不许溢出本行");
     }
 
     // ── v1.9.66 · 撤销 / 重做（用户点名的「保命底线」）──────────────────────
