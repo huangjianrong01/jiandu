@@ -46,6 +46,7 @@ use gpui::{
     KeyDownEvent, StatefulInteractiveElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ParentElement, Render,
     RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, Styled, Window,
+    AnimationExt,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -128,12 +129,6 @@ const HEADER_H: f32 = 44.0;
 /// `editor_origin()` 的纵向原点必须把它算进去——少算 44px，「点哪落哪」
 /// 就整体上移一行。改这个数，两处（本行、`editor_origin`）自动同变。
 const PUNCT_BAR_H: f32 = 44.0;
-/// **纯文本模式提示条**高度（v1.9.65）：一条 20px 的静默横条。
-///
-/// 它是**布局常量**不是视觉常量：`editor_origin()` 的 Y 原点把它算进去（20px），
-/// v1.9.65 起 render() 里分栏行的**绝对高度**（`vh − HEADER_H − PURE_HINT_H`）
-/// 也靠它——本条 div 显式 `.h(px(PURE_HINT_H))`，两处数字一个源，改一处两处同变。
-const PURE_HINT_H: f32 = 20.0;
 const PAD: f32 = 14.0;
 const FONT_SIZE: f32 = 17.0;
 /// 行高（v1.9.24）：17 × 1.8 ≈ 30.6。
@@ -177,10 +172,19 @@ fn est_wrapped_lines(s: &str, cpl: usize) -> usize {
 ///   ① y → **视觉行号**；② 逐逻辑行扣掉它占的视觉行数，落进哪一行就是哪一行；
 ///   ③ 行内列 = 该逻辑行内的第几条视觉行 × 每行字数 + x ÷ 字宽。
 /// 越界一律夹紧到文末，绝不返回越界下标。
-fn caret_at(text: &str, cpl: usize, local_x: f32, local_y: f32) -> usize {
+///
+/// `adv` 是**实测单字进距**（v1.9.68）：由 `TextSystem` 量出的真值，不再用
+/// `CHAR_W`（17 × 0.95）这个近似值。近似值每字差 5%，一行 60 字就累计 51px
+/// ≈ 3 个字——这正是「点两个字之间、光标却插到旁边」的真因。
+///
+/// 列位取**最近的字缝**（`+0.5` 再取整）：点在某个字的左半 → 插到它前面，
+/// 右半 → 插到它后面。用 `floor` 的话点在右半边也会跳到该字左侧，手感上
+/// 总觉得「慢半拍、差一格」。
+fn caret_at(text: &str, cpl: usize, adv: f32, local_x: f32, local_y: f32) -> usize {
     let cpl = cpl.max(1);
+    let adv = if adv > 0.0 { adv } else { CHAR_W };
     let visual = (local_y.max(0.0) / LINE_H).floor() as usize;
-    let col_in_visual = (local_x.max(0.0) / CHAR_W).floor() as usize;
+    let col_in_visual = ((local_x.max(0.0) / adv) + 0.5).floor() as usize;
     let mut start = 0usize;
     let mut remain = visual;
     for line in text.split('\n') {
@@ -194,6 +198,35 @@ fn caret_at(text: &str, cpl: usize, local_x: f32, local_y: f32) -> usize {
     }
     // 点在最后一行下方：落到文末（而不是行首，更不是越界）。
     text.chars().count()
+}
+
+/// **实测 CJK 单字进距**（v1.9.68）：让 `TextSystem` 真正排一行字，取平均宽度。
+///
+/// 为什么必须量：`CHAR_W` 是「字号 × 0.95」的估算，而中文全角字的真实进距就是
+/// 1.0em（17px）。5% 的误差单看无感，但一行的列位是 `x ÷ 字宽` 累计出来的——
+/// 60 字一行就差 51px（≈3 个字），点击时看着就是「插不进两个字之间」。
+/// 用 32 个字取平均，把逐字的亚像素舍入误差摊平。
+///
+/// 量不到（字体未就绪 / 平台返回空）时退回 `CHAR_W`，绝不返回 0——
+/// 0 会让 `chars_per_line` 除零、`caret_at` 全落到行首。
+fn measure_char_adv(ts: &gpui::WindowTextSystem, family: &SharedString) -> f32 {
+    const PROBE_N: usize = 32;
+    let probe: String = "國".repeat(PROBE_N);
+    let run = gpui::TextRun {
+        len: probe.len(),
+        font: gpui::font(family.clone()),
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = ts.shape_line(probe.into(), px(FONT_SIZE), &[run], None);
+    let w = px_f32(shaped.width);
+    if w.is_finite() && w > 1.0 {
+        w / PROBE_N as f32
+    } else {
+        CHAR_W
+    }
 }
 
 /// 把「一行内的列区间 `[a, b)`」按软换行切成若干**视觉行**片段，
@@ -801,6 +834,40 @@ pub struct CollationWorkspace {
     undo_barrier: bool,
     /// 帮助浮窗开关（v1.9.66）：顶栏【？】唤出的毛玻璃说明卡。
     show_help: bool,
+    /// **实测单字进距**（v1.9.68，单位 px）。由 `TextSystem::shape_line` 真量一次，
+    /// 之后全程复用。`0.0` = 还没量到（此时退回 `CHAR_W` 近似值）。
+    ///
+    /// 近似值 `CHAR_W = 字号 × 0.95` 与中文真实的 1.0em 进距差 5%：一行 60 字
+    /// 就累计 51px ≈ 3 个字——这正是「点两个字之间、光标却插到旁边」的真因。
+    char_adv: f32,
+    /// **快捷标点栏是否滑出**（v1.9.68）：鼠标靠近右栏顶部才显形，移开即隐。
+    /// 纯文本模式下一整条 44px 的色带常年占着版面，会把「沉浸阅读」的纸感毁掉。
+    punct_bar_shown: bool,
+    /// 标点栏滑出动画的代际：每次「隐 → 显」+1。
+    /// `with_animation` 只认 id，id 不变就只播一次（记忆里的老坑），
+    /// 故用代际拼进元素 id，让每次唤出都重播那 140ms 的滑入。
+    punct_bar_gen: usize,
+    /// 上一帧的视口高度（v1.9.68）：`ensure_caret_visible` 要拿它算可视范围。
+    /// 渲染期顺手记下来，比在键盘回调里再去问窗口便宜。
+    viewport_h: f32,
+    /// 上一帧的视口宽度（v1.9.68）：光标跟随要用它算「每行几字」。
+    viewport_w: f32,
+    /// **查找条**（v1.9.68，⌘F）：是否展开。
+    find_open: bool,
+    /// 查找词。
+    find_query: String,
+    /// 命中位置（**字节**偏移，扫一次就存下来；只在跳转时换算成字符下标）。
+    find_hits: Vec<usize>,
+    /// 当前命中序号（0 起）。
+    find_idx: usize,
+    /// 当前命中的**字符**区间（只给渲染高亮用，避免每行都做字节→字符换算）。
+    find_sel: Option<Range<usize>>,
+    /// 输入法正在组字的那一截（尚未上屏）：查找词 = `find_query + find_marked`。
+    ///
+    /// 拆成两段是必须的：中文查找要打拼音，而组字是**逐帧替换**的
+    ///（`replace_and_mark_text_in_range` 每次给的是整段新的候选串，不是增量）。
+    /// 只有把「已上屏」与「正在组」分开存，才能一边保留已打的字、一边跟着候选走。
+    find_marked: String,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -1059,6 +1126,18 @@ impl CollationWorkspace {
             quit_hooked: false,
             undo_barrier: false,
             show_help: false,
+            // v1.9.68：字宽度量留到首帧（那时字体一定已注册），先记 0 走近似值。
+            char_adv: 0.0,
+            punct_bar_shown: false,
+            punct_bar_gen: 0,
+            viewport_h: 800.0,
+            viewport_w: 1200.0,
+            find_open: false,
+            find_query: String::new(),
+            find_hits: Vec::new(),
+            find_idx: 0,
+            find_sel: None,
+            find_marked: String::new(),
         };
         // ── v1.9.66：退出前强存（Exit Flush）────────────────────────────
         //
@@ -1174,6 +1253,8 @@ impl CollationWorkspace {
         self.cursor = to;
         // 光标挪过 → 后续键入另起一步（不许与挪动前那次打字合并）。
         self.undo_barrier = true;
+        // 上下键常把光标顶出视口：方向键也要跟随滚动（v1.9.68）。
+        self.ensure_caret_visible(cx);
         cx.notify();
     }
 
@@ -1619,6 +1700,109 @@ impl CollationWorkspace {
     /// 坐标口径与 `render_line` 完全一致（同一个 `CHAR_W` / `LINE_H` / `ED_PAD`，
     /// 再减编辑器滚动偏移），否则气泡会飘在半空——这是「点哪亮哪」那条链的
     /// 同一个坑，故这里只算一次、不再另立一套。
+    /// **查找条**（v1.9.68，⌘F）：右上角一条窄卡，不占布局、不抢焦点。
+    ///
+    /// 为什么不抢焦点：如果给它单独一个 `FocusHandle`，输入法就要重建一次
+    /// 输入上下文（`rfd` 之后那个老坑），而且「在查找条里打字」与「在正文里
+    /// 打字」会走两条不同的 IME 路径。这里让**编辑器保持聚焦**，按键与上屏
+    /// 事件在 `handle_key` / `replace_text_in_range` 里分流——一条路径，
+    /// 中英文都通。
+    fn render_find_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
+        let q = self.find_text();
+        let total = self.find_hits.len();
+        let count = if total == 0 {
+            if q.is_empty() { String::new() } else { "无匹配".to_string() }
+        } else {
+            format!("{} / {}", self.find_idx + 1, total)
+        };
+        let btn = |label: &'static str, cx: &mut Context<Self>, act: fn(&mut Self, &mut Context<Self>)| {
+            div()
+                .px(px(7.0))
+                .py(px(3.0))
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .text_size(px(12.0))
+                .text_color(rgba(0x2B2620AA))
+                .hover(|s| s.bg(rgba(0x2B26200F)).text_color(rgb(0x8c2b22)))
+                .child(SharedString::from(label))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |c, _, _, cx| {
+                        cx.stop_propagation();
+                        act(c, cx);
+                    }),
+                )
+        };
+        div()
+            .absolute()
+            .top(px(HEADER_H + 8.0))
+            .right(px(22.0))
+            .h(px(36.0))
+            .w(px(348.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px(px(11.0))
+            .rounded(px(8.0))
+            .bg(rgb(CHROME))
+            .border_1()
+            .border_color(rgba(0x2B26202E))
+            .shadow(vec![BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.16),
+                offset: gpui::point(px(0.0), px(4.0)),
+                blur_radius: px(14.0),
+                spread_radius: px(-2.0),
+            }])
+            // 阻断穿透：点查找条不该把光标挪到下面的正文里。
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_c, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                div()
+                    .font_family(song.clone())
+                    .text_size(px(11.5))
+                    .text_color(rgba(0x2B262080))
+                    .child(SharedString::from("查找")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .font_family(song.clone())
+                    .text_size(px(13.0))
+                    .text_color(if q.is_empty() {
+                        rgba(0x2B262066)
+                    } else {
+                        rgb(0x2B2622)
+                    })
+                    .child(SharedString::from(if q.is_empty() {
+                        // 组字中的那一截用「…」标出来，用户知道字还没上屏。
+                        "点这里打字 · ⌘G 下一个".to_string()
+                    } else if self.find_marked.is_empty() {
+                        q.clone()
+                    } else {
+                        format!("{}{}", self.find_query, "…")
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgba(0x2B262080))
+                    .child(SharedString::from(count)),
+            )
+            .child(btn("‹", cx, |c, cx| c.find_step(-1, cx)))
+            .child(btn("›", cx, |c, cx| c.find_step(1, cx)))
+            .child(btn("✕", cx, |c, cx| c.close_find(cx)))
+    }
+
     /// **清洗日志内嵌面板**（v1.9.60）：极简浮卡，如实展示本次清洗的三类统计——
     /// 折叠异体/康熙部首 X 处、清除幽灵字符 Y 个、转换异文/括号夹注 Z 处，让
     /// 用户一眼确认「没有把原书真字吞掉」。不离开 App，点「导出明细」才落盘报告。
@@ -1812,7 +1996,8 @@ impl CollationWorkspace {
             .sum();
         let col_in_visual = col % cpl;
         let visual_here = col / cpl;
-        let x = (ED_PAD + col_in_visual as f32 * CHAR_W + 4.0).min((panel_w - 108.0).max(ED_PAD));
+        let x = (ED_PAD + col_in_visual as f32 * self.char_adv() + 4.0)
+            .min((panel_w - 108.0).max(ED_PAD));
         let y = (ED_PAD + (visual_before + visual_here + 1) as f32 * LINE_H - scroll_y + 4.0).max(4.0);
         Some(
             div()
@@ -1875,6 +2060,11 @@ impl CollationWorkspace {
         }
         let k = event.keystroke.key.as_str();
         let shift = event.keystroke.modifiers.shift;
+        let cmd = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
+        // 查找条开着：键先归它（Esc 关、⏎ 下一个、⌫ 删字、再按 ⌘F 收起）。
+        if self.find_open && self.find_key(k, shift, cmd, cx) {
+            return;
+        }
         // ── 平台键（⌘ / Ctrl）───────────────────────────────────────────
         // GPUI 0.2.2 不会替自绘编辑器接管剪贴板：⌘V 必须自己读系统剪贴板再落字
         // （与阅读器草稿框同一条路，见 `reader` 的 note 输入）。否则用户在
@@ -1901,6 +2091,51 @@ impl CollationWorkspace {
                             self.insert_text(&s, cx);
                         }
                     }
+                    return;
+                }
+                // ⌘C / ⌘X / ⌘A：自绘编辑器必须自己接剪贴板与全选——GPUI 不会替
+                // 任何非内置输入框做这件事（v1.9.68）。
+                "c" | "C" => {
+                    self.copy_selection(cx);
+                    return;
+                }
+                "x" | "X" => {
+                    self.cut_selection(cx);
+                    return;
+                }
+                "a" | "A" => {
+                    self.select_all(cx);
+                    return;
+                }
+                // ⌘F 查找；⌘G / ⌘⇧G 下一个 / 上一个（与系统「查找」同一套手感）。
+                "f" | "F" => {
+                    self.open_find(cx);
+                    return;
+                }
+                "g" | "G" => {
+                    if self.find_open {
+                        self.find_step(if shift { -1 } else { 1 }, cx);
+                    }
+                    return;
+                }
+                // ⌘← / ⌘→ 行首行尾、⌘↑ / ⌘↓ 全文首尾（v1.9.68）。
+                // 三百万字的稿子里，用方向键一行行挪到段首是折磨；这两组是
+                // macOS 文本控件的通用约定，缺了就会「手感不像原生」。
+                "left" => {
+                    self.line_home(shift, cx);
+                    return;
+                }
+                "right" => {
+                    self.line_end(shift, cx);
+                    return;
+                }
+                "up" => {
+                    self.move_cursor_to(0, shift, cx);
+                    return;
+                }
+                "down" => {
+                    let total = self.text.chars().count();
+                    self.move_cursor_to(total, shift, cx);
                     return;
                 }
                 // ⌘N：**掩注**（隐藏夹注小字）——竖排预览就地静默重排。
@@ -1930,6 +2165,234 @@ impl CollationWorkspace {
             _ => {}
         }
         self.touch(cx);
+    }
+
+    // ── 剪贴板 / 全选 / 查找（v1.9.68）────────────────────────────────────
+    //
+    // 自绘编辑器意味着这些**全都要自己接**：GPUI 只为它内置的输入框绑定
+    // ⌘C/V/X/A。上一版只做了 ⌘V（粘贴），于是「复制一段去别处比对」这件事
+    // 在整个工作台里做不到——对一个校对工具来说这是硬伤。
+
+    /// 当前选中的文字（无选区 / 空选区返回 `None`）。
+    fn selection_string(&self) -> Option<String> {
+        let r = self.selection.as_ref()?;
+        let (a, b) = (r.start.min(r.end), r.end.max(r.start));
+        if a == b {
+            return None;
+        }
+        let chars: Vec<char> = self.text.chars().collect();
+        let b = b.min(chars.len());
+        let a = a.min(b);
+        Some(chars[a..b].iter().collect())
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(s) = self.selection_string() {
+            crate::clipboard::write_text(cx, s);
+        }
+    }
+
+    /// 剪切 = 复制 + 删（走 `delete_char`，撤销栈记得住这一步）。
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(s) = self.selection_string() {
+            crate::clipboard::write_text(cx, s);
+            self.delete_char(false, cx);
+        }
+    }
+
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        let total = self.text.chars().count();
+        self.anchor = 0;
+        self.cursor = total;
+        self.selection = if total > 0 { Some(0..total) } else { None };
+        self.dragging = false;
+        self.undo_barrier = true;
+        cx.notify();
+    }
+
+    /// 查找词 = 已上屏 + 正在组字（中文查找要打拼音，组字是逐帧替换的）。
+    fn find_text(&self) -> String {
+        format!("{}{}", self.find_query, self.find_marked)
+    }
+
+    fn open_find(&mut self, cx: &mut Context<Self>) {
+        if self.find_open {
+            // 再按一次 ⌘F：收起（与系统查找条同手感）。
+            self.close_find(cx);
+            return;
+        }
+        self.find_open = true;
+        self.find_query.clear();
+        self.find_marked.clear();
+        self.find_hits.clear();
+        self.find_idx = 0;
+        self.find_sel = None;
+        cx.notify();
+    }
+
+    fn close_find(&mut self, cx: &mut Context<Self>) {
+        self.find_open = false;
+        self.find_query.clear();
+        self.find_marked.clear();
+        self.find_hits.clear();
+        self.find_sel = None;
+        cx.notify();
+    }
+
+    /// 查找条打开时的按键分流。返回 `true` = 已消费，不再进编辑逻辑。
+    fn find_key(&mut self, k: &str, shift: bool, cmd: bool, cx: &mut Context<Self>) -> bool {
+        match k {
+            "escape" if !cmd => {
+                self.close_find(cx);
+                true
+            }
+            "enter" | "return" if !cmd => {
+                self.find_step(if shift { -1 } else { 1 }, cx);
+                true
+            }
+            "backspace" if !cmd => {
+                self.find_query.pop();
+                self.find_marked.clear();
+                self.find_refresh(cx);
+                true
+            }
+            "delete" if !cmd => {
+                self.find_query.clear();
+                self.find_marked.clear();
+                self.find_refresh(cx);
+                true
+            }
+            // ⌘F 再按收起；⌘G / ⌘⇧G 上/下一个。
+            "f" | "F" if cmd => {
+                self.close_find(cx);
+                true
+            }
+            "g" | "G" if cmd => {
+                self.find_step(if shift { -1 } else { 1 }, cx);
+                true
+            }
+            // ⌘A 在查找条里没有「全选查找词」的必要，吃掉它，别让文档被全选。
+            "a" | "A" if cmd => true,
+            _ => false,
+        }
+    }
+
+    /// 重算命中并跳到「离光标最近的那一处」。
+    ///
+    /// 命中存**字节偏移**（`str::find` 的原生单位），只在跳转时换算成字符下标：
+    /// 三百万字的稿子里，若每个命中都做一次字节→字符遍历，光换算就是几十毫秒。
+    fn find_refresh(&mut self, cx: &mut Context<Self>) {
+        let q = self.find_text();
+        self.find_hits.clear();
+        self.find_sel = None;
+        self.find_idx = 0;
+        if q.is_empty() {
+            cx.notify();
+            return;
+        }
+        let mut from = 0usize;
+        while from <= self.text.len() {
+            let Some(off) = self.text[from..].find(&q) else {
+                break;
+            };
+            let abs = from + off;
+            self.find_hits.push(abs);
+            // 上限防病态输入（查找 "的" 这种字在古籍里能命中几万处）。
+            if self.find_hits.len() >= 5000 {
+                break;
+            }
+            from = abs + q.len().max(1);
+        }
+        let cursor_byte: usize = self
+            .text
+            .chars()
+            .take(self.cursor)
+            .map(char::len_utf8)
+            .sum();
+        let idx = self
+            .find_hits
+            .iter()
+            .position(|&o| o >= cursor_byte)
+            .unwrap_or(0);
+        self.find_goto(idx, cx);
+    }
+
+    /// 跳到第 `idx` 处命中：高亮 + 光标落段尾 + 滚到可见。
+    fn find_goto(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(&off) = self.find_hits.get(idx) else {
+            cx.notify();
+            return;
+        };
+        let q = self.find_text();
+        let a = self.text[..off].chars().count();
+        let b = a + q.chars().count();
+        self.find_idx = idx;
+        self.find_sel = Some(a..b);
+        // 光标落在命中末尾：用户看完可以直接接着改。
+        self.cursor = b;
+        self.anchor = b;
+        self.selection = None;
+        self.undo_barrier = true;
+        self.ensure_caret_visible(cx);
+        cx.notify();
+    }
+
+    fn find_step(&mut self, dir: isize, cx: &mut Context<Self>) {
+        let n = self.find_hits.len();
+        if n == 0 {
+            return;
+        }
+        let idx = if dir >= 0 {
+            (self.find_idx + 1) % n
+        } else {
+            (self.find_idx + n - 1) % n
+        };
+        self.find_goto(idx, cx);
+    }
+
+    /// **光标跟随**（v1.9.68）：打完字 / 回车 / 方向键之后，光标若跑出视口，
+    /// 就把它滚回来——长文校对时「打着打着光标不见了」是最劝退的体验之一。
+    ///
+    /// 口径与 `caret_at` 完全对称：光标在第几条**视觉行** → 该行 y 区间 →
+    /// 和视口区间比。留一行余量，免得每敲一下屏幕都跟着抖。
+    fn ensure_caret_visible(&mut self, cx: &mut Context<Self>) {
+        // 对照模式左右共用 `diff_scroll`，强行滚动会打乱段落对齐，故不动。
+        if self.show_diff || self.viewport_w <= 0.0 {
+            return;
+        }
+        let vw = self.viewport_w;
+        let cpl = self.chars_per_line(vw);
+        let total = self.text.chars().count();
+        let cursor = self.cursor.min(total);
+        let mut visual_before = 0usize;
+        let mut start = 0usize;
+        for line in self.text.split('\n') {
+            let len = line.chars().count();
+            if cursor <= start + len {
+                break;
+            }
+            visual_before += est_wrapped_lines(line, cpl);
+            start += len + 1;
+        }
+        let col = cursor.saturating_sub(start);
+        let visual_line = visual_before + col / cpl;
+        let top = ED_PAD + visual_line as f32 * LINE_H;
+        let bottom = top + LINE_H;
+        let view_h = self.editor_view_h();
+        let off = -px_f32(self.scroll.offset().y);
+        let margin = LINE_H;
+        let mut target = off;
+        if top - margin < off {
+            target = (top - margin).max(0.0);
+        } else if bottom + margin > off + view_h {
+            target = (bottom + margin - view_h).max(0.0);
+        }
+        if (target - off).abs() > 0.5 {
+            let max = px_f32(self.scroll.max_offset().height).max(0.0);
+            let y = (-target).clamp(-max, 0.0);
+            self.scroll.set_offset(Point::new(px(0.0), px(y)));
+            cx.notify();
+        }
     }
 
     /// **滚轮强接**（v1.9.65，用户「绝对强制」铁律 ③）。
@@ -2012,30 +2475,51 @@ impl CollationWorkspace {
     /// `link_to_paragraph(行号)` 的点击（见 [`Self::click_line`]），行号由结构给出、
     /// 不是量出来的。这里只服务「点在正文之外的空白处」这一种兜底情形。
     fn editor_origin(&self, vw: f32) -> (f32, f32) {
-        let status_h = if self.text_note.is_some() { 24.0 } else { 0.0 };
-        let link_h = if self.match_note.is_some() || self.active_para_idx.is_some() {
-            26.0
-        } else {
-            0.0
-        };
         // 纯文本模式（一键笺校进无图的书）：没有左栏原图，右栏占满整屏，
         // 编辑器内容左缘就是 `ED_PAD`，**不是** `vw*0.4 + ED_PAD`——这正是真机
         // 「点哪光标歪到行首」的 X 轴死因：原点偏右了 40% 屏宽，列位被夹成 0。
         // 原文对照开启时左栏是 50% 的 Raw，原点随之右移。
         let origin_x = self.left_col_w(vw) + ED_PAD;
-        // 纯文本模式顶部多一条静默提示条（render 里 `pure_text_mode` 分支），
-        // 必须算进 Y 原点，否则兜底点击（点正文下方空白）落行错位。
-        let hint_h = if self.pure_text_mode { PURE_HINT_H } else { 0.0 };
         // v1.9.63：对照模式编辑器滚在 `diff_scroll` 上，坐标口径要跟着走。
         let scroll_y = px_f32(if self.show_diff {
             self.diff_scroll.offset().y
         } else {
             self.scroll.offset().y
         });
+        // v1.9.68：快捷标点栏**不再占布局**（改成顶部悬停浮层），
+        // 纯文本提示条也已删除，故 Y 原点只剩「顶栏 + 两条状态条 + 内边距」。
         (
             origin_x,
-            HEADER_H + status_h + link_h + PUNCT_BAR_H + hint_h + ED_PAD + scroll_y,
+            HEADER_H + self.head_band_h() + ED_PAD + scroll_y,
         )
+    }
+
+    /// 编辑器上方常驻的**状态条总高**（文本导入提示 24 + 联动提示 26）。
+    ///
+    /// 三处共用：`editor_origin` 的 Y 原点、`ensure_caret_visible` 的可视高度、
+    /// 标点栏悬停热区的起点。分头写就会出现「点哪偏一行」这类鬼账。
+    fn head_band_h(&self) -> f32 {
+        let status = if self.text_note.is_some() { 24.0 } else { 0.0 };
+        let link = if self.match_note.is_some() || self.active_para_idx.is_some() {
+            26.0
+        } else {
+            0.0
+        };
+        status + link
+    }
+
+    /// 编辑器滚动视口的高度（px）：右栏高 − 顶部状态条。
+    fn editor_view_h(&self) -> f32 {
+        (self.viewport_h - HEADER_H - self.head_band_h()).max(120.0)
+    }
+
+    /// 当前字体的**单字进距**：实测值优先，未量到退回 `CHAR_W`。
+    fn char_adv(&self) -> f32 {
+        if self.char_adv > 0.0 {
+            self.char_adv
+        } else {
+            CHAR_W
+        }
     }
 
     /// 每行可容纳的字符数（软换行口径）。
@@ -2043,20 +2527,22 @@ impl CollationWorkspace {
     /// `render_line` 画选区、`caret_at` 落光标、`render_editor` 估折行**必须同源**：
     /// 差一个字，色块就会比字长一截或短一截，点第 N 个视觉行也会落错列。
     fn chars_per_line(&self, vw: f32) -> usize {
-        let content_w = (vw - self.left_col_w(vw) - 2.0 * ED_PAD).max(CHAR_W);
-        (content_w / CHAR_W).floor().max(1.0) as usize
+        let adv = self.char_adv();
+        let content_w = (vw - self.left_col_w(vw) - 2.0 * ED_PAD).max(adv);
+        (content_w / adv).floor().max(1.0) as usize
     }
 
     /// 由点击/拖拽位置（窗口坐标）推出字符下标。
     ///
-    /// 右文编辑器内用「固定行高 + 平均字宽」估算（仅用于编辑器内落光标 / 选区）；
-    /// 左图高亮坐标则来自 `SourceRegion` 的真实自然像素映射，二者互不影响。
+    /// 右文编辑器内用「固定行高 + **实测**字宽」换算（仅用于编辑器内落光标 /
+    /// 选区）；左图高亮坐标则来自 `SourceRegion` 的真实自然像素映射，二者互不影响。
     /// 换算本身在 [`caret_at`]（纯函数，已覆盖折行 / 越界 / 空文单测）。
     fn caret_from_point(&self, x: f32, y: f32, vw: f32) -> usize {
         let (origin_x, origin_y) = self.editor_origin(vw);
         caret_at(
             &self.text,
             self.chars_per_line(vw),
+            self.char_adv(),
             (x - origin_x).max(0.0),
             (y - origin_y).max(0.0),
         )
@@ -2129,6 +2615,7 @@ impl CollationWorkspace {
         y: f32,
         vw: f32,
         vh: f32,
+        shift: bool,
         click_count: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2137,9 +2624,32 @@ impl CollationWorkspace {
         // `caret_from_point` 才能认出「本行折行后的第几条视觉行」；再用本行的
         // 字符区间夹一次，保证绝不落到别的段落去（预估值抖动也不出这一行）。
         let to = self.caret_from_point(x, y, vw);
+        let prev_anchor = self.anchor;
         self.cursor = to.clamp(line_start, line_start + line_len);
+        // **⇧ 点选扩选**（v1.9.68）：锚点保持在上一次落点，只把光标挪过去——
+        // 这是所有原生文本框的标准行为，校对时「从段首 ⇧ 点到段尾」最常用。
+        if shift {
+            self.anchor = prev_anchor;
+            let (a, b) = (self.anchor.min(self.cursor), self.anchor.max(self.cursor));
+            self.selection = if a == b { None } else { Some(a..b) };
+            self.drag_origin = Some((x, y));
+            self.dragging = false;
+            Self::focus_for_typing(window, &self.focus);
+            self.link_to_paragraph(li, vw, vh, cx);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         self.anchor = self.cursor;
-        if click_count >= 2 {
+        if click_count >= 3 {
+            // 三击：选中**整段**（本逻辑行，含行内所有折行）——v1.9.68。
+            // 校对时最常见的动作是「整段删/整段改写」，三击是最顺手的入口。
+            self.selection = if line_len > 0 {
+                Some(line_start..line_start + line_len)
+            } else {
+                None
+            };
+        } else if click_count >= 2 {
             // 双击：选中光标所在的「句」（到前后最近标点 / 空白边界）。
             let (a, b) = self.sentence_bounds(self.cursor);
             self.selection = if a < b { Some(a..b) } else { None };
@@ -2168,11 +2678,25 @@ impl CollationWorkspace {
         let vh = px_f32(window.viewport_size().height);
         let x = px_f32(event.position.x);
         let y = px_f32(event.position.y);
+        let prev_anchor = self.anchor;
         self.cursor = self.caret_from_point(x, y, vw);
         self.anchor = self.cursor;
         // 点选定位 → 后续键入另起一步（撤销不许跨过这次点击）。
         self.undo_barrier = true;
-        if event.click_count >= 2 {
+        if event.modifiers.shift {
+            // ⇧ 点选扩选（v1.9.68）：锚点不跟着走，只把光标挪过去。
+            self.anchor = prev_anchor;
+            let (a, b) = (self.anchor.min(self.cursor), self.anchor.max(self.cursor));
+            self.selection = if a == b { None } else { Some(a..b) };
+        } else if event.click_count >= 3 {
+            // 三击选整段（v1.9.68）：与 `click_line` 同一口径，两条点击路径
+            // 不能一个有三击、一个没有——那会变成「有时候选得上、有时候选不上」。
+            self.selection = self
+                .line_of(self.cursor)
+                .and_then(|li| self.line_ranges().get(li).copied())
+                .filter(|&(s, e)| e > s)
+                .map(|(s, e)| s..e);
+        } else if event.click_count >= 2 {
             let (a, b) = self.sentence_bounds(self.cursor);
             self.selection = if a < b { Some(a..b) } else { None };
         } else {
@@ -2225,8 +2749,11 @@ impl CollationWorkspace {
         self.selection = if s == e { None } else { Some(s..e) };
         // 拖选也是「挪过光标」，同样断开合并链。
         self.undo_barrier = true;
+        // ⚠️ 这里**不**落盘（v1.9.68）：拖选时 mousemove 是 60~120Hz，若每次都
+        // 起一个 1.5 秒的防抖任务，一秒钟就是上百个 task 在抢 executor——
+        // 拖起来会明显发涩。落盘统一放在 mouse-up（一次就够）。
+        // 光标跟随也不在这里做：拖选是用户主动在找位置，自动滚会打架。
         cx.notify();
-        self.touch(cx);
     }
 
     // ── 渲染 ─────────────────────────────────────────────────────────────
@@ -2870,9 +3397,10 @@ impl CollationWorkspace {
             .child(line("③ 笺校", "书架卡片右下【一键笺校】直达工作台，自动带上原图与正文。"))
             // ② 工作台操作
             .child(head("工作台操作"))
-            .child(line("定位", "单击正文落光标；拖拽选中一段；点左图也能定位到对应正文。"))
+            .child(line("定位", "单击落光标；双击选句；三击选整段；⇧ 点击从上一落点扩选。"))
             .child(line("框选补字", "在左图上拖一个框，命中的字会拼成待补文字，点【补入】插到光标处。"))
             .child(line("撤销", "⌘Z 撤销、⌘⇧Z 重做。连打字算一步，不会一个字退一次。"))
+            .child(line("查找", "⌘F 呼出查找条，⌘G / ⌘⇧G 上下一个；再按 ⌘F 或 Esc 收起。"))
             // ③ 特色功能
             .child(head("特色功能"))
             .child(line("原文对照", "左栏导入毛坯 / 右栏清洗后正文，逐字比对，防清洗误杀。"))
@@ -2884,9 +3412,11 @@ impl CollationWorkspace {
             // ④ 快捷键
             .child(head("快捷键"))
             .child(line("⌘Z / ⌘⇧Z", "撤销 / 重做"))
+            .child(line("⌘C / ⌘X / ⌘V / ⌘A", "复制 / 剪切 / 粘贴 / 全选"))
+            .child(line("⌘F / ⌘G", "查找 / 下一个（⌘⇧G 上一个）"))
             .child(line("⌘V / ⌘N", "粘贴 / 掩注"))
-            .child(line("← → ↑ ↓", "移动光标（按住 ⇧ 扩选）；Home / End 到行首行尾"))
-            .child(line("Esc", "关闭当前浮层（帮助 / 预览 / 问小笺）"))
+            .child(line("← → ↑ ↓", "移动光标（按住 ⇧ 扩选）；⌘← → 行首行尾；⌘↑ ↓ 全文首尾"))
+            .child(line("Esc", "关闭当前浮层（查找 / 帮助 / 预览 / 问小笺）"))
             .child(line("⌘Q", "退出（退出前会自动存盘一次，不会丢最后一笔）"))
             .child(
                 div()
@@ -3802,6 +4332,10 @@ impl CollationWorkspace {
     }
 
     fn touch(&mut self, cx: &mut Context<Self>) {
+        // **光标跟随**（v1.9.68）放在这里：所有「改文本 / 落光标」的路径最后都
+        // 会调 `touch`，在这一处兜住，比在每个编辑函数里各写一遍可靠得多。
+        // 必须在 `store_id` 判空**之前**——演示样张没有 store_id，同样要能跟随。
+        self.ensure_caret_visible(cx);
         let Some(sid) = self.store_id.clone() else {
             return;
         };
@@ -4901,6 +5435,18 @@ impl CollationWorkspace {
     fn link_to_paragraph(&mut self, line_idx: usize, vw: f32, vh: f32, cx: &mut Context<Self>) {
         self.active_line = Some(line_idx);
 
+        // ⓪ **纯文本模式：什么联动都不做**（v1.9.68）。
+        //
+        //    这一模式的定义就是「本书没有原图」，点正文时去算「未加载原图」
+        //    只会甩出一条永远消不掉的红色横幅，既占版面又像程序在报错。
+        //    真机截图里那句红字压在正文顶上，一屏最贵的位置就这么被浪费了。
+        //    静默返回：光标该落哪落哪，版面干干净净。
+        if self.pure_text_mode {
+            self.active_para_idx = None;
+            self.match_note = None;
+            return;
+        }
+
         // ① **前置判断：左侧到底有没有原图**（用户 2026-11-01 明确要求）。
         //
         //    顺序绝不能颠倒。上一版先看 `regions` 空不空，而没有把「压根没导入原图」
@@ -5127,10 +5673,14 @@ impl CollationWorkspace {
 
     /// 右侧 60%：竖排预览工具条 + 原生编辑器。
     fn render_right(&self, vw: f32, row_h: f32, cx: &mut Context<Self>) -> gpui::Div {
-        let editor = self.render_editor(vw, cx);
+        let editor = self.render_editor(vw, row_h, cx);
         // 右栏宽 = 整屏 − 左栏宽（原文对照 50% / 纯文本 0 / 正常 40%）。必须与
         // `left_col_w` 同源，否则右栏溢出或缩水都会让编辑器原点失准。
         let right_w = vw - self.left_col_w(vw);
+        // 标点栏改成**顶部悬停浮层**（v1.9.68）：它不再占布局，只在鼠标靠近
+        // 右栏顶部时滑出。于是正文第一行直接从状态条下面开始——正是用户要的
+        // 「把满屏空间全留给文字」。
+        let bar_top = self.head_band_h();
         // 原先这里还有一条**自己的**小工具条（导入 MD / 竖排预览）。v1.9.22
         // 把它并进全局那条——两栏各顶一条色带，看起来像两套软件拼在一起。
         // 现在整屏只有一条工具条，右栏从第一行字就是稿纸。
@@ -5140,7 +5690,7 @@ impl CollationWorkspace {
             // ⚠️ v1.9.65：不再用 `h_full()`（百分比高）——它解析到的父级
             // （分栏行）高度如今是**写死的绝对像素**，但为了整条高度链
             // 「零百分比」，这里也直接绑绝对像素：`row_h` 由 render() 从
-            // 窗口真实高度算出（vh − 顶栏 − 提示条），一处算、处处用。
+            // 窗口真实高度算出（vh − 顶栏），一处算、处处用。
             .h(px(row_h))
             .flex()
             .flex_col()
@@ -5156,14 +5706,50 @@ impl CollationWorkspace {
                 blur_radius: px(18.0),
                 spread_radius: px(-2.0),
             }])
+            // **悬停唤出标点栏**（v1.9.68）：鼠标进入右栏顶部那一条（状态条 +
+            // 标点栏高度）就滑出，离开即隐。只在**状态真的变**时 notify——
+            // 否则每一次 mousemove 都触发整屏重绘，那就把刚做的窗口化白干了。
+            .on_mouse_move(cx.listener(|c, ev: &MouseMoveEvent, _window, cx| {
+                let y = px_f32(ev.position.y);
+                let show = y <= HEADER_H + c.head_band_h() + PUNCT_BAR_H;
+                if show != c.punct_bar_shown {
+                    c.punct_bar_shown = show;
+                    if show {
+                        c.punct_bar_gen = c.punct_bar_gen.wrapping_add(1);
+                    }
+                    cx.notify();
+                }
+            }))
             .child(match self.render_text_status() {
                 Some(s) => s,
                 None => div().h(px(0.0)),
             })
             .child(self.render_link_status())
-            // 快捷标点栏：夹在状态条与正文之间（用户口径「挂在编辑器上方」）。
-            .child(self.render_punct_bar(cx))
             .child(editor)
+            // 快捷标点栏（浮层）：压在最上，滑出时盖住正文顶部几行；
+            // 收起时**一个像素都不占**。
+            .child(if self.punct_bar_shown {
+                let gen = self.punct_bar_gen;
+                self.render_punct_bar(cx)
+                    .absolute()
+                    .top(px(bar_top))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .shadow(vec![BoxShadow {
+                        color: gpui::hsla(0.0, 0.0, 0.0, 0.14),
+                        offset: gpui::point(px(0.0), px(3.0)),
+                        blur_radius: px(10.0),
+                        spread_radius: px(-2.0),
+                    }])
+                    .with_animation(
+                        gpui::ElementId::NamedInteger("punct-bar-slide".into(), gen as u64),
+                        gpui::Animation::new(Duration::from_millis(140)),
+                        move |el, t| el.top(px(bar_top + (t - 1.0) * PUNCT_BAR_H)),
+                    )
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             // 识别队列浮层：有活才浮出来，压在标点栏上方，不占任何布局。
             .child(if self.ocr_panel && !self.ocr_queue.is_empty() {
                 self.render_ocr_panel(cx)
@@ -5402,6 +5988,9 @@ impl CollationWorkspace {
         let line_end = line_start + line_len;
 
         let cpl = self.chars_per_line(vw);
+        // 实测字宽（v1.9.68）：色带宽度 / 光标列位都必须用它，和 `caret_at`
+        // 用同一个数——两处一旦分家，色块就会比字长一截或短一截。
+        let adv = self.char_adv();
         // 选区在本行内的列区间 `[a, b)`（列号从行首算）。
         let (sel_a, sel_b) = match self.selection.as_ref() {
             Some(r) if r.start != r.end => {
@@ -5444,6 +6033,7 @@ impl CollationWorkspace {
                         px_f32(event.position.y),
                         vw,
                         vh,
+                        event.modifiers.shift,
                         event.click_count,
                         window,
                         cx,
@@ -5463,11 +6053,34 @@ impl CollationWorkspace {
                     div()
                         .absolute()
                         .top(px(box_top + k as f32 * LINE_H))
-                        .left(px((a - k * cpl) as f32 * CHAR_W))
-                        .w(px((b - a) as f32 * CHAR_W))
+                        .left(px((a - k * cpl) as f32 * adv))
+                        .w(px((b - a) as f32 * adv))
                         .h(px(box_h))
                         .bg(rgba(0x8c2b2233)),
                 );
+            }
+        }
+
+        // ②′ 查找命中（v1.9.68，⌘F）：整段泛黄，与朱砂选区区分开——
+        //    查找要「一眼看到在哪」，不能和用户亲手拖出来的选区同色，
+        //    否则按 ⌘G 跳下一个时根本分不清哪一处是刚跳到的。
+        if self.find_open {
+            if let Some(r) = self.find_sel.as_ref() {
+                let a = r.start.max(line_start).min(line_end) - line_start;
+                let b = r.end.max(line_start).min(line_end) - line_start;
+                if b > a {
+                    for (k, sa, sb) in visual_spans(a, b, cpl) {
+                        row = row.child(
+                            div()
+                                .absolute()
+                                .top(px(box_top + k as f32 * LINE_H))
+                                .left(px((sa - k * cpl) as f32 * adv))
+                                .w(px((sb - sa) as f32 * adv))
+                                .h(px(box_h))
+                                .bg(rgba(0xD9A44155)),
+                        );
+                    }
+                }
             }
         }
 
@@ -5493,7 +6106,7 @@ impl CollationWorkspace {
                 div()
                     .absolute()
                     .top(px(box_top + k as f32 * LINE_H))
-                    .left(px(vcol as f32 * CHAR_W))
+                    .left(px(vcol as f32 * adv))
                     .w(px(2.0))
                     .h(px(box_h))
                     .bg(rgb(0x8c2b22)),
@@ -5510,7 +6123,7 @@ impl CollationWorkspace {
     ///
     /// 注：GPUI 0.2.2 无内置 Editor，这里用自绘文本 + `crate::ime::InputField`
     /// 注册焦点，中文输入经 `EntityInputHandler` 落回 `self.text`。
-    fn render_editor(&self, vw: f32, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_editor(&self, vw: f32, row_h: f32, cx: &mut Context<Self>) -> gpui::Div {
         // 稿纸的三件套（v1.9.22）：**宋体**、**#333 的墨**、**1.7 倍行距**。
         // 纯黑（0x000/0x2b2620）在亮纸上是刺的，深灰（#333）才像墨晕开的样子。
         let song = crate::fonts::family_for(
@@ -5568,10 +6181,67 @@ impl CollationWorkspace {
                 char_start += seg.chars().count() + 1;
             }
         } else {
-            for (li, line) in self.text.split('\n').enumerate() {
-                let lc = line.chars().count();
-                content = content.child(self.render_line(line, char_start, li, vw, cx));
-                char_start += lc + 1;
+            // ── **行窗口化**（v1.9.68，用户点名的「局部重绘」）────────────────
+            //
+            // 旧实现每次 `cx.notify()` 都把**整本**正文铺成 div：三百万字 ≈ 几万行
+            // ≈ 几万个元素 + 几万个 hitbox。点一下鼠标要重排这一切，光标自然「慢
+            // 半拍才出现」；滚动时更是一帧建几万个节点。
+            //
+            // 现在只建**视口内的行**（上下各留两屏余量，快速滚动不露白），
+            // 视口外的行用等高的空白占位撑住总高度——滚动条长度、`scroll_max`、
+            // `caret_at` 的全局坐标全都不变，只是不建元素。
+            // 少于此数就直接全画：稿子只有一屏时，窗口化省不到什么，反而多一层风险。
+            const VIRTUALIZE_ABOVE: usize = 160;
+            let lines: Vec<&str> = self.text.split('\n').collect();
+            let cpl = self.chars_per_line(vw);
+            if lines.len() <= VIRTUALIZE_ABOVE {
+                for (li, line) in lines.iter().enumerate() {
+                    let lc = line.chars().count();
+                    content = content.child(self.render_line(line, char_start, li, vw, cx));
+                    char_start += lc + 1;
+                }
+            } else {
+                let scroll_y = -px_f32(if self.show_diff {
+                    self.diff_scroll.offset().y
+                } else {
+                    self.scroll.offset().y
+                });
+                let vis_h = (row_h - self.head_band_h()).max(120.0);
+                // 上下各两屏余量：够快滚时先画上，不至于闪一下白。
+                let overscan = vis_h * 2.0;
+                let top_px = (scroll_y - ED_PAD - overscan).max(0.0);
+                let bot_px = (scroll_y + vis_h + overscan).max(0.0);
+                let first_vis = (top_px / LINE_H).floor() as usize;
+                let last_vis = (bot_px / LINE_H).ceil() as usize;
+
+                let mut visual = 0usize;
+                let mut skip_h = 0.0f32;
+                let mut tail_h = 0.0f32;
+                // (行号, 行文本, 该行在全文的字符起点)
+                let mut visible: Vec<(usize, &str, usize)> = Vec::new();
+                for (li, line) in lines.iter().enumerate() {
+                    let lc = line.chars().count();
+                    let vlines = est_wrapped_lines(line, cpl);
+                    let v_end = visual + vlines;
+                    if v_end <= first_vis {
+                        skip_h += vlines as f32 * LINE_H;
+                    } else if visual > last_vis {
+                        tail_h += vlines as f32 * LINE_H;
+                    } else {
+                        visible.push((li, line, char_start));
+                    }
+                    visual = v_end;
+                    char_start += lc + 1;
+                }
+                if skip_h > 0.0 {
+                    content = content.child(div().w_full().h(px(skip_h)));
+                }
+                for (li, line, cs) in visible {
+                    content = content.child(self.render_line(line, cs, li, vw, cx));
+                }
+                if tail_h > 0.0 {
+                    content = content.child(div().w_full().h(px(tail_h)));
+                }
             }
         }
         // 用 `InputField` 包裹，使其在获得焦点时把 IME 回传中文接住。
@@ -5696,6 +6366,8 @@ impl CollationWorkspace {
                 cx.listener(|c, _, _, cx| {
                     c.dragging = false;
                     c.drag_origin = None;
+                    // 拖选结束才落盘一次（拖拽过程中的高频 notify 不写库）。
+                    c.touch(cx);
                     cx.notify();
                 }),
             )
@@ -6357,6 +7029,19 @@ impl Render for CollationWorkspace {
         }
         let vw = px_f32(window.viewport_size().width);
         let vh = px_f32(window.viewport_size().height);
+        // **首帧实测字宽**（v1.9.68）：`CHAR_W` 是 17 × 0.95 的估算，中文真实进距
+        // 是 1.0em。5% 的误差按行累计，到 60 字一行就差 51px（≈3 个字）——点击
+        // 时看着就是「插不进两个字之间」。这里只量一次，之后全程用真值。
+        // 放在 render 里量（而不是 `new`）：那时字体注册早已完成，量到的一定是真字形。
+        self.viewport_h = vh;
+        self.viewport_w = vw;
+        if self.char_adv <= 0.0 {
+            let fam = crate::fonts::family_for(
+                crate::types::FontChoice::WenJinMincho,
+                crate::types::Script::Ancient,
+            );
+            self.char_adv = measure_char_adv(&window.text_system(), &fam);
+        }
         // 左栏实际显示宽度的**设备像素**：栅格化按它出图（`raster_px`）。
         // 取不到缩放（未接显示器 / 测试环境）时按 1x，绝不会因为 0 而算出空画布。
         let backing = {
@@ -6408,30 +7093,16 @@ impl Render for CollationWorkspace {
             .track_focus(&self.preview_focus)
             .on_key_down(cx.listener(|c, event, window, cx| c.ws_key(event, window, cx)))
             .child(self.render_header(cx));
-        // 纯文本模式：顶部一条静默提示（无原图，仅正文），不占交互。
-        // ⚠️ 显式 `.h(px(PURE_HINT_H))`（v1.9.65）：提示条高度是**布局账本**上
-        // 的一笔（分栏行的绝对高度、`editor_origin` 的 Y 原点都扣它），不能靠
-        // py+字号凑出来——差 2px，下面整栏的绝对高度就对不上。
-        if self.pure_text_mode {
-            root = root.child(
-                div()
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .h(px(PURE_HINT_H))
-                    .bg(rgba(0x2B26200D))
-                    .text_size(px(11.0))
-                    .text_color(rgb(0x9A9184))
-                    .child(SharedString::from("纯文本模式 · 本书无原图，仅显示正文")),
-            );
-        }
+        // **纯文本模式不再有常驻提示条**（v1.9.68）：以前这里有一条 20px 的
+        // 「纯文本模式 · 本书无原图，仅显示正文」静默横条，既占版面又反复提醒
+        // 用户「你没有图」——可这一屏本来就没有左栏，说这句话是噪声。
+        // 直接删掉，把 20px 还给正文；模式信息由顶栏的书名与「无原图」图标承担。
+        //
         // **绝对强制物理高度**（v1.9.65，用户铁律 ①）：分栏行不再用 `flex_1`
         // （高度靠 flex 链逐级解析，链上任何一环把百分比判成「不定」都会塌成
         // 内容高 → 视口 == 内容 → 永远滚不动）。直接绑**窗口绝对高度**：
-        // vh − 顶栏 44 − 纯文本提示 20，写死的像素，不依赖任何父级解析结果。
-        let hint_h = if self.pure_text_mode { PURE_HINT_H } else { 0.0 };
-        let row_h = (vh - HEADER_H - hint_h).max(120.0);
+        // vh − 顶栏 44，写死的像素，不依赖任何父级解析结果。
+        let row_h = (vh - HEADER_H).max(120.0);
         root = root.child(
             // **视觉分割**（v1.9.24）：一条黑线都不要。
             // 现在是「柔影（右纸的 shadow，见 render_right）+ 一根 5% 墨的
@@ -6569,6 +7240,10 @@ impl Render for CollationWorkspace {
         // 清洗日志内嵌面板：压在最上（与覆盖确认同级），点遮罩或 ✕ 收。
         if self.show_sanitize_panel {
             root = root.child(self.render_sanitize_panel(cx));
+        }
+        // 查找条（v1.9.68）：压在正文之上、帮助卡之下。
+        if self.find_open {
+            root = root.child(self.render_find_bar(cx));
         }
         // 帮助浮卡（v1.9.66）：也压在最上——它是「随时呼出、随时收起」的说明。
         if self.show_help {
@@ -7215,6 +7890,14 @@ impl EntityInputHandler for CollationWorkspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 查找条开着：上屏的字进查找词，**绝不写进正文**（v1.9.68）。
+        // 不拦这一步，中文用户按 ⌘F 打一个拼音就会把候选字打进稿子里。
+        if self.find_open {
+            self.find_query.push_str(text);
+            self.find_marked.clear();
+            self.find_refresh(cx);
+            return;
+        }
         let eff = effective_replace_range(range, &self.marked);
         self.marked = None;
         self.apply_replace_utf16(eff, text);
@@ -7231,6 +7914,14 @@ impl EntityInputHandler for CollationWorkspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 查找条开着：组字只更新「正在组」的那一截，等上屏（`replace_text_in_range`）
+        // 才真正并入查找词。组字是逐帧替换的，每帧都全库扫一遍会卡住输入法。
+        if self.find_open {
+            self.find_marked = new_text.to_string();
+            self.marked = None;
+            cx.notify();
+            return;
+        }
         let eff = effective_replace_range(range, &self.marked);
         self.marked = None;
         let start = self.apply_replace_utf16(eff, new_text);
@@ -7772,28 +8463,51 @@ mod tests {
         let text = "abcdefghij\nklm";
         let cpl = 5;
         // 第 1 视觉行第 2 列 → 2。
-        assert_eq!(caret_at(text, cpl, CHAR_W * 2.0 + 1.0, 1.0), 2);
+        assert_eq!(caret_at(text, cpl, CHAR_W, CHAR_W * 2.0 + 1.0, 1.0), 2);
         // 第 2 视觉行第 1 列 → 5 + 1 = 6（仍是第一段，不是第二段）。
-        assert_eq!(caret_at(text, cpl, CHAR_W * 1.0 + 1.0, LINE_H + 1.0), 6);
+        assert_eq!(caret_at(text, cpl, CHAR_W, CHAR_W * 1.0 + 1.0, LINE_H + 1.0), 6);
         // 第 3 视觉行（第二段第一行）第 0 列 → 段首 11。
-        assert_eq!(caret_at(text, cpl, 1.0, LINE_H * 2.0 + 1.0), 11);
+        assert_eq!(caret_at(text, cpl, CHAR_W, 1.0, LINE_H * 2.0 + 1.0), 11);
         // 更下方 → 文末，绝不越界。
-        assert_eq!(caret_at(text, cpl, 1.0, LINE_H * 9.0), text.chars().count());
+        assert_eq!(
+            caret_at(text, cpl, CHAR_W, 1.0, LINE_H * 9.0),
+            text.chars().count()
+        );
+    }
+
+    /// **点击落点取最近的字缝**（v1.9.68）：左半 → 前一个字缝，右半 → 后一个字缝。
+    ///
+    /// 这是「无法精准插入到两个字之间」的直接合同：旧实现用 `floor`，
+    /// 点在某个字的右半边也会插到它**前面**，手感上总是差一格。
+    #[test]
+    fn caret_at_snaps_to_nearest_gap() {
+        let adv = 17.0f32;
+        // 第 0 字左半（x = 3）→ 缝 0；右半（x = 14）→ 缝 1。
+        assert_eq!(caret_at("一二三四五六七八", 8, adv, 3.0, 1.0), 0);
+        assert_eq!(caret_at("一二三四五六七八", 8, adv, 14.0, 1.0), 1);
+        // 第 3 个字的中线两侧：字身占 [51, 68)，中线 59.5。
+        assert_eq!(caret_at("一二三四五六七八", 8, adv, 3.0 * adv - 1.0, 1.0), 3);
+        assert_eq!(caret_at("一二三四五六七八", 8, adv, 3.0 * adv + 9.0, 1.0), 4);
+        // 实测进距与近似值不同时，**以传入的 adv 为准**（这正是精度来源）。
+        assert_eq!(caret_at("一二三四五六七八", 8, 20.0, 19.0, 1.0), 1);
+        assert_eq!(caret_at("一二三四五六七八", 8, 20.0, 21.0, 1.0), 1);
+        assert_eq!(caret_at("一二三四五六七八", 8, 20.0, 11.0, 1.0), 1);
+        assert_eq!(caret_at("一二三四五六七八", 8, 20.0, 9.0, 1.0), 0);
     }
 
     /// 点在行尾右侧的空白：夹到**本行**行尾，不许串到下一行。
     #[test]
     fn caret_at_clamps_to_line_end() {
         let text = "abc\ndefg";
-        assert_eq!(caret_at(text, 5, CHAR_W * 20.0, 1.0), 3);
-        assert_eq!(caret_at(text, 5, CHAR_W * 20.0, LINE_H + 1.0), 8);
+        assert_eq!(caret_at(text, 5, CHAR_W, CHAR_W * 20.0, 1.0), 3);
+        assert_eq!(caret_at(text, 5, CHAR_W, CHAR_W * 20.0, LINE_H + 1.0), 8);
     }
 
     /// 空文 / 空行不 panic，落点恒为 0。
     #[test]
     fn caret_at_handles_empty_text() {
-        assert_eq!(caret_at("", 8, 100.0, 100.0), 0);
-        assert_eq!(caret_at("\n\n", 8, 100.0, LINE_H * 1.5), 1);
+        assert_eq!(caret_at("", 8, CHAR_W, 100.0, 100.0), 0);
+        assert_eq!(caret_at("\n\n", 8, CHAR_W, 100.0, LINE_H * 1.5), 1);
     }
 
     /// 选区按软换行切段：12 个字、每行 5 字 → 三段，最后一段只有 2 个字。
