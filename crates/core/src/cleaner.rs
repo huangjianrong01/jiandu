@@ -1478,6 +1478,55 @@ pub fn normalize_variants(s: &str) -> String {
     out
 }
 
+/// **正文字数**（v1.9.70）：剔除 `[注]` / `[/注]` 标记与所有空白后的字数。
+///
+/// ## 为什么必须单独有一个函数
+/// 清洗把 `〔…〕` 升格成 `[注]…[/注]`——每处**凭空多出 7 个字符**（`[注]` 三个、
+/// `[/注]` 四个）。这些是给渲染器看的**结构标记**，不是书里的字。用
+/// `str::chars().count()` 直接比毛坯与清洗后，几千处夹注就能让「删了 3 万字」
+/// 显示成「净增 31829 字」——用户看到的第一反应是「这引擎在往我的书里塞字」。
+///
+/// 所以字数一律按**正文**算：去掉标记、去掉换行 / 空格 / 制表符，剩下的才算。
+/// 标点计入（`。，` 也是原书的一个字位），零宽与 BOM 这类不可见字符不算。
+pub fn body_char_count(s: &str) -> usize {
+    const OPEN: &str = "[注]";
+    const CLOSE: &str = "[/注]";
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with(OPEN) {
+            i += OPEN.len();
+            continue;
+        }
+        if rest.starts_with(CLOSE) {
+            i += CLOSE.len();
+            continue;
+        }
+        let Some(c) = rest.chars().next() else { break };
+        if !c.is_whitespace() && !is_invisible_char(c) {
+            n += 1;
+        }
+        i += c.len_utf8();
+    }
+    n
+}
+
+/// 不可见字符（零宽 / BOM / 软连 / 方向控制 / 控制符）——与 `denoise_text`
+/// 的删除清单同源。它们本来就会被洗掉，不该在任一侧的字数里占位。
+pub fn is_invisible_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{FEFF}'
+            | '\u{00AD}'
+            | '\u{0000}'..='\u{0008}'
+            | '\u{000E}'..='\u{001F}'
+    )
+}
+
 /// 清洗审计统计（供笺校台【原文对照】/ 清洗日志使用）。
 ///
 /// 三项分别对应用户最关心的「有没有误杀」：
@@ -2041,9 +2090,31 @@ mod tests {
         b
     }
 
+    /// **正文字数不吃标签**（v1.9.70）：这是「314 万 → 317 万 净增 3 万」那个
+    /// Bug 的回归钉子。夹注升格会凭空多出 `[注]` / `[/注]` 共 7 个字符，
+    /// 但它们不是书里的字——按正文算，删了字就必须显示「净减」。
     #[test]
-    fn denoise_kills_urls_pages_and_zero_width() {
-        assert!(is_noise_para("123"));
+    fn body_count_ignores_note_tags_and_whitespace() {
+        // 纯标签不计。
+        assert_eq!(body_char_count("[注]注文[/注]"), 2);
+        assert_eq!(body_char_count("[注][/注]"), 0);
+        // 空白 / 换行 / 制表符不计；标点计（它是原书的一个字位）。
+        assert_eq!(body_char_count("道 可\t道\n，"), 4);
+        // 零宽与 BOM 不计。
+        assert_eq!(body_char_count("道\u{200B}可\u{FEFF}道"), 3);
+        // **真账**：毛坯 3 字夹注 → 升格后正文不变，绝不能算出「增字」。
+        let raw = "天〔注〕地";
+        let cleaned = "[注]天[/注]地";
+        assert!(
+            body_char_count(cleaned) <= body_char_count(raw),
+            "升格夹注不许让正文字数变多：raw={} clean={}",
+            body_char_count(raw),
+            body_char_count(cleaned)
+        );
+    }
+
+    #[test]
+    fn denoise_kills_urls_pages_and_zero_width() {        assert!(is_noise_para("123"));
         assert!(is_noise_para("- 12 -"));
         assert!(is_noise_para("https://example.com/book/1"));
         assert!(is_noise_para("版权所有，翻印必究"));

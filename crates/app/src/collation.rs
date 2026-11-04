@@ -802,9 +802,40 @@ enum EditKind {
     Ime,
 }
 
+/// **清洗审计的一次算完结果**（v1.9.70）。
+///
+/// 为什么要有这个缓存：
+///  ① **绝不在 `render` 里清洗全文**——旧实现每帧 `clean(&raw)`，三百万字就是
+///     每帧全量清洗一遍，面板一开界面就躺平；
+///  ② **字数只算正文**——`[注]` / `[/注]` 是结构标记（每处多吃 7 个字符），
+///     把它们算进字数，就会出现「删了 3 万字却显示净增 31829」这种假账。
+///     真正的判据是 [`jiandu_core::cleaner::body_char_count`]。
+#[derive(Clone, Copy, Debug, Default)]
+struct SanitizeCard {
+    /// 毛坯**正文**字数（已剔标签 / 空白 / 不可见字符）。
+    raw_body: usize,
+    /// 清洗后**正文**字数（同上口径）。
+    clean_body: usize,
+    ghost: usize,
+    variant: usize,
+    notes: usize,
+    /// 被剔除、不计入字数的夹注标签字符数（`[注]` 3 + `[/注]` 4，按实际出现次数）。
+    tag_chars: usize,
+}
+
+impl SanitizeCard {
+    fn delta_label(&self) -> String {
+        let d = self.clean_body as i64 - self.raw_body as i64;
+        if d >= 0 {
+            format!("净增 {d}")
+        } else {
+            format!("净减 {}", -d)
+        }
+    }
+}
+
 /// 连续编辑合并的时间窗（毫秒）。超过就认为是「另一件事」，另起一步。
-const UNDO_COALESCE_MS: u64 = 700;
-/// 撤销栈上限。500 步覆盖任何一次校对会话，内存恒定在几十 KB 量级。
+const UNDO_COALESCE_MS: u64 = 700;/// 撤销栈上限。500 步覆盖任何一次校对会话，内存恒定在几十 KB 量级。
 const UNDO_MAX_STEPS: usize = 500;
 
 /// 笺校工作台视图：拥有自己的编辑缓冲、焦点、滚动柄，**不引用 Reader 任何字段**。
@@ -1116,6 +1147,9 @@ pub struct CollationWorkspace {
     saved_gen: u64,
     /// 上一次落盘时的光标（同上，配合 `saved_gen` 判断「这次真的需要写吗」）。
     saved_cursor: usize,
+    /// **清洗审计卡片的缓存**（v1.9.70）：`None` = 还没算（或换了书）。
+    /// 只随 `raw_text` 失效，**不随打字失效**——它比的是「导入毛坯 vs 清洗后」。
+    sanitize_card: Option<SanitizeCard>,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -1391,6 +1425,7 @@ impl CollationWorkspace {
             text_gen: 1,
             saved_gen: 0,
             saved_cursor: usize::MAX,
+            sanitize_card: None,
         };
         // ── v1.9.66：退出前强存（Exit Flush）────────────────────────────
         //
@@ -1885,7 +1920,32 @@ impl CollationWorkspace {
             return;
         }
         self.show_sanitize_panel = !self.show_sanitize_panel;
+        // 打开时**一次性**算好（`render` 里也会兜一次），之后每帧只读缓存。
+        if self.show_sanitize_panel && self.sanitize_card.is_none() {
+            self.sanitize_card = Some(self.compute_sanitize_card());
+        }
         cx.notify();
+    }
+
+    /// 算一次清洗审计（读毛坯、跑一遍清洗、按**正文**数字数）。只在开面板时调用。
+    fn compute_sanitize_card(&self) -> SanitizeCard {
+        let Some(raw) = self.raw_text.as_deref() else {
+            return SanitizeCard::default();
+        };
+        let stats = jiandu_core::cleaner::sanitize_stats(raw);
+        let cleaned = crate::importer::cleaner::clean(raw);
+        SanitizeCard {
+            // ⚠️ 全部走 `body_char_count`：剔除 `[注]` / `[/注]`、空白、零宽字符。
+            // 用 `chars().count()` 就是把标签算成字，几千处夹注足以把「净减」
+            // 变成「净增三万」——这正是用户截图里那条吓人的假账。
+            raw_body: jiandu_core::cleaner::body_char_count(raw),
+            clean_body: jiandu_core::cleaner::body_char_count(&cleaned),
+            ghost: stats.ghost,
+            variant: stats.variant,
+            notes: stats.notes,
+            tag_chars: cleaned.matches("[注]").count() * 3
+                + cleaned.matches("[/注]").count() * 4,
+        }
     }
 
     /// 生成 `sanitize_report.md` 并在访达中打开（macOS `open`）。
@@ -1899,8 +1959,12 @@ impl CollationWorkspace {
             return;
         };
         let stats = jiandu_core::cleaner::sanitize_stats(&raw);
-        let cleaned_len = crate::importer::cleaner::clean(&raw).chars().count();
-        let raw_len = raw.chars().count();
+        let cleaned = crate::importer::cleaner::clean(&raw);
+        // **正文口径**（v1.9.70）：与面板同一个函数，导出与屏幕绝不能两套账。
+        let cleaned_len = jiandu_core::cleaner::body_char_count(&cleaned);
+        let raw_len = jiandu_core::cleaner::body_char_count(&raw);
+        let tag_chars =
+            cleaned.matches("[注]").count() * 3 + cleaned.matches("[/注]").count() * 4;
         let now = ts_now();
         let report = format!(
             "# 清洗审计日志 · sanitize_report\n\n\
@@ -1911,9 +1975,11 @@ impl CollationWorkspace {
              | 清除幽灵字符 | {ghost} | 零宽 / BOM / 软连字符 / 控制符（竖排里全是空白格，删除零风险） |\n\
              | 折叠异体 / 康熙部首 | {variant} | 只改 VARIANT_MAP 与兼容区里有通式的字；生僻字一律保留 |\n\
              | 转换异文 / 括号夹注 | {notes} | `〔…〕` `（…）` 升格为 `[注]…[/注]` |\n\n\
-             ## 二、体量变化\n\n\
-             - 毛坯字符数：**{raw_len}**\n\
-             - 清洗后字符数：**{cleaned_len}**（{delta_label}）\n\n\
+             ## 二、体量变化（只计正文）\n\n\
+             - 毛坯正文字数：**{raw_len}**\n\
+             - 清洗后正文字数：**{cleaned_len}**（{delta_label}）\n\
+             - 不计入字数的夹注标签字符：{tag_chars}（`[注]` / `[/注]` 是结构标记，不是书里的字）\n\
+             - 说明：空白、换行、零宽 / BOM 等不可见字符一律不计。\n\n\
              ## 三、防误杀声明\n\n\
              清洗层对**可见可读的正文字符一律不动**：幽灵字符删除清单只含零宽 / 控制符，\
              异体字归一只动有通式的字、生僻字保留，段落级噪声删除（广告 / 页码 / 版权页）\
@@ -1923,6 +1989,7 @@ impl CollationWorkspace {
             notes = stats.notes,
             raw_len = raw_len,
             cleaned_len = cleaned_len,
+            tag_chars = tag_chars,
             delta_label = if cleaned_len as i64 >= raw_len as i64 {
                 format!("净增 {}", cleaned_len as i64 - raw_len as i64)
             } else {
@@ -2219,17 +2286,10 @@ impl CollationWorkspace {
             crate::types::FontChoice::WenJinMincho,
             crate::types::Script::Ancient,
         );
-        let raw = self.raw_text.clone().unwrap_or_default();
-        let stats = jiandu_core::cleaner::sanitize_stats(&raw);
-        let cleaned_len = crate::importer::cleaner::clean(&raw).chars().count();
-        let raw_len = raw.chars().count();
-        // v1.9.63：清洗可能「增字」（如 〔…〕 → [注]…[/注]），故用**有符号**差值：
-        // 净增 / 净减，杜绝旧版 `saturating_sub` 在增字时夹成 0（314万→317万 误显「净减 0」）。
-        let delta_label = if cleaned_len as i64 >= raw_len as i64 {
-            format!("净增 {}", cleaned_len as i64 - raw_len as i64)
-        } else {
-            format!("净减 {}", raw_len as i64 - cleaned_len as i64)
-        };
+        // **只读缓存，绝不在渲染里清洗全文**（v1.9.70）：旧实现每帧都跑一遍
+        // `clean(&raw)`——三百万字的稿子，面板开着的时候等于每帧全量清洗一次，
+        // 界面直接躺平。缓存在 `render()` 开头算一次（见 `sanitize_card`）。
+        let card = self.sanitize_card.unwrap_or_default();
         // 单项条目：朱砂数字 + 说明，左对齐。
         let item = |label: &'static str, n: usize, note: &'static str| {
             div()
@@ -2237,80 +2297,95 @@ impl CollationWorkspace {
                 .flex_row()
                 .items_center()
                 .gap(px(10.0))
-                .mb(px(10.0))
+                .mb(px(12.0))
                 .child(
                     div()
-                        .text_size(px(26.0))
+                        .w(px(46.0))
+                        .text_size(px(22.0))
                         .font_family(song.clone())
                         .text_color(rgb(0x8c2b22))
                         .child(SharedString::from(format!("{n}"))),
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(px(12.5))
                                 .text_color(rgb(0x2b2620))
                                 .child(SharedString::from(label)),
                         )
                         .child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(px(10.5))
                                 .text_color(rgb(0x9A9184))
                                 .child(SharedString::from(note)),
                         ),
                 )
         };
+        // 抽屉宽：右栏够宽就 360，窄窗口收到右栏以内——**永不越过左栏**。
+        let panel_w = (self.viewport_w - self.left_col_w(self.viewport_w) - 24.0).clamp(240.0, 360.0);
         div()
             .absolute()
             // 必须 `.id()` 使 `Div` 变 `Stateful<Div>` —— `overflow_y_scroll` 等方法
             // 只在 `StatefulInteractiveElement`（仅对 `Stateful<E>` 实现）上可用。
             .id(SharedString::from("collation-sanitize-panel"))
-            .top(px(16.0))
-            .right(px(16.0))
-            .w(px(400.0))
-            // 注：GPUI 0.2.2 无 `max_h`，卡片按内容自适应高度（本面板内容很少，
-            // 不会过高）；`overflow_y_scroll()` 仍兜底长内容。
+            // **右侧抽屉**（v1.9.70，用户口径）：从右缘贴边滑出，上沿让开顶栏，
+            // 下沿留 8px。左栏（原文 / 原图）**一个像素都不压**。
+            .top(px(HEADER_H + 8.0))
+            .bottom(px(8.0))
+            .right(px(8.0))
+            .w(px(panel_w))
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .p(px(20.0))
-            // v1.9.63：右上角悬浮卡片，**绝不遮挡**左右对照正文（旧版全屏居中遮罩
-            // 直接压住底部原文对照）。GPUI 0.2.2 无 backdrop-filter（见 collation.rs:2125），
-            // 用半透明宣纸浅米色近似毛玻璃；字体统一宋体（WenJinMincho）。
-            .bg(rgba(0xF3ECD9F0))
+            .p(px(18.0))
+            // 毛玻璃感：GPUI 0.2.2 没有 backdrop-filter，用「半透明宣纸 + 大范围柔影」
+            // 近似——底下的字会隐隐透出来，但读不清，正是毛玻璃的观感。绝不用死白。
+            .bg(rgba(0xF3ECD9EB))
             .border_1()
-            .border_color(rgb(0x9A6B4F))
+            .border_color(rgba(0x9A6B4F66))
             .rounded(px(12.0))
             .font_family(song.clone())
             .shadow(vec![gpui::BoxShadow {
-                color: gpui::hsla(0.09, 0.30, 0.20, 0.22),
-                offset: gpui::point(px(0.0), px(6.0)),
-                blur_radius: px(24.0),
-                spread_radius: px(0.0),
+                color: gpui::hsla(0.09, 0.30, 0.20, 0.20),
+                offset: gpui::point(px(-6.0), px(0.0)),
+                blur_radius: px(26.0),
+                spread_radius: px(-2.0),
             }])
             .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .mb(px(4.0))
+                    .mb(px(2.0))
                     .child(
                         div()
-                            .text_size(px(16.0))
+                            .flex_1()
+                            .text_size(px(15.0))
                             .font_family(song.clone())
                             .text_color(rgb(0x2b2620))
                             .child(SharedString::from("清洗审计日志")),
                     )
-                    .child(div().flex_1())
                     .child(
                         div()
+                            .size(px(22.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(11.0))
                             .cursor_pointer()
-                            .text_size(px(16.0))
+                            .text_size(px(13.0))
                             .text_color(rgb(0x9A9184))
+                            .hover(|s| s.bg(rgba(0x2B26200F)).text_color(rgb(0x8c2b22)))
                             .child(SharedString::from("✕"))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -2324,48 +2399,69 @@ impl CollationWorkspace {
             )
             .child(
                 div()
-                    .text_size(px(11.5))
+                    .text_size(px(11.0))
                     .text_color(rgb(0x9A9184))
-                    .mb(px(18.0))
+                    .mb(px(16.0))
                     .child(SharedString::from(
                         "以导入毛坯为基准，如实汇报清洗引擎动了哪些字。",
                     )),
             )
             .child(item(
                 "折叠异体 / 康熙部首",
-                stats.variant,
+                card.variant,
                 "只改有通式的字，生僻字一律保留",
             ))
             .child(item(
                 "清除幽灵字符",
-                stats.ghost,
+                card.ghost,
                 "零宽 / BOM / 软连 / 控制符，删除零风险",
             ))
             .child(item(
                 "转换异文 / 括号夹注",
-                stats.notes,
+                card.notes,
                 "〔…〕（…）升格为 [注]…[/注]",
             ))
             .child(
                 div()
-                    .mt(px(6.0))
+                    .mt(px(4.0))
                     .pt(px(12.0))
                     .border_t_1()
                     .border_color(rgba(0x2B26201A))
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .gap(px(6.0))
+                    // **字数只算正文**（v1.9.70）：`[注]` / `[/注]` 是给渲染器的结构
+                    // 标记，不是书里的字。按整串 `chars().count()` 比，几千处夹注就会
+                    // 让「删了 3 万字」显示成「净增 3 万」——这是上一版最吓人的假账。
                     .child(
                         div()
                             .text_size(px(12.0))
                             .text_color(rgb(0x4a4335))
                             .child(SharedString::from(format!(
-                                "毛坯 {raw_len} 字 → 清洗后 {cleaned_len} 字（{delta_label}）"
+                                "正文 {} 字 → {} 字（{}）",
+                                card.raw_body,
+                                card.clean_body,
+                                card.delta_label()
                             ))),
                     )
                     .child(
-                        self.button("导出明细", |c, _, _, cx| c.open_sanitize_log(cx), cx),
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgb(0x9A9184))
+                            .child(SharedString::from(format!(
+                                "未计入 {} 个夹注标签字符（[注] {} 处）与空白",
+                                card.tag_chars, card.notes
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .mt(px(6.0))
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .child(self.button("导出明细", |c, _, _, cx| {
+                                c.open_sanitize_log(cx)
+                            }, cx)),
                     ),
             )
     }
@@ -3675,10 +3771,10 @@ impl CollationWorkspace {
             // 「替换当前书籍」：已有校对内容时先弹确认框，避免误覆盖（见 `replace_book`）。
             .child(self.ghost_button("替换当前书籍", |c, _, _, cx| c.replace_book(cx), cx))
             .child(self.ghost_button("导入 MD", |c, _, _, cx| c.open_text_picker(cx), cx))
-            // **批量导入**（v1.9.25）：一次选多个 PDF / 图片，排进识别队列。
-            // 与「打开文件」的区别不是选几份，而是**选完不立刻渲染**——它只是
-            // 把活接下来，等 OCR 接入后由队列消费（见 `OcrQueue`）。
-            .child(self.ghost_button("批量导入", |c, _, _, cx| c.open_batch_picker(cx), cx))
+            // 【批量导入】已移除（v1.9.70，用户口径）：工作台是**单书校对台**，
+            // 一次只校一本；批量排队只属于书架（书架自己有【批量导入】）。
+            // 这个按钮在单书工作台上纯属干扰，还容易被误当成「再开一本」。
+            // `open_batch_picker` 与识别队列本身保留——书架的入口还在用它。
             // 「注」：一键显隐**原图高亮框**（v1.9.25）。与阅读器顶栏那枚同名
             // 同义——那边关的是纸上的夹注 / 眉批，这边关的是原图上的联动框，
             // 两处一起关才是「只剩字、只剩图」的安静状态。朱砂 = 框开着。
@@ -3861,7 +3957,7 @@ impl CollationWorkspace {
             )
             // ① 核心工作流
             .child(head("核心工作流"))
-            .child(line("① 导入", "书架【导入书籍】选 PDF / TXT / MD / EPUB；多本用【批量导入】排队。"))
+            .child(line("① 导入", "书架【导入书籍】选 PDF / TXT / MD / EPUB；多本批量导入在书架。"))
             .child(line("② 阅读", "书架点封面进阅读器；← → 翻页，Esc 退专注模式。"))
             .child(line("③ 笺校", "书架卡片右下【一键笺校】直达工作台，自动带上原图与正文。"))
             // ② 工作台操作
@@ -4611,15 +4707,155 @@ impl CollationWorkspace {
         .detach();
     }
 
-    /// **替换当前书籍**（v1.9.59）：点【替换当前书籍】的入口。已有校对内容时
-    /// 先弹确认框，避免误覆盖；空工作台则直接进文件选择。
+    /// **替换当前书籍**（v1.9.59 立项，v1.9.70 修「点了没反应」）。
+    ///
+    /// 旧实现只在「空工作台」时直接进 `open_image_picker`（**只收 PDF/PNG**），
+    /// 有内容时弹确认框、确认后仍然只收原图——用户想换一本 TXT 就永远换不了，
+    /// 看着就是「这个按钮是死的」。现在：
+    ///   ① 空工作台直接进选择器，有内容先弹确认（防误覆盖）；
+    ///   ② 选择器**同时收原图与文本**（PDF / 图片 / TXT / MD），按扩展名分流；
+    ///   ③ 选中后先 `detach_old_book()` **切断旧书绑定**（store_id / 撤销栈 /
+    ///      选区 / 原图 / 毛坯全清），再把新内容载入当前工作台——
+    ///      绝不让新书顶替旧书之后还往旧书的 `collation_state` 里写。
     fn replace_book(&mut self, cx: &mut Context<Self>) {
         if !self.text.is_empty() || self.image_path.is_some() || self.image_mem.is_some() {
             self.replace_confirm = true;
             cx.notify();
         } else {
-            self.open_image_picker(cx);
+            self.replace_book_picker(cx);
         }
+    }
+
+    /// **切断旧书的一切绑定**（v1.9.70）：换书前必须先做，顺序不能颠倒。
+    fn detach_old_book(&mut self) {
+        // ① 持久化锚点：不断掉的话，新书的内容会写进**上一本**的 collation_state，
+        //    下次打开旧书看到的是别人的正文——这是最难查的一类数据事故。
+        self.store_id = None;
+        // ② 撤销 / 重做：那些 diff 的字符坐标只对旧文本成立，留着必错位。
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_barrier = true;
+        // ③ 光标 / 选区 / 拖拽态 / 组字态。
+        self.cursor = 0;
+        self.anchor = 0;
+        self.selection = None;
+        self.marked = None;
+        self.drag_origin = None;
+        self.dragging = false;
+        // ④ 联动与审计缓存。
+        self.active_para_idx = None;
+        self.active_line = None;
+        self.match_note = None;
+        self.sanitize_card = None;
+        self.show_sanitize_panel = false;
+        self.text_file = None;
+        self.raw_text = None;
+        self.text_note = None;
+        self.text_err = false;
+        // ⑤ 原图 / PDF / 坐标。
+        if let Some(old) = self.image_mem.take() {
+            self.image_gc.push(old);
+        }
+        self.image_path = None;
+        self.pdf_path = None;
+        self.pdf_cache.clear();
+        self.regions.clear();
+        self.image_error = None;
+        self.image_note = None;
+        self.pick_from = None;
+        self.pick_rect = None;
+        self.pick_text = None;
+        self.pick_hits = 0;
+        // ⑥ 正文与滚动。
+        self.set_text(String::new());
+        self.scroll.set_offset(Point::new(px(0.0), px(0.0)));
+        self.diff_scroll.set_offset(Point::new(px(0.0), px(0.0)));
+        self.left_scroll.set_offset(Point::new(px(0.0), px(0.0)));
+        // 索引等下一次 render 重建（`text_gen` 已经 +1）。
+    }
+
+    /// 替换书籍的**统一选择器**：原图与文本都收，按扩展名分流。
+    ///
+    /// 与 `open_image_picker` / `open_text_picker` 的分工：那两个是「在当前书上
+    /// 换个图 / 换份稿」，本方法负责「换一本书」——所以一定要先 `detach_old_book`。
+    fn replace_book_picker(&mut self, cx: &mut Context<Self>) {
+        // rfd 同步对话框必须在主线程前台直调（见 `open_image_picker` 的注释）。
+        cx.spawn(
+            |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    let picked = rfd::FileDialog::new()
+                        .set_title("替换当前书籍（原图 / 文本）")
+                        .add_filter(
+                            "全部支持的格式",
+                            &[
+                                "pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp",
+                                "heic", "txt", "md", "markdown",
+                            ],
+                        )
+                        .add_filter(
+                            "原图（PDF / 图片）",
+                            &["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "heic"],
+                        )
+                        .add_filter("文本（TXT / Markdown）", &["txt", "md", "markdown"])
+                        .add_filter("全部文件", &["*"])
+                        .pick_file();
+                    let Some(path) = picked else { return };
+                    let is_text = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| {
+                            let e = e.to_ascii_lowercase();
+                            matches!(e.as_str(), "txt" | "md" | "markdown")
+                        })
+                        .unwrap_or(false);
+                    if !is_text {
+                        // 原图：走既有的一条完整链路（抽文本层 + 后台栅格化）。
+                        if let Some(entity) = this.upgrade() {
+                            let _ = entity.update(&mut app, |this, cx| {
+                                this.detach_old_book();
+                                this.pure_text_mode = false;
+                                let label = file_display_name(&path);
+                                this.ingest_source(path, cx);
+                                this.text_note = Some(format!("已替换原图：{label}"));
+                                this.text_err = false;
+                                cx.notify();
+                            });
+                        }
+                        return;
+                    }
+                    // 文本：读盘 / 解码在后台，绝不在主线程读一个大文件。
+                    let bg = app.background_executor().clone();
+                    let rd = path.clone();
+                    let res = bg.spawn(async move { read_text_file(&rd) }).await;
+                    if let Some(entity) = this.upgrade() {
+                        let _ = entity.update(&mut app, |this, cx| match res {
+                            Ok((body, note)) => {
+                                // **先断旧、再上新**：顺序反了会把旧书的撤销栈 / 光标
+                                // 带进新文本，一按 ⌘Z 就跳回别人的段落。
+                                this.detach_old_book();
+                                this.set_text(body.clone());
+                                this.raw_text = Some(body);
+                                this.show_diff = false;
+                                this.pure_text_mode = true;
+                                this.text_file = Some(path.clone());
+                                this.text_note = Some(note);
+                                this.text_err = false;
+                                this.sanitize_card = None;
+                                this.schedule_refocus(cx);
+                                cx.notify();
+                            }
+                            Err(e) => {
+                                this.text_note = Some(e);
+                                this.text_err = true;
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
     }
 
     /// **吃原图的核心**（v1.9.59）：给定一份原图（PDF / PNG / 位图）路径，
@@ -4746,6 +4982,9 @@ impl CollationWorkspace {
     ) {
         // 重置与「上一本书」相关的全部状态（文本 / 图像 / 联动 / 翻页缓存）。
         self.set_text(text);
+        // 换书 → 清洗审计卡片作废（它比的是「这一本的毛坯 vs 清洗后」）。
+        self.sanitize_card = None;
+        self.show_sanitize_panel = false;
         // 毛坯文本：供【原文对照】展示。重新进书时清空旧值，避免上一本的
         // 脏数据残留到这一本（没图的书 raw 来自重新解析源文件）。
         // ⚠️ 纯文本模式（无图、`source_path` 非 PDF/PNG 或为空）时上游传来的
@@ -4967,6 +5206,8 @@ impl CollationWorkspace {
                                     // 手选文件：Raw 与清洗后同源（导入即未清洗），
                                     // 让【原文对照】仍然可用且一致；同时清掉旧稿残留。
                                     this.raw_text = Some(body);
+                                    // 换稿 → 审计卡片作废（见 `SanitizeCard`）。
+                                    this.sanitize_card = None;
                                     this.show_diff = false;
                                     this.cursor = 0;
                                     this.selection = None;
@@ -7595,6 +7836,11 @@ impl Render for CollationWorkspace {
         // 它只在「文本变了 / 版心列数变了 / 对照开关变了」时真重建，其余帧是
         // 一次整数比较——百万字的稿子，这一行把每帧 O(全文) 变成 O(1)。
         self.ensure_line_index();
+        // **清洗审计卡片**（v1.9.70）：面板开着且没算过，就在这一帧算一次。
+        // 绝不在 `render_sanitize_panel` 里算——那等于每帧清洗一遍全文。
+        if self.show_sanitize_panel && self.sanitize_card.is_none() {
+            self.sanitize_card = Some(self.compute_sanitize_card());
+        }
         // 焦点归属：预览开启时把焦点引到 `preview_focus`，使其落在「根元素」派发
         // 路径上 → 根 div 的 `on_key_down` 能收到 ←/→/Esc；同时编辑器（IME 焦点在
         // `focus`）自然失焦，不再抢方向键去移动光标。预览关闭则焦点还给编辑器，
@@ -7744,7 +7990,7 @@ impl Render for CollationWorkspace {
                                                 cx.listener(|c, _, _, cx| {
                                                     cx.stop_propagation();
                                                     c.replace_confirm = false;
-                                                    c.open_image_picker(cx);
+                                                    c.replace_book_picker(cx);
                                                     cx.notify();
                                                 }),
                                             ),
