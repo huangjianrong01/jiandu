@@ -444,7 +444,12 @@ pub fn parse_txt_opts(text: &str, bracket_notes: bool) -> Vec<RawChapter> {
     ));
     // 全格式夹注归一：`〔…〕`/`【…】`/`（）`/`()` 全部归一成 `[注]…[/注]`，
     // 下游 `split_body_marks` 自然落成双行夹注。这一行让 TXT / DOCX 走通夹注。
+    //
+    // **三家注必须先于它**（v1.9.72）：`【集解】` 长得像 `【题解】`，会被
+    // 「行首短标签原样保留」那条规则放过，注文就顶着正文字号排下去了。先把
+    // 注家标签整段包成 `[注]…[/注]`，下面这一步自然原样放行。
     let norm = if bracket_notes {
+        let norm = crate::cleaner::mark_three_jia_notes(&norm);
         crate::cleaner::brackets_to_notes(&norm)
     } else {
         norm
@@ -1678,20 +1683,17 @@ pub fn paragraph_of(line: &str) -> Paragraph {
     // 注疏壳先规范化（`[ 注 ]` / `[疏]` / `[/疏]` → `[注]` / `[/注]`）。
     // 只去壳、留肉身：注疏正文一个字都不动，方括号一个都不留。
     // 没有 `[` 时整段借走，一个字节都不多分配（大书导入的热路径）。
-    let line = if line.contains('[') {
-        // **归一壳 → 再删落单的收标记**（v1.9.71）。这一步是「正文里出现赤裸裸
-        // `[/注]`」的正解：`normalize_note_shells` 只认壳、**不配对**，一段里
-        // 只剩半对时（跨段/跨行的 `〔…〕` 被段落切开了、旧版本导出的旧稿、
-        // 手改过的稿子），`[/注]` 就原样留在正文里被印出来——用户截图
-        // 「且俟知者。[/注]」正是跨行夹注的后半截。
-        //
-        // 只删**落单的收标记**，不动未闭合的开标记：核心管线的既有契约是
-        // 「未闭合的 `[注]` 把后文吞进夹注、绝不丢字」（见
-        // `note_after_trailing_space_keeps_its_body`），收标记则毫无保留价值
-        // ——它唯一的作用是收口，收不了口就只是一串印刷垃圾。
-        std::borrow::Cow::Owned(crate::cleaner::drop_lone_note_closes(
-            &crate::cleaner::normalize_note_shells(line),
-        ))
+    let line = if line.contains('[') || line.contains('【') || line.contains('〔') {
+        // ① **纯数字标号整枚删**（`[1]` / `［２］`）：三家注、脚注锚点的电子
+        //    产物，留着就是正文里一串孤零零的阿拉伯数字。
+        // ② **三家注剥离**：`【集解】…` 整段包成 `[注]…[/注]`（四格式兜底，
+        //    TXT 链在 `parse_txt_opts` 里已经做过一遍，这一步是幂等保险）。
+        // ③ **归一壳**：`[ 注 ]` / `[疏]` / `[/疏]` → `[注]` / `[/注]`。
+        // ④ **删落单的收标记**：跨段夹注被切开后剩下的半对壳。
+        let zero = crate::cleaner::drop_reference_marks(line);
+        let marked = crate::cleaner::mark_three_jia_notes(&zero);
+        let normed = crate::cleaner::normalize_note_shells(&marked);
+        std::borrow::Cow::Owned(crate::cleaner::drop_lone_note_closes(&normed))
     } else {
         std::borrow::Cow::Borrowed(line)
     };
@@ -2480,6 +2482,36 @@ mod tests {
             .find(|n| n.kind == NoteKind::Note)
             .expect("成对夹注被误删了");
         assert_eq!(note.text, "子：后代。");
+    }
+
+    /// **《史记》三家注不再顶大字**（v1.9.72，用户实报的专业排版事故）。
+    ///
+    /// `【集解】徐廣曰…` 以前会被「行首短标签原样保留」放过，整段注文按正文
+    /// 大字排下去。现在：正文只剩「黃帝者，少典之子。」，注文进 `notes`
+    /// （双行小字），且标签本身留在注文里（三家注的价值一半在「谁说的」）。
+    #[test]
+    fn shiji_three_jia_notes_become_gloss() {
+        let p = paragraph_of("黃帝者，少典之子。【集解】徐廣曰：號有熊。");
+        assert_eq!(p.text, "黃帝者，少典之子。");
+        assert!(!p.text.contains('【'), "注文标签漏进正文：{}", p.text);
+        let note = p
+            .notes
+            .iter()
+            .find(|n| n.kind == NoteKind::Note)
+            .expect("三家注没落成夹注");
+        assert_eq!(note.text, "集解：徐廣曰：號有熊。");
+        // 连续性：第二枚注也要成一枚独立夹注。
+        let p = paragraph_of("[集解]徐廣曰：號有熊。【索隱】案：有熊國君。");
+        assert!(p.text.is_empty() || !p.text.contains("【"));
+        assert_eq!(p.notes.iter().filter(|n| n.kind == NoteKind::Note).count(), 2);
+    }
+
+    /// 纯数字标号不许进正文（三家注 / 脚注锚点的电子残渣）。
+    #[test]
+    fn numeric_reference_marks_never_reach_the_body() {
+        let p = paragraph_of("道可道[1]，非常名[12]。");
+        assert_eq!(p.text, "道可道，非常名。");
+        assert!(p.notes.is_empty());
     }
 
     /// 破折号 → 竖排竖线（两条链路同源：`vclean::classic_punct` 与

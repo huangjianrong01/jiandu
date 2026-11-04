@@ -1575,6 +1575,165 @@ pub fn drop_lone_note_closes(s: &str) -> String {
     out
 }
 
+/// **三家注智能剥离**（v1.9.72）：`【集解】` / `【索隐】` / `【正义】` 这类
+/// 注文标签一出现，就从这里开始**进入注文模式**，一路吃到下一个注文标签、
+/// 空行（段落结束）或章题为止，整段包成 `[注]…[/注]`（双行小字夹注）。
+///
+/// ## 为什么必须有这一步
+/// 《史记》三家注的电子文本长这样：
+///
+/// ```text
+/// 黄帝者，少典之子，姓公孙，名曰轩辕。【集解】徐广曰：号有熊。
+/// 【索隐】案：有熊国君，少典之子，姓公孙。
+/// ```
+///
+/// `【集解】` 恰好**过不了** v1.9.26 那条「行首 + ≤8 字 + 无句读 → 判为章节
+/// 体例标签、原样保留」的闸（它确实长得像 `【题解】`），于是整段注文被当
+/// **正文大字**排了下去——用户在《史记》里看到的就是「【集解】谯周曰……」
+/// 顶着正文字号铺满一列，专业排版上是灾难。
+///
+/// ## 口径
+///   * 只认**明确的注家标签**（集解 / 索隐 / 索隱 / 正义 / 正義），`【题解】`
+///     `【注釋】` 这类章节标签一个字都不动——它们本来就不是注文。
+///   * 注文续行（下一行没有标签）**并进同一枚夹注**，中间不留换行（古籍竖排
+///     折行的位置不是语义边界，留 `\n` 会在小字里凭空断行）。
+///   * 遇到空行 / 章题立刻收口：绝不让一枚夹注把下一段正文吞成小字。
+///   * 标签本身保留在注文里（`集解：…`）——三家注的价值一半在于「这是谁说的」。
+pub fn mark_three_jia_notes(s: &str) -> String {
+    // 热路径：全文里连注家名都没有就一个字都不用看（大书导入时 99% 的行走这支）。
+    if !THREE_JIA_LABELS.iter().any(|l| s.contains(l)) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 32);
+    let mut in_note = false;
+    for (i, line) in s.split('\n').enumerate() {
+        let blank = line.trim().is_empty();
+        let head = !blank && crate::pipeline::is_chapter_head(line);
+        // 空行 / 章题 = 段落边界 → 先收口。收标记必须紧贴上一行注文的末尾，
+        // 绝不能自己占了下一行的行首（那会让夹注把空行也吞进小字）。
+        if in_note && (blank || head) {
+            out.push_str("[/注]");
+            in_note = false;
+        }
+        // 注文续行：直接相接，**不吐换行**。古籍硬折行的位置不是语义边界，
+        // 留着 `\n` 会让同一段注文在小字里凭空断开。
+        if i > 0 && !(in_note && !blank) {
+            out.push('\n');
+        }
+        // 空行原样吐出去（上面的收口已经做完了）。
+        if blank {
+            out.push_str(line);
+            continue;
+        }
+        let mut rest = line;
+        while !rest.is_empty() {
+            match find_note_label(rest) {
+                Some((at, len, label)) => {
+                    // 标签前面的字：在注里就是注文的续段，不在注里就是正文。
+                    if at > 0 {
+                        out.push_str(&rest[..at]);
+                    }
+                    // 换注：先把上一枚收掉（`[注]…[注]` 叠着会让下标错位）。
+                    if in_note {
+                        out.push_str("[/注]");
+                    }
+                    out.push_str("[注]");
+                    out.push_str(label);
+                    out.push('：');
+                    in_note = true;
+                    rest = &rest[at + len..];
+                }
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+            }
+        }
+    }
+    if in_note {
+        out.push_str("[/注]");
+    }
+    out
+}
+
+/// 三家注的标签字（正体 / 繁体都认）。
+///
+/// 刻意**只列注家名**：`题解` / `注釋` / `按` 这些是章节体例或行文用语，
+/// 把它们也转成小字会把正文吃掉（v1.9.26 那条闸就是为它们立的）。
+const THREE_JIA_LABELS: [&str; 5] = ["集解", "索隐", "索隱", "正义", "正義"];
+
+/// 在 `s` 里找下一个注文标签，返回 `(起始字节, 整枚标签字节长, 标签字)`。
+///
+/// 括号四套都认（`【集解】` / `〔集解〕` / `[集解]` / `［集解］`）——不同排印本
+/// 与电子本各用一套，用户实报的那本书里就混着用。只认括号里**恰好是注家名**
+/// 的，`[注]` / `[1]` / `[案]` 一律不算（它们是自家壳或正文）。
+fn find_note_label(s: &str) -> Option<(usize, usize, &'static str)> {
+    const SHELLS: [(char, char); 4] = [('【', '】'), ('〔', '〕'), ('[', ']'), ('［', '］')];
+    let mut from = 0usize;
+    while from < s.len() {
+        let open = s[from..]
+            .char_indices()
+            .find(|(_, c)| SHELLS.iter().any(|(o, _)| o == c))
+            .map(|(i, c)| (from + i, c))?;
+        let (start, oc) = open;
+        let close = SHELLS
+            .iter()
+            .find(|(o, _)| *o == oc)
+            .map(|(_, c)| *c)
+            .unwrap_or('】');
+        let after = &s[start + oc.len_utf8()..];
+        let Some(end) = after.find(close) else {
+            // 没有收括号：这个开括号不可能是标签，往后挪一格继续。
+            from = start + oc.len_utf8();
+            continue;
+        };
+        let inner = after[..end].trim();
+        if let Some(label) = THREE_JIA_LABELS.iter().find(|l| **l == inner) {
+            return Some((start, oc.len_utf8() + end + close.len_utf8(), label));
+        }
+        from = start + oc.len_utf8();
+    }
+    None
+}
+
+/// **纯数字标号整枚删**（v1.9.72）：`[1]` `[２]` `［12］` → 什么都不留。
+///
+/// 三家注的电子文本里到处是 `[1]` `[2]` 这种上标注号（脚注锚点被压平后的
+/// 产物）。旧链路把它们交给 `normalize_note_shells` 的「不认识的方括号只削
+/// 括号、留肉身」分支——结果是正文里留下一串孤零零的阿拉伯数字，紧贴在
+/// 句读旁边（「道可道1，非常名2。」），比标签还难看出是脏数据。
+///
+/// 只认**纯数字**：`[一]` `[注]` `[案]` 一律不碰（可能是正文里的真字）。
+pub fn drop_reference_marks(s: &str) -> String {
+    if !s.contains('[') && !s.contains('［') {
+        return s.to_string();
+    }
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '[' || c == '［' {
+            let close = if c == '[' { ']' } else { '］' };
+            // 标号不会长：最多向前看 6 字（`[12345]`）。
+            let end = (i + 1..(i + 7).min(cs.len())).find(|&j| cs[j] == close);
+            if let Some(j) = end {
+                let pure_num = j > i + 1
+                    && cs[i + 1..j]
+                        .iter()
+                        .all(|ch| ch.is_ascii_digit() || ('０'..='９').contains(ch));
+                if pure_num {
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// 不可见字符（零宽 / BOM / 软连 / 方向控制 / 控制符）——与 `denoise_text`
 /// 的删除清单同源。它们本来就会被洗掉，不该在任一侧的字数里占位。
 pub fn is_invisible_char(c: char) -> bool {
@@ -2174,6 +2333,50 @@ mod tests {
         );
         // 不是自家壳的方括号（正文里的 `[1]`）一个字符都不许碰。
         assert_eq!(drop_lone_note_closes("卷[12]之末"), "卷[12]之末");
+    }
+
+    /// **三家注剥离**（v1.9.72）：`【集解】` 这类注家标签整段转双行夹注，
+    /// 续行并入同一枚，遇到空行 / 章题立刻收口。
+    #[test]
+    fn three_jia_labels_become_inline_notes() {
+        let raw = "黃帝者，少典之子。【集解】徐廣曰：號有熊。\n【索隱】案：有熊國君。\n\n下一段正文。";
+        let s = mark_three_jia_notes(raw);
+        assert!(!s.contains('【'), "注家标签没吃掉：{s}");
+        assert!(s.contains("[注]集解：徐廣曰：號有熊。[/注]"), "{s}");
+        assert!(s.contains("[注]索隱：案：有熊國君。[/注]"), "{s}");
+        assert_eq!(
+            s.matches("[注]").count(),
+            s.matches("[/注]").count(),
+            "标签必须成对：{s}"
+        );
+        // 空行收口：收标记必须紧贴注文末尾，下一段正文一个字都不进小字。
+        assert!(s.ends_with("[/注]\n\n下一段正文。"), "正文被吞进夹注：{s}");
+    }
+
+    /// 续行（没有标签的下一行）并进同一枚夹注，且**不留换行**——
+    /// 古籍硬折行的位置不是语义边界，留 `\n` 会在小字里凭空断行。
+    #[test]
+    fn note_continuation_joins_without_a_break() {
+        let s = mark_three_jia_notes("【正義】此句疑衍，\n且俟知者。");
+        assert_eq!(s, "[注]正義：此句疑衍，且俟知者。[/注]");
+    }
+
+    /// 章节体例标签不是注文：`【題解】` 一个字都不许动。
+    #[test]
+    fn chapter_label_is_not_a_note() {
+        assert_eq!(
+            mark_three_jia_notes("【題解】此章言道之體。"),
+            "【題解】此章言道之體。"
+        );
+    }
+
+    /// 纯数字标号整枚删；`[一]`、正文里真写着的方括号不碰。
+    #[test]
+    fn numeric_reference_marks_are_dropped() {
+        assert_eq!(drop_reference_marks("道可道[1]，非常名[12]。"), "道可道，非常名。");
+        assert_eq!(drop_reference_marks("［２］道"), "道");
+        assert_eq!(drop_reference_marks("卷[一]之末"), "卷[一]之末");
+        assert_eq!(drop_reference_marks("无标号"), "无标号");
     }
 
     #[test]

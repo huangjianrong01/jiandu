@@ -123,6 +123,10 @@ pub enum CollationEvent {
 
 // ── 视觉常量（骨架阶段，先写死；接入主题系统前不改）──
 const HEADER_H: f32 = 44.0;
+/// **已保存微光**的米点直径（v1.9.73）：4.5px ≈ 一粒米，在 44px 顶栏里不抢眼。
+const SAVE_LED_DOT: f32 = 4.5;
+/// 微光指示器的**恒宽**容器。亮 / 灭都不改宽度，右侧按钮一位都不许挪。
+const SAVE_LED_W: f32 = 52.0;
 /// **快捷标点栏**的高度（v1.9.25）。
 ///
 /// 它是**布局常量**不是视觉常量：标点栏夹在状态条与正文之间，所以
@@ -1086,6 +1090,14 @@ pub struct CollationWorkspace {
     /// 防抖落盘代际令牌（v1.9.64）：每次 `touch` +1，定时器触发时校验是否过期，
     /// 过期即丢弃——保证 1.5 秒窗口内**只写最后一次**状态（停手才落盘）。
     save_gen: usize,
+    /// **已保存微光**（v1.9.73）：`true` = 顶栏那粒指示点正亮着朱砂。
+    ///
+    /// 只在**真写盘成功之后**置位（1.5 秒防抖落盘 ✓ / ⌘S ✓），约 1.1 秒后由
+    /// 一枚后台定时器熄灭。临时样张（无 `store_id`）不落库，但 ⌘S 仍亮——
+    /// 用户按了就得有回应，静默才是真的「没保存」。
+    save_flash: bool,
+    /// 微光代际：连改 / 连按 ⌘S 时只让最后那枚定时器熄灭，避免亮到一半被掐断。
+    save_flash_gen: usize,
     /// **撤销栈**（v1.9.66）：操作级 diff（见 [`EditOp`]），绝不存整本快照。
     /// 顺序即时间序，栈顶 = 最近一步。
     undo_stack: Vec<EditOp>,
@@ -1402,6 +1414,9 @@ impl CollationWorkspace {
             // v1.9.64：持久化锚点未定（首启动是演示样张，没有 store_id）。
             store_id: None,
             save_gen: 0,
+            // v1.9.73：微光从灭开始（没保存过就先别亮）。
+            save_flash: false,
+            save_flash_gen: 0,
             // v1.9.66：撤销/重做栈从空开始（演示样张没有「上一版」可退）。
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -2655,6 +2670,13 @@ impl CollationWorkspace {
                     self.move_cursor_to(total, shift, cx);
                     return;
                 }
+                // ⌘S **立即落盘**（v1.9.73）：与 1.5 秒防抖并行的「手动存档」。
+                // 用户按下它，要的是「现在、立刻、已经写进去了」，所以不走防抖，
+                // 写成功顶栏右侧那粒点会亮一次朱砂。
+                "s" | "S" => {
+                    self.save_now(cx);
+                    return;
+                }
                 // ⌘N：**掩注**（隐藏夹注小字）——竖排预览就地静默重排。
                 "n" | "N" => {
                     self.toggle_gloss(cx);
@@ -3796,6 +3818,8 @@ impl CollationWorkspace {
             // 「清洗日志」（v1.9.60）：生成 sanitize_report.md 并在访达中打开。
             .child(self.clean_log_chip(cx))
             .child(div().flex_1())
+            // 已保存微光（v1.9.73）：顶栏右侧一粒米大小的状态点。
+            .child(self.save_led())
             .child(div().w(px(6.0)))
             // 【？】帮助（v1.9.66）：一枚极简的圆形问号，点开是毛玻璃说明卡。
             //
@@ -3861,6 +3885,53 @@ impl CollationWorkspace {
                             cx.emit(CollationEvent::Exit);
                         }),
                     ),
+            )
+    }
+
+    /// **已保存微光**（v1.9.73）：顶栏右侧那粒米大小的状态指示点。
+    ///
+    /// 平时是与墨同色、只有 20% 不透明度的灰点（不亮时才真的「安静」）；一旦
+    /// 1.5 秒防抖落盘成功或用户按了 ⌘S，这一点转朱砂，并在右侧浮出极淡的
+    /// 「已保存」，1.1 秒后自行退回灰点。
+    ///
+    /// 容器**恒宽** [`SAVE_LED_W`]、点子起点固定：亮 / 灭、有字 / 没字都不会
+    /// 推挤右边的【？】【竖排预览】——顶栏按钮在一瞬间挪位，比没有指示器更廉价。
+    fn save_led(&self) -> gpui::Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
+        let lit = self.save_flash;
+        div()
+            .w(px(SAVE_LED_W))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .size(px(SAVE_LED_DOT))
+                    .rounded(px(SAVE_LED_DOT / 2.0))
+                    // 朱砂 = 刚落盘；极淡灰 = 安静（不是「出错」，故不用红色以外的
+                    // 任何警示色——这个点上永远只有两种状态，越简单越可信）。
+                    .bg(if lit {
+                        rgb(0x8c2b22)
+                    } else {
+                        rgba(0x2B26203D)
+                    }),
+            )
+            .child(
+                // 字恒定存在、只改透明度：这样「已保存」浮出 / 隐去时**版面零跳动**
+                //（用显隐切换会让这粒点横移一个词宽）。
+                div()
+                    .font_family(song)
+                    .text_size(px(10.0))
+                    .text_color(if lit {
+                        rgba(0x8c2b22CC)
+                    } else {
+                        rgba(0x2B262000)
+                    })
+                    .child(SharedString::from("已保存")),
             )
     }
 
@@ -5130,6 +5201,100 @@ impl CollationWorkspace {
         self.saved_cursor = self.cursor;
     }
 
+    /// **亮一次「已保存」微光**（v1.9.73）：顶栏右侧那粒米点转朱砂 + 浮出极淡
+    /// 的「已保存」二字，1.1 秒后自行退回灰点。
+    ///
+    /// 为什么不用动画曲线：GPUI 0.2.2 的重绘由 `notify()` 驱动，做淡出就得在
+    /// 每帧里刷一次 `notify`——为了一个小点在后台常驻定时器，代价与收益完全
+    /// 不成比例。一个「亮 → 停 1.1 秒 → 灭」的硬切，在视觉上就是**闪一下**，
+    /// 用户的诉求（「给极大的数据安全感」）已完全满足。
+    ///
+    /// 定时器必须用 `cx.background_executor().timer(..)`——GPUI 后台执行器没有
+    /// tokio 时间驱动，`tokio::time::sleep` 会永远 Pending（专注模式那轮的教训）。
+    fn mark_saved(&mut self, cx: &mut Context<Self>) {
+        self.save_flash_gen = self.save_flash_gen.wrapping_add(1);
+        let gen = self.save_flash_gen;
+        self.save_flash = true;
+        cx.notify();
+        let exec = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    exec.timer(std::time::Duration::from_millis(1100)).await;
+                    if let Some(e) = this.upgrade() {
+                        let _ = e.update(&mut app, |ws, cx| {
+                            // 这一轮已被新的一次保存顶掉：让它去管自己的熄灭。
+                            if ws.save_flash_gen != gen {
+                                return;
+                            }
+                            ws.save_flash = false;
+                            cx.notify();
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// **⌘S 立即落盘**（v1.9.73）：不走 1.5 秒防抖，用户按下就要真的写进去。
+    ///
+    /// 与 [`Self::touch`] 的关系：先 `save_gen + 1` 把还在飞的那轮防抖作废，
+    /// 再由自己写一次——否则 ⌘S 之后 0.3 秒，那轮旧定时器会把同样的内容再写
+    /// 一遍（多一次 15MB REPLACE）。写盘在后台线程，成功才亮微光。
+    fn save_now(&mut self, cx: &mut Context<Self>) {
+        self.save_gen = self.save_gen.wrapping_add(1);
+        let Some(sid) = self.store_id.clone() else {
+            // 临时样张不落库；但 ⌘S 是明确的用户动作，静默才是最坏的回应。
+            self.mark_saved(cx);
+            return;
+        };
+        let text = self.text.clone();
+        let show_diff = self.show_diff;
+        let cursor = self.cursor;
+        let scroll_y = px_f32(self.scroll.offset().y);
+        // 记账在同一帧：写盘在后台，等回来再记就晚了。
+        self.saved_gen = self.text_gen;
+        self.saved_cursor = self.cursor;
+        let exec = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    let wrote = exec
+                        .spawn(async move {
+                            if let Ok(conn) = jiandu_core::store::connect() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs() as i64)
+                                    .unwrap_or(0);
+                                let state = jiandu_core::store::CollationState {
+                                    store_id: sid,
+                                    full_text: text,
+                                    show_diff,
+                                    cursor,
+                                    scroll_y: scroll_y as f64,
+                                    updated_at: now,
+                                };
+                                return jiandu_core::store::put_collation_state(&conn, &state)
+                                    .is_ok();
+                            }
+                            false
+                        })
+                        .await;
+                    if !wrote {
+                        return;
+                    }
+                    if let Some(e) = this.upgrade() {
+                        let _ = e.update(&mut app, |ws, cx| ws.mark_saved(cx));
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
     fn touch(&mut self, cx: &mut Context<Self>) {
         // **光标跟随**（v1.9.68）放在这里：所有「改文本 / 落光标」的路径最后都
         // 会调 `touch`，在这一处兜住，比在每个编辑函数里各写一遍可靠得多。
@@ -5179,7 +5344,7 @@ impl CollationWorkspace {
                         return;
                     };
                     // 落盘扔后台线程：一条 REPLACE 最多写 ≈15MB（500 万字），别卡主线程。
-                    let _ = exec
+                    let wrote = exec
                         .spawn(async move {
                             if let Ok(conn) = jiandu_core::store::connect() {
                                 let now = std::time::SystemTime::now()
@@ -5194,10 +5359,19 @@ impl CollationWorkspace {
                                     scroll_y: scroll_y as f64,
                                     updated_at: now,
                                 };
-                                let _ = jiandu_core::store::put_collation_state(&conn, &state);
+                                return jiandu_core::store::put_collation_state(&conn, &state)
+                                    .is_ok();
                             }
+                            false
                         })
                         .await;
+                    // 微光**只认成功**（v1.9.73）：写失败却亮「已保存」，比不亮坏得多。
+                    if !wrote {
+                        return;
+                    }
+                    if let Some(e) = this.upgrade() {
+                        let _ = e.update(&mut app, |ws, cx| ws.mark_saved(cx));
+                    }
                 }
             },
         )

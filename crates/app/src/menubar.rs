@@ -2,10 +2,10 @@
 //!
 //! 参考「写匠」等现代写作软件：在系统状态栏注册一枚极简图标，点击弹出
 //! 原生下拉菜单（NSMenu，自带 vibrancy 毛玻璃感），提供：
-//!   · 顶部信息：今日阅卷 X 字（复用 [`Root::poll_menu_intents`] 刷进来的数据）
-//!   · 快速笺校（唤起主窗口并切到工作台）
+//!   · 顶部信息：今日阅卷：X 字（复用 [`Root::poll_menu_intents`] 刷进来的数据）
+//!   · 打开工作台（唤起主窗口并切到笺校工作台）
 //!   · 打开书架（唤起主窗口的书架界面）
-//!   · 最近打开（二级子菜单，列最近阅读的 5 本）
+//!   · 最近项目（二级子菜单，列最近阅读的 5 本）
 //!   · 检查更新 / 退出笺读
 //!
 //! # 纪律（同 dropzone / revive）
@@ -198,7 +198,7 @@ mod mac {
             .map(|g| g.today_chars)
             .unwrap_or(0);
         let header_label = if today > 0 {
-            format!("今日阅卷 {} 字", today)
+            format!("今日阅卷：{} 字", today)
         } else {
             "今日尚未阅卷".to_string()
         };
@@ -211,19 +211,19 @@ mod mac {
             let _: () = objc::msg_send![menu, addItem: header];
         }
 
-        // 快捷操作 1：快速笺校。
-        let collation = make_item("快速笺校", false);
+        // 打开工作台（v1.9.73 正名：以前叫「快速笺校」，用户口语里一律叫「工作台」）。
+        let collation = make_item("打开工作台", false);
         if !collation.is_null() {
             let _: () = objc::msg_send![menu, addItem: collation];
         }
-        // 快捷操作 2：打开书架。
+        // 打开书架。
         let shelf = make_item("打开书架", false);
         if !shelf.is_null() {
             let _: () = objc::msg_send![menu, addItem: shelf];
         }
 
-        // 最近打开（二级子菜单）。
-        let recent_parent = make_item("最近打开", false);
+        // 最近项目（二级子菜单；v1.9.73 由「最近打开」正名）。
+        let recent_parent = make_item("最近项目", false);
         if !recent_parent.is_null() {
             let sub = build_recents_submenu();
             if !sub.is_null() {
