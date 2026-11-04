@@ -1649,6 +1649,23 @@ pub fn split_body_marks(s: &str) -> (String, Vec<EmphSpan>, Vec<GlossMark>) {
             }
             rest = after;
         } else {
+            // **落单的收标记连壳删**（v1.9.71 最后一道闸）。
+            //
+            // 走到这里说明 `[/注]` 前面没有配对的 `[注]`——它是跨段夹注的尾巴
+            // （「且俟知者。[/注]」）、或是老稿子里没洗干净的残壳。旧代码把它
+            // 当普通字符逐个 push，用户看到的就是四个赤裸的标签字符印在正文里。
+            //
+            // 上游 `paragraph_of` 已先删过一轮（`strip_dangling_note_marks`），
+            // 这里是不信任上游的兜底：`split_body_marks` 被别处直接调用时
+            // （dclean / 单测 / 将来的新链路），也绝不允许壳进正文。
+            if let Some(tail) = rest.strip_prefix("[/注]") {
+                rest = tail;
+                continue;
+            }
+            if let Some(tail) = rest.strip_prefix("[/高亮]") {
+                rest = tail;
+                continue;
+            }
             let ch = rest.chars().next().unwrap();
             out.push(ch);
             rest = &rest[ch.len_utf8()..];
@@ -1662,7 +1679,19 @@ pub fn paragraph_of(line: &str) -> Paragraph {
     // 只去壳、留肉身：注疏正文一个字都不动，方括号一个都不留。
     // 没有 `[` 时整段借走，一个字节都不多分配（大书导入的热路径）。
     let line = if line.contains('[') {
-        std::borrow::Cow::Owned(crate::cleaner::normalize_note_shells(line))
+        // **归一壳 → 再删落单的收标记**（v1.9.71）。这一步是「正文里出现赤裸裸
+        // `[/注]`」的正解：`normalize_note_shells` 只认壳、**不配对**，一段里
+        // 只剩半对时（跨段/跨行的 `〔…〕` 被段落切开了、旧版本导出的旧稿、
+        // 手改过的稿子），`[/注]` 就原样留在正文里被印出来——用户截图
+        // 「且俟知者。[/注]」正是跨行夹注的后半截。
+        //
+        // 只删**落单的收标记**，不动未闭合的开标记：核心管线的既有契约是
+        // 「未闭合的 `[注]` 把后文吞进夹注、绝不丢字」（见
+        // `note_after_trailing_space_keeps_its_body`），收标记则毫无保留价值
+        // ——它唯一的作用是收口，收不了口就只是一串印刷垃圾。
+        std::borrow::Cow::Owned(crate::cleaner::drop_lone_note_closes(
+            &crate::cleaner::normalize_note_shells(line),
+        ))
     } else {
         std::borrow::Cow::Borrowed(line)
     };
@@ -2416,6 +2445,41 @@ mod tests {
         let (clean, notes) = split_notes("道[注]未尽");
         assert_eq!(clean, "道");
         assert_eq!(notes, vec![(0usize, "未尽".to_string())]);
+    }
+
+    /// **落单的 `[/注]` 绝不许进正文**（v1.9.71，用户真机截图）。
+    ///
+    /// 真机现场：一本《资治通鉴》txt 里的 `〔胡三省注：…〕` 跨了硬折行，管
+    /// 线把它升格成一对跨行的 `[注]…[/注]`，段落一切开，后半截的收标记就成
+    /// 了孤儿——正文里印出「且俟知者。[/注]」四个赤裸的标签字符。
+    ///
+    /// 三道闸都要钉：`split_body_marks`（最底层）、`paragraph_of`（四格式唯一
+    /// 入口）、最终 `Paragraph.text`（屏幕上真正显示的那份）。
+    #[test]
+    fn lone_note_close_never_reaches_the_body() {
+        // ① 最底层：收标记前面没有开标记 → 连壳删。
+        let (clean, spans, notes) = split_body_marks("且俟知者。[/注]");
+        assert_eq!(clean, "且俟知者。");
+        assert!(spans.is_empty() && notes.is_empty());
+        // 高亮的孤儿同理。
+        let (clean, ..) = split_body_marks("且俟知者。[/高亮]");
+        assert_eq!(clean, "且俟知者。");
+
+        // ② 段落入口：正文里一个方括号都不许剩，字一个都不许少。
+        let p = paragraph_of("臣光曰：且俟知者。[/注]");
+        assert_eq!(p.text, "臣光曰：且俟知者。");
+        assert!(!p.text.contains('['), "标签漏进正文：{}", p.text);
+        assert!(p.notes.is_empty(), "孤儿收标记不该造出夹注：{:?}", p.notes);
+
+        // ③ 成对的壳照旧保留：它是双行夹注的开关，绝不能顺手删掉。
+        let p = paragraph_of("黄帝者，少典之子[注]子：后代。[/注]，姓公孙。");
+        assert_eq!(p.text, "黄帝者，少典之子，姓公孙。");
+        let note = p
+            .notes
+            .iter()
+            .find(|n| n.kind == NoteKind::Note)
+            .expect("成对夹注被误删了");
+        assert_eq!(note.text, "子：后代。");
     }
 
     /// 破折号 → 竖排竖线（两条链路同源：`vclean::classic_punct` 与

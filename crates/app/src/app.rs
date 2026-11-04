@@ -917,15 +917,12 @@ pub struct Root {
     /// `fit_sizes` 里不能在算完网格**之前**去动分页（那时几何还是旧的），
     /// 故只把锚点挂起，等 `render_reading` 排完新页再回找位置。
     pub pending_anchor: Option<(usize, usize, usize)>,
-    /// **渲染模式**（v1.23.0 三种版式）：对开翻阅 / 手机竖屏单叶 / 整页等比缩放。
+    /// **渲染模式**（v1.9.71 起只剩两种）：对开翻阅 / 手机竖屏单叶。
     ///
     /// 与 `duplex` 的分工：`layout_mode` 是**用户 / 屏幕选的意图**，
-    /// `duplex` 是它推导出的**当帧铺法**（整页也铺两叶 + 中缝，故 = Facing）。
-    /// 自动模式下 `auto_duplex` 只在对开 ⇄ 单叶之间来回，不碰整页。
+    /// `duplex` 是它推导出的**当帧铺法**。
+    /// 自动模式下 `auto_duplex` 只在对开 ⇄ 单叶之间来回。
     pub layout_mode: crate::grid::LayoutMode,
-    /// 整页模式的当帧缩放系数（其余模式恒为 1.0）：供 UI 与调试查看
-    /// 「整叶被缩到了几成」。
-    pub full_scale: f32,
     /// 窗口内容区尺寸（每帧由 render 写入，供铺满屏计算）。
     pub viewport_w: f32,
     pub viewport_h: f32,
@@ -1377,7 +1374,6 @@ impl Root {
             layout_key: LayoutConfig::default_key(),
             duplex: Duplex::Single,
             layout_mode: crate::grid::LayoutMode::Facing,
-            full_scale: 1.0,
             // v1.84.0：正文出厂清刻本悦宋（见上 `default_ancient`）、
             // 批注出厂霞鹜文楷——刻本里「正文匠体、注文手写体」的层次。
             font_ancient: default_ancient,
@@ -1989,10 +1985,20 @@ impl Root {
     }
 
     pub fn current_font(&self) -> FontChoice {
-        match self.script {
+        let c = match self.script {
             Script::Ancient => self.font_ancient,
             Script::Modern => self.font_modern,
+        };
+        // **下架款回落到本 script 的默认**（v1.9.71）：面板已经不再陈列
+        // 「西文数字」等已下架字体，可老存档里可能还存着它——不回落的后果是
+        // 字体行一片空白（一颗都没选中），用户以为自己把字体弄丢了。
+        if c.is_retired() {
+            return match self.script {
+                Script::Ancient => FontChoice::WenJinMincho,
+                Script::Modern => FontChoice::SystemDefault,
+            };
         }
+        c
     }
 
     pub fn current_size(&self) -> f32 {
@@ -2543,7 +2549,7 @@ impl Root {
         // 自动模式下只在对开 ⇄ 单叶之间来回（整页是「看整体版式」的手动档，
         // 自动切进去会打断阅读）。判据 `grid::should_face` 除宽高比外还要求
         // 单叶宽与字号都过得去——宁可单叶也不牺牲字号。
-        let mut mode = if self.auto_duplex && self.layout_mode != crate::grid::LayoutMode::Full {
+        let mut mode = if self.auto_duplex {
             if crate::grid::should_face(self.viewport_w, self.viewport_h, self.grid.columns, zoom) {
                 crate::grid::LayoutMode::Facing
             } else {
@@ -2606,7 +2612,7 @@ impl Root {
                 }
                 cols = next;
                 // 列数变了可能改变铺法（单叶宽 / 字号门槛），重判一次。
-                if self.auto_duplex && self.layout_mode != crate::grid::LayoutMode::Full {
+                if self.auto_duplex {
                     mode = if crate::grid::should_face(self.viewport_w, self.viewport_h, cols, zoom)
                     {
                         crate::grid::LayoutMode::Facing
@@ -2679,7 +2685,6 @@ impl Root {
             dir,
             fs_max,
         });
-        self.full_scale = plan.scale;
         let m = plan.m;
         self.margin_top = m.margin_top;
         self.margin_bot = m.margin_bot;
@@ -7922,9 +7927,15 @@ impl Render for Root {
         // 被它整块盖住（第一版就是这样，印根本看不见）。印章只在左下角
         // 一小块，压不到居中的浮层。
         root = root.child(screen);
-        // 注：书架上的「笺校」悬浮红钮已于 v1.9.63 移除——与卡片级「一键笺校」
-        // （shelf.rs，调 `enter_collation` 带书载入）功能重叠。进入工作台的入口保留
-        // 两条：卡片「一键笺校」+ 菜单栏「快速笺校」（均载书），工作台内另可【打开文件】。
+        // 笺校工作台入口：**只在书架显示**（用户 2026-11-04 要求恢复 v1.9.63 删掉的
+        // 那枚右下角朱砂钮，功能保持原样）。
+        //
+        // 阅读屏不挂——右下那枚正好压在正文/藏书印旁边，读着书突然冒出一个悬浮钮，
+        // 很碍事；书架是「选书 + 导入 + 进工具」的那一屏，入口放这里就够了。
+        // 专注模式仍然不显示。
+        if self.screen == Screen::Shelf && !self.focus_mode {
+            root = root.child(self.render_collation_entry(cx));
+        }
         // 「雕版刻印中… 34%」：盖在最上层，导入期间挡住操作，免得重复点导入。
         let import_ui = self
             .import_job
@@ -7991,6 +8002,36 @@ impl Root {
         let total = pg.known_total();
         // 对开时一屏覆盖 `page` 与 `page+1`：本屏已含末叶（`total-1`）即算卷末。
         (total > 2 && self.page + 1 >= total - 1).then_some(true)
+    }
+
+    /// 书架右下角的「笺校工作台」入口（悬浮钮，不占排版流）。
+    ///
+    /// v1.9.63 曾以「与卡片级一键笺校重复」为由删除，v1.9.71 按用户要求恢复：
+    /// 卡片那枚要**先找到那本书**，而右下角这枚是「先开工具、再放稿」的路子
+    /// （进去用【导入文本】/【导入原图】/ 拖拽）。两条路服务两种心流，不是重复。
+    ///
+    /// 点一下把顶层模式机切到 `Collation`，`Root::render` 下一帧就直接返回
+    /// 工作台视图——对阅读界面零影响（见 `collation.rs` 文件头）。**行为与
+    /// 删除前完全一致**：不预载任何书，工作台保持它自己的现状。
+    fn render_collation_entry(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .absolute()
+            .right(px(14.0))
+            .bottom(px(72.0))
+            .px(px(14.0))
+            .py(px(8.0))
+            .bg(rgba(0x8c2b22ff))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .text_color(rgb(0xf4ecd8))
+            .child(SharedString::from("笺校"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.mode = AppMode::Collation;
+                    cx.notify();
+                }),
+            )
     }
 
 }

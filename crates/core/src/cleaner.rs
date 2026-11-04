@@ -1512,6 +1512,69 @@ pub fn body_char_count(s: &str) -> usize {
     n
 }
 
+/// **只删落单的收标记**（v1.9.71）：`[/注]` / `[/高亮]` 前面若没有配对的
+/// 开标记，连壳删掉；成对的、以及**没闭合的开标记**一律原样保留。
+///
+/// ## 为什么需要它（真机现场）
+/// 一本《资治通鉴》txt 里 `〔胡三省注：…〕` 跨了硬折行：`brackets_to_notes`
+/// 照规矩把整对升格成 `[注]…\n…[/注]`（换行在注内原样透传），可段落是**按行
+/// 收口**的——上一行补了一个收口，这一行真正的收标记就成了孤儿，
+/// `split_body_marks` 配不上对，四个标签字符原样印进正文：
+/// 用户截图里那句「且俟知者。**[/注]**」就是它。
+///
+/// ## 为什么不用 `types::strip_dangling_note_marks`
+/// 那个是 EPUB 链的「配对通吃」：落单的**开**标记也删。可核心管线的既有契约是
+/// 「未闭合的 `[注]` 把后文吞进夹注、绝不丢字」（见
+/// `pipeline::tests::note_after_trailing_space_keeps_its_body`）——直接换过去
+/// 会把注文变成正文，改动面太大。这里只做**收标记**这一个方向，精准消掉泄露。
+///
+/// 不改变任何非标签字符：壳外的正文一个字不动。
+pub fn drop_lone_note_closes(s: &str) -> String {
+    if !s.contains('[') {
+        return s.to_string();
+    }
+    // (开标记, 收标记)：正文里可能出现的三族壳。
+    const PAIRS: [(&str, &str); 4] = [
+        ("[注]", "[/注]"),
+        ("[疏]", "[/疏]"),
+        ("[note]", "[/note]"),
+        ("[高亮]", "[/高亮]"),
+    ];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    // 各族壳各自记深度：`[高亮][注]…[/注][/高亮]` 这种嵌套也能正确配对。
+    let mut depth = [0usize; 4];
+    while !rest.is_empty() {
+        let mut hit = false;
+        for (k, (open, close)) in PAIRS.iter().enumerate() {
+            if rest.starts_with(close) {
+                if depth[k] > 0 {
+                    depth[k] -= 1;
+                    out.push_str(close);
+                }
+                // 落单的收标记：直接吞掉（连壳删）。
+                rest = &rest[close.len()..];
+                hit = true;
+                break;
+            }
+            if rest.starts_with(open) {
+                depth[k] += 1;
+                out.push_str(open);
+                rest = &rest[open.len()..];
+                hit = true;
+                break;
+            }
+        }
+        if hit {
+            continue;
+        }
+        let Some(c) = rest.chars().next() else { break };
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
 /// 不可见字符（零宽 / BOM / 软连 / 方向控制 / 控制符）——与 `denoise_text`
 /// 的删除清单同源。它们本来就会被洗掉，不该在任一侧的字数里占位。
 pub fn is_invisible_char(c: char) -> bool {
@@ -2093,6 +2156,26 @@ mod tests {
     /// **正文字数不吃标签**（v1.9.70）：这是「314 万 → 317 万 净增 3 万」那个
     /// Bug 的回归钉子。夹注升格会凭空多出 `[注]` / `[/注]` 共 7 个字符，
     /// 但它们不是书里的字——按正文算，删了字就必须显示「净减」。
+    #[test]
+    fn lone_note_close_is_dropped_but_pairs_survive() {
+        // 用户真机截图：跨行夹注被切开后，后半截只剩收标记。
+        assert_eq!(drop_lone_note_closes("且俟知者。[/注]"), "且俟知者。");
+        // 成对的壳原样留（双行夹注的开关，删了就丢注）。
+        assert_eq!(
+            drop_lone_note_closes("道[注]注文[/注]可"),
+            "道[注]注文[/注]可"
+        );
+        // 未闭合的开标记**不动**（既有契约：吞后文、绝不丢字）。
+        assert_eq!(drop_lone_note_closes("道[注]未尽"), "道[注]未尽");
+        // 嵌套 / 多族壳各自记账。
+        assert_eq!(
+            drop_lone_note_closes("[/高亮]道[高亮]非[/高亮]常[/注]"),
+            "道[高亮]非[/高亮]常"
+        );
+        // 不是自家壳的方括号（正文里的 `[1]`）一个字符都不许碰。
+        assert_eq!(drop_lone_note_closes("卷[12]之末"), "卷[12]之末");
+    }
+
     #[test]
     fn body_count_ignores_note_tags_and_whitespace() {
         // 纯标签不计。

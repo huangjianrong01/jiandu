@@ -422,11 +422,16 @@ fn unify_script(s: &str) -> String {
         .collect()
 }
 
-/// 闭合括号与注疏标签：**只补不删**。
+/// 闭合括号与注疏标签：括号**只补不删**；注疏标签**补缺、也删落单**。
 ///
 /// 竖排里一个没闭合的「（」会一路挂到段末，把后面整段字都圈成夹注；
 /// `[注]` 不闭合则会把余下全文吞进夹注。补在行末（不是文末）——按段收口，
 /// 才不会被读者当成跨段的长注。
+///
+/// v1.9.71 起多了一条反向职责：**本行里没有开标记配对的 `[/注]` 必须删掉**。
+/// 旧实现只补不删，跨行夹注被按行切开后，后半截的收标记就成了孤儿，直接印
+/// 进正文（用户实测「且俟知者。[/注]」）。成对的标签照旧原样保留——它是排版
+/// 层做双行夹注的开关，删了就丢夹注。
 fn close_notes(s: &str) -> String {
     const PAIRS: [(char, char); 10] = [
         ('（', '）'),
@@ -450,6 +455,34 @@ fn close_notes(s: &str) -> String {
         if n > 0 {
             out.push('\n');
         }
+        // ── ① 先删本行里**落单的收标记**（v1.9.71，「正文出现赤裸 [/注]」的
+        //        源头之一）。
+        //
+        // 跨行的 `〔…〕` 夹注在 `brackets_to_notes` 里会升格成一对**跨行**的
+        // `[注]…[/注]`（换行在注内原样透传）。到了按行收口这一步：上一行只有
+        // 开标记、这一行只剩收标记，旧代码只补不删——上一行被补一个 `[/注]`，
+        // 这一行真正的收标记就落单了，下游 `split_body_marks` 配不上对，四个
+        // 标签字符原样印进正文（用户截图：「且俟知者。[/注]」）。
+        //
+        // 口径：本行收标记多于开标记 → 多出来的**从最左删起**（落单的那枚
+        // 一定是上一行注文的尾巴，位置在前；后面真正的成对标记要留着）。
+        // 只删壳，壳外一个字不动。
+        let mut fixed: Option<String> = None;
+        let opens = line.matches("[注]").count();
+        let closes = line.matches("[/注]").count();
+        if closes > opens {
+            let mut l = line.to_string();
+            for _ in opens..closes {
+                match l.find("[/注]") {
+                    Some(at) => {
+                        l.replace_range(at..at + "[/注]".len(), "");
+                    }
+                    None => break,
+                }
+            }
+            fixed = Some(l);
+        }
+        let line = fixed.as_deref().unwrap_or(line);
         let mut depth: Vec<char> = Vec::new();
         for c in line.chars() {
             if let Some(&(_, close)) = PAIRS.iter().find(|(o, _)| *o == c) {
@@ -666,5 +699,71 @@ mod dedup_tests {
         let text = "书\n\n正文。";
         let out = strip_leading_title_duplicates(text, "书");
         assert_eq!(out, text, "过短书名不应触发去重");
+    }
+}
+
+/// 注疏标签的配对守卫（v1.9.71）。
+///
+/// 这一组只钉一件事：**正文里绝不许出现带方括号的代码级标签**。
+/// 成对的 `[注]…[/注]` 是排版层的双行夹注开关，必须原样留；落单的壳一律删。
+#[cfg(test)]
+mod note_tag_tests {
+    use super::*;
+
+    /// 每行的收标记都不许多于开标记——「多出来的那枚」就是漏进正文的孤儿。
+    fn assert_no_lone_close(text: &str) {
+        for (i, line) in text.lines().enumerate() {
+            let opens = line.matches("[注]").count();
+            let closes = line.matches("[/注]").count();
+            assert!(
+                closes <= opens,
+                "第 {} 行有落单的收标记（开 {} / 收 {}）：{line}",
+                i + 1,
+                opens,
+                closes
+            );
+            assert!(
+                !line.contains("[高亮]") || line.matches("[高亮]").count() == line.matches("[/高亮]").count(),
+                "第 {} 行着重标签不成对：{line}",
+                i + 1
+            );
+        }
+    }
+
+    /// **用户真机现场**（最高优先级）：跨行的夹注被按行收口切开后，上一行
+    /// 被补了收口，下一行真正的收标记必须被删掉——正文只剩「且俟知者。」。
+    #[test]
+    fn cross_line_note_never_leaves_a_lone_close() {
+        let raw = "周威烈王二十三年[注]案：此句疑衍，\n且俟知者。[/注]";
+        let out = close_notes(raw);
+        assert_no_lone_close(&out);
+        let second = out.lines().nth(1).unwrap();
+        assert!(!second.contains("[/注]"), "孤儿收标记漏进正文：{second}");
+        assert!(
+            second.starts_with("且俟知者。"),
+            "壳外的字被动了：{second}"
+        );
+        // 注文本身一个字不丢（只摘壳，不吞字）。
+        assert!(out.contains("案：此句疑衍"), "注文被吞：{out}");
+    }
+
+    /// 整条清洗链跑完，正文里连一个方括号标签都不许剩（字形字义都不动）。
+    #[test]
+    fn whole_chain_never_prints_a_tag() {
+        let raw = "卷一\n\n臣光曰：周威烈王（案：此句疑衍，\n且俟知者。）\n\n下段正文。";
+        let out = clean(raw);
+        assert_no_lone_close(&out);
+        assert!(!out.contains("[注]") || out.matches("[注]").count() == out.matches("[/注]").count(),
+            "整链输出标签不成对：{out}");
+        assert!(out.contains("且俟知者。"), "正文被吞：{out}");
+        assert!(out.contains("下段正文。"), "下一段被吞：{out}");
+    }
+
+    /// 正常成对的夹注**一个都不许动**：删孤儿不等于删夹注。
+    #[test]
+    fn paired_note_survives_the_guard() {
+        let s = "正文[注]注疏内容[/注]正文";
+        assert_eq!(close_notes(s), s);
+        assert!(clean(s).contains("[注]注疏内容[/注]"), "{}", clean(s));
     }
 }

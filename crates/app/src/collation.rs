@@ -3767,10 +3767,19 @@ impl CollationWorkspace {
                     ),
             )
             .child(div().w(px(18.0)))
-            // 两个「渠道」并排在最左（用户口径：打开文件与导入 MD 合并到左侧）。
+            // ── 两个「导入」入口，职责严格分离（v1.9.71，用户口径）────────────
+            //
+            // 旧版只有一枚【导入 MD】，而它的选择器把 PDF 全置灰——用户想导原图
+            // 时根本找不到入口（只能去点「替换当前书籍」，那会把整本书换掉）。
+            // 现在：
+            //   · 【导入文本】**只收 .md / .txt** —— 换校对稿，正文变、原图不动；
+            //   · 【导入原图】**只收 .pdf / 图片** —— 给当前稿配底图，正文一个字不动，
+            //     选中即渲染到左栏并切「左图右文」分屏。
+            // 两个按钮都**不换书**；真要整本换掉才用【替换当前书籍】（带覆盖确认）。
+            .child(self.ghost_button("导入文本", |c, _, _, cx| c.open_text_picker(cx), cx))
+            .child(self.ghost_button("导入原图", |c, _, _, cx| c.open_image_picker(cx), cx))
             // 「替换当前书籍」：已有校对内容时先弹确认框，避免误覆盖（见 `replace_book`）。
             .child(self.ghost_button("替换当前书籍", |c, _, _, cx| c.replace_book(cx), cx))
-            .child(self.ghost_button("导入 MD", |c, _, _, cx| c.open_text_picker(cx), cx))
             // 【批量导入】已移除（v1.9.70，用户口径）：工作台是**单书校对台**，
             // 一次只校一本；批量排队只属于书架（书架自己有【批量导入】）。
             // 这个按钮在单书工作台上纯属干扰，还容易被误当成「再开一本」。
@@ -3962,6 +3971,9 @@ impl CollationWorkspace {
             .child(line("③ 笺校", "书架卡片右下【一键笺校】直达工作台，自动带上原图与正文。"))
             // ② 工作台操作
             .child(head("工作台操作"))
+            .child(line("导入文本", "顶栏【导入文本】只收 .md / .txt：换稿子，原图不动。"))
+            .child(line("导入原图", "顶栏【导入原图】只收 .pdf / 图片：配底图，正文不动，自动切左图右文。"))
+            .child(line("拖拽", "把 PDF / 图片 / .txt 直接拖进工作台，按扩展名自动分流。"))
             .child(line("定位", "单击落光标；双击选句；三击选整段；⇧ 点击从上一落点扩选。"))
             .child(line("框选补字", "在左图上拖一个框，命中的字会拼成待补文字，点【补入】插到光标处。"))
             .child(line("撤销", "⌘Z 撤销、⌘⇧Z 重做。连打字算一步，不会一个字退一次。"))
@@ -4368,7 +4380,10 @@ impl CollationWorkspace {
                             .font_family(song.clone())
                             .text_size(px(11.5))
                             .text_color(rgba(0x5A5346B5))
-                            .child(SharedString::from("请点左上角「打开文件」导入")),
+                            // v1.9.71：按钮改名后这里也要跟着改，否则用户照着
+                            // 提示去找「打开文件」，一个都找不到（旧提示就是这么
+                            // 变成「死路」的）。
+                            .child(SharedString::from("拖入 PDF / 图片，或点顶栏【导入原图】")),
                     )
                     .child(div().h(px(5.0)))
                     .child(
@@ -4376,7 +4391,7 @@ impl CollationWorkspace {
                             .font_family(sans)
                             .text_size(px(11.0))
                             .text_color(rgba(0x7E7666C0))
-                            .child(SharedString::from("支持 PDF / PNG · PDF 需带文本层")),
+                            .child(SharedString::from("支持 PDF / PNG / JPG · PDF 需带文本层")),
                     ),
             )
     }
@@ -4679,8 +4694,16 @@ impl CollationWorkspace {
         cx.notify();
     }
 
-    /// 导入原图（PDF / PNG）：弹出系统文件选择框（rfd **前台直调**），
-    /// 选中后在异步块里把 PDF 首页 / PNG 预栅格化为位图路径，存入 `image_path`。
+    /// **导入原图**（PDF / 图片）：给**当前这本稿子**配一张底图，正文一个字不动。
+    ///
+    /// 与【替换当前书籍】的分工（v1.9.71 用户口径）：
+    ///   * 本方法 = 「补一张图」：只动左栏，右栏正文 / 撤销栈 / 存档锚点全保留；
+    ///   * 替换 = 「换一本书」：先 `detach_old_book` 再整本上新。
+    ///
+    /// 旧实现把 PDF 之外的全放进「全部文件」过滤器、且标题只写「PDF / PNG」，
+    /// 用户想导 JPG / TIFF 时以为不支持；反过来【导入 MD】的选择器又把 PDF 置灰，
+    /// 两条路各堵一半——这就是「想导原图找不到入口」的真因。现在两个按钮各管
+    /// 各的格式，互不重叠。
     fn open_image_picker(&mut self, cx: &mut Context<Self>) {
         // rfd 同步对话框必须跑在主线程（见 IME 笔记 / reader.rs）：用 cx.spawn 前台
         // executor，块内同步调用 pick_file；绝不过 background_executor（会静默 None）。
@@ -4689,16 +4712,26 @@ impl CollationWorkspace {
                 let mut app = app.clone();
                 async move {
                     let picked = rfd::FileDialog::new()
-                        .set_title("选择原图（PDF / PNG）")
-                        .add_filter("原图 (PDF / PNG)", &["pdf", "png"])
-                        .add_filter("全部文件", &["*"])
+                        .set_title("导入原图（PDF / 图片）")
+                        .add_filter(
+                            "原图（PDF / 图片）",
+                            &["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "heic"],
+                        )
                         .pick_file();
                     let Some(path) = picked else { return };
                     // 「吃原图」这一套抽到 `ingest_source`，一键笺校的自动装配
                     // （`load_book_auto`）也走同一份，绝不两套逻辑。
                     if let Some(entity) = this.upgrade() {
                         let _ = entity.update(&mut app, |this, cx| {
+                            let label = file_display_name(&path);
+                            // **纯文本模式必须切回分屏**（v1.9.71）：只灌图不改模式，
+                            // `left_col_w()` 仍是 0，左侧拿 0 宽度→用户看到的是
+                            // 「点了没反应」。先关纯文本，再喂图。
+                            this.pure_text_mode = false;
                             this.ingest_source(path, cx);
+                            this.text_note = Some(format!("已导入原图：{label}"));
+                            this.text_err = false;
+                            cx.notify();
                         });
                     }
                 }
@@ -5186,12 +5219,25 @@ impl CollationWorkspace {
             |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
                 let mut app = app.clone();
                 async move {
+                    // **只收 .md / .txt**（v1.9.71 用户口径）：去掉「全部文件」这一档，
+                    // 否则选择器里所有 PDF 都是可点的，用户以为「导入文本」也能吃 PDF。
+                    // rfd 的过滤器拦不住手打文件名，落盘后还要再验一次扩展名。
                     let picked = rfd::FileDialog::new()
-                        .set_title("选择校对稿（Markdown / 纯文本）")
+                        .set_title("导入文本（Markdown / 纯文本）")
                         .add_filter("Markdown / 纯文本", &["md", "markdown", "txt"])
-                        .add_filter("全部文件", &["*"])
                         .pick_file();
                     let Some(path) = picked else { return };
+                    if !is_text_path(&path) {
+                        if let Some(entity) = this.upgrade() {
+                            let _ = entity.update(&mut app, |this, cx| {
+                                this.text_note =
+                                    Some(format!("「{}」不是文本稿（只收 .md / .txt）", file_display_name(&path)));
+                                this.text_err = true;
+                                cx.notify();
+                            });
+                        }
+                        return;
+                    }
 
                     // 读盘在后台：纯 IO，不碰 UI，也不占主线程。
                     let bg = app.background_executor().clone();
@@ -5202,49 +5248,128 @@ impl CollationWorkspace {
                         let _ = entity.update(&mut app, |this, cx| {
                             match res {
                                 Ok((body, note)) => {
-                                    this.set_text(body.clone());
-                                    // 手选文件：Raw 与清洗后同源（导入即未清洗），
-                                    // 让【原文对照】仍然可用且一致；同时清掉旧稿残留。
-                                    this.raw_text = Some(body);
-                                    // 换稿 → 审计卡片作废（见 `SanitizeCard`）。
-                                    this.sanitize_card = None;
-                                    this.show_diff = false;
-                                    this.cursor = 0;
-                                    this.selection = None;
-                                    this.marked = None;
-                                    // 联动状态属于旧稿，随新稿一起清空，绝不带着
-                                    // 上一本书的高亮框进下一本。
-                                    this.active_para_idx = None;
-                                    this.active_line = None;
-                                    this.match_note = None;
-                                    // **换稿即清场**（v1.9.24）：竖排预览的版式指纹、
-                                    // 旧页图、当前页码全部作废。不清就会「上一份稿的
-                                    // 竖排版式还挂在新稿上」——用户看到的正是那种
-                                    // 「右侧排版乱套了」的假象：新稿横排、旧预览竖排
-                                    // 叠在一起。旧 PNG 挪进待删队列，下一帧统一删盘。
-                                    this.preview_sig = None;
-                                    this.preview_page = 0;
-                                    this.temp_gc.append(&mut this.preview_paths);
-                                    this.text_file = Some(path.clone());
-                                    this.text_note = Some(note);
-                                    this.text_err = false;
-                                    // 原生对话框刚关 → **分几次**把焦点交回来。
-                                    this.schedule_refocus(cx);
+                                    this.apply_text_file(path.clone(), body, note, cx);
                                 }
                                 Err(e) => {
                                     this.text_note = Some(e);
                                     this.text_err = true;
+                                    cx.notify();
                                 }
                             }
-                            cx.notify();
-                            // v1.9.64：换稿 / 改稿后标脏，1.5 秒防抖落盘（覆盖全文快照）。
-                            this.touch(cx);
                         });
                     }
                 }
             },
         )
         .detach();
+    }
+
+    /// 上手一份新校对稿（**选择器与拖拽共用**，v1.9.71）：清场 → 上正文 → 标脏落盘。
+    ///
+    /// 抽出来是为了让「点按钮导入」与「把文件拖进来」走**同一条**清场链——
+    /// 两条入口各写一遍，早晚会漏掉某一项（竖排预览的版式指纹、联动高亮、
+    /// 审计卡片……），表现出来就是「拖进来的稿子还带着上一本的预览」。
+    fn apply_text_file(
+        &mut self,
+        path: std::path::PathBuf,
+        body: String,
+        note: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_text(body.clone());
+        // 手选文件：Raw 与清洗后同源（导入即未清洗），
+        // 让【原文对照】仍然可用且一致；同时清掉旧稿残留。
+        self.raw_text = Some(body);
+        // 换稿 → 审计卡片作废（见 `SanitizeCard`）。
+        self.sanitize_card = None;
+        self.show_diff = false;
+        self.cursor = 0;
+        self.selection = None;
+        self.marked = None;
+        // 联动状态属于旧稿，随新稿一起清空，绝不带着上一本书的高亮框进下一本。
+        self.active_para_idx = None;
+        self.active_line = None;
+        self.match_note = None;
+        // **换稿即清场**（v1.9.24）：竖排预览的版式指纹、旧页图、当前页码全部
+        // 作废。不清就会「上一份稿的竖排版式还挂在新稿上」——用户看到的正是那种
+        // 「右侧排版乱套了」的假象：新稿横排、旧预览竖排叠在一起。旧 PNG 挪进
+        // 待删队列，下一帧统一删盘。
+        self.preview_sig = None;
+        self.preview_page = 0;
+        self.temp_gc.append(&mut self.preview_paths);
+        self.text_file = Some(path);
+        self.text_note = Some(note);
+        self.text_err = false;
+        // 原生对话框刚关 → **分几次**把焦点交回来。
+        self.schedule_refocus(cx);
+        cx.notify();
+        // v1.9.64：换稿 / 改稿后标脏，1.5 秒防抖落盘（覆盖全文快照）。
+        self.touch(cx);
+    }
+
+    /// **把文件拖进工作台**（v1.9.71）：一份文件顶两条入口。
+    ///
+    ///   * PDF / 图片 → 给它配底图，并**自动切成「左图右文」分屏**；
+    ///   * `.md` / `.txt` → 换校对稿（后台读盘，同 `apply_text_file` 一条链）；
+    ///   * 其它 → 一声不响地不处理是最坏的选择，明确回一句「不支持」。
+    ///
+    /// GPUI 0.2.2 已经把系统拖拽接好了：`platform/mac/window.rs` 实现了
+    /// `draggingEntered / performDragOperation`，并把 `FileDropEvent` 翻译成
+    /// 「合成鼠标拖放」（`cx.active_drag` + MouseMove/MouseUp）；落点由挂了
+    /// `on_drop::<ExternalPaths>` 的元素在 `hitbox.is_hovered` 时接收。
+    /// 因此不需要我们手写 NSDraggingDestination。
+    fn on_files_dropped(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        let Some(path) = paths.first().cloned() else {
+            return;
+        };
+        // 一次只吃一份（工作台是单书台，不是队列）。多拖的那几个要明说没处理，
+        // 静默忽略正是「怎么没反应」类投诉的来源。
+        let extra = paths.len().saturating_sub(1);
+        if is_image_path(&path) {
+            let label = file_display_name(&path);
+            // **必须先关纯文本模式再喂图**：只灌图不改模式时 `left_col_w()`
+            // 仍是 0，左栏被算成 0 宽——用户看到的就是「拖进来没反应」。
+            self.pure_text_mode = false;
+            self.ingest_source(path, cx);
+            self.text_note = Some(if extra > 0 {
+                format!("已导入原图：{label}（另 {extra} 个未处理：工作台一次只配一张原图）")
+            } else {
+                format!("已导入原图：{label}　已切到「左图右文」")
+            });
+            self.text_err = false;
+            cx.notify();
+            return;
+        }
+        if is_text_path(&path) {
+            let this = cx.entity().downgrade();
+            let bg = cx.background_executor().clone();
+            cx.spawn(
+                move |_: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                    let mut app = app.clone();
+                    async move {
+                        let rd = path.clone();
+                        let res = bg.spawn(async move { read_text_file(&rd) }).await;
+                        let Some(entity) = this.upgrade() else { return };
+                        let _ = entity.update(&mut app, |this, cx| match res {
+                            Ok((body, note)) => this.apply_text_file(path.clone(), body, note, cx),
+                            Err(e) => {
+                                this.text_note = Some(e);
+                                this.text_err = true;
+                                cx.notify();
+                            }
+                        });
+                    }
+                },
+            )
+            .detach();
+            return;
+        }
+        self.text_note = Some(format!(
+            "「{}」不能用在笺校台：文本要 .md / .txt，原图要 .pdf / 图片",
+            file_display_name(&path)
+        ));
+        self.text_err = true;
+        cx.notify();
     }
 
     /// 重新生成竖排预览：把当前编辑器文本离屏栅格化成「笺读风」竖排书页 PNG。
@@ -7291,7 +7416,7 @@ impl CollationWorkspace {
                                     // 真机上正文明明有 4928 字，写「为空」等于冤枉用户。
                                     "尚未生成预览，点「刷新预览」可重新排版"
                                 } else {
-                                    "（正文为空：写入文字或【导入 MD】后，点「刷新预览」）"
+                                    "（正文为空：写入文字或【导入文本】后，点「刷新预览」）"
                                 }))
                                 .into_any_element()
                             }
@@ -7864,6 +7989,13 @@ impl Render for CollationWorkspace {
             .bg(rgb(PAPER_R))
             .track_focus(&self.preview_focus)
             .on_key_down(cx.listener(|c, event, window, cx| c.ws_key(event, window, cx)))
+            // **把 PDF / 稿子直接拖进来**（v1.9.71）：挂在整个工作台上，左右两栏
+            // 都算落点——用户不会先想「该往哪一半扔」。分发逻辑见 `on_files_dropped`。
+            // `ExternalPaths` 是 GPUI 为系统文件拖拽准备的载荷类型，类型对不上
+            // （比如应用内拖选的文字）这里不会误触发。
+            .on_drop(cx.listener(
+                |c, paths: &gpui::ExternalPaths, _window, cx| c.on_files_dropped(paths.paths(), cx),
+            ))
             .child(self.render_header(cx));
         // **纯文本模式不再有常驻提示条**（v1.9.68）：以前这里有一条 20px 的
         // 「纯文本模式 · 本书无原图，仅显示正文」静默横条，既占版面又反复提醒
@@ -8062,6 +8194,34 @@ fn file_display_name(path: &Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "（未命名）".to_string())
+}
+
+/// 是不是**校对稿**（`.md` / `.markdown` / `.txt`）。
+///
+/// 与 [`is_image_path`] 严格互斥：一个文件只能进一个入口。这是 v1.9.71 那条
+/// 「【导入文本】的选择器把 PDF 全置灰」投诉的根子——以前两个按钮共用一份
+/// 宽松过滤器，谁也不专一，用户自然找不到导原图的路。
+fn is_text_path(path: &Path) -> bool {
+    ext_eq(path, &["md", "markdown", "txt"])
+}
+
+/// 是不是**原图**（PDF / 位图）。见 [`is_text_path`] 的分工说明。
+fn is_image_path(path: &Path) -> bool {
+    ext_eq(
+        path,
+        &["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "heic"],
+    )
+}
+
+/// 扩展名判等（大小写不敏感；没有扩展名一律 false）。
+fn ext_eq(path: &Path, want: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            want.iter().any(|w| *w == e)
+        })
+        .unwrap_or(false)
 }
 
 /// 流式读盘 + 硬上限：最多读 `hard + 1` 字节，多读的那一字节就是「越界」的证据。

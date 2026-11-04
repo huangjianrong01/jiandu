@@ -252,14 +252,20 @@ impl FontChoice {
     /// 横笺用的无衬线组（思源黑体 / 系统默认）。
     pub const MODERN: [FontChoice; 2] = [FontChoice::SourceHanSans, FontChoice::SystemDefault];
 
-    /// **已下架**（v1.84.0）：思源黑体 / 尚古等宽。
+    /// **已下架**（v1.84.0 思源黑体 / 尚古等宽；v1.9.71 再下架「西文数字」）。
     ///
-    /// 用户定：这两款现代体放在古籍阅读器里太出戏，版字面板不再陈列。
+    /// 用户定：现代无衬线放在古籍阅读器里太出戏；「西文数字」（Computer
+    /// Modern）更是纯冗余——正文里偶现的阿拉伯数字由 `FontRole::Latin`
+    /// 自动接管，不需要用户挑一款「西文字体」当正文。两者都在面板上消失。
+    ///
     /// ⚠️ **只过滤、绝不从 `CLASSIC` / `MODERN` 数组里删元素**——两张表
     /// 的下标就是 `prefs.font_ancient` / `font_modern` 的存档值，删中间
     /// 一项会让所有老存档「自己换了个字体」。
     pub fn is_retired(self) -> bool {
-        matches!(self, FontChoice::SourceHanSans | FontChoice::ShangguMono)
+        matches!(
+            self,
+            FontChoice::SourceHanSans | FontChoice::ShangguMono | FontChoice::LatinModern
+        )
     }
 
     /// 面板实际陈列的字体（剔除已下架的现代体）。
