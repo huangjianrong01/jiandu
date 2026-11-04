@@ -556,11 +556,26 @@ pub fn strip_running_lines(pages: &mut [Vec<SourceRegion>]) {
         }
     }
     let need = (pages.len() / 3).max(3);
-    let drop: std::collections::HashSet<String> = freq
+    let mut drop: std::collections::HashSet<String> = freq
         .into_iter()
         .filter(|(_, n)| *n >= need)
         .map(|(k, _)| k)
         .collect();
+    // 第二刀：竖排影印 / OCR 古籍「同前缀·仅末位页码不同」的书眉
+    // （資治通鑑卷一…三 / 四 / 五）。单行判定与「整行完全重复」都认不出，
+    // 这里按前缀归并，与 md / txt / html / json / docx / EPUB 共用 cleaner 同一把尺。
+    {
+        let mut lines: Vec<String> = Vec::new();
+        for page in pages.iter() {
+            for r in page.iter() {
+                if !r.text.trim().is_empty() {
+                    lines.push(r.text.clone());
+                }
+            }
+        }
+        let variant_drop = jiandu_core::cleaner::running_header_prefix_keys(&lines);
+        drop.extend(variant_drop);
+    }
     if drop.is_empty() {
         return;
     }

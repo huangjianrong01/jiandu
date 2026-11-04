@@ -7546,13 +7546,15 @@ impl Root {
         let (book_title, author) = match &self.book {
             Some(b) => (
                 b.title.clone(),
+                // 方案 2「作者留白」：作者为空时渲染空署名，不再硬填「佚名」
+                // （书名下方那道空白就是落款位，留白比假名更克制）。
                 if b.author.trim().is_empty() {
-                    "佚名".to_string()
+                    String::new()
                 } else {
                     b.author.clone()
                 },
             ),
-            None => (String::new(), "佚名".to_string()),
+            None => (String::new(), String::new()),
         };
         let vol = crate::types::chapter_volume(chapter, &self.chapter_title(chapter));
         let title_line = format!("{book_title}{vol}");

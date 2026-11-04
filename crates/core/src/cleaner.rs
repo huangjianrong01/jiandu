@@ -833,6 +833,164 @@ pub fn is_running_header(s: &str, book_title: &str) -> bool {
     has_mark || has_book
 }
 
+// ───────────────────── 书眉：跨章 / 跨页「同前缀·仅页码不同」剔除 ─────────────────────
+//
+// 竖排影印 / OCR 古籍每叶都印同一串书眉（`資治通鑑卷一 周紀一・威烈王・安王・烈王　三`
+// / `…　四` / `…　五`）：只在最末缀一个**页码**，整行因此**每页都不完全相同**。
+// 只靠「整行完全重复」认书眉会漏掉它们；这里把行尾页码剥掉、按**前缀**归并，
+// 让同一书眉的所有变体一起被认出来。
+//
+// 与 [`is_running_header`]（单行：无句读 + 短 + 书名 / 注疏）互补：那个看**一行**，
+// 这个看**整书分布**，能抓跨章 / 跨页重复与「仅页码不同」的变体。
+// 也和 `vclean::purge_running_headers`（EPUB）、`pdf_text::strip_running_lines`（PDF）
+// 共用同一把尺，保证各格式口径一致。
+
+/// 书眉判定用的归一键：去空白（含全角 / 半角空格与换行），**保留 `・` 等间隔号**
+/// —— 它们是前缀身份的一部分，剥了会把不同书眉混为一谈。
+pub fn header_norm_key(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// 尾码字符：阿拉伯数字 / 汉字数字 / 罗马数字。
+fn rh_is_tail_char(c: char) -> bool {
+    c.is_ascii_digit()
+        || ('０'..='９').contains(&c)
+        || matches!(
+            c,
+            '〇' | '零' | '一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十'
+                | '百' | '千' | '万' | '萬' | '两' | '兩' | '廿' | '卅'
+        )
+        || matches!(c, 'i' | 'I' | 'v' | 'V' | 'x' | 'X' | 'l' | 'L')
+}
+
+/// 一整串是否纯尾码字符（这种串不是书眉，是页码本身）。
+fn rh_prefix_only_numerals(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(rh_is_tail_char)
+}
+
+/// 剥掉行尾的「页码尾码」，返回 `(前缀, 尾码)`。
+///
+/// 尾码 = 行尾连续的数字（阿拉伯 / 汉字数字 / 罗马数字）；其前若是
+/// `第` / `页` / `葉` / `頁` / `p` / `P` / `No` / `no` 这类页码前缀字一并剥掉。
+pub fn strip_page_tail(s: &str) -> (String, String) {
+    let cs: Vec<char> = s.trim().chars().collect();
+    if cs.is_empty() {
+        return (String::new(), String::new());
+    }
+    let mut end = cs.len();
+    while end > 0 && rh_is_tail_char(cs[end - 1]) {
+        end -= 1;
+    }
+    // 尾码前的页码前缀字（`第N` / `N页` / `No.N`）。
+    if end < cs.len() && end > 0 {
+        let c = cs[end - 1];
+        if matches!(c, '第' | '页' | '葉' | '叶' | '頁' | 'p' | 'P') {
+            end -= 1;
+        } else if end > 1 && cs[end - 2] == '第' {
+            end -= 2;
+        } else if end > 1
+            && (cs[end - 1] == 'o' || cs[end - 1] == 'O')
+            && (cs[end - 2] == 'n' || cs[end - 2] == 'N')
+        {
+            end -= 2;
+        }
+    }
+    let prefix: String = cs[..end].iter().collect();
+    let tail: String = cs[end..].iter().collect();
+    (prefix, tail)
+}
+
+/// 书眉短行的长度上限（字）：再长的「重复行」是正文（诗里的叠句），不动。
+const RH_MAX_CHARS: usize = 30;
+/// 同一前缀出现多少次才算书眉：影印书眉几乎是每叶一条。
+const RH_MIN_REPEAT: usize = 3;
+
+/// 全书的「同前缀、仅尾部页码不同」书眉归一键集合。
+///
+/// 输入是一本书的**所有行**（逐行文本，含标点也无妨）。返回应当删除的
+/// 归一键（[`header_norm_key`] 之后）。
+///
+/// 判定（严格，宁可漏判不可误杀）：
+///   * 行 ≤ [`RH_MAX_CHARS`] 字；
+///   * 剥掉尾码后的**前缀 ≥ 4 字**且**不是纯数字**；
+///   * 同一前缀在全书出现 ≥ [`RH_MIN_REPEAT`] 次，且至少 **2 个不同的尾码**。
+///
+/// 覆盖「书名·卷次都相同、只差页码」的竖排影印书与 `…　三 / 四 / 五` 这种
+/// 汉字页码尾码——普通 PDF 的 `strip_running_lines`（整行完全重复）认不出它们。
+pub fn running_header_prefix_keys(
+    lines: &[String],
+) -> std::collections::HashSet<String> {
+    let mut groups: std::collections::HashMap<
+        String,
+        (usize, std::collections::HashSet<String>),
+    > = std::collections::HashMap::new();
+    for l in lines {
+        let k = header_norm_key(l);
+        if k.is_empty() || k.chars().count() > RH_MAX_CHARS {
+            continue;
+        }
+        let (prefix, tail) = strip_page_tail(&k);
+        if prefix.chars().count() >= 4 && !rh_prefix_only_numerals(&prefix) {
+            let g = groups
+                .entry(prefix)
+                .or_insert((0, std::collections::HashSet::new()));
+            g.0 += 1;
+            if !tail.is_empty() {
+                g.1.insert(tail);
+            }
+        }
+    }
+    let mut drop: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (prefix, (count, tails)) in &groups {
+        if *count >= RH_MIN_REPEAT && tails.len() >= 2 {
+            for l in lines {
+                let k = header_norm_key(l);
+                if k.chars().count() > RH_MAX_CHARS {
+                    continue;
+                }
+                let (p, _) = strip_page_tail(&k);
+                if p == *prefix {
+                    drop.insert(k);
+                }
+            }
+        }
+    }
+    drop
+}
+
+/// 在清洗主流程的去噪阶段，把「同前缀·仅页码不同」的书眉从 IR 里赶出去。
+///
+/// 跨所有巻 / 章收集块文本，复用 [`running_header_prefix_keys`]：md / txt /
+/// html / json / docx 这些走 `clean_book` 的格式因此与 EPUB（`purge_running_headers`）、
+/// PDF（`strip_running_lines`）共用同一把尺。只删 `Para` / `Annotation`（章题、
+/// 眉批不在其列），且绝不把空巻判没（下游 `retain` 另有兜底）。
+fn purge_running_header_variants(ir: &mut IrBook) {
+    let mut lines: Vec<String> = Vec::new();
+    for j in ir.juans.iter() {
+        for b in j.blocks.iter() {
+            let t = b.plain_text();
+            if !t.trim().is_empty() {
+                lines.push(t);
+            }
+        }
+    }
+    if lines.len() < RH_MIN_REPEAT {
+        return;
+    }
+    let drop = running_header_prefix_keys(&lines);
+    if drop.is_empty() {
+        return;
+    }
+    for j in ir.juans.iter_mut() {
+        j.blocks.retain(|b| match b {
+            IrBlock::Para(spans) | IrBlock::Annotation { spans, .. } => {
+                !drop.contains(&header_norm_key(&spans_line(spans)))
+            }
+            _ => true,
+        });
+    }
+}
+
 /// 第一遍：一巻内的去噪（文本净化 + 丢噪声段 + 丢页眉 / 叶码 + 合并连续重复段
 /// + 砍导航短段堆）。
 ///
@@ -1861,6 +2019,10 @@ pub fn clean_book_with(book: &mut Book, source: IrSource, opts: &CleanOpts) {
         for j in ir.juans.iter_mut() {
             pass1_juan(j, &titles, &book_title);
         }
+        // 跨章 / 跨页「同前缀·仅页码不同」的书眉（影印 / OCR 古籍每叶都印同一串
+        // 书眉，只在末位缀页码）：单行 `is_running_header` 与「整行完全重复」都认
+        // 不出，这里按前缀归并补刀。md / txt / html / json / docx 走这一条。
+        purge_running_header_variants(&mut ir);
         ir.juans.retain(|j| !j.is_empty() || !j.title.trim().is_empty());
     }
 
@@ -2883,6 +3045,71 @@ mod tests {
         // 参数绝不能当正文排（`dào` 三个拉丁字母竖着摞成三格是灾难）。
         assert_eq!(strip_note_tags("道[拼音:dào]可道"), "道可道");
         assert_eq!(strip_note_tags("凡[数字:35]葉"), "凡葉");
+    }
+
+    // ---- v1.9.88：书眉「同前缀·仅页码不同」跨格式归并 -------------------
+
+    #[test]
+    fn strip_page_tail_peels_trailing_page_numbers() {
+        // 汉字页码尾码。
+        assert_eq!(strip_page_tail("資治通鑑卷一威烈王三"), ("資治通鑑卷一威烈王".into(), "三".into()));
+        // 阿拉伯数字尾码。
+        assert_eq!(strip_page_tail("資治通鑑卷一威烈王3"), ("資治通鑑卷一威烈王".into(), "3".into()));
+        // 罗马数字尾码。
+        assert_eq!(strip_page_tail("資治通鑑卷一威烈王iv"), ("資治通鑑卷一威烈王".into(), "iv".into()));
+        // 无尾码：整串都是前缀。
+        assert_eq!(strip_page_tail("周威烈王二十三年"), ("周威烈王二十三年".into(), String::new()));
+        // 纯页码串：前缀为空，整串当尾码（这种不是书眉）。
+        assert_eq!(strip_page_tail("一二三"), (String::new(), "一二三".into()));
+    }
+
+    #[test]
+    fn header_norm_key_drops_whitespace_only() {
+        assert_eq!(header_norm_key("資 治 通 鑑"), "資治通鑑");
+        assert_eq!(header_norm_key("資治通鑑卷一　三"), "資治通鑑卷一三");
+    }
+
+    #[test]
+    fn running_header_prefix_keys_catches_variant_page_tails() {
+        // 竖排影印《資治通鑑》：书眉每叶同串、只末位页码不同。
+        let lines = vec![
+            "資治通鑑卷一周紀一威烈王安王烈王三".to_string(),
+            "資治通鑑卷一周紀一威烈王安王烈王三".to_string(),
+            "資治通鑑卷一周紀一威烈王安王烈王三".to_string(),
+            "資治通鑑卷一周紀一威烈王安王烈王四".to_string(),
+            "資治通鑑卷一周紀一威烈王安王烈王四".to_string(),
+            "資治通鑑卷一周紀一威烈王安王烈王五".to_string(),
+            // 正文短句：只出现一次，绝不误杀。
+            "周威烈王二十三年初命晉大夫".to_string(),
+        ];
+        let drop = running_header_prefix_keys(&lines);
+        assert!(drop.contains(&header_norm_key("資治通鑑卷一周紀一威烈王安王烈王三")));
+        assert!(drop.contains(&header_norm_key("資治通鑑卷一周紀一威烈王安王烈王四")));
+        assert!(drop.contains(&header_norm_key("資治通鑑卷一周紀一威烈王安王烈王五")));
+        assert!(!drop.contains(&header_norm_key("周威烈王二十三年初命晉大夫")));
+    }
+
+    #[test]
+    fn running_header_prefix_keys_does_not_kill_plain_repeats() {
+        // 同尾码重复（没有页码变化）不该被这把尺删：那是「整行完全重复」的活，
+        // 由各自的 strip_running_lines / purge_running_headers 处理，互不越界。
+        let lines = vec![
+            "章題一".to_string(),
+            "章題一".to_string(),
+            "章題一".to_string(),
+        ];
+        assert!(running_header_prefix_keys(&lines).is_empty(), "同尾码重复不误杀");
+        // 样本太小（<3 条）也不动。
+        let few = vec!["資治通鑑卷一三".to_string(), "資治通鑑卷一四".to_string()];
+        assert!(running_header_prefix_keys(&few).is_empty(), "尾码不足不误杀");
+        // 纯数字串不是书眉。
+        let numerals = vec![
+            "一二三".to_string(),
+            "一二三".to_string(),
+            "一二四".to_string(),
+            "一二五".to_string(),
+        ];
+        assert!(running_header_prefix_keys(&numerals).is_empty(), "纯数字串不误杀");
     }
 
 }
