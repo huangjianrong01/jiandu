@@ -6,7 +6,7 @@
 //!   · 继续阅读：《最近那本》
 //!   · 开始 / 停止听书（接 TTS，见 `crate::tts`）
 //!   · 高对比护眼模式（勾选态，黑底黄字）
-//!   · 打开工作台 / 导入异体字表…
+//!   · 打开工作台（「导入异体字表」v1.9.85 起搬到「版字 → 校勘」）
 //!   · 最近阅读（二级子菜单，列最近读的 5 本 + 全部书架）
 //!   · 重启并更新 / 退出笺读
 //!
@@ -123,6 +123,22 @@ pub fn take_intents() -> Vec<MenuIntent> {
         .lock()
         .map(|mut g| std::mem::take(&mut *g))
         .unwrap_or_default()
+}
+
+/// 从 **GPUI 主线程**入队一条意图（v1.9.85）。
+///
+/// 「导入异体字表」的入口从系统菜单搬到「版字 → 校勘」之后，主界面按钮
+/// 不能直碰 `Root`，也不该另抄一份导入实现——`push_intent` 只服务 AppKit
+/// 回调栈。这个口子把主界面的点击塞回**同一条队列**，`Root::render` 里的
+/// `poll_menu_intents` 下一帧照常取空执行。于是入口换了地方，动作一字未改。
+///
+/// 入队后再抬标记：先抬标记再入队会留出「标记真、队列空」的一拍（见
+/// [`take_intents`] 的顺序说明）。
+pub fn enqueue_intent(intent: MenuIntent) {
+    if let Ok(mut g) = INTENTS.lock() {
+        g.push(intent);
+        PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// 队列里有没有待处理的意图（给 `Root::ensure_menu_pump` 用）。
@@ -267,13 +283,11 @@ mod mac {
     }
 
     /// 把意图塞进队列（永远安全：只碰锁与枚举）。
+    ///
+    /// 与 [`crate::menubar::enqueue_intent`] 是同一条队列、同一套顺序；
+    /// 这里只保留 `unsafe` 签名给 AppKit 回调栈用，逻辑不再抄第二遍。
     unsafe fn push_intent(intent: MenuIntent) {
-        if let Ok(mut g) = INTENTS.lock() {
-            g.push(intent);
-            // 入队之后再抬标记：先抬标记再入队的话，中间那一拍被取空，
-            // 就会「标记为真、队列为空」，白跑一趟（不丢数据，但没意义）。
-            PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        crate::menubar::enqueue_intent(intent);
     }
 
     fn intent_from_tag(tag: i64) -> Option<MenuIntent> {
@@ -419,8 +433,9 @@ mod mac {
 
     /// 构造当次菜单（带最新数据）。调用方负责 release。
     ///
-    /// 顺序严格按产品给的结构；`打开工作台` / `导入异体字表` 是原有功能，
-    /// 结构里没有但删了就没入口，故并进中段（仍是一条分割线之内）。
+    /// 顺序严格按产品给的结构；`打开工作台` 是原有功能，结构里没有但删了
+    /// 就没入口，故并进中段（仍是一条分割线之内）。`导入异体字表` 自
+    /// v1.9.85 起移到「版字 → 校勘」，这里不再建菜单项（见下方 ⑤）。
     unsafe fn build_menu() -> *mut Object {
         let menu: *mut Object = objc::msg_send![class!(NSMenu), new];
         if menu.is_null() {
@@ -469,15 +484,21 @@ mod mac {
 
         add_sep(menu);
 
-        // ⑤ 原有入口（结构里没有，但不能丢）：工作台 / 导入异体字表。
+        // ⑤ 工作台仍留在菜单里；「导入异体字表」v1.9.85 搬到主界面。
         let collation = make_item("打开工作台", TAG_COLLATION, false);
         if !collation.is_null() {
             let _: () = objc::msg_send![menu, addItem: collation];
         }
-        let variants = make_item("导入异体字表…", TAG_VARIANTS, false);
-        if !variants.is_null() {
-            let _: () = objc::msg_send![menu, addItem: variants];
-        }
+        // v1.9.85：「导入异体字表」这枚菜单项**只在此注释掉**，入口已搬到
+        // 「版字 → 校勘 → 表 → 导入异体字表…」（reader.rs）。底层
+        // `TAG_VARIANTS` / `intent_from_tag` / `MenuIntent::ImportVariants`
+        // / `Root::import_variant_dict_dialog` 全部原样保留——主界面按钮
+        // 走的是同一条意图队列、同一段实现。将来要恢复菜单项，取消下面
+        // 四行注释即可，不必改任何底层代码。
+        // let variants = make_item("导入异体字表…", TAG_VARIANTS, false);
+        // if !variants.is_null() {
+        //     let _: () = objc::msg_send![menu, addItem: variants];
+        // }
 
         // ⑥ 最近阅读（二级子菜单，系统会自动画「>」并在悬停时展开）。
         let recent_parent = make_item("最近阅读", 0, false);

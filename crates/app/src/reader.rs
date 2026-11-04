@@ -2844,6 +2844,12 @@ impl Root {
             A::AnkiCards => self.run_more(MoreAct::AnkiCards, window, cx),
             A::ObsidianCards => self.run_more(MoreAct::Obsidian, window, cx),
             A::MarginNotes => self.run_more(MoreAct::MarginNotes, window, cx),
+            // v1.9.85：与「版字 → 校勘 → 导入异体字表…」同一条命。
+            // 只把意图塞回共享队列，对话框 / 解析 / 落盘全在 Root——
+            // 快捷键是一条入口，不是第二套实现。⚠️ 不碰 han_digits 任何链路。
+            A::ImportVariants => crate::menubar::enqueue_intent(
+                crate::menubar::MenuIntent::ImportVariants,
+            ),
         }
         cx.notify();
     }
@@ -11560,6 +11566,16 @@ impl Root {
         list = list.child(help_row("同上 · 密钥", "只存本机 ai.json（权限 600），不外传、不进日志", t));
         list = list.child(help_row("同上 · 联网", "问一句就把这句原文发给所选服务商（自己选的服务商）", t));
 
+        // 外部字表（v1.9.85）：入口从系统菜单栏搬进「版字 → 校勘」。
+        // 键位那一行由下面 `Action::ALL` 的自动遍历从键表取值生成，
+        // 这里只说「去哪儿点」，不手抄一枚会过期的死键。
+        list = list.child(help_sec("异体字表", t));
+        list = list.child(help_row(
+            "版字 → 校勘 → 表",
+            "导入自定义异体字表（txt/csv）：古籍生僻字精准映射与发音",
+            t,
+        ));
+
         // 批量导入（v1.77.0）：一个文件夹几十本，一本一本地刻。
         list = list.child(help_sec("批量导入", t));
         list = list.child(help_row("书架「导入」", "可多选：选一本照旧单本导入，选多本自动转批量", t));
@@ -13639,6 +13655,51 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             if tab_i == 2 {
                 body = body.child(style_row("画", ink_chips, t));
             }
+        }
+
+        // ---- 外部字表（v1.9.85）：从系统菜单栏搬进「版字 → 校勘」----
+        //
+        // 用户口径：**只搬 UI 入口，底层一条不动**。这枚按钮把
+        // `MenuIntent::ImportVariants` 塞回 menubar 那条共享意图队列，
+        // `Root::poll_menu_intents` 下一帧照旧调 `import_variant_dict_dialog`
+        // ——与旧菜单项走的是同一段实现，对话框、解析、落盘全没碰。
+        // ⚠️ 与 `han_digits`（数字转汉字）毫无关系：那条链路一行未动。
+        let import_dict = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .child(
+                div()
+                    .cursor_pointer()
+                    .text_size(px(11.5))
+                    .text_color(rgb(t.ink_soft()))
+                    .hover(|s| s.text_color(rgb(sheet_zhu(t))))
+                    .child(SharedString::from("导入异体字表…"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| {
+                            cx.stop_propagation();
+                            crate::menubar::enqueue_intent(
+                                crate::menubar::MenuIntent::ImportVariants,
+                            );
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from("导入自定义异体字表（支持 txt/csv 格式）")),
+            )
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from("用于古籍生僻字的精准映射与发音")),
+            );
+        if tab_i == 2 {
+            body = body.child(style_row("表", import_dict, t));
         }
 
         // ---- v1.0.0-beta：底行那枚「分享所选 / 分享本叶」已撤 ----

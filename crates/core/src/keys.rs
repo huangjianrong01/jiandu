@@ -101,11 +101,15 @@ pub enum Action {
     ObsidianCards,
     /// 导出全书批注（朱批录 Markdown）。
     MarginNotes,
+    /// **导入外部异体字表**（v1.9.85）：入口从系统菜单栏搬进
+    /// 「版字 → 校勘」，这里补一条可改键的快捷键。帮助 / 改键面板
+    /// 照 [`Action::ALL`] 自动列出，动作本身仍走 `MenuIntent::ImportVariants`。
+    ImportVariants,
 }
 
 impl Action {
     /// 面板渲染顺序 = 这份数组的顺序（分组靠 [`Action::section`] 相邻聚拢）。
-    pub const ALL: [Action; 42] = [
+    pub const ALL: [Action; 43] = [
         Action::Search,
         Action::SearchNext,
         Action::SearchPrev,
@@ -119,6 +123,7 @@ impl Action {
         Action::PunctMode,
         Action::Rare,
         Action::Traditional,
+        Action::ImportVariants,
         Action::Theme,
         Action::Shelf,
         Action::Style,
@@ -166,6 +171,7 @@ impl Action {
             Action::PunctMode => "punct_mode",
             Action::Rare => "rare",
             Action::Traditional => "traditional",
+            Action::ImportVariants => "import_variants",
             Action::Theme => "theme",
             Action::Shelf => "shelf",
             Action::Style => "style",
@@ -220,6 +226,7 @@ impl Action {
             Action::PunctMode => "现代标点 / 古籍句读",
             Action::Rare => "生僻注音显隐",
             Action::Traditional => "简体 / 繁体互转",
+            Action::ImportVariants => "导入异体字表（txt/csv · 生僻字映射）",
             Action::Theme => "切换纸色",
             Action::Shelf => "回书架",
             Action::Style => "版字面板",
@@ -268,6 +275,7 @@ impl Action {
             | Action::PunctMode
             | Action::Rare
             | Action::Traditional
+            | Action::ImportVariants
             | Action::Theme => "阅读",
             Action::Style
             | Action::Side
@@ -322,6 +330,9 @@ impl Action {
             Action::PunctMode => "cmd+j",
             Action::Rare => "cmd+r",
             Action::Traditional => "cmd+t",
+            // ⌘⌥V：V 取 Variants。⌘⌥ 族里 A/B/E/I/K/M/O/P/S/T/Y 都已占，
+            // 这一枚空着，也不碰系统保留键。
+            Action::ImportVariants => "cmd+alt+v",
             Action::Theme => "cmd+p",
             // ⌘⇧B：B 取「书架 / Bookshelf」。系统不占这一组（⌘⇧B 在
             // Safari 里是书签栏，属应用内键，不会抢全局）。
