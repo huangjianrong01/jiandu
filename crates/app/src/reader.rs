@@ -6009,9 +6009,63 @@ impl Root {
         // 界行（乌丝栏）：从右往左先排正文——`i = text_cols-1` 落在最左，
         // `i = 0` 落在最右，正是竖排的读序。每列左缘一道通高细线，
         // 空列也照画（刻本里字未排满，栏线一样到底）。
-        let mut grid = div().flex().flex_row().items_start();
+        // ── Debug Layout Tree（v1.9.89，临时排查用）────────────────────
+        // `JIANDU_DEBUG_LAYOUT=1` 时，把本叶的排版节点结构落盘到
+        // `/tmp/jiandu_layout.log`：每列可见片数（M=正文 / G=注 / ·=Gap）、
+        // 是否折叠（∅）、是否越界（!）。只在「有折叠列」或「章首页」时写，
+        // 直接坐实「幽灵空白列」到底是哪个节点在占地方。
+        if std::env::var("JIANDU_DEBUG_LAYOUT").is_ok() {
+            let collapsed = (0..text_cols)
+                .any(|i| {
+                    let it = columns.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+                    !it.iter().any(|p| matches!(p, Piece::Main(_) | Piece::Gloss(..)))
+                });
+            if collapsed || start_chapter {
+                let mut line = format!(
+                    "[LAYOUT] chapter={} start_chapter={} text_cols={} real_cols={} grid_w={:.0} | ",
+                    chapter, start_chapter, text_cols, columns.len(), grid_w
+                );
+                for (ci, col) in columns.iter().enumerate() {
+                    let m = col.iter().filter(|p| matches!(p, Piece::Main(_))).count();
+                    let g = col.iter().filter(|p| matches!(p, Piece::Gloss(..))).count();
+                    let gap = col.iter().filter(|p| matches!(p, Piece::Gap)).count();
+                    let vis = m + g > 0;
+                    line.push_str(&format!(
+                        "c{}=[M{}G{}·{}]{}{} ",
+                        ci, m, g, gap,
+                        if vis { "" } else { "∅" },
+                        if ci >= text_cols { "!" } else { "" }
+                    ));
+                }
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/jiandu_layout.log")
+                {
+                    let _ = std::io::Write::write_fmt(
+                        &mut f,
+                        format_args!("{}\n", line),
+                    );
+                }
+            }
+        }
+
+        // 折叠零可见宽度的「幽灵列」：列内没有任何正文 / 注文片（空列或纯
+        // Gap 占位列）一律不给物理列宽、不画界行——杜绝整列空白霸占版面。
+        // grid 固定 `grid_w` 宽 + `justify_end`：可见列靠右排，左侧空当就是
+        // 古籍里没写满的留白（不画线），右读顺序（列 0 = 最右）一字不挪。
+        let mut grid = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .justify_end()
+            .w(px(grid_w));
         for i in (0..text_cols).rev() {
             let items: &[Piece] = columns.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+            // 零可见宽度判定：空列或纯 Gap 列 → 折叠成零宽占位，不分配列宽。
+            let visible = items
+                .iter()
+                .any(|p| matches!(p, Piece::Main(_) | Piece::Gloss(..)));
             // 章首页的开卷列（i==0，紧邻版心）：顶部预留一段空白带给卷首题署，
             // 正文从带下接着排（带高 = chapter_inscription_reserve_rows）。
             let top_skip = if start_chapter && i == 0 { reserve } else { 0 };
@@ -6026,21 +6080,26 @@ impl Root {
             if geo.show_fish_tail && i == split_i {
                 grid = grid.child(self.render_letter_gutter(cell_w, cell_h, rows, foot_h));
             }
-            grid = grid.child(self.ancient_column(
-                items,
-                cell_w,
-                cell_h,
-                rows,
-                foot_h,
-                fs,
-                self.grid.columns,
-                back,
-                top_skip,
-                first_col,
-                &note_index,
-                geo.interactive,
-                cx,
-            ));
+            if visible {
+                grid = grid.child(self.ancient_column(
+                    items,
+                    cell_w,
+                    cell_h,
+                    rows,
+                    foot_h,
+                    fs,
+                    self.grid.columns,
+                    back,
+                    top_skip,
+                    first_col,
+                    &note_index,
+                    geo.interactive,
+                    cx,
+                ));
+            } else {
+                // 折叠占位：零宽、无界行——幽灵列在此彻底消失。
+                grid = grid.child(div().w(px(0.0)));
+            }
         }
         // 章题列最后加：flex_row 末尾即最右，成为本章第一列（读序之首）。
         if start_chapter {
@@ -6457,6 +6516,7 @@ impl Root {
                                     fs,
                                     back,
                                     crate::types::is_open_title(g.ch),
+                                    cx,
                                 )),
                         );
                     }
@@ -7514,7 +7574,7 @@ impl Root {
             .border_r_1()
             .border_color(rgb(line))
             .bg(rgb(t.paper()))
-            .child(row("篇".to_string(), "章".to_string(), "字".to_string()));
+            .child(row("卷".to_string(), "章".to_string(), "字".to_string()));
         for st in stats {
             // 篇名过长时只留三字，宁缺毋滥。
             let title: String = st.title.chars().take(3).collect();
@@ -7654,6 +7714,7 @@ impl Root {
         back: bool,
         // true = 开号（上半格）；false = 闭号（下半格）。
         open: bool,
+        cx: &App,
     ) -> Div {
         let t = self.theme;
         let c = crate::types::title_mark(ch);
@@ -7661,6 +7722,12 @@ impl Root {
             .max(6.0)
             .min(cell_h.min(cell_w));
         let ink = if back { t.ink_soft() } else { t.ink() };
+        // **逐字字体回退（v1.9.x）**：首选字体 `qiji.ttf` 不含竖排书名号
+        // `︽ ︾`（已用 fonttools 核实 MISSING），必须由回退链挑一支含此字的
+        // 系统 CJK 字体来画——否则就是豆腐块 / 落到不可控字体（与引号
+        // `︃` 同一口径，见 `font_fallback`）。回退只管挑字体、绝不动几何：
+        // 字格宽高仍由网格引擎给，回退字体撑不动竖排网格。
+        let pick = crate::font_fallback::body(self.font_ancient, self.script, c, cx);
         // 小方盒宽 = 一枚标点的字号宽，高 = **半格**：盒内居中，标点就落在
         // 这一半的正中（横向仍贴格右缘——竖排的书名号长在字列右侧）。
         let mut boxed = div()
@@ -7674,7 +7741,12 @@ impl Root {
             .text_size(px(pfs))
             .line_height(px(pfs))
             .text_color(rgb(ink))
-            .child(SharedString::from(c.to_string()));
+            .font_family(pick.family.clone());
+        if pick.needs_lock() {
+            // 回退字体的字形框与首选不同：锁死小方盒并裁掉溢出，绝不撑动网格。
+            boxed = boxed.overflow_hidden();
+        }
+        boxed = boxed.child(SharedString::from(c.to_string()));
         boxed = if open {
             boxed.top(px(0.0))
         } else {
@@ -8248,13 +8320,18 @@ impl Root {
             // 半格账记 0、不占格。走到这里说明它是**孤立**的（前后都没有
             // 可依附的正文），只能单独一格——字号仍是 0.7 倍正文。
             let tf = (fs * crate::punct::TITLE_FS_RATIO).max(9.0).min(cell_h);
+            // **逐字回退**：首选字体缺 ︽︾，必须挑含此字的系统 CJK 字体
+            // （与 `title_mark_overlay` 同一条口径），否则落单的书名号也会变豆腐块。
+            let tm = crate::types::title_mark(g.ch);
+            let pick =
+                crate::font_fallback::body(self.font_ancient, self.script, tm, cx);
             cell = cell.relative().child(self.optical_center(
-                crate::types::title_mark(g.ch),
+                tm,
                 tf,
                 ink,
                 cell_w,
                 cell_h,
-                self.main_family(),
+                pick.family.clone(),
                 cx,
             ));
         } else if crate::types::is_quote_mark(g.ch) {
@@ -8405,10 +8482,10 @@ impl Root {
         if open_mk.is_some() || close_mk.is_some() {
             cell = cell.relative();
             if let Some(c) = open_mk {
-                cell = cell.child(self.title_mark_overlay(c, cell_w, cell_h, fs, back, true));
+                cell = cell.child(self.title_mark_overlay(c, cell_w, cell_h, fs, back, true, cx));
             }
             if let Some(c) = close_mk {
-                cell = cell.child(self.title_mark_overlay(c, cell_w, cell_h, fs, back, false));
+                cell = cell.child(self.title_mark_overlay(c, cell_w, cell_h, fs, back, false, cx));
             }
         }
         // 脚注模式下补圈号角标（v1.9.87 重写）：**角标自己去适应格子**。

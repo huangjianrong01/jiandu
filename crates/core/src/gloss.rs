@@ -302,10 +302,16 @@ pub fn layout_book_from_opts(
     macro_rules! seal {
         () => {{
             if !glyphs.is_empty() {
+                // 折叠零可见宽度的「幽灵列」：空列或纯 Gap 占位列不进版面，
+                // 避免渲染端拿到「零可见宽度」的列却仍分配物理列宽
+                // （整列空白 + 界行——用户实机报的「幽灵空白列」）。
+                // 可见 = 列内有正文片 / 注文片；Gap 只是占位白格，不撑列宽。
+                let mut cols = std::mem::take(&mut columns);
+                cols.retain(|c| c.iter().any(|p| matches!(p, Piece::Main(_) | Piece::Gloss(..))));
                 pages.push(Page {
                     glyphs: std::mem::take(&mut glyphs),
                     start_chapter,
-                    columns: std::mem::take(&mut columns),
+                    columns: cols,
                 });
                 columns = vec![Vec::new()];
             }
@@ -704,10 +710,13 @@ pub fn layout_book_from_opts(
         || !columns.iter().all(|c| c.is_empty())
         || pages.is_empty()
     {
+        // 收尾页同样折叠零可见列，与 `seal!` 同口径（幽灵列根治）。
+        let mut cols = columns;
+        cols.retain(|c| c.iter().any(|p| matches!(p, Piece::Main(_) | Piece::Gloss(..))));
         pages.push(Page {
             glyphs,
             start_chapter,
-            columns,
+            columns: cols,
         });
     }
     pages
@@ -990,15 +999,20 @@ pub enum Jodu {
 impl Jodu {
     /// 记号直径 = 正文字号 × 此比例（渲染与 PDF 共用的唯一口径）。
     ///
-    /// 读（0.54）< 疑叹（0.62）< 句（0.42）？不——**句比读小**是刻本的
+    /// **v1.9.89 整体收敛**：此前读（0.54）/ 疑叹（0.62）偏大，真机观感
+    /// 喧宾夺主（小红书用户反馈「圆圈句号 ○ 和顿号 、 太抢眼」）。现统一
+    /// 压到主字号 Em 的 40%–45% 一档，回归「墨主朱辅」：句读是附在字隙里
+    /// 的小朱记，不是缩小的正字。
+    ///
+    /// 读（0.42）< 疑叹（0.45）< 句（0.38）？不——**句比读小**是刻本的
     /// 规矩：句末那一圈只作收束，读处那一点要撑住行气故更重。疑叹最重，
-    /// 因为它是「读」的加强。
+    /// 因为它是「读」的加强。三者都落在 38%–45% 区间内，绝不探出半字格。
     pub fn fs_ratio(self) -> f32 {
         match self {
-            Jodu::Seed => 0.54,
-            Jodu::Ring => 0.42,
-            Jodu::BigSeed => 0.62,
-            Jodu::Dot => 0.35,
+            Jodu::Seed => 0.42,
+            Jodu::Ring => 0.38,
+            Jodu::BigSeed => 0.45,
+            Jodu::Dot => 0.38,
         }
     }
 
@@ -1840,6 +1854,62 @@ mod tests {
             .filter(|p| matches!(p, Piece::Main(g) if g.para == 1))
             .count();
         assert_eq!(laid, praise.len(), "论赞少了字");
+    }
+
+    /// **幽灵空白列根治**（v1.9.89）：`seal!` 与收尾页都必须折叠零可见列——
+    /// 任何「空列 / 纯 Gap 占位列」不得进入 `Page::columns`，否则渲染端会给它
+    /// 分配物理列宽 + 界行，形成整列空白（用户实机《楞严经》《史记》报的毒瘤）。
+    #[test]
+    fn seal_collapses_zero_visible_columns() {
+        // 一面 4 列 / 5 行，单章；正文恰好 20 字 → 第一面满列收面。
+        let mut flow: Vec<Glyph> = Vec::new();
+        let txt: Vec<char> =
+            "天地玄黃宇宙洪荒日月盈昴辰宿列張寒來暑往".chars().collect();
+        for (i, c) in txt.iter().enumerate() {
+            flow.push(Glyph {
+                chapter: 0,
+                para: 0,
+                offset: i,
+                ch: *c,
+                kind: GlyphKind::Char,
+            });
+        }
+        let pages = layout_book_from_opts(&flow, |_| None, 4, 5, 0, false, false);
+        assert!(!pages.is_empty(), "至少要排出一页");
+        let pg = &pages[0];
+        // 满列页：列数 = 配置列数，且每列都有可见正文片（无越界幽灵列）。
+        assert_eq!(
+            pg.columns.len(),
+            4,
+            "满列页应是 4 列，不是 {} 列（含越界幽灵列）",
+            pg.columns.len()
+        );
+        for (ci, col) in pg.columns.iter().enumerate() {
+            let visible = col.iter().any(|p| matches!(p, Piece::Main(_) | Piece::Gloss(..)));
+            assert!(visible, "满列页第 {ci} 列是零可见的幽灵列，不应进版面");
+        }
+
+        // 欠填页：单章只 3 字，远不满一列——收尾页只能有「装得下」的列，
+        // 绝不能因为初始 `vec![Vec::new()]` 或 roll 残留而塞进空列。
+        let short: Vec<Glyph> = "道德經"
+            .chars()
+            .enumerate()
+            .map(|(i, c)| Glyph {
+                chapter: 0,
+                para: 0,
+                offset: i,
+                ch: c,
+                kind: GlyphKind::Char,
+            })
+            .collect();
+        let pages2 = layout_book_from_opts(&short, |_| None, 8, 20, 0, true, false);
+        assert!(!pages2.is_empty(), "欠填章也要有一页");
+        let pg2 = &pages2[0];
+        assert!(pg2.start_chapter, "开篇页应为章首页");
+        for (ci, col) in pg2.columns.iter().enumerate() {
+            let visible = col.iter().any(|p| matches!(p, Piece::Main(_) | Piece::Gloss(..)));
+            assert!(visible, "欠填章第 {ci} 列是零可见幽灵列");
+        }
     }
 
     /// **同一段**里挤着的论赞（旧书稿没断段）也要降格：判据从「段首」

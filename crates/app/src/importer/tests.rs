@@ -699,3 +699,131 @@ fn quotes_are_normalized_before_layout() {
     assert_eq!(cleaner::clean("'希有。"), "「希有。」\n");
 }
 
+/// **经史子集丛全量完整性探针**（不进 CI）：`cargo test -p jiandu --bin jiandu
+/// probe_real_books_integrity -- --ignored --nocapture`，文件路径为本地真实书。
+///
+/// 覆盖经（杂阿含经 / 楞严经）、史（史记 / 后汉书注 / 汉书注）、子（庄子注 /
+/// 道德经河上公注 / 道德经王弼注）三类九本，各自 schema 同构但 `type` 语义各异。
+/// 每本统计章数 / 段数 / 夹注 / 正文总字，并检测垃圾章（单字 / 空章名），
+/// 用来钉死「导入不误杀正文、不误吸夹注」这条边界——
+/// 尤其验证 `type=2` 一刀切的教训：《楞嚴經》的 `type=2` 是正文经文（占 96%），
+/// 绝不能按字段删，只能按「内容形态」甄别元数据（见 `jiandu_core::jsonkit`）。
+#[test]
+#[ignore]
+fn probe_real_books_integrity() {
+    let cases = [
+        (
+            "format",
+            "/Users/huangjianrong/Downloads/chinese-philosophy-main/format.json",
+        ),
+        (
+            "史记",
+            "/Users/huangjianrong/Downloads/chinese-philosophy-main/back/new/史书/史记.json",
+        ),
+        (
+            "后汉书注",
+            "/Users/huangjianrong/Downloads/chinese-philosophy-main/back/new/史书/后汉书注.json",
+        ),
+        (
+            "汉书注",
+            "/Users/huangjianrong/Downloads/chinese-philosophy-main/back/new/史书/汉书注.json",
+        ),
+        (
+            "庄子注",
+            "/Users/huangjianrong/Downloads/chinese-philosophy-main/back/new/道家/庄子注.json",
+        ),
+        (
+            "道德经河上公注",
+            "/Users/huangjianrong/Downloads/chinese-philosophy-main/back/new/道家/道德经河上公注.json",
+        ),
+        (
+            "道德经王弼注",
+            "/Users/huangjianrong/Downloads/chinese-philosophy-main/back/new/道家/道德经王弼注.json",
+        ),
+        (
+            "杂阿含经",
+            "/Users/huangjianrong/Downloads/chinese-philosophy-main/back/new/佛学/杂阿含经.json",
+        ),
+        (
+            "楞严经",
+            "/Users/huangjianrong/Downloads/chinese-philosophy-main/佛/密教部/楞严经.json",
+        ),
+    ];
+    for (name, p) in cases {
+        let path = std::path::Path::new(p);
+        if !path.exists() {
+            eprintln!("[{name}] 不存在，跳过");
+            continue;
+        }
+        let mut sink = |_, _: String| {};
+        let doc = match import_file_with(path, &mut sink) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[{name}] 导入失败 {e:?}");
+                continue;
+            }
+        };
+        let book = doc.book.to_book();
+        let chapters = book.chapters.len();
+        let paras: usize = book.chapters.iter().map(|c| c.paragraphs.len()).sum();
+        let notes: usize = book
+            .chapters
+            .iter()
+            .flat_map(|c| &c.paragraphs)
+            .map(|p| p.notes.len())
+            .sum();
+        let chars: usize = book
+            .chapters
+            .iter()
+            .flat_map(|c| &c.paragraphs)
+            .map(|p| p.text.chars().count())
+            .sum();
+        let junk: Vec<&String> = book
+            .chapters
+            .iter()
+            .map(|c| &c.title)
+            .filter(|t| t.chars().count() <= 1 || t.is_empty())
+            .collect();
+        eprintln!("===== [{name}] =====");
+        // 抽查前 3 条夹注，肉眼确认夹注来源正当（是注疏/括号小注，而非正文误吸）。
+        let mut shown = 0;
+        for c in &book.chapters {
+            for p in &c.paragraphs {
+                for n in &p.notes {
+                    if shown < 3 {
+                        eprintln!(
+                            "    [注样例] {:?} → {:?}",
+                            p.text.chars().take(10).collect::<String>(),
+                            n.text.chars().take(40).collect::<String>()
+                        );
+                        shown += 1;
+                    }
+                }
+            }
+            if shown >= 3 {
+                break;
+            }
+        }
+        eprintln!(
+            "  导入: 章={} 段={} 夹注={} 正文总字={}",
+            chapters, paras, notes, chars
+        );
+        eprintln!(
+            "  章名前6: {:?}",
+            book.chapters
+                .iter()
+                .take(6)
+                .map(|c| &c.title)
+                .collect::<Vec<_>>()
+        );
+        if !junk.is_empty() {
+            eprintln!(
+                "  ⚠ 疑似垃圾章名(单字/空) {} 条: {:?}",
+                junk.len(),
+                junk.iter().take(10).collect::<Vec<_>>()
+            );
+        } else {
+            eprintln!("  垃圾章检测: 无");
+        }
+    }
+}

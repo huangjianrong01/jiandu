@@ -261,6 +261,7 @@ pub fn import_file_with(
     })?;
 
     // ② 各格式的「字节 → 纯文本」；PDF 顺带抽文本层坐标（扫描件为空）。
+    let stem = jiandu_core::importer::file_stem(path);
     let (raw, pdf_regions) = match fmt {
         Format::Json => (json_parser::JsonParser::parse(path)?, None),
         Format::Epub => (epub_parser::EpubParser::parse(path)?, None),
@@ -287,7 +288,7 @@ pub fn import_file_with(
             if pages.iter().all(|p| p.is_empty()) {
                 return Err(ImportError::OcrNeeded(path.display().to_string()));
             }
-            crate::pdf_text::strip_running_lines(&mut pages);
+            crate::pdf_text::strip_running_lines(&mut pages, &stem);
             let raw = crate::pdf_text::pages_to_text(&pages);
             // `pdf_regions` 仍只装**第 1 页**：它服务的是校对台左侧参考图，
             // 一次只显示一页，坐标系必须与当前页一致，跨页坐标没有意义。
@@ -303,7 +304,6 @@ pub fn import_file_with(
     // ③ 全局唯一清洗出口（把换行 / 乱码 / 假夹注彻底洗掉）
     let mut text = cleaner::clean(&raw);
 
-    let stem = jiandu_core::importer::file_stem(path);
     let (kind, source) = fmt.kinds();
 
     // 空书不是错误：一本空笺也是笺（UI 弹「此书空白」比弹「导入失败」诚实）。

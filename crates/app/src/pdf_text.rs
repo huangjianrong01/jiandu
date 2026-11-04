@@ -536,7 +536,7 @@ fn running_key(s: &str) -> String {
 ///
 /// 页数少于三页时不剔——样本太小，一条真实存在的短标题（书名、卷题）会被
 /// 误判成版式装饰，把书的内容整段删掉比留着噪声严重得多。
-pub fn strip_running_lines(pages: &mut [Vec<SourceRegion>]) {
+pub fn strip_running_lines(pages: &mut [Vec<SourceRegion>], title: &str) {
     if pages.len() < 3 {
         return;
     }
@@ -561,9 +561,10 @@ pub fn strip_running_lines(pages: &mut [Vec<SourceRegion>]) {
         .filter(|(_, n)| *n >= need)
         .map(|(k, _)| k)
         .collect();
-    // 第二刀：竖排影印 / OCR 古籍「同前缀·仅末位页码不同」的书眉
-    // （資治通鑑卷一…三 / 四 / 五）。单行判定与「整行完全重复」都认不出，
-    // 这里按前缀归并，与 md / txt / html / json / docx / EPUB 共用 cleaner 同一把尺。
+    // 第二刀：竖排影印 / OCR 古籍书眉，两路都认（骨架归一后频率一网打尽）：
+    // ① 结构标记（卷/紀/纪/册/冊/集/部）——直接删；
+    // ② 纯书名（影印书口字）——只在「页面最前 / 最后几行」出现 ≥2 页才删
+    //    （位置闸门防误杀正文里偶提的书名）。
     {
         let mut lines: Vec<String> = Vec::new();
         for page in pages.iter() {
@@ -573,14 +574,46 @@ pub fn strip_running_lines(pages: &mut [Vec<SourceRegion>]) {
                 }
             }
         }
-        let variant_drop = jiandu_core::cleaner::running_header_prefix_keys(&lines);
-        drop.extend(variant_drop);
+        let (structure, by_title) =
+            jiandu_core::cleaner::running_header_prefix_keys(&lines, title);
+        drop.extend(structure);
+        if !by_title.is_empty() {
+            // 位置闸门：书名骨架在「每页前 3 / 后 3 非空区域」出现的页数。
+            let mut boundary_pages: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for page in pages.iter() {
+                let non_empty: Vec<&SourceRegion> =
+                    page.iter().filter(|r| !r.text.trim().is_empty()).collect();
+                let n = non_empty.len();
+                if n == 0 {
+                    continue;
+                }
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for idx in 0..n {
+                    if idx < 3 || idx + 3 >= n {
+                        seen.insert(jiandu_core::cleaner::skeleton_key(
+                            &non_empty[idx].text,
+                        ));
+                    }
+                }
+                for k in seen {
+                    if by_title.contains(&k) {
+                        *boundary_pages.entry(k).or_insert(0) += 1;
+                    }
+                }
+            }
+            for (k, pc) in boundary_pages {
+                if pc >= 2 {
+                    drop.insert(k);
+                }
+            }
+        }
     }
     if drop.is_empty() {
         return;
     }
     for page in pages.iter_mut() {
-        page.retain(|r| !drop.contains(&running_key(&r.text)));
+        page.retain(|r| !drop.contains(&jiandu_core::cleaner::skeleton_key(&r.text)));
     }
 }
 
@@ -1589,7 +1622,7 @@ mod book_tests {
     #[test]
     fn running_heads_are_dropped_but_body_survives() {
         let mut pages = run_of_four();
-        strip_running_lines(&mut pages);
+        strip_running_lines(&mut pages, "");
         for (i, page) in pages.iter().enumerate() {
             assert_eq!(page.len(), 1, "第 {i} 页的书口字该被剔掉，正文该留着");
             assert!(
@@ -1611,7 +1644,7 @@ mod book_tests {
         // 样本太小时「每页都出现的短行」更可能是书名 / 卷题，宁可留着。
         let mut pages = run_of_four();
         pages.truncate(2);
-        strip_running_lines(&mut pages);
+        strip_running_lines(&mut pages, "");
         assert_eq!(pages[0].len(), 2, "两页的书不该被动刀");
     }
 
@@ -1630,7 +1663,7 @@ mod book_tests {
                 ]
             })
             .collect();
-        strip_running_lines(&mut pages);
+        strip_running_lines(&mut pages, "");
         assert_eq!(pages[0].len(), 2, "超过 12 字的重复正文不许被当成版式装饰");
         assert!(
             pages[0].iter().any(|r| r.text == line),
@@ -1641,7 +1674,7 @@ mod book_tests {
     #[test]
     fn pages_join_with_blank_line_between_and_single_newline_inside() {
         let mut pages = run_of_four();
-        strip_running_lines(&mut pages);
+        strip_running_lines(&mut pages, "");
         let text = pages_to_text(&pages);
         assert_eq!(
             text,
@@ -2479,7 +2512,7 @@ mod pdf_import_e2e {
         }
 
         let before: usize = pages.iter().flatten().map(|r| r.text.chars().count()).sum();
-        strip_running_lines(&mut pages);
+        strip_running_lines(&mut pages, "");
         let after: usize = pages.iter().flatten().map(|r| r.text.chars().count()).sum();
         assert!(
             after < before,
@@ -2507,6 +2540,287 @@ mod pdf_import_e2e {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // === 真实《資治通鑑》专项回归（忽略，手动跑） ===
+    //
+    // 跑法：
+    //   JIANDU_ZIZHI_PDF="$HOME/Downloads/《資治通鑑》周纪五卷-蓝.pdf" \
+    //     cargo test -p jiandu --lib real_zizhi -- --ignored --nocapture
+    //
+    // 目的：用那本出问题的影印本源文件，跑两路书眉剔除（PDF 路径
+    // `strip_running_lines` + 文本路径 `clean_book` → `purge_running_header_variants`，
+    // 同一把尺），断言真实书眉彻底消失、正文安全——这就是用户要的「真实数据验证 +
+    // 边界校验」。
+    #[test]
+    #[ignore = "真书回归：设 JIANDU_ZIZHI_PDF 后跑"]
+    fn real_zizhi_header_purge() {
+        let path = std::env::var("JIANDU_ZIZHI_PDF").unwrap_or_else(|_| {
+            "/Users/huangjianrong/Downloads/《資治通鑑》周纪五卷-蓝.pdf".to_string()
+        });
+        let p = std::path::PathBuf::from(path);
+        let mut nop = |_, _| {};
+        let pages = extract_pdf_pages(&p, &mut nop);
+        assert!(!pages.is_empty(), "PDF 应抽到页");
+        // PDF 路径：strip_running_lines → 共享书眉函数（变尾码 + 整行重复两路都认）。
+        let mut pages2 = pages.clone();
+        strip_running_lines(&mut pages2, "資治通鑑");
+        // 文本路径：clean_book → purge_running_header_variants（同一把尺）。
+        let text = pages_to_text(&pages2);
+        let mut book = jiandu_core::importer::book_from_plaintext("資治通鑑", &text);
+        jiandu_core::cleaner::clean_book(&mut book, jiandu_core::ir::IrSource::Txt);
+        let body: String = book
+            .chapters
+            .iter()
+            .flat_map(|c| c.paragraphs.iter().map(|pp| pp.text.clone()))
+            .collect();
+        eprintln!(
+            "=== 真实《資治通鑑》：章数 = {} / 正文总字数 = {} ===",
+            book.chapters.len(),
+            body.chars().count()
+        );
+        // ① 边界校验：真实书眉（整行重复、每卷只跨几页的卷题）必须彻底消失——
+        //    不是「降级成章题留在正文里」，而是不再污染版面。
+        for h in [
+            "周紀一・威烈王・安王・烈王",
+            "周紀二・顯王",
+            "資治通鑑卷二周紀二・顯王",
+            "周紀三・愼靚王・赧王上",
+        ] {
+            assert!(!body.contains(h), "清洗后书眉仍在正文里：{h}");
+        }
+        // ② 真实数据验证：正文大量保留（书没被洗秃）。
+        assert!(
+            body.chars().count() > 50_000,
+            "正文被洗秃了：{} 字",
+            body.chars().count()
+        );
+        // ③ 防御性：开篇纪年句含「凡三十五年」这类数字句若在场必保留。
+        eprintln!("含『凡三十五年』？ {}", body.contains("凡三十五年"));
+    }
+
+    /// **Debug 探针**（忽略，手动跑）：把《資治通鑑》清洗「前 / 中 / 后」三段文本与结构
+    /// dump 到 stderr，定位用户的三种妖怪：
+    ///   (a) 页眉根本没被匹配到（清洗后正文里还能搜到书眉串）；
+    ///   (b) 匹配到了，但留下了空段落 / 空列（清洗后段落数不变、或存在空白段落）；
+    ///   (c) 竖排断行 / 全角空格 / 特殊符号导致一行被拆开、匹配失败。
+    ///
+    /// 跑法：
+    ///   JIANDU_ZIZHI_PDF="$HOME/Downloads/《資治通鑑》周纪五卷-蓝.pdf" \
+    ///     cargo test -p jiandu --lib debug_zizhi -- --ignored --nocapture
+    #[test]
+    #[ignore = "Debug 探针"]
+    fn debug_zizhi_dump() {
+        let path = std::env::var("JIANDU_ZIZHI_PDF").unwrap_or_else(|_| {
+            "/Users/huangjianrong/Downloads/《資治通鑑》周纪五卷-蓝.pdf".to_string()
+        });
+        let p = std::path::PathBuf::from(path);
+        let mut nop = |_, _| {};
+        let pages = extract_pdf_pages(&p, &mut nop);
+        let norm = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        eprintln!("========== RAW 抽取 ==========");
+        eprintln!("页數 = {}", pages.len());
+        let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut raw_regions = 0usize;
+        for pg in &pages {
+            for r in pg {
+                raw_regions += 1;
+                if !r.text.trim().is_empty() {
+                    *freq.entry(norm(&r.text)).or_insert(0) += 1;
+                }
+            }
+        }
+        eprintln!("区域总数 = {} / 非空区域 = {}", raw_regions, freq.len());
+        eprintln!("--- RAW 高频行（前 40）---");
+        debug_print_top(&freq, 40);
+        let mut hits = 0usize;
+        for pg in &pages {
+            for r in pg {
+                if r.text.contains('卷') || r.text.contains('紀') || r.text.contains('纪') {
+                    hits += 1;
+                }
+            }
+        }
+        eprintln!("  含卷/紀 的区域数 = {}（多 = 书眉被拆成碎区域，留意 (c)）", hits);
+        // === RAW 区域逐字符码点审计：抓「隐藏字符让匹配失效」的现行犯 ===
+        eprintln!("--- RAW 含书眉区域码点审计（前 20，异常字符高亮）---");
+        let mut audited = 0usize;
+        for pg in &pages {
+            for r in pg {
+                if (r.text.contains('資') || r.text.contains('周'))
+                    && r.text.trim().chars().count() <= 30
+                {
+                    if audited < 20 {
+                        let mut odd = String::new();
+                        for c in r.text.chars() {
+                            if c.is_whitespace()
+                                || c.is_control()
+                                || matches!(
+                                    c,
+                                    '\u{00a0}' | '\u{200b}' | '\u{200c}' | '\u{200d}'
+                                        | '\u{feff}' | '\u{fffd}' | '\u{3000}'
+                                        | '\u{200e}' | '\u{200f}' | '\u{2060}'..='\u{2064}'
+                                )
+                            {
+                                odd.push_str(&format!(" U+{:04X}", c as u32));
+                            }
+                        }
+                        eprintln!(
+                            "  {:?}{}",
+                            r.text,
+                            if odd.is_empty() {
+                                " （无异常）".into()
+                            } else {
+                                format!(" ⚠️{}", odd)
+                            }
+                        );
+                        audited += 1;
+                    }
+                }
+            }
+        }
+
+        // 中：strip_running_lines（PDF 路径，两路都认）
+        let mut pages2 = pages.clone();
+        // === 直接验证 running_header_prefix_keys 到底返回了什么 ===
+        {
+            let direct_lines: Vec<String> = pages
+                .iter()
+                .flat_map(|pg| pg.iter().map(|r| r.text.clone()))
+                .filter(|t| !t.trim().is_empty())
+                .collect();
+            let (dstruct, dtitle) =
+                jiandu_core::cleaner::running_header_prefix_keys(&direct_lines, "資治通鑑");
+            let ddrop: std::collections::HashSet<String> =
+                dstruct.into_iter().chain(dtitle).collect();
+            eprintln!("=== running_header_prefix_keys 直接调用（新双集签名）===");
+            for q in [
+                "資治通鑑卷一",
+                "資治通鑑卷一周紀一・威烈王・安王・烈王二",
+                "資治通鑑卷第一・周紀一・威烈王・安王・烈王",
+                "資治通鑑卷第二・周紀二・顯王",
+                "資治通鑑",
+            ] {
+                let sk = jiandu_core::cleaner::skeleton_key(q);
+                eprintln!(
+                    "  骨架 {:?} (原 {:?}) 命中 drop ? {}",
+                    sk,
+                    q,
+                    ddrop.contains(&sk)
+                );
+            }
+            eprintln!("  drop 集合大小 = {}；样例（前 30）：", ddrop.len());
+            for k in ddrop.iter().take(30) {
+                eprintln!("    {}", k);
+            }
+        }
+        strip_running_lines(&mut pages2, "資治通鑑");
+        let mut freq2: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut empty_pages = 0usize;
+        for pg in &pages2 {
+            if pg.is_empty() || pg.iter().all(|r| r.text.trim().is_empty()) {
+                empty_pages += 1;
+            }
+            for r in pg {
+                if !r.text.trim().is_empty() {
+                    *freq2.entry(norm(&r.text)).or_insert(0) += 1;
+                }
+            }
+        }
+        eprintln!("========== 经 strip_running_lines ==========");
+        eprintln!("空页（整页被剔光） = {} / 原页数 = {}", empty_pages, pages2.len());
+        eprintln!("--- MID 高频行（前 40）---");
+        debug_print_top(&freq2, 40);
+
+        // 后：clean_book → 文本路径
+        let text = pages_to_text(&pages2);
+        // —— 关键插桩：strip 之后、入书之前，text 里到底还剩什么书眉形态？——
+        eprintln!("========== 经 strip_running_lines 后的 text ==========");
+        for probe in ["周紀", "資治通鑑", "紀一", "紀二", "紀三"] {
+            let cnt = text.matches(probe).count();
+            eprintln!("  text 含片段 {:?} 的次数 = {}", probe, cnt);
+        }
+        // 把 text 里所有「含周紀/資治通鑑」的行原样打印（看清残留书眉是否带尾码/空格）
+        let mut shown = 0usize;
+        for line in text.lines() {
+            if line.contains("周紀") || line.contains("資治通鑑") {
+                if shown < 25 {
+                    eprintln!("  [残留书眉行] {:?}", line);
+                    // 逐字符码点审计：揪全角空格 / 零宽 / BOM / 替换符 / 控制符等妖怪
+                    let mut odd = String::new();
+                    for c in line.chars() {
+                        if c.is_whitespace()
+                            || c.is_control()
+                            || matches!(
+                                c,
+                                '\u{00a0}' | '\u{200b}' | '\u{200c}' | '\u{200d}'
+                                    | '\u{feff}' | '\u{fffd}' | '\u{3000}'
+                                    | '\u{200e}' | '\u{200f}' | '\u{2060}'..='\u{2064}'
+                            )
+                        {
+                            odd.push_str(&format!(" U+{:04X}", c as u32));
+                        }
+                    }
+                    if odd.is_empty() {
+                        eprintln!("    （码点审计：无隐藏/异常字符）");
+                    } else {
+                        eprintln!("    ⚠️ 异常码点：{}", odd);
+                    }
+                }
+                shown += 1;
+            }
+        }
+        eprintln!("  残留书眉行总数 = {}", shown);
+        let mut book = jiandu_core::importer::book_from_plaintext("資治通鑑", &text);
+        jiandu_core::cleaner::clean_book(&mut book, jiandu_core::ir::IrSource::Txt);
+        let paras: Vec<&str> = book
+            .chapters
+            .iter()
+            .flat_map(|c| c.paragraphs.iter().map(|pp| pp.text.as_str()))
+            .collect();
+        let empty_paras = paras.iter().filter(|t| t.trim().is_empty()).count();
+        let short_paras = paras
+            .iter()
+            .filter(|t| !t.trim().is_empty() && t.trim().chars().count() <= 2)
+            .count();
+        let body: String = paras.concat();
+        eprintln!("========== 经 clean_book ==========");
+        eprintln!(
+            "章数 = {} / 段落数 = {} / 空段落 = {} / ≤2字短段 = {}",
+            book.chapters.len(),
+            paras.len(),
+            empty_paras,
+            short_paras
+        );
+        eprintln!("正文总字数 = {}", body.chars().count());
+        eprintln!("--- 书眉串是否还在正文（清洗后）---");
+        for h in [
+            "周紀一・威烈王・安王・烈王",
+            "周紀二・顯王",
+            "資治通鑑卷二周紀二・顯王",
+            "周紀三・愼靚王・赧王上",
+            "卷",
+        ] {
+            eprintln!("  {} : {}", if body.contains(h) { "还在❌" } else { "已除✅" }, h);
+        }
+        eprintln!("--- 清洗后正文前 1200 字（看有无空行/空列）---");
+        eprintln!("{}", body.chars().take(1200).collect::<String>());
+        if empty_paras > 0 {
+            eprintln!(
+                "⚠️ 存在 {} 个空段落 —— 『匹配到了却留下空列』的嫌疑犯，需 grid.rs 跳过",
+                empty_paras
+            );
+        } else {
+            eprintln!("✅ 无空段落（数据层干净，空白列若还在就是纯渲染层问题）");
+        }
+    }
+
+    fn debug_print_top(freq: &std::collections::HashMap<String, usize>, n: usize) {
+        let mut v: Vec<_> = freq.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        for (k, c) in v.iter().take(n) {
+            eprintln!("{:>4}  {}", c, k);
+        }
     }
 }
 

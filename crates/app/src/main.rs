@@ -135,6 +135,12 @@ use gpui::{
     prelude::*, px, size, App, Application, AssetSource, Bounds, KeyBinding, Menu, MenuItem,
     Pixels, SharedString, TitlebarOptions, WindowBounds, WindowOptions,
 };
+// `JIANDU_FULLSCREEN` 钩子（启动进全屏空间）走 AppKit 直调，需 `objc` 宏。
+// 用 `#[macro_use] extern crate` 把 `msg_send!` / `sel!` / 内部 `sel_impl!` 等
+// 全部宏带入作用域（objc 0.2.7 的宏相互引用，单 `use` 不够）。
+#[macro_use]
+extern crate objc;
+
 use jiandu_core::library::Library;
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -403,6 +409,41 @@ fn main() {
 
             cx.open_window(zen_window_options(bounds), move |_window, _cx| root.clone())
                 .expect("failed to open window");
+
+            // 开发用：JIANDU_FULLSCREEN=1 启动即把主窗口送入 macOS 全屏空间，
+            // 便于无「辅助功能 / 自动化」权限环境下用 `screencapture -x` 截到
+            // 干净的全屏阅读器（无菜单栏 / Dock / 其他窗口）。钩子只走 AppKit，
+            // 不依赖 GPUI 窗口句柄；仅 macOS 编译。
+            if std::env::var("JIANDU_FULLSCREEN").is_ok() {
+                std::thread::spawn(|| {
+                    // 开发用：`JIANDU_FULLSCREEN=1` 启动即进入演示模式，隐藏菜单栏 + Dock，
+                    // 便于用 `screencapture -x` 截到干净的阅读器渲染图（无菜单栏 / Dock）。
+                    //
+                    // ⚠️ 只动「应用级演示选项」，**绝不碰 NSWindow 的 styleMask /
+                    // collectionBehavior / frame / titleVisibility**——运行时改 GPUI 窗的
+                    // 这些会触发 EXC_BAD_ACCESS（本机实测：一戳窗体结构 App 即崩，进程直接
+                    // 退出且日志为空）。演示模式是应用级开关，与具体窗口无关，稳定且足以
+                    // 隐去菜单栏与 Dock。
+                    use objc::runtime::{Class, Object};
+                    // NSApplicationPresentationHideMenuBar = 1<<3 = 8
+                    // NSApplicationPresentationHideDock    = 1<<1 = 2
+                    const HIDE_MENUBAR_DOCK: u64 = 8 | 2;
+                    for _ in 0..60 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        unsafe {
+                            if let Some(cls) = Class::get("NSApplication") {
+                                let app: *mut Object = objc::msg_send![cls, sharedApplication];
+                                // 持续重试（不 break）：确保 App 完全激活后演示选项才真正
+                                // 生效（后台线程早调可能暂时只部分生效）。
+                                let _: () = objc::msg_send![
+                                    app,
+                                    setPresentationOptions: HIDE_MENUBAR_DOCK
+                                ];
+                            }
+                        }
+                    }
+                });
+            }
         }
 
         // ── Dock 复活（v1.9.35）────────────────────────────────────────

@@ -1000,9 +1000,10 @@ pub fn purge_running_headers(chapters: &mut Vec<crate::types::Chapter>, book_tit
             !(looks_like_running_head(&k, &book) && (repeated || titled))
         });
     }
-    // 第二刀：竖排影印 / OCR 古籍「同前缀·仅末位页码不同」的书眉
-    // （資治通鑑卷一…三 / 四 / 五）。单行判定与「整行完全重复」都认不出，
-    // 这里按前缀归并，与 md / txt / html / json / docx / PDF 共用 cleaner 同一把尺。
+    // 第二刀：竖排影印 / OCR 古籍书眉，两路都认：① 变尾码
+    // （資治通鑑卷一…三 / 四 / 五）② 整行完全重复但每卷只跨几页的卷题
+    // （周紀一・威烈王・安王・烈王）。与 md / txt / html / json / docx / PDF
+    // 共用 cleaner 同一把尺（`running_header_prefix_keys`）。
     {
         let mut lines: Vec<String> = Vec::new();
         for c in chapters.iter() {
@@ -1012,11 +1013,13 @@ pub fn purge_running_headers(chapters: &mut Vec<crate::types::Chapter>, book_tit
                 }
             }
         }
-        let drop = crate::cleaner::running_header_prefix_keys(&lines);
+        let (structure, by_title) = crate::cleaner::running_header_prefix_keys(&lines, "");
+        let drop: std::collections::HashSet<String> =
+            structure.into_iter().chain(by_title).collect();
         if !drop.is_empty() {
             for c in chapters.iter_mut() {
                 c.paragraphs.retain(|p| {
-                    !drop.contains(&crate::cleaner::header_norm_key(&p.text))
+                    !drop.contains(&crate::cleaner::skeleton_key(&p.text))
                 });
             }
         }

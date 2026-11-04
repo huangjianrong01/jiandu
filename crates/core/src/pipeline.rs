@@ -404,6 +404,12 @@ pub fn txt_is_title_line(line: &str) -> bool {
     if n < 2 || n >= 15 {
         return false;
     }
+    // 带行内夹注 `[注]…[/注]` 的，一定是正文段落（古籍音释 / 注疏常写成
+    // 「單字[注]反切[/注]」或「詞[注]九十二[/注]」），绝不是章题——否则
+    // 《楞嚴經》音释字表会被整批错拆成几百个垃圾章。章题行从不带夹注。
+    if line.contains("[注]") {
+        return false;
+    }
     if cs.iter().any(|c| {
         matches!(
             c,
@@ -2582,5 +2588,16 @@ mod tests {
         assert_eq!(sniff_kind("a.xml", ""), SrcKind::Xml);
         assert_eq!(sniff_kind("noext", "<!DOCTYPE html><p>x</p>"), SrcKind::Html);
         assert_eq!(sniff_kind("noext", "{"), SrcKind::Json);
+    }
+
+    /// 带行内夹注 `[注]…[/注]` 的行一定是正文段落，绝不被 `txt_is_title_line`
+    /// 误判成章题——否则《楞嚴經》音释「單字[注]反切[/注]」会被整批错拆成垃圾章。
+    #[test]
+    fn title_line_never_matches_inline_note() {
+        assert!(!txt_is_title_line("挃[注]陟栗切，撞也。[/注]"));
+        assert!(!txt_is_title_line("𨙻伽婆夜[注]九十二[/注]"));
+        // 普通短行（无夹注）仍照常认章题。
+        assert!(txt_is_title_line("卷一"));
+        assert!(txt_is_title_line("周紀一"));
     }
 }

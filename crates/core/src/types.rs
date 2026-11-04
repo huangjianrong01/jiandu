@@ -1626,9 +1626,10 @@ fn is_han(c: char) -> bool {
 /// **句读字号比例**（v1.0.0-beta 自 app 的 `punct` 上提）。
 ///
 /// 句号 / 逗号不是「缩小的正字」，而是一粒记号：圈径（或墨点直径）=
-/// 正文字号 × 本值。渲染层（`app::punct` 的手绘画笔）与排版层（注文标点
-/// 该多大）共用这一个数，免得两边各写一个 0.35、改了一处忘另一处。
-pub const PUNCT_FS_RATIO: f32 = 0.35;
+/// 正文字号 × 本值。v1.9.89 整体收敛到 **0.38**（句类空心圈 / 古风〇）；
+/// 读点（Seed）与疑叹（BigSeed）走 [`jiandu_core::gloss::Jodu`] 的 0.42 / 0.45
+/// （见 `app::punct::PunctKind::fs_ratio`），屏幕与 PDF 共用同一张表。
+pub const PUNCT_FS_RATIO: f32 = 0.38;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Glyph {

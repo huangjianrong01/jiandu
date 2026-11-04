@@ -24,8 +24,10 @@
 //!   （v1.83.0「放生锦鲤」：旧版鼓肚 + 尾尖两侧切线张开，真机上是一条
 //!   红锦鲤）；句类（。！？…）画**细线空心圈**（[`PunctKind::Dot`]）；
 //!   两者一律 `paint_path` 手绘，绝不取字体字形；
-//! * **大小**：瓜子点长 = 字号 × 0.54（[`SEED_H_RATIO`]）、宽 = 长的 0.56，
-//!   圈径 = 字号 × 0.35（[`FS_RATIO`]）——都是一粒记号，不是缩小的正字；
+//! * **大小**：瓜子点长 = 字号 × 0.54（[`SEED_H_RATIO`]）、宽 = 长的 0.37，
+//!   圈径 = 字号 × 0.38（[`FS_RATIO`]，句类空心圈 / 古风〇）——都是一粒记号，
+//!   不是缩小的正字；读点（[`PunctKind::Seed`]）直径走 [`PunctKind::fs_ratio`]
+//!   的 0.42、疑叹（[`PunctKind::BigSeed`]）0.45，见 [`Jodu::fs_ratio`]。
 //! * **墨色** = **朱砂红**（`palette.note`，与夹注同源）——形状与位置是新制的，
 //!   颜色照旧不动（用户点名「还是原来的颜色」）。
 //!
@@ -39,10 +41,11 @@
 use gpui::{PathBuilder, Rgba, Window, point, px, rgb};
 use std::sync::OnceLock;
 
-/// 句读直径 / 正文字号：**0.35**（v1.34.0 用户定「极小，像个手点的小记号」）。
+/// 句类空心圈 / 古风〇 直径 / 正文字号：**0.38**（v1.9.89 收敛；v1.34.0 起用户
+/// 定「极小，像个手点的小记号」）。
 ///
-/// 现在只作用于「句」类的空心圈（[`PunctKind::Dot`]）；读点走
-/// [`SEED_H_RATIO`]（瓜子点，另有一组比例）。
+/// 只作用于「句」类（[`PunctKind::Dot`] / [`PunctKind::Ring`]）；读点与疑叹走
+/// [`PunctKind::fs_ratio`]，见 [`Jodu::fs_ratio`]。
 pub const FS_RATIO: f32 = crate::types::PUNCT_FS_RATIO;
 /// **瓜子点的长 / 正文字号**（v1.67.2）：0.50。
 ///
@@ -459,9 +462,17 @@ pub fn marker_box(fs: f32, cell_w: f32, cell_h: f32, chars: usize) -> (f32, f32)
 /// 不硬撑出一个比格还大的记号。
 pub fn place(fs_body: f32, cell_w: f32, cell_h: f32, kind: PunctKind) -> PunctMark {
     let room = (cell_w * 0.5).min(cell_h * 0.5).max(1.0);
-    // 直径一律从 core 的符号库取（屏幕 / PDF 同一张表），不再在本模块
-    // 另写一份 `match kind` —— 加一种形制只需改 `gloss::Jodu::fs_ratio`。
-    let d = (fs_body * kind.fs_ratio()).max(kind.min_d()).min(room);
+    // 句读直径一律从 core 的符号库取（屏幕 / PDF 同一张表）。
+    // 圆圈（句类）额外加一道硬上限：外径（横径 = d × (1+RING_OVAL)）绝不
+    // 超过主字格 Em 的 50%——小红书反馈「空心圈 ○ 尤其大」，这里把口径钉死：
+    // 无论正文字号怎么涨，圈都只是字隙里的一粒小朱记。几何以 (cx,cy) 为心
+    // 绝对对称（paint_classic_ring 本就绕中心画），故「居中」不靠偏移补。
+    let cap = match kind {
+        PunctKind::Ring => (fs_body * 0.5 / (1.0 + RING_OVAL)).min(room),
+        PunctKind::Dot => (fs_body * 0.5).min(room),
+        _ => room,
+    };
+    let d = (fs_body * kind.fs_ratio()).max(kind.min_d()).min(cap);
     let stroke = kind.stroke_of(d);
     // 中心先取右上角，再按「中心 ± (d/2 + stroke) 不出格」夹紧。
     let half = d * 0.5 + stroke;
@@ -1299,16 +1310,16 @@ mod tests {
     }
 
     #[test]
-    fn diameter_is_35_percent_of_the_body() {
-        // 常用字号段里严格是 0.35 倍（只是个记号，不是缩小的正字）。
+    fn dot_diameter_is_38_percent_of_body() {
+        // 句类空心圈严格是 0.38 倍正文（v1.9.89 收敛；只是一粒记号，不是缩小的正字）。
         for fs in [12.0, 17.0, 21.9, 24.0, 34.0, 44.0] {
             let (cw, ch) = cell(fs);
             let m = place(fs, cw, ch, PunctKind::Dot);
             assert!(
-                (m.d - fs * FS_RATIO).abs() < 0.01,
-                "直径应为 0.35 倍正文：{:.2} vs {:.2}",
+                (m.d - fs * PunctKind::Dot.fs_ratio()).abs() < 0.01,
+                "句号直径应为 0.38 倍正文：{:.2} vs {:.2}",
                 m.d,
-                fs * FS_RATIO
+                fs * PunctKind::Dot.fs_ratio()
             );
         }
         // 句号约正字三分之一高：一眼是「点」不是「字」。
@@ -1371,18 +1382,19 @@ mod tests {
         assert!(m.cy < 44.0 * 0.45, "太靠下（掉到字底下）：{}", m.cy);
     }
 
-    /// 瓜子点（读类）的尺寸与形：长 = 字号 × 0.40、宽 = 长 × 0.55，
-    /// 竖长的一粒，落在格右上再向左下让 1px（悬空感）。
+    /// 瓜子点（读类）的尺寸与形：placement 直径 = 字号 × 0.42（[`Jodu::Seed`]
+    /// 的 `fs_ratio`），视觉长由 [`SEED_H_RATIO`]（0.54）另行决定；竖长的一粒，
+    /// 落在格右上再向左下让 1px（悬空感）。
     #[test]
     fn seed_is_a_small_melon_seed_scaled_to_the_body() {
-        for fs in [12.0f32, 17.0, 21.9, 34.0] {
+        for fs in [12.0f32, 17.0, 21.9,34.0] {
             let (cw, ch) = cell(fs);
             let m = place(fs, cw, ch, PunctKind::Seed);
             assert!(
-                (m.d - fs * SEED_H_RATIO).abs() < 0.01,
-                "瓜子点长应为 0.40 倍正文：{:.2} vs {:.2}",
+                (m.d - fs * PunctKind::Seed.fs_ratio()).abs() < 0.01,
+                "瓜子点直径应为 0.42 倍正文：{:.2} vs {:.2}",
                 m.d,
-                fs * SEED_H_RATIO
+                fs * PunctKind::Seed.fs_ratio()
             );
             // 竖长形：长 > 宽，才收得出「细尾」。
             assert!(m.d > m.d * SEED_W_OF_H, "瓜子点应是竖长形：{m:?}");

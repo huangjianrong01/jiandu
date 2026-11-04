@@ -833,7 +833,7 @@ pub fn is_running_header(s: &str, book_title: &str) -> bool {
     has_mark || has_book
 }
 
-// ───────────────────── 书眉：跨章 / 跨页「同前缀·仅页码不同」剔除 ─────────────────────
+// ───────────────────── 书眉：跨章 / 跨页「变尾码 + 整行重复」双路剔除 ─────────────────────
 //
 // 竖排影印 / OCR 古籍每叶都印同一串书眉（`資治通鑑卷一 周紀一・威烈王・安王・烈王　三`
 // / `…　四` / `…　五`）：只在最末缀一个**页码**，整行因此**每页都不完全相同**。
@@ -851,6 +851,30 @@ pub fn header_norm_key(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// 书眉「骨架」归一（清洗底层共用，跨格式同一把尺）：在去空白之上，再剥掉所有
+/// 页码数字（`rh_is_tail_char` 涵盖汉字 `〇零一二…廿卅` / 阿拉伯 / 罗马）、`第`、
+/// 与各类括号（`〔〕【】（）()「」『』<>`）及注疏壳（`[注]`/`[/注]` 的 `[` `]` `注`）。
+///
+/// 用途：把同一条书眉的全部数字 / 中缀变体坍缩成同一骨架——
+/// `資治通鑑卷一` / `資治通鑑卷第一・周紀一・威烈王・安王・烈王` /
+/// `資治通鑑卷一周紀一・威烈王・安王・烈王二` 全部化成
+/// `資治通鑑卷・紀・威烈王・安王・烈王`，再用频率（≥ [`RH_MIN_REPEAT`]）一网打尽。
+///
+/// ⚠️ 它**只用于匹配键**，绝不改动正文文本——正文清洗由 `denoise_text` 负责。
+pub fn skeleton_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !c.is_whitespace()
+                && !rh_is_tail_char(*c)
+                && !matches!(
+                    *c,
+                    '第' | '〔' | '〕' | '【' | '】' | '（' | '）' | '(' | ')'
+                        | '「' | '」' | '『' | '』' | '<' | '>' | '[' | ']' | '注'
+                )
+        })
+        .collect()
+}
+
 /// 尾码字符：阿拉伯数字 / 汉字数字 / 罗马数字。
 fn rh_is_tail_char(c: char) -> bool {
     c.is_ascii_digit()
@@ -866,6 +890,27 @@ fn rh_is_tail_char(c: char) -> bool {
 /// 一整串是否纯尾码字符（这种串不是书眉，是页码本身）。
 fn rh_prefix_only_numerals(s: &str) -> bool {
     !s.is_empty() && s.chars().all(rh_is_tail_char)
+}
+
+/// 一行像不像「古籍书眉 / 卷题」：短（≤ [`RH_MAX_CHARS`]），且含结构标记
+/// `卷 / 紀 / 纪 / 册 / 冊 / 集 / 部`。
+///
+/// 影印古籍每叶都印同一串卷题、又不是正文——`周紀一・威烈王・安王・烈王`、
+/// `資治通鑑卷二周紀二・顯王`、`卷` 都是这类。不含 `題 / 章 / 年` 等，避免误杀
+/// 正文里偶提的「某章」与一般年份；正文第一句「凡三十五年」之类的数字句不含
+/// 任何结构标记，绝不会被这一路认走。
+fn rh_looks_like_header(k: &str) -> bool {
+    let n = k.chars().count();
+    if n == 0 || n > RH_MAX_CHARS {
+        return false;
+    }
+    k.contains('卷')
+        || k.contains('紀')
+        || k.contains('纪')
+        || k.contains('册')
+        || k.contains('冊')
+        || k.contains('集')
+        || k.contains('部')
 }
 
 /// 剥掉行尾的「页码尾码」，返回 `(前缀, 尾码)`。
@@ -905,30 +950,55 @@ const RH_MAX_CHARS: usize = 30;
 /// 同一前缀出现多少次才算书眉：影印书眉几乎是每叶一条。
 const RH_MIN_REPEAT: usize = 3;
 
-/// 全书的「同前缀、仅尾部页码不同」书眉归一键集合。
+/// 全书的「书眉」归一键集合（跨格式共用同一把尺，两路都认）。
 ///
 /// 输入是一本书的**所有行**（逐行文本，含标点也无妨）。返回应当删除的
 /// 归一键（[`header_norm_key`] 之后）。
 ///
-/// 判定（严格，宁可漏判不可误杀）：
-///   * 行 ≤ [`RH_MAX_CHARS`] 字；
-///   * 剥掉尾码后的**前缀 ≥ 4 字**且**不是纯数字**；
-///   * 同一前缀在全书出现 ≥ [`RH_MIN_REPEAT`] 次，且至少 **2 个不同的尾码**。
+/// **（A）同前缀·仅页码不同**：剥掉尾码后的前缀 ≥ 4 字、非纯数字，且同一前缀
+/// 在全书出现 ≥ [`RH_MIN_REPEAT`] 次、至少 **2 个不同尾码**——覆盖
+/// `資治通鑑卷一…三 / 四 / 五` 这类汉字页码尾码（整行完全重复认不出）。
 ///
-/// 覆盖「书名·卷次都相同、只差页码」的竖排影印书与 `…　三 / 四 / 五` 这种
-/// 汉字页码尾码——普通 PDF 的 `strip_running_lines`（整行完全重复）认不出它们。
+/// **（B）整行完全重复的书眉**：短（≤ [`RH_MAX_CHARS`]）、含结构标记
+/// `卷 / 紀 / 纪 / 册 / 冊 / 集 / 部`、且整行**原样重复 ≥ [`RH_MIN_REPEAT`]
+/// 次**——覆盖影印古籍「每卷/纪只跨几页」的卷题（`周紀一・威烈王・安王・烈王`
+/// 每页印一遍、整本只出现十几回）。这类既低于 PDF `strip_running_lines` 的
+/// 1/3 页门槛，又没有变尾码可认，单列一行重复判定也漏，故按「书眉形状」补刀。
+///
+/// 两路都走「严格、宁可漏判不可误杀」：正文第一句「凡三十五年」这类数字句不含
+/// 任何结构标记，绝不会被（B）认走；纯数字串（`一二三`）被（A）的结构守卫挡掉。
+/// 全书的「书眉」骨架删除集（跨格式共用同一把尺，两路都认）。
+///
+/// 返回 `(结构标记命中, 纯书名命中)` 两个骨架集：
+/// * **结构集**——骨架含 `卷/紀/纪/册/冊/集/部` 且频率 ≥ [`RH_MIN_REPEAT`]，
+///   直接可删（有结构标记 + 重复，几乎不可能是正文）；
+/// * **书名集**——骨架恰好等于书名骨架（影印书口字 / 书眉头），需由调用方
+///   结合「页面最前 / 最后几行」的位置闸门再放行，避免误杀正文中偶提的书名。
+///
+/// 输入是一本书的所有行（逐行文本）；返回应当删除的**骨架键**
+/// （[`skeleton_key`] 之后）。骨架归一会把同一条书眉的`資治通鑑卷一` /
+/// `資治通鑑卷第一・周紀一…` / `資治通鑑卷一周紀一…二` 等全部数字 / 中缀变体
+/// 坍缩成同一个骨架，再用频率一网打尽。
 pub fn running_header_prefix_keys(
     lines: &[String],
-) -> std::collections::HashSet<String> {
+    title: &str,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    let title_sk = skeleton_key(title);
     let mut groups: std::collections::HashMap<
         String,
         (usize, std::collections::HashSet<String>),
     > = std::collections::HashMap::new();
+    let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for l in lines {
-        let k = header_norm_key(l);
+        let k = skeleton_key(l);
         if k.is_empty() || k.chars().count() > RH_MAX_CHARS {
             continue;
         }
+        *freq.entry(k.clone()).or_insert(0) += 1;
+        // （A）同前缀·仅页码不同：骨架化后数字已先剥，前缀归并更稳。
         let (prefix, tail) = strip_page_tail(&k);
         if prefix.chars().count() >= 4 && !rh_prefix_only_numerals(&prefix) {
             let g = groups
@@ -940,31 +1010,43 @@ pub fn running_header_prefix_keys(
             }
         }
     }
-    let mut drop: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut structure: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // （A）同前缀·仅页码不同。
     for (prefix, (count, tails)) in &groups {
         if *count >= RH_MIN_REPEAT && tails.len() >= 2 {
             for l in lines {
-                let k = header_norm_key(l);
+                let k = skeleton_key(l);
                 if k.chars().count() > RH_MAX_CHARS {
                     continue;
                 }
                 let (p, _) = strip_page_tail(&k);
                 if p == *prefix {
-                    drop.insert(k);
+                    structure.insert(k);
                 }
             }
         }
     }
-    drop
+    // （B）整行重复 / 数字中缀变体坍缩后的书眉骨架。
+    let mut by_title: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (k, n) in &freq {
+        if *n >= RH_MIN_REPEAT {
+            if rh_looks_like_header(k) {
+                structure.insert(k.clone());
+            } else if !title_sk.is_empty() && k == &title_sk {
+                by_title.insert(k.clone());
+            }
+        }
+    }
+    (structure, by_title)
 }
 
-/// 在清洗主流程的去噪阶段，把「同前缀·仅页码不同」的书眉从 IR 里赶出去。
+/// 在清洗主流程的去噪阶段，把书眉（变尾码 / 整行重复两路）从 IR 里赶出去。
 ///
 /// 跨所有巻 / 章收集块文本，复用 [`running_header_prefix_keys`]：md / txt /
 /// html / json / docx 这些走 `clean_book` 的格式因此与 EPUB（`purge_running_headers`）、
 /// PDF（`strip_running_lines`）共用同一把尺。只删 `Para` / `Annotation`（章题、
 /// 眉批不在其列），且绝不把空巻判没（下游 `retain` 另有兜底）。
-fn purge_running_header_variants(ir: &mut IrBook) {
+fn purge_running_header_variants(ir: &mut IrBook, title: &str) {
     let mut lines: Vec<String> = Vec::new();
     for j in ir.juans.iter() {
         for b in j.blocks.iter() {
@@ -977,14 +1059,16 @@ fn purge_running_header_variants(ir: &mut IrBook) {
     if lines.len() < RH_MIN_REPEAT {
         return;
     }
-    let drop = running_header_prefix_keys(&lines);
+    let (structure, by_title) = running_header_prefix_keys(&lines, title);
+    let drop: std::collections::HashSet<String> =
+        structure.into_iter().chain(by_title).collect();
     if drop.is_empty() {
         return;
     }
     for j in ir.juans.iter_mut() {
         j.blocks.retain(|b| match b {
             IrBlock::Para(spans) | IrBlock::Annotation { spans, .. } => {
-                !drop.contains(&header_norm_key(&spans_line(spans)))
+                !drop.contains(&skeleton_key(&spans_line(spans)))
             }
             _ => true,
         });
@@ -2019,10 +2103,12 @@ pub fn clean_book_with(book: &mut Book, source: IrSource, opts: &CleanOpts) {
         for j in ir.juans.iter_mut() {
             pass1_juan(j, &titles, &book_title);
         }
-        // 跨章 / 跨页「同前缀·仅页码不同」的书眉（影印 / OCR 古籍每叶都印同一串
-        // 书眉，只在末位缀页码）：单行 `is_running_header` 与「整行完全重复」都认
-        // 不出，这里按前缀归并补刀。md / txt / html / json / docx 走这一条。
-        purge_running_header_variants(&mut ir);
+        // 跨章 / 跨页书眉（影印 / OCR 古籍每叶都印同一串卷题）：① 变尾码
+        // （資治通鑑卷一…三/四/五）② 整行完全重复但每卷只跨几页（周紀一・威烈王・
+        // 安王・烈王）单列「1/3 页重复」或「同前缀·仅页码不同」都认不出，这里两路
+        // 并认。`purge_running_header_variants` 复用 `running_header_prefix_keys`，与
+        // EPUB / PDF 共用同一把尺。md / txt / html / json / docx 走这一条。
+        purge_running_header_variants(&mut ir, &book_title);
         ir.juans.retain(|j| !j.is_empty() || !j.title.trim().is_empty());
     }
 
@@ -3047,7 +3133,7 @@ mod tests {
         assert_eq!(strip_note_tags("凡[数字:35]葉"), "凡葉");
     }
 
-    // ---- v1.9.88：书眉「同前缀·仅页码不同」跨格式归并 -------------------
+    // ---- v1.9.88：书眉剔除（变尾码 + 整行重复，跨格式共用）-------------------
 
     #[test]
     fn strip_page_tail_peels_trailing_page_numbers() {
@@ -3082,11 +3168,12 @@ mod tests {
             // 正文短句：只出现一次，绝不误杀。
             "周威烈王二十三年初命晉大夫".to_string(),
         ];
-        let drop = running_header_prefix_keys(&lines);
-        assert!(drop.contains(&header_norm_key("資治通鑑卷一周紀一威烈王安王烈王三")));
-        assert!(drop.contains(&header_norm_key("資治通鑑卷一周紀一威烈王安王烈王四")));
-        assert!(drop.contains(&header_norm_key("資治通鑑卷一周紀一威烈王安王烈王五")));
-        assert!(!drop.contains(&header_norm_key("周威烈王二十三年初命晉大夫")));
+        let (structure, _title) = running_header_prefix_keys(&lines, "");
+        let drop: std::collections::HashSet<String> = structure.into_iter().collect();
+        assert!(drop.contains(&skeleton_key("資治通鑑卷一周紀一威烈王安王烈王三")));
+        assert!(drop.contains(&skeleton_key("資治通鑑卷一周紀一威烈王安王烈王四")));
+        assert!(drop.contains(&skeleton_key("資治通鑑卷一周紀一威烈王安王烈王五")));
+        assert!(!drop.contains(&skeleton_key("周威烈王二十三年初命晉大夫")));
     }
 
     #[test]
@@ -3098,10 +3185,12 @@ mod tests {
             "章題一".to_string(),
             "章題一".to_string(),
         ];
-        assert!(running_header_prefix_keys(&lines).is_empty(), "同尾码重复不误杀");
+        let (s, t) = running_header_prefix_keys(&lines, "");
+        assert!(s.is_empty() && t.is_empty(), "同尾码重复不误杀");
         // 样本太小（<3 条）也不动。
         let few = vec!["資治通鑑卷一三".to_string(), "資治通鑑卷一四".to_string()];
-        assert!(running_header_prefix_keys(&few).is_empty(), "尾码不足不误杀");
+        let (s2, t2) = running_header_prefix_keys(&few, "");
+        assert!(s2.is_empty() && t2.is_empty(), "尾码不足不误杀");
         // 纯数字串不是书眉。
         let numerals = vec![
             "一二三".to_string(),
@@ -3109,7 +3198,159 @@ mod tests {
             "一二四".to_string(),
             "一二五".to_string(),
         ];
-        assert!(running_header_prefix_keys(&numerals).is_empty(), "纯数字串不误杀");
+        let (s3, t3) = running_header_prefix_keys(&numerals, "");
+        assert!(s3.is_empty() && t3.is_empty(), "纯数字串不误杀");
+    }
+
+    /// 真实《資治通鑑》影印本暴露的形态：书眉是**整行完全重复、但每卷只跨几页**
+    /// 的卷题（无变尾码），旧 `strip_running_lines` 的 1/3 页门槛与「同前缀·仅页码不同」
+    /// 都认不出；新函数按「书眉形状」补刀，必须删掉。
+    #[test]
+    fn running_header_prefix_keys_drops_exact_repeat_volume_headers() {
+        // 取自真实 PDF 探针：这些串每叶印一遍、整本只出现十几回。
+        let lines = vec![
+            "周紀一・威烈王・安王・烈王".to_string(),
+            "周紀一・威烈王・安王・烈王".to_string(),
+            "周紀一・威烈王・安王・烈王".to_string(),
+            "周紀一・威烈王・安王・烈王".to_string(),
+            "周紀二・顯王".to_string(),
+            "周紀二・顯王".to_string(),
+            "周紀二・顯王".to_string(),
+            "周紀二・顯王".to_string(),
+            "周紀二・顯王".to_string(),
+            "資治通鑑卷二周紀二・顯王".to_string(),
+            "資治通鑑卷二周紀二・顯王".to_string(),
+            "資治通鑑卷二周紀二・顯王".to_string(),
+            "資治通鑑卷二周紀二・顯王".to_string(),
+            "資治通鑑卷二周紀二・顯王".to_string(),
+            "資治通鑑卷二周紀二・顯王".to_string(),
+            "資治通鑑卷二周紀二・顯王".to_string(),
+            "資治通鑑卷二周紀二・顯王".to_string(),
+            "卷".to_string(),
+            "卷".to_string(),
+            "卷".to_string(),
+            "卷".to_string(),
+            "卷".to_string(),
+            "卷".to_string(),
+            "卷".to_string(),
+            "卷".to_string(),
+            "卷".to_string(),
+            // 正文短句（含「王」但不含结构标记、且只出现一次）：绝不可误杀。
+            "周威烈王二十三年初命晉大夫".to_string(),
+        ];
+        let (structure, _t) = running_header_prefix_keys(&lines, "");
+        let drop: std::collections::HashSet<String> = structure.into_iter().collect();
+        assert!(drop.contains(&skeleton_key("周紀一・威烈王・安王・烈王")));
+        assert!(drop.contains(&skeleton_key("周紀二・顯王")));
+        assert!(drop.contains(&skeleton_key("資治通鑑卷二周紀二・顯王")));
+        assert!(drop.contains(&skeleton_key("卷")));
+        assert!(!drop.contains(&skeleton_key("周威烈王二十三年初命晉大夫")));
+    }
+
+    /// 骨架归一的核心价值：把 `資治通鑑卷一` / `資治通鑑卷第一・周紀一…` /
+    /// `資治通鑑卷一周紀一…二` 全部坍缩到同一骨架，再用频率（≥3）一网打尽——
+    /// 真实《資治通鑑》影印本里「第X」中缀、页码尾码都是同一书眉的变体。
+    #[test]
+    fn skeleton_normalization_collapses_numeral_variants() {
+        let lines = vec![
+            "資治通鑑卷一".to_string(),
+            "資治通鑑卷一".to_string(),
+            "資治通鑑卷一".to_string(),
+            "資治通鑑卷第一・周紀一・威烈王・安王・烈王".to_string(),
+            "資治通鑑卷第一・周紀一・威烈王・安王・烈王".to_string(),
+            "資治通鑑卷第一・周紀一・威烈王・安王・烈王".to_string(),
+            "資治通鑑卷一周紀一・威烈王・安王・烈王二".to_string(),
+            "資治通鑑卷一周紀一・威烈王・安王・烈王二".to_string(),
+            "資治通鑑卷一周紀一・威烈王・安王・烈王二".to_string(),
+            "資治通鑑卷一周紀一・威烈王・安王・烈王三".to_string(),
+            "資治通鑑卷一周紀一・威烈王・安王・烈王三".to_string(),
+            "資治通鑑卷一周紀一・威烈王・安王・烈王三".to_string(),
+        ];
+        let (structure, _t) = running_header_prefix_keys(&lines, "資治通鑑");
+        assert!(structure.contains(&skeleton_key("資治通鑑卷一")), "卷一变体必删");
+        assert!(
+            structure.contains(&skeleton_key("資治通鑑卷第一・周紀一・威烈王・安王・烈王")),
+            "第X形必删"
+        );
+        assert!(
+            structure.contains(&skeleton_key("資治通鑑卷一周紀一・威烈王・安王・烈王二")),
+            "尾码形必删"
+        );
+    }
+
+    /// 防御性（用户原话「资治通鉴」）：正文里三次提到书名（嵌入句、非独立成行）
+    /// 必须保留；但独立成行、重复三遍的书名（影印书口字）必须删。
+    #[test]
+    fn body_mentioning_title_thrice_is_kept_but_standalone_header_dropped() {
+        let title = "資治通鑑";
+        // ① 正文嵌入书名 ×3：绝不误杀。
+        let body = vec![
+            "前文已述資治通鑑乃編年巨著。".to_string(),
+            "前文已述資治通鑑乃編年巨著。".to_string(),
+            "前文已述資治通鑑乃編年巨著。".to_string(),
+        ];
+        let (s, t) = running_header_prefix_keys(&body, title);
+        assert!(s.is_empty() && t.is_empty(), "正文嵌入书名不误杀");
+        // ② 独立成行、重复三遍的书名（影印书口字）→ 必须删（书名集命中）。
+        let header = vec![
+            "資治通鑑".to_string(),
+            "資治通鑑".to_string(),
+            "資治通鑑".to_string(),
+        ];
+        let (_s, t2) = running_header_prefix_keys(&header, title);
+        assert!(t2.contains(&skeleton_key("資治通鑑")), "独立成行的书名书眉必须删");
+    }
+
+    /// 防御性（用户原话「凡三十五年」）：正文第一句就是带数字的，绝不能误杀——
+    /// 它不含任何书眉结构标记（卷 / 纪 / 册 / 集 / 部），再怎么重复都不该被书眉尺删掉。
+    #[test]
+    fn body_with_leading_numerals_is_never_killed() {
+        // ① 整句重复出现多次：仍必须保留。
+        let repeated = vec![
+            "凡三十五年，天下大旱".to_string(),
+            "凡三十五年，天下大旱".to_string(),
+            "凡三十五年，天下大旱".to_string(),
+            "凡三十五年，天下大旱".to_string(),
+        ];
+        let (s, t) = running_header_prefix_keys(&repeated, "");
+        assert!(
+            s.is_empty() && t.is_empty(),
+            "『凡三十五年』整句重复也绝不可误杀"
+        );
+        // ② 孤行一次：保留。
+        let once = vec!["起著雍攝提格盡玄黓困敦凡三十五年".to_string()];
+        let (s2, t2) = running_header_prefix_keys(&once, "");
+        assert!(
+            s2.is_empty() && t2.is_empty(),
+            "《資治通鑑》开篇纪年句含『凡三十五年』不可误杀"
+        );
+        // ③ 干支纪年重复：不含结构标记，保留。
+        let gan = vec![
+            "著雍攝提格".to_string(),
+            "著雍攝提格".to_string(),
+            "著雍攝提格".to_string(),
+        ];
+        let (s3, t3) = running_header_prefix_keys(&gan, "");
+        assert!(
+            s3.is_empty() && t3.is_empty(),
+            "干支纪年重复也不可误杀"
+        );
+    }
+
+    /// 边界（长度闸门）：一条很长的「正文」即便含『卷』也绝不因（B）路被当书眉删——
+    /// 结构标记只在短行（≤ RH_MAX_CHARS）才生效，长正文豁免。
+    #[test]
+    fn long_body_line_with_volume_char_survives() {
+        let long = vec![
+            "昔者周室既衰諸侯力政強弱相劫君臣易位上下失序而孔子修春秋以正名分其文雖簡而義甚嚴學者不可不察焉且著於卷末以告後世".to_string(),
+            "昔者周室既衰諸侯力政強弱相劫君臣易位上下失序而孔子修春秋以正名分其文雖簡而義甚嚴學者不可不察焉且著於卷末以告後世".to_string(),
+            "昔者周室既衰諸侯力政強弱相劫君臣易位上下失序而孔子修春秋以正名分其文雖簡而義甚嚴學者不可不察焉且著於卷末以告後世".to_string(),
+        ];
+        let (s, t) = running_header_prefix_keys(&long, "");
+        assert!(
+            s.is_empty() && t.is_empty(),
+            "超长正文含『卷』也不该被删"
+        );
     }
 
 }

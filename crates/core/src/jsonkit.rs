@@ -93,6 +93,14 @@ const NOTE_KEYS: &[&str] = &[
     "索隱",
     "正义",
     "正義",
+    // 音释 / 注音：古籍 JSON 常把反切注音放在 `zhushu`（「注疏」拼音）字段，
+    // 与 `paragraph`（被注单字）平级。旧版没认这个键，导致音释被整枚吞掉、
+    // 只剩孤零零的单字段落，断章器再把它们错拆成垃圾章题。补上后音释会就地
+    // 包成 `[注]…[/注]`，书籍主路 `ingest_inline_notes` 吸成双行小字夹注。
+    "zhushu",
+    "yinzhu",
+    "音释",
+    "注音",
 ];
 
 /// 题名字段（先出题名再出正文，章名才不会掉到章尾）。
@@ -214,7 +222,20 @@ fn collect(
             }
         }
         Value::Object(m) => {
-            if let Some(body) = find_body(m) {
+            // 书眉级元数据行（「音釋」节题 / 译者·作者署名）绝不进正文流——
+            // 否则断章器会把无标点短行误判成章题，炸出垃圾章、竖排错乱。
+            // ⚠️ 绝不基于 `type` 字段一刀切：`type` 语义因书而异——
+            //   《楞嚴經》的 `type=2` 是**正文经文**（占全书 96% 内容），
+            //   《漢書注》的 `type=2` 是注释者小传，两者都带标点、都该保留；
+            //   只有「音釋」节题与译者署名行是无标点的纯元数据。这里只认
+            //   「内容形态」，对所有书通用、零误杀。
+            let body = find_body(m);
+            if let Some(Value::String(s)) = body {
+                if is_metadata_line(s) {
+                    return;
+                }
+            }
+            if let Some(body) = body {
                 *saw_body = true;
                 if emit_title {
                     if let Some(Value::String(t)) = find_title(m) {
@@ -493,6 +514,40 @@ fn get_ci<'a>(m: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a Va
         .map(|(_, v)| v)
 }
 
+/// 古籍 JSON 里两类**书眉级元数据行**绝不进正文流，否则断章器会把无标点短行
+/// 误判成章题，炸出垃圾章、竖排错乱：
+///   * 「音釋」「音释」节题（固定 2 字）；
+///   * 译者 / 作者署名行（**无标点** + 短 + 以 譯 / 譯語 / 筆受 结尾）。
+///
+/// ⚠️ 不基于 `type` 字段一刀切：`type` 语义因书而异（经史子集丛各有各的约定——
+///   《楞嚴經》的 `type=2` 是正文经文，《漢書注》的 `type=2` 是注释者小传，其余书
+///   根本没有 `type=2`）。两类书里真正的正文 / 小传都**带标点**，只有纯元数据
+///   是无标点的署名行——所以靠「无标点 + 译/筆受结尾」这一内容形态来甄别，
+///   对所有经史子集丛通用、**零误杀**。
+fn is_metadata_line(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // 「音釋」「音释」节题。
+    if t == "音釋" || t == "音释" {
+        return true;
+    }
+    // 译者 / 作者署名行：无标点 + 短 + 以译家动词结尾。
+    // 限定「无标点」是关键区分——佛经译者署名行（唐天竺沙門般剌密帝譯）无标点，
+    // 而真正的经文（如是我聞：一時…）与史书注的注释者小传（刘德，北海人。）
+    // 都带标点，绝不会被误剔。
+    let has_punct = t.chars().any(|c| {
+        "。，、：；！？…—（）〔〕【】「」『』《》〈〉．：；！？".contains(c)
+    });
+    if !has_punct && t.chars().count() <= 60 {
+        if t.ends_with("譯") || t.ends_with("譯語") || t.ends_with("筆受") {
+            return true;
+        }
+    }
+    false
+}
+
 /// 元信息字段：**绝不进正文流**。
 ///
 /// 古籍 JSON 的元数据多到离谱（`pinyin` / `book` / `volume` / `author` …），
@@ -654,5 +709,63 @@ mod tests {
         let flat: Value =
             serde_json::from_str(r#"{"paragraphs":[{"text":"甲","note":"注"}]}"#).unwrap();
         assert!(!is_structured_paragraphs(&flat));
+    }
+
+    /// 音释 / 注音字段（`zhushu` 等）必须就地包成 `[注]…[/注]`，绝不整枚吞掉。
+    ///
+    /// v1.9.89 之前 `zhushu` 既非正文字段也非注疏键，音释被静默丢弃——
+    /// 《楞嚴經》音释字表整批消失、只剩孤零零的单字段落，断章器再把它们
+    /// 错拆成垃圾章。补 `zhushu` 进 `NOTE_KEYS` 后，音释必须成为行内夹注。
+    #[test]
+    fn zhushu_becomes_inline_note() {
+        let v: Value = serde_json::from_str(
+            r#"{"chapters":[{"name":"楞嚴經卷第一","paragraphs":[
+                {"paragraph":"挃","zhushu":"陟栗切，撞也。"},
+                {"paragraph":"如是我聞。","zhushu":""}
+            ]}]}"#,
+        )
+        .unwrap();
+        let t = flatten_text(&v);
+        assert!(t.contains("[注]陟栗切，撞也。[/注]"), "音释必须包成夹注：{t}");
+        assert!(t.contains("挃"), "被注单字必须保留：{t}");
+        // 空音释不得生成空壳 `[注][/注]`。
+        assert_eq!(t.matches("[注][/注]").count(), 0, "空音释不得留空壳：{t}");
+    }
+
+    /// 书眉级元数据（「音釋」节题 / 无标点的译者署名行）绝不进正文流，但正文经文
+    /// （哪怕 `type=2` 且很长）必须保留——否则《楞嚴經》96% 的经文会被误杀。
+    #[test]
+    fn metadata_lines_never_leak_but_body_is_kept() {
+        let v: Value = serde_json::from_str(
+            r#"{"chapters":[{"name":"楞嚴經卷第一","paragraphs":[
+                {"paragraph":"楞嚴經卷第一","type":1},
+                {"paragraph":"唐天竺沙門般剌密帝譯","type":2},
+                {"paragraph":"音釋","type":2},
+                {"paragraph":"如是我聞：一時，佛在室羅筏城祇桓精舍。","type":2},
+                {"paragraph":"挃","zhushu":"陟栗切，撞也。"}
+            ]}]}"#,
+        )
+        .unwrap();
+        let t = flatten_text(&v);
+        assert!(t.contains("楞嚴經卷第一"), "卷题文本(type=1)应保留：{t}");
+        assert!(
+            t.contains("如是我聞"),
+            "正文经文(type=2 带标点)必须保留——否则误杀 96% 正文：{t}"
+        );
+        assert!(t.contains("挃"), "音释单字必须保留：{t}");
+        assert!(
+            !t.contains("般剌密帝"),
+            "译者署名(无标点·譯结尾)不得进正文：{t}"
+        );
+        assert!(!t.contains("音釋"), "音释节题不得进正文：{t}");
+
+        let mut rep = JsonReport::default();
+        let ps = paragraphs_of(&v, &mut rep);
+        let joined = ps.concat();
+        assert!(joined.contains("如是我聞"), "正文经文必须进段落流：{joined}");
+        assert!(
+            !joined.contains("般剌密帝"),
+            "译者署名不得进段落流：{joined}"
+        );
     }
 }
