@@ -229,6 +229,234 @@ fn measure_char_adv(ts: &gpui::WindowTextSystem, family: &SharedString) -> f32 {
     }
 }
 
+/// **气泡锚点**（纯函数，v1.9.69）：内容原点 + 「选区末行的下一行」的行距。
+///
+/// 抽出来只为一件事——**可测**。v1.9.68 那次回归正是坐标写错（`- scroll_y`
+/// 把负偏移又取反了一次），而错在 `render_*` 里的算式只能靠开窗口点鼠标验。
+/// 现在的契约是：`origin` 是 `editor_origin()`（**已含滚动偏移**），所以
+/// 滚动只该通过 `origin.y` 生效，这里绝不再自己加减滚动量。
+fn bar_anchor(origin: (f32, f32), visual_idx: usize, col_in_visual: usize, adv: f32) -> (f32, f32) {
+    let x = origin.0 + col_in_visual as f32 * adv + 4.0;
+    let y = origin.1 + (visual_idx + 1) as f32 * LINE_H + 4.0;
+    (x, y)
+}
+
+/// **把气泡夹进右栏矩形**（纯函数，v1.9.69）：任何输入都不许算到屏幕外。
+///
+/// 三种必须兜住的情形：选区在视口之上（y 会是负的）、选区在视口之下
+/// （y 会远超面板）、窄窗口（x 顶到右缘）。夹紧策略是「贴边」而不是「隐藏」——
+/// 用户刚拖完选，气泡跑到天边比贴边更让人以为坏了。
+fn clamp_bar_pos(
+    x: f32,
+    y: f32,
+    vw: f32,
+    vh: f32,
+    panel_l: f32,
+    panel_t: f32,
+    bar_w: f32,
+    bar_h: f32,
+) -> (f32, f32) {
+    let min_x = panel_l + 8.0;
+    let max_x = (vw - bar_w - 10.0).max(min_x);
+    let min_y = panel_t + 4.0;
+    let max_y = (vh - bar_h - 10.0).max(min_y);
+    (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
+}
+
+fn est_wrapped_lines_n(n: usize, cpl: usize) -> usize {
+    let cpl = cpl.max(1);
+    if n == 0 { 1 } else { n.div_ceil(cpl) }
+}
+
+/// **版式行索引**（v1.9.69）——百万字正文的唯一几何真相。
+///
+/// ## 为什么非有它不可
+/// 旧实现每一帧都做三件 O(全文) 的事：
+///   ① `self.text.split('\n').collect::<Vec<_>>()`（几万行 → 每帧一次堆分配）；
+///   ② 逐行 `line.chars().count()` 算视觉行（百万字 → 每帧扫一遍全本）；
+///   ③ `line_ranges()` 再建一个 `Vec<(usize,usize)>`（又一次几万条分配）。
+/// 静止时勉强能撑，一滚动 / 一拖选就掉帧——因为滚动是**每帧**都重排。
+///
+/// 现在把这三件事压成**一次**：文本或版心列数变了才重建（`gen` / `cpl` 做键），
+/// 之后每帧只做二分查找，O(log n)。虚拟列表的「只画可见几十行」也因此才真正成立——
+/// 没有前缀和，你根本不知道第 8000 行该落在哪个像素上。
+///
+/// 字段全是行级前缀和，`len = 行数 + 1`（末尾那格是总量，省一次 if）：
+/// ・`char_start` / `byte_start`：每行在全文里的字符 / 字节起点（`text = …` 用得上）；
+/// ・`vis`：累加**视觉行**数（软换行口径，与 `render_line` / `caret_at` 同源）；
+/// ・`aligned`：对照模式的**段落对齐**口径（每段取 `max(清洗行数, 毛坯行数)`），
+///   非对照模式与 `vis` 完全相同。
+///
+/// ⚠️ 行数用 `usize` 而不是 `u32`：百万字 ≈ 几万行，内存 4 个 Vec 合起来不到 1MB，
+///    换掉一整类溢出边界，值得。
+#[derive(Default, Clone)]
+struct LineIndex {
+    /// 建索引时的文本代际（`CollationWorkspace::text_gen`）。0 = 空索引。
+    gen: u64,
+    /// 建索引时的每行字数（列数变了，视觉行前缀和就全废）。
+    cpl: usize,
+    /// 建索引时是否处于对照模式（`aligned` 是否等于 `vis`）。
+    diff: bool,
+    /// 每行字符起点。
+    char_start: Vec<usize>,
+    /// 每行字节起点。
+    byte_start: Vec<usize>,
+    /// 视觉行前缀和（len = 行数 + 1）。
+    vis: Vec<usize>,
+    /// 段落对齐前缀和（len = 行数 + 1）。
+    aligned: Vec<usize>,
+    /// 毛坯（左栏 / 对照）每行的字节起点；非对照模式为空。
+    ///
+    /// 对照模式右栏要逐段比对 `raw_seg != clean_seg`（决定是否打朱砂底纹），
+    /// 没有这张表就只能 `raw.split('\n').nth(i)`——那是 O(n) 的，一屏 60 行
+    /// 就是 60 次全量扫描，比整帧预算还贵。
+    raw_byte_start: Vec<usize>,
+    /// 全文总字数（`chars().count()` 的结果，省掉每帧整本扫描）。
+    total_chars: usize,
+}
+
+impl LineIndex {
+    fn build(text: &str, raw: Option<&str>, cpl: usize, gen: u64, diff: bool) -> Self {
+        let cpl = cpl.max(1);
+        let mut idx = LineIndex {
+            gen,
+            cpl,
+            diff,
+            ..Default::default()
+        };
+        // 预留容量：按「平均 80 字一行」估，避开多次扩容。估歪了也只是多占一点。
+        let est_lines = (text.chars().count() / 80).max(8);
+        idx.char_start.reserve(est_lines);
+        idx.byte_start.reserve(est_lines);
+        idx.vis.reserve(est_lines + 1);
+        idx.aligned.reserve(est_lines + 1);
+        idx.vis.push(0);
+        idx.aligned.push(0);
+
+        let mut raw_iter = raw.map(|r| r.split('\n'));
+        let mut cstart = 0usize;
+        let mut bstart = 0usize;
+        let mut rstart = 0usize;
+        let (mut vis, mut al) = (0usize, 0usize);
+        for line in text.split('\n') {
+            let n = line.chars().count();
+            idx.char_start.push(cstart);
+            idx.byte_start.push(bstart);
+            cstart += n + 1;
+            bstart += line.len() + 1;
+            let v = est_wrapped_lines_n(n, cpl);
+            vis += v;
+            // 对照模式：本段高度取两栏的较大者（与 `render_editor` 的填充口径一致）。
+            let raw_line = raw_iter.as_mut().and_then(|it| it.next());
+            if raw.is_some() {
+                idx.raw_byte_start.push(rstart);
+                rstart += raw_line.map(|r| r.len() + 1).unwrap_or(1);
+            }
+            let rv = raw_line
+                .map(|r| est_wrapped_lines(r, cpl))
+                .unwrap_or(v);
+            al += v.max(rv);
+            idx.vis.push(vis);
+            idx.aligned.push(al);
+        }
+        // 每行都多算了一个 '\n'，末行没有 → 减 1 即总字数。
+        idx.total_chars = cstart.saturating_sub(1);
+        idx
+    }
+
+    fn valid(&self, gen: u64, cpl: usize, diff: bool) -> bool {
+        self.gen != 0 && self.gen == gen && self.cpl == cpl && self.diff == diff
+    }
+
+    fn lines(&self) -> usize {
+        self.char_start.len()
+    }
+
+    fn total_visual(&self) -> usize {
+        *self.vis.last().unwrap_or(&0)
+    }
+
+    fn total_aligned(&self) -> usize {
+        *self.aligned.last().unwrap_or(&0)
+    }
+
+    /// 字符下标 → 行号（二分，O(log n)）。
+    ///
+    /// 行尾那个「换行符位」算前一行（与 `line_ranges` 的 `s <= i <= e` 同口径），
+    /// 否则光标停在行尾时会跳到下一行行首，`⇧→` 的手感立刻不对。
+    fn line_of(&self, char_idx: usize) -> Option<usize> {
+        if self.char_start.is_empty() {
+            return None;
+        }
+        let li = self.char_start.partition_point(|&s| s <= char_idx);
+        let li = li.saturating_sub(1).min(self.lines() - 1);
+        let end = self.char_end(li);
+        (char_idx <= end).then_some(li)
+    }
+
+    /// 第 `li` 行的字符终点（不含换行）。
+    fn char_end(&self, li: usize) -> usize {
+        match self.char_start.get(li + 1) {
+            Some(&n) => n - 1,
+            None => self.total_chars,
+        }
+    }
+
+    /// 第 `li` 行的字符区间。
+    fn char_range(&self, li: usize) -> (usize, usize) {
+        (self.char_start[li], self.char_end(li))
+    }
+
+    /// 第 `li` 行的字节区间（`\n` 不在内）。
+    ///
+    /// 末行没有后续行起点可参照，只能拿 `text.len()` 收尾——`text` 必须是建索引的
+    /// 那一份（调用点都传 `&self.text`）。
+    fn byte_range(&self, text: &str, li: usize) -> (usize, usize) {
+        let a = self.byte_start[li];
+        let b = match self.byte_start.get(li + 1) {
+            Some(&n) => n - 1,
+            None => text.len(),
+        };
+        (a, b.max(a))
+    }
+
+    /// 第 `li` 行的 &str。
+    fn line_str<'a>(&self, text: &'a str, li: usize) -> &'a str {
+        let (a, b) = self.byte_range(text, li);
+        text.get(a..b).unwrap_or("")
+    }
+
+    /// 对照模式：第 `li` 段对应的**毛坯**原文（越界返回空串）。
+    fn raw_line<'a>(&self, raw: &'a str, li: usize) -> &'a str {
+        let Some(&a) = self.raw_byte_start.get(li) else {
+            return "";
+        };
+        let b = match self.raw_byte_start.get(li + 1) {
+            Some(&n) => n.saturating_sub(1),
+            None => raw.len(),
+        };
+        raw.get(a..b.max(a)).unwrap_or("")
+    }
+
+    /// 视觉行号 → 行号（二分，O(log n)）：虚拟列表的入口。
+    fn line_at_visual(&self, v: usize) -> usize {
+        Self::line_at_table(&self.vis, self.lines(), v)
+    }
+
+    /// 段落对齐视觉行号 → 行号（对照模式用）。
+    fn line_at_aligned(&self, v: usize) -> usize {
+        Self::line_at_table(&self.aligned, self.lines(), v)
+    }
+
+    fn line_at_table(table: &[usize], n: usize, v: usize) -> usize {
+        if n == 0 || table.is_empty() {
+            return 0;
+        }
+        let i = table.partition_point(|&x| x <= v);
+        i.saturating_sub(1).min(n - 1)
+    }
+}
+
 /// 把「一行内的列区间 `[a, b)`」按软换行切成若干**视觉行**片段，
 /// 返回 `(视觉行序号, 起始列, 结束列)`（列号仍以逻辑行行首为 0）。
 ///
@@ -301,16 +529,23 @@ const PREVIEW_IMG_MAX_H: f32 = 880.0;
 
 /// 右侧编辑器可载入的**最大字数**（导入 .md / .txt 时生效）。
 ///
-/// 编辑器是「一行一个 GPUI 元素」的自绘文本框，几十万字一次性铺开会让首帧
-/// 布局与滚动全部变慢（不是崩，是拖）。故按字数截断并明确告知——宁可只校对
-/// 前 8 万字，也不让点一下导入就把界面拖住。
-const TEXT_MAX_CHARS: usize = 80_000;
+/// v1.9.69 起从 8 万字提到 **500 万字**：《資治通鑑》全本 ≈ 300 万字、《四庫全書》
+/// 单种多在 100 万字以内，这个门限足够装下「一整部书」而不用按卷拆。
+///
+/// 敢提这么高，是因为渲染已经不是「一行一个 div 全铺」了：`render_editor` 现在
+/// 只建**视口内那几十行**（行索引 + 前缀和，见 [`LineIndex`]），文本本身是
+/// 一份 `String`，滚动是 `ScrollHandle` 的像素偏移——几百万字和几千字在渲染
+/// 上没有任何区别。真正的成本只剩内存（500 万字 ≈ 15MB UTF-8）与一次 O(n)
+/// 的建索引。
+///
+/// 超过此数仍然**截断并明确告知**，绝不静默吞掉。再往上就该按卷导入了：
+/// 一亿字的东西不是「一本书」，而是「一个数据库」。
+const TEXT_MAX_CHARS: usize = 5_000_000;
 /// 导入文本的**硬上限**：超过直接拒绝，绝不把用户内存撑爆。
 ///
-/// 产品边界（用户 2026-11-01 定）：
+/// 产品边界（用户 2026-11-01 定，v1.9.69 复核）：
 /// ・**不做「大于 8MB 就不让进」**——大部头古籍扫描件转出来的纯文本动辄十几
-///   MB，一刀切拒绝等于「我的书导入不了」。8MB 只是**经验上的提示量级**，真正的
-///   判据是字数：超过 [`TEXT_MAX_CHARS`] 就截断，并明确告诉用户「只载入了前 N 字」。
+///   MB，一刀切拒绝等于「我的书导入不了」。判据永远是字数，不是字节。
 /// ・真正的闸门放在这里：64MB。再大就不是「一本书」了（多半是选错了文件，
 ///   或者是数据库 / 日志），读进来只会把内存和界面一起拖死。
 /// ・读盘按 `take(HARD + 1)` **流式**读，绝不先信 `metadata` 再整读——网络盘 /
@@ -868,6 +1103,17 @@ pub struct CollationWorkspace {
     ///（`replace_and_mark_text_in_range` 每次给的是整段新的候选串，不是增量）。
     /// 只有把「已上屏」与「正在组」分开存，才能一边保留已打的字、一边跟着候选走。
     find_marked: String,
+    /// **版式行索引**（v1.9.69）：百万字的虚拟列表就靠它。
+    ///
+    /// 只在「文本变了」或「版心列数变了」时重建（见 [`Self::ensure_line_index`]），
+    /// 之后每帧都是二分查找。没有它，滚动一帧就要扫一遍全本 + 建几万个 Vec 条目。
+    lines: LineIndex,
+    /// 文本代际：每次正文被替换 +1。行索引的失效键，也是「有没有真的改过字」的判据。
+    text_gen: u64,
+    /// 上一次落盘时的文本代际（v1.9.69）：**内容没变就绝不重写 15MB**。
+    saved_gen: u64,
+    /// 上一次落盘时的光标（同上，配合 `saved_gen` 判断「这次真的需要写吗」）。
+    saved_cursor: usize,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -1138,6 +1384,11 @@ impl CollationWorkspace {
             find_idx: 0,
             find_sel: None,
             find_marked: String::new(),
+            lines: LineIndex::default(),
+            // 从 1 起：0 是 `LineIndex::default()` 的哨兵值（表示「还没建过」）。
+            text_gen: 1,
+            saved_gen: 0,
+            saved_cursor: usize::MAX,
         };
         // ── v1.9.66：退出前强存（Exit Flush）────────────────────────────
         //
@@ -1168,7 +1419,104 @@ impl CollationWorkspace {
 
     // ── 选区 / 光标 / 编辑 ───────────────────────────────────────────────
 
+    /// **换正文的唯一入口**（v1.9.69）：写正文的同时把代际 +1，行索引随之失效。
+    ///
+    /// 为什么要一个入口而不是十处直接赋值：行索引一旦漏掉一次失效，屏幕上就会拿
+    /// **上一版文本**的几何去画这一版的字——表现为「打一个字，光标位置跳一下」，
+    /// 而且只在长文里出现，极难复查。收成一个函数，漏不掉。
+    fn set_text(&mut self, t: String) {
+        self.text = t;
+        self.text_gen = self.text_gen.wrapping_add(1);
+    }
+
+    /// 全文总字数（读索引里的缓存，O(1)）。
+    ///
+    /// 直接写 `self.text.chars().count()` 是百万字里最贵的一行——一帧里被调五六次
+    /// 就是几千万次字符解码，全花在「数一遍」上。
+    fn total_chars(&self) -> usize {
+        if self.index_valid() {
+            self.lines.total_chars
+        } else {
+            self.text.chars().count()
+        }
+    }
+
+    /// 行索引当前是否可用（文本代际 / 列数 / 模式三者全对）。
+    fn index_valid(&self) -> bool {
+        self.lines
+            .valid(self.text_gen, self.chars_per_line(self.viewport_w), self.show_diff)
+    }
+
+    /// **按需重建行索引**（v1.9.69）。只在 `render` 里调一次，任何读几何的函数
+    /// 都假定它已经就位。
+    fn ensure_line_index(&mut self) {
+        let cpl = self.chars_per_line(self.viewport_w);
+        if self.lines.valid(self.text_gen, cpl, self.show_diff) {
+            return;
+        }
+        let raw = if self.show_diff {
+            self.raw_text.as_deref()
+        } else {
+            None
+        };
+        self.lines = LineIndex::build(&self.text, raw, cpl, self.text_gen, self.show_diff);
+    }
+
+    /// **可见行窗口**（v1.9.69）：虚拟列表的核心一步，返回闭区间 `[first, last]`。
+    ///
+    /// 口径与 `render_line` / `caret_at` 完全同源（`ED_PAD` + `LINE_H` + 滚动偏移，
+    /// 向下滚为负），否则「画到屏幕上的行」和「光标该在的行」会错开，表现为
+    /// 页面一片空白或行号错位。上下各留两屏余量：快滚时先画上，不至于闪白。
+    fn visible_line_range(&self, row_h: f32) -> (usize, usize) {
+        let n = self.lines.lines();
+        if n == 0 {
+            return (0, 0);
+        }
+        let scroll = -px_f32(if self.show_diff {
+            self.diff_scroll.offset().y
+        } else {
+            self.scroll.offset().y
+        });
+        let vis_h = (row_h - self.head_band_h()).max(120.0);
+        let overscan = vis_h * 2.0;
+        let first_px = (scroll - ED_PAD - overscan).max(0.0);
+        let last_px = (scroll + vis_h + overscan).max(0.0);
+        let total = if self.show_diff {
+            self.lines.total_aligned()
+        } else {
+            self.lines.total_visual()
+        };
+        if total == 0 {
+            return (0, n - 1);
+        }
+        let last_v = ((last_px / LINE_H).ceil() as usize).min(total - 1);
+        let first_v = ((first_px / LINE_H).floor() as usize).min(last_v);
+        let (li0, li1) = if self.show_diff {
+            (
+                self.lines.line_at_aligned(first_v),
+                self.lines.line_at_aligned(last_v),
+            )
+        } else {
+            (
+                self.lines.line_at_visual(first_v),
+                self.lines.line_at_visual(last_v),
+            )
+        };
+        (li0.min(n - 1), li1.min(n - 1).max(li0.min(n - 1)))
+    }
+
+    /// 第 `li` 行的字符区间（索引可用走 O(1)，否则退回单趟扫）。
+    fn line_range(&self, li: usize) -> Option<(usize, usize)> {
+        if self.index_valid() {
+            return (li < self.lines.lines()).then(|| self.lines.char_range(li));
+        }
+        self.line_ranges().get(li).copied()
+    }
+
     /// `(start, end)` 每行字符区间（不含换行）。
+    ///
+    /// ⚠️ 冷路径专用（导入 / 兜底）。热路径一律走 [`Self::line_range`] 或
+    /// `self.lines`——这里每次调用都要 `split` + 建 Vec，几万行的稿子上就是几毫秒。
     fn line_ranges(&self) -> Vec<(usize, usize)> {
         let mut v = Vec::new();
         let mut start = 0usize;
@@ -1181,13 +1529,49 @@ impl CollationWorkspace {
     }
 
     fn line_of(&self, char_idx: usize) -> Option<usize> {
-        self.line_ranges()
-            .iter()
-            .position(|&(s, e)| char_idx >= s && char_idx <= e)
+        if self.index_valid() {
+            return self.lines.line_of(char_idx);
+        }
+        // 兜底：单趟扫，不建 Vec（旧实现这里会先 `line_ranges()` 再线性找）。
+        let mut start = 0usize;
+        for (i, line) in self.text.split('\n').enumerate() {
+            let len = line.chars().count();
+            if char_idx >= start && char_idx <= start + len {
+                return Some(i);
+            }
+            start += len + 1;
+        }
+        None
+    }
+
+    /// 字符下标 → **字节偏移**（v1.9.69）：让「插入一个字」不必再把全本倒进
+    /// `Vec<char>`（百万字 = 每次按键 20MB 分配 + 三次全量拷贝）。
+    ///
+    /// 走行索引：先落到行，再只扫这一行（≤ 版心列数个字），O(词长)。
+    fn byte_of_char(&self, char_idx: usize) -> usize {
+        if let Some(li) = self.line_of(char_idx) {
+            if self.index_valid() {
+                let (cs, _) = self.lines.char_range(li);
+                let (bs, be) = self.lines.byte_range(&self.text, li);
+                let off = char_idx.saturating_sub(cs);
+                let line = &self.text[bs..be];
+                return bs
+                    + line
+                        .char_indices()
+                        .nth(off)
+                        .map(|(b, _)| b)
+                        .unwrap_or(line.len());
+            }
+        }
+        // 兜底（索引未就绪 / 越界）：扫一遍。
+        self.text
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.text.len())
     }
 
     fn char_up(&self) -> usize {
-        let ranges = self.line_ranges();
         let idx = match self.line_of(self.cursor) {
             Some(i) => i,
             None => return self.cursor,
@@ -1195,36 +1579,44 @@ impl CollationWorkspace {
         if idx == 0 {
             return self.cursor;
         }
-        let col = self.cursor - ranges[idx].0;
-        let (ps, pe) = ranges[idx - 1];
-        (ps + col.min(pe - ps)).min(pe)
+        let Some((cs, _)) = self.line_range(idx) else {
+            return self.cursor;
+        };
+        let col = self.cursor - cs;
+        match self.line_range(idx - 1) {
+            Some((ps, pe)) => (ps + col.min(pe - ps)).min(pe),
+            None => self.cursor,
+        }
     }
 
     fn char_down(&self) -> usize {
-        let ranges = self.line_ranges();
         let idx = match self.line_of(self.cursor) {
             Some(i) => i,
             None => return self.cursor,
         };
-        if idx + 1 >= ranges.len() {
+        let Some((cs, _)) = self.line_range(idx) else {
             return self.cursor;
+        };
+        let col = self.cursor - cs;
+        match self.line_range(idx + 1) {
+            Some((ns, ne)) => (ns + col.min(ne - ns)).min(ne),
+            None => self.cursor,
         }
-        let col = self.cursor - ranges[idx].0;
-        let (ns, ne) = ranges[idx + 1];
-        (ns + col.min(ne - ns)).min(ne)
     }
 
     fn line_home(&mut self, shift: bool, cx: &mut Context<Self>) {
         if let Some(idx) = self.line_of(self.cursor) {
-            let (s, _) = self.line_ranges()[idx];
-            self.move_cursor_to(s, shift, cx);
+            if let Some((s, _)) = self.line_range(idx) {
+                self.move_cursor_to(s, shift, cx);
+            }
         }
     }
 
     fn line_end(&mut self, shift: bool, cx: &mut Context<Self>) {
         if let Some(idx) = self.line_of(self.cursor) {
-            let (_, e) = self.line_ranges()[idx];
-            self.move_cursor_to(e, shift, cx);
+            if let Some((_, e)) = self.line_range(idx) {
+                self.move_cursor_to(e, shift, cx);
+            }
         }
     }
 
@@ -1308,7 +1700,7 @@ impl CollationWorkspace {
         };
         let (text, cursor) =
             splice_chars(&self.text, op.pos, op.inserted.chars().count(), &op.removed);
-        self.text = text;
+        self.set_text(text);
         // 光标落在这段恢复文字之后（按下 ⌘Z 后接着打字的位置就是那里）。
         self.cursor = cursor;
         self.selection = None;
@@ -1328,7 +1720,7 @@ impl CollationWorkspace {
         };
         let (text, cursor) =
             splice_chars(&self.text, op.pos, op.removed.chars().count(), &op.inserted);
-        self.text = text;
+        self.set_text(text);
         self.cursor = cursor;
         self.selection = None;
         self.marked = None;
@@ -1344,14 +1736,18 @@ impl CollationWorkspace {
         if self.marked.is_some() {
             return;
         }
+        // ⚠️ 全部走**字节区间**（v1.9.69）：旧实现每次按键都 `self.text.chars()
+        //    .collect::<Vec<char>>()`，百万字就是每按一次分配 20MB 再拷贝三遍——
+        //    打一句话界面就卡成幻灯片。`replace_range` 只做一次 memmove。
         if let Some(sel) = self.selection.as_ref() {
             let (s, e) = (sel.start.min(sel.end), sel.start.max(sel.end));
-            let chars: Vec<char> = self.text.chars().collect();
-            let s = s.min(chars.len());
-            let e = e.min(chars.len()).max(s);
-            let removed: String = chars[s..e].iter().collect();
-            let kept: String = chars[..s].iter().chain(&chars[e..]).collect();
-            self.text = kept;
+            let total = self.total_chars();
+            let s = s.min(total);
+            let e = e.min(total).max(s);
+            let (bs, be) = (self.byte_of_char(s), self.byte_of_char(e));
+            let removed: String = self.text[bs..be].to_string();
+            self.text.replace_range(bs..be, "");
+            self.text_gen = self.text_gen.wrapping_add(1);
             self.cursor = s;
             self.selection = None;
             // 删选区是「一次性动作」：不参与合并，按一次 ⌘Z 整段回来。
@@ -1360,20 +1756,28 @@ impl CollationWorkspace {
             self.touch(cx);
             return;
         }
-        let total = self.text.chars().count();
+        let total = self.total_chars();
         if forward {
             if self.cursor < total {
-                let chars: Vec<char> = self.text.chars().collect();
-                let removed: String = chars[self.cursor].to_string();
-                self.text = chars[..self.cursor].iter().chain(&chars[self.cursor + 1..]).collect();
+                let (b0, b1) = (
+                    self.byte_of_char(self.cursor),
+                    self.byte_of_char(self.cursor + 1),
+                );
+                let removed: String = self.text[b0..b1].to_string();
+                self.text.replace_range(b0..b1, "");
+                self.text_gen = self.text_gen.wrapping_add(1);
                 self.record_edit(self.cursor, removed, String::new(), EditKind::Delete);
                 cx.notify();
                 self.touch(cx);
             }
         } else if self.cursor > 0 {
-            let chars: Vec<char> = self.text.chars().collect();
-            let removed: String = chars[self.cursor - 1].to_string();
-            self.text = chars[..self.cursor - 1].iter().chain(&chars[self.cursor..]).collect();
+            let (b0, b1) = (
+                self.byte_of_char(self.cursor - 1),
+                self.byte_of_char(self.cursor),
+            );
+            let removed: String = self.text[b0..b1].to_string();
+            self.text.replace_range(b0..b1, "");
+            self.text_gen = self.text_gen.wrapping_add(1);
             self.cursor -= 1;
             self.record_edit(self.cursor, removed, String::new(), EditKind::Backspace);
             cx.notify();
@@ -1387,13 +1791,16 @@ impl CollationWorkspace {
             Some(sel) => (sel.start.min(sel.end), sel.start.max(sel.end)),
             None => (self.cursor, self.cursor),
         };
-        let mut chars: Vec<char> = self.text.chars().collect();
-        let a = a.min(chars.len());
-        let b = b.min(chars.len()).max(a);
-        let replaced: String = chars[a..b].iter().collect();
-        chars.splice(a..b, s.chars());
-        self.text = chars.into_iter().collect();
-        self.cursor = (a + s.chars().count()).min(self.text.chars().count());
+        let total = self.total_chars();
+        let a = a.min(total);
+        let b = b.min(total).max(a);
+        // 字节区间 + `replace_range`（v1.9.69）：见 `delete_char` 的注释。
+        let (bs, be) = (self.byte_of_char(a), self.byte_of_char(b));
+        let replaced: String = self.text[bs..be].to_string();
+        let s_n = s.chars().count();
+        self.text.replace_range(bs..be, s);
+        self.text_gen = self.text_gen.wrapping_add(1);
+        self.cursor = a + s_n;
         self.selection = None;
         // 逐字键入（含回车）走 `Insert`，可与前后连打合并成一步；
         // 整段粘贴 / AI 补全一次进一大块，走 `Once` 独立成步——否则「粘一页、
@@ -1418,8 +1825,7 @@ impl CollationWorkspace {
     fn wrap_selection(&mut self, open: &str, close: &str, cx: &mut Context<Self>) {
         // 先把这次替换的「旧串 / 新串」算出来（撤销栈只认这一对），再交给
         // `wrap_text` 做真活——两边口径必须同源，否则撤销会错位一个字。
-        let chars: Vec<char> = self.text.chars().collect();
-        let total = chars.len();
+        let total = self.total_chars();
         let (a, b) = match self.selection.clone() {
             Some(r) if r.start != r.end => (
                 r.start.min(r.end).min(total),
@@ -1430,10 +1836,10 @@ impl CollationWorkspace {
                 (c, c)
             }
         };
-        let removed: String = chars[a..b].iter().collect();
+        let removed: String = self.text[self.byte_of_char(a)..self.byte_of_char(b)].to_string();
         let inserted = format!("{open}{removed}{close}");
         let (text, cursor) = wrap_text(&self.text, self.selection.clone(), self.cursor, open, close);
-        self.text = text;
+        self.set_text(text);
         self.cursor = cursor;
         self.selection = None;
         self.record_edit(a, removed, inserted, EditKind::Once);
@@ -1962,48 +2368,61 @@ impl CollationWorkspace {
             )
     }
 
-    fn render_selection_bar(
-        &self,
-        vw: f32,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::Div> {
+    /// **选区旁的悬浮钮**（v1.9.54 立项，v1.9.69 重定位）。
+    ///
+    /// ## 回归事故记录（必读，别再把坐标写回「相对编辑器」）
+    /// v1.9.68 给编辑器面板加 `.overflow_hidden()` 之后，这枚气泡**整颗消失**。
+    /// 根因是坐标写法本身错了两处，只是以前面板不裁切、错位也还看得见：
+    ///   ① `- scroll_y` 是**双重否定**——`scroll.offset().y` 向下滚已经是负数，
+    ///      再取反等于「滚 300px、气泡往下跑 600px」。一滚就飘出屏幕，裁切一来即消失。
+    ///   ② 高度只数了 `est_wrapped_lines`，**没算对照模式每段的等高填充**；
+    ///      改过几段之后，气泡就浮到选区上面几十行去。
+    /// 现在统一走 `editor_origin()`（全应用唯一的内容原点）+ 行索引前缀和：
+    /// 气泡位置 = 原点 + (对齐后的视觉行 + 1) × 行高，滚动偏移由原点自带，
+    /// 不再手工加减。最后再夹进右栏矩形——**任何情况下都不会算到屏幕外**。
+    ///
+    /// 它现在挂在**根节点**（[`Self::render`]），是全屏最后一层：编辑器的
+    /// `overflow_hidden`、标点栏、识别队列都盖不住它。模态浮层（预览 / 问小笺卡 /
+    /// 覆盖确认）仍压在它上面，那是刻意的。
+    fn render_selection_bar(&self, vw: f32, vh: f32, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let sel = self.selection.as_ref()?;
         if sel.start == sel.end {
             return None;
         }
-        let total = self.text.chars().count();
-        let end = sel.end.max(sel.start).min(total);
+        // 预览 / 覆盖确认开着时不浮（那两层是模态，气泡没有意义还挡字）。
+        if self.show_preview || self.replace_confirm {
+            return None;
+        }
+        let end = sel.end.max(sel.start).min(self.total_chars());
         let li = self.line_of(end)?;
-        let (line_start, _) = *self.line_ranges().get(li)?;
+        let (line_start, _) = self.line_range(li)?;
         let col = end.saturating_sub(line_start);
-        // v1.9.63：对照模式滚在 `diff_scroll`，选区气泡 y 坐标口径同步。
-        let scroll_y = px_f32(if self.show_diff {
-            self.diff_scroll.offset().y
+        let cpl = self.chars_per_line(vw).max(1);
+        // 视觉行 = 该行之前累计的视觉行数 + 行内第几折行。对照模式用**对齐后**
+        // 的前缀和（每段取两栏行数的较大者），否则填充会把气泡顶到选区上方。
+        let visual_before = if self.show_diff {
+            self.lines.aligned.get(li).copied().unwrap_or(0)
         } else {
-            self.scroll.offset().y
-        });
-        let panel_w = vw - self.left_col_w(vw);
-        // 气泡贴选区末行的下一行；右缘留 8px，越界则往回顶。
-        //
-        // ⚠️ 行距要按**视觉行**算（v1.9.67）：`li` 是逻辑行号，软换行后一个逻辑行
-        // 可能占两三屏行——直接用 `li * LINE_H` 会让气泡浮到选区上方好几行去。
-        let cpl = self.chars_per_line(vw);
-        let visual_before: usize = self
-            .text
-            .split('\n')
-            .take(li)
-            .map(|l| est_wrapped_lines(l, cpl))
-            .sum();
+            self.lines.vis.get(li).copied().unwrap_or(0)
+        };
+        let visual_idx = visual_before + col / cpl;
         let col_in_visual = col % cpl;
-        let visual_here = col / cpl;
-        let x = (ED_PAD + col_in_visual as f32 * self.char_adv() + 4.0)
-            .min((panel_w - 108.0).max(ED_PAD));
-        let y = (ED_PAD + (visual_before + visual_here + 1) as f32 * LINE_H - scroll_y + 4.0).max(4.0);
+        // 唯一原点（含 left_col_w / 顶栏 / 状态条 / 滚动偏移）。
+        let (ox, oy) = self.editor_origin(vw);
+        const BAR_W: f32 = 66.0;
+        const BAR_H: f32 = 24.0;
+        let panel_l = self.left_col_w(vw);
+        let panel_t = HEADER_H + self.head_band_h();
+        // 贴选区末行的**下一行**；越界一律夹进右栏矩形（见 `clamp_bar_pos`）。
+        let (bx, by) = bar_anchor((ox, oy), visual_idx, col_in_visual, self.char_adv());
+        let (x, y) = clamp_bar_pos(bx, by, vw, vh, panel_l, panel_t, BAR_W, BAR_H);
         Some(
             div()
                 .absolute()
                 .left(px(x))
                 .top(px(y))
+                // `occlude`：这一小块必须挡住下面的编辑器，否则点「问小笺」
+                // 会先落一次光标、把选区清掉，随后的 ask_ai 就拿到空选区。
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2362,20 +2781,31 @@ impl CollationWorkspace {
         }
         let vw = self.viewport_w;
         let cpl = self.chars_per_line(vw);
-        let total = self.text.chars().count();
+        let total = self.total_chars();
         let cursor = self.cursor.min(total);
-        let mut visual_before = 0usize;
-        let mut start = 0usize;
-        for line in self.text.split('\n') {
-            let len = line.chars().count();
-            if cursor <= start + len {
-                break;
+        // 视觉行号走行索引（v1.9.69）：旧实现每敲一个字都 `split('\n')` 全本扫一遍，
+        // 百万字就是「每打一个字扫五百万次」——光标跟随还没到，键盘已经卡了。
+        let visual_line = if self.index_valid() {
+            match self.lines.line_of(cursor) {
+                Some(li) => {
+                    let (cs, _) = self.lines.char_range(li);
+                    self.lines.vis[li] + cursor.saturating_sub(cs) / cpl
+                }
+                None => 0,
             }
-            visual_before += est_wrapped_lines(line, cpl);
-            start += len + 1;
-        }
-        let col = cursor.saturating_sub(start);
-        let visual_line = visual_before + col / cpl;
+        } else {
+            let mut visual_before = 0usize;
+            let mut start = 0usize;
+            for line in self.text.split('\n') {
+                let len = line.chars().count();
+                if cursor <= start + len {
+                    break;
+                }
+                visual_before += est_wrapped_lines(line, cpl);
+                start += len + 1;
+            }
+            visual_before + cursor.saturating_sub(start) / cpl
+        };
         let top = ED_PAD + visual_line as f32 * LINE_H;
         let bottom = top + LINE_H;
         let view_h = self.editor_view_h();
@@ -2539,21 +2969,47 @@ impl CollationWorkspace {
     /// 换算本身在 [`caret_at`]（纯函数，已覆盖折行 / 越界 / 空文单测）。
     fn caret_from_point(&self, x: f32, y: f32, vw: f32) -> usize {
         let (origin_x, origin_y) = self.editor_origin(vw);
-        caret_at(
-            &self.text,
-            self.chars_per_line(vw),
-            self.char_adv(),
-            (x - origin_x).max(0.0),
-            (y - origin_y).max(0.0),
-        )
+        let local_x = (x - origin_x).max(0.0);
+        let local_y = (y - origin_y).max(0.0);
+        let cpl = self.chars_per_line(vw);
+        let adv = self.char_adv();
+        // 快路径（v1.9.69）：行索引在就二分定位，O(log n) + O(行内)。
+        // 慢路径（索引未就绪）退回 `caret_at`，与它逐字同源，绝不两套算法。
+        if self.index_valid() {
+            let visual = (local_y / LINE_H).floor() as usize;
+            let col_in_visual = ((local_x / adv) + 0.5).floor() as usize;
+            // 对照模式的段落填充会凭空多出空行，故视觉行坐标系要换成 `aligned`。
+            let (total, li) = if self.show_diff {
+                (
+                    self.lines.total_aligned(),
+                    self.lines.line_at_aligned(visual),
+                )
+            } else {
+                (
+                    self.lines.total_visual(),
+                    self.lines.line_at_visual(visual),
+                )
+            };
+            if visual >= total {
+                return self.lines.total_chars;
+            }
+            let (cs, ce) = self.lines.char_range(li);
+            let base = if self.show_diff {
+                self.lines.aligned[li]
+            } else {
+                self.lines.vis[li]
+            };
+            let in_line = visual.saturating_sub(base);
+            return cs + (in_line * cpl + col_in_visual).min(ce - cs);
+        }
+        caret_at(&self.text, cpl, adv, local_x, local_y)
     }
 
     /// 双击选「句」：以 `pos` 为中心，向前后扩张到最近的句读 / 空白边界，
     /// 返回 `[start, end)` 字符区间。CJK 无空格分词，故以常见句读、括号、引号、
     /// 换行及空白作为句界——双击一次即选中光标所在的整句（而非整段）。
     fn sentence_bounds(&self, pos: usize) -> (usize, usize) {
-        let chars: Vec<char> = self.text.chars().collect();
-        let total = chars.len();
+        let total = self.total_chars();
         let p = pos.min(total);
         let delim = |c: char| -> bool {
             c.is_whitespace()
@@ -2578,19 +3034,30 @@ impl CollationWorkspace {
                         | '\n'
                 )
         };
-        let mut a = p;
+        // **只扫本行**（v1.9.69）：句界里含 `\n`，所以「句」永远落在一个逻辑行内。
+        // 旧实现把**整本**倒进 `Vec<char>` 再前后走——百万字双击一次就是 20MB
+        // 分配 + 五百万次解码，双击能明显顿一下。现在最多扫一整行（几十字）。
+        let (ls, le) = match self.line_of(p) {
+            Some(li) => self.line_range(li).unwrap_or((0, total)),
+            None => (0, total),
+        };
+        let local_text = &self.text[self.byte_of_char(ls)..self.byte_of_char(le)];
+        let chars: Vec<char> = local_text.chars().collect();
+        let n = chars.len();
+        let lp = p.saturating_sub(ls).min(n);
+        let mut a = lp;
         while a > 0 && !delim(chars[a - 1]) {
             a -= 1;
         }
-        let mut b = p;
-        while b < total && !delim(chars[b]) {
+        let mut b = lp;
+        while b < n && !delim(chars[b]) {
             b += 1;
         }
         // 落在标点 / 空白上（区间为空）时，退而选中该单字，避免「双击无反应」。
-        if a == b && p < total {
-            b = p + 1;
+        if a == b && lp < n {
+            b = lp + 1;
         }
-        (a, b)
+        (ls + a, ls + b)
     }
 
     /// 右文**某一行的行身**被点中：落光标 + 直连左图联动。
@@ -3454,7 +3921,9 @@ impl CollationWorkspace {
             crate::types::FontChoice::WenJinMincho,
             crate::types::Script::Ancient,
         );
-        let raw = self.raw_text.clone().unwrap_or_default();
+        // ⚠️ 不再 `self.raw_text.clone()`（v1.9.69）：几十万字的稿子，每帧复制一份
+        //    就是每帧几 MB 的 memcpy，纯浪费。借引用即可。
+        let raw: &str = self.raw_text.as_deref().unwrap_or("");
         let mut content = div().w_full().flex().flex_col();
         // 顶部一条标签：明确这是「未清洗」的毛坯，与右栏的清洗后正文区分。
         content = content.child(
@@ -3471,25 +3940,70 @@ impl CollationWorkspace {
         // v1.9.63：段落对齐（防错位，极重要）。清洗会增减字数，若左右各滚各的、
         // 只按「总高」同步，段落必然越滚越错。做法：把每一段（按 \n 切）当对齐单元，
         // 两侧各段都填充到「同一段在两栏里较高的那个行数」→ 第 i 段永远停在同一个 y，
-        // 零漂移。两侧等宽（各 vw*0.5）、同字体同字号同行距，段内行数用「字数 ÷ 每行字数」
-        // 估（对中文近似足够准）；极淡浅色底纹逐段勾出左右对应，眼睛不丢。
-        let cpl = ((self.left_col_w(vw) - 2.0 * ED_PAD) / CHAR_W)
-            .max(1.0)
-            .floor() as usize;
-        let raw_segs: Vec<&str> = raw.split('\n').collect();
-        let clean_segs: Vec<&str> = self.text.split('\n').collect();
-        for (i, seg) in raw_segs.iter().enumerate() {
-            let clean_seg = clean_segs.get(i).copied().unwrap_or("");
-            let seg_lines = est_wrapped_lines(seg, cpl);
-            let clean_lines = est_wrapped_lines(clean_seg, cpl);
-            let max_lines = seg_lines.max(clean_lines);
+        // 零漂移。两侧等宽（各 vw*0.5）、同字体同字号同行距。
+        //
+        // **虚拟列表**（v1.9.69）：左栏与右栏用**同一份**行索引、同一套对齐前缀和，
+        // 只画视口内的段，其余用等高空白撑住。百万字时「左栏全铺」和「右栏全铺」
+        // 一样致命——而对照模式恰恰是大部头校对最常用的视图。
+        const VIRTUALIZE_ABOVE: usize = 160;
+        let n_lines = self.lines.lines();
+        if !self.index_valid() || n_lines == 0 {
+            // 兜底（索引未就绪，理论上进不来）：只铺前 200 段，绝不整本铺。
+            // 宁可少显示，也不能在这一条冷路径上把主线程拖死。
+            for (li, seg) in raw.split('\n').take(200).enumerate() {
+                let band = if li % 2 == 1 {
+                    rgba(0x2B26200A)
+                } else {
+                    rgba(0x2B262004)
+                };
+                content = content.child(
+                    div()
+                        .w_full()
+                        .bg(band)
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .whitespace_normal()
+                                .text_size(px(FONT_SIZE))
+                                .text_color(rgb(0x333333))
+                                .font_family(song.clone())
+                                .line_height(px(LINE_H))
+                                .child(SharedString::from(seg.to_string())),
+                        ),
+                );
+            }
+            return self.render_raw_pane_frame(vw, content);
+        }
+        let panel_h = (self.viewport_h - HEADER_H).max(120.0);
+        let (li0, li1) = if n_lines <= VIRTUALIZE_ABOVE {
+            (0, n_lines - 1)
+        } else {
+            self.visible_line_range(panel_h)
+        };
+        let top_lines = self.lines.aligned[li0];
+        let total_lines = self.lines.total_aligned();
+        let bot_lines = total_lines.saturating_sub(
+            self.lines
+                .aligned
+                .get(li1 + 1)
+                .copied()
+                .unwrap_or(total_lines),
+        );
+        if top_lines > 0 {
+            content = content.child(div().w_full().h(px(top_lines as f32 * LINE_H)));
+        }
+        for li in li0..=li1 {
+            let seg = self.lines.raw_line(raw, li);
+            let seg_lines = est_wrapped_lines(seg, self.lines.cpl);
+            let max_lines = self.lines.aligned[li + 1] - self.lines.aligned[li];
             // 极淡浅色底纹：逐段勾出左右对应（隔段略深一档，便于眼睛定位）。
-            let band = if i % 2 == 1 {
+            let band = if li % 2 == 1 {
                 rgba(0x2B26200A)
             } else {
                 rgba(0x2B262004)
             };
-            let pad = (max_lines - seg_lines) as f32 * LINE_H;
+            let pad = max_lines.saturating_sub(seg_lines) as f32 * LINE_H;
             content = content.child(
                 div()
                     .w_full()
@@ -3508,6 +4022,14 @@ impl CollationWorkspace {
                     .child(div().h(px(pad))), // 填充到与右栏同段等高 → 段落对齐
             );
         }
+        if bot_lines > 0 {
+            content = content.child(div().w_full().h(px(bot_lines as f32 * LINE_H)));
+        }
+        self.render_raw_pane_frame(vw, content)
+    }
+
+    /// 左栏（毛坯）的骨架：宽度、底色、滚动柄、内边距。内容由调用方给。
+    fn render_raw_pane_frame(&self, vw: f32, content: gpui::Div) -> gpui::Div {
         div()
             .w(px(self.left_col_w(vw)))
             .h_full()
@@ -4221,7 +4743,7 @@ impl CollationWorkspace {
         cx: &mut Context<Self>,
     ) {
         // 重置与「上一本书」相关的全部状态（文本 / 图像 / 联动 / 翻页缓存）。
-        self.text = text;
+        self.set_text(text);
         // 毛坯文本：供【原文对照】展示。重新进书时清空旧值，避免上一本的
         // 脏数据残留到这一本（没图的书 raw 来自重新解析源文件）。
         // ⚠️ 纯文本模式（无图、`source_path` 非 PDF/PNG 或为空）时上游传来的
@@ -4263,7 +4785,7 @@ impl CollationWorkspace {
         if let Some(sid) = store_id {
             if let Some(saved) = jiandu_core::store::get_collation_state(&sid) {
                 if !saved.full_text.is_empty() {
-                    self.text = saved.full_text;
+                    self.set_text(saved.full_text);
                 }
                 self.show_diff = saved.show_diff;
                 self.cursor = saved.cursor.min(self.text.chars().count());
@@ -4329,6 +4851,9 @@ impl CollationWorkspace {
             updated_at: now,
         };
         let _ = jiandu_core::store::put_collation_state(&conn, &state);
+        // 强存也算「已落盘」，否则退出前刚写过的内容会被防抖任务再写一遍。
+        self.saved_gen = self.text_gen;
+        self.saved_cursor = self.cursor;
     }
 
     fn touch(&mut self, cx: &mut Context<Self>) {
@@ -4355,6 +4880,18 @@ impl CollationWorkspace {
                             if gen != ws.save_gen {
                                 return None;
                             }
+                            // **内容没变就不写**（v1.9.69）：`collation_state` 是
+                            // 单行 `INSERT OR REPLACE`，几百万字一次就是 15MB
+                            // 序列化 + 写盘。拖选收尾、点一下、滚动一下都会走
+                            // `touch`——只为挪个光标就把整本书重写一遍毫无意义，
+                            // 而且主线程上还要先 `clone` 出那 15MB。
+                            if ws.text_gen == ws.saved_gen && ws.cursor == ws.saved_cursor {
+                                return None;
+                            }
+                            // 记账要在**同一帧**里做：写盘在后台，等它回来再记
+                            // 就可能被下一轮 touch 抢先，重复写第二次。
+                            ws.saved_gen = ws.text_gen;
+                            ws.saved_cursor = ws.cursor;
                             Some((
                                 ws.text.clone(),
                                 ws.show_diff,
@@ -4367,7 +4904,7 @@ impl CollationWorkspace {
                     let Ok(Some((text, show_diff, cursor, scroll_y))) = snapshot else {
                         return;
                     };
-                    // 落盘扔后台线程：一条 REPLACE 最多写 ≈1MB（百万字），别卡主线程。
+                    // 落盘扔后台线程：一条 REPLACE 最多写 ≈15MB（500 万字），别卡主线程。
                     let _ = exec
                         .spawn(async move {
                             if let Ok(conn) = jiandu_core::store::connect() {
@@ -4424,7 +4961,7 @@ impl CollationWorkspace {
                         let _ = entity.update(&mut app, |this, cx| {
                             match res {
                                 Ok((body, note)) => {
-                                    this.text = body.clone();
+                                    this.set_text(body.clone());
                                     // 手选文件：Raw 与清洗后同源（导入即未清洗），
                                     // 让【原文对照】仍然可用且一致；同时清掉旧稿残留。
                                     this.raw_text = Some(body);
@@ -6142,106 +6679,89 @@ impl CollationWorkspace {
         //  ③ 文本段 `flex_1 + min_w(0)`：flex item 默认 `min-width:auto` 会拒绝
         //     收缩，是「中文长行不肯折、直接冲出右边」的经典死因。
         let mut content = div().w_full().flex().flex_col();
-        let mut char_start = 0usize;
-        // 行号 `li` 在渲染时就绑给每一行（见 `render_line` 的点击闭包），
-        // 这样「点第几行」是结构事实，不再靠鼠标坐标反推。
-        if self.show_diff {
-            // v1.9.63：对照模式（Diff）右栏段落对齐 + 差异高亮。
-            // 与左栏毛坯共用同一套「段落(按 \n 切)对齐」口径：两侧等宽(vw*0.5)、
-            // 同字体同字号同行距、段内行数按 `chars ÷ cpl` 估，每段填充到
-            // `max(左段行数, 右段行数)` 等高 → 第 i 段在两栏永远停在同一 y，零漂移。
-            // 段落块内部仍走 `render_line`（光标 / 选区 / 打字全部保留），只是整体
-            // 包进带底色的块 + 尾部等高填充，编辑交互不受任何影响。
-            // 「差异高亮」：本段被清洗引擎修改过（raw_seg != clean_seg）→ 极弱朱砂底，
-            // 一眼看出哪些段被改了；未改动段沿用与左栏一致的隔段浅色底纹（眼睛不丢）。
-            let cpl = self.chars_per_line(vw);
-            let raw_text = self.raw_text.clone().unwrap_or_default();
-            let raw_segs: Vec<&str> = raw_text.split('\n').collect();
-            let clean_segs: Vec<&str> = self.text.split('\n').collect();
-            for (i, seg) in clean_segs.iter().copied().enumerate() {
-                let raw_seg = raw_segs.get(i).copied().unwrap_or("");
-                let seg_lines = est_wrapped_lines(seg, cpl);
-                let raw_lines = est_wrapped_lines(raw_seg, cpl);
-                let max_lines = seg_lines.max(raw_lines);
-                let band = if raw_seg != seg {
-                    rgba(0x8c2b221A) // 差异高亮：本段被清洗引擎改动过
-                } else if i % 2 == 1 {
-                    rgba(0x2B26200A) // 隔段浅色底纹（与左栏一致）
+        // ── **虚拟列表**（v1.9.69，百万字的主命门）──────────────────────────
+        //
+        // 三条铁律（改这里之前先读完）：
+        //  ① **只建可见行**：一帧最多建「视口高 ÷ 行高 + 4 屏余量」个行元素。
+        //     百万字 ≈ 几万行，全建的话光 hitbox 就是几万个，点一下鼠标要重排
+        //     整套树——那不是慢，是死。
+        //  ② **总高必须一分不差**：视口外的行用等高空白（skip / tail）撑住，
+        //     于是 `scroll_max`、滚动条长度、`caret_at` 的全局坐标全都不变。
+        //     少一像素，滚动条就会「跳」。
+        //  ③ **几何只问行索引**：`self.lines` 里的前缀和是唯一真相。绝不在渲染里
+        //     再 `split('\n')` 一遍——那是 O(全文) × 每帧。
+        //
+        // 少于此数就直接全画：稿子只有一两屏时，窗口化省不到什么，反而多一层风险。
+        const VIRTUALIZE_ABOVE: usize = 160;
+        let n_lines = self.lines.lines();
+        if self.index_valid() && n_lines > 0 {
+            // ① 定位可见窗口（二分）。
+            let (li0, li1) = if n_lines <= VIRTUALIZE_ABOVE {
+                (0, n_lines - 1)
+            } else {
+                self.visible_line_range(row_h)
+            };
+            // ② 顶部 / 底部占位（`aligned` 在非对照模式下等于 `vis`）。
+            let top_lines = if self.show_diff {
+                self.lines.aligned[li0]
+            } else {
+                self.lines.vis[li0]
+            };
+            let total_lines = if self.show_diff {
+                self.lines.total_aligned()
+            } else {
+                self.lines.total_visual()
+            };
+            let bot_lines = total_lines.saturating_sub(if li1 + 1 < self.lines.aligned.len() {
+                if self.show_diff {
+                    self.lines.aligned[li1 + 1]
                 } else {
-                    rgba(0x2B262004)
-                };
-                let pad = (max_lines - seg_lines) as f32 * LINE_H;
-                content = content.child(
-                    div()
-                        .w_full()
-                        .bg(band)
-                        .child(self.render_line(seg, char_start, i, vw, cx))
-                        .child(div().h(px(pad))), // 等高填充 → 段落对齐
-                );
-                char_start += seg.chars().count() + 1;
-            }
-        } else {
-            // ── **行窗口化**（v1.9.68，用户点名的「局部重绘」）────────────────
-            //
-            // 旧实现每次 `cx.notify()` 都把**整本**正文铺成 div：三百万字 ≈ 几万行
-            // ≈ 几万个元素 + 几万个 hitbox。点一下鼠标要重排这一切，光标自然「慢
-            // 半拍才出现」；滚动时更是一帧建几万个节点。
-            //
-            // 现在只建**视口内的行**（上下各留两屏余量，快速滚动不露白），
-            // 视口外的行用等高的空白占位撑住总高度——滚动条长度、`scroll_max`、
-            // `caret_at` 的全局坐标全都不变，只是不建元素。
-            // 少于此数就直接全画：稿子只有一屏时，窗口化省不到什么，反而多一层风险。
-            const VIRTUALIZE_ABOVE: usize = 160;
-            let lines: Vec<&str> = self.text.split('\n').collect();
-            let cpl = self.chars_per_line(vw);
-            if lines.len() <= VIRTUALIZE_ABOVE {
-                for (li, line) in lines.iter().enumerate() {
-                    let lc = line.chars().count();
-                    content = content.child(self.render_line(line, char_start, li, vw, cx));
-                    char_start += lc + 1;
+                    self.lines.vis[li1 + 1]
                 }
             } else {
-                let scroll_y = -px_f32(if self.show_diff {
-                    self.diff_scroll.offset().y
-                } else {
-                    self.scroll.offset().y
-                });
-                let vis_h = (row_h - self.head_band_h()).max(120.0);
-                // 上下各两屏余量：够快滚时先画上，不至于闪一下白。
-                let overscan = vis_h * 2.0;
-                let top_px = (scroll_y - ED_PAD - overscan).max(0.0);
-                let bot_px = (scroll_y + vis_h + overscan).max(0.0);
-                let first_vis = (top_px / LINE_H).floor() as usize;
-                let last_vis = (bot_px / LINE_H).ceil() as usize;
-
-                let mut visual = 0usize;
-                let mut skip_h = 0.0f32;
-                let mut tail_h = 0.0f32;
-                // (行号, 行文本, 该行在全文的字符起点)
-                let mut visible: Vec<(usize, &str, usize)> = Vec::new();
-                for (li, line) in lines.iter().enumerate() {
-                    let lc = line.chars().count();
-                    let vlines = est_wrapped_lines(line, cpl);
-                    let v_end = visual + vlines;
-                    if v_end <= first_vis {
-                        skip_h += vlines as f32 * LINE_H;
-                    } else if visual > last_vis {
-                        tail_h += vlines as f32 * LINE_H;
+                total_lines
+            });
+            if top_lines > 0 {
+                content = content.child(div().w_full().h(px(top_lines as f32 * LINE_H)));
+            }
+            // ③ 只画窗口内的行。
+            let raw_owned;
+            let raw: &str = if self.show_diff {
+                raw_owned = self.raw_text.as_deref().unwrap_or("");
+                raw_owned
+            } else {
+                ""
+            };
+            for li in li0..=li1 {
+                let seg = self.lines.line_str(&self.text, li);
+                let cs = self.lines.char_start[li];
+                if self.show_diff {
+                    // v1.9.63：段落对齐 + 差异高亮。段内仍走 `render_line`（光标 /
+                    // 选区 / 打字全部保留），只是外面包一层带底色的块 + 尾部填充。
+                    let raw_seg = self.lines.raw_line(raw, li);
+                    let seg_lines = self.lines.vis[li + 1] - self.lines.vis[li];
+                    let max_lines = self.lines.aligned[li + 1] - self.lines.aligned[li];
+                    let band = if raw_seg != seg {
+                        rgba(0x8c2b221A) // 本段被清洗引擎改过 → 极弱朱砂底
+                    } else if li % 2 == 1 {
+                        rgba(0x2B26200A)
                     } else {
-                        visible.push((li, line, char_start));
-                    }
-                    visual = v_end;
-                    char_start += lc + 1;
+                        rgba(0x2B262004)
+                    };
+                    let pad = max_lines.saturating_sub(seg_lines) as f32 * LINE_H;
+                    content = content.child(
+                        div()
+                            .w_full()
+                            .bg(band)
+                            .child(self.render_line(seg, cs, li, vw, cx))
+                            .child(div().h(px(pad))),
+                    );
+                } else {
+                    content = content.child(self.render_line(seg, cs, li, vw, cx));
                 }
-                if skip_h > 0.0 {
-                    content = content.child(div().w_full().h(px(skip_h)));
-                }
-                for (li, line, cs) in visible {
-                    content = content.child(self.render_line(line, cs, li, vw, cx));
-                }
-                if tail_h > 0.0 {
-                    content = content.child(div().w_full().h(px(tail_h)));
-                }
+            }
+            if bot_lines > 0 {
+                content = content.child(div().w_full().h(px(bot_lines as f32 * LINE_H)));
             }
         }
         // 用 `InputField` 包裹，使其在获得焦点时把 IME 回传中文接住。
@@ -6337,10 +6857,6 @@ impl CollationWorkspace {
             // ⚠️ 只能挂这一处：内层若也挂，退格一次会删两个字。
             .on_key_down(cx.listener(|c, event, _window, cx| c.handle_key(event, cx)))
             .child(editor);
-        // 选区悬浮钮（问小笺）叠在编辑器之上：`relative` 容器 + 绝对定位气泡，
-        // 气泡是**滚动视口之外**的兄弟节点（不随滚动位移），故 y 要自己减
-        // `scroll.offset()`（见 `render_selection_bar` 的坐标口径）。
-        //
         // `min_h(px(0.0))`：wrap 是右栏 flex 列里的 `flex_1` 子项，不带它就
         // 会被正文撑到「内容高度」。**v1.9.65 起右栏本身已是绝对像素高**，
         // flex 分配必出确定值；wrap 同时改 flex 列，让 scroll_view 的
@@ -6349,7 +6865,12 @@ impl CollationWorkspace {
         // **拖选监听挂在面板层**（v1.9.67）：拖到正文内容盒之外（短稿的下方空白、
         // 或横向拖出一点）仍要继续扩选。挂在内容盒上会因为「鼠标离开了该 hitbox」
         // 而中断；挂在铺满面板的这一层，手感才连续。
-        let mut wrap = div()
+        //
+        // ⚠️ **选区悬浮钮不在这里**（v1.9.69）：它已提到根节点（见 `render`）。
+        //    留在这一层会被本层的 `overflow_hidden` 裁掉——v1.9.68 起「问小笺
+        //    气泡整颗消失」的直接原因。气泡的显示条件只看 `self.selection`，
+        //    与它挂在哪一层无关，故搬走不影响触发。
+        div()
             .relative()
             .flex()
             .flex_col()
@@ -6364,18 +6885,17 @@ impl CollationWorkspace {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|c, _, _, cx| {
+                    // **拖选收尾**（v1.9.69）：清拖拽态 → 落盘一次 → 重绘。
+                    // 重绘是必须的：气泡的显示条件虽然是 `selection`，但拖拽过程中
+                    // 的最后一帧可能还没画到（mousemove 被 3px 死区吃掉），
+                    // 抬起时补一次 notify，保证「松手即见气泡」。
                     c.dragging = false;
                     c.drag_origin = None;
-                    // 拖选结束才落盘一次（拖拽过程中的高频 notify 不写库）。
                     c.touch(cx);
                     cx.notify();
                 }),
             )
-            .child(scroll_view);
-        if let Some(bar) = self.render_selection_bar(vw, cx) {
-            wrap = wrap.child(bar);
-        }
-        wrap
+            .child(scroll_view)
     }
 
     /// 竖排预览浮层：把转录文本离屏栅格化成「笺读风」竖排书页，`gpui::img` 贴图。
@@ -7069,6 +7589,10 @@ impl Render for CollationWorkspace {
                 self.frame_count, self.show_preview, self.preview_busy
             );
         }
+        // **行索引就位**（v1.9.69）：必须在任何读几何 / 建行的代码之前。
+        // 它只在「文本变了 / 版心列数变了 / 对照开关变了」时真重建，其余帧是
+        // 一次整数比较——百万字的稿子，这一行把每帧 O(全文) 变成 O(1)。
+        self.ensure_line_index();
         // 焦点归属：预览开启时把焦点引到 `preview_focus`，使其落在「根元素」派发
         // 路径上 → 根 div 的 `on_key_down` 能收到 ←/→/Esc；同时编辑器（IME 焦点在
         // `focus`）自然失焦，不再抢方向键去移动光标。预览关闭则焦点还给编辑器，
@@ -7130,6 +7654,16 @@ impl Render for CollationWorkspace {
                 })
                 .child(self.render_right(vw, row_h, cx)),
         );
+        // **选区悬浮钮（问小笺）挂在这里**（v1.9.69）：
+        // 根节点是全屏最后一层的坐标系，气泡不会再被右栏的 `overflow_hidden`
+        // 裁掉，也不会被标点栏 / 识别队列浮层盖住。它用 `editor_origin()` 算
+        // 窗口绝对坐标，所以对照模式（左栏占一半）同样落得准。
+        //
+        // 位置刻意排在预览 / 问小笺浮卡 / 覆盖确认**之前**：那三层是真模态，
+        // 该压住它；气泡只跟编辑器争层级。
+        if let Some(bar) = self.render_selection_bar(vw, vh, cx) {
+            root = root.child(bar);
+        }
         if self.show_preview {
             root = root.child(self.render_preview_overlay(vh, cx));
         }
@@ -7337,8 +7871,11 @@ fn read_text_file(path: &Path) -> Result<(String, String), String> {
         return Ok((
             cut,
             format!(
-                "已载入「{}」前 {} 字（原文 {} 字）：编辑器逐行渲染，超长会拖慢界面",
-                name, TEXT_MAX_CHARS, total
+                "「{}」共 {} 万字，超过单册上限 {} 万字：已载入前 {} 万字，其余部分请按卷导入",
+                name,
+                total / 10_000,
+                TEXT_MAX_CHARS / 10_000,
+                TEXT_MAX_CHARS / 10_000
             ),
         ));
     }
@@ -7950,15 +8487,18 @@ impl CollationWorkspace {
                 (c, c)
             }
         };
-        let total = self.text.chars().count();
+        let total = self.total_chars();
         let a = a.min(total);
         let b = b.clamp(a, total);
         let clean: String = text.chars().filter(|c| !c.is_control()).collect();
-        let mut chars: Vec<char> = self.text.chars().collect();
-        let replaced: String = chars[a..b].iter().collect();
-        chars.splice(a..b, clean.chars());
-        self.text = chars.into_iter().collect();
-        self.cursor = (a + clean.chars().count()).min(self.text.chars().count());
+        // 字节区间替换（v1.9.69）：组字每出一帧候选都会走这里，百万字若还
+        // `chars().collect()` 就是把 20MB 反复搬来搬去——拼音打到第三个字母就明显卡。
+        let (bs, be) = (self.byte_of_char(a), self.byte_of_char(b));
+        let replaced: String = self.text[bs..be].to_string();
+        let n = clean.chars().count();
+        self.text.replace_range(bs..be, &clean);
+        self.text_gen = self.text_gen.wrapping_add(1);
+        self.cursor = a + n;
         // 输入法这条路的撤销：组字过程中 `replace_and_mark_text_in_range` 会被
         // 逐帧调用（n → ni → nih → niha…），逐帧记步会让 ⌘Z 退成「一个字退一下」。
         // 统一标 `Ime`，由 `try_absorb` 把连续组字合成**一次输入**。
@@ -8095,18 +8635,203 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 两条线各自的位置钉死：**64 MB 硬闸门**（不是 8 MB 一刀切）+ 8 万字截断线。
+    /// 两条线各自的位置钉死：**64 MB 硬闸门**（不是 8 MB 一刀切）+ 500 万字截断线。
     ///
-    /// 8 万字按汉字 3 字节算只有 240 KB，硬闸门必须远高于截断线——否则十几 MB 的
-    /// 大部头连「截断到 8 万字」的机会都没有就被拒了，等于「我的书导入不了」。
+    /// 500 万字按汉字 3 字节算 15 MB，仍在 64 MB 硬闸门之内（`* 4` 兜住最坏编码）——
+    /// 否则整部《資治通鑑》连「被截断」的机会都没有就被拒了，等于「我的书导入不了」。
     #[test]
     fn product_limits_are_the_agreed_ones() {
         assert_eq!(TEXT_IMPORT_HARD_BYTES, 64 * 1024 * 1024);
-        assert_eq!(TEXT_MAX_CHARS, 80_000);
+        assert_eq!(TEXT_MAX_CHARS, 5_000_000);
         assert!(
-            TEXT_IMPORT_HARD_BYTES > (TEXT_MAX_CHARS as u64) * 3 * 10,
-            "硬闸门必须远高于截断线，否则截断逻辑永远跑不到"
+            TEXT_IMPORT_HARD_BYTES > (TEXT_MAX_CHARS as u64) * 4,
+            "硬闸门必须高于截断线（按最坏 4 字节/字算），否则截断逻辑永远跑不到"
         );
+    }
+
+    // ── 行索引（v1.9.69）：虚拟列表的地基 ─────────────────────────────────
+
+    /// 前缀和必须与「逐行实实在在数一遍」完全一致——差一行，滚动条就会跳。
+    #[test]
+    fn line_index_prefix_sums_match_a_hand_count() {
+        let text = "第一行\n\n第三行很长很长……\nabc\nde";
+        let idx = LineIndex::build(text, None, 5, 7, false);
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!(idx.lines(), lines.len());
+        // 字符起点 / 字节起点逐行对齐。
+        let (mut cs, mut bs) = (0usize, 0usize);
+        for (li, l) in lines.iter().enumerate() {
+            assert_eq!(idx.char_start[li], cs, "第 {li} 行字符起点错");
+            assert_eq!(idx.byte_start[li], bs, "第 {li} 行字节起点错");
+            cs += l.chars().count() + 1;
+            bs += l.len() + 1;
+        }
+        assert_eq!(idx.total_chars, text.chars().count());
+        // 视觉行前缀和 = 逐行上取整累加。
+        let mut acc = 0usize;
+        for (li, l) in lines.iter().enumerate() {
+            acc += est_wrapped_lines(l, 5);
+            assert_eq!(idx.vis[li + 1], acc, "第 {li} 行视觉行前缀错");
+        }
+        assert_eq!(idx.total_visual(), acc);
+        // 非对照模式：aligned 与 vis 同值。
+        assert_eq!(idx.aligned, idx.vis);
+        // 行尾换行符位归**前一行**（⇧→ 的手感就靠这条）。
+        assert_eq!(idx.line_of(0), Some(0));
+        assert_eq!(idx.line_of(3), Some(0), "第 0 行末尾的换行位属于第 0 行");
+        assert_eq!(idx.line_of(4), Some(1), "空行独占一个位");
+        assert!(idx.line_of(text.chars().count()).is_some());
+        // 字节区间取出来的正是该行原文。
+        for (li, l) in lines.iter().enumerate() {
+            assert_eq!(idx.line_str(text, li), *l);
+        }
+    }
+
+    /// 对照模式：每段高度取两栏的**较大者**（段落对齐的数学依据）。
+    #[test]
+    fn diff_prefix_takes_the_taller_side() {
+        // 清洗后 2 个视觉行（cpl=6，12 字），毛坯只有 1 行 → 取 2。
+        let clean2 = "一二三四五六七八九十一二";
+        let raw2 = "一二三";
+        let idx2 = LineIndex::build(clean2, Some(raw2), 6, 1, true);
+        assert_eq!(idx2.vis[1], 2);
+        assert_eq!(idx2.aligned[1], 2, "取较大者：2 > 1");
+        // 反过来：毛坯更长 → 对齐后仍取 2，右栏空的这一行由填充撑住。
+        let idx3 = LineIndex::build("一二三", Some(clean2), 6, 1, true);
+        assert_eq!(idx3.vis[1], 1);
+        assert_eq!(idx3.aligned[1], 2, "取较大者：1 < 2");
+        // 毛坯行数比清洗后少（清洗可能增段）→ 越界的毛坯行返回空串，绝不 panic。
+        assert_eq!(idx3.raw_line(clean2, 1), "");
+        // 非对照模式（diff=false）时两者必须完全一致：右栏没有段落填充。
+        let idx4 = LineIndex::build(clean2, None, 6, 1, false);
+        assert_eq!(idx4.aligned, idx4.vis);
+    }
+
+    /// 视觉行 → 行号的二分必须与「逐行累加找」一致，且永不越界。
+    #[test]
+    fn visual_to_line_lookup_never_overshoots() {
+        let mut text = String::new();
+        for i in 0..500 {
+            // 行长度在 0..30 之间摆动，制造 1~5 个视觉行不等。
+            let n = (i * 7) % 30;
+            for _ in 0..n {
+                text.push('字');
+            }
+            if i < 499 {
+                text.push('\n');
+            }
+        }
+        let cpl = 7;
+        let idx = LineIndex::build(&text, None, cpl, 3, false);
+        let lines: Vec<&str> = text.split('\n').collect();
+        // 逐视觉行问一遍，答案必须落在「该视觉行确实属于这一行」的区间里。
+        for v in 0..idx.total_visual() {
+            let li = idx.line_at_visual(v);
+            assert!(li < lines.len(), "越界：v={v} → li={li}");
+            assert!(
+                idx.vis[li] <= v && v < idx.vis[li + 1],
+                "v={v} 落在 li={li} 之外（区间 {}..{}）",
+                idx.vis[li],
+                idx.vis[li + 1]
+            );
+        }
+        // 超出总量 → 夹到末行，不 panic。
+        assert_eq!(idx.line_at_visual(idx.total_visual() + 999), lines.len() - 1);
+    }
+
+    /// **性能守门**：百万字建索引只跑一次（文本 / 列数不变就不重建）。
+    ///
+    /// 这里只钉「建得出来且不算完」，不断言毫秒数——CI 机器差异太大。
+    /// 真正防的是「退回每帧 O(全文)」：那会让 `render` 里每帧都走一遍，
+    /// 这个测试跑 100 万字符若卡住，肉眼立刻能看出来。
+    #[test]
+    fn million_char_index_builds_and_answers_in_log_time() {
+        let text = "資治通鑑卷第一周紀一起著雍攝提格盡玄黓困敦凡三十五年".repeat(50_000);
+        let idx = LineIndex::build(&text, None, 37, 9, false);
+        assert_eq!(idx.total_chars, text.chars().count());
+        assert_eq!(idx.lines(), 1, "整本没有换行 → 一个逻辑行");
+        // 二分定位：无论问哪一条视觉行，都是一次查找的事。
+        let mid = idx.total_visual() / 2;
+        let li = idx.line_at_visual(mid);
+        assert_eq!(li, 0);
+        assert!(idx.line_of(idx.total_chars / 2).is_some());
+    }
+
+    /// **虚拟列表的核心不变量**：无论稿子多长、滚到哪里，一帧只画「一屏 + 四屏余量」
+    /// 那么多的行。这条断言就是「百万元字不会一次性全渲染」的机器化表述。
+    ///
+    /// 注意：它不测 `render_editor`（那要开窗口），而是测它依赖的两个事实——
+    /// 前缀和能把「像素」翻译成「行号」，且窗口宽度与文本总量无关。
+    #[test]
+    fn visible_window_stays_bounded_no_matter_how_long_the_book_is() {
+        // 造一本 ~100 万字的「书」，每 40 字一段。
+        let para = "資治通鑑卷第一周紀一起著雍攝提格盡玄黓困敦凡三十五年";
+        let text = para.repeat(40_000); // 26 字 × 4 万 ≈ 104 万字
+        let cpl = 37; // 1440 宽窗口、左右各半、17px 字 → 约 37 字一行
+        let idx = LineIndex::build(&text, None, cpl, 11, false);
+        assert!(idx.total_chars > 900_000, "样本够大：{}", idx.total_chars);
+        let total_v = idx.total_visual();
+        let (vis_h, overscan) = (900.0f32, 900.0f32 * 2.0);
+        let mut max_rows = 0usize;
+        for scroll in [0.0f32, 500.0, 5_000.0, 60_000.0, 120_000.0] {
+            let first_v = ((scroll - ED_PAD - overscan).max(0.0) / LINE_H).floor() as usize;
+            let last_v = (((scroll + vis_h + overscan) / LINE_H).ceil() as usize).min(total_v - 1);
+            let li0 = idx.line_at_visual(first_v);
+            let li1 = idx.line_at_visual(last_v);
+            let rows = li1 - li0 + 1;
+            max_rows = max_rows.max(rows);
+            assert!(li0 <= li1);
+        }
+        // 一屏 ≈ 30 行，加四屏余量 ≈ 150 行；给到 200 已经是很宽松的上界。
+        assert!(
+            max_rows <= 200,
+            "窗口化失效：一帧竟然要建 {max_rows} 行（100 万字的稿子）"
+        );
+    }
+
+    // ── 选区气泡坐标（v1.9.69 回归）────────────────────────────────────
+    /// **回归钉子**：气泡跟着**内容**走，不跟着屏幕走。
+    ///
+    /// v1.9.68 的真 bug 是 `- scroll_y`：偏移本身是负数，再取反等于「向下滚
+    /// 300px，气泡往下跑 600px」。这里用两个原点（未滚 / 已滚 300）验证：
+    /// 同一个选区在滚动后 y 必须**同样上移 300**，而不是下移。
+    #[test]
+    fn bar_follows_content_when_scrolled() {
+        let adv = 17.0;
+        let (x0, y0) = bar_anchor((100.0, 44.0 + 40.0), 10, 6, adv);
+        let (x1, y1) = bar_anchor((100.0, 44.0 + 40.0 - 300.0), 10, 6, adv);
+        assert_eq!(x0, x1, "滚动只影响 y");
+        assert!(
+            (y0 - y1 - 300.0).abs() < 0.01,
+            "滚动 300 后气泡必须上移 300，实际 Δ={}",
+            y0 - y1
+        );
+        // 锚点本身贴在「末行下一行」：比末行顶多一整行 + 4px。
+        let expect_y = 44.0 + 40.0 + (10 + 1) as f32 * LINE_H + 4.0;
+        assert!((y0 - expect_y).abs() < 0.01, "锚点公式被改了？y0={y0}");
+        // X 跟着列位走（第 6 个字缝）。
+        assert!((x0 - (100.0 + 6.0 * adv + 4.0)).abs() < 0.01);
+    }
+
+    /// 任何输入都不许把气泡算到面板外——这是「拖完选却看不见气泡」的第二半答案。
+    #[test]
+    fn bar_is_always_clamped_inside_the_panel() {
+        let (vw, vh) = (1440.0, 900.0);
+        let (pl, pt) = (720.0, 44.0 + 50.0);
+        let cases = [
+            (-500.0, -500.0),
+            (0.0, 0.0),
+            (5000.0, 5000.0),
+            (f32::MAX, f32::MAX),
+            (f32::MIN, f32::MIN),
+        ];
+        for (bx, by) in cases {
+            let (x, y) = clamp_bar_pos(bx, by, vw, vh, pl, pt, 66.0, 24.0);
+            assert!(x >= pl, "x={x} 跑到左栏里去了（panel_l={pl}）");
+            assert!(x + 66.0 <= vw, "x={x} 右侧出窗口（vw={vw}）");
+            assert!(y >= pt, "y={y} 压到状态条上去了（panel_t={pt}）");
+            assert!(y + 24.0 <= vh, "y={y} 底部出窗口（vh={vh}）");
+        }
     }
     // ── 纸张口径：容量从版式实测，绝不写第二张魔数表 ─────────────────────
     /// 换纸必须换容量；`預覽卡` 的老经验表一个字都不许变。
