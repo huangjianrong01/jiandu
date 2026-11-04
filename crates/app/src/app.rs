@@ -3719,6 +3719,10 @@ impl Root {
                     self.ensure_window(cx);
                     self.open_book(idx);
                 }
+                MenuIntent::ImportVariants => {
+                    self.ensure_window(cx);
+                    self.import_variant_dict_dialog(cx);
+                }
                 MenuIntent::CheckUpdate => {
                     self.ensure_window(cx);
                     self.notice =
@@ -3730,6 +3734,49 @@ impl Root {
             }
         }
         cx.notify();
+    }
+
+    /// **导入外部异体字表**（v1.9.78）：菜单栏「导入异体字表…」的落地。
+    ///
+    /// 纪律同 `import_dialog`：`rfd` 同步对话框必须**前台直调**（过后台执行器
+    /// 会被 GPUI 主循环挤掉、静默返回 None），所以放在 `cx.spawn` 的 async 块
+    /// 里但不用 background_executor。回调里只碰 `notice` 与 core 的纯函数。
+    pub fn import_variant_dict_dialog(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let picked = rfd::FileDialog::new()
+                    .set_title("导入异体字 / 繁简映射表")
+                    .add_filter("字表 (txt / csv / tsv / json)", &["txt", "csv", "tsv", "json"])
+                    .add_filter("全部文件", &["*"])
+                    .pick_file();
+                let Some(path) = picked else { return };
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        this.update(&mut cx, |this, cx| {
+                            this.notice = format!("字表读不到：{e}");
+                            cx.notify();
+                        }).ok();
+                        return;
+                    }
+                };
+                let result = jiandu_core::variants::user_dict::import_bytes(&bytes);
+                let msg = match result {
+                    Ok(rep) => format!(
+                        "异体字表已导入：{}｜{}",
+                        rep.summary(),
+                        jiandu_core::variants::active_summary()
+                    ),
+                    Err(e) => format!("字表未导入：{e}"),
+                };
+                this.update(&mut cx, |this, cx| {
+                    this.notice = msg;
+                    cx.notify();
+                }).ok();
+            }
+        })
+        .detach();
     }
 
     /// **保证主窗口可见并置顶**（v1.9.44）：菜单项唤起主窗口时的核心体验。

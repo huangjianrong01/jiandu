@@ -6,6 +6,7 @@
 //!   · 打开工作台（唤起主窗口并切到笺校工作台）
 //!   · 打开书架（唤起主窗口的书架界面）
 //!   · 最近项目（二级子菜单，列最近阅读的 5 本）
+//!   · 导入异体字表…（v1.9.78，外部 CJK / 繁简映射表）
 //!   · 检查更新 / 退出笺读
 //!
 //! # 纪律（同 dropzone / revive）
@@ -34,6 +35,8 @@ pub enum MenuIntent {
     OpenShelf,
     Collation,
     OpenRecent(usize),
+    /// 导入外部异体字 / 繁简映射表（v1.9.78）。
+    ImportVariants,
     CheckUpdate,
     Quit,
 }
@@ -79,6 +82,7 @@ mod mac {
     const TAG_COLLATION: i64 = 2;
     const TAG_UPDATE: i64 = 3;
     const TAG_QUIT: i64 = 4;
+    const TAG_VARIANTS: i64 = 5; // v1.9.78 导入外部异体字表
     const TAG_RECENT_BASE: i64 = 100; // 100 + book_idx
 
     static STATUS_ITEM: OnceLock<OpaquePtr> = OnceLock::new();
@@ -146,6 +150,7 @@ mod mac {
             TAG_COLLATION => Some(MenuIntent::Collation),
             TAG_UPDATE => Some(MenuIntent::CheckUpdate),
             TAG_QUIT => Some(MenuIntent::Quit),
+            TAG_VARIANTS => Some(MenuIntent::ImportVariants),
             t if t >= TAG_RECENT_BASE => {
                 Some(MenuIntent::OpenRecent((t - TAG_RECENT_BASE) as usize))
             }
@@ -212,14 +217,25 @@ mod mac {
         }
 
         // 打开工作台（v1.9.73 正名：以前叫「快速笺校」，用户口语里一律叫「工作台」）。
+        // ⚠️ v1.9.78 修 bug：原先这四项造完**没 setTag**，tag 全是 0，
+        // `intent_from_tag(0)` 返回 None —— 菜单看得见、点了没反应。
+        // 只有「最近项目」的子项设了 tag，所以之前只有它能用。
         let collation = make_item("打开工作台", false);
         if !collation.is_null() {
+            let _: () = objc::msg_send![collation, setTag: TAG_COLLATION];
             let _: () = objc::msg_send![menu, addItem: collation];
         }
         // 打开书架。
         let shelf = make_item("打开书架", false);
         if !shelf.is_null() {
+            let _: () = objc::msg_send![shelf, setTag: TAG_SHELF];
             let _: () = objc::msg_send![menu, addItem: shelf];
+        }
+        // 导入外部异体字表（v1.9.78）：三字一行 / 两字一行 / TSV / JSON 都吃。
+        let variants = make_item("导入异体字表…", false);
+        if !variants.is_null() {
+            let _: () = objc::msg_send![variants, setTag: TAG_VARIANTS];
+            let _: () = objc::msg_send![menu, addItem: variants];
         }
 
         // 最近项目（二级子菜单；v1.9.73 由「最近打开」正名）。
@@ -241,10 +257,12 @@ mod mac {
         // 检查更新 / 退出。
         let update = make_item("检查更新", false);
         if !update.is_null() {
+            let _: () = objc::msg_send![update, setTag: TAG_UPDATE];
             let _: () = objc::msg_send![menu, addItem: update];
         }
         let quit = make_item("退出笺读", false);
         if !quit.is_null() {
+            let _: () = objc::msg_send![quit, setTag: TAG_QUIT];
             let _: () = objc::msg_send![menu, addItem: quit];
         }
 

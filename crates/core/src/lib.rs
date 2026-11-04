@@ -63,6 +63,10 @@ pub mod dict;
 pub mod docx;
 /// **内测邀请码**（v1.0.0-beta）：纯本地闸门，无服务器。
 pub mod gate;
+/// **字体字形覆盖**（v1.9.78）：自带极小 `cmap` 解析器，只回答一件事——
+/// 这个字这款字体画不画得出。「导入古籍不出豆腐块」只能靠它验证，任何
+/// 映射表都替不了缺字形。零平台依赖，纯字节解析。
+pub mod glyph;
 pub mod grid;
 /// **命中测试**（v1.0.0-beta 自 app 迁入）：`Page` → 字/片包围盒，
 /// 供画布点选、卡片定位、注音落点复用。纯几何，零 UI。
@@ -115,6 +119,11 @@ pub mod ruby;
 pub mod store;
 pub mod stream;
 pub mod trad;
+/// **异体字 / 繁简映射层**（v1.9.78）：外部字典（三元组 / 二元组 / 分隔符 /
+/// JSON）导入 → 三张泾渭分明的映射表（繁体正字 / 简体正字 / 可写回的异体归一），
+/// 外加「字体缺字才折」的豆腐块抢救。基线 5164 条由
+/// `scripts/gen_variant_table.py` 生成。详见 `variants.rs`。
+pub mod variants;
 /// **中医方剂本地化规则字典**（v1.9.19）：剂量量词 / 数量单位 / 异体 OCR 别名 /
 /// 炮制短语全部外置到 `src/data/tcm_rules.json`（编译期 `include_str!` 嵌入），
 /// 解析器只委托、不硬编码。详见 `tcm_rules.rs`。
