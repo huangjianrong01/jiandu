@@ -580,6 +580,12 @@ pub(crate) fn side_offset(slide: f32) -> f32 {
 /// 面板选中色的**实际取值**：深底主题（夜读）上这枚朱砂会沉进深纸看不见，
 /// 故向宣纸白提亮一档——界面色与纸面永远反色，不会出现「暗纸上的暗朱」。
 pub(crate) fn sheet_zhu(t: Theme) -> u32 {
+    if t.is_a11y() {
+        // 无障碍档：面板 / 顶栏的朱字直接取**算过对比度**的那支朱
+        // （`Theme::zhu`：日 8.6:1 / 夜 8.2:1）。旧做法「深底把朱向奶油
+        // 兑 38%」在黑底上只有 4.5:1，小字号的「注」会糊成一团暗红。
+        return t.zhu();
+    }
     if t.is_dark() {
         crate::theme::mix(ZHU_BASE, 0xF2EAD6, 0.38)
     } else {
@@ -2584,6 +2590,19 @@ impl Root {
                     if (k == "t" || k == "T") && (mods.platform || mods.control) {
                         self.bar_shown = !self.bar_shown;
                         self.ensure_anchor_heartbeat(cx);
+                        cx.notify();
+                        return;
+                    }
+
+                    // ②‴ ⌘⇧A：一键切换无障碍高对比（v1.9.82）。
+                    //    **必须带 Shift**：⌘A 是编辑器里的「全选」，别抢。
+                    //    排在 ⌘⌥ 那一组之前无所谓（修饰键不同），但排在
+                    //    Esc / 打字态判断之后是有意的——正在写字时不该换肤。
+                    if (k == "a" || k == "A")
+                        && mods.shift
+                        && (mods.platform || mods.control)
+                    {
+                        self.toggle_a11y();
                         cx.notify();
                         return;
                     }
@@ -7728,6 +7747,10 @@ impl Root {
         fs: f32,
         back: bool,
         hung: bool,
+        // **强制墨色**（v1.9.82）：无障碍档里这一格压着深蓝 / 纯黄实色块，
+        // 朱砂句读落在深蓝上只剩 1.6:1——那不是「朱点」，是块脏印。
+        // `Some` 时用它（= 色块的前景色），`None` 走原来的朱砂。
+        force_ink: Option<u32>,
     ) -> Div {
         // 几何（纯函数、有单测）：读类手绘**瓜子点**（高 0.28 倍正文），
         // 句类画空心圈；中心钉在格内 72% × 28% 的**右上角**，再向左下让
@@ -7746,7 +7769,7 @@ impl Root {
         };
         // 回锋开关（只对斜点有意义，圈类不看它）。
         let m = crate::punct::with_hook(m, self.punct_hook);
-        let ink = self.punct_ink(back);
+        let ink = force_ink.unwrap_or_else(|| self.punct_ink(back));
         // 浮层铺满字格：canvas 的 paint 闭包收到的是**窗口坐标**的
         // bounds，把字格原点（ox/oy）加回记号中心即可。
         div()
@@ -7871,6 +7894,11 @@ impl Root {
             self.tts_cur,
         );
         let tts_here = tts_k > 0.001;
+        // **无障碍档换一套画法**（v1.9.82）：淡染是给常视力「看一眼就够」的
+        // 提示，对弱视等于没画——0.12 的朱砂兑在白纸上只是一片几乎看不出的
+        // 粉。这一档改成两块**实色**：句 = 深蓝底白字，词 = 纯黄底黑字。
+        // 两种画法互斥：同一格绝不会既淡染又实色（否则颜色会互相污染）。
+        let a11y = t.a11y();
         let marked = self.underlines.contains(&key);
         // 注音：**书里的永远显示，字典只补空缺**。
         //   * `NoteKind::Ruby` —— EPUB `<ruby><rt>` / `[拼音:…]` 导入的读音，
@@ -7950,33 +7978,83 @@ impl Root {
             cell = cell.relative();
         }
         if tts_here && hit.is_none() && !margin_hit {
-            // 浓度已由 `tts_cell_ink` 算定（纯函数、有单测）：
-            //   * 当前词 0.12→0.34 —— 起手浅、随交接走满，换词不闪眼；
-            //   * 本句其余 0.12 —— 只圈出范围，绝不抢正文的墨色；
-            //   * 交接中的上一词 / 上一句 —— 同一套曲线反向退场。
-            //
-            // 分层靠**绘制顺序**而不是混合模式：这枚衬底是 cell 的第一个子节点，
-            // 正文（与注音、句读）都排在它之后，天然压在它上面。GPUI 0.2.2
-            // 没有 `blend_mode`，硬做混合反而会把纸纹和墨色一起搅浑。
-            // 「不互相污染」靠的是**每格只画一层**：四层浓度先合成一个数，
-            // 再由这一个数决定这一格画不画、多深——不存在两层叠在同一格。
-            let paper = if back { t.paper_back() } else { t.paper() };
-            if tts_cur_word && crate::app::tts_debug() {
-                eprintln!("[tts] paint cell={key:?} k={tts_k:.2} t={:.2}", self.tts_cur);
+            if let Some(a) = a11y {
+                // ── 无障碍：两块实色，不用浓度 ────────────────────────
+                // 句底先铺，词底后铺——同一位置、后画的盖住先画的，于是
+                // 「当前这个词」天然是黄块，不需要计算「扣除」。
+                if tts_cur_line {
+                    cell = cell.child(
+                        div()
+                            .absolute()
+                            .top(px(0.0))
+                            .left(px(0.0))
+                            .w(px(cell_w))
+                            .h(px(cell_h))
+                            .bg(rgb(a.line_bg)),
+                    );
+                    // 「下划线」的竖排画法：**落在字格左内侧**（4px 进深、
+                    // 3px 宽），逐格相接成一条连续的竖线。
+                    //
+                    // 为什么不画在字格「底边」（横排习惯里的那一笔）：竖排
+                    // 字格的底边就是下一个字的顶边，一格一条会变成一架
+                    // **梯子**；而沿列侧连成一条，才是「这一句」的范围。
+                    // 本项目原有的「划线」也是这么画的（`marked` 那支：
+                    // 右内侧 4px / 3px 宽），这里换到左内侧，两者不打架。
+                    //
+                    // 词格跳过：黄块盖满整格，白线压上去只有 1.07:1，
+                    // 等于画了个看不见的东西——那一格由黄块本身报位。
+                    if !tts_cur_word {
+                        cell = cell.child(
+                            div()
+                                .absolute()
+                                .top(px(0.0))
+                                .left(px(4.0))
+                                .w(px(3.0))
+                                .h(px(cell_h))
+                                .bg(rgb(a.line_rule)),
+                        );
+                    }
+                }
+                if tts_cur_word {
+                    cell = cell.child(
+                        div()
+                            .absolute()
+                            .top(px(0.0))
+                            .left(px(0.0))
+                            .w(px(cell_w))
+                            .h(px(cell_h))
+                            .bg(rgb(a.word_bg)),
+                    );
+                }
+            } else {
+                // 浓度已由 `tts_cell_ink` 算定（纯函数、有单测）：
+                //   * 当前词 0.12→0.34 —— 起手浅、随交接走满，换词不闪眼；
+                //   * 本句其余 0.12 —— 只圈出范围，绝不抢正文的墨色；
+                //   * 交接中的上一词 / 上一句 —— 同一套曲线反向退场。
+                //
+                // 分层靠**绘制顺序**而不是混合模式：这枚衬底是 cell 的第一个
+                // 子节点，正文（与注音、句读）都排在它之后，天然压在它上面。
+                // GPUI 0.2.2 没有 `blend_mode`，硬做混合反而会把纸纹和墨色
+                // 一起搅浑。「不互相污染」靠的是**每格只画一层**：四层浓度
+                // 先合成一个数，再由这一个数决定这一格画不画、多深。
+                let paper = if back { t.paper_back() } else { t.paper() };
+                if tts_cur_word && crate::app::tts_debug() {
+                    eprintln!("[tts] paint cell={key:?} k={tts_k:.2} t={:.2}", self.tts_cur);
+                }
+                // 淡出层单独打点：这一层是「交接」的证据——没有它，旧词是一下消失的。
+                if tts_prev_word && crate::app::tts_debug() {
+                    eprintln!("[tts] fade  cell={key:?} k={tts_k:.2} t={:.2}", self.tts_cur);
+                }
+                cell = cell.child(
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .w(px(cell_w))
+                        .h(px(cell_h))
+                        .bg(rgb(crate::theme::mix(paper, t.accent(), tts_k))),
+                );
             }
-            // 淡出层单独打点：这一层是「交接」的证据——没有它，旧词是一下消失的。
-            if tts_prev_word && crate::app::tts_debug() {
-                eprintln!("[tts] fade  cell={key:?} k={tts_k:.2} t={:.2}", self.tts_cur);
-            }
-            cell = cell.child(
-                div()
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(0.0))
-                    .w(px(cell_w))
-                    .h(px(cell_h))
-                    .bg(rgb(crate::theme::mix(paper, t.accent(), tts_k))),
-            );
         }
         if let Some(is_cur) = hit {
             // 朱砂兑纸色：当前命中重一档，其它命中轻一档。
@@ -8065,6 +8143,18 @@ impl Root {
         } else {
             base_ink
         };
+        // 无障碍档：**字色跟着色块走**——白字压深蓝、黑字压纯黄。
+        //
+        // 这一步必须在注音 / 句读 / 书名的取色之前：它们全都吃 `ink`，
+        // 只改一处，那一格里的所有笔画就一起翻色，不会出现「白字配红圈」。
+        let ink = match a11y {
+            Some(a) if tts_cur_word => a.word_ink,
+            Some(a) if tts_cur_line => a.line_ink,
+            _ => ink,
+        };
+        // 这一格若压着实色块，句读 / 注音也得跟着翻成块的前景色：
+        // 朱砂落在深蓝上只有 1.6:1，看图就是一块脏印子，不是句读。
+        let a11y_ink = (a11y.is_some() && (tts_cur_word || tts_cur_line)).then_some(ink);
 
         // ── 注音外挂（v1.9.56）───────────────────────────────────────
         // **悬挂式**：拼音是一枚绝对定位的小标签，行盒上缘 `top = −fs/2`，
@@ -8097,7 +8187,11 @@ impl Root {
                         // 若按框高做行盒，文字会在框内垂直居中、往主字上多压
                         // 两三像素——框高只在 8 列这种宽格里才有富余。
                         .line_height(px(rl.fs))
-                        .text_color(rgba((crate::ruby::RUBY_INK << 8) | 0xF2))
+                        // 同句读：压在实色块上时，注音也换成块的前景色。
+                        .text_color(match a11y_ink {
+                            Some(c) => rgba((c << 8) | 0xF2),
+                            None => rgba((crate::ruby::RUBY_INK << 8) | 0xF2),
+                        })
                         .child(SharedString::from(py.to_string())),
                 );
             }
@@ -8176,7 +8270,7 @@ impl Root {
             // 这里就画谁，两处不再各判一次。
             cell = cell
                 .relative()
-                .child(self.punct_overlay(g.ch, cell_w, cell_h, fs, back, false));
+                .child(self.punct_overlay(g.ch, cell_w, cell_h, fs, back, false, a11y_ink));
         } else if crate::west::is_west_hyphen(g.ch) {
             // 单独出现的连字符：竖排里旋转成一道竖线（丨）。
             cell = cell.child(
@@ -8233,6 +8327,18 @@ impl Root {
                     // 纯样式层：不改格宽高、不改分页、不改命中矩形。
                     .line_height(px(cell_h))
                     .text_color(rgb(label_ink))
+                    // 无障碍档的当前词：**加粗**（v1.9.82）。
+                    //
+                    // 只加在词上，不加在句上：句靠白字压深蓝已经够重，
+                    // 整句一起加粗会让「当前这个词」重新糊进整句里。
+                    // 字库若没有粗体（`qiji.ttf` 只有一档），CoreText 会
+                    // 合成假粗；实在合成不了也不致命——黑字压纯黄本来
+                    // 就是 19.6:1，粗细只是再加一层保险。
+                    .font_weight(if a11y.is_some() && tts_cur_word {
+                        gpui::FontWeight::BOLD
+                    } else {
+                        gpui::FontWeight::NORMAL
+                    })
                     .child(label);
             // ── 网格保护（回退专用）──────────────────────────────────
             // 首选字体走原路（继承根元素的族名、行盒锁格高），一个字节都不
@@ -8264,7 +8370,7 @@ impl Root {
         if let Some(h) = hang {
             cell = cell
                 .relative()
-                .child(self.punct_overlay(h.ch, cell_w, cell_h, fs, back, true));
+                .child(self.punct_overlay(h.ch, cell_w, cell_h, fs, back, true, a11y_ink));
         }
         // 书名号：0.7 倍正文，**开号占上半格、闭号占下半格**（v1.9.26）。
         // 开号在本格（书名首字）、闭号也在本格（书名末字）——一格至多各一枚，
@@ -12748,9 +12854,10 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         self.tts_u16 = crate::app::utf16_char_map(&text);
         self.tts_span = crate::app::tts_key_span(&self.tts_keys);
         // 换叶重念 = 新的一轮：交接状态全清，起手直接「稳态」（t = 1）。
-        // 这里**不做**淡入——新一叶的第一格若从 0.12 爬到 0.34，读者会以为
-        // 上一叶还有一格没读完。降级标记也在这里复位（换叶是重新观察帧率
-        // 的最好时机：宁可先试一次动画，也别一直瞬移下去）。
+        // 本叶第一个词也**不淡入**——一开声就该看清从哪起；这一条由
+        // `poll_tts_mark` 里 `old_mark.is_none()` 那半个判据保证（这里只负责
+        // 把状态摆正）。降级标记也在这里复位：换叶是重新观察帧率的最好时机，
+        // 宁可先试一次动画，也别一直瞬移下去。
         self.tts_mark = None;
         self.tts_line = None;
         self.tts_prev = None;
@@ -13941,6 +14048,36 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         let idx = Theme::ALL.iter().position(|x| *x == self.theme).unwrap_or(0);
         let next = (idx + 1) % Theme::ALL.len();
         self.set_theme(next);
+    }
+
+    /// **一键切换无障碍高对比**（v1.9.82，`⌘⇧A`）。
+    ///
+    /// 视弱用户找不到「版字」面板里的第七颗色点，也不该找：这个模式的
+    /// 全部意义就是**一个键进去、一个键出来**。
+    ///
+    /// 进档按当前深浅选日 / 夜（深底留在夜里，别拿纯白闪一下眼睛）；
+    /// 出档原样还原进档前那套纸色——`a11y_back` 为空时（冷启动就在档里）
+    /// 回默认宣纸。
+    pub(crate) fn toggle_a11y(&mut self) {
+        let entering = !self.theme.is_a11y();
+        let back = if entering {
+            Some(self.theme)
+        } else {
+            self.a11y_back
+        };
+        let next = self.theme.toggle_a11y(back);
+        self.set_theme(next.index());
+        // 顺序不能反：`set_theme` 会把 `theme` 换掉，上面那句进档判断
+        // 必须读换之前的值。
+        self.a11y_back = if entering { back } else { None };
+        self.notice = if next.is_a11y() {
+            format!(
+                "無障礙：{}（⌘⇧A 退出）",
+                if next.is_dark() { "高對比夜" } else { "高對比日" }
+            )
+        } else {
+            "已退出無障礙配色".to_string()
+        };
     }
 
     /// 切到第 `i` 套纸面主题（配置表 `PAPER_THEMES` 下标）。

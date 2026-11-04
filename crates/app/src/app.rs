@@ -915,6 +915,12 @@ pub struct Root {
     pub tts_lean: bool,
     /// 连续掉了几拍（连中两拍才降级，单次抖动不算）。
     pub tts_lag: u8,
+    /// **进无障碍档之前用的是哪套主题**（v1.9.82）。
+    ///
+    /// `⌘⇧A` 一键进 / 出一回，退出去必须原样还回去——用户精心调的纸色
+    /// 不该被一次快捷键抹掉。`None` 表示「不在档里」，或冷启动就直接停在
+    /// 无障碍档（那时没有来处，退出回默认宣纸）。
+    pub a11y_back: Option<jiandu_core::theme::Theme>,
     /// **「聽書」浮层**开着没（v1.9.41）。
     ///
     /// 语速原先挂在「版字」面板第一屏，和列数、纸色挤在一张纸上——那是一张
@@ -1616,6 +1622,7 @@ impl Root {
             tts_mark_at: std::time::Instant::now(),
             tts_lean: false,
             tts_lag: 0,
+            a11y_back: None,
             show_tts: false,
             tts_scope: String::new(),
             key_hint: None,
@@ -1898,6 +1905,27 @@ impl Root {
                 .position(|t| t.is_keben())
                 .unwrap_or(4);
             root.set_theme(i);
+        }
+        // 开发用（v1.9.82）：`JIANDU_THEME=a11y` / `a11y_night` 直接进无障碍档
+        // ——`⌘⇧A` 走合成键盘过不了 TCC，截图核对只能从环境变量摆位。
+        // 走 `set_theme`，与快捷键同一条路（`a11y_back` 仍为空：这是冷启动）。
+        if let Ok(v) = std::env::var("JIANDU_THEME") {
+            if let Some(i) = crate::theme::Theme::ALL
+                .iter()
+                .position(|t| t.paper_theme().id == v)
+            {
+                root.set_theme(i);
+            }
+        }
+        // 开发用（v1.9.82）：`JIANDU_A11Y=1` 走**真的** `⌘⇧A` 那条路进档
+        // （`toggle_a11y` 而不是 `set_theme`——要连 `a11y_back` 一起验）；
+        // `=2` 进档再出档，用来核对「退出去纸色原样还回来」。
+        // 合成 ⌘⇧A 过不了 TCC，这是唯一能在真机上跑通这条路的办法。
+        if let Ok(v) = std::env::var("JIANDU_A11Y") {
+            root.toggle_a11y();
+            if v == "2" {
+                root.toggle_a11y();
+            }
         }
         // 开发用：JIANDU_PAGE=3 直接翻到第 3 叶（0 基），便于核对章首版心。
         if let Ok(v) = std::env::var("JIANDU_PAGE") {
@@ -3503,9 +3531,12 @@ impl Root {
             let now = std::time::Instant::now();
             let gap = now.saturating_duration_since(self.tts_mark_at).as_millis();
             self.tts_mark_at = now;
-            if self.tts_lean || gap < TTS_FADE_MIN_MS {
-                // 高倍速（词间隔已经短于过渡下限）或已降级：任何过渡都只剩
-                // 残影，直接定位。这是「倍数越高越干脆」的那一半逻辑。
+            if self.tts_lean || old_mark.is_none() || gap < TTS_FADE_MIN_MS {
+                // 三种情况都直接定位，不做过渡：
+                //   * 已降级（画不及 60fps）；
+                //   * **本叶第一个词**——一开声就该看清从哪起，淡入会让读者
+                //     以为上一叶还有一格没读完；
+                //   * 词间隔已短于过渡下限（高倍速）——任何过渡都只剩残影。
                 self.tts_cur = 1.0;
                 self.tts_prev = None;
                 self.tts_line_prev = None;

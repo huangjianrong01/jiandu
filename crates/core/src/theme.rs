@@ -96,7 +96,89 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         zhu: 0xB0342C,   // 句读朱砂：照精刻本照片取（照片实测 #B3262F）
         border: 0x2E2823, // 版框：比正文更深，外框才立得住
     },
+    // ── v1.9.82 · 无障碍高对比（视弱用户）────────────────────────────
+    // 这**不是**第三套国色，是另一套目标：前面五套追求「层次」（纸、墨、
+    // 界行、朱印各压一档，正文才立得住），这里只有一条硬指标——WCAG 2.1
+    // 的 **7:1**（AAA 正文级）。所以纸是纯白 / 纯黑，字是纯黑 / 纯白，
+    // 中间**不留**任何「淡淡的、看得见就行」的灰。层次让位给可读。
+    //
+    // 注意 `note`（夹注）也一并拉到 7:1 以上：夹注是双行小字，本来就比正文
+    // 难认，在无障碍档里再让它「淡一档」就等于把它删了。
+    PaperTheme {
+        id: "a11y_day",
+        name: "高对比日",
+        paper: 0xFFFFFF, // 纯白
+        text: 0x000000,  // 纯黑（21:1）
+        note: 0x0B2A5B,  // 深靛（13.9:1）——夹注仍要与正文分得开
+        zhu: 0x9E0000,   // 朱（8.6:1）：句读是图形，但太暗就成墨点了
+        border: 0x000000,
+    },
+    PaperTheme {
+        id: "a11y_night",
+        name: "高对比夜",
+        paper: 0x000000, // 纯黑
+        text: 0xFFFFFF,  // 纯白（21:1）
+        note: 0xFFC24D,  // 琥珀（13.1:1）
+        zhu: 0xFF7A66,   // 亮朱（8.2:1）：0xB0342C 这种沉朱在黑底上只有 3.4:1
+        border: 0x8A8A8A, // 界行 6.1:1——1px 细线在黑底上不能更淡
+    },
 ];
+
+/// **无障碍高对比的「朗读高亮」三色**（v1.9.82）。
+///
+/// 为什么另开一张表：纸 / 墨 / 朱是「书长什么样」，高亮是「读到哪儿」——
+/// 后者在无障碍档里的任务是**在纯黑纯白之间再立起两块绝对可辨的色块**，
+/// 而不是在纸上添一层淡晕。两者服务于不同的眼睛，混在一张表里必然互相迁就。
+///
+/// 三块硬指标（都能用 [`contrast_ratio`] 断言，见 `tests`）：
+///   * 句：深蓝底 + 白字 ≥ 7:1；
+///   * 词：纯黄底 + 黑字 ≥ 7:1；
+///   * 词 vs 句 ≥ 7:1 —— 这样「当前这个词」与「这一句的其余字」一眼分得开，
+///     不靠深浅差一档去猜（旧版的 0.34 / 0.12 是给常视力看的，对弱视不够）。
+pub struct A11yTheme {
+    /// 与 [`PaperTheme::id`] 同一个 id：两张表按 id 配对，不按下标。
+    pub id: &'static str,
+    /// 当前句的底。
+    pub line_bg: u32,
+    /// 当前句的字。
+    pub line_ink: u32,
+    /// 当前句的「下划线」。竖排里它落在字格**左内侧**（见
+    /// `reader` 里的说明：字格底边是下一个字的顶边，画在底边会变成梯子）。
+    pub line_rule: u32,
+    /// 当前词的底。
+    pub word_bg: u32,
+    /// 当前词的字。
+    pub word_ink: u32,
+}
+
+/// 两套无障碍高亮（日 / 夜）。顺序与 [`A11Y_THEMES`] 无关紧要——
+/// 查找一律走 [`a11y_theme`]，绝不按下标取。
+pub const A11Y_THEMES: &[A11yTheme] = &[
+    A11yTheme {
+        id: "a11y_day",
+        line_bg: 0x0A2A5E,   // 深靛蓝：白字 13.8:1
+        line_ink: 0xFFFFFF,
+        line_rule: 0xFFFFFF,
+        word_bg: 0xFFFF00,   // 纯黄：黑字 19.6:1
+        word_ink: 0x000000,
+    },
+    A11yTheme {
+        id: "a11y_night",
+        // 夜里蓝块要比白天**亮一档**才看得出「这里有一块」：黑纸上
+        // 0x0A2A5E 的亮度只有 0.026，块与纸几乎不分。提亮到 0.085 之后
+        // 白字仍有 7.8:1。
+        line_bg: 0x1B50A0,
+        line_ink: 0xFFFFFF,
+        line_rule: 0xFFFFFF,
+        word_bg: 0xFFFF00,
+        word_ink: 0x000000,
+    },
+];
+
+/// 按 id 取无障碍高亮配色；非无障碍主题给 `None`。
+pub fn a11y_theme(id: &str) -> Option<&'static A11yTheme> {
+    A11Y_THEMES.iter().find(|a| a.id == id)
+}
 
 impl PaperTheme {
     /// 按 id 取配置（未知 id 回落首项）。
@@ -121,8 +203,7 @@ pub fn luma(c: u32) -> f32 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
-/// 彩度（RGB 三通道极差，0..255）：用来把「低饱和国色」写成可回归的约束。
-///
+/// 彩度（RGB 三通道极差，0..255）：用来把「低饱和国色」写成可回归的约束。///
 /// 竞品爱用高饱和的蓝 / 紫 / 绿做阅读底，一眼就跳；这套配色全部压在极差
 /// 之下——纸色极差不超过 60，正文与界栏不超过 80。夹注朱印是另一回事，
 /// 它可以艳，但不许染成荧光（上限 170）。
@@ -131,6 +212,36 @@ pub fn sat(c: u32) -> f32 {
     let g = ((c >> 8) & 0xFF) as f32;
     let b = (c & 0xFF) as f32;
     r.max(g).max(b) - r.min(g).min(b)
+}
+
+/// **WCAG 2.1 相对亮度**（0.0..1.0，纯函数）。
+///
+/// 与 [`luma`] **不是一回事**：`luma` 是「感知亮度」（直接在线性 sRGB 数值上
+/// 加权，0..255，用来判深浅、比淡浓，够快够糙）；这里要先做**伽马还原**
+/// （sRGB 传输函数的分段逆），再做 Y 加权。两者在中间调能差出一倍。
+///
+/// 对比度是法务级别的数字，必须走这一条——用 `luma` 算出来的比值不可引用。
+pub fn rel_luminance(c: u32) -> f32 {
+    fn ch(v: u32) -> f32 {
+        let s = (v & 0xFF) as f32 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * ch(c >> 16) + 0.7152 * ch(c >> 8) + 0.0722 * ch(c)
+}
+
+/// **WCAG 2.1 对比度**（1.0..21.0，纯函数，与参数顺序无关）。
+///
+/// 阈值口径（WCAG 2.1）：正文 4.5:1（AA）/ 7:1（AAA）；
+/// 大字号 3:1（AA）/ 4.5:1（AAA）；图形与界面构件 3:1（1.4.11）。
+/// 无障碍档一律按 **7:1** 立规——视弱用户看的是「字号够大但不够黑」的正文。
+pub fn contrast_ratio(a: u32, b: u32) -> f32 {
+    let (la, lb) = (rel_luminance(a), rel_luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -147,17 +258,23 @@ pub enum Theme {
     Ye,
     /// **仿古籍精刻本**（v1.83.0）：冷米白纸 #F7F6F1 + 焦墨 + 双边版框。
     Ke,
+    /// **无障碍高对比 · 日间**（v1.9.82）：纯白纸 + 纯黑字（21:1）。
+    A11yDay,
+    /// **无障碍高对比 · 夜间**（v1.9.82）：纯黑纸 + 纯白字（21:1）。
+    A11yNight,
 }
 
 
 impl Theme {
     /// 顺序必须与 [`PAPER_THEMES`] 完全一致——下标即主题编号。
-    pub const ALL: [Theme; 5] = [
+    pub const ALL: [Theme; 7] = [
         Theme::Xuan,
         Theme::Mi,
         Theme::Qing,
         Theme::Ye,
         Theme::Ke,
+        Theme::A11yDay,
+        Theme::A11yNight,
     ];
 
     /// 面板上显示的名字（直接取配置表，免得两套名字不同步）。
@@ -173,7 +290,47 @@ impl Theme {
             Theme::Qing => 2,
             Theme::Ye => 3,
             Theme::Ke => 4,
+            Theme::A11yDay => 5,
+            Theme::A11yNight => 6,
         }
+    }
+
+    /// **是否无障碍高对比档**（v1.9.82）。
+    ///
+    /// 只此一处判定。要问的场合：朗读高亮换不换色、字号下不下限、动画要不要
+    /// 收着来。**绝不在别处写 `matches!(self, …)`**——那样迟早分家。
+    pub fn is_a11y(self) -> bool {
+        matches!(self, Theme::A11yDay | Theme::A11yNight)
+    }
+
+    /// 无障碍高亮配色；常视力主题给 `None`。
+    ///
+    /// 按 **id** 配对而不是下标：两张表（纸墨 / 高亮）本来就不等长，
+    /// 下标一错就是「夜读套白天的高亮」，而那种错不会崩、只会难看，
+    /// 最难发现。
+    pub fn a11y(self) -> Option<&'static A11yTheme> {
+        a11y_theme(self.paper_theme().id)
+    }
+
+    /// 无障碍档的**默认主题**（进/出这个模式时用）：日 / 夜由当前是不是深底决定。
+    pub fn a11y_default(dark: bool) -> Theme {
+        if dark {
+            Theme::A11yNight
+        } else {
+            Theme::A11yDay
+        }
+    }
+
+    /// 「一键切换高对比」：已在无障碍档就退回来处（`back`），否则按当前的
+    /// 深浅进对应的无障碍档。
+    ///
+    /// `back` 是进入前的那套主题；退出去时原样还原——**不要**自己猜一套
+    /// 「近似的普通主题」，用户精心调的纸色不该被一次快捷键抹掉。
+    pub fn toggle_a11y(self, back: Option<Theme>) -> Theme {
+        if self.is_a11y() {
+            return back.unwrap_or(Theme::Xuan);
+        }
+        Theme::a11y_default(self.is_dark())
     }
 
     /// **是否仿刻本模式**（v1.83.0）。
@@ -191,7 +348,10 @@ impl Theme {
     /// 用户随后仍可手动把墨色切到任意一套（手动覆盖默认联动）。
     pub fn linked_palette(self) -> InkPalette {
         match self {
-            Theme::Xuan | Theme::Ke => InkPalette::Ink,
+            // 无障碍档恒连锁「墨朱」= 直接取纸主题的 `text`，即纯黑 / 纯白。
+            // 若这里放行别的墨色组（赭朱、暗金），正文就不再是纯色，
+            // 7:1 的承诺当场作废。
+            Theme::Xuan | Theme::Ke | Theme::A11yDay | Theme::A11yNight => InkPalette::Ink,
             Theme::Mi => InkPalette::Ochre,
             Theme::Qing => InkPalette::Forest,
             Theme::Ye => InkPalette::Gold,
@@ -216,7 +376,14 @@ impl Theme {
     /// 纸面（翻过来的一面）：纸色向「墨 / 纯黑」压深一档。
     pub fn paper_back(self) -> u32 {
         let p = self.paper_theme();
-        mix(p.paper, if p.is_dark() { 0x000000 } else { p.text }, 0.07)
+        if p.is_dark() {
+            // 深底：往纯黑再压一档。**但纯黑已经压不动了**（无障碍夜），
+            // 那时反过来向正文提一档——目标始终是「两叶分得开」，不是
+            // 「一定更黑」。
+            mix(p.paper, if self.is_a11y() { p.text } else { 0x000000 }, if self.is_a11y() { 0.05 } else { 0.07 })
+        } else {
+            mix(p.paper, p.text, 0.07)
+        }
     }
 
     /// 正文墨色（松烟墨）。
@@ -393,6 +560,12 @@ impl Theme {
     /// 永远与纸面同调，不另起一套色；深底自动更暗、浅底自动更亮。
     pub fn chrome(self) -> u32 {
         let p = self.paper_theme();
+        if self.is_a11y() {
+            // **纯白 / 纯黑没有「再亮一档」的余地**：无障碍档把界面底往
+            // 正文方向偏一档。深浅两种情况都成立，画面永远是「纸 + 一条
+            // 比纸偏一档的横带」，绝不出现「顶栏与纸同色、浑然一片」。
+            return mix(p.paper, p.text, 0.07);
+        }
         if p.is_dark() {
             mix(p.paper, 0x000000, 0.16)
         } else {
@@ -403,6 +576,11 @@ impl Theme {
     /// 界面分隔线——向对比色压一档（深底提亮、浅底压暗）。
     pub fn chrome_line(self) -> u32 {
         let p = self.paper_theme();
+        if self.is_a11y() {
+            // 高对比的界面分隔线不许是「一档淡灰」：0.55 兑下去 ≈ #737373，
+            // 对白纸 4.7:1，一条线就立得住。
+            return mix(p.paper, p.text, 0.55);
+        }
         if p.is_dark() {
             mix(p.paper, 0xFFFFFF, 0.16)
         } else {
@@ -414,6 +592,11 @@ impl Theme {
     /// 绝不出现白底白字 / 黑底黑字。
     pub fn chrome_text(self) -> u32 {
         let p = self.paper_theme();
+        if self.is_a11y() {
+            // 界面字 = 正文色（纯黑 / 纯白）。`chrome()` 只偏了 7%，所以
+            // 18:1 上下——顶栏的字与书页的字一样黑，视弱用户不用切换眼睛。
+            return p.text;
+        }
         if p.is_dark() {
             mix(p.paper, 0xFFFFFF, 0.30)
         } else {
@@ -507,6 +690,11 @@ impl InkPalette {
     /// **墨朱组（默认）直接取纸主题的正文色**（`PAPER_THEMES` 的 `text`）——
     /// 「纸—墨」是一套设计好的搭配；其余墨色组是读者自选的组内配色。
     pub fn ink(self, t: Theme) -> u32 {
+        // 无障碍档**不许被墨色组改写**：这里放行就等于允许把纯黑换成赭褐，
+        // 7:1 当场作废。读者在无障碍档里也改墨色（UI 拦了一道）也不会破功。
+        if t.is_a11y() {
+            return t.ink();
+        }
         if matches!(self, InkPalette::Ink) {
             return t.ink();
         }
@@ -529,6 +717,10 @@ impl InkPalette {
     /// 小字注文（繁体、夹注、句读、眉批）的颜色：默认组取纸主题的夹注色
     /// （`PAPER_THEMES` 的 `note`），与正文严格分色。
     pub fn note(self, t: Theme) -> u32 {
+        // 同 `ink`：无障碍档的夹注色是**算过 7:1 的**，不许被墨色组顶掉。
+        if t.is_a11y() {
+            return t.note();
+        }
         if matches!(self, InkPalette::Ink) {
             return t.note();
         }
@@ -586,8 +778,125 @@ mod tests {
         0.2126 * r + 0.7152 * g + 0.0722 * b
     }
 
-    /// **句读朱砂必须是「活朱」**（v1.84.0）：用户拿精刻本照片比过——照片里
-    /// 那枚朱砂读点是 `#B3262F` 那一路的鲜红，压在冷米白上跳出来；而朱印那
+    /// **WCAG 对比度的算式本身**（v1.9.82）。
+    ///
+    /// 先把这条钉死，再用它去约束配色——否则「7:1」只是句口号：
+    ///   * 纯黑对纯白 = 21:1（公式的上界，差一点就说明伽马还原写错了）；
+    ///   * 同色 = 1:1（下界）；
+    ///   * 黑白颠倒 = 同一个值（对比度与顺序无关）。
+    ///
+    /// ⚠️ 这条**必须**用 `rel_luminance`（含 sRGB 伽马还原），不能用上面
+    /// 那个 `lum`：线性近似会把中灰的对比度算高一倍，于是「算着 7:1、
+    /// 看着 4:1」——那是最坏的一种通过。
+    #[test]
+    fn z_contrast_ratio_matches_the_wcag_reference_values() {
+        // 上界：纯黑 / 纯白 = 21:1。
+        assert!((contrast_ratio(0x000000, 0xFFFFFF) - 21.0).abs() < 0.05);
+        // 下界：同色 = 1:1。
+        assert!((contrast_ratio(0x336699, 0x336699) - 1.0).abs() < 1e-6);
+        // 与参数顺序无关。
+        assert_eq!(
+            contrast_ratio(0x0A2A5E, 0xFFFFFF),
+            contrast_ratio(0xFFFFFF, 0x0A2A5E)
+        );
+        // 参考值：`#767676` 对白 = 4.54:1（WCAG 文档里最常引的那个「刚好 AA」）。
+        let r = contrast_ratio(0x767676, 0xFFFFFF);
+        assert!((4.50..4.60).contains(&r), "#767676 对白应为 4.54，实得 {r:.3}");
+        // 伽马还原确实生效：线性近似会把 `#808080` 算成 ~5.3:1，
+        // 正确的值是 ~3.95:1（低于 AA，这正是「中灰不够黑」的意思）。
+        let gray = contrast_ratio(0x808080, 0xFFFFFF);
+        assert!((3.8..4.1).contains(&gray), "#808080 对白应为 3.95，实得 {gray:.3}");
+        // rel_luminance 单调：越亮值越大。
+        assert!(rel_luminance(0x333333) < rel_luminance(0x777777));
+        assert!((rel_luminance(0xFFFFFF) - 1.0).abs() < 1e-6);
+        assert!(rel_luminance(0x000000).abs() < 1e-6);
+    }
+
+    /// **无障碍档全表过 7:1**（v1.9.82）：这是这一档存在的**唯一**理由。
+    ///
+    /// 四组关系逐一套算：
+    ///   * 正文 / 纸、夹注 / 纸 —— 书页本身；
+    ///   * 句底字 / 句底、词底字 / 词底 —— 朗读高亮；
+    ///   * 词底 / 句底 —— 「当前这个词」必须从「这一句的其余字」里跳出来，
+    ///     否则弱视用户只能看到一个整块的蓝，看不见光标走到哪。
+    ///
+    /// 任何一条掉到 7 以下，这一档就不该发布——所以这里用的是 `assert!`
+    /// 而不是 `warn!`。
+    #[test]
+    fn z_a11y_themes_clear_wcag_aaa_seven_to_one() {
+        // 两张表必须能配上对（按 id），少一行就是「选了无障碍纸色却没有高亮」。
+        assert_eq!(A11Y_THEMES.len(), 2, "日 / 夜两套，多一套少一套都要改这里");
+
+        for id in ["a11y_day", "a11y_night"] {
+            let p = PaperTheme::by_id(id);
+            assert_eq!(p.id, id, "PAPER_THEMES 里没有 {id}");
+            let a = a11y_theme(id).unwrap_or_else(|| panic!("A11Y_THEMES 里没有 {id}"));
+
+            // ① 书页本身。
+            let body = contrast_ratio(p.text, p.paper);
+            assert!(body >= 7.0, "{id} 正文对纸只有 {body:.2}:1");
+            let note = contrast_ratio(p.note, p.paper);
+            assert!(note >= 7.0, "{id} 夹注对纸只有 {note:.2}:1（小字更要够黑）");
+
+            // ② 朗读高亮的两块色。
+            let line = contrast_ratio(a.line_ink, a.line_bg);
+            assert!(line >= 7.0, "{id} 句底字对句底只有 {line:.2}:1");
+            let word = contrast_ratio(a.word_ink, a.word_bg);
+            assert!(word >= 7.0, "{id} 词底字对词底只有 {word:.2}:1");
+
+            // ③ 词必须从句里跳出来。
+            let split = contrast_ratio(a.word_bg, a.line_bg);
+            assert!(split >= 7.0, "{id} 词底对句底只有 {split:.2}:1（光标看不出来）");
+
+            // ④ 句读朱在这张纸上得看得见（图形线 3:1 是 WCAG 1.4.11 的下限）。
+            let zhu = contrast_ratio(p.zhu, p.paper);
+            assert!(zhu >= 3.0, "{id} 句读朱对纸只有 {zhu:.2}:1");
+
+            // ⑤ 句底字必须与**句底**分得开；它和正文同色没关系（夜档两者都是
+            //    纯白，正该如此），但不能和色块同色，否则字就沉进块里了。
+            assert_ne!(a.line_ink, a.line_bg, "{id} 句底字与句底同色");
+        }
+    }
+
+    /// **无障碍档不能被墨色组顶掉**（v1.9.82）。
+    ///
+    /// 读者若把墨色切到「赭朱 / 暗金」，正文就不再是纯黑纯白，7:1 立刻失真。
+    /// 故 `InkPalette::ink/note` 在无障碍档里**直接短路**到纸主题——这条测试
+    /// 就是在钉那个短路：四套墨色算出来必须是同一个值。
+    #[test]
+    fn z_a11y_ignores_the_ink_palette_choice() {
+        for t in [Theme::A11yDay, Theme::A11yNight] {
+            let want_ink = t.ink();
+            let want_note = t.note();
+            for p in InkPalette::ALL {
+                assert_eq!(p.ink(t), want_ink, "{p:?}/{:?} 把正文改掉了", t);
+                assert_eq!(p.note(t), want_note, "{p:?}/{:?} 把夹注改掉了", t);
+            }
+            assert!(contrast_ratio(want_ink, t.paper()) >= 7.0);
+        }
+    }
+
+    /// **一键切换的来去**（v1.9.82）：进得去、退得回，且不吞掉用户原来的纸色。
+    #[test]
+    fn z_toggle_a11y_round_trips_to_the_original_theme() {
+        // 浅纸进「日」，深纸进「夜」。
+        assert_eq!(Theme::Xuan.toggle_a11y(None), Theme::A11yDay);
+        assert_eq!(Theme::Ke.toggle_a11y(None), Theme::A11yDay);
+        assert_eq!(Theme::Ye.toggle_a11y(None), Theme::A11yNight);
+        // 退回来处：用户调的那套原样还给他。
+        assert_eq!(Theme::A11yDay.toggle_a11y(Some(Theme::Mi)), Theme::Mi);
+        assert_eq!(Theme::A11yNight.toggle_a11y(Some(Theme::Ke)), Theme::Ke);
+        // 没有来处（比如冷启动就停在无障碍档）就回默认，不许留在原地打转。
+        assert_eq!(Theme::A11yDay.toggle_a11y(None), Theme::Xuan);
+        // 两次切换 = 回到原点。
+        for t in [Theme::Xuan, Theme::Mi, Theme::Ye, Theme::Ke] {
+            let there = t.toggle_a11y(None);
+            assert!(there.is_a11y());
+            assert_eq!(there.toggle_a11y(Some(t)), t);
+        }
+    }
+
+    /// **句读朱砂必须是「活朱」**（v1.84.0）：用户拿精刻本照片比过——照片里    /// 那枚朱砂读点是 `#B3262F` 那一路的鲜红，压在冷米白上跳出来；而朱印那
     /// 档（`accent`）是沉朱，用来点句读就读成一枚暗红的墨点，没有书卷气。
     /// 故句读另开 `zhu` 一档，且它必须**明显偏红**（R 高出 G/B 一大截）。
     #[test]
@@ -657,10 +966,10 @@ mod tests {
     }
 
     #[test]
-    fn four_paper_themes_are_registered_and_indexed() {
+    fn paper_themes_are_registered_and_indexed() {
         // 主题数与配置表严格同长：加一套配色，两边必须同时加。
         assert_eq!(Theme::ALL.len(), PAPER_THEMES.len());
-        assert_eq!(PAPER_THEMES.len(), 5);
+        assert_eq!(PAPER_THEMES.len(), 7);
         assert_eq!(InkPalette::ALL.len(), 4);
         for (i, t) in Theme::ALL.iter().copied().enumerate() {
             let p = t.paper_theme();
@@ -679,7 +988,14 @@ mod tests {
     fn themes_are_low_saturation_guose() {
         // 摒弃高饱和刺眼色：纸 / 正文 / 界栏一律低饱和（通道极差受限）。
         // 夹注朱色是朱印语汇，可以比纸「艳」，但仍不许染成荧光。
+        //
+        // **无障碍两套不在此列**（v1.9.82）：那一档的指标是对比度而不是
+        // 饱和度，纯黄 / 深蓝本来就是高饱和的——硬拿这条去卡，等于要求
+        // 「弱视看得清」与「看着不刺眼」同时成立，而前者优先。
         for t in Theme::ALL {
+            if t.is_a11y() {
+                continue;
+            }
             let p = t.paper_theme();
             assert!(sat(p.paper) < 60.0, "{} 纸色太艳：{:06X}", t.label(), p.paper);
             assert!(sat(p.text) < 80.0, "{} 正文太艳：{:06X}", t.label(), p.text);
@@ -697,6 +1013,20 @@ mod tests {
             // 正文与纸面同样要有可辨对比。
             let di = (luma(t.ink()) - luma(t.paper())).abs();
             assert!(di > 60.0, "{} 正文与纸对比不足：{di:.1}", t.label());
+            if t.is_a11y() {
+                // 无障碍档：纸是纯白 / 纯黑的一端，「更亮 / 更暗」这个方向
+                // 已经不成立（白到顶、黑到底）。改为要求「界面底必须与纸
+                // 分得开」+「界面字照 AAA 正文级」。
+                assert_ne!(
+                    luma(t.chrome()),
+                    luma(t.paper()),
+                    "{} 界面底与纸同色，顶栏会糊成一片",
+                    t.label()
+                );
+                let r = contrast_ratio(t.chrome_text(), t.chrome());
+                assert!(r >= 7.0, "{} 界面字对界面底只有 {r:.2}:1", t.label());
+                continue;
+            }
             // 深底判定：纸暗则底更暗、字更亮。
             if t.is_dark() {
                 assert!(luma(t.chrome()) < luma(t.paper()), "{} 深底界面底应更沉", t.label());
@@ -730,16 +1060,16 @@ mod tests {
 
     #[test]
     fn paper_themes_are_the_single_source_of_truth() {
-        assert_eq!(PAPER_THEMES.len(), 5);
+        assert_eq!(PAPER_THEMES.len(), 7);
         let ids: Vec<&str> = PAPER_THEMES.iter().map(|p| p.id).collect();
         assert_eq!(
             ids,
-            vec!["xuanzhi", "mihuang", "qingjian", "yedou", "keben"]
+            vec!["xuanzhi", "mihuang", "qingjian", "yedou", "keben", "a11y_day", "a11y_night"]
         );
         let names: Vec<&str> = PAPER_THEMES.iter().map(|p| p.name).collect();
         assert_eq!(
             names,
-            vec!["宣纸", "米黄", "青简", "夜读", "仿刻本"]
+            vec!["宣纸", "米黄", "青简", "夜读", "仿刻本", "高对比日", "高对比夜"]
         );
         // 四色齐全、互不重复（纸 / 正文 / 夹注 / 界栏）。
         for p in PAPER_THEMES {
@@ -888,6 +1218,11 @@ mod tests {
             let p = t.paper();
             let b = t.paper_back();
             assert_ne!(p, b);
+            if t.is_a11y() {
+                // 纯白 / 纯黑已经在一端，背叶只能**反向**偏一档（夜档向白提
+                // 5%）。要的是「两叶分得开」，不是「一定更黑」。
+                continue;
+            }
             if t.is_dark() {
                 assert!(luma(b) <= luma(p), "深底背面应更沉");
             } else {
