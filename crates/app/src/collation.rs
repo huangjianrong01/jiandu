@@ -324,8 +324,10 @@ impl LineIndex {
             diff,
             ..Default::default()
         };
-        // 预留容量：按「平均 80 字一行」估，避开多次扩容。估歪了也只是多占一点。
-        let est_lines = (text.chars().count() / 80).max(8);
+        // 预留容量：按「平均 80 字一行」估（汉字 3 字节 → 240 字节一行），避开多次
+        // 扩容。**用字节长估，不 `chars().count()`**——后者是白扫一遍全文，百万字
+        // 每次重建多花两三毫秒，而这里只是个容量提示，估歪了也只是多占一点。
+        let est_lines = (text.len() / 240).max(8);
         idx.char_start.reserve(est_lines);
         idx.byte_start.reserve(est_lines);
         idx.vis.reserve(est_lines + 1);
