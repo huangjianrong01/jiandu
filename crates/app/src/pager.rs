@@ -65,6 +65,11 @@ pub struct LayoutKey {
     pub inline_notes: bool,
     /// 西文成组压缩（影响占格）。
     pub west_mode: bool,
+    /// **現代標點古籍化**（v1.9.91）：剥掉《》（影响流的字数与占格）。
+    ///
+    /// 它和「标点显隐」同一类：**改字流**，故必须进指纹——否则切了开关
+    /// 仍读旧缓存，版面会「点了没反应」，直到翻到下一个缓存 miss 才变。
+    pub strip_title: bool,
 }
 
 /// 一章的排版结果在 LRU 里最多留多少章。24 章 ≈ 300 面，足够视口 +
@@ -152,7 +157,7 @@ impl Pager {
         book: &Book,
         ci: usize,
     ) -> Vec<Page> {
-        let flow = book.flow_of_chapter(ci, self.key.show_punct);
+        let flow = book.flow_of_chapter_with(ci, self.key.show_punct, self.key.strip_title);
         if flow.is_empty() {
             return Vec::new();
         }
@@ -518,6 +523,7 @@ mod tests {
             show_punct: true,
             inline_notes: false,
             west_mode: false,
+            strip_title: false,
         }
     }
 

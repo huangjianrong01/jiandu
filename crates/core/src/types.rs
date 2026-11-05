@@ -765,6 +765,14 @@ impl Paragraph {
             }
         })
     }
+    /// 某偏移是否在**书名号之内**（v1.9.91 · 古籍化的波浪线判据）。
+    ///
+    /// 与 `mark_at` 分开：`mark_at` 读的是**存下来的**标记跨度（用户划的、
+    /// 导入器认出来的），这里读的是**原文里的书名号**——壳已被剥掉，但
+    /// 段落文本里还留着，故随时可查、不落任何新数据。
+    pub fn inside_title_marks(&self, offset: usize) -> bool {
+        crate::types::inside_title_marks(&self.text, offset)
+    }
     /// 某偏移是否在**着重**（`[高亮]…[/高亮]`）的跨度内。
     ///
     /// 与 `mark_at` 分开：专名 / 书名是「线」，着重是「点」，视觉与语义都不同，
@@ -1430,7 +1438,22 @@ impl Book {
     ///
     /// 返回的 `Glyph.chapter` 仍是**全书章号** `ci`（不是 0），这样分页引擎
     /// 判章边界、渲染层反查章节的行为都与全书流一致。
+    ///
+    /// 书名号按**现代原样**保留（换成竖排形 `︽︾` 附着在邻字格）。要走
+    /// 「現代標點古籍化」（剥掉《》、改画旁侧波浪线）请用
+    /// [`Book::flow_of_chapter_with`]。
     pub fn flow_of_chapter(&self, ci: usize, show_punct: bool) -> Vec<Glyph> {
+        self.flow_of_chapter_with(ci, show_punct, false)
+    }
+
+    /// `flow_of_chapter` 的「古籍化」版：`strip_title = true` 时书名号**不进
+    /// 字流**（真刻本没有《》，书名靠旁侧波浪线表示）。
+    pub fn flow_of_chapter_with(
+        &self,
+        ci: usize,
+        show_punct: bool,
+        strip_title: bool,
+    ) -> Vec<Glyph> {
         let mut out = Vec::new();
         let Some(ch) = self.chapters.get(ci) else {
             return out;
@@ -1446,6 +1469,13 @@ impl Book {
                     continue;
                 }
                 if !show_punct && is_punct(c) {
+                    continue;
+                }
+                // 「現代標點古籍化」（默认开）：书名号在刻版之前就剥掉——真刻本
+                // 里没有《》，书名靠**旁侧波浪线**（專名號）表示。剥掉后不占
+                // 格、不进列，故绝不会有「《」吊在列尾这种事（避头尾天然成立）。
+                // 波浪线由渲染层按 [`inside_title_marks`] 补，不在流里留记号。
+                if strip_title && is_title_mark(c) {
                     continue;
                 }
                 out.push(Glyph {
@@ -1469,7 +1499,14 @@ impl Book {
     /// 顶格起排，现代「首行缩进两个字」在此为刻意剔除（v1.52.0 起）。
     /// 字符流里已无任何 `Indent` 占位，段与段之间只靠换行 / 列尾自然收束，
     /// 正文第一列从版框顶缘起排。
+    ///
+    /// 书名号按**现代原样**保留（见 [`Book::to_flow_with`] 的「古籍化」开关）。
     pub fn to_flow(&self, show_punct: bool) -> Vec<Glyph> {
+        self.to_flow_with(show_punct, false)
+    }
+
+    /// `to_flow` 的「古籍化」版：`strip_title = true` 时书名号不进字流。
+    pub fn to_flow_with(&self, show_punct: bool, strip_title: bool) -> Vec<Glyph> {
         let mut out = Vec::new();
         for (ci, ch) in self.chapters.iter().enumerate() {
             for (pi, p) in ch.paragraphs.iter().enumerate() {
@@ -1481,6 +1518,11 @@ impl Book {
                     }
                     // 标点显隐：关闭时不产出标点字（offset 仍按原文计数，注文定位不受影响）。
                     if !show_punct && is_punct(c) {
+                        continue;
+                    }
+                    // 「現代標點古籍化」（默认开）：书名号不进字流，见 `flow_of_chapter`
+                    // 同一道闸的说明。
+                    if strip_title && is_title_mark(c) {
                         continue;
                     }
                     // **书名号在进排版引擎之前就换成竖排专用形**（v1.30.0）：
@@ -1745,6 +1787,47 @@ pub fn han_small(n: usize) -> String {    const DIGITS: [&str; 10] = ["", "一",
         return s;
     }
     n.to_string()
+}
+
+/// **某字是否被书名号包住**（「現代標點古籍化」的判据 · v1.9.91）。
+///
+/// 真刻本没有《》，书名用**旁侧波浪线**（專名號）表示。开关打开时
+/// [`Book::to_flow`] 把《》剥掉，渲染层再用本函数把「被包住的那些字」
+/// 找回来，逐字画一条波浪线——剥了壳、留了线，书的味道才对。
+///
+/// `offset` 是**段落内的字符下标**（与 `Glyph.offset` 同一把尺子，剥壳
+/// 不影响它）。判据只认**成对且有序**的括号：`甲《乙》丙` → 只有「乙」
+/// 为真；`《甲` 这种落单的开号不算（没有收束就没有书名，不该胡乱划线）。
+/// 嵌套（`《甲〈乙〉丙》`）按层数算，里外都算「被包住」。
+pub fn inside_title_marks(text: &str, offset: usize) -> bool {
+    // ① 先走到 `offset`，看此刻有没有**还开着的**书名号（记住最内层那枚）。
+    let mut depth = 0usize;
+    let mut open_at: Option<usize> = None;
+    for (i, c) in text.chars().enumerate() {
+        if i == offset {
+            // 括号本身不算「被包住」：开号领起后面的字、闭号收束前面的字，
+            // 两者都不该拿到波浪线（否则线的首末会多出半格，看着像划歪了）。
+            if is_title_mark(c) {
+                return false;
+            }
+            break;
+        }
+        if is_open_title(c) {
+            depth += 1;
+            open_at = Some(i);
+        } else if is_close_title(c) {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                open_at = None;
+            }
+        }
+    }
+    if open_at.is_none() {
+        return false; // 不在任何书名号里（或已经越界）
+    }
+    // ② 有开号还不够，**后面必须真有一个收束的闭号**才算书名。落单的
+    //    `《`（清洗没配对的残壳）只是错字，胡给它划线等于把错当成体例。
+    text.chars().skip(offset).any(is_close_title)
 }
 
 /// 书名号：横排的 `《》〈〉` 与竖排专用 `︽︾︿﹀`。
@@ -2409,6 +2492,58 @@ mod tests {
         assert!(without.iter().any(|g| g.offset == 0 && g.ch == '道'));
         // v1.52.0 起不再产出段首缩进占位——流里应无任何 Indent 字形。
         assert_eq!(without.iter().filter(|g| g.is_indent()).count(), 0);
+    }
+
+    #[test]
+    fn classic_title_marks_strip_the_brackets_and_flag_the_inside() {
+        // 「現代標點古籍化」：真刻本没有《》，壳剥掉、字留下、旁侧补波浪线。
+        let mut b = Book::new("書名號", "佚名");
+        b.chapters.push(Chapter {
+            title: "一".into(),
+            paragraphs: vec![Paragraph::plain("讀《資治通鑑》有得")],
+        });
+
+        // ① 现代态：书名号换成竖排形、标成 Attach，不占格。
+        let modern = b.to_flow_with(true, false);
+        let marks: Vec<char> = modern
+            .iter()
+            .filter(|g| g.kind == GlyphKind::Attach)
+            .map(|g| g.ch)
+            .collect();
+        assert_eq!(marks, vec!['︽', '︾'], "现代态应保留一对竖排书名号");
+
+        // ② 古籍态：一个书名号也不许进字流。
+        let classic = b.to_flow_with(true, true);
+        assert!(
+            classic.iter().all(|g| !is_title_mark(g.ch)),
+            "古籍化之后流里仍有书名号：{:?}",
+            classic
+                .iter()
+                .filter(|g| is_title_mark(g.ch))
+                .map(|g| g.ch)
+                .collect::<Vec<_>>()
+        );
+        // 正文一个字都不许少（剥的只是壳）。
+        assert_eq!(classic.len(), modern.len() - 2);
+        assert_eq!(
+            classic.iter().map(|g| g.ch).collect::<String>(),
+            "讀資治通鑑有得"
+        );
+
+        // ③ 波浪线的判据：被包住的四个字为真，括号本身与外面为假。
+        let t = "讀《資治通鑑》有得";
+        assert!(!inside_title_marks(t, 0), "「讀」在书名号外");
+        assert!(!inside_title_marks(t, 1), "「《」本身不算被包住");
+        for off in 2..6 {
+            assert!(inside_title_marks(t, off), "第 {off} 字应在书名号内");
+        }
+        assert!(!inside_title_marks(t, 6), "「》」本身不算被包住");
+        assert!(!inside_title_marks(t, 7), "「有」在书名号外");
+
+        // ④ 落单的开号不是书名，不该胡乱划线；越界不 panic。
+        assert!(!inside_title_marks("《資治通鑑", 3));
+        assert!(!inside_title_marks("資治通鑑", 99));
+        assert!(inside_title_marks("無《甲》", 2));
     }
 
     #[test]

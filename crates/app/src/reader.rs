@@ -521,12 +521,13 @@ const BIG_TITLE_SCALE: f32 = 0.92;
 /// 小题（篇题）最多排几字。
 const SUB_TITLE_MAX: usize = 7;
 
-/// **卷首章题上空几格**（v1.36）：两格。
+/// **卷首章题上空几格**（v1.36 定为两格；v1.9.89 归零）。
 ///
-/// 刻本的卷首题名不顶着上鱼尾排，而是低两格起——「空两格另起一列」那份
-/// 尊。章题列本就独占一列、通高到版框，空出的两格只是把篇题往下压，
-/// 既不占正文的地，也不会挤掉正文（能排几字按扣除后的余高算）。
-const TITLE_HEAD_CELLS: f32 = 2.0;
+/// 旧制让卷首题名低两格起（「空两格另起一列」那份尊），但在窄屏单叶
+/// 大字号下，这两格叠加象鼻 + 上鱼尾，把标题顶上顶出一大块空白，与左边
+/// 顶格的正文列高低悬殊——用户实测点名「版心灾难」。**归零**：题名紧贴
+/// 上鱼尾下缘起排，与正文列同一「顶格」口径，整版四边齐平。
+const TITLE_HEAD_CELLS: f32 = 0.0;
 
 /// 顶栏高度：一处定义——动画位移、命中判定全用它。
 ///
@@ -554,7 +555,10 @@ pub(crate) const BAR_GAP: f32 = 16.0;
 /// 刻本正文是顶着边栏排的，屏幕上却显闷：字与那道朱线贴死，整版像被
 /// 框死。内缩 8px 之后，字与边栏之间留出一线呼吸，仍远窄于天头地脚，
 /// 「天宽地窄」的格局不动。左右对称内缩，故两叶仍严格镜像。
-pub(crate) const INNER_PAD: f32 = 8.0;
+///
+/// v1.9.90：常量搬到墨线层 [`crate::sheet_ink::INNER_PAD`]——文字层的内缩
+/// 与墨线层的界行位置从此是**同一个数**，不许各存一份。
+pub(crate) use crate::sheet_ink::INNER_PAD;
 
 /// **左侧栏宽度**（v1.79.0）：一处定义——面板自身宽度、滑出位移、目录题名
 /// 能排几字全用它。
@@ -1254,12 +1258,7 @@ impl Root {
             self.duplex == Duplex::Facing,
             // 中缝渲染条件：对开且下一面（左半叶）存在。
             self.page + 1 < total,
-            crate::grid::gutter_w(
-                self.content_w,
-                self.grid.columns,
-                ANCIENT_EDGE,
-                self.grid.margin,
-            ),
+            crate::grid::BANXIN_W,
             self.col_w,
             self.grid.columns,
         )
@@ -2894,6 +2893,8 @@ impl Root {
                 .get(self.page)
                 .and_then(|p| p.iter().find(|g| !g.is_indent()).map(|g| (g.chapter, g.para, g.offset)));
             if let Some(key) = first {
+                // 键盘划线恒为实线：先清掉同字的波浪线，再切实线。
+                self.underlines_wavy.remove(&key);
                 if !self.underlines.remove(&key) {
                     self.underlines.insert(key);
                 }
@@ -4579,6 +4580,8 @@ impl Root {
         // v1.81.0 · 模块六：出卡面三枚小印（挖空 / 问答 / 释义）——决定
         // 「更多 → 卡片匣→Anki」出哪种卡，故摆在条目之上、题头之下。
         list = list.child(self.render_anki_kind_row(cx));
+        // 模块六 · 生词本：篩選行（全部 / 生词本 / 划线）摆在条目之上。
+        list = list.child(self.render_card_filter_row(cx));
         list = list.child(self.render_cards_list(cx));
         list
     }
@@ -5549,15 +5552,7 @@ impl Root {
         // 单页内上下滑动查看，而不是把字压到更小或裁掉。
         let inner = if self.grid_min_font {
             let leaf_w = if self.duplex == Duplex::Facing {
-                ((self.content_w
-                    - crate::grid::gutter_w(
-                        self.content_w,
-                        self.grid.columns,
-                        ANCIENT_EDGE,
-                        self.grid.margin,
-                    ))
-                    / 2.0)
-                    .max(80.0)
+                ((self.content_w - crate::grid::BANXIN_W) / 2.0).max(80.0)
             } else {
                 self.content_w.max(80.0)
             };
@@ -6050,29 +6045,22 @@ impl Root {
             }
         }
 
-        // 折叠零可见宽度的「幽灵列」：列内没有任何正文 / 注文片（空列或纯
-        // Gap 占位列）一律不给物理列宽、不画界行——杜绝整列空白霸占版面。
-        // grid 固定 `grid_w` 宽 + `justify_end`：可见列靠右排，左侧空当就是
-        // 古籍里没写满的留白（不画线），右读顺序（列 0 = 最右）一字不挪。
-        let mut grid = div()
-            .flex()
-            .flex_row()
-            .items_start()
-            .justify_end()
-            .w(px(grid_w));
+        // ── 满栏（v1.9.90）：每列恒占一格，**再没有零宽列** ──────────────
+        // 刻本的行格是刻在整块版上的：这一叶没写满，栏线照样画到底。旧制
+        // 把「字流中间的幽灵列」（纯 Gap 占位）压成零宽，可见列于是在
+        // `justify_end` 下被整体推挤——而界行现在由 Canvas 按 `k × cell_w`
+        // 画（`sheet_ink::LeafInk`），一旦列宽被协商掉，墨线与字格就错位。
+        // 现在每列恒占满一格（空列 = 只留白、不排字），第 k 列的 x 恒等于
+        // `k × cell_w`，文字层与墨线层逐格对得上；界行也因此一道不缺。
+        let mut grid = div().flex().flex_row().items_start().w(px(grid_w));
         for i in (0..text_cols).rev() {
             let items: &[Piece] = columns.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-            // 零可见宽度判定：空列或纯 Gap 列 → 折叠成零宽占位，不分配列宽。
             let visible = items
                 .iter()
                 .any(|p| matches!(p, Piece::Main(_) | Piece::Gloss(..)));
             // 章首页的开卷列（i==0，紧邻版心）：顶部预留一段空白带给卷首题署，
             // 正文从带下接着排（带高 = chapter_inscription_reserve_rows）。
             let top_skip = if start_chapter && i == 0 { reserve } else { 0 };
-            // 最左一列（i == text_cols-1）贴版框左缘：它的左界行由 inner
-            // 的闭合细线（`border_l_1`）充当，自己不再画——否则两条 1px
-            // 并成 2px，乌丝栏就不再根根一样粗（v1.34.0 闭合版框的收尾）。
-            let first_col = i == text_cols - 1;
             // 信笺模板：在第 7、8 个正文列之间插一道一列宽的中缝。
             // 章首页最右多一个章题列（也算一列），分割点随之前移一列，
             // 左右两边仍各是 7 列。
@@ -6091,14 +6079,14 @@ impl Root {
                     self.grid.columns,
                     back,
                     top_skip,
-                    first_col,
                     &note_index,
                     geo.interactive,
                     cx,
                 ));
             } else {
-                // 折叠占位：零宽、无界行——幽灵列在此彻底消失。
-                grid = grid.child(div().w(px(0.0)));
+                // 空列（没排到字 / 纯 Gap 占位）：整格留白，不排一个字；
+                // 它那道界行由墨线层统一画，这里一个边框都不许有。
+                grid = grid.child(self.blank_column(cell_w, cell_h, rows, foot_h));
             }
         }
         // 章题列最后加：flex_row 末尾即最右，成为本章第一列（读序之首）。
@@ -6156,49 +6144,31 @@ impl Root {
         //      下面的边框循环只碰 `border_*`，绝不重建 `grid` 的子元素树。
         // ════════════════════════════════════════════════════════════
         //
-        // 版框：由配置驱动——single = 单线；double = 外粗内细（文武边栏）。
-        // 文武的内层细线只在 double 时画；single 只需最外一根。
-        // **四边一律闭合**（v1.34.0）：对开两叶贴中缝的内侧缘（左叶右缘 /
-        // 右叶左缘）也设框线——左右两叶拼成一整张纸时，外框围住整页外缘、
-        // 内侧各一道粗竖框把中缝夹住；单叶（Alone）同样四边全封闭。
-        // 内层 `relative`：地脚 / 卷首题署都用绝对定位叠在行格之上。
+        // ════════════════════════════════════════════════════════════════
+        // v1.9.90 **混合渲染**：版框 / 界行 / 版心全部改由 Canvas 按绝对坐标画，
+        // 文字仍然走 GPUI 文本节点。分界线只有一句：
         //
-        // v1.86.0「呼吸感」：内框横向加 `INNER_PAD` 的内衬——字与左右两道
-        // 朱线之间留一线白，整版不再被框死。**只加横向**：天头地脚的 3:2
-        // 铁律（`TOP_OF_BOT`）一寸不动；左右对称，两叶仍严格镜像。
-        // 版框本身因此宽出 2×`INNER_PAD`，正好吃掉引擎给版框预留的
-        // `ANCIENT_EDGE`（50）余量，不会挤到中缝。
+        //   墨线层（`sheet_ink`）：外框、内框、每一道界行——只拿常量与格数算，
+        //                        与窗口宽、列数、flex 的协商结果毫无关系；
+        //   文字层（这里）  ：只把字格摆到 `LeafInk::grid_x()/grid_y()` 上。
+        //
+        // 从此「框线跟着布局漂移」这件事在物理上不可能发生：`border_*` 一个
+        // 都不许再出现（版框宽度、内衬、界行位置全在 `sheet_ink` 里定死）。
+        // ════════════════════════════════════════════════════════════════
+        //
+        // 内层 `relative`：地脚 / 卷首题署都用绝对定位叠在行格之上。
+        // 内衬 `INNER_PAD` 只在横向：字与左右两道竖线之间留一线白，
+        // 天头地脚的 3:2 铁律（`TOP_OF_BOT`）一寸不动。
         let mut inner = div()
             .relative()
-            .px(px(INNER_PAD))
-            .border_color(rgb(t.frame_ink()))
+            .px(px(crate::sheet_ink::INNER_PAD))
             .child(grid)
             .child(foot);
-        // **内框线（文武边栏的内层细线）**：与列间界行（乌丝栏）同一条——
-        // 同色、同粗（1px）、同起止，看上去就是「界行围了一圈」。
-        // **四边一律闭合**（v1.34.0，`grid::frame_sides`）：对开两叶贴中缝
-        // 的内侧缘（左叶右缘 / 右叶左缘）也必须画——此前内侧留空，中缝像
-        // 一条孤立的马路悬在中央（用户实测）。界行的上下两端因此接到
-        // 横框上，字格围成完全封闭的网格。
-        //
-        // v1.85.0「版框形制」：外框恒四边（3px），**内框按款式裁边**——
+        // 版框形制（v1.85.0）：外框恒四边（3px）；**内框按款式裁边**——
         // 四周双边满画、左右双边只留左右两道竖线、四周单边整圈不画。
-        // 裁的只是这一层 1px 细线，`grid` 的子元素树一个都不碰。
+        // 裁的只是墨线层里的那圈 1px 细线，`grid` 的子元素树一个都不碰。
         let sides = crate::grid::frame_sides(edge);
         let in_sides = self.frame_style.inner_sides(sides);
-        if in_sides[0] {
-            inner = inner.border_t_1();
-        }
-        if in_sides[1] {
-            inner = inner.border_r_1();
-        }
-        if in_sides[2] {
-            inner = inner.border_b_1();
-        }
-        if in_sides[3] {
-            inner = inner.border_l_1();
-        }
-        inner = inner.border_color(rgb(t.rule_line(self.rule_color)));
         // 卷首题署（卷端）：章首页开卷列顶部叠一卷端题名——
         // 第一行（顶格）写书名·卷次，第二行（低几格）写署名；
         // 落在 layout_book 预留的空白带上，与正文互不遮挡。
@@ -6219,33 +6189,28 @@ impl Root {
                 ));
             }
         }
+        // ── 版框 / 界行：交给墨线层（Canvas 绝对坐标）──────────────────
+        // 一叶的物理尺寸由「格数 × 格宽 + 两层框线 + 横向内衬」定死，
+        // 与 flex 怎么协商毫无关系。`p(FRAME_INSET)` 是**文字层的内缩**：
+        // 外粗框 3 + 框内留边 3 + 内细线 1 = 7，墨线层用同一常量落笔，
+        // 故「框线压字」或「字离框一线」在数值上不可能出现。
+        let frame_w = grid_w + (crate::sheet_ink::FRAME_INSET + crate::sheet_ink::INNER_PAD) * 2.0;
+        let frame_h = cell_h * rows as f32 + foot_h + crate::sheet_ink::FRAME_INSET * 2.0;
+        let ink = crate::sheet_ink::LeafInk {
+            w: frame_w,
+            h: frame_h,
+            cell_w,
+            // 章题列也是一格：它同样要有一道界行、同样占满宽度。
+            cols: text_cols
+                + usize::from(start_chapter)
+                + usize::from(geo.show_fish_tail),
+            sides,
+            inner_sides: in_sides,
+        };
         let mut frame = div()
-            .border_color(rgb(t.frame_outer()))
-            .p(px(3.0))
+            .w(px(frame_w))
+            .p(px(crate::sheet_ink::FRAME_INSET))
             .child(inner);
-        // **外层框线一律加粗（3px）**：8 / 10 / 12 / 14 列都是「外粗内细」
-        // 的文武边栏——外框压得住整版，内框与界行同粗，层次才立得住。
-        // **四边一律闭合**（v1.34.0）：左半叶的右缘、右半叶的左缘各立一道
-        // 粗竖框，两线分居中缝两侧，把鱼尾、书名、叶码死死夹在中间——
-        // 中缝不再是一条悬空的「马路」。
-        // **四边同粗（v1.65.0：3px 一圈闭合矩形）**：旧制横 3px、竖 4px，
-        // 上下一线细、左右一线粗，远看是一圈「粗细不匀的框」；照规范图把
-        // 外框收成**等宽的粗栏线**，四角才咬得住。内框仍是 1px 细线，
-        // 外粗内细的文武边栏层次照旧。**四边一律闭合**：左半叶的右缘、
-        // 右半叶的左缘各立一道粗竖框，两线分居中缝两侧，把鱼尾、书名、
-        // 叶码死死夹在中间——中缝不再是一条悬空的「马路」。
-        if sides[0] {
-            frame = frame.border_t_3();
-        }
-        if sides[1] {
-            frame = frame.border_r_3();
-        }
-        if sides[2] {
-            frame = frame.border_b_3();
-        }
-        if sides[3] {
-            frame = frame.border_l_3();
-        }
         // **横向裁剪（v1.9.21）：字只许被版框裁掉，绝不许画到隔壁叶上。**
         //
         // 真机双页样张的事故：左半叶最右一列「斯不善已」压在中缝鱼尾上、右半叶
@@ -6283,6 +6248,19 @@ impl Root {
             frame = frame.child(book_ear(t, ear_w, ear_h, 0.0, 0.0, &ear_label));
         }
 
+        // 墨线在下、文字在上：`relative` 容器没有任何 padding，画布的
+        // `top(0)/left(0)` 就是版框外缘——两层共用同一个原点。
+        let leaf = div()
+            .relative()
+            .w(px(frame_w))
+            .h(px(frame_h))
+            .child(crate::sheet_ink::leaf_ink_canvas(
+                ink,
+                t.frame_outer(),
+                t.rule_line(self.rule_color),
+            ))
+            .child(frame);
+
         // 纸面留白：对开时内侧（贴纸心那一侧）收掉，两半才能拼成一张纸。
         // `relative`：书耳 / 地脚牌记用绝对定位挂在纸面角上。
         //
@@ -6306,7 +6284,7 @@ impl Root {
             .pl(px(pl))
             .pr(px(pr))
             .bg(rgb(paper))
-            .child(frame);
+            .child(leaf);
         // 纸张高度锁死为内容区高：顶对齐后整张纸撑满正文区，天头 / 地脚就是
         // 引擎算出的 `margin_top` / `margin_bot`（非交互的导出图保持自适应）。
         if geo.interactive {
@@ -6392,13 +6370,25 @@ impl Root {
         sheet
     }
 
+    /// 一叶没排满时的**空白栅格列**：不排一个字，只占满一格。
+    ///
+    /// 刻本的行格刻在整块版上——这一叶没写满，栏线照样画到底。这里
+    /// **一个边框都不画**：界行由墨线层（`sheet_ink::LeafInk::rule_xs`）
+    /// 按 `k × cell_w` 统一落笔，空列一个字都不排，位置却一格不差。
+    fn blank_column(&self, cell_w: f32, cell_h: f32, rows: usize, foot_h: f32) -> Div {
+        div()
+            .w(px(cell_w))
+            .h(px(cell_h * rows as f32 + foot_h))
+    }
+
     /// 一列：正文单字与夹注小字自上而下相接。
     /// `rows` = 每列字数（来自网格引擎）；`foot_h` 是地脚高度：
     /// 列高照加，界行才能通到版框下沿。
     /// `columns` = 当前列数（≥10 时夹注走阈值字号 / 单行，避免小字糊掉）。
-    /// `first_col` = 是否是**最左一列**（贴版框左缘）：它的左界行由
-    /// `inner` 的 `border_l_1` 充当（v1.34.0 四边闭合后那条线必然存在），
-    /// 自己再画一道就并成 2px——乌丝栏必须根根一样粗。
+    ///
+    /// ⚠️ v1.9.90：本列**不画任何边框**。界行（乌丝栏）改由墨线层
+    /// `sheet_ink::LeafInk` 按 `k × cell_w` 绝对坐标统一落笔——列与列之间
+    /// 的线不再跟着 flex 协商结果走，也绝不会两条 1px 并成 2px。
     fn ancient_column(
         &self,
         items: &[Piece],
@@ -6411,28 +6401,20 @@ impl Root {
         back: bool,
         // 顶部预留给卷首题署的空白行数（0 = 不预留，普通列）。
         top_skip: usize,
-        // 是否最左一列（贴版框左缘）：为真则不画左界行（由 inner 的
-        // 闭合细线充当），免得两条 1px 并成 2px。
-        first_col: bool,
         note_index: &NoteIndex,
         // 字格 / 注块是否挂鼠标交互（晒本预览传 false：纯展示）。
         interactive: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme;
-        // 列外框（含乌丝栏界行）高度固定，与邻列对齐；顶部预留带用内边距把
-        // 正文内容压到带下，预留带内仍是空白纸面，留给卷首题署叠绘。
+        // 列盒高度固定，与邻列对齐；顶部预留带用内边距把正文内容压到带下，
+        // 预留带内仍是空白纸面，留给卷首题署叠绘。
         let mut col = div()
             .w(px(cell_w))
             .h(px(cell_h * rows as f32 + foot_h))
             .flex()
             .flex_col()
             .items_center();
-        // 丝栏：列间界行按版字面板所选（乌 / 金 / 朱）取色。
-        // 最左一列不画（见 `first_col`）：版框内缘那道闭合细线就是它。
-        if !first_col {
-            col = col.border_l_1().border_color(rgb(t.rule_line(self.rule_color)));
-        }
         let mut content = div().w_full().flex().flex_col().items_center();
         // ── v1.56.0 顶格对齐 ──────────────────────────────────────────
         // 列的**起始绘制一律锚定 `grid::top_baseline`**（不再就地写
@@ -6856,7 +6838,6 @@ impl Root {
     ) -> Div {
         let t = self.theme;
         let is_user = matches!(source, NoteSource::User);
-        let chars: Vec<char> = text.chars().collect();
         // ── 几何唯一源（v1.9.57 · clreq / GB/T 口径）──────────────────
         //
         // ① 小字 = 正文**严格半字号**；② 每个小字格 = 正文格**严格半格**
@@ -6864,7 +6845,9 @@ impl Root {
         // ③ 行距 0；④ 右列读在前、且恒不短于左列。
         // 全部取自 `gloss::note_geom`——PDF（`pdf::draw_gloss`）读同一份，
         // 屏幕与纸上不会各算一套。
-        let g = crate::gloss::note_geom(&chars, cell_w, cell_h, fs);
+        // 直接吃 `&str`（v1.9.89）：不再每帧把注文 `collect` 成 `Vec<char>`，
+        // 海量夹注重绘不再吃堆。
+        let g = crate::gloss::note_geom(text, cell_w, cell_h, fs);
         let (rows, row_h, sub_w) = (g.rows().max(1), g.row_h, g.sub_w);
         let nfs = g.fs;
         // 注文小字色：墨色 × 纸色自动推导（永远比正文淡一档）。
@@ -6991,8 +6974,8 @@ impl Root {
             // 右格右缘正落在正文列的中轴线上，合起来恰好一个正文列——
             // 这就是「右侧右对齐、左侧左对齐、整体与正文列居中」的实现。
             let pair = [
-                chars.get(r + g.right).copied(),
-                chars.get(r).copied(),
+                text.chars().nth(r + g.right),
+                text.chars().nth(r),
             ];
             let mut line = div()
                 .w(px(cell_w))
@@ -7079,43 +7062,29 @@ impl Root {
         // 丝栏：列间界行按版字面板所选（乌 / 金 / 朱）取色。
         let col_h = cell_h * rows as f32 + foot_h;
         let mut col = div()
-            // `relative`：象鼻（绝对定位的 Canvas）以本列为定位上下文。
+            // `relative`：留着作本列的定位上下文（改版后虽已无象鼻 Canvas，
+            // 但将来若有绝对定位子件，仍以本列为基准，防回退成视口定位）。
             .relative()
             .w(px(col_w))
             .h(px(col_h))
             .flex()
             .flex_col()
-            .items_center()
-            .border_l_1()
-            .border_color(rgb(t.rule_line(self.rule_color)));
-        // 天头：与版心同制的**象鼻**——鱼尾吊在版框下面，不是贴框。
-        // （v1.68.0：原来这里拍的是 `cell_h × 1.0`，与版心的象鼻长度对不上，
-        //   章首页的鱼尾会与左半叶的鱼尾高低不齐。）
-        let (_ref_w, th) = crate::banxin::banxin_tail_size(col_w, cell_h, col_w);
-        let head = crate::banxin::xiangbi_len(th);
-        // 章题列在本版式里就是那一叶的版心（见 `detailed`）：顶端同样要吊
-        // 一根**实心象鼻**。缺了它，鱼尾之上那段空当看着就像凭空加的
-        // padding——其实那是象鼻的位置（v1.68.0 补画，只画上端：列尾没有
-        // 鱼尾，底下那根无处可落）。
-        col = col.child(gutter_trunk(col_w, col_h, head, t.frame_ink(), false));
-        col = col.child(div().h(px(head)));
-        // 上鱼尾：与版心同一枚黑鱼尾（深灰 `#222222`），形制同式：宽 = 本列宽，
-        // 高 = 宽 × 0.4（扁宽），凹口顶点在 `H × 0.7`。
-        let tw = (col_w - 2.0).max(crate::banxin::FISHTAIL_W_MIN);
-        col = col.child(banxin_tail(tw, th, true, t.fish_ink()));
-        col = col.child(div().h(px(cell_h * 0.18)));
-        // 篇题能排几字：总高扣天头、两枚鱼尾、篇题数与几段留白，
-        // 余下全给篇题——鱼尾取了 1.5 字高后，短叶也不会溢出。
+            .items_center();
+        // v1.9.90：本列**不画边框**——它左缘那道界行由墨线层
+        // （`sheet_ink::LeafInk::rule_xs`）按 `k × cell_w` 统一落笔。
+        // v1.9.89：**章题列不再是第二道版心**。
+        //
+        // 旧制把象鼻 + 上下鱼尾也搬进章题列，等于在「中缝那道版心」之外又造
+        // 了一道：对开时右叶最右凭空多出一列鱼尾（用户圈红「版心灾难」），单叶
+        // 时更把题名顶下一大截、留出一块空当。版心的象鼻鱼尾只属于中缝
+        // （`render_gutter`），章题列回归**纯文字列**——题名紧贴版心顶部，与正文
+        // 列同一「顶格」口径，四边齐平。
         let nfs = (fs * 0.42).max(9.0);
         let num_h = (nfs + 2.0) * han_num(chapter + 1).chars().count() as f32;
-        // 卷首空两格：题名不顶着上鱼尾起，低 [`TITLE_HEAD_CELLS`] 格再落字。
+        // 卷首空几格（v1.9.89 归零）：题名直接顶格起排。
         let lead = tcell * TITLE_HEAD_CELLS;
-        let room = cell_h * rows as f32 + foot_h
-            - head
-            - th * 2.0
-            - num_h
-            - lead
-            - cell_h * (0.18 + 0.1 + 0.38);
+        // 能排几字：总高扣掉底部「篇题数 + 留白」，余下全给题名。
+        let room = cell_h * rows as f32 + foot_h - num_h - lead - cell_h * (0.1 + 0.38);
         // ── 大题在上、小题在下（古籍卷首常例）────────────────────────
         // **大题 = 书名**（《史记》），**小题 = 篇题 / 章题**（五帝本纪第一）。
         // 正文起首书名与篇题各占一行、前后呼应，上下位序取「大题在上、
@@ -7190,8 +7159,7 @@ impl Root {
             );
         }
         col = col.child(div().h(px(cell_h * 0.1)));
-        // 下鱼尾：与上鱼尾对合，夹住篇题与篇题数（同形，开口相对）。
-        col = col.child(banxin_tail(tw, th, false, t.fish_ink()));
+        // v1.9.89：下鱼尾同撤——版心鱼尾只归中缝，章题列收尾只留地脚留白。
         col.child(div().h(px(cell_h * 0.38)))
     }
 
@@ -7286,14 +7254,10 @@ impl Root {
         let t = self.theme;
         let fs = self.size_ancient;
         let cell_h = self.row_h;
-        // 中缝宽＝网格引擎预留的两叶间隙（`grid::gutter_w`）：约一行字宽，
-        // 纸面总宽不变，只是把原来「两叶之间的空白」换成了纸心的一道版心。
-        let gw = crate::grid::gutter_w(
-            self.content_w,
-            self.grid.columns,
-            ANCIENT_EDGE,
-            self.grid.margin,
-        );
+        // 中缝宽 = `grid::BANXIN_W`（**物理定值 32px**）：版心是一条极窄
+        // 通道，不随窗口宽 / 列数伸缩——纸面总宽仍不变，只是把原来
+        // 「两叶之间的空白」换成纸心的一道定宽版心。
+        let gw = crate::grid::BANXIN_W;
         // ── 与两叶同源的纵向几何（Invariant 1 / ②）──────────────────
         // 纸面锁 `content_h`、上下留白用引擎的天头 / 地脚——与
         // `render_ancient` 的 sheet 逐值相同，中缝因此与两叶严格对齐。
@@ -7308,7 +7272,9 @@ impl Root {
         // 版心**内芯**宽：gw 扣掉左右两叶各 7pt 的框层（3 粗框 + 3 框内
         // 留边 + 1 内细线）。鱼尾、书口字都排在这两条细线之间，
         // 绝不探到框上——中缝因此被两叶的竖框「夹」住。
-        let core_w = (gw - 14.0).max(9.0);
+        // v1.9.90：版心内芯宽是**物理常量**（`grid::BANXIN_CORE_W` = 18px），
+        // 与 `meixin_band` 同源——版心只有一个宽度，绝不在各处各算一套。
+        let core_w = crate::grid::banxin_core_w();
         // ── 版心几何（v1.68.0，照《古籍的规范》图逐项量出来的）──────────
         // 图上量得的四个数（全部以中缝全宽 W 为基准，见 `banxin` 模块文档）：
         //   · 鱼尾宽 = W        ——两翼端点正压在左右界栏的线心上；
@@ -7322,6 +7288,22 @@ impl Root {
         let tail_w = gw + crate::banxin::FISHTAIL_OVERLAP;
         let tail_h = crate::banxin::tail_h_for_width(tail_w);
         let xiangbi = crate::banxin::xiangbi_len(tail_h);
+        // ── 版心墨线：绝对坐标，交给 `sheet_ink::GutterInk` ──────────────
+        // 鱼尾 / 象鼻 / 折痕 / 上下横框全部由这一张画布落笔；文字另摆一层。
+        // 两个 y 都从常量推出来（`core_y()` / `tail_top_y()` / `tail_bot_y()`），
+        // 与 flex 的分摊结果无关——中缝因此永远是「一条窄通道」，
+        // 不会因为窗口变宽就被拉成峡谷。
+        let ink = crate::sheet_ink::GutterInk {
+            w: gw,
+            h,
+            mt,
+            mb,
+            tail_w,
+            tail_h,
+            xiangbi,
+            core_h,
+            inner_line: self.frame_style == crate::types::FrameStyle::DoubleAll,
+        };
         // 书口文字：书名（去括号）、卷次「卷五十一」、叶码「五十」。
         let book = self.book_title();
         let juan = format!("卷{}", han_num(chapter + 1));
@@ -7351,24 +7333,16 @@ impl Root {
         // 书口小字**极小号宋体**：走正文字体的回退链，
         // 横笺里也不会退化成黑体。
         let family = crate::fonts::family_for(self.current_font(), Script::Ancient);
-        // 版心内芯：全部走**流式布局**——上「象鼻 + 鱼尾」，中段书口字，
-        // 下「鱼尾 + 象鼻」。两段 `flex_1` 把书口字撑在正中，鱼尾因此
-        // 永远钉在版框内缘那一端（不是按内芯高等分算出来的位置）。
-        // 纯版心装饰：不占正文行格，阅读锚点（page_anchor）完全不受影响。
+        // 文字列：只排字，**一笔墨线都不画**。
+        // 上下各留出「象鼻 + 鱼尾」那一段（墨线层照同一份几何落笔），
+        // 中段由两段 `flex_1` 把书口字撑在两枚鱼尾正中。
         let mut col = div()
-            .relative()
             .w(px(core_w))
             .h(px(core_h))
             .flex()
             .flex_col()
             .items_center();
-        // 象鼻：一根 1px 单线，从版框内缘垂到鱼尾上缘（上下严格镜像）。
-        col = col.child(gutter_trunk(core_w, core_h, xiangbi, t.frame_ink(), true));
-        // 上象鼻那一段的高度（鱼尾的上缘因此落在 `Y_top + H_xiangbi`）。
-        col = col.child(div().h(px(xiangbi)));
-        // 上鱼尾：平顶贴象鼻下缘、凹口在下缘朝下；宽＝中缝全宽。
-        col = col.child(banxin_tail(lay.tail_w, lay.tail_h, true, t.fish_ink()));
-        // 上鱼尾之下的余量：书名 / 卷次 / 篇题因此**垂直居中**于两鱼尾之间。
+        col = col.child(div().h(px(xiangbi + tail_h)));
         col = col.child(div().flex_1());
         // 书名 → 卷次 → 篇题（极小号宋体，一字一格竖排，行高 1.62 倍字号）。
         // 每段之间留一道气口（v1.56.0：3px → 5px，字距再拉开一点）。
@@ -7385,67 +7359,38 @@ impl Root {
             col = col.child(banxin_vtext(line, core_w, &family, t));
         }
         col = col.child(div().h(px(lay.gap)));
-        // 下鱼尾：上鱼尾的**严格垂直镜像**（底边贴象鼻上缘、凹口朝上）。
-        col = col.child(banxin_tail(lay.tail_w, lay.tail_h, false, t.fish_ink()));
-        // 下象鼻：与上象鼻同长，落到地脚（版框内缘）。
-        col = col.child(div().h(px(xiangbi)));
+        col = col.child(div().h(px(xiangbi + tail_h)));
 
-        // ── 纸面 / 版框 / 内框：与 `render_ancient` 的 sheet 逐层同构 ──
-        // `relative`：折痕用绝对定位锚在本栏内（GPUI 的 absolute 子元素
-        // 以最近的 positioned 祖先为定位上下文，缺了它线会飘到根节点上）。
-        // **不设 `overflow_hidden`**：两叶的纸面也没设——版框自然高
-        // （core_h + 14）略超内容盒时两边一样溢出，框线才仍对齐；
-        // 单边裁一刀，中缝的下框反比两叶短一截。
-        let mut paper = div()
+        // 三重叠加，顺序即层次：纸色 → 墨线 → 书口字。
+        // 容器**没有 padding**，画布的 `(0,0)` 就是纸面左上角；文字列
+        // 按 `core_y()` / 内芯居中的绝对坐标落位，三层同一个原点。
+        div()
             .relative()
             .w(px(gw))
             .h(px(h))
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(mt))
-            .pb(px(mb))
-            .bg(rgb(t.paper()));
-        // 版框（与两叶的 frame 同层）：外粗 3px + 框内留边 3px，
-        // **只画上下横框**——左右竖框由两叶闭合的版框充当。
-        let mut frame = div()
-            .w(px(gw))
-            .p(px(3.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .border_color(rgb(t.frame_outer()))
-            .border_t_3()
-            .border_b_3();
-        // 内框细线（与两叶的 inner 同层）：1px、与界行同色同起止，
-        // 只画上下——中缝的上下两端因此与左右叶的上下框**逐层闭合**，
-        // 界行（乌丝栏）也顺着这两条线接到横框上，字格围成封闭网格。
-        //
-        // v1.85.0：中缝的上下两道正是「横框」——只有「四周双边」才在内侧
-        // 再压一道 1px（此时上下也是双线）；「左右双边」「四周单边」的上下
-        // 都是单线，故这一层整条不画，与两叶的上下缘保持同一口气。
-        let mut inner = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .border_color(rgb(t.rule_line(self.rule_color)));
-        if self.frame_style == crate::types::FrameStyle::DoubleAll {
-            inner = inner.border_t_1().border_b_1();
-        }
-        let inner = inner.child(col);
-        // 折痕：纸**对折**的那一道物理褶，落在版心正中——0.5px、`#999999`、
-        // 实线（v1.28.0 由虚线改来），只作「纸的痕迹」，比界行还淡。
-        // 起止夹在两条内框细线之间（mt+6 ⇄ h-mb-6），与两叶的内框同界。
-        paper = paper.child(fold_crease(
-            gw * 0.5 - crate::banxin::FOLD_W * 0.5,
-            mt + 6.0,
-            (h - mt - mb - 12.0).max(0.0),
-            t.fold_ink(),
-        ));
-        frame = frame.child(inner);
-        paper = paper.child(frame);
-        paper
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .w(px(gw))
+                    .h(px(h))
+                    .bg(rgb(t.paper())),
+            )
+            .child(crate::sheet_ink::gutter_ink_canvas(
+                ink,
+                t.frame_outer(),
+                t.rule_line(self.rule_color),
+                t.fish_ink(),
+                t.fold_ink(),
+            ))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(ink.core_y()))
+                    .left(px((gw - core_w) * 0.5))
+                    .child(col),
+            )
     }
 
     /// 书名（版心书口用）：去《》【】「」等括号与空白，只留题名——
@@ -7994,6 +7939,10 @@ impl Root {
         // 两种画法互斥：同一格绝不会既淡染又实色（否则颜色会互相污染）。
         let a11y = t.a11y();
         let marked = self.underlines.contains(&key);
+        // 波浪线（专名号 / 书名线）：与实线划线互斥——同一字要么实线要么波浪，
+        // 不叠画。两个集合在「划线」动作里保证互斥（见 `act_underline` /
+        // 划词工具条的划线钮）。
+        let wavy = self.underlines_wavy.contains(&key);
         // 注音：**书里的永远显示，字典只补空缺**。
         //   * `NoteKind::Ruby` —— EPUB `<ruby><rt>` / `[拼音:…]` 导入的读音，
         //     作者标了什么就读什么（`长[拼音:cháng]` 不会被念成 zhǎng）；
@@ -8225,6 +8174,11 @@ impl Root {
                         .bg(rgb(t.accent())),
                 );
             }
+        } else if wavy {
+            // 波浪线（专名号 / 书名线）：与书里印的「书名线」同一套几何
+            // （`lines::book_wave`），**贴字左侧**、逐字首尾相接——直行文稿
+            // 的线在左（GB/T 15834），右边那条带子留给实线朱线，两不相撞。
+            cell = cell.child(crate::lines::book_wave(cell_w, cell_h, fs, t.accent()));
         }
         // 正文墨色：带注音的字略调暗（提示「此处有信息」），其余用常规墨色。
         let base_ink = if back { t.ink_soft() } else { self.palette.ink(t) };
@@ -10058,6 +10012,18 @@ impl Root {
                 )
         };
 
+        // 极小的「已自动收录至生词本」提示：查到释义才显示（呼应「成功获取
+        // 释义后静默收录」），墨色极淡、字号极小，不抢释义视线。
+        let dict_hint = if has_any {
+            div()
+                .flex_none()
+                .text_size(px(9.5))
+                .text_color(rgb(crate::theme::mix(t.ink(), zhu, 0.45)))
+                .child(SharedString::from("已自动收录至生词本"))
+        } else {
+            div()
+        };
+
         // ── 便签本体：宣纸半透明 + 一根极细朱砂边 + 微弱阴影 ──────────
         div()
             .absolute()
@@ -10078,6 +10044,7 @@ impl Root {
             .child(tab_row)
             .child(head_block)
             .child(body_area)
+            .child(dict_hint)
             .child(bar)
             // 点浮签内部不让它冒到根容器的「点别处收起」监听上去。
             .on_mouse_down(
@@ -10657,12 +10624,17 @@ impl Root {
         // （「连读」已并入「听」；存卡走选区长按，不占这排位。）
         // 「听」已独立为贴底胶囊（见 render_tts_sheet），划词工具条不再放听钮，
         // 避免与底部控件功能重复。
+        // v1.9.89（模块六）：菜单七枚按**常用频率**排列——读古籍时查字最频、
+        // 复制次之、划线 / 朱批随手标、问笺 / 夹注 / 眉批相对少用，故顺序为：
+        // 查典 / 摘录 / 划线 / 朱批 / 问笺 / 夹注 / 眉批。「拓印」已更名「摘录」
+        // （复制 + 入匣，更具书卷气），「划线」为竖排右侧朱线。
         push_btn("查典", &mut items);
+        push_btn("摘录", &mut items);
+        push_btn("划线", &mut items);
         push_btn("朱批", &mut items);
         push_btn("问笺", &mut items);
         push_btn("夹注", &mut items);
         push_btn("眉批", &mut items);
-        push_btn("拓印", &mut items);
 
         // 外框宽高**由实际按钮数反算**（GPUI 无 fit-content，这是它的等价物）：
         // 按钮增减都不露字，红框永远死死包裹所有钮。
@@ -10695,8 +10667,10 @@ impl Root {
             .map(|n| n.text.clone())
             .unwrap_or_default();
 
-        // ── 逐枚绑上动作（与上面 push 的次序一一对应：查典 / 朱批 / 问笺 / 夹注 / 眉批 / 拓印）──
+        // ── 逐枚绑上动作（与上面 push 的次序一一对应：查典 / 摘录 / 划线 /
+        // 朱批 / 问笺 / 夹注 / 眉批）──
         let mut items = items.into_iter();
+        // 查典（最常用）：就地呼出康熙 + 說文浮签（并静默收录生词本）。
         let b_query = items
             .next()
             .unwrap()
@@ -10719,7 +10693,7 @@ impl Root {
                         x: hit_xy.0,
                         y: hit_xy.1,
                     });
-                    this.open_lookup(key, ch, text, Some(hit_xy), anchor_rect);
+                    this.open_lookup_logged(key, ch, text, Some(hit_xy), anchor_rect);
                     this.hover_card = false;
                     this.more_open = false;
                     this.popup = None;
@@ -10727,7 +10701,63 @@ impl Root {
                     cx.notify();
                 }),
             );
-        // 「听」已从划词工具条移除（独立为贴底胶囊），此处不再绑定听钮动作。
+        // 摘录（v1.9.89 由「拓印」更名）：复制当前文本到剪贴板，并生成一张
+        // 知识点卡片（Quote）存入书阁；极简 Toast 提示后自动收起菜单。
+        let b_excerpt = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                // 没选区就先框选本字：保证「复制 + 入匣」的都是这个字。
+                if !this.has_selection() {
+                    this.sel_anchor = Some(key);
+                    this.sel_focus = Some(key);
+                }
+                let text = this.selected_text().trim().to_string();
+                if text.is_empty() {
+                    // 退化：单字也照样摘录。
+                    crate::clipboard::write_text(cx, ch.to_string());
+                    this.sel_anchor = Some(key);
+                    this.sel_focus = Some(key);
+                    this.save_selection_card(cx);
+                } else {
+                    crate::clipboard::write_text(cx, text);
+                    this.save_selection_card(cx);
+                }
+                // 覆盖为「摘录」专属回执：复制与入匣两件事一次性说清。
+                this.toast = Some("已摘录至剪贴板，并存入书阁".to_string());
+                this.clear_selection();
+                this.popup = None;
+                cx.notify();
+            }),
+        );
+        // 划线（模块六 · 右侧朱线 / 波浪线）：有选区划整段（实线）；单字时
+        // 按住 ⌥ 划波浪线（专名号），否则划实线。实线与波浪互斥——同一字
+        // 不叠画。
+        let b_underline = items.next().unwrap().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                let wavy = event.modifiers.alt;
+                if this.has_selection() {
+                    this.underline_selection();
+                } else if wavy {
+                    this.underlines.remove(&key);
+                    if !this.underlines_wavy.remove(&key) {
+                        this.underlines_wavy.insert(key);
+                    }
+                    this.save_annotations();
+                } else {
+                    this.underlines_wavy.remove(&key);
+                    if !this.underlines.remove(&key) {
+                        this.underlines.insert(key);
+                    }
+                    this.save_annotations();
+                }
+                this.popup = None;
+                cx.notify();
+            }),
+        );
+        // 朱批（背景半透明红底）：就地开朱批编辑框。
         let b_note = items.next().unwrap().on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
@@ -10739,8 +10769,6 @@ impl Root {
             }),
         );
         // 问笺（v1.76.0）：把选中的这句交给小笺，栏开在右侧，答案一字一字吐。
-        // ⚠️ 顺序要紧：面板自己要从 `popup.hit.key` 取「没拖选时那一个字」的
-        // 锚点，故**先**发问、再收工具条；这里也不清选区，让面板拿到完整引文。
         let b_ask = items.next().unwrap().on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, window, cx| {
@@ -10751,9 +10779,7 @@ impl Root {
                 cx.notify();
             }),
         );
-        // 更多：切换二级菜单（存卡 / 眉批 / 夹注 / 拓印），**不收起**主工具条。
-        // 夹注：在宿主字上新建（或改写）一条用户自加夹注——单级工具栏里它和
-        // 朱批平起平坐，点一下直接开编辑框，不再钻两级菜单（v1.9.12 去「更多」）。
+        // 夹注：在宿主字上新建（或改写）一条用户自加夹注。
         let b_gloss = items.next().unwrap().on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
@@ -10773,27 +10799,13 @@ impl Root {
                 cx.notify();
             }),
         );
-        // 拓印：把本页正文复制到剪贴板（没选区就框选本字所在整页）。
-        let b_copy = items.next().unwrap().on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                if !this.has_selection() {
-                    this.sel_anchor = Some(key);
-                    this.sel_focus = Some(key);
-                }
-                this.copy_page_text(cx);
-                this.clear_selection();
-                this.popup = None;
-                cx.notify();
-            }),
-        );
 
         // ── 面板本体：横排圆角面板，钮内文字竖排（单级、七枚平铺）────────
         // 极简克制 + 半透明毛玻璃感：底调透（≈0.84），不抢正文视线。
         let paper_washi = rgba((t.paper() << 8) | 0xD8);
         // 钮与钮之间**只用留白**分档（不画线、不加框）：一枚钮就是面板上的
         // 一列字，靠呼吸感隔开；面板整体横排，文字逐列竖读。
+        // 顺序即上方 push 顺序：查典 / 摘录 / 划线 / 朱批 / 问笺 / 夹注 / 眉批。
         let mut row = div()
             .flex()
             .flex_row()
@@ -10801,7 +10813,7 @@ impl Root {
             .justify_center()
             .gap(px(gap))
             .child(b_query);
-        for b in [b_note, b_ask, b_gloss, b_margin, b_copy] {
+        for b in [b_excerpt, b_underline, b_note, b_ask, b_gloss, b_margin] {
             row = row.child(b);
         }
 
@@ -11195,6 +11207,8 @@ impl Root {
         }
         let all_marked = keys.iter().all(|k| self.underlines.contains(k));
         for k in keys {
+            // 选区划线恒为实线：顺手清掉同字的波浪线，保证两集合互斥。
+            self.underlines_wavy.remove(&k);
             if all_marked {
                 self.underlines.remove(&k);
             } else {
@@ -11208,6 +11222,91 @@ impl Root {
         } else {
             "已给选中文字划线".to_string()
         };
+    }
+
+    /// 把内存里的划线（`underlines` 集合）现场合成「划线卡」列表，供知识库
+    /// 「划线」篩選页展示。
+    ///
+    /// ⚠️ 划线是**书内**数据，正本在 `underlines` 集合（随书 meta 落盘，
+    /// 见 `save_annotations`），**不**另开一套写库——否则双写必然漂移。这里
+    /// 只做「只读合成」：相邻（同章同段、偏移连续）的划线并成一条 run，一条
+    /// run 一张卡，原文快照记在 `quote` 上，锚点仍是 `(章, 段, 段内偏移)`。
+    pub(crate) fn underline_cards(&self) -> Vec<jiandu_core::cards::Card> {
+        let book = self.book.as_ref();
+        let title = book.map(|b| b.title.clone()).unwrap_or_default();
+        let store_id = book.and_then(|b| b.store_id.clone()).unwrap_or_default();
+        let pages = self.paginate();
+        // 按阅读顺序收集被划线的字（双面对开两页都算）。实线与波浪合并收集，
+        // 用 `wavy` 标记区分——相邻同款并成一条 run。
+        let mut seq: Vec<(usize, usize, usize, char, bool)> = Vec::new();
+        for pg in [self.page, self.page + 1] {
+            if let Some(glyphs) = pages.get(pg) {
+                for g in glyphs {
+                    if g.kind != GlyphKind::Char || g.is_indent() {
+                        continue;
+                    }
+                    let k = (g.chapter, g.para, g.offset);
+                    let wavy = self.underlines_wavy.contains(&k);
+                    if self.underlines.contains(&k) || wavy {
+                        seq.push((k.0, k.1, k.2, self.shown_glyph(*g), wavy));
+                    }
+                }
+            }
+        }
+        seq.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        let mut out: Vec<jiandu_core::cards::Card> = Vec::new();
+        let mut run: Option<(usize, usize, usize, String, bool)> = None;
+        for (ch, para, off, c, wavy) in seq {
+            match run {
+                Some((rch, rpara, roff, ref mut s, rw))
+                    if rch == ch
+                        && rpara == para
+                        && off == roff + s.chars().count()
+                        && rw == wavy =>
+                {
+                    s.push(c);
+                }
+                _ => {
+                    if let Some((rch, rpara, roff, s, rw)) = run.take() {
+                        out.push(Self::underline_card(
+                            &title, &store_id, (rch, rpara, roff), &s, rw,
+                        ));
+                    }
+                    run = Some((ch, para, off, c.to_string(), wavy));
+                }
+            }
+        }
+        if let Some((rch, rpara, roff, s, wavy)) = run.take() {
+            out.push(Self::underline_card(&title, &store_id, (rch, rpara, roff), &s, wavy));
+        }
+        out
+    }
+
+    /// 造一张划线卡（run 文字 + 锚点 + 线型：0 实线 / 1 波浪）。
+    fn underline_card(
+        title: &str,
+        store_id: &str,
+        key: (usize, usize, usize),
+        text: &str,
+        wavy: bool,
+    ) -> jiandu_core::cards::Card {
+        jiandu_core::cards::Card {
+            id: 0,
+            book: title.to_string(),
+            chapter: String::new(),
+            store_id: store_id.to_string(),
+            key,
+            len: text.chars().count(),
+            quote: text.to_string(),
+            note: String::new(),
+            kind: jiandu_core::cards::CardKind::Underline,
+            created_ms: 0,
+            pinyin: String::new(),
+            view_count: 0,
+            last_viewed_ms: 0,
+            starred: false,
+            style: if wavy { 1 } else { 0 },
+        }
     }
 
     /// 分享卡片：深底竖排正文 + 落款朱印（参照 02 图），可存为 PNG。
@@ -13701,6 +13800,27 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             body = body.child(style_row("简", trad_chips, t));
         }
 
+        // ---- 書名號：古籍化（波浪專名線）⇄ 現代標準（《》）----
+        //
+        // v1.9.91 用户定：**真刻本正文里没有《》**，古人表示书名用的是
+        // 旁侧一条**波浪线**（专名号的一种）。打开「專名線」→ 字流里把
+        // 《》剥掉、给被包住的字补一条波浪线（剥壳靠 `to_flow_with`，
+        // 补线靠 `mark_kind` —— 都在底层，不是贴一层假字）。关掉 → 回
+        // 现代标准：竖排形 `︽︾` 缩到四成叠在邻字格上。
+        //
+        // 两枚印是**互斥的两档**，不是开 / 关：写「關」等于让人猜「关掉
+        // 之后是什么」，写「《》」则一眼看懂另一头长什么样。
+        let title_chips = self.style_chips(
+            vec![
+                ("專名線", self.classic_marks, StyleAct::ClassicMarks),
+                ("《》", !self.classic_marks, StyleAct::ModernMarks),
+            ],
+            cx,
+        );
+        if tab_i == 2 {
+            body = body.child(style_row("號", title_chips, t));
+        }
+
         // ---- 句读：形制（现代标点 / 古籍句读）+ 点画（墨 / 朱砂 / 回锋）----
         //
         // v1.81.0：古籍句读不是「换一套标点字体」，而是**换一套记号**——
@@ -14044,6 +14164,11 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                                 this.punct_hook = !this.punct_hook;
                                 this.save_punct_prefs();
                             }
+                            // 書名號古籍化：改的是**字流**（剥两个壳），
+                            // 故分页缓存要作废——`sync_pager` 下一帧按新
+                            // 指纹重排；`set_classic_marks` 里另记了页首锚点。
+                            StyleAct::ClassicMarks => this.set_classic_marks(true),
+                            StyleAct::ModernMarks => this.set_classic_marks(false),
                         }
                         cx.notify();
                     }),
@@ -14416,6 +14541,10 @@ enum StyleAct {
     InkZhu,
     /// 读点的回锋（出锋末端带一小勾）。
     Hook,
+    /// 書名號**古籍化**（v1.9.91）：剥掉《》、改画旁侧波浪線（專名號）。
+    ClassicMarks,
+    /// 書名號**現代標準**：保留《》，竖排形 `︽︾` 叠在邻字格上。
+    ModernMarks,
 }
 
 // ── 文本分析抽屉的小构件（v1.81.0 · 模块五）───────────────────────────────

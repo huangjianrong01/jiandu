@@ -11,7 +11,7 @@
 //! `(章, 段, 段内字偏移)`——与眉批 / 朱批**同一把尺子**，点一条卡片直接
 //! 复用现成的 `jump_to_key` 跳回原文。
 
-use crate::app::Root;
+use crate::app::{CardFilter, Root};
 use crate::reader::sheet_zhu;
 use gpui::{div, prelude::*, px, rgb, Context, Div, MouseButton, SharedString};
 use jiandu_core::cards::{self, Card, CardKind};
@@ -78,6 +78,11 @@ impl Root {
             note: String::new(),
             kind: CardKind::Quote,
             created_ms: now_ms(),
+            pinyin: String::new(),
+            view_count: 0,
+            last_viewed_ms: 0,
+            starred: false,
+            style: 0,
         };
 
         // 去重要拿**库里**的最新状态比：开栏后一直在加卡，`self.cards`
@@ -188,6 +193,50 @@ impl Root {
     ///
     /// **只有条目，不含外壳、不含滚动容器**——理由见上一条 `render_anki_kind_row`
     /// 上方的说明：滚动交给外层那一页，两处各滚一次会出两套滚动条。
+    /// **卡片匣过滤行**（模块六 · 生词本）：全部 / 生词本 / 划线 三枚小印，
+    /// 当前那一枚用朱砂、其余淡墨——与「出卡」三枚印同一套规矩。
+    pub(crate) fn render_card_filter_row(&mut self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme;
+        let zhu = sheet_zhu(t);
+        let ink_soft = t.ink_soft();
+        let cur = self.card_filter;
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .px(px(12.0))
+            .pb(px(4.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(ink_soft))
+                    .child(SharedString::from("篩")),
+            );
+        for f in CardFilter::ALL {
+            let on = f == cur;
+            row = row.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(if on { zhu } else { ink_soft }))
+                    .when(on, |s| s.font_weight(gpui::FontWeight::BOLD))
+                    .cursor_pointer()
+                    .hover(move |s| s.text_color(rgb(zhu)))
+                    .child(SharedString::from(f.label()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            // 拦住冒泡：切篩選不應翻頁 / 跳原文。
+                            cx.stop_propagation();
+                            this.set_card_filter(f);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        row
+    }
+
     pub(crate) fn render_cards_list(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let zhu = sheet_zhu(t);
@@ -196,38 +245,60 @@ impl Root {
         // 极细墨线（条目分隔）：纸 + 墨 16%。
         let sept = crate::theme::mix(t.paper(), t.ink(), 0.16);
 
-        let rows: Vec<(i64, String, String, (usize, usize, usize), usize, CardKind, String)> =
-            self.cards
-                .iter()
-                .map(|c| {
-                    (
-                        c.id,
-                        c.source(),
-                        c.quote.clone(),
-                        c.key,
-                        c.len,
-                        c.kind,
-                        c.note.clone(),
-                    )
-                })
-                .collect();
+        // 按当前篩選收口 + 排序：生词本按查阅次数降序（最常查的生字排最前）。
+        // 划线卡是书内数据（正本在 `underlines`），「划线」篩選页由内存现场
+        // 合成，不进 `self.cards`（避免双写漂移）。
+        let base: Vec<Card> = if self.card_filter == CardFilter::Underline {
+            self.underline_cards()
+        } else {
+            self.cards.clone()
+        };
+        let mut shown: Vec<Card> = base
+            .into_iter()
+            .filter(|c| match self.card_filter {
+                CardFilter::All => true,
+                CardFilter::Dictionary => c.kind == CardKind::Dictionary,
+                CardFilter::Underline => c.kind == CardKind::Underline,
+            })
+            .collect();
+        if self.card_filter == CardFilter::Dictionary {
+            shown.sort_by(|a, b| {
+                b.view_count
+                    .cmp(&a.view_count)
+                    .then(b.last_viewed_ms.cmp(&a.last_viewed_ms))
+            });
+        }
 
         let mut list = div()
             .flex()
             .flex_col()
             .w_full();
-        if rows.is_empty() {
+        if shown.is_empty() {
+            let msg = match self.card_filter {
+                CardFilter::All => "匣中空空。框選正文，於浮簽點「存卡」即入匣。",
+                CardFilter::Dictionary => "生詞本尚空。閱讀時點【查典】，生字自動收錄於此。",
+                CardFilter::Underline => "尚無劃線。長按選字，於浮簽點【劃線】即標右側朱線。",
+            };
             list = list.child(
                 div()
                     .p_4()
                     .text_size(px(11.0))
                     .text_color(rgb(ink_soft))
-                    .child(SharedString::from(
-                        "匣中空空。框選正文，於浮簽點「存卡」即入匣。",
-                    )),
+                    .child(SharedString::from(msg)),
             );
         }
-        for (i, (id, source, quote, key, len, kind, note)) in rows.into_iter().enumerate() {
+        for (i, c) in shown.into_iter().enumerate() {
+            let id = c.id;
+            let key = c.key;
+            let len = c.len;
+            let kind = c.kind;
+            let source = c.source();
+            let quote = c.quote.clone();
+            let note = c.note.clone();
+            let pinyin = c.pinyin.clone();
+            let starred = c.starred;
+            let view_count = c.view_count;
+            let style = c.style;
             let head = div()
                 .flex()
                 .flex_row()
@@ -237,7 +308,23 @@ impl Root {
                     div()
                         .text_size(px(10.0))
                         .text_color(rgb(zhu))
-                        .child(SharedString::from(kind.label())),
+                        // 划线卡：波浪线（专名号）加一枚「～」区分实线。
+                        .child(SharedString::from(if kind == CardKind::Underline && style == 1 {
+                            "線～"
+                        } else {
+                            kind.label()
+                        })),
+                )
+                .when(
+                    kind == CardKind::Dictionary && !pinyin.is_empty(),
+                    |s| {
+                        s.child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(rgb(crate::theme::mix(ink, zhu, 0.25)))
+                                .child(SharedString::from(pinyin)),
+                        )
+                    },
                 )
                 .child(
                     div()
@@ -245,6 +332,17 @@ impl Root {
                         .text_size(px(11.5))
                         .text_color(rgb(ink_soft))
                         .child(SharedString::from(source)),
+                )
+                .when(
+                    kind == CardKind::Dictionary && view_count > 0,
+                    |s| {
+                        s.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgb(ink_soft))
+                                .child(SharedString::from(format!("查 {view_count} 次"))),
+                        )
+                    },
                 );
             let mut body = div()
                 .flex()
@@ -267,7 +365,7 @@ impl Root {
                 );
             }
 
-            let row = div()
+            let mut row = div()
                 .flex()
                 .flex_row()
                 .items_start()
@@ -296,7 +394,27 @@ impl Root {
                                 this.open_analysis(crate::app::AnalysisScope::Card(id), cx);
                             }),
                         ),
-                )
+                );
+            // 生词本卡片多一枚「加入重点」印：一键转正为核心复习卡（星标）。
+            if kind == CardKind::Dictionary {
+                let label = if starred { "已重點" } else { "加入重點" };
+                row = row.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(if starred { zhu } else { ink_soft }))
+                        .cursor_pointer()
+                        .hover(move |s| s.text_color(rgb(zhu)))
+                        .child(SharedString::from(label))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_dict_star(id, !starred, cx);
+                            }),
+                        ),
+                );
+            }
+            row = row
                 .child(
                     // 「刪」：单字 CJK（✕ 那类拉丁符号在 GPUI 里是零宽，画不出来）。
                     div()

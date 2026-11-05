@@ -1093,8 +1093,7 @@ fn draw_punct(
 /// 半字号、小字格 = 正文格的严格半格、行距 0、右列不短于左列。屏幕上
 /// （`reader::ancient_gloss`）读的是同一份，纸上的疏密才有意义。
 fn draw_gloss(b: &mut Brush, txt: &str, x: f64, y: f64, g: &PdfGeo, head: bool) {
-    let chars: Vec<char> = txt.chars().collect();
-    let ng = crate::gloss::note_geom(&chars, g.cell_w, g.cell_h, g.fs);
+    let ng = crate::gloss::note_geom(txt, g.cell_w, g.cell_h, g.fs);
     let nrows = ng.rows().max(1);
     let nfs = ng.fs as f64;
     let sub_w = ng.sub_w as f64;
@@ -1113,7 +1112,7 @@ fn draw_gloss(b: &mut Brush, txt: &str, x: f64, y: f64, g: &PdfGeo, head: bool) 
     let pfs = nfs * crate::gloss::NOTE_PUNCT_RATIO as f64;
     for r in 0..nrows {
         // 右列读在前、左列续后 → 先落左列（第 r+right 个）、再落右列（第 r 个）。
-        let pair = [chars.get(r + ng.right).copied(), chars.get(r).copied()];
+        let pair = [txt.chars().nth(r + ng.right), txt.chars().nth(r)];
         for (k, c) in pair.iter().enumerate() {
             let Some(c) = c else { continue };
             let ch = crate::types::bracket_to_quote(*c);

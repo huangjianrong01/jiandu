@@ -177,8 +177,7 @@ pub fn gloss_units(text: &str) -> usize {
     // v1.9.57：行数取 `note_split` 的**右列字数**（避头尾可能把左列首的
     // 收束标点搬回右列 → 右列多一行）。分页、渲染、命中三处必须同一口径，
     // 否则注块会比预约的半格账高出一截、把后面的正文顶出版框。
-    let chars: Vec<char> = text.chars().collect();
-    let (right, left) = note_split(&chars);
+    let (right, left) = note_split(text);
     right.max(left).div_ceil(2) * 2
 }
 
@@ -187,12 +186,26 @@ pub fn gloss_units(text: &str) -> usize {
 ///
 /// 渲染层据此在章首页开卷列顶部叠一卷端题名；正文从预留带之下接着排。
 /// 若章名 + 署名过长超出上限，渲染层按预留带裁切（不会顶穿版框）。
+///
+/// ⚠️ **v1.9.90 最后一道防线：题署绝不许把开卷列吃成「孤字列」。**
+///
+/// 旧制只留 2 行（`need.min(rows - 2)`）：矮窗口里 `rows = 13`、题署要 9 行，
+/// 于是开卷列顶部被题名占满，底下只剩两三个字孤零零地吊着——紧贴版框，
+/// 远看像「越界的孤字」（用户实测点名的就是它）。现在**恒留
+/// [`INSCRIPTION_MIN_BODY_ROWS`] 行正文**：
+///   · 题署排得下就按需给行，排不下就**裁题署**，绝不再向正文借行；
+///   · 一列短到连正文都不够分（`rows ≤ 5`）时，整列给正文，题署这次不题。
 pub fn inscription_reserve(need: usize, rows: usize) -> usize {
-    if rows <= 2 {
+    if rows <= INSCRIPTION_MIN_BODY_ROWS {
         return 0;
     }
-    need.min(rows - 2).min(14)
+    need.min(rows - INSCRIPTION_MIN_BODY_ROWS).min(14)
 }
+
+/// 开卷列里**正文至少要留的行数**（题署与正文的分界线）。
+///
+/// 5 行：一眼看得出是「正文接着排」，而不是几个字掉在版框角上。
+pub const INSCRIPTION_MIN_BODY_ROWS: usize = 5;
 
 /// 避头（列首）禁则：下列标点 / 闭合类符号不可居一列之顶（竖排列首）。
 /// 落在此类标点前需让出一格空位，把它压到第二格。
@@ -835,19 +848,26 @@ impl NoteGeom {
 ///      但**只在让完仍然平衡时**才让（否则守 ① 而让 ③，刻本也这么将就）。
 ///
 /// 返回 `(右列字数, 左列字数)`，两者之和恒等于注文字数。
-pub fn note_split(chars: &[char]) -> (usize, usize) {
-    let n = chars.len();
+/// 双行夹注分列（写入 `&str`，零 `Vec<char>` 拷贝）。
+///
+/// 旧签名收 `&[char]`——逼着每个调用方先把注文 `chars().collect()` 成
+/// `Vec<char>`（4 字节/字），在「几万字带海量夹注」的极端场景里，
+/// 每段夹注每渲染一次就白吃一块堆。本函数只用到「总长」与「第 `right` /
+/// `right-1` 个字符」两处信息，故直接吃 `&str`，逐字符按需取，
+/// 不再物化整段 `Vec<char>`。
+pub fn note_split(s: &str) -> (usize, usize) {
+    let n = s.chars().count();
     if n == 0 {
         return (0, 0);
     }
     let mut right = n.div_ceil(2);
     // ② 避头：左列（或右列内部换行）不得以收束标点起头。
-    while right < n && is_head_prohibited(chars[right]) {
+    while right < n && is_head_prohibited(s.chars().nth(right).unwrap()) {
         right += 1;
     }
     // ③ 避尾：右列末字若是开启型标点，尽量推到左列——让完仍须
     //    `left ≤ right`（`cand ≥ n - cand`），否则宁可留它在右列末。
-    if right > 1 && is_tail_prohibited(chars[right - 1]) {
+    if right > 1 && is_tail_prohibited(s.chars().nth(right - 1).unwrap()) {
         let cand = right - 1;
         if cand >= n - cand {
             right = cand;
@@ -857,8 +877,10 @@ pub fn note_split(chars: &[char]) -> (usize, usize) {
 }
 
 /// 按正文格几何算出双行夹注的全部度量（纯函数，可断言）。
-pub fn note_geom(chars: &[char], cell_w: f32, cell_h: f32, body_fs: f32) -> NoteGeom {
-    let (right, left) = note_split(chars);
+///
+/// 直接吃 `&str`（见 [`note_split`] 的零拷贝说明）。
+pub fn note_geom(s: &str, cell_w: f32, cell_h: f32, body_fs: f32) -> NoteGeom {
+    let (right, left) = note_split(s);
     NoteGeom {
         fs: body_fs * NOTE_FS_OF_BODY,
         sub_w: cell_w * NOTE_CELL_OF_BODY,
@@ -1380,15 +1402,15 @@ pub fn z_layout(text: &str, col_w: f32, row_h: f32, fs: f32) -> Vec<ZCell> {
                 }
             }
             Seg::Note(t) => {
-                let chars: Vec<char> = t.chars().collect();
                 // 右小列（读在前）的字数——与渲染同源（`note_split`：平衡 +
-                // 避头尾），改这里就是改屏幕与 PDF。
-                let (half, _left) = note_split(&chars);
+                // 避头尾），改这里就是改屏幕与 PDF。直接吃 `&str`，不再物化
+                // `Vec<char>`。
+                let (half, _left) = note_split(&t);
                 let anchor = y; // 注块紧跟宿主字之后起排
-                for (i, ch) in chars.iter().enumerate() {
+                for (i, ch) in t.chars().enumerate() {
                     let right = i < half; // 竖排右先左后
                     out.push(ZCell {
-                        ch: *ch,
+                        ch,
                         // 右小列 x 靠右（次列宽处）；左小列贴格左缘。
                         x: if right { sub_w } else { 0.0 },
                         y: anchor + (if right { i } else { i - half }) as f32 * sub_row,
@@ -1792,6 +1814,38 @@ mod tests {
 
     fn flow_of(book: &Book) -> Vec<Glyph> {
         book.to_flow(true)
+    }
+
+    /// **卷首题署不许吃掉整列**（v1.9.90 用户点名的「孤字」）：
+    /// 矮窗口里 `rows = 13`、题署要 9 行时，旧制留 `rows-2 = 11` 行给题署，
+    /// 开卷列只剩两个字吊在版框角上。现在恒留 5 行正文，题署排不下就裁题署。
+    #[test]
+    fn inscription_never_starves_the_opening_column() {
+        // 典型矮窗口：13 行、题署要 9 行 → 只准吃 8 行，正文留住 5 行。
+        assert_eq!(inscription_reserve(9, 13), 8);
+        assert_eq!(13 - inscription_reserve(9, 13), INSCRIPTION_MIN_BODY_ROWS);
+        // 高窗口：题署按需给，不许多占。
+        assert_eq!(inscription_reserve(9, 30), 9);
+        // 巨长的题署（书名 + 长署名）：裁到上限，正文仍有 5 行。
+        assert_eq!(inscription_reserve(60, 20), 15_usize.min(14).min(20 - 5));
+        // 极矮：一列连正文都不够分 → 整列给正文，题署这次不题。
+        assert_eq!(inscription_reserve(9, 5), 0);
+        assert_eq!(inscription_reserve(9, 2), 0);
+        // 不变式：只要题署出现，开卷列必留够正文行数；上限恒 ≤ 14。
+        for rows in 1..=60usize {
+            for need in [0usize, 3, 7, 9, 20, 99] {
+                let r = inscription_reserve(need, rows);
+                assert!(r <= 14, "rows={rows} need={need}：题署 {r} 行超过上限");
+                assert!(r <= need, "rows={rows} need={need}：给多了");
+                if r > 0 {
+                    assert!(
+                        rows - r >= INSCRIPTION_MIN_BODY_ROWS,
+                        "rows={rows} need={need}：题署 {r} 行，正文只剩 {} 行（孤字列）",
+                        rows - r
+                    );
+                }
+            }
+        }
     }
 
     /// **论赞降格**（v1.9.40）：段首「臣光曰」另起一列、列顶低两格；
@@ -2330,8 +2384,8 @@ mod tests {
             (14, 46.97, 23.48, 19.96),
         ] {
             for len in [1usize, 2, 3, 7, 12, 41] {
-                let chars: Vec<char> = "名者實之賓也故曰無名天地之始有名萬物之母".chars().cycle().take(len).collect();
-                let g = note_geom(&chars, cell_w, cell_h, fs);
+                let s: String = "名者實之賓也故曰無名天地之始有名萬物之母".chars().cycle().take(len).collect();
+                let g = note_geom(&s, cell_w, cell_h, fs);
                 assert!((g.fs - fs * 0.5).abs() < 1e-4, "{cols} 列注文字号不是半字号");
                 assert!((g.sub_w - cell_w * 0.5).abs() < 1e-4, "{cols} 列小字格宽不是半格");
                 assert!((g.row_h - cell_h * 0.5).abs() < 1e-4, "{cols} 列小字格高不是半格");
@@ -2349,7 +2403,7 @@ mod tests {
     /// 一个正文字格恰好横下两个小字（50% 账），不多不少。
     #[test]
     fn two_note_chars_fit_exactly_one_body_cell() {
-        let g = note_geom(&['甲', '乙'], 55.51, 27.75, 23.59);
+        let g = note_geom("甲乙", 55.51, 27.75, 23.59);
         assert_eq!((g.right, g.left), (1, 1));
         assert!((g.sub_w * 2.0 - 55.51).abs() < 1e-3);
         assert!((g.content_h() - 27.75 / 2.0).abs() < 1e-3);
@@ -2358,12 +2412,12 @@ mod tests {
     /// 避头：左列首字不得是收束型标点——遇到就把该字归给右列。
     #[test]
     fn note_split_never_opens_the_left_line_with_closing_punct() {
-        let chars: Vec<char> = "甲乙，丙".chars().collect(); // n=4 → 右 2 / 左 2，左首是「，」
-        let (right, left) = note_split(&chars);
+        let s = "甲乙，丙"; // n=4 → 右 2 / 左 2，左首是「，」
+        let (right, left) = note_split(s);
         assert!(right >= 3, "「，」仍落在左列首：right={right}");
         assert!(left <= right, "避头让步破坏了长度平衡");
         // 归位后左列首字必不是避头类。
-        let left_head = chars[right];
+        let left_head = s.chars().nth(right).unwrap();
         assert!(!is_head_prohibited(left_head), "左列首 {left_head} 仍是避头标点");
     }
 
@@ -2372,19 +2426,18 @@ mod tests {
     /// 这条锁死优先级，防止后来者为了避尾把两行的长短关系弄反。
     #[test]
     fn note_split_prefers_balance_over_tail_kinsoku() {
-        let chars: Vec<char> = "甲乙「丙丁".chars().collect(); // n=5 → 右 3（末字「）
-        let (right, left) = note_split(&chars);
+        let s = "甲乙「丙丁"; // n=5 → 右 3（末字「）
+        let (right, left) = note_split(s);
         assert_eq!((right, left), (3, 2));
         assert!(left < right, "左行不得长于右行");
     }
 
     #[test]
     fn note_split_is_stable_for_plain_text() {
-        let chars: Vec<char> = "名者實之賓也".chars().collect();
-        let (right, left) = note_split(&chars);
+        let (right, left) = note_split("名者實之賓也");
         assert_eq!((right, left), (3, 3));
-        assert_eq!(note_split(&[]), (0, 0));
-        assert_eq!(note_split(&['注']), (1, 0));
+        assert_eq!(note_split(""), (0, 0));
+        assert_eq!(note_split("注"), (1, 0));
     }
 
     #[test]
@@ -2410,7 +2463,7 @@ mod tests {
     fn leaf_origin_facing_puts_back_on_left() {
         // 对开：两叶并排隔中缝 gap，整体居中；back（下一面）在左。
         let (pw, ph) = (560.0, 640.0);
-        let gap = crate::grid::gutter_w(1200.0, 8, 50.0, 0.04);
+        let gap = crate::grid::BANXIN_W;
         let (lx, ly) = leaf_origin(true, 1200.0, 800.0, pw, ph, gap, true, false, false);
         let (rx, ry) = leaf_origin(true, 1200.0, 800.0, pw, ph, gap, false, false, false);
         let stage = pw * 2.0 + gap;

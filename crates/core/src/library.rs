@@ -57,6 +57,10 @@ pub struct ShelfEntry {
     /// 用户划线的字：(chapter, para, offset)。
     #[serde(default)]
     pub underlines: Vec<(usize, usize, usize)>,
+    /// 用户划的**波浪线**（专名号 / 书名线）：同三元组，与实线分开存，
+    /// 渲染时走 `lines::book_wave`。老库无此字段，`[serde(default)]` 自动为空。
+    #[serde(default)]
+    pub underlines_wavy: Vec<(usize, usize, usize)>,
     /// 四部分类：经 / 史 / 子 / 集；空串表示按书名自动归类，
     /// 其它值即用户自定的书单名（「自定义书单」页签按它聚合）。
     #[serde(default)]
@@ -739,10 +743,12 @@ impl Library {
         idx: usize,
         notes: &std::collections::HashMap<usize, String>,
         underlines: &[(usize, usize, usize)],
+        underlines_wavy: &[(usize, usize, usize)],
     ) {
         if let Some(e) = self.books.get_mut(idx) {
             e.notes = notes.clone();
             e.underlines = underlines.to_vec();
+            e.underlines_wavy = underlines_wavy.to_vec();
         }
         self.save();
     }
@@ -827,6 +833,7 @@ impl Library {
             last_read: 0,
             notes: std::collections::HashMap::new(),
             underlines: Vec::new(),
+            underlines_wavy: Vec::new(),
             category: String::new(),
             annotator: String::new(),
             edition: String::new(),
@@ -893,6 +900,7 @@ impl Library {
             last_read: 0,
             notes: std::collections::HashMap::new(),
             underlines: Vec::new(),
+            underlines_wavy: Vec::new(),
             category: String::new(),
             annotator: String::new(),
             edition: String::new(),
@@ -1062,6 +1070,7 @@ pub(crate) mod tests {
             last_read: 0,
             notes: std::collections::HashMap::new(),
             underlines: Vec::new(),
+            underlines_wavy: Vec::new(),
             category: category.to_string(),
             annotator: String::new(),
             edition: String::new(),

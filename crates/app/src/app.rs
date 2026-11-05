@@ -378,6 +378,29 @@ pub enum PdfScope {
     Book,
 }
 
+/// **卡片匣过滤**（模块六 · 生词本）：点「生词本」只看查词卡、「划线」只看
+/// 划线卡，默认「全部」混着看。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardFilter {
+    /// 全部（摘录 / 问笺 / 生词 / 划线 混排，默认）。
+    All,
+    /// 生词本：只显示查词卡（`CardKind::Dictionary`），按查阅次数降序。
+    Dictionary,
+    /// 划线：只显示划线卡（`CardKind::Underline`）。
+    Underline,
+}
+
+impl CardFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            CardFilter::All => "全部",
+            CardFilter::Dictionary => "生词本",
+            CardFilter::Underline => "划线",
+        }
+    }
+    pub const ALL: [CardFilter; 3] = [CardFilter::All, CardFilter::Dictionary, CardFilter::Underline];
+}
+
 
 /// 把 `catch_unwind` 捕获的 panic 负载转成可读字符串（`&str` / `String` 优先，
 /// 其它类型回退为「未知错误」）。导出路径在事件处理器与异步任务两处 FFI 边界
@@ -696,6 +719,9 @@ pub struct Root {
     pub more_group: Option<usize>,
     /// 匣中卡片（开栏时从库里读一次，增删后重读；不每帧查询）。
     pub cards: Vec<jiandu_core::cards::Card>,
+    /// **卡片匣过滤**（模块六 · 生词本）：默认 `All`；`Dictionary` 只看查词
+    /// 卡（生词本），`Underline` 只看划线卡。
+    pub card_filter: CardFilter,
     /// **问小笺侧栏**（v1.76.0 · V2.0 模块二）：AI 伴读。
     ///
     /// 面板是**独立 Entity**——流式输出每秒要 notify 几十次，若状态住在
@@ -814,6 +840,15 @@ pub struct Root {
     pub show_about: bool,
     /// 已划线的字：(chapter, para, offset)。
     pub underlines: std::collections::HashSet<(usize, usize, usize)>,
+    /// 已划的**波浪线**（专名号 / 书名线）：同三元组，与实线分开——渲染时
+    /// 走 `lines::book_wave`，与实线在右侧并排也不冲突。
+    pub underlines_wavy: std::collections::HashSet<(usize, usize, usize)>,
+    /// 开发用（v1.9.88）：`JIANDU_UNDERLINE` 钩子在 `root.book` 还是 `None`
+    /// 时先置这两个标记，**等 `open_book` 把书落库后再一次性挂载**——这就是
+    /// 「异步初始化时序」的修复：钩子不再死等书加载，而是绑定到书的加载完成
+    /// 事件上（见 `flush_dev_underlines`）。两个标记互斥地记录「该划实线 / 波浪」。
+    dev_pending_underline: bool,
+    dev_pending_wavy: bool,
     /// 分享卡片浮层是否展开。
     pub show_share_panel: bool,
     /// 分享卡：书名 / 作者 / 章节 / 日期 四个元素是否显示。
@@ -908,6 +943,12 @@ pub struct Root {
     pub palette: InkPalette,
     /// 标点显隐：true 显示句读（朱色小字），false 隐藏（同时影响分页）。
     pub show_punct: bool,
+    /// **現代標點古籍化**（v1.9.91）：true = 剥掉《》、书名改画旁侧波浪线
+    /// （專名號，真刻本的规矩）；false = 现代标准，保留竖排形 `︽︾`。
+    ///
+    /// 它**动字流**（剥掉两个壳，故影响分页的半格账），所以是版式指纹
+    /// `pager::LayoutKey` 的一项——切了必须整份缓存作废、重排。
+    pub classic_marks: bool,
     /// **句读模式**（v1.81.0）：现代标点 / 古籍句读。
     ///
     /// 古籍模式下句用「〇」、疑叹用大斜点、读用侧点（见 `gloss::jodu_of`）。
@@ -1655,6 +1696,9 @@ impl Root {
             show_help: false,
             show_about: false,
             underlines: std::collections::HashSet::new(),
+            underlines_wavy: std::collections::HashSet::new(),
+            dev_pending_underline: false,
+            dev_pending_wavy: false,
             show_share_panel: false,
             share_show_title: true,
             share_show_author: true,
@@ -1699,6 +1743,7 @@ impl Root {
             sel_char: None,
             palette: InkPalette::Ink,
             show_punct: true,
+            classic_marks: prefs.classic_marks,
             punct_mode: prefs.punct_mode(),
             keben_prev: None,
             punct_ink: prefs.punct_ink(),
@@ -1790,6 +1835,7 @@ impl Root {
             ai_target: false,
             ai_animating: false,
             cards: Vec::new(),
+            card_filter: CardFilter::All,
             search_slide: 0.0,
             search_target: false,
             search_animating: false,
@@ -1852,6 +1898,11 @@ impl Root {
         if let Ok(v) = std::env::var("JIANDU_SHELF") {
             if v == "list" {
                 root.shelf_view = ShelfView::Spine;
+            }
+            // 开发用：`JIANDU_SHELF=manage` 直接进整理态，便于截图核对
+            // 「編輯」里那排排序（時間 / 書名 / 進度）与勾选印。
+            if v == "manage" {
+                root.shelf_manage = true;
             }
         }
         // 开发用：JIANDU_PANEL=style|banzi|side|toc|cards|help|keys 直接把某个面板摊开，
@@ -2113,23 +2164,18 @@ impl Root {
         if std::env::var("JIANDU_RENAME_OPEN").is_ok() {
             root.start_rename(0);
         }
-        // 开发用：给本页开头几个字划线，便于截图核对「朱点 + 朱线」。
+        // 开发用：给「当前页」开头几个字划线，便于截图核对「朱点 + 朱线」。
+        // v1.9.88：钩子只置「待挂载」标记，真正插入推迟到 `open_book` 落库之后
+        // （见 `flush_dev_underlines`）——否则书还没载入、`root.book` 还是 None，
+        // 插了也白插；而且原先插在「全书开头」，恢复进度后停在末页根本看不到。
         if std::env::var("JIANDU_UNDERLINE").is_ok() {
-            let keys: Vec<(usize, usize, usize)> = root
-                .book
-                .as_ref()
-                .map(|b| {
-                    b.to_flow(true)
-                        .iter()
-                        .filter(|g| !g.is_indent() && g.kind == GlyphKind::Char)
-                        .take(4)
-                        .map(|g| (g.chapter, g.para, g.offset))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for k in keys {
-                root.underlines.insert(k);
-            }
+            root.dev_pending_underline = true;
+            root.flush_dev_underlines();
+        }
+        // 开发用：给「当前页」开头几个字划**波浪线**（专名号），便于截图核对波浪样式。
+        if std::env::var("JIANDU_UNDERLINE_WAVY").is_ok() {
+            root.dev_pending_wavy = true;
+            root.flush_dev_underlines();
         }
     // 开发用：直接打开分享面板，便于核对版式 / 底色 / 开关。
     // v1.64.0：改为走**真实快照**（旧版只置 `show_share_panel = true`，
@@ -2394,6 +2440,100 @@ impl Root {
         };
     }
 
+    /// **点击【查典】并取到释义后，静默收录该字到「生词本」**（模块六 · 查词
+    /// 自动记录）。
+    ///
+    /// 与 `open_lookup` 的区别：本方法在呼出字书浮签的同时，把当前字**按词
+    /// 去重**落库为一张 `CardKind::Dictionary` 卡片（原词 / 拼音 / 释义 /
+    /// 出处）。悬停查词（`probe_hover`）走的是 `open_lookup`、**不**触发收录
+    /// ——否则鼠标掠过一排字就把整页生字刷进生词本，污染匣子。
+    ///
+    /// ⚠️ 落库失败一律静默：生词本写不进去**不该打断阅读**，顶多这条没收录上。
+    pub fn open_lookup_logged(
+        &mut self,
+        key: GlyphKey,
+        ch: char,
+        text: String,
+        at: Option<(f32, f32)>,
+        rect: Option<(f32, f32, f32, f32)>,
+    ) {
+        self.open_lookup(key, ch, text.clone(), at, rect);
+        let Some(book) = self.book.clone() else {
+            return;
+        };
+        let (word, pinyin, gloss) = Self::dict_gloss_for(ch, &text);
+        if word.is_empty() {
+            return;
+        }
+        let store_id = book.store_id.clone().unwrap_or_default();
+        let chapter = self.chapter_title(key.0);
+        if let Ok(c) = jiandu_core::store::connect() {
+            let _ = jiandu_core::cards::upsert_dict_card(
+                &c,
+                &store_id,
+                &book.title,
+                &chapter,
+                key,
+                &word,
+                &pinyin,
+                &gloss,
+            );
+        }
+    }
+
+    /// 把「一个字 + 一段查询文本」解析成 `(原词, 拼音, 释义)`——与
+    /// `render_lookup_card` 共用同一套字书优先级（康熙 + 說文 优先，不成再退
+    /// 古汉语字典），保证生词本里的释义和浮签里看到的完全一致。
+    fn dict_gloss_for(ch: char, text: &str) -> (String, String, String) {
+        let zishu = crate::dict::query_dict(ch);
+        let entry = crate::dict::lookup(text).or_else(|| crate::dict::entry_of(ch));
+        let word = zishu
+            .as_ref()
+            .map(|z| z.word.clone())
+            .or_else(|| entry.as_ref().map(|e| e.word.clone()))
+            .unwrap_or_else(|| ch.to_string());
+        let pinyin = {
+            let raw = zishu
+                .as_ref()
+                .filter(|z| !z.pinyin.is_empty())
+                .map(|z| z.pinyin.clone())
+                .or_else(|| entry.as_ref().map(|e| e.pinyin.clone()))
+                .unwrap_or_default();
+            let t = raw
+                .trim()
+                .trim_matches(|c| matches!(c, '—' | '–' | '-' | '_' | '|' | '/' | '／' | '　'))
+                .trim()
+                .to_string();
+            if t.is_empty() {
+                String::new()
+            } else {
+                t
+            }
+        };
+        // 释义取「最有用的一段」：简明库（现代语体概括）优先，否则退回字书
+        // 原注，过长则截断，免得生词本里塞进半页小篆本义。
+        let gloss = crate::dict::concise_of(ch)
+            .map(|s| s.to_string())
+            .or_else(|| entry.as_ref().map(|e| e.gloss.clone()))
+            .or_else(|| {
+                zishu.as_ref().map(|z| {
+                    let s = crate::dict::tidy_zishu(&z.kangxi);
+                    if s.is_empty() {
+                        crate::dict::tidy_zishu(&z.shuowen)
+                    } else {
+                        s
+                    }
+                })
+            })
+            .unwrap_or_default();
+        let gloss = if gloss.chars().count() > 120 {
+            format!("{}…", gloss.chars().take(120).collect::<String>())
+        } else {
+            gloss
+        };
+        (word, pinyin, gloss)
+    }
+
     /// **悬停查词**（v1.38.0，v1.40.0 重做状态机）：鼠标在一个字上停满
     /// [`crate::reader::HOVER_LOOKUP`] 就自动浮出字书浮签，与长按互为两条路——
     /// 手不离笔时悬停更快，触屏没有 hover 就仍走长按。
@@ -2561,12 +2701,7 @@ impl Root {
         } else if self.page < pages.len() {
             leaves.push((self.page, false));
         }
-        let gap = crate::grid::gutter_w(
-            self.content_w,
-            self.grid.columns,
-            ANCIENT_EDGE,
-            self.grid.margin,
-        );
+        let gap = crate::grid::BANXIN_W;
         let right_align = !facing && crate::grid::is_narrow(self.viewport_w, self.viewport_h);
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         for (idx, back) in leaves {
@@ -2701,12 +2836,7 @@ impl Root {
         } else if self.page < pages.len() {
             leaves.push((self.page, false));
         }
-        let gap = crate::grid::gutter_w(
-            self.content_w,
-            self.grid.columns,
-            ANCIENT_EDGE,
-            self.grid.margin,
-        );
+        let gap = crate::grid::BANXIN_W;
         let right_align = !facing && crate::grid::is_narrow(self.viewport_w, self.viewport_h);
         for (idx, back) in leaves {
             let Some(pg) = pages.get(idx) else { continue };
@@ -2795,7 +2925,7 @@ impl Root {
     ///   * 古籍竖笺：sheet p_4(16×2) + border_3+border_1(8×2) + 版框双边
     ///     （`ANCIENT_EDGE` 50）、地脚鱼尾叶码（`ANCIENT_FOOT` 12，脚注模式
     ///     再加 `ANCIENT_NOTES`）；双面对开两叶之间还有一道版心中缝
-    ///     （宽约一行字，见 `crate::grid::gutter_w`）。
+    ///     （定值 32px，见 `crate::grid::BANXIN_W`）。
     ///   * 章题列占「格内一列」：章首页 = 列数-1 个正文列 + 1 个章题列，
     ///     总宽仍是 列数×col_w，不额外外扩。
     ///
@@ -2843,6 +2973,9 @@ impl Root {
         let edge = ANCIENT_EDGE;
         let head = ANCIENT_HEAD;
         let foot = ANCIENT_FOOT + if notes_foot { ANCIENT_NOTES } else { 0.0 };
+        // v1.9.90：版心改成**物理死尺寸**（`grid::BANXIN_W` = 32px），
+        // 不再有「为了让中缝站住而牺牲页边距」这件事——留白就是用户选的
+        // 留白，一分不让、一分不抢。
         let margin = self.grid.margin;
         let line_scale = self.grid.line_scale;
         let dir = self.grid.dir;
@@ -2996,13 +3129,23 @@ impl Root {
             fs_max,
         });
         let m = plan.m;
-        self.margin_top = m.margin_top;
-        self.margin_bot = m.margin_bot;
+        // ── 版框之外的多余高度，还给天头地脚（v1.9.90 用户定调）────────
+        // 纸面锁 `content_h`、版框是死的：两者之差（`slack`，恒小于一行）
+        // 此前全堆在纸面底部 —— 地脚被悄悄撑大，「天头 = 地脚 × 1.5」的
+        // 铁律名存实亡，宽屏上尤其明显（多余空间全塞给了地脚）。
+        // 现在按 3:2 还给天地：天头拿六成、地脚拿四成，版框在纸面上居中，
+        // 而 `(mt+.6s)/(mb+.4s)` 仍严格等于 1.5 —— 比例一分不破。
+        let foot_h = (m.fs * 0.36).max(9.0) + 10.0;
+        let frame_h = m.row_h * m.rows as f32 + foot_h + crate::grid::BANXIN_FRAME_TOTAL;
+        let slack = content_h - m.margin_top - m.margin_bot - frame_h;
+        let (mt, mb) = crate::grid::balance_vertical(m.margin_top, m.margin_bot, slack);
+        self.margin_top = mt;
+        self.margin_bot = mb;
         self.size_ancient = m.fs;
         if std::env::var("JIANDU_FIT_DEBUG").is_ok() {
             eprintln!(
-                "[fit] content_h={:.0} 天头 margin_top={:.1}  地脚 margin_bot={:.1}  比例 {:.2}:1",
-                content_h, m.margin_top, m.margin_bot, m.margin_top / m.margin_bot.max(0.01)
+                "[fit] content_h={:.0} 天头 margin_top={:.1}  地脚 margin_bot={:.1}  比例 {:.2}:1  盈余 {:.1}",
+                content_h, mt, mb, mt / mb.max(0.01), slack
             );
         }
         self.size_modern = m.fs;
@@ -3037,12 +3180,7 @@ impl Root {
             // 行款 + 双叶几何（v1.32.0）：行款字数、每列实际字数、单叶纸宽、
             // 中缝宽，以及「两叶 + 中缝」相对内容区的占比——中缝是否居中、
             // 左右是否均分，一眼可查。
-            let gap = crate::grid::gutter_w(
-                content_w,
-                self.grid.columns,
-                ANCIENT_EDGE,
-                self.grid.margin,
-            );
+            let gap = crate::grid::BANXIN_W;
             let row_w = if facing { 2.0 * m.outer_w + gap } else { m.outer_w };
             eprintln!(
                 "[fit] → fs={:.1} col_w={:.1} row_h={:.1} rows={} (行款 {}字/列, 实际 {}字) paper={:.0}x{:.0} leaf={:.0} gap={:.1} row_w={:.0}/content_w={:.0} ({:.0}%)",
@@ -3770,6 +3908,7 @@ impl Root {
         };
         let nt = entry.notes.clone();
         let ul = entry.underlines.clone();
+        let ulw = entry.underlines_wavy.clone();
         match Self::load_book_for(&entry) {
             Ok(mut book) => {
                 book.ensure_toc();
@@ -3830,6 +3969,7 @@ impl Root {
                 self.inscription_need = None;
                 self.notes = nt;
                 self.underlines = ul.into_iter().collect();
+                self.underlines_wavy = ulw.into_iter().collect();
                 self.bookmarks = entry.bookmarks.clone();
                 self.show_share_panel = false;
                 self.more_menu = false;
@@ -3891,11 +4031,106 @@ impl Root {
                     self.count_leaf(self.page);
                 }
                 self.persist();
+                // 开发用：书已落库，把暂存的划线 / 波浪线钩子一次性挂载到「当前页」
+                // （含对开右页）开头几个字——这是经典的「异步初始化时序」修复：
+                // 钩子在 `Root::new` 里只置 `dev_pending_*` 标记，这里（书的加载
+                // 完成事件）才真正注入划线数据，书没 ready 前保持 pending 不丢失。
+                self.flush_dev_underlines();
             }
             Err(e) => {
                 self.notice = format!("打开失败：{e}");
             }
         }
+    }
+
+    /// 开发用（v1.9.88）：把 `JIANDU_UNDERLINE` / `JIANDU_UNDERLINE_WAVY` 暂存的
+    /// 划线动作一次性挂载到「当前页（含对开右页）」开头几个字。
+    ///
+    /// 这是书的**加载完成**事件等价物：`open_book` 是全书唯一把 `self.book` 置
+    /// `Some` 的地方，所以在这里 flush 就能覆盖「书还没载入钩子空转」的时序 bug。
+    /// 书没 ready 时保持 pending 不丢（下次 `open_book` 再来）；顺带把「原钩子划
+    /// 在全书开头、恢复进度后停在末页根本看不到」的 visibility bug 一并修了——
+    /// 现在改划**屏幕上真正显示的那一叶**。
+    fn flush_dev_underlines(&mut self) {
+        if !self.dev_pending_underline && !self.dev_pending_wavy {
+            return;
+        }
+        // 书还没 ready：保持 pending，等下一次 `open_book` 落库后再挂。
+        if self.book.is_none() {
+            return;
+        }
+        let need_solid = self.dev_pending_underline;
+        let need_wavy = self.dev_pending_wavy;
+        let pages = self.paginate();
+        // **只划正文**（v1.9.89）：本页字符数 ≥ 8 的段落才算「正文段」。
+        // 章首那行「〔周〕李耳」署名只有 4 字，旧钩子把它当第一段来划，
+        // 朱线就落在标题 / 署名区，看着像坐标溢出到版心外——这正是用户
+        // 点名的「幽灵红竖线」。署名行、篇题行一律跳过，只挑真正的大段正文。
+        const BODY_MIN: usize = 8;
+        let mut para_count = std::collections::HashMap::new();
+        for pg in [self.page, self.page + 1] {
+            if let Some(glyphs) = pages.get(pg) {
+                for g in glyphs.iter() {
+                    if g.is_indent() || g.kind != GlyphKind::Char {
+                        continue;
+                    }
+                    *para_count.entry((g.chapter, g.para)).or_insert(0usize) += 1;
+                }
+            }
+        }
+        // 本页出现顺序里第一个「正文段」。
+        let body_para = 'pick: {
+            for pg in [self.page, self.page + 1] {
+                if let Some(glyphs) = pages.get(pg) {
+                    for g in glyphs.iter() {
+                        if g.is_indent() || g.kind != GlyphKind::Char {
+                            continue;
+                        }
+                        let pk = (g.chapter, g.para);
+                        if para_count.get(&pk).copied().unwrap_or(0) >= BODY_MIN {
+                            break 'pick Some(pk);
+                        }
+                    }
+                }
+            }
+            None
+        };
+        let mut solid: Vec<(usize, usize, usize)> = Vec::with_capacity(4);
+        let mut wavy: Vec<(usize, usize, usize)> = Vec::with_capacity(4);
+        'scan: for pg in [self.page, self.page + 1] {
+            let Some(glyphs) = pages.get(pg) else { continue };
+            for g in glyphs.iter() {
+                if g.is_indent() || g.kind != GlyphKind::Char {
+                    continue;
+                }
+                // 有正文段就只在正文段里划；实在没有（如纯短句页）退回旧口径。
+                if let Some((c, p)) = body_para {
+                    if (g.chapter, g.para) != (c, p) {
+                        continue;
+                    }
+                }
+                let k = (g.chapter, g.para, g.offset);
+                if need_solid && solid.len() < 4 {
+                    solid.push(k);
+                }
+                if need_wavy && wavy.len() < 4 {
+                    wavy.push(k);
+                }
+                // 本类型要的都凑齐了就停（只划实线时也只在凑满 4 个后跳出）。
+                if (!need_solid || solid.len() >= 4) && (!need_wavy || wavy.len() >= 4) {
+                    break 'scan;
+                }
+            }
+        }
+        for k in solid {
+            self.underlines.insert(k);
+        }
+        for k in wavy {
+            self.underlines_wavy.insert(k);
+        }
+        // 队列已清空：pending 关掉，避免翻页 / 重开书时重复注入。
+        self.dev_pending_underline = false;
+        self.dev_pending_wavy = false;
     }
 
     /// **一键笺校**（v1.9.59）：从书架直达笺校工作台，并把这本书的正文与原图
@@ -4830,7 +5065,6 @@ impl Root {
         let notices = job.notices();
         match res {
             Ok((book, sid, src)) => {
-                let title = book.title.clone();
                 // `sid` 为空 = 走的是漏斗兜底（整本入库），不是流式骨架。
                 let admitted = if sid.is_empty() {
                     self.admit_whole(&src, &book)
@@ -4842,12 +5076,14 @@ impl Root {
                         // 索引不在这里建：推给后台慢慢补，首屏不为它等。
                         self.mark_shelf_birth(&sid, book.store_id.as_deref(), &book.title);
                         self.enqueue_fts(sid);
-                        // 有提示就先说提示（用户最需要知道「这本进来的是降级稿」），
-                        // 上架结果缩进括号里当后缀。
+                        // **不再喊「已上架：某某」**（v1.9.93 用户点名的调试味）。
+                        // 书已经躺在书架上了，那行字再重复一遍书名，纯粹是噪音；
+                        // 只有**非致命提示**（JSON 降级、OCR 待办…）才值得占一
+                        // 行——那是「这本书进来得不太完美」，用户确实该知道。
                         self.notice = if notices.is_empty() {
-                            format!("已上架：{title}")
+                            String::new()
                         } else {
-                            format!("{}（已上架：{title}）", notices.join("；"))
+                            notices.join("；")
                         };
                     }
                     Err(e) => self.notice = format!("导入失败：{e}"),
@@ -5350,10 +5586,10 @@ impl Root {
         };
         // 整本不让 `ci` 夹章节——全书的字都要印。
         let flow: Vec<Glyph> = if matches!(scope, PdfScope::Book) {
-            book.to_flow(self.show_punct)
+            book.to_flow_with(self.show_punct, self.classic_marks)
         } else {
             book
-                .to_flow(self.show_punct)
+                .to_flow_with(self.show_punct, self.classic_marks)
                 .into_iter()
                 .filter(|g| g.chapter == ci)
                 .collect()
@@ -6142,6 +6378,20 @@ fn anki_push_card(
         self.notice = format!("卡片匣出卡：{}（Anki {}）", kind.label(), kind.note_type());
     }
 
+    /// 切卡片匣过滤（全部 / 生词本 / 划线）。
+    pub fn set_card_filter(&mut self, f: CardFilter) {
+        self.card_filter = f;
+    }
+
+    /// 查词卡「加入重点」：一键转正为核心复习卡（星标），写库后重读匣子。
+    pub fn toggle_dict_star(&mut self, id: i64, starred: bool, cx: &mut Context<Self>) {
+        if let Ok(c) = jiandu_core::store::connect() {
+            let _ = jiandu_core::cards::set_dict_starred(&c, id, starred);
+        }
+        self.reload_cards();
+        cx.notify();
+    }
+
     /// 某章的第一面页码；找不到就回 0。
     pub fn page_of_chapter(&self, chapter: usize) -> usize {
         let pages = self.paginate();
@@ -6759,6 +7009,13 @@ fn anki_push_card(
         }
         let book = self.book.as_ref()?;
         let p = book.chapters.get(g.chapter)?.paragraphs.get(g.para)?;
+        // **現代標點古籍化**（v1.9.91）：书名号已在字流里剥掉，书名改画
+        // **旁侧波浪线**——真刻本就是这么表示的。判据是原文里那对《》，
+        // 剥壳不影响 offset，故随时可查、不落一份新数据；用户在「版字」
+        // 里关掉古籍化，这一条立刻失效、回到《》的原样。
+        if self.classic_marks && p.inside_title_marks(g.offset) {
+            return Some(MarkKind::Book);
+        }
         p.mark_at(g.offset)
     }
 
@@ -7119,9 +7376,40 @@ fn anki_push_card(
         show_notes && notes_shown && notes_inline
     }
 
+    /// **切「現代標點古籍化」**（v1.9.91）：剥书名号 → 改画旁侧波浪线，
+    /// 或反过来回到现代标准。
+    ///
+    /// 它动的是**字流**（《》两枚壳的去留），所以分页必须重排。重排前先
+    /// 记住**本叶第一枚字**，重排后靠它把读者放回原处——否则正读到一半，
+    /// 切一下开关就整页飘走，读者会以为点坏了。
+    pub fn set_classic_marks(&mut self, on: bool) {
+        if self.classic_marks == on {
+            return;
+        }
+        let anchor = self
+            .paginate()
+            .get(self.page)
+            .and_then(|pg| pg.iter().next())
+            .map(|g| (g.chapter, g.para, g.offset));
+        self.classic_marks = on;
+        let mut prefs = crate::prefs::Prefs::load();
+        prefs.classic_marks = on;
+        prefs.save();
+        self.sync_pager();
+        if let Some(k) = anchor {
+            if let Some(p) = self.page_of_key(k) {
+                self.page = p;
+            }
+        }
+        self.notice = if on {
+            "書名號已古籍化：改畫旁側波浪線".to_string()
+        } else {
+            "書名號已回到現代標準：《》".to_string()
+        };
+    }
+
     /// 当前版式指纹：它变了的任何一项都会改变面数，故整份分页缓存作废。
-    fn pager_key(&mut self) -> crate::pager::LayoutKey {
-        // 卷首题署预留行数要遍历全书章题，缓存住（换书时清）。
+    fn pager_key(&mut self) -> crate::pager::LayoutKey {        // 卷首题署预留行数要遍历全书章题，缓存住（换书时清）。
         let need = match self.inscription_need {
             Some(v) => v,
             None => {
@@ -7137,6 +7425,7 @@ fn anki_push_card(
             show_punct: self.show_punct,
             inline_notes: self.notes_in_column(),
             west_mode: !self.han_digits,
+            strip_title: self.classic_marks,
         }
     }
 
@@ -7212,7 +7501,7 @@ fn anki_push_card(
                 columns: Vec::new(),
             }];
         };
-        let flow = book.to_flow(self.show_punct);
+        let flow = book.to_flow_with(self.show_punct, self.classic_marks);
         let cols = self.grid.columns;
         let rows = self.grid_rows;
         // 卷首题署：章首页开卷列顶部预留的空白带行数（0 = 不预留）。
@@ -7335,8 +7624,8 @@ fn anki_push_card(
     /// （注块随纸面一起滚，命中矩形同步平移）。
     pub fn note_box_at(&self, x: f32, y: f32) -> Option<&crate::gloss::NoteBox> {
         let facing = self.duplex == Duplex::Facing;
-        // 中缝宽与渲染层同源（grid::gutter_w）：对开时两叶之间隔的就是它。
-        let gap = crate::grid::gutter_w(self.content_w, self.grid.columns, ANCIENT_EDGE, self.grid.margin);
+        // 中缝宽与渲染层同源（grid::BANXIN_W 定值）：对开时两叶之间隔的就是它。
+        let gap = crate::grid::BANXIN_W;
         self.note_boxes.iter().find(|b| {
             let (ox, oy) = crate::gloss::leaf_origin(
                 facing,
@@ -7576,7 +7865,7 @@ fn anki_push_card(
     /// 宿主字键 `(chapter, para, offset)` → 全局流下标。
     fn flow_index_of_key(&self, key: (usize, usize, usize)) -> Option<usize> {
         let book = self.book.as_ref()?;
-        let flow = book.to_flow(self.show_punct);
+        let flow = book.to_flow_with(self.show_punct, self.classic_marks);
         flow.iter()
             .position(|g| g.chapter == key.0 && g.para == key.1 && g.offset == key.2)
     }
@@ -7595,7 +7884,7 @@ fn anki_push_card(
         let Some(book) = self.book.as_ref() else {
             return;
         };
-        let flow = book.to_flow(self.show_punct);
+        let flow = book.to_flow_with(self.show_punct, self.classic_marks);
         let cols = self.grid.columns;
         let rows = self.grid_rows;
         let reserve = crate::gloss::inscription_reserve(self.chapter_inscription_need(), rows);
@@ -8232,7 +8521,8 @@ fn anki_push_card(
     pub fn save_annotations(&mut self) {
         let nts = self.notes.clone();
         let uls: Vec<(usize, usize, usize)> = self.underlines.iter().copied().collect();
-        self.library.save_annotations(self.current, &nts, &uls);
+        let ulw: Vec<(usize, usize, usize)> = self.underlines_wavy.iter().copied().collect();
+        self.library.save_annotations(self.current, &nts, &uls, &ulw);
     }
 
     // ---- 拖拽选字（竖排 / 横排连续划线）----
@@ -8420,9 +8710,9 @@ pub fn draft_move(draft: &str, cursor: &mut usize, left: bool) {
 
 // ---- 纸面 chrome 常量（与 reader.rs 的实际渲染严格对应，改渲染须同步改这里）----
 // （现代横笺 chrome 已随「现代横笺」模式移除，只剩古籍竖笺。）
-/// 双面对开两叶之间的「版心（中缝）」宽：约等于一行字宽，随列数走，
-/// 由 `grid::gutter_w(content_w, columns)` 统一算出——渲染层与引擎同源，
-/// 本文件不再另存副本（旧常量 `LEAF_GAP = 32` 已并入该函数）。
+/// 双面对开两叶之间的「版心（中缝）」宽：**物理定值**，见
+/// [`crate::grid::BANXIN_W`]（32px = 框层 14 + 内芯 18）。v1.9.90 起它与
+/// 窗口宽、列数、留白档全部无关——渲染层与点击带同读这一个常量。
 ///
 /// 古文竖笺纸面 chrome（横 / 纵共用）：sheet p_4(16×2=32) + 版框双边
 /// （外 3×2 + 中缝 3×2 + 内 1×2 = 14）+ 余量 ≈ 50。
@@ -9698,7 +9988,7 @@ mod tests {
             target_chars: 14,
             banxin_ratio: crate::grid::BANXIN_RATIOS[crate::grid::BANXIN_TIER_DEFAULT],
         };
-        let gap = crate::grid::gutter_w(VW, 8, ANCIENT_EDGE, cfg.margin);
+        let gap = crate::grid::BANXIN_W;
         let m = compute_grid(
             VW,
             VH,
@@ -9743,7 +10033,7 @@ mod tests {
         // 古文竖笺双面对开：两叶并排 + 中缝不得超出内容宽度。
         let (cw, _ch) = content();
         let m = grid_metrics(8, true);
-        let gap = crate::grid::gutter_w(cw, 8, ANCIENT_EDGE, 0.04);
+        let gap = crate::grid::BANXIN_W;
         assert!(
             2.0 * m.outer_w + gap <= cw + 0.5,
             "古文双面纸宽 {:.1}×2 + 中缝 超 {cw}",
@@ -9774,7 +10064,7 @@ mod tests {
             ANCIENT_HEAD,
             ANCIENT_FOOT,
             0.0, crate::grid::GRID_FS_MAX);
-        assert!(2.0 * m.outer_w + crate::grid::gutter_w(cw, 8, ANCIENT_EDGE, 0.04) <= cw + 0.5);
+        assert!(2.0 * m.outer_w + crate::grid::BANXIN_W <= cw + 0.5);
     }
 
     #[test]
@@ -10164,6 +10454,7 @@ mod tests {
             show_punct: true,
             inline_notes: false,
             west_mode: false,
+            strip_title: false,
         };
         let mut pg = crate::pager::Pager::new(n, key, Some(id.clone()));
 

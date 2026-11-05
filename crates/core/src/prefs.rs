@@ -154,6 +154,16 @@ pub struct Prefs {
     /// 老存档没有这一项 → 0（随纸面），与升级前观感一致。
     #[serde(default)]
     pub png_ratio: usize,
+    /// **現代標點古籍化**（v1.9.91，出厂开）。
+    ///
+    /// true = 剥掉《》，书名改画**旁侧波浪线**（專名號）——真刻本的规矩：
+    /// 古书正文里没有书名号，书名靠线。false = 按现代标准保留《》，竖排
+    /// 形 `︽︾` 缩到四成叠在邻字格上（`title_mark_overlay`）。
+    ///
+    /// 老存档没有这一项 → true：升级后一进来就是刻本的样子，与产品的
+    /// 「仿古籍」主张一致；不喜欢的人一次点击就回现代态。
+    #[serde(default = "default_true")]
+    pub classic_marks: bool,
 }
 
 impl Default for Prefs {
@@ -201,6 +211,8 @@ impl Default for Prefs {
             user_presets: Vec::new(),
             // 出图默认随纸面：本叶真实比例，与升级前一致。
             png_ratio: 0,
+            // 出厂即「古籍化」：剥书名号、画波浪线——真刻本没有《》。
+            classic_marks: true,
         }
     }
 }
@@ -315,8 +327,14 @@ impl Prefs {
         p.save();
     }
 
+    /// 只把**現代標點古籍化**写盘（单点写，与 `save_trad` 同款）。
+    pub fn save_classic_marks(on: bool) {
+        let mut p = Self::load();
+        p.classic_marks = on;
+        p.save();
+    }
+
     /// 只把**繁简档**写盘（不动其它字段）。
-    ///
     /// 全仓没有「界面 → Prefs」的总收口，所以每一处改设置都得自己写这一下；
     /// 写成静态方法，免得调用方再去拼一遍下标。
     pub fn save_trad(m: crate::trad::TradMode) {

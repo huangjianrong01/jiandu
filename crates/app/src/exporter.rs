@@ -817,6 +817,8 @@ pub fn to_card_md(c: &Card, author: &str) -> String {
     let kind_tag = match c.kind {
         CardKind::Quote => "笺读/摘录",
         CardKind::Ai => "笺读/问笺",
+        CardKind::Dictionary => "笺读/生词",
+        CardKind::Underline => "笺读/划线",
     };
     out.push_str(&format!("  - {kind_tag}\n"));
     out.push_str(&format!("  - {}\n", tag_of(&c.book)));
@@ -1270,6 +1272,11 @@ mod tests {
             note: note.into(),
             kind: CardKind::Quote,
             created_ms: 1_763_000_000_000, // 2025-11-11 前后
+            pinyin: String::new(),
+            view_count: 0,
+            last_viewed_ms: 0,
+            starred: false,
+            style: 0,
         }
     }
 

@@ -14,6 +14,9 @@
 //! ⚠️ 铁律：本模块**不得**引入 GPUI / 平台类型；清洗只在**导入时**跑一次，
 //! 不擅自覆盖用户已经改过的书稿。
 
+use std::borrow::Cow;
+use std::cell::RefCell;
+
 use crate::ir::{IrBlock, IrBook, IrJuan, IrSource, IrSpan};
 use crate::pipeline::RawChapter;
 use crate::types::Book;
@@ -331,41 +334,57 @@ fn is_latin_letter(c: char) -> bool {
         || ('\u{1E00}'..='\u{1EFF}').contains(&c)
 }
 
-pub fn strip_pinyin_runs(s: &str) -> String {
-    let cs: Vec<char> = s.chars().collect();
-    let n = cs.len();
-    let mut out = String::with_capacity(s.len());
+/// 拼音串剥离（写入 `out`，零 `Vec<char>` 拷贝）。
+///
+/// 与 [`strip_pinyin_runs`] 行为完全一致，但不再把整段 `collect` 成
+/// `Vec<char>`（一段 5MB 正文会白白吃掉 20MB 堆）——改用字节游标 + 前瞻，
+/// 直接把结果写进调用方复用的缓冲区。
+pub fn strip_pinyin_runs_into(s: &str, out: &mut String) {
+    out.clear();
     let mut i = 0usize;
     let mut space = false;
-    while i < n {
+    while i < s.len() {
+        let rest = &s[i..];
+        let Some(c) = rest.chars().next() else { break };
+        let c_len = c.len_utf8();
         // 自家标记整段放行（`[…]` 里的内容一个字母不动）。
-        if cs[i] == '[' {
-            if let Some(end) = (i + 1..n).find(|&j| cs[j] == ']') {
-                for &c in &cs[i..=end] {
-                    out.push(c);
-                }
+        if c == '[' {
+            if let Some(rel) = s[i + 1..].find(']') {
+                let end = i + 1 + rel; // `]` 的字节下标
+                out.push_str(&s[i..=end]);
                 i = end + 1;
                 space = false;
                 continue;
             }
+            // 没有配对的 `]`：当普通字符处理。
+            out.push('[');
+            i += c_len;
+            space = false;
+            continue;
         }
-        let c = cs[i];
         if is_latin_letter(c) {
-            // 数一数这串字母有多长。
-            let mut j = i;
-            while j < n && is_latin_letter(cs[j]) {
-                j += 1;
+            // 数一数这串拉丁字母有多长。
+            let mut j = i + c_len;
+            while j < s.len() {
+                let Some(nc) = s[j..].chars().next() else { break };
+                if !is_latin_letter(nc) {
+                    break;
+                }
+                j += nc.len_utf8();
             }
             // 只留「单字母」：那是一个词里的一格，不是拼音串。
-            if j - i == 1 {
+            if j - i == c_len {
                 out.push(c);
                 space = false;
             }
-            // 拼音串（≥2）：整段丢；它前面若留着空格，交给下面的空格折叠。
+            // 拼音串（≥2）：整段丢；后面跟着的数字（声调 `dào3`）一并吃掉。
             i = j;
-            // 一串拼音后面可能跟着数字（声调 `dào3`）：一并吃掉。
-            while i < n && cs[i].is_ascii_digit() {
-                i += 1;
+            while i < s.len() {
+                let Some(nc) = s[i..].chars().next() else { break };
+                if !nc.is_ascii_digit() {
+                    break;
+                }
+                i += nc.len_utf8();
             }
             continue;
         }
@@ -374,70 +393,143 @@ pub fn strip_pinyin_runs(s: &str) -> String {
                 out.push(' ');
                 space = true;
             }
-            i += 1;
+            i += c_len;
             continue;
         }
         out.push(c);
         space = false;
-        i += 1;
+        i += c_len;
     }
-    out.trim().to_string()
+    // 与旧实现一致：末尾 trim 后返回。
+    let trimmed: String = out.trim().to_string();
+    *out = trimmed;
 }
 
-pub fn denoise_text(s: &str) -> String {
-    let mut s = s.to_string();
-    // HTML 残留（清洗漏网的 `<span>`、`&nbsp;`）：先剥标签再解实体。
-    if s.contains('<') && s.contains('>') {
-        s = crate::pipeline::strip_tags(&s);
-    }
-    if s.contains('&') {
-        s = crate::pipeline::decode_entities(&s);
-    }
-    // v1.69.0：**拼音（连续拉丁字母）一律删**。开源 JSON 的 `pinyin` 字段
-    // 一旦混进正文，竖排引擎会把它**一个字母一格**竖着排成一串天书。
-    // 单个字母保留（真有西文单词时它是一个完整词，占一格）。
-    // 自家标记 `[拼音:dào]` / `[注]…` 里的内容受保护，一个字母不少。
-    s = strip_pinyin_runs(&s);
+/// 拼音串剥离：连续拉丁字母（≥2）整段删除，单个字母保留；
+/// 自家标记 `[…]` 内原样透传。返回新 `String`。
+pub fn strip_pinyin_runs(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut space = false;
-    let mut tile = false; // 上一个输出已是「□」：连续私用/乱码只留一个方块
-    for c in s.chars() {
-        match c {
-            // 零宽 / BOM / 软连字符 / 方向控制符：一律删（竖排里全是空白格）。
-            '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'
-            | '\u{FEFF}'
-            | '\u{00AD}'
-            | '\u{0000}'..='\u{0008}'
-            | '\u{000E}'..='\u{001F}' => {}
-            // PUA 私用区（BMP + 增补 A/B）：任何字库都无此字形 → 「□」占位，
-            // 连续多个压成一个，绝不把无法渲染的私造字漏进排版引擎。
-            '\u{E000}'..='\u{F8FF}'
-            | '\u{F0000}'..='\u{FFFFD}'
-            | '\u{100000}'..='\u{10FFFD}' => {
-                if !tile {
-                    out.push('\u{25A1}');
-                    tile = true;
-                }
-                space = false;
+    strip_pinyin_runs_into(s, &mut out);
+    out
+}
+
+/// 单字符去噪落笔：零宽 / BOM / 控制符删；私用区压成一个方块；
+/// 各类空白归一成一个半角空格；其余原样。
+fn denoise_push(out: &mut String, c: char, space: &mut bool, tile: &mut bool) {
+    match c {
+        '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'
+        | '\u{FEFF}'
+        | '\u{00AD}'
+        | '\u{0000}'..='\u{0008}'
+        | '\u{000E}'..='\u{001F}' => {
+            *space = false;
+        }
+        '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}' => {
+            if !*tile {
+                out.push('\u{25A1}');
+                *tile = true;
             }
-            // 各种空白统一成一个半角空格（段内换行先并成空格）。
-            '\u{00A0}' | '\u{3000}' | '\t' | '\r' | '\n' | ' ' => {
-                if !space {
-                    out.push(' ');
-                    space = true;
-                }
-                tile = false;
+            *space = false;
+        }
+        '\u{00A0}' | '\u{3000}' | '\t' | '\r' | '\n' | ' ' => {
+            if !*space {
+                out.push(' ');
+                *space = true;
             }
-            _ => {
-                out.push(c);
-                space = false;
-                tile = false;
-            }
+            *tile = false;
+        }
+        _ => {
+            out.push(c);
+            *space = false;
+            *tile = false;
         }
     }
-    out.trim().to_string()
+}
+
+/// 去噪（写入 `out`，零冗余拷贝）。
+///
+/// 把「拼音剥离 + 不可见字符 / 私用区折叠 + 空白归一」合并成**单趟扫描**直接
+/// 写进 `out`——旧实现先 `to_string` 拷一份、再过 `strip_pinyin_runs`（内部
+/// 又 `collect` 成 `Vec<char>`）、最后 `.trim().to_string()` 再拷一份，一段
+/// 正文要付 3~4 次全量分配。新版只在「含 `<>` 标签或 `&` 实体」这种罕见路径上
+/// 才分配临时串，常态路径零分配。
+pub fn denoise_text_into(s: &str, out: &mut String) {
+    out.clear();
+    // 罕见路径：标签 / HTML 实体——按需才分配。
+    let work: Cow<'_, str> = if (s.contains('<') && s.contains('>')) || s.contains('&') {
+        let mut t = String::with_capacity(s.len());
+        if s.contains('<') && s.contains('>') {
+            t.push_str(&crate::pipeline::strip_tags(s));
+        } else {
+            t.push_str(s);
+        }
+        if t.contains('&') {
+            t = crate::pipeline::decode_entities(&t);
+        }
+        Cow::Owned(t)
+    } else {
+        Cow::Borrowed(s)
+    };
+
+    let mut space = false;
+    let mut tile = false; // 上一个输出已是「□」：连续私用/乱码只留一个方块
+    let mut i = 0usize;
+    while i < work.len() {
+        let rest = &work[i..];
+        let Some(c) = rest.chars().next() else { break };
+        let c_len = c.len_utf8();
+
+        // 自家标记整段放行（`[…]` 里的内容原样透传，不做任何归一）。
+        if c == '[' {
+            if let Some(rel) = work[i + 1..].find(']') {
+                let end = i + 1 + rel;
+                out.push_str(&work[i..=end]);
+                i = end + 1;
+                space = false;
+                tile = false;
+                continue;
+            }
+        }
+
+        // 拼音串（连续拉丁字母 ≥2）整段丢；单字母保留并照常归一。
+        if is_latin_letter(c) {
+            let mut j = i + c_len;
+            while j < work.len() {
+                let Some(nc) = work[j..].chars().next() else { break };
+                if !is_latin_letter(nc) {
+                    break;
+                }
+                j += nc.len_utf8();
+            }
+            if j - i == c_len {
+                denoise_push(out, c, &mut space, &mut tile);
+            }
+            i = j;
+            while i < work.len() {
+                let Some(nc) = work[i..].chars().next() else { break };
+                if !nc.is_ascii_digit() {
+                    break;
+                }
+                i += nc.len_utf8();
+            }
+            continue;
+        }
+
+        denoise_push(out, c, &mut space, &mut tile);
+        i += c_len;
+    }
+    let trimmed: String = out.trim().to_string();
+    *out = trimmed;
+}
+
+/// 去噪：剥离 HTML 残留、解码实体、删拼音串、折叠不可见字符与空白。
+/// 返回新 `String`。
+pub fn denoise_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    denoise_text_into(s, &mut out);
+    out
 }
 
 // ── 终极头部清洗（v1.68.1）────────────────────────────────────────────
@@ -1388,8 +1480,10 @@ fn rebuild_headings(juans: Vec<IrJuan>) -> Vec<IrJuan> {
 ///
 /// 判据保守：只认圆括号 `（）` / `()`（现代编辑加的注释都这么写），内容 1–30 字、
 /// 不含句读（含句读的说明是正文本身，不是注）、不含嵌套括号。
-pub fn paren_to_note(s: &str) -> String {
-    let mut out = String::new();
+/// 括号→夹注（写入 `out`）。与 [`paren_to_note`] 行为一致，写进复用缓冲区，
+/// 且把 `format!("[注]{body}[/注]")` 的临时串也省掉（直接三次 `push_str`）。
+pub fn paren_to_note_into(s: &str, out: &mut String) {
+    out.clear();
     let mut depth = 0i32;
     let mut buf = String::new();
     for c in s.chars() {
@@ -1413,9 +1507,13 @@ pub fn paren_to_note(s: &str) -> String {
                             && !body.chars().any(is_sentence_punct)
                             && !body.contains(['（', '）', '(', ')']);
                         if ok {
-                            out.push_str(&format!("[注]{body}[/注]"));
+                            out.push_str("[注]");
+                            out.push_str(body);
+                            out.push_str("[/注]");
                         } else {
-                            out.push_str(&format!("（{body}）"));
+                            out.push('（');
+                            out.push_str(body);
+                            out.push('）');
                         }
                         buf.clear();
                         continue;
@@ -1439,6 +1537,13 @@ pub fn paren_to_note(s: &str) -> String {
         out.push('（');
         out.push_str(&buf);
     }
+}
+
+/// 括号→夹注：把 `（）` / `()` 保守升格成系统一等公民的 `[注]…[/注]` 标记。
+/// 返回新 `String`。
+pub fn paren_to_note(s: &str) -> String {
+    let mut out = String::new();
+    paren_to_note_into(s, &mut out);
     out
 }
 
@@ -1681,12 +1786,20 @@ pub fn normalize_variant_char(c: char) -> char {
 ///
 /// 一次取激活表快照，再逐字查表——**绝不每字读一次锁 / 磁盘**。
 /// 百万字丛书这条路会跑一整遍，性能不能靠「反正表小」糊过去。
-pub fn normalize_variants(s: &str) -> String {
+/// 异体字归一（写入 `out`）。一次性取激活表快照，逐字查表——绝不每字读一次锁。
+pub fn normalize_variants_into(s: &str, out: &mut String) {
     let table = crate::variants::active();
-    let mut out = String::with_capacity(s.len());
+    out.clear();
+    out.reserve(s.len());
     for c in s.chars() {
         out.push(table.fold(c));
     }
+}
+
+/// 全文本异体字归一。返回新 `String`。
+pub fn normalize_variants(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    normalize_variants_into(s, &mut out);
     out
 }
 
@@ -2159,13 +2272,31 @@ pub fn clean_chapters(chapters: &[RawChapter], source: IrSource) -> Vec<RawChapt
         .collect()
 }
 
+/// 单段文本清洗的复用缓冲区：两块 `String` 乒乓，避免每段都重新分配。
+/// 分两个独立的线程局部单元，规避 `RefMut` 同帧多重可变借用的限制。
+thread_local! {
+    static CLEAN_A: RefCell<String> = RefCell::new(String::new());
+    static CLEAN_B: RefCell<String> = RefCell::new(String::new());
+}
+
 /// 单段文本的完整清洗（去噪 + 括号夹注 + 异体归一），给导入向导 / 命令行用。
+///
+/// 通过线程局部复用缓冲区，把旧实现「三段各返回新 `String`」的 ~4 次全量分配
+/// 压到只剩返回值的 1 次拷贝——百万字的丛书导入能少分配上百万次堆块。
 pub fn clean_line(s: &str) -> String {
-    let t = denoise_text(s);
-    if t.is_empty() || is_noise_para(&t) {
-        return String::new();
-    }
-    normalize_variants(&paren_to_note(&t))
+    CLEAN_A.with(|a| {
+        let mut a = a.borrow_mut();
+        denoise_text_into(s, &mut *a);
+        if a.is_empty() || is_noise_para(&*a) {
+            return String::new();
+        }
+        CLEAN_B.with(|b| {
+            let mut b = b.borrow_mut();
+            paren_to_note_into(&*a, &mut *b);
+            normalize_variants_into(&*b, &mut *a);
+            a.clone() // 线程局部缓冲区不能外借，复制出返回值（1 次分配）。
+        })
+    })
 }
 
 // ------------------------------------------------------------------

@@ -18,22 +18,57 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::Script;
 
-/// 双面对开两叶之间的「版心（中缝）」宽：**约等于一行字宽**。
-/// 刻本版心本就是一格字的宽度——鱼尾、篇题、叶码、朱砂小印都立在这一格
-/// 里。这里按 `compute_grid` 的同一套算式反解：令中缝宽恰等于单叶字格宽
-/// （`(content_w×k/2 - edge) / (columns + k/2)`，`k = 1 - 2×margin`），
-/// 两叶各占 `columns` 格、缝里再立一格；列数越多缝越窄，始终跟随
-/// 「一行字宽」进退。
-pub fn gutter_w(content_w: f32, columns: usize, edge: f32, margin: f32) -> f32 {
-    let c = columns.max(1) as f32;
-    let k = (1.0 - 2.0 * margin.clamp(0.0, 0.45)).max(0.1);
-    let num = (content_w * k / 2.0 - edge).max(1.0);
-    (num / (c + k / 2.0)).clamp(LEAF_GAP_MIN, LEAF_GAP_MAX)
+// ── 版心（中缝）：物理死尺寸，绝不参与弹性分配 ────────────────────────
+//
+// 用户口径（v1.9.90，对照《古籍的规范》图）：
+//   「版心只是一条用来放鱼尾、象鼻和折页线的极窄通道。在代码里，版心的
+//     宽度必须是一个固定常量，绝对不能参与弹性拉伸。不管屏幕多宽，版心
+//     宽度不变。」
+//
+// 旧制把版心当成**普通文本列**去平分屏幕：`gutter = 一行字宽`，于是
+// 8 列时缝宽 57px、12 列时 39px——列数一换它就变，宽屏上真成了一道
+// 「大峡谷」。现在只认三个物理常量，与窗口宽、列数、留白档**全部无关**。
+
+/// 中缝两侧**单叶框层**的厚度：外粗框 3 + 框内留边 3 + 内细线 1。
+///
+/// 这是**物理厚度**，不是比例——鱼尾与书口字只准排在这两条细线之间，
+/// 故版心内芯宽 = 中缝全宽 − 2 × 本值。
+pub const BANXIN_FRAME_W: f32 = 7.0;
+/// 中缝两侧框层总厚（14px）：两侧细线之间的那一截才是「内芯」。
+pub const BANXIN_FRAME_TOTAL: f32 = BANXIN_FRAME_W * 2.0;
+/// **版心内芯宽**（18px）：正好一行竖排书口小字（约 8px）+ 两侧各 5px 气口，
+/// 鱼尾的平顶与 V 口也才咬得出形。
+pub const BANXIN_CORE_W: f32 = 18.0;
+/// **版心全宽 = 32px，物理死尺寸。**
+///
+/// 不随 `content_w`、不随 `columns`、不随 `margin` 变化——这是 v1.9.90 的
+/// 死命令。两叶各占 `(content_w − 32) / 2`，多出来的宽度一律还给纸外的
+/// 天地（左右留白），绝不再塞给版心。
+pub const BANXIN_W: f32 = BANXIN_FRAME_TOTAL + BANXIN_CORE_W;
+
+/// 版心内芯宽（渲染层与点击带同读这一个常量）。
+pub const fn banxin_core_w() -> f32 {
+    BANXIN_CORE_W
 }
 
-/// 中缝宽下限（窄屏也立得住一对鱼尾）/ 上限（14 列时不至于宽得离谱）。
-pub const LEAF_GAP_MIN: f32 = 22.0;
-pub const LEAF_GAP_MAX: f32 = 110.0;
+/// 把版框之外的**多余高度**还给天头地脚，按 [`TOP_OF_BOT`]（3:2）分。
+///
+/// 用户口径：「如果半叶的文字排不满，多余的屏幕空间绝对不能塞给版心，
+/// 也不能塞给界格。应该把多余的空间还给外围的天头、地脚，让整个版框在
+/// 屏幕居中。」按 3:2 分而非对半分，是因为天头恒大于地脚是刻本的形制
+/// （`TOP_OF_BOT`）；且 `0.6 + 0.4` 刚好让 `(mt+0.6s)/(mb+0.4s)` 仍等于
+/// 1.5——原有的 3:2 铁律一分不破。
+pub fn split_vertical_slack(slack: f32) -> (f32, f32) {
+    let s = slack.max(0.0);
+    let k = TOP_OF_BOT + 1.0;
+    (s * TOP_OF_BOT / k, s / k)
+}
+
+/// 加过「天地盈余」之后的天头 / 地脚（比例仍是 3:2）。
+pub fn balance_vertical(margin_top: f32, margin_bot: f32, slack: f32) -> (f32, f32) {
+    let (t, b) = split_vertical_slack(slack);
+    (margin_top + t, margin_bot + b)
+}
 
 // ── 响应式单 / 双叶 ─────────────────────────────────────────────────
 /// 双叶对开所需的最小宽高比：低于此值按「竖屏 / 近方屏」处理 → 单叶。
@@ -839,10 +874,10 @@ pub fn compute_grid(
     extra_cols: f32,
     fs_max: f32,
 ) -> GridMetrics {
-    // 1) 双面对开：单叶可用宽对半——先扣两叶之间的版心（中缝），
-    //    中缝宽约等于一行字宽（见 `gutter_w`）。
+    // 1) 双面对开：单叶可用宽对半——先扣掉两叶之间那道**定宽**版心
+    //    （[`BANXIN_W`] = 32px，与列数 / 窗口宽无关），剩下的才是两叶的地盘。
     let per_leaf = if facing {
-        ((content_w - gutter_w(content_w, cfg.columns, edge, cfg.margin)) / 2.0).max(60.0)
+        ((content_w - BANXIN_W) / 2.0).max(60.0)
     } else {
         content_w
     };
@@ -1295,8 +1330,7 @@ mod tests {
                             inp.banxin_ratio = *ratio;
                             inp.zoom = zoom;
                             let p = calculate_grid(inp);
-                            let g = gutter_w(cw, columns, inp.edge, inp.margin);
-                            let per_leaf = (cw - g) / 2.0;
+                            let per_leaf = (cw - BANXIN_W) / 2.0;
                             if p.m.outer_w > per_leaf + 0.5 {
                                 bad.push(format!(
                                     "cw={cw} ch={ch} cols={columns} tier={tier} zoom={zoom}: \
@@ -2071,8 +2105,7 @@ mod tests {
             target_chars: 21,
             ..GridConfig::default()
         };
-        let gap = gutter_w(cw, 12, 50.0, base.margin);
-        let per_leaf = (cw - gap) / 2.0;
+        let per_leaf = (cw - BANXIN_W) / 2.0;
         let mut prev_top = f32::MAX;
         for (i, &ratio) in BANXIN_RATIOS.iter().enumerate() {
             let m = compute_grid(
@@ -2233,7 +2266,6 @@ mod frame_tests {
 
     /// ② 绝对居中：对分两叶 + 中缝恰好铺满内容宽，两叶一丝不差等宽，
     /// 且**中缝中心 = 屏幕正中央**（`gw/2 + per_leaf == cw/2`）。
-    /// 中缝宽只由「列数 / 内容宽 / 版框 / 纸边」决定，与边框粗细无关。
     #[test]
     fn facing_split_is_symmetric_and_the_gutter_sits_on_the_center_line() {
         for &(cw, cols) in &[
@@ -2244,33 +2276,103 @@ mod frame_tests {
             (900.0, 12),
             (1600.0, 14),
         ] {
-            for &edge in &[50.0, 14.0, 3.0] {
-                // 外框从 1px 加到 3px（edge 取几档）都不许破坏等宽与居中。
-                let gw = gutter_w(cw, cols, edge, 0.10);
-                let per_leaf = ((cw - gw) / 2.0).max(60.0);
-                // ②-a 两叶严格等宽：从中缝向两侧各分一半，右叶宽度由
-                //   「剩余宽度」反算，差值必须为 0（不许有一丝舍入损失）。
-                let right_w = cw - gw - per_leaf;
-                assert!(
-                    (per_leaf - right_w).abs() < 1e-9,
-                    "cols={cols} edge={edge}：两叶不等宽 {per_leaf} vs {right_w}"
+            // 中缝是物理常量：与列数、内容宽、版框粗细**全都无关**。
+            let gw = BANXIN_W;
+            let per_leaf = ((cw - gw) / 2.0).max(60.0);
+            // ②-a 两叶严格等宽：从中缝向两侧各分一半，右叶宽度由
+            //   「剩余宽度」反算，差值必须为 0（不许有一丝舍入损失）。
+            let right_w = cw - gw - per_leaf;
+            assert!(
+                (per_leaf - right_w).abs() < 1e-9,
+                "cols={cols}：两叶不等宽 {per_leaf} vs {right_w}"
+            );
+            // ②-b 两叶 + 中缝 = 内容宽（不溢不欠）。
+            assert!(
+                (per_leaf * 2.0 + gw - cw).abs() < 1e-4,
+                "cols={cols}：{per_leaf}×2 + {gw} ≠ {cw}"
+            );
+            // ②-c 中缝中心钉在屏幕正中。
+            let gutter_center = per_leaf + gw * 0.5;
+            assert!(
+                (gutter_center - cw * 0.5).abs() < 1e-4,
+                "cols={cols}：中缝中心 {gutter_center} 不在屏幕正中 {}",
+                cw * 0.5
+            );
+        }
+    }
+
+    /// **v1.9.90 死命令**：版心宽是物理常量——8 / 10 / 12 / 14 列、任意窗口
+    /// 宽度下都是同一个 32px，绝不跟列数或屏幕宽一起伸缩。
+    ///
+    /// 旧制拿「一行字宽」当中缝宽，于是 8 列时缝宽 57px、12 列时 39px，
+    /// 宽屏上远看就是一道「大峡谷」。现在两叶的列宽怎么变，缝都不变。
+    #[test]
+    fn banxin_width_is_a_dead_constant() {
+        for cw in [360.0f32, 480.0, 620.0, 860.0, 1024.0, 1161.0, 1440.0, 2048.0] {
+            for columns in GRID_COLUMN_CHOICES {
+                let m = compute_grid(
+                    cw,
+                    720.0,
+                    GridConfig {
+                        columns,
+                        ..GridConfig::default()
+                    },
+                    true,
+                    1.0,
+                    50.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    GRID_FS_MAX,
                 );
-                // ②-b 两叶 + 中缝 = 内容宽（不溢不欠）。
+                // 两叶纸宽之和 + 版心塞得进内容宽（纸面不越界）。
                 assert!(
-                    (per_leaf * 2.0 + gw - cw).abs() < 1e-4,
-                    "cols={cols} edge={edge}：{per_leaf}×2 + {gw} ≠ {cw}"
+                    m.outer_w * 2.0 + BANXIN_W <= cw + 1.5 || cw < 400.0,
+                    "cw={cw} cols={columns}：两叶 {:.0}×2 + 版心 {BANXIN_W} 超出 {cw}",
+                    m.outer_w
                 );
-                // ②-c 中缝中心钉在屏幕正中。
-                let gutter_center = per_leaf + gw * 0.5;
+                // 形制量全部由常量推出，任何档位都不许被压瘪。
+                assert_eq!(banxin_core_w(), BANXIN_CORE_W);
+                let tail_w = BANXIN_W + crate::banxin::FISHTAIL_OVERLAP;
+                let tail_h = crate::banxin::tail_h_for_width(tail_w);
+                assert!(tail_w >= crate::banxin::FISHTAIL_W_MIN, "鱼尾被压窄");
+                assert!(tail_h >= crate::banxin::FISHTAIL_H_MIN, "鱼尾被压瘪");
+                assert!(crate::banxin::xiangbi_len(tail_h) >= crate::banxin::XIANG_BI_MIN);
+                // 鱼尾只许在版心内：两翼外探合计不得超过框层总厚。
                 assert!(
-                    (gutter_center - cw * 0.5).abs() < 1e-4,
-                    "cols={cols} edge={edge}：中缝中心 {gutter_center} 不在屏幕正中 {}",
-                    cw * 0.5
+                    tail_w <= BANXIN_W + BANXIN_FRAME_TOTAL,
+                    "鱼尾探出了版心的框层"
                 );
-                // ②-d 中缝宽度合理（立得住一对鱼尾，又不像一条马路）。
-                assert!((LEAF_GAP_MIN - 1e-6..=LEAF_GAP_MAX + 1e-6).contains(&gw));
             }
         }
+    }
+
+    /// **多余的纵向空间还给天地**（用户口径）：不塞给版心、不塞给界格，
+    /// 按 3:2 分给天头地脚——且分完仍严格守住「天头 = 地脚 × 1.5」。
+    #[test]
+    fn slack_goes_to_sky_and_ground_keeping_the_three_two_ratio() {
+        for &slack in &[0.0f32, 7.0, 26.0, 63.5, 180.0] {
+            for &(mt, mb) in &[(120.0f32, 80.0f32), (60.0, 40.0), (200.0, 133.33)] {
+                let (t, b) = balance_vertical(mt, mb, slack);
+                assert!(
+                    (t / b - TOP_OF_BOT).abs() < 1e-3,
+                    "slack={slack}：天地比例 {:.3} 破了 3:2",
+                    t / b
+                );
+                assert!(t > b, "slack={slack}：天头没大于地脚");
+                assert!(
+                    ((t - mt) + (b - mb) - slack).abs() < 1e-3,
+                    "slack={slack}：一分没多给、一分没少给"
+                );
+                assert!(
+                    slack <= 0.0 || (t - mt) > (b - mb),
+                    "天头该拿大头"
+                );
+            }
+        }
+        // 负数（版框比内容区还高）不许反向吃掉留白。
+        let (t, b) = balance_vertical(100.0, 66.0, -40.0);
+        assert_eq!((t, b), (100.0, 66.0));
     }
 
     /// v1.34.0 回归（用户实测「双叶分家」）：对开两叶贴中缝的内侧缘

@@ -20,22 +20,29 @@ use serde::{Deserialize, Serialize};
 
 /// 卡片来源。
 ///
-/// v1.74.0 只有 `Quote`（选中原文入匣）；`Ai` 是模块二「问小笺」的落点——
-/// 先把枚举与列留出来，届时不必改表结构。
+/// v1.74.0 只有 `Quote`（选中原文入匣）；`Ai` 是模块二「问小笺」的落点；
+/// `Dictionary` 是「生词本」——点【查典】成功取义后静默收录的查词卡；
+/// `Underline` 是竖排正文右侧的「划线」朱线，绑定 Char Index 区间。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CardKind {
     /// 摘录：用户框选的原文。
     Quote = 0,
     /// 问笺：AI 的回答（模块二接入）。
     Ai = 1,
+    /// 查词卡片（生词本）：点【查典】成功取义后自动收录，与朱批 / 笔记区分开。
+    Dictionary = 2,
+    /// 划线（右侧朱线）：竖排正文右侧的前景朱线，绑定 Char Index 区间，与
+    /// 朱批（背景半透明红底）彻底解耦。
+    Underline = 3,
 }
 
 impl CardKind {
     pub fn from_i64(v: i64) -> Self {
-        if v == 1 {
-            CardKind::Ai
-        } else {
-            CardKind::Quote
+        match v {
+            1 => CardKind::Ai,
+            2 => CardKind::Dictionary,
+            3 => CardKind::Underline,
+            _ => CardKind::Quote,
         }
     }
     /// 卡片列表上的一枚小标签（单字，朱砂）。
@@ -43,6 +50,8 @@ impl CardKind {
         match self {
             CardKind::Quote => "摘",
             CardKind::Ai => "笺",
+            CardKind::Dictionary => "典",
+            CardKind::Underline => "线",
         }
     }
 }
@@ -69,6 +78,16 @@ pub struct Card {
     pub kind: CardKind,
     /// 入匣时刻（毫秒）。列表按它倒序——最新入匣的在最上。
     pub created_ms: i64,
+    /// 拼音（查词卡用：生词本「读音」一栏；其余类型空）。
+    pub pinyin: String,
+    /// 查阅次数（查词卡去重后的热度，生词本默认按它降序）。
+    pub view_count: i64,
+    /// 最近查阅时间（毫秒）：去重命中时刷新。
+    pub last_viewed_ms: i64,
+    /// 是否已「加入重点」（查词卡一键转正为核心复习卡）。
+    pub starred: bool,
+    /// 线型（划线卡用：0 实线 / 1 波浪线，波浪线作专名号）。
+    pub style: i64,
 }
 
 impl Card {
@@ -83,6 +102,11 @@ impl Card {
 }
 
 /// 建表（`store::init` 里调一次；`IF NOT EXISTS` 保证老库自动补表）。
+///
+/// v1.9.89 起新增五列：`pinyin` / `view_count` / `last_viewed_ms` / `starred`
+/// / `style`——分别服务「生词本」（拼音 / 查阅次数 / 最近查阅 / 星标）与
+/// 「划线」（线型）。老库（v1.9.88 及更早）表里没有这些列，`init` 末尾的
+/// `ensure_column` 会逐列 `ALTER TABLE ADD COLUMN` 补上，零迁移成本。
 pub fn init(c: &Connection) -> Result<()> {
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS cards(
@@ -97,12 +121,61 @@ pub fn init(c: &Connection) -> Result<()> {
              quote       TEXT NOT NULL,
              note        TEXT NOT NULL,
              kind        INTEGER NOT NULL,
-             created_ms  INTEGER NOT NULL
+             created_ms  INTEGER NOT NULL,
+             pinyin      TEXT NOT NULL DEFAULT '',
+             view_count  INTEGER NOT NULL DEFAULT 0,
+             last_viewed_ms INTEGER NOT NULL DEFAULT 0,
+             starred     INTEGER NOT NULL DEFAULT 0,
+             style       INTEGER NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS idx_cards_time ON cards(created_ms DESC);
-         CREATE INDEX IF NOT EXISTS idx_cards_book ON cards(store_id);",
+         CREATE INDEX IF NOT EXISTS idx_cards_book ON cards(store_id);
+         CREATE INDEX IF NOT EXISTS idx_cards_kind ON cards(kind);",
     )
-    .context("建卡片匣表失败")
+    .context("建卡片匣表失败")?;
+    // 老库（v1.9.88 之前）没有新列，逐列补齐——只补缺失的，已有则跳过。
+    ensure_column(c, "cards", "pinyin", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(c, "cards", "view_count", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(c, "cards", "last_viewed_ms", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(c, "cards", "starred", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(c, "cards", "style", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
+/// 老库补列：若 `table` 尚无 `col`，就 `ALTER TABLE ADD COLUMN`。
+///
+/// SQLite 不支持「加列若存在则跳过」的语法，故先 `PRAGMA table_info`
+/// 探一遍，避免重复加列报错。
+fn ensure_column(c: &Connection, table: &str, col: &str, def: &str) -> Result<()> {
+    let mut st = c
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .context("探表结构失败")?;
+    let mut found = false;
+    let rows = st
+        .query_map([], |r| r.get::<_, String>(1))
+        .context("读表结构失败")?;
+    for r in rows {
+        if r? == col {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        c.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {col} {def}"),
+            [],
+        )
+        .with_context(|| format!("补列 {col} 失败"))?;
+    }
+    Ok(())
+}
+
+/// 当前毫秒（落库时间戳用；core 不依赖任何平台时钟 API）。
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// 入匣一枚卡片，返回它的 `id`。
@@ -112,8 +185,9 @@ pub fn init(c: &Connection) -> Result<()> {
 pub fn put_card(c: &Connection, card: &Card) -> Result<i64> {
     c.execute(
         "INSERT INTO cards(store_id,book,chapter,chapter_idx,para_idx,char_off,
-                           len,quote,note,kind,created_ms)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                           len,quote,note,kind,created_ms,
+                           pinyin,view_count,last_viewed_ms,starred,style)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             card.store_id,
             card.book,
@@ -126,6 +200,11 @@ pub fn put_card(c: &Connection, card: &Card) -> Result<i64> {
             card.note,
             card.kind as i64,
             card.created_ms,
+            card.pinyin,
+            card.view_count,
+            card.last_viewed_ms,
+            if card.starred { 1i64 } else { 0i64 },
+            card.style,
         ],
     )
     .context("入匣失败")?;
@@ -139,7 +218,8 @@ pub fn put_card(c: &Connection, card: &Card) -> Result<i64> {
 pub fn list_cards(c: &Connection, limit: usize) -> Result<Vec<Card>> {
     let mut st = c.prepare(
         "SELECT id,store_id,book,chapter,chapter_idx,para_idx,char_off,
-                len,quote,note,kind,created_ms
+                len,quote,note,kind,created_ms,
+                pinyin,view_count,last_viewed_ms,starred,style
          FROM cards ORDER BY created_ms DESC, id DESC LIMIT ?1",
     )?;
     let rows = st.query_map(params![limit as i64], |r| {
@@ -154,6 +234,11 @@ pub fn list_cards(c: &Connection, limit: usize) -> Result<Vec<Card>> {
             note: r.get(9)?,
             kind: CardKind::from_i64(r.get(10)?),
             created_ms: r.get(11)?,
+            pinyin: r.get(12)?,
+            view_count: r.get(13)?,
+            last_viewed_ms: r.get(14)?,
+            starred: r.get::<_, i64>(15)? != 0,
+            style: r.get(16)?,
         })
     })?;
     let mut out = Vec::new();
@@ -190,6 +275,75 @@ pub fn same_place(a: &Card, b: &Card) -> bool {
     a.store_id == b.store_id && a.key == b.key && a.quote == b.quote
 }
 
+/// **查词卡去重落库（生词本）**：同一「词条」(`quote`) 只留一张卡。
+///
+/// * 已存在 → 查阅次数 `+1`、刷新最近查阅时间，并把出处更新为最近一次查的
+///   位置（书 / 章 / 锚点）——同一字在不同书里查，生词本只留一条，但记住
+///   你最近是在哪儿查的。
+/// * 不存在 → 新建，记下原词 / 拼音 / 释义 / 出处，`view_count` 起手为 1。
+///
+/// ⚠️ 与 `save_selection_card` 的「位置去重」(`same_place`) 区分开：生词本
+/// 按「词」去重，不是按「位置」——否则同一字每出现一次就刷一条，污染匣子。
+pub fn upsert_dict_card(
+    c: &Connection,
+    store_id: &str,
+    book: &str,
+    chapter: &str,
+    key: (usize, usize, usize),
+    word: &str,
+    pinyin: &str,
+    gloss: &str,
+) -> Result<i64> {
+    let existing: Option<i64> = c
+        .query_row(
+            "SELECT id FROM cards WHERE kind=?1 AND quote=?2 LIMIT 1",
+            params![CardKind::Dictionary as i64, word],
+            |r| r.get(0),
+        )
+        .ok();
+    let now = now_ms();
+    if let Some(id) = existing {
+        // 重复词条：**只**累加查阅次数、刷新最近查阅时间（用户需求 #2）。
+        // 释义 / 出处（首次落库时记录的书·章）一律不动——同一字在别处再查，
+        // 不该把原来「在《庄子》查的」改写成「在《列子》查的」，否则出处失真。
+        c.execute(
+            "UPDATE cards SET view_count=view_count+1, last_viewed_ms=?1 WHERE id=?2",
+            params![now, id],
+        )
+        .context("更新生词本失败")?;
+        Ok(id)
+    } else {
+        let card = Card {
+            id: 0,
+            book: book.to_string(),
+            chapter: chapter.to_string(),
+            store_id: store_id.to_string(),
+            key,
+            len: word.chars().count(),
+            quote: word.to_string(),
+            note: gloss.to_string(),
+            kind: CardKind::Dictionary,
+            created_ms: now,
+            pinyin: pinyin.to_string(),
+            view_count: 1,
+            last_viewed_ms: now,
+            starred: false,
+            style: 0,
+        };
+        put_card(c, &card)
+    }
+}
+
+/// 查词卡「加入重点」：一键转正为核心复习卡（星标）。`starred` 只管生词本。
+pub fn set_dict_starred(c: &Connection, id: i64, starred: bool) -> Result<()> {
+    c.execute(
+        "UPDATE cards SET starred=?1 WHERE id=?2",
+        params![if starred { 1i64 } else { 0i64 }, id],
+    )
+    .context("星标失败")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +361,11 @@ mod tests {
             note: String::new(),
             kind: CardKind::Quote,
             created_ms: 1_700_000_000_000,
+            pinyin: String::new(),
+            view_count: 0,
+            last_viewed_ms: 0,
+            starred: false,
+            style: 0,
         }
     }
 
@@ -271,5 +430,49 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].book, "莊子");
         assert_eq!(all[0].quote, "北冥有魚");
+    }
+
+    /// **生词本按「词」去重**：同一字查两次不该刷两条，而是次数累加；
+    /// 重复时只刷新查阅次数与最近查阅时间，**不覆盖**首次落库的释义与出处。
+    #[test]
+    fn dict_card_dedups_by_word_and_bumps_count() {
+        let c = store::connect_in_memory().unwrap();
+        let _a = upsert_dict_card(&c, "zhuangzi", "莊子", "逍遙遊", (0, 1, 3), "鯤", "kūn", "鱼子也").unwrap();
+        let b = upsert_dict_card(&c, "liezi", "列子", "湯問", (2, 0, 9), "鯤", "kūn", "大鱼也").unwrap();
+        // 同一词「鯤」只留一张。
+        let all = list_cards(&c, 100).unwrap();
+        assert_eq!(all.len(), 1, "同一词条不应重复落库");
+        assert_eq!(all[0].kind, CardKind::Dictionary);
+        assert_eq!(all[0].view_count, 2, "查阅次数应累加");
+        // 出处与释义保持首次落库时的值（在《庄子》查的「鱼子也」），
+        // 不因后来在《列子》再查而改写成「大鱼也」。
+        assert_eq!(all[0].book, "莊子", "出处应保持首次落库的书");
+        assert_eq!(all[0].pinyin, "kūn");
+        assert_eq!(all[0].note, "鱼子也", "释义不应被重复查阅覆盖");
+        // 星标一键转正。
+        set_dict_starred(&c, b, true).unwrap();
+        let all = list_cards(&c, 100).unwrap();
+        assert!(all[0].starred);
+    }
+
+    /// **四类卡片各归其位**：Quote / Ai / Dictionary / Underline 入匣后
+    /// `from_i64` 与 `label` 都能正确还原。
+    #[test]
+    fn four_kinds_roundtrip() {
+        let c = store::connect_in_memory().unwrap();
+        for k in [CardKind::Quote, CardKind::Ai, CardKind::Dictionary, CardKind::Underline] {
+            let mut cd = card("測", (0, 0, 0));
+            cd.kind = k;
+            cd.style = 1;
+            put_card(&c, &cd).unwrap();
+        }
+        let all = list_cards(&c, 100).unwrap();
+        assert_eq!(all.len(), 4);
+        for cd in &all {
+            assert_eq!(CardKind::from_i64(cd.kind as i64), cd.kind);
+            assert_eq!(cd.style, 1);
+        }
+        assert_eq!(CardKind::Dictionary.label(), "典");
+        assert_eq!(CardKind::Underline.label(), "线");
     }
 }

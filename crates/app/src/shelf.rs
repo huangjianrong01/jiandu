@@ -833,6 +833,11 @@ impl Root {
         // 两个按钮做的是同一件事，只是入口分了两处。
         bar = bar.child(import_btn);
         bar = bar.child(self.render_search_icon(searching, cx));
+        // 整理态才露出的**排序**三枚（時間 / 書名 / 進度）：平时天头要空着，
+        // 只有进了「编辑」才需要回答「这些书怎么摆」。
+        if managing {
+            bar = bar.child(self.render_shelf_sort(cx));
+        }
         bar = bar.child(edit);
 
         // 第二行：胶囊页签（全部 / 经 / 史 / 子 / 集）。
@@ -844,6 +849,52 @@ impl Root {
             .child(self.render_shelf_tabs(cx));
 
         div().flex().flex_col().child(bar).child(tabs)
+    }
+
+    /// **整理态的排序三枚**（v1.9.93 用户定）：時間 / 書名 / 進度。
+    ///
+    /// 排序逻辑本来就长在 `shelf_filtered()` 里（`ShelfSort` 四档：最近阅读 /
+    /// 书名 / 进度 / 入架顺序），只是 v1.49.3 为了「天头留白」把入口整排撤了
+    /// ——那一下把功能也撤没了。现在按用户的意思收进「编辑」：**平时不占地方，
+    /// 整理时才有**。三枚小字，选中的转朱，与书架那一排页签同一套笔法。
+    fn render_shelf_sort(&mut self, cx: &mut Context<Self>) -> Div {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::SongTi,
+            crate::types::Script::Ancient,
+        );
+        let cur = self.shelf_sort;
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .font_family(song);
+        // 只要三档：入架顺序这一档没有入口（新书本来就排在最前，用不上）。
+        for (s, label) in [
+            (ShelfSort::Recent, "时间"),
+            (ShelfSort::Title, "书名"),
+            (ShelfSort::Progress, "进度"),
+        ] {
+            let on = cur == s;
+            row = row.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(if on { CINNABAR } else { INK_SOFT }))
+                    .when(on, |d| d.font_weight(FontWeight::MEDIUM))
+                    .cursor_pointer()
+                    .hover(|d| d.text_color(rgb(CINNABAR)))
+                    .child(SharedString::from(label))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.shelf_sort = s;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        row
     }
 
     /// 顶栏第一行那行小字：**今日读了几叶**（v1.9.38）。紧跟在「书架」
@@ -1373,6 +1424,32 @@ impl Root {
             .cursor_pointer()
             // 整理态勾中：收一圈朱边（常态一条线都不画）。
             .when(picked, |d| d.border_1().border_color(rgb(CINNABAR)))
+            // ⓿ **装订线**（v1.9.93 用户要的「书的质感」）：左侧一道压痕 +
+            // 外侧一道极淡高光，上下一律让开 10px——线装书的书脊就是这么压
+            // 出来的。先 add 先画，故它在题签**之下**，绝不压字。
+            //
+            // 为什么不做噪点：GPUI 0.2.2 没有 `background-image`、也没有元素级
+            // 的混合模式，撒点只能靠一张位图贴上去；为封面单独打一张 noise
+            // 资源并塞进 .app 包，代价远大于「一点点纸纹」的收益，且缩放后
+            // 会摩尔纹。压痕 + 高光两笔，靠的是几何而不是贴图，任何缩放下都稳。
+            .child(
+                div()
+                    .absolute()
+                    .left(px(7.0))
+                    .top(px(10.0))
+                    .bottom(px(10.0))
+                    .w(px(1.0))
+                    .bg(rgba(0x0000002E)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(8.0))
+                    .top(px(10.0))
+                    .bottom(px(10.0))
+                    .w(px(1.0))
+                    .bg(rgba(0xFFFFFF1A)),
+            )
             // ① 左上题签：上、左各 10，白底小矩形，里面竖排书名。
             .child(
                 div()
@@ -1390,7 +1467,11 @@ impl Root {
                     .bg(rgb(0xFFFFFF))
                     .child(title),
             )
-            // ② 右缘作者：右 10、上 10，极小号浅灰竖排——像书脊那行小注。
+            // ② 右缘作者：右 10、上 10，小号竖排——像书脊那行小注。
+            //
+            // v1.9.93：字号 8.5 → 10，颜色提亮到 `0xD8CFBB`。原先 8.5px 的
+            // 浅灰压在深青布面上，对比不足 3:1，弱视用户基本看不见；现在
+            // 与书名（15px）仍差着一档半，层级没丢，但读得清了。
             .child(
                 div()
                     .absolute()
@@ -1398,18 +1479,26 @@ impl Root {
                     .top(px(10.0))
                     .max_h(px(H * 0.52))
                     .overflow_hidden()
-                    .child(vertical_mini(&e.author_line(), H * 0.52, 8.5, 0xBCB19C)),
+                    .child(vertical_mini(&e.author_line(), H * 0.52, 10.0, 0xD8CFBB)),
             )
-            // ③ 左下进度：下、左各 10，极小号；未读的书不写「已读 0%」。
+            // ③ 左下进度：下、左各 10；未读的书不写「已读 0%」。
+            //
+            // v1.9.93（无障碍）：原先 9px + `0xC8BCA4`，压在深青布上对比不足
+            // 3:1，用户点名的「太暗太小」。改成**纸白小签 + 深墨字**：不透明
+            // 底把布色隔开，对比 ≈ 12:1（WCAG AAA 小字要 7:1），字号 11。
             .when(started, |d| {
                 d.child(
                     div()
                         .absolute()
                         .left(px(10.0))
                         .bottom(px(10.0))
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(px(3.0))
+                        .bg(rgb(0xF7F1E2))
                         .font_family(song.clone())
-                        .text_size(px(9.0))
-                        .text_color(rgb(0xC8BCA4))
+                        .text_size(px(11.0))
+                        .text_color(rgb(0x2A2119))
                         .child(SharedString::from(format!("已读 {pct}%"))),
                 )
             })
