@@ -145,9 +145,9 @@ pub fn key_in_range(k: GlyphKey, a: GlyphKey, b: GlyphKey) -> bool {
 /// 字体选择。
 ///
 /// 分工（换字体方案的核心）：
-///   * **正文** —— 大字库宋体（文津宋体 / 梦源宋体）：生僻字全覆盖、
+///   * **正文** —— 大字库宋体（思源宋体 / 文津宋体 / 梦源宋体）：生僻字全覆盖、
 ///     竖排标点挤压正确，古籍正文只认这一类；
-///   * **批注** —— 楷体（玄冬楷书 / 霞鹜文楷）：夹注小字、放大注卡、题识；
+///   * **批注** —— 仿宋 / 楷体（朱雀仿宋 / 霞鹜文楷）：夹注小字、放大注卡、题识；
 ///   * **标题 / UI** —— 思源黑体；
 ///   * **等宽 / 西文** —— 尚古等宽、西文数字（Computer Modern）。
 ///
@@ -158,7 +158,7 @@ pub fn key_in_range(k: GlyphKey, a: GlyphKey, b: GlyphKey) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum FontChoice {
     // —— 正文：大字符集宋体 ——
-    /// 文津宋体（首选：生僻字全覆盖、大陆字形、竖排标点正确）
+    /// 文津宋体（生僻字全覆盖、大陆字形、竖排标点正确）
     WenJinMincho,
     /// 梦源宋体（思源宋体多字重衍生，字重大、屏显厚重）
     MengYuanSerif,
@@ -228,7 +228,7 @@ impl FontChoice {
     /// 正文字体组（版字页的竖排字牌按此顺序陈列）：
     /// 两款大字库宋体打头，楷体 / 黑体 / 等宽 / 西文随后——一套字体覆盖
     /// 正文、批注、标题、混排西文四类角色，不必再装一堆零散字库。
-    pub const CLASSIC: [FontChoice; 10] = [
+    pub const CLASSIC: [FontChoice; 11] = [
         FontChoice::WenJinMincho,
         FontChoice::MengYuanSerif,
         FontChoice::XuandongKaishu,
@@ -241,13 +241,17 @@ impl FontChoice {
         // 往前插会叫所有老存档「换了个字体」——只许往后长。
         FontChoice::FZQingKeBen,
         FontChoice::HuiwenMincho,
+        // v1.9.88+：思源宋体作为开源大字库宋体加入正文候选（同样只许在队尾长，
+        // 不顶替文津 / 梦源的下标——两者本机可能未装，用户选了才落到回退链，
+        // 不会塌版式；思源宋体给「想用开源大字库宋体」的用户一个正经入口）。
+        FontChoice::SourceHanSerif,
     ];
 
-    /// **批注字体**组：楷体二选一（玄冬楷书 / 霞鹜文楷）。
+    /// **批注字体**组：仿宋 / 楷体二选一（朱雀仿宋 / 霞鹜文楷）。
     ///
     /// 夹注小字与放大注卡专用——正文用宋体、批注用楷体，正是刻本里
     /// 「正文匠体、注文手写体」的层次；两款都装了就按用户选的走。
-    pub const NOTE: [FontChoice; 2] = [FontChoice::XuandongKaishu, FontChoice::LXGWWenKai];
+    pub const NOTE: [FontChoice; 2] = [FontChoice::ZhuqueFangsong, FontChoice::LXGWWenKai];
 
     /// 横笺用的无衬线组（思源黑体 / 系统默认）。
     pub const MODERN: [FontChoice; 2] = [FontChoice::SourceHanSans, FontChoice::SystemDefault];
@@ -288,9 +292,9 @@ impl FontChoice {
 /// （见 `main_choice` / `note_choice`），层次感不丢。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum FontPreset {
-    /// 刻本宋体：正文文津宋体、批注霞鹜文楷（默认）。
+    /// 刻本宋体：正文思源宋体、批注霞鹜文楷（默认）。
     Song,
-    /// 手写楷体：正文霞鹜文楷、批注玄冬楷书。
+    /// 手写楷体：正文霞鹜文楷、批注朱雀仿宋。
     Kai,
 }
 
@@ -308,15 +312,15 @@ impl FontPreset {
     /// 面板上的副题：写清正文明用哪一款。
     pub fn hint(&self) -> &'static str {
         match self {
-            FontPreset::Song => "文津宋体 · 注用霞鹜文楷",
-            FontPreset::Kai => "霞鹜文楷 · 注用玄冬楷书",
+            FontPreset::Song => "思源宋体 · 注用霞鹜文楷",
+            FontPreset::Kai => "霞鹜文楷 · 注用朱雀仿宋",
         }
     }
 
     /// 该预设的**正文**字体。
     pub fn main_choice(&self) -> FontChoice {
         match self {
-            FontPreset::Song => FontChoice::WenJinMincho,
+            FontPreset::Song => FontChoice::SourceHanSerif,
             FontPreset::Kai => FontChoice::LXGWWenKai,
         }
     }
@@ -325,14 +329,14 @@ impl FontPreset {
     pub fn note_choice(&self) -> FontChoice {
         match self {
             FontPreset::Song => FontChoice::LXGWWenKai,
-            FontPreset::Kai => FontChoice::XuandongKaishu,
+            FontPreset::Kai => FontChoice::ZhuqueFangsong,
         }
     }
 
     /// **正文字体 → 所属预设**（v1.35.0：面板只剩「字体」一行，这是它与
     /// 行高 / 批注字体之间换算的**唯一**公式）。
     ///
-    /// 楷体属「写体」（行间要更松、注配玄冬楷书），其余都按匠体排。
+    /// 楷体属「写体」（行间要更松、注配朱雀仿宋），其余都按匠体排。
     /// 面板上「排版字体」那一行已删——它和「字体」行写的是同一个
     /// `font_ancient`，留着只会互相打脸（见 `Root::set_font`）。
     pub fn for_main(c: FontChoice) -> FontPreset {
@@ -2162,11 +2166,13 @@ mod tests {
         ] {
             assert!(offered.contains(&keep), "{keep:?} 被误剔了：{offered:?}");
         }
-        // 表长与下标不许动：齐伋体 7、清刻本悦宋 8、汇文明朝 9。
-        assert_eq!(FontChoice::CLASSIC.len(), 10, "CLASSIC 表被改短了");
+        // 表长只许往后长（不许缩短/前插，否则老存档下标错位）：
+        // 齐伋体 7、清刻本悦宋 8、汇文明朝 9、思源宋体 10。
+        assert_eq!(FontChoice::CLASSIC.len(), 11, "CLASSIC 表被改短了");
         assert_eq!(FontChoice::CLASSIC[7], FontChoice::Qiji);
         assert_eq!(FontChoice::CLASSIC[8], FontChoice::FZQingKeBen);
         assert_eq!(FontChoice::CLASSIC[9], FontChoice::HuiwenMincho);
+        assert_eq!(FontChoice::CLASSIC[10], FontChoice::SourceHanSerif);
     }
 
     fn sample() -> Book {

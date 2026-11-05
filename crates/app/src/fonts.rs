@@ -717,12 +717,13 @@ mod tests {
     /// 个字体」。这条测试把前 8 位钉死，新字体只能追加在队尾。
     #[test]
     fn classic_font_table_only_grows_at_the_tail() {
-        assert_eq!(FontChoice::CLASSIC.len(), 10);
+        assert_eq!(FontChoice::CLASSIC.len(), 11);
         assert_eq!(FontChoice::CLASSIC[0], FontChoice::WenJinMincho);
         assert_eq!(FontChoice::CLASSIC[4], FontChoice::SourceHanSans);
         assert_eq!(FontChoice::CLASSIC[7], FontChoice::Qiji);
         assert_eq!(FontChoice::CLASSIC[8], FontChoice::FZQingKeBen);
         assert_eq!(FontChoice::CLASSIC[9], FontChoice::HuiwenMincho);
+        assert_eq!(FontChoice::CLASSIC[10], FontChoice::SourceHanSerif);
     }
 
     #[test]
@@ -770,14 +771,22 @@ mod tests {
 
     #[test]
     fn every_note_font_has_chain() {
-        // 批注字体组（楷体二选一）同样必须有兜底。
+        // 批注字体组（仿宋 / 楷体二选一）同样必须有兜底，且不能一垮就掉到
+        // 匠体宋 / 黑体——未装开源字时至少落到系统「仿宋」或「楷体」，
+        // 保住「注文软体」的层次。
         for c in FontChoice::NOTE {
             let chain = ancient_chain(c);
             assert!(chain.contains(&"serif"), "{} 缺 serif 兜底", c.label());
-            // 楷体链里至少带一个系统楷体，未装开源楷体时仍是楷体味。
+            // 仿宋链带系统仿宋（STFangsong / FangSong）、楷体链带系统楷体
+            // （Kaiti SC / STKaiti）；大小写都算。
             assert!(
-                chain.iter().any(|f| f.contains("Kaiti")),
-                "{} 缺系统楷体回退：{:?}",
+                chain
+                    .iter()
+                    .any(|f| {
+                        let l = f.to_lowercase();
+                        l.contains("kaiti") || l.contains("fangsong")
+                    }),
+                "{} 缺系统仿宋/楷体回退：{:?}",
                 c.label(),
                 chain
             );
@@ -889,10 +898,10 @@ mod tests {
             // 行高缩放随正文那款字体走。
             assert_eq!(preset_line_scale(p), line_height_scale(p.main_choice()));
         }
-        // 刻本宋体：正文宋、批注楷；手写楷体：正文楷、批注另一款楷。
-        assert_eq!(FontPreset::Song.main_choice(), FontChoice::WenJinMincho);
+        // 刻本宋体：正文思源宋、批注楷；手写楷体：正文楷、批注仿宋。
+        assert_eq!(FontPreset::Song.main_choice(), FontChoice::SourceHanSerif);
         assert_eq!(FontPreset::Song.note_choice(), FontChoice::LXGWWenKai);
         assert_eq!(FontPreset::Kai.main_choice(), FontChoice::LXGWWenKai);
-        assert_eq!(FontPreset::Kai.note_choice(), FontChoice::XuandongKaishu);
+        assert_eq!(FontPreset::Kai.note_choice(), FontChoice::ZhuqueFangsong);
     }
 }
