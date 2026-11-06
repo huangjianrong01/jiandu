@@ -40,6 +40,9 @@ mod clock;
 /// 顶层状态机 `AppMode` 在此；进入时 `Root::render` 直接返回它的视图实体，
 /// 根本不构建阅读界面（见 `collation.rs` 文件头）。
 mod collation;
+// v2.1：古籍排版工作台已整体拆为**第二个独立可执行文件**
+// （src/bin/typesetter_app.rs）。本二进制是纯阅读器，既没有排版入口，
+// 也不再编译 `typeset_studio` 模块；两者只共享 `typesetter` 内核库。
 /// **PDF 文本层坐标抽取**（macOS / PDFKit）：把带文本层的古籍 PDF 逐字包围盒
 /// 聚合成 `SourceRegion`，是 `collation` 真实坐标映射的数据源。
 mod pdf_text;

@@ -48,9 +48,10 @@ use gpui::{
     RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, Styled, Window,
     AnimationExt,
 };
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::path::{Path, PathBuf};
 
 /// Pixels → f32：gpui 的 `Pixels` 字段在 jiandu crate 不可见，用「除 1px」取数值。
@@ -169,6 +170,9 @@ fn ts_now() -> String {
 }
 
 /// 顶层应用模式：阅读器 / 笺校工作台。
+///
+/// v2.1：古籍排版工作台曾是这里的第三个态 `Typeset`，现已拆为独立 App，
+/// 阅读器不再有「跳去排版」这种状态切换——状态机回到它本来的两态。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AppMode {
     Reader,
@@ -235,7 +239,12 @@ const SEL_BG: u32 = 0x2F6FED66;
 /// 当前行：约 6% 黑的一层极浅灰，只做「眼睛不跟丢」的引路，不抢字。
 const ACTIVE_LINE_BG: u32 = 0x0000000F;
 /// ⌘F 命中：暖黄，与用户亲手拖出的蓝色选区明确区分（沿用旧值）。
-const FIND_BG: u32 = 0xD9A44155;
+const FIND_BG: u32 = 0xD9A44188;
+/// ⌘F **当前**命中：朱砂，强焦点——比所有命中黄更深、更跳，形成视觉锚点。
+const FIND_CUR_BG: u32 = 0xB0342BCC;
+/// 搜索浮窗「宣纸毛玻璃」底色：暖白半透明（RGB=F7F0DC，alpha=DC≈86%）。
+/// GPUI 0.2.2 无 backdrop-filter，用半透明 + 柔影模拟磨砂质感，读起来像浮在木桌上的法器。
+const FIND_PANEL_BG: u32 = 0xF7F0DCDC;
 /// 对照模式单段最多为「段落对齐」补几行（v1.9.86）。
 /// 右栏按 Enter 拆段后，段号与毛坯整体错位，半段会被拿去对齐毛坯的
 /// **整段**（几百字 → 十几视觉行），补出一大截空白——这正是真机
@@ -589,6 +598,7 @@ fn visual_spans(a: usize, b: usize, cpl: usize) -> Vec<(usize, usize, usize)> {
 enum HlKind {
     ActiveLine,
     FindHit,
+    FindCur,
     Selection,
 }
 
@@ -617,7 +627,8 @@ struct HlRect {
 /// 抽成纯函数就是为了「物理坐标对不对」可以断言，而不是开窗口拿眼估。
 fn line_highlights(
     sel: Option<(usize, usize)>,
-    find: Option<(usize, usize)>,
+    find_ranges: &[(usize, usize)],
+    find_cur: Option<(usize, usize)>,
     active_visual: Option<usize>,
     cpl: usize,
     adv: f32,
@@ -634,8 +645,8 @@ fn line_highlights(
             kind: HlKind::ActiveLine,
         });
     }
-    for (range, kind) in [(find, HlKind::FindHit), (sel, HlKind::Selection)] {
-        let Some((a, b)) = range else { continue };
+    // 所有命中：暖黄（`FindHit`）。
+    for &(a, b) in find_ranges {
         if b <= a {
             continue;
         }
@@ -645,8 +656,36 @@ fn line_highlights(
                 y: box_top + k as f32 * LINE_H,
                 w: Some((sb - sa) as f32 * adv),
                 h: box_h,
-                kind,
+                kind: HlKind::FindHit,
             });
+        }
+    }
+    // 当前命中：朱砂（`FindCur`），画在暖黄之上、选区之下。
+    if let Some((a, b)) = find_cur {
+        if b > a {
+            for (k, sa, sb) in visual_spans(a, b, cpl) {
+                out.push(HlRect {
+                    x: (sa - k * cpl) as f32 * adv,
+                    y: box_top + k as f32 * LINE_H,
+                    w: Some((sb - sa) as f32 * adv),
+                    h: box_h,
+                    kind: HlKind::FindCur,
+                });
+            }
+        }
+    }
+    // 用户亲手拖出的选区：蓝，永远压在最上（最优先）。
+    if let Some((a, b)) = sel {
+        if b > a {
+            for (k, sa, sb) in visual_spans(a, b, cpl) {
+                out.push(HlRect {
+                    x: (sa - k * cpl) as f32 * adv,
+                    y: box_top + k as f32 * LINE_H,
+                    w: Some((sb - sa) as f32 * adv),
+                    h: box_h,
+                    kind: HlKind::Selection,
+                });
+            }
         }
     }
     out
@@ -1309,14 +1348,27 @@ pub struct CollationWorkspace {
     viewport_w: f32,
     /// **查找条**（v1.9.68，⌘F）：是否展开。
     find_open: bool,
-    /// 查找词。
+    /// 替换条（⌘H）：在查找条基础上展开替换输入框。
+    replace_open: bool,
+    /// 查找词（已上屏部分）。
     find_query: String,
-    /// 命中位置（**字节**偏移，扫一次就存下来；只在跳转时换算成字符下标）。
-    find_hits: Vec<usize>,
+    /// 全部命中的**字符**区间（0 起，半开）。高亮层逐行裁切它即可，不必每行重扫。
+    find_ranges: Vec<(usize, usize)>,
     /// 当前命中序号（0 起）。
     find_idx: usize,
     /// 当前命中的**字符**区间（只给渲染高亮用，避免每行都做字节→字符换算）。
     find_sel: Option<Range<usize>>,
+    /// 本次搜索是否命中含有**异体字**的匹配（如搜「群」却标到「羣」），
+    /// 用来在浮条上提示「已包含异体字匹配」。
+    find_has_variant: bool,
+    /// 浮条里当前正在输入的是哪一栏：0 = 查找词，1 = 替换词。
+    /// 因为浮条不抢焦点、键路由到编辑器，必须用这枚开关决定按键进哪栏。
+    find_field: u8,
+    /// 替换词。
+    replace_query: String,
+    /// 异步查找的代际：每次改动 +1；后台任务回写时比对，丢弃过期结果，
+    /// 免得「旧查询慢半拍盖掉新查询」。
+    find_token: u64,
     /// 输入法正在组字的那一截（尚未上屏）：查找词 = `find_query + find_marked`。
     ///
     /// 拆成两段是必须的：中文查找要打拼音，而组字是**逐帧替换**的
@@ -1446,6 +1498,89 @@ fn splice_chars(text: &str, pos: usize, from_len: usize, to: &str) -> (String, u
     next.extend(chars[b..].iter().copied());
     let cursor = (a + to.chars().count()).min(next.len());
     (next.into_iter().collect(), cursor)
+}
+
+/// 标点剥离（比对用）：CJK 句读（`is_punct`）与 ASCII 标点都从搜索比对里剔除，
+/// 但**不动空格**——空格不是句读，留着避免「道可道 非常道」被误并。搜索
+/// 「道可道非常道」能命中原文「道可道，非常道」，靠的就是这层剥离。
+fn is_punct_strip(c: char) -> bool {
+    crate::types::is_punct(c) || c.is_ascii_punctuation()
+}
+
+/// **核心匹配**（纯函数，可单测）：在 `text` 里找 `query` 的全部命中区间。
+///
+/// 比普通 `str::find` 多了两层古籍校对专属逻辑：
+/// ① **异体字联动**：用底层 `variants` 表的 `search_key`（异体归一 → 简体正字）
+///    把「群 / 羣」「峰 / 峯」折到同一把钥匙，搜「群」就能标到「羣」。
+/// ② **忽略句读容错**：见 [`is_punct_strip`]，搜「道可道非常道」能命中「道可道，非常道」。
+///
+/// 返回 `(命中字符半开区间, 是否含异体字命中)`。命中上限 5000，防病态输入。
+fn find_matches(
+    text: &str,
+    query: &str,
+    table: &jiandu_core::variants::VariantTable,
+) -> (Vec<(usize, usize)>, bool) {
+    // 查询词：剥标点，并为每个字算一次 search_key（按字缓存，避免逐字建串）。
+    let mut q_keys: Vec<(char, String)> = Vec::new();
+    let mut cache: HashMap<char, String> = HashMap::new();
+    for c in query.chars() {
+        if is_punct_strip(c) {
+            continue;
+        }
+        let key = cache
+            .entry(c)
+            .or_insert_with(|| table.search_key(&c.to_string()))
+            .clone();
+        q_keys.push((c, key));
+    }
+    if q_keys.is_empty() {
+        return (Vec::new(), false);
+    }
+    // 原文：同样剥标点、算 key，记下原字符下标与原字（用于异体字判定）。
+    let mut t: Vec<(usize, char, String)> = Vec::new();
+    for (i, c) in text.chars().enumerate() {
+        if is_punct_strip(c) {
+            continue;
+        }
+        let key = cache
+            .entry(c)
+            .or_insert_with(|| table.search_key(&c.to_string()))
+            .clone();
+        t.push((i, c, key));
+    }
+    let n = t.len();
+    let m = q_keys.len();
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    let mut has_variant = false;
+    let mut i = 0;
+    while i + m <= n {
+        let mut ok = true;
+        for j in 0..m {
+            if t[i + j].2 != q_keys[j].1 {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            let a = t[i].0;
+            let b = t[i + m - 1].0 + 1;
+            // 这一命中里但凡有一个字是「异体」而非「本字」，就算异体字匹配。
+            for j in 0..m {
+                if t[i + j].1 != q_keys[j].0 {
+                    has_variant = true;
+                    break;
+                }
+            }
+            hits.push((a, b));
+            if hits.len() >= 5000 {
+                break;
+            }
+            i += m;
+        } else {
+            i += 1;
+        }
+    }
+    (hits, has_variant)
 }
 
 /// **竖排预览剥壳**（不改编辑器）：把笺读标准 `[注]…[/注]` 换成古籍里本就
@@ -1670,10 +1805,15 @@ impl CollationWorkspace {
             viewport_h: 800.0,
             viewport_w: 1200.0,
             find_open: false,
+            replace_open: false,
             find_query: String::new(),
-            find_hits: Vec::new(),
+            find_ranges: Vec::new(),
             find_idx: 0,
             find_sel: None,
+            find_has_variant: false,
+            find_field: 0,
+            replace_query: String::new(),
+            find_token: 0,
             find_marked: String::new(),
             lines: LineIndex::default(),
             // 从 1 起：0 是 `LineIndex::default()` 的哨兵值（表示「还没建过」）。
@@ -2437,15 +2577,28 @@ impl CollationWorkspace {
     /// 打字」会走两条不同的 IME 路径。这里让**编辑器保持聚焦**，按键与上屏
     /// 事件在 `handle_key` / `replace_text_in_range` 里分流——一条路径，
     /// 中英文都通。
+    /// **查找 / 替换浮条**（v1.9.68 起，⌘F / ⌘H）：右上角一条「宣纸毛玻璃」窄卡，
+    /// 不占布局、不抢焦点。本版升级：
+    /// ・所有命中染暖黄、当前命中染朱砂（视觉焦点）；
+    /// ・接入 `variants` 异体字表（搜「群」标到「羣」）与句读容错（搜「道可道非常道」命中「道可道，非常道」）；
+    /// ・⌘H 展开替换栏，支持「替换当前 / 全部替换」；
+    /// ・100ms 防抖 + 后台异步扫描，几十万字不卡主线程。
+    ///
+    /// 为什么不抢焦点：编辑器保持聚焦，按键与上屏事件在 `handle_key` /
+    /// `replace_text_in_range` 里分流——一条输入路径，中英文都通。
     fn render_find_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let song = crate::fonts::family_for(
             crate::types::FontChoice::WenJinMincho,
             crate::types::Script::Ancient,
         );
         let q = self.find_text();
-        let total = self.find_hits.len();
+        let total = self.find_ranges.len();
         let count = if total == 0 {
-            if q.is_empty() { String::new() } else { "无匹配".to_string() }
+            if q.is_empty() {
+                String::new()
+            } else {
+                "无匹配".to_string()
+            }
         } else {
             format!("{} / {}", self.find_idx + 1, total)
         };
@@ -2467,70 +2620,148 @@ impl CollationWorkspace {
                     }),
                 )
         };
-        div()
+        // 点查找 / 替换词文本区：把输入焦点切到对应栏（浮条不抢焦点，靠 `find_field` 决定按键去哪）。
+        let pick_search = |c: &mut Self, _cx: &mut Context<Self>| {
+            c.find_field = 0;
+        };
+        let pick_replace = |c: &mut Self, _cx: &mut Context<Self>| {
+            c.find_field = 1;
+        };
+
+        let mut card = div()
             .absolute()
             .top(px(HEADER_H + 8.0))
             .right(px(22.0))
-            .h(px(36.0))
-            .w(px(348.0))
+            .w(px(380.0))
             .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .px(px(11.0))
-            .rounded(px(8.0))
-            .bg(rgb(CHROME))
+            .flex_col()
+            .gap(px(6.0))
+            .px(px(12.0))
+            .py(px(9.0))
+            .rounded(px(11.0))
+            // 「宣纸毛玻璃」：暖白半透明 + 柔影 + 细描边。GPUI 0.2.2 无 backdrop-filter，
+            // 用半透明 + 柔影模拟磨砂质感，读起来像浮在木桌上的法器。
+            .bg(rgba(FIND_PANEL_BG))
             .border_1()
-            .border_color(rgba(0x2B26202E))
+            .border_color(rgba(0x2B262033))
             .shadow(vec![BoxShadow {
-                color: gpui::hsla(0.0, 0.0, 0.0, 0.16),
-                offset: gpui::point(px(0.0), px(4.0)),
-                blur_radius: px(14.0),
-                spread_radius: px(-2.0),
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.18),
+                offset: gpui::point(px(0.0), px(6.0)),
+                blur_radius: px(22.0),
+                spread_radius: px(-3.0),
             }])
-            // 阻断穿透：点查找条不该把光标挪到下面的正文里。
+            // 阻断穿透：点浮条不该把光标挪到下面的正文里。
             .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_c, _, _, cx| cx.stop_propagation()),
-            )
-            .child(
+            );
+
+        // —— 第一行：查找词 + 计数 + 异体提示 + 翻页 + 关闭 ——
+        let mut row1 = div().flex().flex_row().items_center().gap(px(8.0));
+        row1 = row1.child(
+            div()
+                .font_family(song.clone())
+                .text_size(px(11.5))
+                .text_color(rgba(0x2B262080))
+                .child(SharedString::from("查找")),
+        );
+        row1 = row1.child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .when(self.find_field == 0, |d| d.bg(rgba(0x2B26200A)).rounded(px(3.0)))
+                .px(px(2.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |c, _, _, cx| {
+                        cx.stop_propagation();
+                        pick_search(c, cx);
+                    }),
+                )
+                .font_family(song.clone())
+                .text_size(px(13.0))
+                .text_color(if q.is_empty() {
+                    rgba(0x2B262066)
+                } else {
+                    rgb(0x2B2622)
+                })
+                .child(SharedString::from(if q.is_empty() {
+                    "点这里打字 · ⌘G 下一个 · Tab 切换".to_string()
+                } else if self.find_marked.is_empty() {
+                    q.clone()
+                } else {
+                    format!("{}{}", self.find_query, "…")
+                })),
+        );
+        if self.find_has_variant {
+            row1 = row1.child(
+                div()
+                    .px(px(6.0))
+                    .py(px(1.0))
+                    .rounded(px(9.0))
+                    .bg(rgba(0xB0342C22))
+                    .text_size(px(10.0))
+                    .text_color(rgb(0x8c2b22))
+                    .child(SharedString::from("异体")),
+            );
+        }
+        row1 = row1.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgba(0x2B262080))
+                .child(SharedString::from(count)),
+        );
+        row1 = row1.child(btn("‹", cx, |c, cx| c.find_step(-1, cx)));
+        row1 = row1.child(btn("›", cx, |c, cx| c.find_step(1, cx)));
+        row1 = row1.child(btn("✕", cx, |c, cx| c.close_find(cx)));
+        card = card.child(row1);
+
+        // —— 第二行：替换（⌘H 才出现）——
+        if self.replace_open {
+            let rq = self.replace_query.clone();
+            let mut row2 = div().flex().flex_row().items_center().gap(px(8.0));
+            row2 = row2.child(
                 div()
                     .font_family(song.clone())
                     .text_size(px(11.5))
                     .text_color(rgba(0x2B262080))
-                    .child(SharedString::from("查找")),
-            )
-            .child(
+                    .child(SharedString::from("替换为")),
+            );
+            row2 = row2.child(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
                     .overflow_hidden()
+                    .when(self.find_field == 1, |d| d.bg(rgba(0x2B26200A)).rounded(px(3.0)))
+                    .px(px(2.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |c, _, _, cx| {
+                            cx.stop_propagation();
+                            pick_replace(c, cx);
+                        }),
+                    )
                     .font_family(song.clone())
                     .text_size(px(13.0))
-                    .text_color(if q.is_empty() {
+                    .text_color(if rq.is_empty() {
                         rgba(0x2B262066)
                     } else {
                         rgb(0x2B2622)
                     })
-                    .child(SharedString::from(if q.is_empty() {
-                        // 组字中的那一截用「…」标出来，用户知道字还没上屏。
-                        "点这里打字 · ⌘G 下一个".to_string()
-                    } else if self.find_marked.is_empty() {
-                        q.clone()
+                    .child(SharedString::from(if rq.is_empty() {
+                        "替换成什么".to_string()
                     } else {
-                        format!("{}{}", self.find_query, "…")
+                        rq
                     })),
-            )
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(rgba(0x2B262080))
-                    .child(SharedString::from(count)),
-            )
-            .child(btn("‹", cx, |c, cx| c.find_step(-1, cx)))
-            .child(btn("›", cx, |c, cx| c.find_step(1, cx)))
-            .child(btn("✕", cx, |c, cx| c.close_find(cx)))
+            );
+            row2 = row2.child(btn("替换", cx, |c, cx| c.replace_current(cx)));
+            row2 = row2.child(btn("全部", cx, |c, cx| c.replace_all(cx)));
+            card = card.child(row2);
+        }
+
+        card
     }
 
     /// **清洗日志内嵌面板**（v1.9.60）：极简浮卡，如实展示本次清洗的三类统计——
@@ -2879,9 +3110,13 @@ impl CollationWorkspace {
                     self.select_all(cx);
                     return;
                 }
-                // ⌘F 查找；⌘G / ⌘⇧G 下一个 / 上一个（与系统「查找」同一套手感）。
+                // ⌘F 查找；⌘H 查找 + 替换；⌘G / ⌘⇧G 下一个 / 上一个（与系统「查找」同一套手感）。
                 "f" | "F" => {
                     self.open_find(cx);
+                    return;
+                }
+                "h" | "H" => {
+                    self.open_replace(cx);
                     return;
                 }
                 "g" | "G" => {
@@ -3001,21 +3236,118 @@ impl CollationWorkspace {
             return;
         }
         self.find_open = true;
+        self.replace_open = false;
+        self.find_field = 0;
         self.find_query.clear();
         self.find_marked.clear();
-        self.find_hits.clear();
+        self.find_ranges.clear();
         self.find_idx = 0;
         self.find_sel = None;
+        self.find_has_variant = false;
+        self.schedule_find(cx);
+        cx.notify();
+    }
+
+    /// ⌘H：在查找条基础上展开替换栏，焦点先留在查找词上（用户多半先打完搜索词）。
+    fn open_replace(&mut self, cx: &mut Context<Self>) {
+        if !self.find_open {
+            self.open_find(cx);
+        }
+        self.replace_open = true;
+        self.find_field = 0;
         cx.notify();
     }
 
     fn close_find(&mut self, cx: &mut Context<Self>) {
         self.find_open = false;
+        self.replace_open = false;
         self.find_query.clear();
         self.find_marked.clear();
-        self.find_hits.clear();
+        self.replace_query.clear();
+        self.find_ranges.clear();
+        self.find_idx = 0;
         self.find_sel = None;
+        self.find_has_variant = false;
         cx.notify();
+    }
+
+    /// 触发一次**防抖 + 异步**搜索：100ms 后才真正扫描，且扫描在后台线程跑，
+    /// 主 UI 不被几十万字的大稿拖住。后台回写时比对 `find_token`，过期结果直接丢弃。
+    fn schedule_find(&mut self, cx: &mut Context<Self>) {
+        let token = self.find_token + 1;
+        self.find_token = token;
+        let text = self.text.clone();
+        let query = self.find_text();
+        let table = jiandu_core::variants::active();
+        cx.spawn(move |_this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                // 防抖：等 100ms，期间若又有输入会刷新 token，旧任务回写时被判过期。
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let (ranges, has_variant) = find_matches(&text, &query, &table);
+                _this
+                    .update(&mut cx, |this, cx| {
+                        if this.find_token != token {
+                            return; // 过期：有更新的查询已经覆盖，丢弃这次结果。
+                        }
+                        this.find_ranges = ranges;
+                        this.find_has_variant = has_variant;
+                        this.find_reposition(cx);
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// 扫描完成后：把当前命中定位到「离光标最近、且不小于光标」的那一处。
+    fn find_reposition(&mut self, cx: &mut Context<Self>) {
+        let n = self.find_ranges.len();
+        if n == 0 {
+            self.find_idx = 0;
+            self.find_sel = None;
+            cx.notify();
+            return;
+        }
+        let cursor = self.cursor;
+        let idx = self
+            .find_ranges
+            .iter()
+            .position(|&(a, _)| a >= cursor)
+            .unwrap_or(0);
+        self.find_goto(idx, cx);
+    }
+
+    /// 跳到第 `idx` 处命中：高亮 + 光标落段尾 + 滚到可见。
+    fn find_goto(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(&(a, b)) = self.find_ranges.get(idx) else {
+            cx.notify();
+            return;
+        };
+        self.find_idx = idx;
+        self.find_sel = Some(a..b);
+        // 光标落在命中末尾：用户看完可以直接接着改。
+        self.cursor = b;
+        self.anchor = b;
+        self.selection = None;
+        self.undo_barrier = true;
+        self.ensure_caret_visible(cx);
+        cx.notify();
+    }
+
+    fn find_step(&mut self, dir: isize, cx: &mut Context<Self>) {
+        let n = self.find_ranges.len();
+        if n == 0 {
+            return;
+        }
+        let idx = if dir >= 0 {
+            (self.find_idx + 1) % n
+        } else {
+            (self.find_idx + n - 1) % n
+        };
+        self.find_goto(idx, cx);
     }
 
     /// 查找条打开时的按键分流。返回 `true` = 已消费，不再进编辑逻辑。
@@ -3029,16 +3361,30 @@ impl CollationWorkspace {
                 self.find_step(if shift { -1 } else { 1 }, cx);
                 true
             }
+            // Tab：在「查找 / 替换」两栏间切换输入焦点（浮条不抢焦点，靠这枚开关）。
+            "tab" if !cmd => {
+                self.find_field = 1 - self.find_field;
+                cx.notify();
+                true
+            }
             "backspace" if !cmd => {
-                self.find_query.pop();
+                if self.find_field == 0 {
+                    self.find_query.pop();
+                } else {
+                    self.replace_query.pop();
+                }
                 self.find_marked.clear();
-                self.find_refresh(cx);
+                self.schedule_find(cx);
                 true
             }
             "delete" if !cmd => {
-                self.find_query.clear();
+                if self.find_field == 0 {
+                    self.find_query.clear();
+                } else {
+                    self.replace_query.clear();
+                }
                 self.find_marked.clear();
-                self.find_refresh(cx);
+                self.schedule_find(cx);
                 true
             }
             // ⌘F 再按收起；⌘G / ⌘⇧G 上/下一个。
@@ -3056,77 +3402,65 @@ impl CollationWorkspace {
         }
     }
 
-    /// 重算命中并跳到「离光标最近的那一处」。
-    ///
-    /// 命中存**字节偏移**（`str::find` 的原生单位），只在跳转时换算成字符下标：
-    /// 三百万字的稿子里，若每个命中都做一次字节→字符遍历，光换算就是几十毫秒。
-    fn find_refresh(&mut self, cx: &mut Context<Self>) {
-        let q = self.find_text();
-        self.find_hits.clear();
-        self.find_sel = None;
-        self.find_idx = 0;
-        if q.is_empty() {
-            cx.notify();
-            return;
-        }
-        let mut from = 0usize;
-        while from <= self.text.len() {
-            let Some(off) = self.text[from..].find(&q) else {
-                break;
-            };
-            let abs = from + off;
-            self.find_hits.push(abs);
-            // 上限防病态输入（查找 "的" 这种字在古籍里能命中几万处）。
-            if self.find_hits.len() >= 5000 {
-                break;
-            }
-            from = abs + q.len().max(1);
-        }
-        let cursor_byte: usize = self
-            .text
-            .chars()
-            .take(self.cursor)
-            .map(char::len_utf8)
-            .sum();
-        let idx = self
-            .find_hits
-            .iter()
-            .position(|&o| o >= cursor_byte)
-            .unwrap_or(0);
-        self.find_goto(idx, cx);
-    }
-
-    /// 跳到第 `idx` 处命中：高亮 + 光标落段尾 + 滚到可见。
-    fn find_goto(&mut self, idx: usize, cx: &mut Context<Self>) {
-        let Some(&off) = self.find_hits.get(idx) else {
-            cx.notify();
+    /// **替换当前**：把当前命中的字符区间换成 `replace_query`。
+    fn replace_current(&mut self, cx: &mut Context<Self>) {
+        let Some(sel) = self.find_sel.clone() else {
             return;
         };
-        let q = self.find_text();
-        let a = self.text[..off].chars().count();
-        let b = a + q.chars().count();
-        self.find_idx = idx;
-        self.find_sel = Some(a..b);
-        // 光标落在命中末尾：用户看完可以直接接着改。
-        self.cursor = b;
-        self.anchor = b;
+        let (a, b) = (sel.start, sel.end);
+        let rep = self.replace_query.clone();
+        let removed: String =
+            self.text[self.byte_of_char(a)..self.byte_of_char(b)].to_string();
+        let (new_text, new_cursor) = splice_chars(&self.text, a, b - a, &rep);
+        self.set_text(new_text);
+        self.cursor = new_cursor;
+        self.anchor = new_cursor;
         self.selection = None;
-        self.undo_barrier = true;
-        self.ensure_caret_visible(cx);
+        self.record_edit(a, removed, rep, EditKind::Once);
+        self.schedule_find(cx);
         cx.notify();
+        self.touch(cx);
     }
 
-    fn find_step(&mut self, dir: isize, cx: &mut Context<Self>) {
-        let n = self.find_hits.len();
-        if n == 0 {
+    /// **全部替换**：在字符层面一次性重建（命中互不重叠、已按升序），并逐处记撤销。
+    ///
+    /// 不走「对偏移的字符串反复 splice」——那样每处都要对**漂移后的**字符串重新
+    /// 算字节偏移，既慢又错。直接用原始字符数组跳着拼：保留段 + 替换段，干净利落。
+    fn replace_all(&mut self, cx: &mut Context<Self>) {
+        if self.find_ranges.is_empty() {
             return;
         }
-        let idx = if dir >= 0 {
-            (self.find_idx + 1) % n
-        } else {
-            (self.find_idx + n - 1) % n
-        };
-        self.find_goto(idx, cx);
+        let rep = self.replace_query.clone();
+        let rep_chars: Vec<char> = rep.chars().collect();
+        let orig: Vec<char> = self.text.chars().collect();
+        let mut out: Vec<char> = Vec::with_capacity(orig.len());
+        let mut last = 0usize;
+        // 光标跟随：命中区间平移，落到命中内的光标推到替换后起点。
+        let mut cursor = self.cursor as isize;
+        // 先拷一份，避免「迭代 self.find_ranges」与「调用 self.record_edit」借冲突。
+        let ranges = self.find_ranges.clone();
+        for &(a, b) in &ranges {
+            out.extend_from_slice(&orig[last..a]);
+            out.extend_from_slice(&rep_chars);
+            let removed: String = orig[a..b].iter().collect();
+            self.record_edit(a, removed, rep.clone(), EditKind::Once);
+            let delta = rep_chars.len() as isize - (b - a) as isize;
+            if (self.cursor as isize) >= a as isize && (self.cursor as isize) < b as isize {
+                cursor = a as isize + rep_chars.len() as isize;
+            } else if (self.cursor as isize) >= b as isize {
+                cursor += delta;
+            }
+            last = b;
+        }
+        out.extend_from_slice(&orig[last..]);
+        let new_text: String = out.into_iter().collect();
+        self.set_text(new_text);
+        self.cursor = cursor.max(0) as usize;
+        self.anchor = self.cursor;
+        self.selection = None;
+        self.schedule_find(cx);
+        cx.notify();
+        self.touch(cx);
     }
 
     /// **光标跟随**（v1.9.68）：打完字 / 回车 / 方向键之后，光标若跑出视口，
@@ -6438,6 +6772,49 @@ impl CollationWorkspace {
         cx.notify();
     }
 
+    /// **开发用**（v1.9.94，`JIANDU_FIND_DEMO=1`）：开机把工作台摆成
+    /// 「宣纸毛玻璃查找浮条 + 暖黄全命中 + 朱砂当前命中 + 异体提示」的目标状态，
+    /// 供 `screencapture` 核对 Find & Replace 的灵魂。与 `dev_setup_highlight_demo`
+    /// 同一套路——合成点击 / ⌘F 都过不了 TCC，只能靠环境变量把界面摆到位。
+    ///
+    /// 文案特意埋了成对的「群 / 羣」「峰 / 峯」，搜「群」就能同时标到「羣」，
+    /// 浮条亮起「异体」朱砂小药丸；另埋「道可道，非常道」演示忽略句读容错。
+    pub fn dev_setup_find_demo(&mut self, cx: &mut Context<Self>) {
+        let text = concat!(
+            "【題解】世說新語卷上　德行第一\n",
+            "群贤毕至，少长咸集。羣臣皆贺，四海升平。\n",
+            "夫君子之行，静以修身，俭以养德。非澹泊无以明志，非宁静无以致远。\n",
+            "群疑满腹，众难塞胸。羣公卿士，各敬尔仪。\n",
+            "道可道，非常道。名可名，非常名。\n",
+            "峰回路转，有亭翼然临于泉上者，醉翁亭也。峯峦如聚，波涛如怒。\n",
+        );
+        // ⚠️ 临时样张：切断落盘闸门，绝不把这段示例写回用户书库。
+        self.store_id = None;
+        self.set_text(text.to_string());
+        self.raw_text = None;
+        self.show_diff = false;
+        self.pure_text_mode = true; // 单栏编辑器，干净展示高亮
+        self.show_preview = false;
+        self.show_help = false;
+        self.sanitize_card = None;
+        self.cursor = 0;
+        self.anchor = 0;
+        self.selection = None;
+        // 摆出「查找 + 替换」目标状态：搜「群」→ 联动标到「羣」；同时展开替换栏，
+        // 把 Find & Replace 的整条浮条一次摆全，供 screencapture 核对。
+        self.find_open = true;
+        self.replace_open = true;
+        self.find_field = 0;
+        self.find_query = "群".to_string();
+        self.find_marked.clear();
+        self.find_idx = 0;
+        self.find_sel = None;
+        self.find_has_variant = false;
+        self.find_ranges.clear();
+        self.schedule_find(cx);
+        cx.notify();
+    }
+
     fn close_preview(&mut self) {
         self.show_preview = false;
         self.preview_gen += 1;
@@ -7570,7 +7947,9 @@ impl CollationWorkspace {
                 col / cpl
             }
         });
-        let find_range = if self.find_open {
+        // 当前命中（朱砂）与全部命中（暖黄）：逐行把文档级区间裁到本行窗口，
+        // 再交给 `line_highlights` 画。裁切用全局字符下标，与高亮纯函数口径一致。
+        let find_cur = if self.find_open {
             self.find_sel.as_ref().map(|r| {
                 let a = r.start.max(line_start).min(line_end) - line_start;
                 let b = r.end.max(line_start).min(line_end) - line_start;
@@ -7579,9 +7958,26 @@ impl CollationWorkspace {
         } else {
             None
         };
+        let find_all: Vec<(usize, usize)> = if self.find_open {
+            self.find_ranges
+                .iter()
+                .filter_map(|&(a, b)| {
+                    let ca = a.max(line_start).min(line_end);
+                    let cb = b.max(line_start).min(line_end);
+                    if cb > ca {
+                        Some((ca, cb))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let rects = line_highlights(
             (sel_b > sel_a).then_some((sel_a, sel_b)),
-            find_range,
+            &find_all,
+            find_cur,
             caret_visual,
             cpl,
             adv,
@@ -7638,6 +8034,7 @@ impl CollationWorkspace {
                             let color = match r.kind {
                                 HlKind::ActiveLine => rgba(ACTIVE_LINE_BG),
                                 HlKind::FindHit => rgba(FIND_BG),
+                                HlKind::FindCur => rgba(FIND_CUR_BG),
                                 HlKind::Selection => rgba(SEL_BG),
                             };
                             let w = r.w.unwrap_or(px_f32(bounds.size.width));
@@ -9687,12 +10084,16 @@ impl EntityInputHandler for CollationWorkspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 查找条开着：上屏的字进查找词，**绝不写进正文**（v1.9.68）。
-        // 不拦这一步，中文用户按 ⌘F 打一个拼音就会把候选字打进稿子里。
+        // 查找条开着：上屏的字进「当前栏」（查找词或替换词），**绝不写进正文**
+        // （v1.9.68）。不拦这一步，中文用户按 ⌘F 打一个拼音就会把候选字打进稿子里。
         if self.find_open {
-            self.find_query.push_str(text);
+            if self.find_field == 0 {
+                self.find_query.push_str(text);
+            } else {
+                self.replace_query.push_str(text);
+            }
             self.find_marked.clear();
-            self.find_refresh(cx);
+            self.schedule_find(cx);
             return;
         }
         let eff = effective_replace_range(range, &self.marked);
@@ -9712,9 +10113,13 @@ impl EntityInputHandler for CollationWorkspace {
         cx: &mut Context<Self>,
     ) {
         // 查找条开着：组字只更新「正在组」的那一截，等上屏（`replace_text_in_range`）
-        // 才真正并入查找词。组字是逐帧替换的，每帧都全库扫一遍会卡住输入法。
+        // 才真正并入查找词 / 替换词。组字是逐帧替换的，每帧都全库扫一遍会卡住输入法。
         if self.find_open {
-            self.find_marked = new_text.to_string();
+            if self.find_field == 1 {
+                self.replace_query = new_text.to_string();
+            } else {
+                self.find_marked = new_text.to_string();
+            }
             self.marked = None;
             cx.notify();
             return;
@@ -9780,7 +10185,7 @@ mod tests {
         let adv = 17.0;
         let box_top = 4.0;
         let box_h = 24.0;
-        let rects = line_highlights(Some((2, 12)), None, Some(1), 5, adv, box_top, box_h);
+        let rects = line_highlights(Some((2, 12)), &[], None, Some(1), 5, adv, box_top, box_h);
         assert_eq!(rects[0].kind, HlKind::ActiveLine);
         assert_eq!(rects[0].w, None, "当前行要撑满整行");
         assert_eq!(rects[0].y, LINE_H);
@@ -9798,7 +10203,7 @@ mod tests {
     /// 叠放顺序：当前行 → 查找命中 → 用户选区（选区压最上，不被黄色盖掉）。
     #[test]
     fn selection_is_drawn_above_find_hit_and_active_line() {
-        let rects = line_highlights(Some((0, 3)), Some((1, 4)), Some(0), 10, 17.0, 4.0, 24.0);
+        let rects = line_highlights(Some((0, 3)), &[(1, 4)], None, Some(0), 10, 17.0, 4.0, 24.0);
         let kinds: Vec<_> = rects.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![HlKind::ActiveLine, HlKind::FindHit, HlKind::Selection]);
         assert_eq!(SEL_BG, 0x2F6FED66, "系统蓝是产品口径，不许悄悄改回朱砂");
@@ -9808,11 +10213,47 @@ mod tests {
     /// 无选区 / 空选区不产生选区矩形；只有当前行时仍要亮一行。
     #[test]
     fn empty_selection_emits_no_selection_rect() {
-        assert!(line_highlights(None, None, None, 5, 17.0, 4.0, 24.0).is_empty());
-        assert!(line_highlights(Some((3, 3)), None, None, 5, 17.0, 4.0, 24.0).is_empty());
-        let r = line_highlights(None, None, Some(0), 5, 17.0, 4.0, 24.0);
+        assert!(line_highlights(None, &[], None, None, 5, 17.0, 4.0, 24.0).is_empty());
+        assert!(line_highlights(Some((3, 3)), &[], None, None, 5, 17.0, 4.0, 24.0).is_empty());
+        let r = line_highlights(None, &[], None, Some(0), 5, 17.0, 4.0, 24.0);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].kind, HlKind::ActiveLine);
+    }
+
+    /// **异体字联动**：搜「群」必须标到原文里的「羣」，且 `has_variant` 为真。
+    #[test]
+    fn find_matches_links_variant_characters() {
+        let table = jiandu_core::variants::active();
+        let text = "群贤毕至，少长咸集。羣臣皆贺。";
+        let (hits, has_variant) = find_matches(text, "群", &table);
+        // 命中区间是**原文字符下标**（含标点），方便高亮层直接套用。
+        let q_idx = text.chars().position(|c| c == '群').unwrap();
+        let qv_idx = text.chars().position(|c| c == '羣').unwrap();
+        assert_eq!(hits, vec![(q_idx, q_idx + 1), (qv_idx, qv_idx + 1)]);
+        assert!(has_variant, "搜本字却标到异体，必须提示异体命中");
+    }
+
+    /// **忽略句读容错**：搜「道可道非常道」要命中原文「道可道，非常道」。
+    #[test]
+    fn find_matches_ignores_intervening_punctuation() {
+        let table = jiandu_core::variants::active();
+        let text = "道可道，非常道。";
+        let (hits, _has) = find_matches(text, "道可道非常道", &table);
+        assert_eq!(hits.len(), 1, "逗号被剥离后仍应整串命中");
+        let (a, b) = hits[0];
+        // 命中区间是原文字符下标，自然跨过被剥离的逗号，覆盖整段「道可道，非常道」。
+        let sub: String = text.chars().skip(a).take(b - a).collect();
+        assert_eq!(sub, "道可道，非常道");
+    }
+
+    /// **纯本字**：搜「群」命中本字「群」时不应误报有异体命中。
+    #[test]
+    fn find_matches_reports_no_variant_when_only_base_char() {
+        let table = jiandu_core::variants::active();
+        let text = "群贤毕至。";
+        let (hits, has_variant) = find_matches(text, "群", &table);
+        assert_eq!(hits.len(), 1);
+        assert!(!has_variant, "只命中本字时不应提示异体");
     }
 
     /// ⚠️ **回归**：右栏按 Enter 拆段后，段号与毛坯错位。旧实现让半段去对齐

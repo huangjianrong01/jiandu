@@ -1334,6 +1334,8 @@ pub struct Root {
     /// 「返回阅读」事件的订阅柄：必须持有（`Subscription` Drop 即退订），
     /// 让工作台「返回阅读」钮能唤回阅读态。
     pub collation_sub: Subscription,
+    // v2.1：排版工作台实体 / 订阅柄已随独立 App 一起移走，`Root` 里不再
+    // 为别的产品持任何状态。阅读器的状态面回到拆分前的大小。
 }
 
 /// **后台导入任务**（v1.50.0 流式架构）。
@@ -1568,7 +1570,8 @@ impl Root {
             this.mode = AppMode::Reader;
             cx.notify();
         });
-
+        // v2.1：排版工作台原本在这里被 `cx.new` 预建、并由 JIANDU_TYPESET
+        // 直接切态。它现在是另一个进程里的事，阅读器开局不再付那一次排版。
         let mut root = Self {
             library,
             // 今日读叶账（v1.9.38）：开局先按账本算一遍，书架第一帧就有数。
@@ -2066,6 +2069,14 @@ impl Root {
             ws.update(cx, |w, cx| {
                 w.dev_load_source(std::path::PathBuf::from(p), cx)
             });
+        }
+        // 开发用（v1.9.94）：JIANDU_FIND_DEMO=1 直接进笺校工作台并摆出
+        // 「宣纸毛玻璃查找浮条 + 暖黄全命中 + 朱砂当前命中 + 异体提示」目标状态，
+        // 供 screencapture 核对 Find & Replace。不依赖书库有没有书。
+        if std::env::var("JIANDU_FIND_DEMO").is_ok() {
+            root.mode = AppMode::Collation;
+            let ws = root.collation.clone();
+            ws.update(cx, |w, cx| w.dev_setup_find_demo(cx));
         }
         // 开发用：JIANDU_COLUMNS=n 指定初始列数（8/10/12/14），便于逐列截图核对。
         if let Ok(v) = std::env::var("JIANDU_COLUMNS") {
@@ -8832,6 +8843,8 @@ impl Render for Root {
         // 正文照样会跑一遍排版（几百毫秒），而且根元素上那组快捷键仍然活着，
         // 方向键会翻动看不见的纸。直接从 `render` 的第一行岔开，是唯一干净的
         // 做法——没有可绕过的第二条路。
+        // v2.1：原先那条「排版工作台优先于闸门」的早退已删除。现在第一行
+        // 就是阅读器自己的逻辑，没有任何旁路。
         if !self.beta_ok {
             return self.render_beta_gate(window, cx).into_any_element();
         }
@@ -9084,6 +9097,8 @@ impl Render for Root {
         // 专注模式仍然不显示。
         if self.screen == Screen::Shelf && !self.focus_mode {
             root = root.child(self.render_collation_entry(cx));
+            // v2.1：书架右下角不再挂「排版」悬浮钮。排版工具是另一个 App，
+            // 读者在书架里看不到也点不到它，界面回到纯粹的「选书」。
         }
         // 「雕版刻印中… 34%」：盖在最上层，导入期间挡住操作，免得重复点导入。
         let import_ui = self
@@ -9183,6 +9198,8 @@ impl Root {
             )
     }
 
+    // v2.1：`render_typeset_entry` 已随独立 App 一起删除，书架右下角
+    // 只剩「笺校」一枚朱砂钮（位置也回到原来的 bottom(72)）。
 }
 
 /// 用**系统默认浏览器**打开一个网址（「在线查阅」用）。
