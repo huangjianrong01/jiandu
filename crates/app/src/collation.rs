@@ -1500,6 +1500,29 @@ fn splice_chars(text: &str, pos: usize, from_len: usize, to: &str) -> (String, u
     (next.into_iter().collect(), cursor)
 }
 
+/// **全部替换的纯字符拼装**（v1.9.94 抽离，可单测、可断言不 Panic）。
+///
+/// 把 `ranges` 命中的区间替换成 `rep`，跳着拼出新字符数组。`ranges` 约定升序且不
+/// 重叠；任一段**越界**（典型场景：旧正文算出的过期命中区间，被套到「全部替换」后
+/// 已缩短的新正文上）都会被 `.min(orig.len())` 钳制，越界段直接跳过——绝不对越界
+/// 区间做切片，因此哪怕 `find_ranges` 因任何原因陈旧，也不会触发越界 Panic。
+fn assemble_replace_all(orig: &[char], ranges: &[(usize, usize)], rep: &[char]) -> Vec<char> {
+    let mut out: Vec<char> = Vec::with_capacity(orig.len());
+    let mut last = 0usize;
+    for &(a, b) in ranges {
+        let a = a.min(orig.len());
+        let b = b.min(orig.len());
+        if a >= b {
+            continue; // 过期 / 越界段：丢弃，不切片
+        }
+        out.extend_from_slice(&orig[last..a]);
+        out.extend_from_slice(rep);
+        last = b;
+    }
+    out.extend_from_slice(&orig[last..]);
+    out
+}
+
 /// 标点剥离（比对用）：CJK 句读（`is_punct`）与 ASCII 标点都从搜索比对里剔除，
 /// 但**不动空格**——空格不是句读，留着避免「道可道 非常道」被误并。搜索
 /// 「道可道非常道」能命中原文「道可道，非常道」，靠的就是这层剥离。
@@ -3433,15 +3456,18 @@ impl CollationWorkspace {
         let rep = self.replace_query.clone();
         let rep_chars: Vec<char> = rep.chars().collect();
         let orig: Vec<char> = self.text.chars().collect();
-        let mut out: Vec<char> = Vec::with_capacity(orig.len());
-        let mut last = 0usize;
-        // 光标跟随：命中区间平移，落到命中内的光标推到替换后起点。
-        let mut cursor = self.cursor as isize;
         // 先拷一份，避免「迭代 self.find_ranges」与「调用 self.record_edit」借冲突。
         let ranges = self.find_ranges.clone();
+        // 纯字符拼装（含越界钳制，过期区间绝不触发越界切片 Panic）。
+        let out = assemble_replace_all(&orig, &ranges, &rep_chars);
+        // 光标跟随：命中区间平移，落到命中内的光标推到替换后起点。
+        let mut cursor = self.cursor as isize;
         for &(a, b) in &ranges {
-            out.extend_from_slice(&orig[last..a]);
-            out.extend_from_slice(&rep_chars);
+            let a = a.min(orig.len());
+            let b = b.min(orig.len());
+            if a >= b {
+                continue;
+            }
             let removed: String = orig[a..b].iter().collect();
             self.record_edit(a, removed, rep.clone(), EditKind::Once);
             let delta = rep_chars.len() as isize - (b - a) as isize;
@@ -3450,15 +3476,20 @@ impl CollationWorkspace {
             } else if (self.cursor as isize) >= b as isize {
                 cursor += delta;
             }
-            last = b;
         }
-        out.extend_from_slice(&orig[last..]);
         let new_text: String = out.into_iter().collect();
         self.set_text(new_text);
         self.cursor = cursor.max(0) as usize;
         self.anchor = self.cursor;
         self.selection = None;
-        self.schedule_find(cx);
+        // 替换后立刻用新正文同步重算命中，清掉旧（已失效）的 find_ranges。否则 100ms
+        // 防抖窗口内再点「全部替换」会把旧区间套到缩短后的正文上 → 越界 Panic。
+        self.find_token = self.find_token.wrapping_add(1);
+        let (ranges2, has_variant) =
+            find_matches(&self.text, &self.find_text(), &jiandu_core::variants::active());
+        self.find_ranges = ranges2;
+        self.find_has_variant = has_variant;
+        self.find_reposition(cx);
         cx.notify();
         self.touch(cx);
     }
@@ -5837,10 +5868,12 @@ impl CollationWorkspace {
             scroll_y: px_f32(self.scroll.offset().y) as f64,
             updated_at: now,
         };
-        let _ = jiandu_core::store::put_collation_state(&conn, &state);
-        // 强存也算「已落盘」，否则退出前刚写过的内容会被防抖任务再写一遍。
-        self.saved_gen = self.text_gen;
-        self.saved_cursor = self.cursor;
+        // 写盘失败（磁盘满 / 库损坏 / 权限）→ 绝不「假保存」：不记账，下次 touch /
+        // 退出时 flush_now 会重试，否则会静默丢失未落盘的内容。
+        if jiandu_core::store::put_collation_state(&conn, &state).is_ok() {
+            self.saved_gen = self.text_gen;
+            self.saved_cursor = self.cursor;
+        }
     }
 
     /// **亮一次「已保存」微光**（v1.9.73）：顶栏右侧那粒米点转朱砂 + 浮出极淡
@@ -5969,10 +6002,7 @@ impl CollationWorkspace {
                             if ws.text_gen == ws.saved_gen && ws.cursor == ws.saved_cursor {
                                 return None;
                             }
-                            // 记账要在**同一帧**里做：写盘在后台，等它回来再记
-                            // 就可能被下一轮 touch 抢先，重复写第二次。
-                            ws.saved_gen = ws.text_gen;
-                            ws.saved_cursor = ws.cursor;
+                            // 记账放到写盘成功之后（见下方），这里只读快照，避免「假保存」。
                             Some((
                                 ws.text.clone(),
                                 ws.show_diff,
@@ -6009,10 +6039,17 @@ impl CollationWorkspace {
                         .await;
                     // 微光**只认成功**（v1.9.73）：写失败却亮「已保存」，比不亮坏得多。
                     if !wrote {
-                        return;
+                        return; // 不动 saved_gen → 下次 touch / 退出 flush_now 会重试，绝不假保存
                     }
                     if let Some(e) = this.upgrade() {
-                        let _ = e.update(&mut app, |ws, cx| ws.mark_saved(cx));
+                        let _ = e.update(&mut app, |ws, cx| {
+                            // 用**快照代际**记账：若写入期间又有了新编辑（text_gen 已变），
+                            // 这里记的是旧代际，下次 touch 仍会重写新文本，不会「写旧文却标记
+                            // 新文已保存」造成数据丢失。
+                            ws.saved_gen = gen as u64;
+                            ws.saved_cursor = cursor as usize;
+                            ws.mark_saved(cx);
+                        });
                     }
                 }
             },
@@ -10254,6 +10291,31 @@ mod tests {
         let (hits, has_variant) = find_matches(text, "群", &table);
         assert_eq!(hits.len(), 1);
         assert!(!has_variant, "只命中本字时不应提示异体");
+    }
+
+    /// ⚠️ **回归（v1.9.94）**：`assemble_replace_all` 对越界 / 过期区间必须钳制跳过，
+    /// 绝不 Panic。复现「全部替换」连点场景——旧正文算出的命中区间被套到缩短后的
+    /// 新正文上（100ms 防抖窗口内再点一次就会触发）。
+    #[test]
+    fn assemble_replace_all_tolerates_stale_out_of_bounds_ranges() {
+        // 新正文只有 5 个字，却传入一份来自更长旧正文的过期区间 (10, 12)。
+        let orig: Vec<char> = "天地玄黄宇".chars().collect();
+        let rep: Vec<char> = "〇".chars().collect();
+        let stale = vec![(1, 3), (10, 12)]; // 第二段越界
+        // 不应 Panic；越界段被丢弃（宇 之后的内容不受影响），仅第一段正常替换。
+        let out = assemble_replace_all(&orig, &stale, &rep);
+        let s: String = out.into_iter().collect();
+        assert_eq!(s, "天〇黄宇");
+    }
+
+    #[test]
+    fn assemble_replace_all_replaces_all_non_overlapping() {
+        let orig: Vec<char> = "甲之乙之丙".chars().collect();
+        let rep: Vec<char> = "的".chars().collect();
+        let ranges = vec![(1, 2), (3, 4)];
+        let out = assemble_replace_all(&orig, &ranges, &rep);
+        let s: String = out.into_iter().collect();
+        assert_eq!(s, "甲的乙的丙");
     }
 
     /// ⚠️ **回归**：右栏按 Enter 拆段后，段号与毛坯错位。旧实现让半段去对齐
