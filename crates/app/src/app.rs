@@ -2109,7 +2109,7 @@ impl Root {
             let i = crate::theme::Theme::ALL
                 .iter()
                 .position(|t| t.is_keben())
-                .unwrap_or(4);
+                .unwrap_or(3);
             root.set_theme(i);
         }
         // 开发用（v1.9.82）：`JIANDU_THEME=a11y` / `a11y_night` 直接进无障碍档

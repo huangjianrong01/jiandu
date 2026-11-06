@@ -16,6 +16,37 @@ use anyhow::{anyhow, Context, Result};
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 
+/// 单文件导入的**硬字节闸**：在读取侧用 `take(HARD + 1)` 截断，绝不
+/// `fs::read` 一把梭，也绝不先信 `metadata().len()` 预分配。100MB 级
+/// 稿件 / 网络盘假尺寸 / ZIP 解压炸弹到此为止，明确报错而不是把原文 +
+/// 反序列化树一起堆进内存导致 OOM。
+pub const IMPORT_HARD_BYTES: u64 = 128 * 1024 * 1024;
+
+/// EPUB 里**单个 zip 条目**的上限（OPF / nav / 单篇 XHTML）。压缩率可以造假，
+/// 一个 1MB 的条目能解出几 GB，故解压侧也必须封顶。
+const ZIP_TEXT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 带参数的读取闸（`hard` 可注入，供单测用小阈值撞而不必真造 128MB 样本）。
+fn read_file_capped_with(path: &Path, what: &str, hard: u64) -> Result<Vec<u8>> {
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("打开 {what} 失败: {}", path.display()))?;
+    let mut bytes = Vec::new();
+    f.take(hard + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("读取 {what} 失败: {}", path.display()))?;
+    if bytes.len() as u64 > hard {
+        return Err(anyhow!(
+            "{what} 超过 {} MB，已停止读取（请拆分后按卷导入）",
+            hard / 1024 / 1024
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_file_capped(path: &Path, what: &str) -> Result<Vec<u8>> {
+    read_file_capped_with(path, what, IMPORT_HARD_BYTES)
+}
+
 /// 根据扩展名导入。
 pub fn import_from_path(path: &Path) -> Result<Book> {
     let ext = path
@@ -453,7 +484,7 @@ pub(crate) fn para_of(line: &str) -> Paragraph {
 // ---------------------------------------------------------------------------
 pub fn import_txt(path: &Path) -> Result<Book> {
     // 走管线：先解码（UTF-8 / GBK），再切章、全角化、数字转汉字。
-    let bytes = std::fs::read(path).with_context(|| format!("读取 txt 失败: {}", path.display()))?;
+    let bytes = read_file_capped(path, "txt")?;
     let text = crate::pipeline::decode_bytes(&bytes);
     Ok(book_from_plaintext(&file_stem(path), &text))
 }
@@ -527,8 +558,7 @@ fn flush_para(para: &mut Vec<String>, chap: &mut Option<Chapter>, book: &mut Boo
 // markdown
 // ---------------------------------------------------------------------------
 pub fn import_md(path: &Path) -> Result<Book> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("读取 markdown 失败: {}", path.display()))?;
+    let bytes = read_file_capped(path, "markdown")?;
     let text = crate::pipeline::decode_bytes(&bytes);
     Ok(book_from_markdown(&file_stem(path), &text))
 }
@@ -552,8 +582,7 @@ pub fn book_from_markdown(fallback_title: &str, md: &str) -> Book {
 // html / xml
 // ---------------------------------------------------------------------------
 pub fn import_html(path: &Path) -> Result<Book> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("读取 html 失败: {}", path.display()))?;
+    let bytes = read_file_capped(path, "html")?;
     let text = crate::pipeline::decode_bytes(&bytes);
     let chapters = crate::pipeline::parse_html(&text);
     // 书名优先取 <title> / <h1>，取不到才回退文件名。
@@ -607,7 +636,7 @@ fn strip_links(s: &str, open: &str, mid: &str) -> String {
 /// DOCX 导入：zip 包 → `word/document.xml` → 标准章数组（样式全丢，见
 /// [`crate::pipeline::parse_docx`]）。
 pub fn import_docx(path: &Path) -> Result<Book> {
-    let bytes = std::fs::read(path).with_context(|| format!("读不出 {}", path.display()))?;
+    let bytes = read_file_capped(path, "docx")?;
     let chapters = crate::pipeline::parse_docx(&bytes)?;
     let mut book = crate::pipeline::chapters_to_book(&file_stem(path), "", chapters);
     let (t, a) = detect_title_author(&book.chapters.first().map(|c| {
@@ -637,8 +666,11 @@ pub fn import_json(path: &Path) -> Result<Book> {
 /// 只有吸成 `Paragraph::notes` 之后，排版层才会把它们排成双行小字；
 /// 留在 `text` 里就会被当「[」「注」「]」四个正文字排进字格（v1.36 的老坑）。
 fn import_json_report(path: &Path) -> Result<(Book, crate::jsonkit::JsonReport)> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("读取 json 失败: {}", path.display()))?;
+    let bytes = read_file_capped(path, "json")?;
+    // 与旧 `read_to_string` 同口径：JSON 必须是 UTF-8，坏编码明确报错，
+    // 绝不 lossy 塞进解析器（GBK 老稿请走 txt 入口，那里有四码表嗅探）。
+    let text = String::from_utf8(bytes)
+        .with_context(|| format!("读取 json 失败（需 UTF-8）: {}", path.display()))?;
     let (mut book, rep) = adapt_json_book_report(&text, &file_stem(path))?;
     book.ingest_inline_notes();
     Ok((book, rep))
@@ -1389,6 +1421,22 @@ fn extract_html_title(html: &str) -> Option<String> {
     None
 }
 
+/// 断行 XML（标签缺 `>`）时把截断位置回退到最近的合法 UTF-8 字符边界。
+///
+/// 旧写法直接按 `seg.len() - 1` 硬切；若末尾是多字节汉字，这个下标落在
+/// 半个字中间，Rust 会 panic「byte index is not a char boundary」——
+/// 畸形 EPUB 的 OPF / NCX 被中途截断时必现的闪退点。
+fn tag_end(seg: &str) -> usize {
+    let mut end = seg
+        .find('>')
+        .unwrap_or_else(|| seg.len().saturating_sub(1))
+        .min(seg.len());
+    while end > 0 && !seg.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// 取 manifest：id -> (href, media-type, properties)。
 fn extract_items(
     opf: &str,
@@ -1396,8 +1444,9 @@ fn extract_items(
     let mut out = Vec::new();
     let mut rest = opf;
     while let Some(i) = rest.find("<item") {
+        let prev_len = rest.len();
         let seg = &rest[i..];
-        let stop = seg.find('>').unwrap_or(seg.len().saturating_sub(1));
+        let stop = tag_end(seg);
         let tag = &seg[..stop];
         let id = attr_in_tag(tag, "id");
         let href = attr_in_tag(tag, "href");
@@ -1407,6 +1456,10 @@ fn extract_items(
             out.push((id, (href, mtype, props)));
         }
         rest = &seg[stop..];
+        // 畸形 XML 绝不许把 while 卡成死循环：本轮没变短就收工。
+        if rest.len() >= prev_len {
+            break;
+        }
     }
     out
 }
@@ -1424,9 +1477,15 @@ fn read_zip_text<R: Read + std::io::Seek>(
     name: &str,
 ) -> Result<String> {
     let mut file = zip.by_name(name)?;
-    let mut s = String::new();
-    file.read_to_string(&mut s)?;
-    Ok(s)
+    // 解压侧封顶：ZIP 条目的声明大小不可信，坏包能把几 GB 解进内存。
+    let mut bytes = Vec::new();
+    file.take(ZIP_TEXT_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > ZIP_TEXT_MAX_BYTES {
+        return Err(anyhow!("EPUB 篇目过大：{name}"));
+    }
+    // 保持旧语义：非 UTF-8 的篇目明确报错（调用方 `if let Ok` 会跳过它），
+    // 不因加了闸门就悄悄把 GBK / 坏字节 lossy 混进正文。
+    String::from_utf8(bytes).with_context(|| format!("EPUB 篇目不是 UTF-8：{name}"))
 }
 
 fn find_attr(xml: &str, attr: &str) -> Option<String> {
@@ -1456,8 +1515,9 @@ fn extract_manifest(opf: &str) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let mut rest = opf;
     while let Some(i) = rest.find("<item ") {
+        let prev_len = rest.len();
         let seg = &rest[i..];
-        let end = seg.find('>').unwrap_or(seg.len().saturating_sub(1));
+        let end = tag_end(seg);
         let tag = &seg[..end];
         let id = find_attr(tag, "id");
         let href = find_attr(tag, "href");
@@ -1468,6 +1528,9 @@ fn extract_manifest(opf: &str) -> std::collections::HashMap<String, String> {
             }
         }
         rest = &seg[end..];
+        if rest.len() >= prev_len {
+            break;
+        }
     }
     map
 }
@@ -1485,12 +1548,16 @@ fn extract_spine_ids(opf: &str) -> Vec<String> {
     let region = &spine[..end];
     let mut rest = region;
     while let Some(i) = rest.find("<itemref") {
+        let prev_len = rest.len();
         let seg = &rest[i..];
-        let stop = seg.find('>').unwrap_or(seg.len().saturating_sub(1));
+        let stop = tag_end(seg);
         if let Some(idref) = find_attr(&seg[..stop], "idref") {
             ids.push(idref);
         }
         rest = &seg[stop..];
+        if rest.len() >= prev_len {
+            break;
+        }
     }
     ids
 }
@@ -2446,4 +2513,78 @@ mod tests {
         let (_, rep) = adapt_json_book_report(raw, "論語").expect("应能解析");
         assert!(!rep.downgraded);
     }
+
+
+    // ── v1.9.99 全格式导入 · 致命崩溃回归 ───────────────────────────────
+    /// 0 字节 / GBK / 四码表全崩的字节：五种格式一律不许 panic。
+    #[test]
+    fn empty_and_bad_encoding_inputs_never_panic() {
+        for name in ["a.txt", "a.md", "a.json", "a.html", "a.epub", "a.docx"] {
+            let _ = import_from_bytes(name, Vec::new());
+        }
+        let gbk = vec![0xB5u8, 0xC0, 0xB5, 0xC2, 0xBD, 0x9B]; // 「道德經」
+        for name in ["a.txt", "a.md", "a.json", "a.html"] {
+            let _ = import_from_bytes(name, gbk.clone());
+        }
+        let _ = import_from_bytes("a.txt", vec![0xFF; 4096]);
+        let _ = import_from_bytes("a.md", vec![0xFE; 4096]);
+    }
+
+    /// 少括号 / 截断 / 未知标签 / 600 层嵌套：serde_json 深度闸兜住，绝不爆栈。
+    #[test]
+    fn malformed_and_deep_json_never_panic() {
+        for raw in [
+            "",
+            "{",
+            "[",
+            "{\"chapters\":[",
+            "{\"a\":",
+            "{{{",
+            "\"unterminated",
+            "not json at all",
+            "<unknown>标签</unknown>",
+        ] {
+            let _ = adapt_json_book(raw, "無題");
+            let _ = parse_json_book(raw, "無題");
+        }
+        let deep = format!("{}{}", "[".repeat(600), "]".repeat(600));
+        let _ = adapt_json_book(&deep, "無題");
+        let _ = parse_json_book(&deep, "無題");
+        let v = serde_json::from_str::<serde_json::Value>(&deep)
+            .unwrap_or(serde_json::Value::Null);
+        let _ = crate::jsonkit::flatten_text(&v);
+    }
+
+    /// 断行 XML：`<item` 缺 `>` 且末尾是多字节汉字 —— 旧代码按 `len()-1`
+    /// 硬切会 panic「byte index is not a char boundary」。
+    #[test]
+    fn broken_epub_opf_never_panics() {
+        let broken =
+            "<?xml version=\"1.0\"?><package><manifest><item id=\"c1\" href=\"中文";
+        let _ = extract_items(broken);
+        let _ = extract_spine_ids(broken);
+        let _ = extract_manifest(broken);
+        let _ = attr_in_tag(broken, "id");
+        let _ = parse_nav_toc(broken, "OEBPS");
+        let _ = parse_ncx_toc(broken, "OEBPS");
+        // 三千枚未闭合标签 + 中文尾：顺带钉死「死循环」这条路。
+        let nasty = format!("{}中", "<item ".repeat(3000));
+        let _ = extract_items(&nasty);
+        let _ = extract_spine_ids(&nasty);
+    }
+
+    /// 超大文件在读取侧就被截断，绝不信 metadata().len() 整读。
+    #[test]
+    fn oversized_file_is_refused_before_allocating() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("jiandu_cap_{}.txt", std::process::id()));
+        std::fs::write(&p, vec![b'x'; 4096]).ok();
+        let r = read_file_capped_with(&p, "txt", 1024);
+        assert!(r.is_err(), "越过闸门必须明确报错，不许整读");
+        assert!(r.unwrap_err().to_string().contains("已停止读取"));
+        let ok = read_file_capped_with(&p, "txt", 8192);
+        assert_eq!(ok.unwrap().len(), 4096);
+        std::fs::remove_file(&p).ok();
+    }
 }
+

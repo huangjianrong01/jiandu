@@ -536,6 +536,11 @@ const TITLE_HEAD_CELLS: f32 = 0.0;
 /// 平时整条收到窗顶之外，鼠标贴到屏幕上沿再滑下。为解决当年「找不到」的
 /// 老问题，两处补偿：① 开卷时顶栏先露一息（`bar_shown` 初值 true），鼠标
 /// 一动才收回；② 触发带给足 10px、退出回差 16px，手抖也不会闪。
+/// 竹简目录的**分叉鱼尾**：五点多边形，底边 W 形（两枚垂尖 + 中央凹口）。
+/// 上下两枚严格镜像；纯几何手绘，不取字体字形、不用贝塞尔、不叠噪点。
+pub(crate) const TOC_FISH_TOP: &str = "M0 0 H34 V3 L19 10 L17 5 L15 10 L0 3 Z";
+pub(crate) const TOC_FISH_BOT: &str = "M0 10 V7 L15 0 L17 5 L19 0 L34 7 V10 Z";
+
 pub(crate) const BAR_H: f32 = 44.0;
 
 /// **顶栏触发带**（px）：鼠标进到窗顶这么深就滑出。
@@ -1920,52 +1925,6 @@ impl Root {
             }
         }
 
-        // ---- 聽：阅读界面正下方一枚小图标（v1.9.41）----
-        //
-        // 用户口径：听不能只藏在「框选文字 → 工具条 → 听」里——不选字想听
-        // 整叶，还得先划一道，太绕。纸面正下方放一枚「聽」，点一下调出语速
-        // 卡并开始读；再点一下（或按卡上的「停」）收声收卡。
-        //
-        // 位置：专注模式贴纸底（7px），常规模式抬到页码条之上（26px）——
-        // 两种模式都不压正文，也不跟藏书印抢那一角。
-        //
-        // v1.9.42：这枚小字只是「收起态」的触发器——听书条（胶囊）激活时
-        // 它让位给胶囊本身，故 `show_tts` 为真时整枚不渲染，绝不重复。
-        if !self.show_tts {
-            let tts_y = if self.focus_mode { 7.0 } else { 26.0 };
-            root = root.child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(tts_y))
-                    .flex()
-                    .flex_row()
-                    .justify_center()
-                    .child(
-                        div()
-                            .id("tts-tab")
-                            // 命中栈在此截断：点这枚小字不该被底下的正文读成翻页。
-                            .occlude()
-                            .cursor_pointer()
-                            .px(px(10.0))
-                            .py(px(2.0))
-                            .text_size(px(10.5))
-                            .text_color(rgb(crate::theme::mix(t.chrome_text(), t.chrome(), 0.42)))
-                            .hover(|s| s.text_color(rgb(sheet_zhu(t))))
-                            .child(SharedString::from("聽"))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    // 开条即出声；保位交给 `set_tts_active`。
-                                    this.set_tts_active(true, cx);
-                                }),
-                            ),
-                    ),
-            );
-        }
-
         // v1.71.0：**导出收尾提示条（Toast）**——极简一枚纸签，浮在页码条之上。
         //
         // 三条例行公事：
@@ -2100,7 +2059,7 @@ impl Root {
         // 左侧栏（v1.79.0）：目录 / 书签 / 批注 三页合一，从左侧滑出。
         // 替换掉了原先「底部竖排卷帘目录」与「底部书签抽屉」两套外壳。
         if self.show_side && !self.focus_mode {
-            root = root.child(self.render_side_panel(cx));
+            root = root.child(self.render_toc_split_panel(cx));
         }
         // 版字面板浮层：点工具栏「样式」展开，宽度与单张页面一致，
         // 可盖住正文下部（像照片说明压在照片上），但全部样式内容完整显示。
@@ -2121,11 +2080,9 @@ impl Root {
                     .child(self.render_style_sheet(cx)),
             );
         }
-        // 聽書 / 印製（v1.9.41）：两张小卡。语速归听、出图归印，各住各的门，
-        // 不再挤在版字那张「怎么排」的纸上。
-        if self.show_tts {
-            root = root.child(self.render_tts_sheet(cx));
-        }
+        // 聽書（v1.9.96）：贴底语速胶囊与纸面下方「聽」字小图标已撤——
+        // 入口移到顶栏右组「聽書」钮。TTS 引擎、状态机、⌘⌥Y 快捷键、
+        // 语速键（⌘⌥[ / ⌘⌥]）全部原样保留，正文不再被任何浮层压住。
         // （原「版式控制面板」浮层 v1.35.0 已删除：那四枚 8/10/12/14 档位与
         // 版字面板的「列数」是同一件事的两副面孔，现统一并入「版字」页的
         // `COLUMN_OPTS`；留白两行也一并搬过去了。）
@@ -3782,17 +3739,24 @@ impl Root {
     ///      的纸面打回现代界面。改以**竖排朱砂小印**切换——读法是「翻检签牌」
     ///      而非「切换标签页」，形制上更接近书耳与藏印。
     #[allow(non_snake_case)]
-    fn render_side_panel(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_toc_split_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let vw = self.viewport_w;
         let vh = self.viewport_h;
         let t = self.theme;
         const HEAD_H: f32 = 34.0;
+        // 底部状态栏（页码 / 阅读进度 / 双击回到卷首）永远可见：右侧栏与
+        // 捕获层的下沿都抬到它之上，绝不覆盖这条保留带。
+        const STATUS_RESERVE: f32 = 46.0;
+        // 黄金分割视口：栏宽 = vw × 0.37（上限 400 / 下限 260），左侧正文
+        // 自然留约 61.8% 可视区。纯覆盖层，不参与正文 flex 流 —— viewport_w /
+        // 字号 / 列数一概不动，排版引擎零重排、零缩放，只做视口裁剪。
+        let panel_w = (vw * 0.37).min(400.0).max(260.0);
         let slide = self.side_slide.clamp(0.0, 1.0);
-        let off = side_offset(slide);
+        let off = -(1.0 - slide) * panel_w;
         let zhu = sheet_zhu(t);
         let ink_soft = t.ink_soft();
-        // 抽屉底：宣纸本色 + alpha 0xF6（96%）——见头注第 2 条，不做模糊。
-        let drawer_bg: u32 = (t.paper() << 8) | 0xF6;
+        // 极简纯色：把纸色向白洗淡一档，绝不叠泛黄噪点 / 烘焙纹理。
+        let drawer_bg: u32 = (crate::theme::mix(t.paper(), 0xFFFFFF, 0.62) << 8) | 0xFD;
         // 分隔界：纸 + 墨 10%，只用于「栏头」与「内容」之间那一道。
         let sept: u32 = crate::theme::mix(t.paper(), t.ink(), 0.12);
         let sept_soft: u32 = crate::theme::mix(t.paper(), t.ink(), 0.07);
@@ -3928,7 +3892,7 @@ impl Root {
 
         // ── 内容：三印各一片 ──────────────────────────────────────
         let body = match cur_tab {
-            SideTab::Toc => self.render_side_toc_list(cx),
+            SideTab::Toc => self.render_toc_split_list(cx, panel_w),
             SideTab::Bookmark => self.render_side_bookmark_list(cx),
             SideTab::Note => self.render_side_note_list(cx),
         };
@@ -3985,17 +3949,17 @@ impl Root {
         let drawer = div()
             .absolute()
             .top(px(BAR_H))
-            .bottom(px(0.0))
-            .left(px(off))
-            .w(px(SIDE_W))
+            .bottom(px(STATUS_RESERVE))
+            .right(px(off))
+            .w(px(panel_w))
             .flex()
             .flex_row()
             .bg(rgba(drawer_bg))
-            .border_r_1()
+            .border_l_1()
             .border_color(rgba(sept))
             .shadow(vec![gpui::BoxShadow {
                 color: gpui::hsla(0.0, 0.0, 0.0, 0.10),
-                offset: point(px(2.0), px(0.0)),
+                offset: point(px(-2.0), px(0.0)),
                 blur_radius: px(14.0),
                 spread_radius: px(0.0),
             }])
@@ -4033,7 +3997,7 @@ impl Root {
             .top(px(BAR_H))
             .left(px(0.0))
             .w(px(vw))
-            .h(px((vh - BAR_H).max(0.0)))
+            .h(px((vh - BAR_H - STATUS_RESERVE).max(0.0)))
             .bg(rgba(0x00000000))
             .occlude()
             .on_mouse_down(
@@ -4090,12 +4054,204 @@ impl Root {
         (bm, nt)
     }
 
+/// 【右侧窄栏 · 竹简鱼尾目录】v1.9.98
+///
+/// 每一条目录项都是一枚竹简：上鱼尾 ─ 竖排层级签 + 题名 ─ 下鱼尾。
+/// 卷 / 章 / 节用缩进分档，当前在读那一级朱砂底 + 朱砂描边；点任意一条
+/// 都按 `start_char_index` 精准跳转，末级自然落在字上。
+///
+/// 这一层是纯覆盖层：`viewport_w`、正文字号、列数一概不碰，排版引擎
+/// 零重排零缩放；栏与捕获层的下沿都停在 `STATUS_RESERVE` 之上，底部
+/// 状态栏的页码 / 进度 / 双击回到卷首永远可见、永远可点。
+#[allow(non_snake_case)]
+fn render_toc_split_list(
+    &mut self,
+    cx: &mut Context<Self>,
+    panel_w: f32,
+) -> Stateful<Div> {
+    let t = self.theme;
+    let zhu = sheet_zhu(t);
+    let ink = t.ink();
+    let sept: u32 = crate::theme::mix(t.paper(), t.ink(), 0.16);
+    let hover_bg: u32 = crate::theme::mix(t.paper(), t.ink(), 0.05);
+    let cur_bg: u32 = crate::theme::mix(t.paper(), zhu, 0.13);
+    let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
+
+    let toc: Vec<TocEntry> = match self.book.as_ref() {
+        Some(b) => b.toc.iter().filter(|e| e.level <= 3).cloned().collect(),
+        None => Vec::new(),
+    };
+    let cur_chapter = self.current_chapter;
+    let (marked_bm, marked_note) = self.chapter_marks();
+
+    // 开栏自动滚到在读那一章；翻章了也只跟一次，不抢用户手动滚的位置。
+    if self.toc_need_scroll || self.side_follow != Some(cur_chapter) {
+        let pos = toc
+            .iter()
+            .position(|e| e.chapter == cur_chapter)
+            .unwrap_or(0);
+        self.toc_scroll.scroll_to_item(pos);
+        self.toc_need_scroll = false;
+        self.side_follow = Some(cur_chapter);
+    }
+
+    let mut list = div()
+        .id(SharedString::from("toc-split-list"))
+        .flex()
+        .flex_col()
+        .w_full()
+        .flex_1()
+        .min_h(px(0.0))
+        .overflow_y_scroll()
+        .scrollbar_width(px(3.0))
+        .track_scroll(&self.toc_scroll)
+        .py(px(6.0));
+
+    if toc.is_empty() {
+        list = list.child(
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .pt(px(18.0))
+                .font_family(song.clone())
+                .text_size(px(12.0))
+                .text_color(rgb(t.ink_soft()))
+                .child(SharedString::from("这本书没有目录")),
+        );
+    }
+
+    for e in toc.iter() {
+        let cur = e.chapter == cur_chapter;
+        let jump = e.start_char_index.unwrap_or(0);
+        let indent = 10.0 + ((e.level.saturating_sub(1).min(2)) as f32) * 14.0;
+        let fs = match e.level {
+            1 => 13.5,
+            2 => 12.5,
+            _ => 12.0,
+        };
+        let room = ((panel_w - indent - 58.0) / (fs * 0.98)).floor() as usize;
+        let shown = clip_chars(&Self::toc_label(&e.title, room.max(4)), room.max(4));
+        let fish = if cur { zhu } else { sept };
+        let level_word = match e.level {
+            1 => "卷",
+            2 => "章",
+            _ => "節",
+        };
+
+        // 上鱼尾：分叉两尖朝下。
+        let slip = div().w_full().flex().flex_col().items_center().child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    svg()
+                        .path(SharedString::from(TOC_FISH_TOP.to_string()))
+                        .w(px(34.0))
+                        .h(px(10.0))
+                        .text_color(rgb(fish)),
+                ),
+        );
+
+        let mut row = div()
+            .w_full()
+            .h(px(28.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .pl(px(indent))
+            .pr(px(10.0))
+            .gap(px(6.0));
+        if cur {
+            row = row
+                .bg(rgb(cur_bg))
+                .border_1()
+                .border_color(rgb(zhu))
+                .rounded(px(2.0));
+        }
+        row = row
+            .child(
+                // 竖排层级签：单字一列，卷 / 章 / 節 一眼分档。
+                div()
+                    .flex_shrink_0()
+                    .w(px(13.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .font_family(song.clone())
+                    .text_size(px(10.0))
+                    .text_color(rgb(if cur { zhu } else { t.ink_soft() }))
+                    .child(SharedString::from(level_word.to_string())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .font_family(song.clone())
+                    .text_size(px(fs))
+                    .when(cur, |d| d.font_weight(FontWeight::BOLD))
+                    .text_color(rgb(if cur { zhu } else { ink }))
+                    .child(SharedString::from(shown.clone())),
+            );
+        if marked_bm.get(e.chapter).copied().unwrap_or(false) {
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .font_family(song.clone())
+                    .text_size(px(10.0))
+                    .text_color(rgb(zhu))
+                    .child(SharedString::from("籤")),
+            );
+        }
+        if marked_note.get(e.chapter).copied().unwrap_or(false) {
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(4.0))
+                    .h(px(4.0))
+                    .rounded(px(2.0))
+                    .bg(rgb(zhu)),
+            );
+        }
+
+        // 下鱼尾：与上鱼尾严格镜像。
+        let slip = slip.child(row).child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    svg()
+                        .path(SharedString::from(TOC_FISH_BOT.to_string()))
+                        .w(px(34.0))
+                        .h(px(10.0))
+                        .text_color(rgb(fish)),
+                ),
+        );
+        let slip = slip.cursor_pointer().hover(move |s| s.bg(rgb(hover_bg)));
+        list = list.child(slip.id(SharedString::from(format!("toc-split-{}", e.chapter))).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.goto_char_index(jump);
+                this.close_side();
+                cx.notify();
+            }),
+        ));
+    }
+    list
+}
+
     /// 左侧栏 · **目录页**（「錄」印）：全卷篇目，按层级缩进；当前在读那一章
     /// 淡朱底 + 左侧朱线；折过角的章右侧一枚朱「籤」，批过字的章一枚朱点。
     ///
     /// 两枚标记是 v1.80.0 的「彻底融合」：不必翻到「籤」印那一页才知道哪一章
     /// 折过——目录本身就是一张**带批注的书根**，把「我读过 / 我折过 / 我批过」
     /// 三层信息压进同一行。
+    #[allow(dead_code)]
     fn render_side_toc_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = self.theme;
         let zhu = sheet_zhu(t);
@@ -4806,6 +4962,17 @@ impl Root {
                 this.toggle_ai(window, cx);
             }),
         ));
+        // 聽書：開始／暫停朗讀（v1.9.96）。原「聽」字孤立小字与贴底胶囊已撤，
+        // 入口老老实实落在顶栏，与检索 / 问笺同组；TTS 引擎一字未动。
+        let tts_on = self.show_tts;
+        right = right.child(tight(if tts_on { "停聽" } else { "聽書" }, tts_on).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.set_tts_active(!this.show_tts, cx);
+                cx.notify();
+            }),
+        ));
         // v1.80.0：**更多**下拉。原先散在底部状态栏的六条导出、以及一年点
         // 几次的「帮助」，现在都住在这一枚里——顶栏只需留「天天点的那几件」。
         // 点哪条都直接弹系统保存对话框；菜单本体与旧的「导出」同形同构，
@@ -5021,7 +5188,7 @@ impl Root {
         let est = |chars: f32, fs: f32, pad: f32| chars * fs + pad * 2.0;
         let bar_w = est(2.0, 13.0, 14.0) * 3.0  // 书阁 / 目录 / 版字
             + est(1.0, 13.0, 14.0)              // 注（单字钮，v1.9.25）
-            + est(2.0, 13.0, 9.0) * 2.0         // 检索 / 问笺
+            + est(2.0, 13.0, 9.0) * 3.0         // 检索 / 问笺 / 聽書
             + est(2.0, 11.0, 9.0) + 2.0         // 印製
             + est(2.0, 13.0, 14.0)              // 更多
             + 3.0 * (1.0 + 44.0);               // 三道界行（1px + 左右各 22）
@@ -6258,6 +6425,8 @@ impl Root {
                 ink,
                 t.frame_outer(),
                 t.rule_line(self.rule_color),
+                t.grain(),
+                t.ink(),
             ))
             .child(frame);
 
@@ -7383,6 +7552,8 @@ impl Root {
                 t.rule_line(self.rule_color),
                 t.fish_ink(),
                 t.fold_ink(),
+                t.grain(),
+                t.ink(),
             ))
             .child(
                 div()
@@ -8837,12 +9008,8 @@ impl Root {
             self.page_frozen = None;
         }
         let (page_no, total_no) = self.page_frozen.unwrap_or((self.page, total));
-        // v1.9.42：听书控制条（贴底胶囊）占用屏幕最底端这条状态栏的位置，
-        // 听书时整条状态栏让位——页码读数是次要信息，别跟胶囊叠在一起。
-        // （叶码冻结逻辑已在上面跑完，不受影响。）
-        if self.show_tts {
-            return div();
-        }
+        // 聽書时状态栏常驻（v1.9.96）：贴底胶囊已撤、入口移到顶栏，
+        // 页码 / 阅读进度 / 双击回到卷首不再被任何浮层吞掉。
         // v1.86.0：古籍视图一律写繁体「葉」（版心书口叶码同字），现代视图仍是「页」。
         let unit = match self.script {
             Script::Ancient => "葉",
@@ -11708,7 +11875,7 @@ impl Root {
             use jiandu_core::keys::Action as A;
             let tts = self.keymap.chord(A::Tts).display();
             list = list.child(help_row(&tts, "聽書：朗讀本葉 · 語速在卡上調", t));
-            list = list.child(help_row("纸面下方「聽」", "点一下调出语速卡并开读，再点即停", t));
+            list = list.child(help_row("顶栏「聽書」", "开始朗读本叶；再点即停", t));
         }
 
         list = list.child(help_sec("翻页", t));
@@ -12893,9 +13060,12 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
     /// 摆着一条「怎么听」。现在它跟着「听」一起来：开读那一刻浮出这张小卡，
     /// 读什么、多快、停不停都在这里，收起来就散，不占常驻界面。
     ///
+    /// **已停用挂载（v1.9.96）**：胶囊 UI 撤下，入口移至顶栏；实现保留备设置菜单复用。
+    ///
     /// **贴底单行胶囊（v1.9.43）**：从竖向卡片压成一行极简胶囊——`聽 · 倍速
     /// 数字 · 再讀 · 停 ×`，高度从 ~90px 砍到 ~30px，正文区让位也跟着从 96
     /// 降到 60。倍速直接以数字呈现（0.8 / 1.0 / 1.25），选中态用朱砂 + 细下划线。
+    #[allow(dead_code)]
     fn render_tts_sheet(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let song = crate::fonts::family_for(FontChoice::SongTi, self.script);
@@ -14415,7 +14585,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
 
     /// 切到第 `i` 套纸面主题（配置表 `PAPER_THEMES` 下标）。
     /// 换纸即重排（纸色变了、夹注兑淡基点也变）；并智能联动墨色——
-    /// 每套纸都有默认墨色配对（宣纸→墨朱 / 米黄→赭朱 / 青简→松墨 /
+    /// 每套纸都有默认墨色配对（宣纸→墨朱 / 青简→松墨 /
     /// 夜读→暗金 / 仿刻本→墨朱），一键换肤；用户随后仍可手动把墨色切到
     /// 任意一套。
     ///
@@ -14433,6 +14603,10 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         // 绝不「跳页」（用户报告：滚到书中段切暗金 / 宣纸，正文乱跳）。
         let anchor = self.page_anchor();
         let was_keben = self.theme.is_keben();
+        // v1.9.99 宋本泛黄（Pro）三件套同源：纸色 `t.paper()`、噪点
+        // `t.grain()`、专属墨色 `t.ink()` 全部在 render 当下从 `self.theme`
+        // 派生，这里只换 theme + 联动墨色，绝不另存第二份配色缓存——
+        // 切进 / 切出都不可能出现「底色换了、纹理没换」的半套状态。
         self.theme = next;
         self.palette = next.linked_palette();
         if next.is_keben() {

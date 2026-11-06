@@ -80,7 +80,7 @@ pub const BUILTIN: &[StylePreset] = &[
     // 灯下：夜读深底 + 暗金 + 十二行密排。深夜读，屏幕不刺眼。
     StylePreset {
         name: String::new(),
-        theme: 3,
+        theme: 2,
         palette: 3,
         font_preset: 0,
         columns: 12,
@@ -97,7 +97,7 @@ pub const BUILTIN: &[StylePreset] = &[
     // 雨窗：青简 + 松墨 + 手写楷体 + 十行。清冷，适合诗文。
     StylePreset {
         name: String::new(),
-        theme: 2,
+        theme: 1,
         palette: 1,
         font_preset: 1,
         columns: 10,
@@ -114,7 +114,7 @@ pub const BUILTIN: &[StylePreset] = &[
     // 仿刻：仿刻本纸 + 墨朱 + 八行疏朗 + 宽留白。最接近文物原型，出图最好看。
     StylePreset {
         name: String::new(),
-        theme: 4,
+        theme: 3,
         palette: 0,
         font_preset: 0,
         columns: 8,
@@ -292,7 +292,7 @@ mod tests {
         let preset = StylePreset::builtin(2).unwrap(); // 仿刻
         preset.apply(&mut p);
         assert!(preset.matches(&p), "应用后再抄下来应当一致");
-        assert_eq!(p.theme, 4);
+        assert_eq!(p.theme, 3);
         assert_eq!(p.columns, 8);
         assert_eq!(p.layout_key, "standard8");
     }

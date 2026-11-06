@@ -1053,12 +1053,14 @@ pub fn parse_html_raw(html: &str) -> Vec<RawChapter> {
                     // 栈顶正是这个标签名 → 收口，并把开标签时记下的标记补上。
                     let matches = stack.last().map(|t| t.name == lower).unwrap_or(false);
                     if matches {
-                        let top = stack.pop().unwrap();
-                        if lower == "blockquote" {
-                            in_blockquote = in_blockquote.saturating_sub(1);
-                        }
-                        if let Some(kind) = top.kind {
-                            close_one(kind, &mut buf, &mut heading);
+                        // 畸形 HTML 的闭合标签再多也不许 unwrap：栈空就当没配对。
+                        if let Some(top) = stack.pop() {
+                            if lower == "blockquote" {
+                                in_blockquote = in_blockquote.saturating_sub(1);
+                            }
+                            if let Some(kind) = top.kind {
+                                close_one(kind, &mut buf, &mut heading);
+                            }
                         }
                     }
                     if BLOCK_TAGS.contains(&lower.as_str()) {

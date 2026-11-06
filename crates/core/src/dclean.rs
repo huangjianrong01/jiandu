@@ -197,7 +197,11 @@ fn words_starting_with(c: char) -> &'static [&'static str] {
         .get_or_init(build_ad_buckets)
         .binary_search_by_key(&c, |(k, _)| *k)
     {
-        Ok(i) => AD_BUCKETS.get().unwrap()[i].1,
+        Ok(i) => AD_BUCKETS
+            .get()
+            .and_then(|b| b.get(i))
+            .map(|x| x.1)
+            .unwrap_or(&[]),
         Err(_) => &[],
     }
 }

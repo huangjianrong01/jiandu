@@ -41,7 +41,7 @@ use crate::share_layout::{
 use crate::share_paint::{render_pdf, render_pdf_spread, render_png, render_spread_png};
 use gpui::prelude::*;
 use gpui::{
-    div, img, px, rgb, rgba, Bounds, BoxShadow, Context, Div,
+    div, img, px, rgb, rgba, svg, Bounds, BoxShadow, Context, Div,
     EntityInputHandler, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
     KeyDownEvent, StatefulInteractiveElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ParentElement, Render,
@@ -182,7 +182,10 @@ pub enum AppMode {
 /// 笺校工作台发回 Root 的事件（用于「返回阅读」）。
 #[derive(Clone, Copy)]
 pub enum CollationEvent {
+    /// 工作台点「返回阅读」→ Root 切回正常阅读态。
     Exit,
+    /// 【AI 句读】未激活用户点击 → 请求 Root 弹激活浮层（Pro 收费站的解耦触发）。
+    RequestActivation,
 }
 
 // ── 视觉常量（骨架阶段，先写死；接入主题系统前不改）──
@@ -211,6 +214,16 @@ const STYLE_HANDLE_W: f32 = 12.0;
 /// `editor_origin()` 的纵向原点必须把它算进去——少算 44px，「点哪落哪」
 /// 就整体上移一行。改这个数，两处（本行、`editor_origin`）自动同变。
 const PUNCT_BAR_H: f32 = 44.0;
+
+/// **【AI 句读】毛笔图标**（v1.9.95 脚手架）：Material 风格的画笔路径，
+/// 朱砂着色，压在 15px。将来接真模型时图标不动，只换底层取数逻辑。
+const AI_BRUSH_PATH: &str =
+    "M20.7 3.3a1 1 0 0 0-1.4 0l-2 2 1.4 1.4 2-2a1 1 0 0 0 0-1.4zM3.9 20.6l2.6-2.6 1.4 1.4-2.6 2.6a.9.9 0 0 1-1.4-1.4zM6.5 14.5l3-3 5.6 5.6-3 3-5.6-5.6z";
+
+/// **【查找 / 替换】放大镜图标**（v1.9.97）：圆环 + 斜柄，两段路径同向
+/// 绕外圈、反向绕内圈，非零填充自动挖空镜心。与毛笔图标同一规格 24×24。
+const FIND_GLASS_PATH: &str =
+    "M10.5 3a7.5 7.5 0 1 0 4.54 13.47l4.25 4.25 1.42-1.42-4.25-4.25A7.5 7.5 0 0 0 10.5 3zm0 2a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11z";
 const PAD: f32 = 14.0;
 const FONT_SIZE: f32 = 17.0;
 /// 行高（v1.9.24）：17 × 1.8 ≈ 30.6。
@@ -1164,6 +1177,11 @@ pub struct CollationWorkspace {
     export_busy: bool,
     /// 导出结果 / 错误（浮层底部状态条，与预览状态条同一套视觉语言）。
     export_note: Option<String>,
+    /// **【AI 句读】是否在途**（v1.9.95 脚手架）：后台跑 Mock / 真模型时置真，
+    /// 按钮文案临时变「AI 句读中…」、并挡住重复点击。
+    ai_busy: bool,
+    /// 【AI 句读】的瞬时状态（开始 / 完成 / 失败），顶部工具栏右侧就地显示。
+    ai_note: Option<String>,
     /// 样式选择面板是否展开（**常开**开关，顶栏【样式】控制）。
     show_style_panel: bool,
     /// **抽屉悬停态**（v1.9.74）：鼠标停在右边缘抓手上时临时滑出。
@@ -1757,6 +1775,8 @@ impl CollationWorkspace {
             binding: Binding::Right,
             export_busy: false,
             export_note: None,
+            ai_busy: false,
+            ai_note: None,
             preview_page: 0,
             preview_error: None,
             preview_note: None,
@@ -4274,6 +4294,167 @@ impl CollationWorkspace {
             )
     }
 
+    /// 【AI 句读】工具按钮（v1.9.95 脚手架）：毛笔图标 + 文字，Pro 专属。
+    ///
+    /// 点击走 `ai_punctuate`——未激活直接弹激活窗，已激活则后台跑 Mock / 真模型。
+    /// 在途时文案变「AI 句读中…」并挡住重复点击。
+    fn ai_tool_button(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let busy = self.ai_busy;
+        div()
+            .px(px(11.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(0x8c2b22))
+            .bg(rgba(0x8c2b2214))
+            .hover(|s| s.bg(rgba(0x8c2b2222)))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .child(
+                svg()
+                    .path(SharedString::from(AI_BRUSH_PATH))
+                    .w(px(15.0))
+                    .h(px(15.0))
+                    .text_color(rgb(0x8c2b22)),
+            )
+            .child(SharedString::from(if busy { "AI 句读中…" } else { "AI 句读" }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|c, _event, _window, cx| c.ai_punctuate(cx)),
+            )
+    }
+
+    /// 【查找 / 替换】顶栏入口（v1.9.97）：放大镜图标 + 文字。
+    ///
+    /// 底层 `⌘F` / `⌘H` → `open_find` / `open_replace` 的键盘路由一直都在，
+    /// 缺的只是**鼠标能点到的地方**。这里一步呼出「查找 + 替换」两栏的
+    /// 宣纸毛玻璃浮窗（再点一次收起）；`⌘F` 仍走单栏 `open_find`，
+    /// `⌘H` 仍走 `open_replace`，两条路径一字未改。
+    fn find_tool_button(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let full_open = self.find_open && self.replace_open;
+        div()
+            .px(px(11.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(0x8c2b22))
+            .bg(rgba(if full_open { 0x8c2b2228 } else { 0x8c2b2214 }))
+            .hover(|s| s.bg(rgba(0x8c2b2222)))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .child(
+                svg()
+                    .path(SharedString::from(FIND_GLASS_PATH))
+                    .w(px(15.0))
+                    .h(px(15.0))
+                    .text_color(rgb(0x8c2b22)),
+            )
+            .child(SharedString::from(if full_open {
+                "收起查找"
+            } else {
+                "查找 / 替换"
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|c, _event, window, cx| {
+                    cx.stop_propagation();
+                    if c.find_open && c.replace_open {
+                        c.close_find(cx);
+                    } else {
+                        // 一次给全：查找栏 + 替换栏，等价于 ⌘H。
+                        c.open_replace(cx);
+                    }
+                    // 浮条刻意不抢焦点，键仍归编辑器：`handle_key` → `find_key`
+                    // 才收得到 ⌘F / ⌘H / ⌘G / Esc / 输入上屏。
+                    let focus = c.focus.clone();
+                    Self::focus_for_typing(window, &focus);
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// 【AI 句读】瞬时状态标签（顶部工具栏就地显示）：开始 / 完成 / 失败。
+    ///
+    /// `None` 时返回空 `div`（不占版面）。
+    fn ai_note_label(&self, _cx: &mut Context<Self>) -> Div {
+        let Some(note) = self.ai_note.as_ref() else {
+            return div();
+        };
+        div()
+            .text_size(px(11.0))
+            .text_color(rgba(0x4a433599))
+            .child(SharedString::from(note.clone()))
+    }
+
+    /// 【AI 句读】（v1.9.95 脚手架）：整篇补标点，Pro 专属。
+    ///
+    /// 未激活 → 发 `CollationEvent::RequestActivation`，Root 弹激活浮层（不往下走）。
+    /// 已激活 → `cx.spawn` + `background_executor` 调 `fetch_ai_punctuation`，
+    /// UI 不卡；回来后用 Find/Replace 纯函数 `splice_chars` 把新文本无缝替换进
+    /// 编辑器并触发重排。当前是 Mock（句尾补句号），v1.1 接真模型时只换底层函数。
+    fn ai_punctuate(&mut self, cx: &mut Context<Self>) {
+        // Pro 收费拦截：未激活直接呼出激活浮层。
+        if !jiandu_core::license::activated() {
+            cx.emit(CollationEvent::RequestActivation);
+            return;
+        }
+        if self.ai_busy {
+            return;
+        }
+        if self.text.trim().is_empty() {
+            self.ai_note = Some("正文为空，无可句读".to_string());
+            cx.notify();
+            return;
+        }
+        self.ai_busy = true;
+        self.ai_note = Some("AI 句读中…".to_string());
+        cx.notify();
+        let text = self.text.clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<CollationWorkspace>, app: &mut gpui::AsyncApp| {
+                let mut app = app.clone();
+                async move {
+                    // 网络 / Mock 在后台线程跑（真接 API 时这里会 await HTTP），
+                    // 主线程只等结果、只改状态——UI 永远不卡。
+                    let res = app
+                        .background_executor()
+                        .spawn(async move {
+                            jiandu_core::ai::fetch_ai_punctuation(&text).await
+                        })
+                        .await;
+                    let _ = this.update(&mut app, |c, cx| {
+                        c.ai_busy = false;
+                        match res {
+                            Ok(punct) => {
+                                let n = c.text.chars().count();
+                                // 用 Find/Replace 纯函数无缝替换整段（不拆段、不越界）。
+                                let (new, _) = splice_chars(&c.text, 0, n, &punct);
+                                if new != c.text {
+                                    c.text = new;
+                                    c.touch(cx); // 触发重排（ensure_line_index 在 text 变后重建）
+                                    c.ai_note = Some("AI 句读完成".to_string());
+                                } else {
+                                    c.ai_note = Some("正文已是句读态".to_string());
+                                }
+                            }
+                            Err(e) => {
+                                c.ai_note = Some(format!("AI 句读失败：{e}"));
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
     /// **快捷标点栏的一枚小方块**（v1.9.25）。
     ///
     /// 刻意不做成「灰色按钮」：28×28 的薄片、7px 圆角、4% 墨的底，悬停才浮到
@@ -4419,6 +4600,11 @@ impl CollationWorkspace {
                     ),
             )
             .child(div().w(px(18.0)))
+            // 【查找 / 替换】（v1.9.97）：顶栏最显眼的第一个工具，放大镜图标。
+            // 点击直出「查找 + 替换」双栏浮窗；⌘F / ⌘H 的键盘路由原样保留，
+            // 异体字联动、忽略句读、浅黄 + 朱红高亮三项核心逻辑一字未动。
+            .child(self.find_tool_button(cx))
+            .child(div().w(px(6.0)))
             // ── 两个「导入」入口，职责严格分离（v1.9.71，用户口径）────────────
             //
             // 旧版只有一枚【导入 MD】，而它的选择器把 PDF 全置灰——用户想导原图
@@ -4448,6 +4634,11 @@ impl CollationWorkspace {
             .child(self.diff_chip(cx))
             // 「清洗日志」（v1.9.60）：生成 sanitize_report.md 并在访达中打开。
             .child(self.clean_log_chip(cx))
+            // 【AI 句读】（v1.9.95 脚手架）：毛笔图标 + 文字，Pro 专属。
+            // 未激活点它会直接弹激活窗（见 `ai_punctuate` 与
+            // `CollationEvent::RequestActivation`）。
+            .child(self.ai_tool_button(cx))
+            .child(self.ai_note_label(cx))
             .child(div().flex_1())
             // 已保存微光（v1.9.73）：顶栏右侧一粒米大小的状态点。
             .child(self.save_led())
@@ -4680,7 +4871,7 @@ impl CollationWorkspace {
             .child(line("定位", "单击落光标；双击选句；三击选整段；⇧ 点击从上一落点扩选。"))
             .child(line("框选补字", "在左图上拖一个框，命中的字会拼成待补文字，点【补入】插到光标处。"))
             .child(line("撤销", "⌘Z 撤销、⌘⇧Z 重做。连打字算一步，不会一个字退一次。"))
-            .child(line("查找", "⌘F 呼出查找条，⌘G / ⌘⇧G 上下一个；再按 ⌘F 或 Esc 收起。"))
+            .child(line("查找 / 替换", "顶栏【查找 / 替换】或 ⌘H 呼出双栏浮窗；⌘F 只开查找，⌘G / ⌘⇧G 上下一个；再按 ⌘F 或 Esc 收起。异体字联动、忽略句读标点，全命中浅黄 / 当前命中朱红。"))
             // ③ 特色功能
             .child(head("特色功能"))
             .child(line("原文对照", "左栏导入毛坯 / 右栏清洗后正文，逐字比对，防清洗误杀。"))

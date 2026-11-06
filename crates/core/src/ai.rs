@@ -814,6 +814,59 @@ pub fn jodu_assign(
     out
 }
 
+/// **`fetch_ai_punctuation` —— AI 句读的网络取数接口（v1.9.95 脚手架）。**
+///
+/// 这是「真·发给模型」那一步的**预留接口**。当前是 **Mock 实现**：不碰网络、
+/// 不调任何 API，只把每行末尾按需补上一颗句末标点（"句尾直接加句号"），用来把
+/// 「异步取数 → 回写正文 → 重排」这条链路在还没接真模型前就跑通、跑绿。
+///
+/// 真实实现（v1.1 落地）会：拿 [`JODU_SYSTEM`] 当系统提示、把待断句文本按
+/// [`jodu_plan`] 分组、用 `ai.json` 里的连接参数发 OpenAI 兼容请求、再拿
+/// [`jodu_assign`] 把回包对齐回写。到时候本函数只需把 `text` 送进请求、把回包
+/// 原样返回，上层逻辑一行都不用动。
+///
+/// 之所以写成 `async fn`：上层用 `cx.background_executor()` 调它，UI 永远不卡；
+/// 真接网络后这里 `await` 一次 HTTP 调用即可，调用方零改动。
+///
+/// 入参 `text` 是待断句的**纯文本**（一段一行，行即段）；返回带标点的同构文本。
+pub async fn fetch_ai_punctuation(text: &str) -> Result<String, String> {
+    // TODO(v1.1)：替换成真实的 OpenAI 兼容请求（见上方模块说明）。
+    // 现在直接转调同步 Mock，预留的网络位将来填这里。
+    mock_punctuate(text)
+}
+
+/// Mock 本体（纯同步，可单测）：见 [`fetch_ai_punctuation`] 说明。
+///
+/// 规则极简：每段（按行）末尾若还没有句末标点，补一颗句号。空行原样保留，
+/// 末尾多余换行也去掉，保证与输入「同形」。这只是占位，v1.1 会被真模型替换。
+pub fn mock_punctuate(text: &str) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Err("正文为空，无可句读".to_string());
+    }
+    // 逐行处理后用 '\n' 拼回：`lines()` 不会像 `split('\n')` 那样为末尾
+    // 换行再造一个空段，也就不会把「有字\n\n」里那一道真正的空行吃掉。
+    // 空行原样保留、末尾不多补换行 —— 与输入同形（见函数注释与单测）。
+    let mut lines_out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            lines_out.push(String::new());
+            continue;
+        }
+        let ends_punct = line
+            .chars()
+            .last()
+            .map(|c| matches!(c, '。' | '．' | '.' | '！' | '？' | '，' | ',' | '；' | '：' | '、' | '”' | '』'))
+            .unwrap_or(false);
+        let mut s = line.to_string();
+        if !ends_punct {
+            s.push('。');
+        }
+        lines_out.push(s);
+    }
+    Ok(lines_out.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1257,5 +1310,25 @@ mod tests {
             chapters: Vec::new(),
         };
         assert!(!jodu_needed(&empty), "没字不判需要");
+    }
+
+    #[test]
+    fn mock_punctuate_appends_period_to_bare_lines() {
+        // 无标点段 → 句尾补句号。
+        assert_eq!(mock_punctuate("天地玄黄").unwrap(), "天地玄黄。");
+        // 多段逐行处理。
+        assert_eq!(
+            mock_punctuate("天地玄黄\n宇宙洪荒").unwrap(),
+            "天地玄黄。\n宇宙洪荒。"
+        );
+        // 已有句末标点的段不再补（幂等）。
+        assert_eq!(
+            mock_punctuate("天地玄黄。\n宇宙洪荒？").unwrap(),
+            "天地玄黄。\n宇宙洪荒？"
+        );
+        // 空行原样保留，但末尾多余换行被去掉（与输入同形）。
+        assert_eq!(mock_punctuate("有字\n\n").unwrap(), "有字。\n");
+        // 空正文 → Err（上层据此提示「正文为空」）。
+        assert!(mock_punctuate("   \n  ").is_err());
     }
 }

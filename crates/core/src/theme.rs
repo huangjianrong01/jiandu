@@ -1,4 +1,4 @@
-//! 纸色主题：宣纸 / 米黄 / 青简 / 夜读。
+//! 纸色主题：宣纸 / 青简 / 夜读 / 仿刻本 / 高对比日 / 高对比夜 / 护眼 / 宋本泛黄。
 //!
 //! 刻本的美感来自「层次」而不是「对比」：纸、墨、界行、版框、朱印各压一档，
 //! 正文才立得住。夜读不用纯黑底 + 纯白字，改用暖调深棕 + 米色墨，
@@ -12,7 +12,7 @@
 ///     （背景=纸色，界栏/版框=界栏色，正文=正文色，双行夹注=夹注色）。
 ///
 /// 新增一套配色只在此加一行，UI 与渲染零改动。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct PaperTheme {
     /// 配置 id（持久化 / 反查用）。
     pub id: &'static str,
@@ -34,11 +34,16 @@ pub struct PaperTheme {
     /// 是「沉朱」（`#8C2B22`），用来盖印、写夹注很稳，用来点句读就读成
     /// 一枚暗红的墨点，毫无书卷气。两档各归各的，谁也不迁就谁。
     pub zhu: u32,
+    /// **Pro 专属**（v1.9.99）：只此一档是专业版纸色，配置上单列标记。
+    pub is_pro: bool,
+    /// **纸张噪点强度**（0.0 = 不铺纹理；0.10 ≈ 陈年纸的细颗粒）。
+    /// 由底层墨线 Canvas 在画框线之前撒点，见 `sheet_ink::paint_paper_grain`。
+    pub grain: f32,
 }
 
 /// 主题配置表：顺序即面板按钮顺序，下标即 `Theme` 的编号。
 ///
-/// **纸色固定四套**（宣纸 / 米黄 / 青简 / 夜读），与「墨色」四套
+/// **纸色共八套**（宣纸 / 青简 / 夜读 / 仿刻本 / 高对比日 / 高对比夜 / 护眼 / 宋本泛黄），与「墨色」四套
 /// （墨朱 / 松墨 / 赭朱 / 暗金）一一联动（见 [`Theme::linked_palette`]）。
 /// 每套纸的 `text` / `note` 即联动墨色的浅纸取值，选「墨朱」组时直接取这里。
 /// 新增配色只在此加一行（同时给 `Theme` 加一个变体）。
@@ -51,15 +56,8 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         note: 0xB23A30,  // 墨朱·批注（朱砂红）
         zhu: 0xB2382E,   // 墨朱·句读
         border: 0x2F3535, // 乌丝栏
-    },
-    PaperTheme {
-        id: "mihuang",
-        name: "米黄",
-        paper: 0xF2E6D0,
-        text: 0x3D352F,  // 赭朱·正文
-        note: 0xA63F2E,  // 赭朱·批注
-        zhu: 0xA8412F,   // 赭朱·句读
-        border: 0x4A6B5D, // 绿丝栏
+        is_pro: false,
+        grain: 0.0,
     },
     PaperTheme {
         id: "qingjian",
@@ -69,6 +67,8 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         note: 0x8C3A3A,  // 松墨·批注
         zhu: 0x9A3C36,   // 松墨·句读
         border: 0x222B2D,
+        is_pro: false,
+        grain: 0.0,
     },
     PaperTheme {
         id: "yedou",
@@ -78,6 +78,8 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         note: 0xA68E5C, // 暗金·批注（秋香）
         zhu: 0xC0A26A,  // 暗金·句读（秋香，深底上不刺眼）
         border: 0x4A4D4F, // 灰丝栏
+        is_pro: false,
+        grain: 0.0,
     },
     // ── v1.83.0 · 仿古籍精刻本 ──────────────────────────────────────
     // 用户点名的那一档：**纸是 #F7F6F1**（冷一点的米白，不是宣纸黄），
@@ -95,6 +97,8 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         note: 0x8C2B22,   // 朱（比墨朱稍沉，压在冷米白上不刺）
         zhu: 0xB0342C,   // 句读朱砂：照精刻本照片取（照片实测 #B3262F）
         border: 0x2E2823, // 版框：比正文更深，外框才立得住
+        is_pro: false,
+        grain: 0.0,
     },
     // ── v1.9.82 · 无障碍高对比（视弱用户）────────────────────────────
     // 这**不是**第三套国色，是另一套目标：前面五套追求「层次」（纸、墨、
@@ -112,6 +116,8 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         note: 0x0B2A5B,  // 深靛（13.9:1）——夹注仍要与正文分得开
         zhu: 0x9E0000,   // 朱（8.6:1）：句读是图形，但太暗就成墨点了
         border: 0x000000,
+        is_pro: false,
+        grain: 0.0,
     },
     PaperTheme {
         id: "a11y_night",
@@ -121,6 +127,8 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         note: 0xFFC24D,  // 琥珀（13.1:1）
         zhu: 0xFF7A66,   // 亮朱（8.2:1）：0xB0342C 这种沉朱在黑底上只有 3.4:1
         border: 0x8A8A8A, // 界行 6.1:1——1px 细线在黑底上不能更淡
+        is_pro: false,
+        grain: 0.0,
     },
     // ── v1.9.83 · 护眼（黑底黄字）────────────────────────────────
     // 与「高对比夜」看着像、目的不同：那一档是**视弱**要极致对比（纯白
@@ -137,6 +145,22 @@ pub const PAPER_THEMES: &[PaperTheme] = &[
         note: 0xC9A24A,  // 暗金（8.9:1）：夹注仍要退一档，否则小字抢正文
         zhu: 0xFF9A70,   // 亮朱（深底再兑 0.20 后约 4.9:1）
         border: 0x8A7A4A, // 暗金界行（兑下去 4.2:1）
+        is_pro: false,
+        grain: 0.0,
+    },
+    // ── v1.9.99 · 宋本泛黄（Pro，第 8 套）────────────────────────────
+    // 陈年黄纸 + 松烟墨 0x3D352F，纸面另铺一层 grain=0.10 的烘焙噪点。
+    // 三者都由 `Theme` 在 render 当下派生，绝不缓存第二份配色状态。
+    PaperTheme {
+        id: "songben",
+        name: "宋本泛黄",
+        paper: 0xE8D9B8, // 陈年黄纸（比宣纸沉、比米黄旧，绝不发荧光）
+        text: 0x3D352F,  // 松烟墨（用户点名，联动墨朱组直接取这一档）
+        note: 0x8C3A2E,  // 沉朱批注
+        zhu: 0xB0342C,   // 句读朱砂
+        border: 0x4A3F31, // 陈年界栏（褐而不黑）
+        is_pro: true,
+        grain: 0.10,
     },
 ];
 
@@ -278,8 +302,6 @@ pub enum Theme {
     /// 宣纸：米白偏暖，最像常见的影印本（联动「墨朱」）。
     #[default]
     Xuan,
-    /// 米黄：更黄一些，旧书味重（联动「赭朱」）。
-    Mi,
     /// 青简：青灰纸配竹青界行（联动「松墨」）。
     Qing,
     /// 夜读：暖调深底（联动「暗金」）。
@@ -295,6 +317,9 @@ pub enum Theme {
     /// 与 [`Theme::A11yNight`] 的区别是**目的**而不是深浅：那一档为视弱
     /// 要极致对比，这一档为久读要少蓝光。菜单栏「高对比护眼模式」进的是它。
     Huyan,
+    /// **宋本泛黄（Pro，v1.9.99）**：陈年黄纸 + 松烟墨 + 烘焙纸张噪点。
+    /// 排在表尾是有意的——旧存档 / 内建预设存的都是 0..6 下标，绝不漂移。
+    Songben,
 }
 
 
@@ -302,13 +327,13 @@ impl Theme {
     /// 顺序必须与 [`PAPER_THEMES`] 完全一致——下标即主题编号。
     pub const ALL: [Theme; 8] = [
         Theme::Xuan,
-        Theme::Mi,
         Theme::Qing,
         Theme::Ye,
         Theme::Ke,
         Theme::A11yDay,
         Theme::A11yNight,
         Theme::Huyan,
+        Theme::Songben,
     ];
 
     /// 面板上显示的名字（直接取配置表，免得两套名字不同步）。
@@ -320,13 +345,13 @@ impl Theme {
     pub fn index(self) -> usize {
         match self {
             Theme::Xuan => 0,
-            Theme::Mi => 1,
-            Theme::Qing => 2,
-            Theme::Ye => 3,
-            Theme::Ke => 4,
-            Theme::A11yDay => 5,
-            Theme::A11yNight => 6,
-            Theme::Huyan => 7,
+            Theme::Qing => 1,
+            Theme::Ye => 2,
+            Theme::Ke => 3,
+            Theme::A11yDay => 4,
+            Theme::A11yNight => 5,
+            Theme::Huyan => 6,
+            Theme::Songben => 7,
         }
     }
 
@@ -399,17 +424,19 @@ impl Theme {
 
     /// 「纸色 → 墨色」智能联动的默认配对（任务四：一键换肤）。
     ///
-    /// 宣纸→墨朱、米黄→赭朱、青简→松墨、夜读→暗金；仿刻本→墨朱（焦墨那套）；
+    /// 宣纸→墨朱、青简→松墨、夜读→暗金；仿刻本→墨朱（焦墨那套）；
     /// 用户随后仍可手动把墨色切到任意一套（手动覆盖默认联动）。
     pub fn linked_palette(self) -> InkPalette {
         match self {
             // 无障碍档与护眼档恒连锁「墨朱」= 直接取纸主题的 `text`，
             // 即纯黑 / 纯白 / 暖黄。若这里放行别的墨色组（赭朱、暗金），
             // 正文就不再是那个承诺的色，对比度与「黑底黄字」当场作废。
-            Theme::Xuan | Theme::Ke | Theme::A11yDay | Theme::A11yNight | Theme::Huyan => {
-                InkPalette::Ink
-            }
-            Theme::Mi => InkPalette::Ochre,
+            Theme::Xuan
+            | Theme::Ke
+            | Theme::Songben
+            | Theme::A11yDay
+            | Theme::A11yNight
+            | Theme::Huyan => InkPalette::Ink,
             Theme::Qing => InkPalette::Forest,
             Theme::Ye => InkPalette::Gold,
         }
@@ -418,6 +445,16 @@ impl Theme {
     /// 取本主题的四色配置（纸 / 正文 / 夹注 / 界栏）。
     pub fn paper_theme(self) -> &'static PaperTheme {
         &PAPER_THEMES[self.index()]
+    }
+
+    /// **纸张噪点强度**（0 = 这套纸不铺纹理）。渲染层唯一入口。
+    pub fn grain(self) -> f32 {
+        self.paper_theme().grain
+    }
+
+    /// 是否 Pro 专属纸色。
+    pub fn is_pro(self) -> bool {
+        self.paper_theme().is_pro
     }
 
     /// 是否深底：由纸色亮度推导（新增深底主题无需改这里）。
@@ -722,7 +759,7 @@ pub enum InkPalette {
     Ink,
     /// 墨绿正文 · 砖红批注（联动青简）
     Forest,
-    /// 赭褐正文 · 朱红批注（联动米黄）
+    /// 赭褐正文 · 朱红批注（可手动选；已无纸色默认联动它）
     Ochre,
     /// 暗金正文 · 米白/金批注（联动夜读；浅纸走暗金，深底走月白+秋香）
     Gold,
@@ -953,8 +990,8 @@ mod tests {
         assert!(chrome >= 7.0, "护眼界面字对界面底只有 {chrome:.2}:1");
 
         // 一键进 / 出：进档恒 Huyan，出档原样回进档前那套。
-        assert_eq!(Theme::Mi.toggle_huyan(None), Theme::Huyan);
-        assert_eq!(Theme::Huyan.toggle_huyan(Some(Theme::Mi)), Theme::Mi);
+        assert_eq!(Theme::Qing.toggle_huyan(None), Theme::Huyan);
+        assert_eq!(Theme::Huyan.toggle_huyan(Some(Theme::Qing)), Theme::Qing);
         // 冷启动就在档里（没有 back）回默认宣纸，而不是卡在档里出不来。
         assert_eq!(Theme::Huyan.toggle_huyan(None), Theme::Xuan);
     }
@@ -985,12 +1022,12 @@ mod tests {
         assert_eq!(Theme::Ke.toggle_a11y(None), Theme::A11yDay);
         assert_eq!(Theme::Ye.toggle_a11y(None), Theme::A11yNight);
         // 退回来处：用户调的那套原样还给他。
-        assert_eq!(Theme::A11yDay.toggle_a11y(Some(Theme::Mi)), Theme::Mi);
+        assert_eq!(Theme::A11yDay.toggle_a11y(Some(Theme::Qing)), Theme::Qing);
         assert_eq!(Theme::A11yNight.toggle_a11y(Some(Theme::Ke)), Theme::Ke);
         // 没有来处（比如冷启动就停在无障碍档）就回默认，不许留在原地打转。
         assert_eq!(Theme::A11yDay.toggle_a11y(None), Theme::Xuan);
         // 两次切换 = 回到原点。
-        for t in [Theme::Xuan, Theme::Mi, Theme::Ye, Theme::Ke] {
+        for t in [Theme::Xuan, Theme::Ye, Theme::Ke] {
             let there = t.toggle_a11y(None);
             assert!(there.is_a11y());
             assert_eq!(there.toggle_a11y(Some(t)), t);
@@ -1002,7 +1039,7 @@ mod tests {
     /// 故句读另开 `zhu` 一档，且它必须**明显偏红**（R 高出 G/B 一大截）。
     #[test]
     fn z_zhu_is_a_livelier_cinnabar_than_the_seal_ink() {
-        for t in [Theme::Xuan, Theme::Mi, Theme::Qing, Theme::Ke] {
+        for t in [Theme::Xuan, Theme::Qing, Theme::Ke] {
             let zhu = t.zhu();
             let (r, g, b) = (
                 ((zhu >> 16) & 0xFF) as i32,
@@ -1026,7 +1063,7 @@ mod tests {
     #[test]
     fn z_note_is_fainter_than_ink_on_light_paper() {
         // 浅纸：夹注目色 = 墨色向纸色兑淡 → 一定比正文淡（亮度更高）。
-        for t in [Theme::Xuan, Theme::Mi, Theme::Qing] {
+        for t in [Theme::Xuan, Theme::Qing] {
             for p in InkPalette::ALL {
                 let ink = p.ink(t);
                 let note = p.z_note(t, false);
@@ -1083,6 +1120,27 @@ mod tests {
             // 纸色与墨色智能联动：每套纸都有默认墨色配对。
             assert_eq!(t.linked_palette().ink(t), p.text, "{:?} 联动墨色错位", t);
         }
+    }
+
+    /// 宋本泛黄四件套必须同时到位：名字 / Pro 标记 / 墨色 / 噪点，
+    /// 且只有它一套带纹理（防止 grain 被批量误填到别套纸上）。
+    #[test]
+    fn songben_theme_is_wired_with_grain_and_ink() {
+        let p = PaperTheme::by_id("songben");
+        assert_eq!(p.name, "宋本泛黄");
+        assert!(p.is_pro, "宋本泛黄必须标 Pro");
+        assert!((p.grain - 0.10).abs() < 1e-6, "grain 应约 0.10，实际 {}", p.grain);
+        assert_eq!(p.text, 0x3D352F, "专属松烟墨被改了");
+        let t = Theme::Songben;
+        assert_eq!(t.index(), 7);
+        assert_eq!(t.paper(), p.paper);
+        assert_eq!(t.ink(), 0x3D352F);
+        assert_eq!(t.grain(), p.grain);
+        assert!(t.is_pro());
+        // 联动墨朱组必须原样取配置里的正文色，不许被墨色组改写。
+        assert_eq!(t.linked_palette().ink(t), p.text);
+        assert_eq!(Theme::ALL.iter().filter(|x| x.grain() > 0.0).count(), 1);
+        assert_eq!(Theme::ALL.iter().filter(|x| x.is_pro()).count(), 1);
     }
 
     #[test]
@@ -1167,8 +1225,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "xuanzhi", "mihuang", "qingjian", "yedou", "keben", "a11y_day", "a11y_night",
-                "huyan"
+                "xuanzhi", "qingjian", "yedou", "keben", "a11y_day", "a11y_night",
+                "huyan", "songben"
             ]
         );
         let names: Vec<&str> = PAPER_THEMES.iter().map(|p| p.name).collect();
@@ -1176,13 +1234,13 @@ mod tests {
             names,
             vec![
                 "宣纸",
-                "米黄",
                 "青简",
                 "夜读",
                 "仿刻本",
                 "高对比日",
                 "高对比夜",
-                "护眼"
+                "护眼",
+                "宋本泛黄"
             ]
         );
         // 四色齐全、互不重复（纸 / 正文 / 夹注 / 界栏）。
@@ -1199,7 +1257,7 @@ mod tests {
         // ① 用户点名的纸号，逐位钉死（改纸色＝改这一档的全部气质）。
         assert_eq!(Theme::Ke.paper(), 0xF7F6F1);
         assert!(Theme::Ke.is_keben());
-        for t in [Theme::Xuan, Theme::Mi, Theme::Qing, Theme::Ye] {
+        for t in [Theme::Xuan, Theme::Qing, Theme::Ye] {
             assert!(!t.is_keben(), "{t:?} 不该被当成仿刻本");
         }
         // ② 仿刻本的界行 / 内框比外框淡一档（外框仍是 `frame_ink` 的浓墨）。
@@ -1216,10 +1274,10 @@ mod tests {
                 "{rc:?} 的界行淡到看不见了：{inner:06X}"
             );
         }
-        // ③ 浅纸三套：`rule_line` 必须与 `rule_by` 逐值相同
+        // ③ 浅纸两套：`rule_line` 必须与 `rule_by` 逐值相同
         //    （老版面的框线颜色一分都不许变）。夜读自 v1.85.0 起另退一档，
         //    见下一段。
-        for t in [Theme::Xuan, Theme::Mi, Theme::Qing] {
+        for t in [Theme::Xuan, Theme::Qing] {
             for rc in crate::types::RuleColor::ALL {
                 assert_eq!(
                     t.rule_line(rc),
@@ -1251,8 +1309,8 @@ mod tests {
                 "{rc:?} 夜读的界行淡到看不见了：{inner:06X}"
             );
         }
-        // ⑤ 浅纸四套的外框取色一分不动（提亮只发生在深底）。
-        for t in [Theme::Xuan, Theme::Mi, Theme::Qing, Theme::Ke] {
+        // ⑤ 浅纸三套的外框取色一分不动（提亮只发生在深底）。
+        for t in [Theme::Xuan, Theme::Qing, Theme::Ke] {
             assert_eq!(
                 t.frame_outer(),
                 t.paper_theme().border,
@@ -1285,7 +1343,7 @@ mod tests {
     #[test]
     fn dark_theme_is_derived_from_paper_luma() {
         assert!(Theme::Ye.is_dark());
-        for t in [Theme::Xuan, Theme::Mi, Theme::Qing] {
+        for t in [Theme::Xuan, Theme::Qing] {
             assert!(!t.is_dark());
         }
         // 深底判定来自纸色亮度，不是写死枚举。

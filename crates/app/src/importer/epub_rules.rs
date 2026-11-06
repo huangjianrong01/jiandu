@@ -173,8 +173,23 @@ impl Rules {
                 return p;
             }
         }
-        // 兜底：`profiles` 为空等极端情况，绝不 panic。
-        self.profiles.last().expect("规则表至少有一条 generic 方案")
+        // 兜底：用户把规则表里的 `profiles` 删空也绝不 panic。
+        // 旧的 `.expect(...)` 与上面「绝不 panic」的注释自相矛盾，换成
+        // 静态 generic 方案，任何时刻都有引用可返。
+        static FALLBACK: std::sync::OnceLock<Profile> = std::sync::OnceLock::new();
+        self.profiles.last().unwrap_or_else(|| {
+            FALLBACK.get_or_init(|| Profile {
+                id: "generic".to_string(),
+                note: String::new(),
+                detect: Detect::default(),
+                img_class: Vec::new(),
+                vertical_forms: false,
+                strip_leading_indent: false,
+                drop_class: Vec::new(),
+                note_class: Vec::new(),
+                merge_broken: true,
+            })
+        })
     }
 
     /// 按方案组装出本次导入要用的句读图片映射。
