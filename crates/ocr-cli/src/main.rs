@@ -160,12 +160,17 @@ fn main() -> Result<()> {
     if let Some("vision") = args.get(1).map(|s| s.as_str()) {
         let mut img: Option<String> = None;
         let mut out: Option<String> = None;
+        let mut overlay: Option<String> = None;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
                 "-o" | "--output" => {
                     i += 1;
                     out = args.get(i).cloned();
+                }
+                "--overlay" => {
+                    i += 1;
+                    overlay = args.get(i).cloned();
                 }
                 s => {
                     if img.is_none() {
@@ -175,8 +180,12 @@ fn main() -> Result<()> {
             }
             i += 1;
         }
-        let img = img.context("缺少输入图像路径（用法：jiandu-ocr vision <图片> [-o 输出]）")?;
-        return vision::run_vision_cli(Path::new(&img), out.as_deref().map(Path::new));
+        let img = img.context("缺少输入（用法：jiandu-ocr vision <图片|目录> [-o 输出] [--overlay 叠加图]）")?;
+        return vision::run_vision_cli(
+            Path::new(&img),
+            out.as_deref().map(Path::new),
+            overlay.as_deref().map(Path::new),
+        );
     }
 
     let mut input: Option<String> = None;

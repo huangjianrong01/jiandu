@@ -26,6 +26,9 @@ use objc2_foundation::CGRect;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+use image::{Rgba, RgbaImage};
+
 // 链接 Vision 框架（仅声明，符号由系统提供）。
 #[link(name = "Vision", kind = "framework")]
 unsafe extern "C" {}
@@ -247,30 +250,210 @@ impl OcrProvider for VisionOcrProvider {
     }
 }
 
-/// 独立 CLI 入口：把一张本地图片喂给 Vision，打印与 `app.rs::load_compare_json`
-/// 兼容的坐标 JSON（图像维度 + 逐字 x/y/w/h/target/confidence）。
-pub fn run_vision_cli(image: &Path, output: Option<&Path>) -> Result<()> {
+/// 独立 CLI 入口（macOS）：把一张本地图片（或整目录）喂给 Vision，产出与
+/// `app.rs::load_compare_json` 兼容的坐标 JSON，并可叠加一张「红框 overlay」PNG
+/// 用于人工核验坐标质量（弯曲书脊 / 倾斜扫描等复杂排版）。
+///
+/// - 单图模式：`vision <图片> [-o json] [--overlay png]`
+/// - 批量模式：`vision <目录>` → 目录内每张图产出 `<名>.json` + `<名>._overlay.png`
+///   并汇总越界数 / y 区间等统计，便于一次性扫一堆扫描页。
+pub fn run_vision_cli(input: &Path, output: Option<&Path>, overlay: Option<&Path>) -> Result<()> {
+    if input.is_dir() {
+        return run_vision_dir(input);
+    }
     let provider = VisionOcrProvider::default();
-    let result = provider.recognize(&OcrInput::from_path(image))?;
+    let result = provider.recognize(&OcrInput::from_path(input))?;
     let store = jiandu_core::ocr_provider::AlignmentStore::from_ocr(result);
-    let json = store.to_compare_json();
-    let pretty = serde_json::to_string_pretty(&json)?;
+    let pretty = serde_json::to_string_pretty(&store.to_compare_json())?;
     match output {
         Some(p) => {
             std::fs::write(p, &pretty).with_context(|| format!("写文件失败：{}", p.display()))?;
-            eprintln!(
-                "✓ Vision OCR 完成：{} 字，写出 {}",
-                store.glyphs.len(),
-                p.display()
-            );
+            eprintln!("✓ Vision OCR 完成：{} 字，写出 {}", store.glyphs.len(), p.display());
         }
         None => {
             println!("{}", pretty);
         }
     }
+    if let Some(ov) = overlay {
+        draw_overlay(input, &store, ov)?;
+        eprintln!("✓ overlay 写出 {}", ov.display());
+    }
+    let (oob, ymin, ymax) = glyph_stats(&store);
     eprintln!(
-        "  provider=vision  image={}x{}  glyphs={}",
-        store.image_width, store.image_height, store.glyphs.len()
+        "  provider=vision  image={}x{}  glyphs={}  oob={}  y∈[{:.0},{:.0}]",
+        store.image_width, store.image_height, store.glyphs.len(), oob, ymin, ymax
     );
     Ok(())
+}
+
+/// 批量目录模式：取一层目录内的图像文件，逐张产出 JSON + 红框 overlay，并打印统计。
+fn run_vision_dir(dir: &Path) -> Result<()> {
+    let provider = VisionOcrProvider::default();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .with_context(|| format!("无法读取目录：{}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| is_image_ext(p))
+        .collect();
+    entries.sort();
+    eprintln!("▶ 批量 Vision OCR：{} 共 {} 张图", dir.display(), entries.len());
+    let mut total = 0usize;
+    let mut failed = 0usize;
+    for p in &entries {
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("page");
+        let json_path = dir.join(format!("{}.json", stem));
+        let ov_path = dir.join(format!("{}._overlay.png", stem));
+        // 单张图最多重试一次：Vision 在同进程连续跑 handler 时偶发 performRequests 失败，
+        // 重试通常即可恢复；最终失败则跳过该图，不让整批中断（用户可能一次丢几十张扫描页）。
+        let result = match recognize_with_retry(&provider, p, 2) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("  ⚠️ {} 识别失败（跳过）：{:#}", stem, e);
+                failed += 1;
+                continue;
+            }
+        };
+        let store = jiandu_core::ocr_provider::AlignmentStore::from_ocr(result);
+        total += store.glyphs.len();
+        std::fs::write(&json_path, serde_json::to_string_pretty(&store.to_compare_json())?)?;
+        draw_overlay(p, &store, &ov_path)?;
+        let (oob, ymin, ymax) = glyph_stats(&store);
+        eprintln!(
+            "  ✓ {} → {} 字, oob={}, y∈[{:.0},{:.0}] (+overlay)",
+            stem, store.glyphs.len(), oob, ymin, ymax
+        );
+    }
+    eprintln!(
+        "✅ 批量完成：{} 张图，成功 {} 张，跳过 {} 张，共 {} 字",
+        entries.len(),
+        entries.len() - failed,
+        failed,
+        total
+    );
+    Ok(())
+}
+
+/// 带重试的识别（见 `run_vision_dir` 注释：规避 Vision 连续 handler 的偶发失败）。
+fn recognize_with_retry(
+    provider: &VisionOcrProvider,
+    path: &Path,
+    attempts: usize,
+) -> Result<OcrResult> {
+    let mut last = None;
+    for _ in 0..attempts.max(1) {
+        match provider.recognize(&OcrInput::from_path(path)) {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("未知识别错误")))
+}
+
+/// 常见扫描图扩展名（批量模式据此挑文件）。
+fn is_image_ext(p: &Path) -> bool {
+    let ext = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "webp" | "gif"
+    )
+}
+
+/// 统计越界字数与 y 区间（左上角原点）。oob=0 且 y 区间合理即说明 Y 翻转正确。
+fn glyph_stats(store: &jiandu_core::ocr_provider::AlignmentStore) -> (u32, f32, f32) {
+    let (w_f, h_f) = (store.image_width as f32, store.image_height as f32);
+    let mut oob = 0u32;
+    let mut ymin = f32::MAX;
+    let mut ymax = f32::MIN;
+    for g in &store.glyphs {
+        if g.x < 0.0 || g.y < 0.0 || g.x + g.w > w_f || g.y + g.h > h_f {
+            oob += 1;
+        }
+        ymin = ymin.min(g.y);
+        ymax = ymax.max(g.y + g.h);
+    }
+    if ymin == f32::MAX {
+        ymin = 0.0;
+        ymax = 0.0;
+    }
+    (oob, ymin, ymax)
+}
+
+/// 在原图上叠加红色字形包围盒，存为 PNG，用于人工核验坐标是否贴合字形。
+/// 这是判断「坐标精度」最直观的依据：弯曲书脊 / 倾斜扫描下，看红框是否仍钉在
+/// 各自字符上（Vision 给的是轴对齐框，不随文字旋转，倾斜页会显露出基线错位）。
+fn draw_overlay(
+    image_path: &Path,
+    store: &jiandu_core::ocr_provider::AlignmentStore,
+    out_path: &Path,
+) -> Result<()> {
+    let img = image::open(image_path)
+        .with_context(|| format!("无法打开原图绘制 overlay：{}", image_path.display()))?
+        .to_rgba8();
+    let (w_img, h_img) = (img.width() as i64, img.height() as i64);
+    let mut canvas = img;
+    let red = Rgba([255u8, 0u8, 0u8, 255u8]);
+    for g in &store.glyphs {
+        draw_rect(
+            &mut canvas,
+            g.x.round() as i64,
+            g.y.round() as i64,
+            g.w.round() as i64,
+            g.h.round() as i64,
+            &red,
+            w_img,
+            h_img,
+        );
+    }
+    canvas
+        .save(out_path)
+        .with_context(|| format!("保存 overlay 失败：{}", out_path.display()))?;
+    Ok(())
+}
+
+/// 画 2px 红色描边矩形（clamp 到图像内，绝不越界写入）。
+fn draw_rect(
+    img: &mut RgbaImage,
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+    color: &image::Rgba<u8>,
+    w_img: i64,
+    h_img: i64,
+) {
+    let x0 = x.max(0).min(w_img - 1);
+    let y0 = y.max(0).min(h_img - 1);
+    let x1 = (x + w).max(0).min(w_img - 1);
+    let y1 = (y + h).max(0).min(h_img - 1);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let t = 2i64;
+    for xx in x0..=x1 {
+        for dy in 0..t {
+            if y0 + dy < h_img {
+                img.put_pixel(xx as u32, (y0 + dy) as u32, *color);
+            }
+            if y1 - dy >= 0 {
+                img.put_pixel(xx as u32, (y1 - dy) as u32, *color);
+            }
+        }
+    }
+    for yy in y0..=y1 {
+        for dx in 0..t {
+            if x0 + dx < w_img {
+                img.put_pixel((x0 + dx) as u32, yy as u32, *color);
+            }
+            if x1 - dx >= 0 {
+                img.put_pixel((x1 - dx) as u32, yy as u32, *color);
+            }
+        }
+    }
 }

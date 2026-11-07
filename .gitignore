@@ -16,6 +16,9 @@ dist/
 # Android 签名密钥（机密，绝不入库）
 *.keystore
 
+# L4 OCR 真图测试箱：用户丢真实扫描书图 + 生成的 JSON/overlay 都不入库
+test_ocr/
+
 # Android 前端资源由 Gradle 拷贝任务生成，属构建产物
 jiandu-tauri/src-tauri/gen/android/app/frontend_assets/
 
