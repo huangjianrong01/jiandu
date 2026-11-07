@@ -114,6 +114,7 @@ mod share;
 mod share_layout;
 #[cfg(target_os = "macos")]
 mod share_paint;
+mod compare_tiles;
 mod shelf;
 mod sound;
 mod storekit;

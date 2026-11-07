@@ -497,6 +497,8 @@ pub struct Root {
     compare_tween_text: Option<f32>,
     compare_anim_img: bool,
     compare_anim_text: bool,
+    /// L3 瓦片渲染缓存：左图按视口懒加载切片 + LRU，零侵入 L1/L2。
+    compare_tiles: crate::compare_tiles::TileCache,
     pub script: Script,
     /// 参数化网格排版配置：列数 / 方向 / 留白（驱动竖排与横排两套渲染）。
     pub grid: GridConfig,
@@ -1638,6 +1640,7 @@ impl Root {
             compare_tween_text: None,
             compare_anim_img: false,
             compare_anim_text: false,
+            compare_tiles: crate::compare_tiles::TileCache::new(512, 96),
             script: Script::Ancient,
             grid: GridConfig::default(),
             content_w: 0.0,
@@ -6300,6 +6303,7 @@ impl Root {
                     // 换新图：保留既有坐标红框（坐标暂不对版也 OK），只清掉上一次命中高亮。
                     this.compare_img = Some(display);
                     this.compare_hit = None;
+                    this.compare_tiles.reset();
                     cx.notify();
                 })
                 .ok();
@@ -11068,13 +11072,45 @@ impl Root {
                     let scale = if nw > 0 { fit / nw as f32 } else { 1.0 };
                     let dw = fit;
                     let dh = nh as f32 * scale;
-                    // 命中层与图片同尺寸：每个 glyph 画半透明描边框（蓝/命中红），
-                    // 顶层透明 overlay 捕获点击 → 换算到图像坐标 → HitTester。
-                    let mut img_box = div()
-                        .relative()
-                        .w(px(dw))
-                        .h(px(dh))
-                        .child(img(path.clone()).w(px(dw)).h(px(dh)));
+                    // L3 瓦片渲染：按当前滚动 offset + 缩放(scale) 算视口可见切片，只裁切
+                    // /渲染可见范围，命中 LRU 复用，避免重复解码；边缘瓦片按真实剩余尺寸
+                    // 裁切，绝不越界、不闪退。零侵入 L1/L2（联动、滚动补间）。
+                    let disp = compare_image_display_path(path);
+                    let max_off = self.compare_img_scroll.max_offset().height / unit;
+                    let viewport_h = if max_off > 0.0 { (dh - max_off).max(0.0) } else { dh };
+                    let ox = self.compare_img_scroll.offset().x / unit;
+                    let oy = self.compare_img_scroll.offset().y / unit;
+                    let ts = self.compare_tiles.tile_size();
+                    let (c0, r0, c1, r1) =
+                        crate::compare_tiles::TileCache::visible_range(nw, nh, ts, scale, ox, oy, dw, viewport_h);
+                    let mut img_box = div().relative().w(px(dw)).h(px(dh));
+                    let mut tiled = false;
+                    for row in r0..=r1 {
+                        for col in c0..=c1 {
+                            if let Some(tp) = self.compare_tiles.tile(&disp, nw, nh, col, row) {
+                                let tx = col as f32 * ts as f32 * scale;
+                                let ty = row as f32 * ts as f32 * scale;
+                                let ex = ((col + 1) * ts).min(nw);
+                                let ey = ((row + 1) * ts).min(nh);
+                                let tw = (ex - col * ts) as f32 * scale;
+                                let th = (ey - row * ts) as f32 * scale;
+                                img_box = img_box.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(ty))
+                                        .left(px(tx))
+                                        .w(px(tw))
+                                        .h(px(th))
+                                        .child(img(tp).w(px(tw)).h(px(th))),
+                                );
+                                tiled = true;
+                            }
+                        }
+                    }
+                    if !tiled {
+                        // 兜底：切片失败（解码异常等）退回原单图渲染，保证不闪退。
+                        img_box = img_box.child(img(disp.clone()).w(px(dw)).h(px(dh)));
+                    }
                     for g in &self.compare_glyphs {
                         let gx = g.x / nw as f32 * dw;
                         let gy = g.y / nh as f32 * dh;
