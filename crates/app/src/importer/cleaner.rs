@@ -120,6 +120,17 @@ pub fn clean_with(raw: &str, opt: &CleanOptions) -> String {
 
     s = tidy_whitespace(&s);
 
+    // 整行减法：广告 / 网址 / 扫码关注 / 版权行。core 链早有这道闸
+    // （dclean::strip_piracy_lines：超长豁免 + URL 强信号 + 行首 24 字窗口
+    // 三道防误杀），但 app 这一层过去没接，扒站 txt/md 的推广行会原样
+    // 排进竖排字格。纯删行，保留行一个字都不动；笺校台原文不走这里。
+    if opt.residue {
+        let stripped = jiandu_core::dclean::strip_piracy_lines(&s);
+        if stripped.len() != s.len() {
+            s = stripped;
+        }
+    }
+
     if opt.residue {
         // 汉字之间的伪空格（PDF / OCR 的头号产物），必须在标点全角化之前：
         // 先删空格，`道 ,` 的左邻才会暴露出「道」，全角化判据才成立。

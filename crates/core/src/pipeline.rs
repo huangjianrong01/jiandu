@@ -668,8 +668,34 @@ fn cut_at_sentence(mut cur: Vec<String>) -> (Vec<String>, Vec<String>) {
 /// * `>` 引用 → `[注]…[/注]`（竖排里就是双行夹注）；
 /// * `**加粗**` / `__加粗__` → `[高亮]…[/高亮]`（字右朱砂圈点）；
 /// * ``` 代码块、`行内码`、![图片]() 一律去干净。
+/// 剥掉跨行 HTML 注释（剪藏 MD 里常见）。未闭合的注释保守保留，绝不吞正文。
+pub(crate) fn strip_html_comments(s: &str) -> String {
+    if !s.contains("<!--") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("<!--") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 4..];
+        let Some(end) = after.find("-->") else {
+            out.push_str(&rest[i..]);
+            return out;
+        };
+        rest = &after[end + 3..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn parse_markdown(md: &str) -> Vec<RawChapter> {
-    let norm = md.replace("\r\n", "\n").replace('\r', "\n");
+    let mut norm = md.replace("\r\n", "\n").replace('\r', "\n");
+    // app 链在清洗层剥注释 / 表格，core 链这里是入口，得自己补一遍：
+    // 两链共用 residue 的同一份实现，绝不抄第二套正则。
+    norm = strip_html_comments(&norm);
+    if let Some(x) = crate::residue::clean_md_tables(&norm) {
+        norm = x;
+    }
     let mut chapters: Vec<RawChapter> = Vec::new();
     // 空标题 = 还没遇到 `#`（正文开头的零散段落归「正文」）。
     let mut title = String::new();

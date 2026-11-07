@@ -74,8 +74,11 @@ pub fn extract_docx_text(xml: &str) -> String {
             Ok(Event::Eof) => break,
             Ok(Event::Start(e)) => {
                 match local(e.name().as_ref()).as_str() {
-                    // 域代码 / 修订删除：整段跳过。
-                    "instrtext" | "deltext" | "del" => skip += 1,
+                    // 域代码 / 修订删除 / 文本框 / 绘图：整段跳过。
+                    // 表格**不跳**：既有口径钉死「单元内说明文字亦须完整保留」
+                    // （见 importer/tests.rs），只在单元格边界补分隔，不删字。
+                    "instrtext" | "deltext" | "del" | "drawing" | "pict"
+                    | "object" | "txbxcontent" => skip += 1,
                     "br" if skip == 0 => para.push('\n'),
                     "tab" if skip == 0 => para.push(' '),
                     _ => {}
@@ -91,10 +94,20 @@ pub fn extract_docx_text(xml: &str) -> String {
             }
             Ok(Event::End(e)) => {
                 let name = local(e.name().as_ref());
-                if matches!(name.as_str(), "instrtext" | "deltext" | "del") {
+                if matches!(
+                    name.as_str(),
+                    "instrtext" | "deltext" | "del" | "drawing" | "pict"
+                        | "object" | "txbxcontent"
+                ) {
                     skip = skip.saturating_sub(1);
                 } else if name == "p" {
                     flush(&mut para, &mut out, &mut saw_any);
+                } else if name == "tc" || name == "tr" {
+                    // 表格文字必须保留，只在单元格 / 行边界补一个空格，
+                    // 免得相邻两格的字粘成一句。
+                    if skip == 0 && !para.is_empty() && !para.ends_with(' ') {
+                        para.push(' ');
+                    }
                 }
             }
             Ok(Event::Text(t)) => {
@@ -116,8 +129,45 @@ pub fn extract_docx_text(xml: &str) -> String {
     }
 }
 
+/// `<w:br>` 软回车：中文直接相接、西文补一个空格。
+///
+/// 只处理换行，不做空白归一——段首全角空格是古籍的抬头，交给下游清洗层，
+/// 这里一寸不动（软回车口径与 core 链 `tidy_docx_para` 一致）。
+fn join_soft_breaks(s: &str) -> String {
+    if !s.contains('\n') {
+        return s.to_string();
+    }
+    fn cjk(c: char) -> bool {
+        ('\u{3400}'..='\u{9FFF}').contains(&c)
+            || ('\u{3000}'..='\u{303F}').contains(&c)
+            || ('\u{FF00}'..='\u{FF65}').contains(&c)
+    }
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < cs.len() {
+        if cs[i] == '\n' || cs[i] == '\r' {
+            let mut j = i;
+            while j < cs.len() && (cs[j] == '\n' || cs[j] == '\r') {
+                j += 1;
+            }
+            let prev = out.chars().next_back();
+            let next = cs.get(j).copied();
+            if !prev.map(cjk).unwrap_or(true) || !next.map(cjk).unwrap_or(true) {
+                out.push(' ');
+            }
+            i = j;
+            continue;
+        }
+        out.push(cs[i]);
+        i += 1;
+    }
+    out
+}
+
 fn flush(para: &mut String, out: &mut String, saw_any: &mut bool) {
-    let t = para.trim();
+    let joined = join_soft_breaks(para);
+    let t = joined.trim();
     if !t.is_empty() {
         *saw_any = true;
         if !out.is_empty() {

@@ -554,6 +554,22 @@ pub fn strip_sup_marks(s: &str) -> Option<String> {
     let mut i = 0usize;
     while i < cs.len() {
         let c = cs[i];
+        // Markdown 脚注锚 `[^1]`：与纯数字上标同口径，整枚删。
+        // 只认 `[^` + 纯数字 + `]`，天然不碰 `[一]` / 外来方括号 /
+        // 三家注标签 / 注疏壳。
+        if c == '[' && i + 1 < cs.len() && cs[i + 1] == '^' {
+            let mut j = i + 2;
+            let mut digits = 0usize;
+            while j < cs.len() && j - i <= 7 && cs[j].is_ascii_digit() {
+                digits += 1;
+                j += 1;
+            }
+            if digits > 0 && j < cs.len() && cs[j] == ']' {
+                hit = true;
+                i = j + 1;
+                continue;
+            }
+        }
         let close = match c {
             '[' => ']',
             '【' => '】',
@@ -643,6 +659,87 @@ fn is_md_rule(t: &str) -> bool {
         && t.chars().filter(|c| *c == first).count() >= 3
 }
 
+/// **Markdown 表格行**（v1.9.99.1）：分隔行整行删，数据行去竖线、单元格以空格相接。
+///
+/// 判据刻意保守：必须行首或行尾有 `|`，且整行至少两枚 `|`。古籍正文里
+/// 偶发的 `甲|乙|丙` 不会被碰；`[一]`、`【題解】`、注疏壳更不会碰。
+/// 返回 `None` = 不是表格行，`Some("")` = 整行删。
+pub fn clean_md_table_line(line: &str) -> Option<String> {
+    let t = line.trim();
+    if !t.contains('|') {
+        return None;
+    }
+    let bars = t.chars().filter(|c| *c == '|').count();
+    if bars < 2 || !(t.starts_with('|') || t.ends_with('|')) {
+        return None;
+    }
+    // 分隔行 `| --- | :---: |`：整行只有 | : - = 与空白，且至少三枚连字符。
+    let is_rule = t
+        .chars()
+        .all(|c| matches!(c, '|' | ':' | '-' | '=' | '\u{3000}') || c.is_whitespace())
+        && t.chars().filter(|c| *c == '-').count() >= 3;
+    if is_rule {
+        return Some(String::new());
+    }
+    let cells: Vec<&str> = t
+        .split('|')
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if cells.is_empty() {
+        return None;
+    }
+    Some(cells.join(" "))
+}
+
+/// 整篇版：给 core 链 `parse_markdown` 用（app 链走 `sweep_lines` 的单行版）。
+pub fn clean_md_tables(s: &str) -> Option<String> {
+    if !s.contains('|') {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut hit = false;
+    let mut first = true;
+    for line in s.split('\n') {
+        let rep = clean_md_table_line(line);
+        let drop_line = matches!(&rep, Some(x) if x.is_empty());
+        if rep.is_some() {
+            hit = true;
+        }
+        if drop_line {
+            continue;
+        }
+        let kept = match rep {
+            Some(x) => x,
+            None => line.to_string(),
+        };
+        if !first {
+            out.push('\n');
+        }
+        out.push_str(&kept);
+        first = false;
+    }
+    if hit { Some(out) } else { None }
+}
+
+/// Markdown 脚注定义 `[^1]: 河上公注` → 留注文本身，只去标号前缀。
+///
+/// 注文一个字不丢，也不硬塞成夹注壳——定义行常在文末，挂成夹注会脱离原位。
+fn md_footnote_def(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    let rest = t.strip_prefix("[^")?;
+    let close = rest.find("]:")?;
+    let digits = &rest[..close];
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let text = rest[close + 2..].trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_string())
+}
+
 /// Markdown 行内标记 → 剥掉。
 ///
 /// 只处理**成对**的、且两侧都有内容的：孤零零一个 `*` 原样留着（可能是
@@ -713,8 +810,21 @@ fn clean_one_line(line: &str) -> Option<String> {
     if is_page_line(line) || is_toc_line(line) || is_md_rule(line) {
         return Some(String::new());
     }
+    // 脚注定义行优先：留注文、去 `[^N]:` 前缀（正文里的 `[^N]` 锚在下面
+    // strip_sup_marks 里删）。放在最前，免得被目录行判据误吞。
+    if let Some(x) = md_footnote_def(line) {
+        return Some(x);
+    }
     let mut cur = line.to_string();
     let mut hit = false;
+    // Markdown 表格：分隔行整行删，数据行去竖线后再走下面的行内剥壳。
+    if let Some(x) = clean_md_table_line(&cur) {
+        if x.is_empty() {
+            return Some(String::new());
+        }
+        cur = x;
+        hit = true;
+    }
     if let Some(x) = md_strip_head(&cur) {
         cur = x;
         hit = true;
@@ -756,6 +866,7 @@ pub fn sweep_lines(s: &str) -> Option<String> {
         || s.contains('_')
         || s.contains('[')
         || s.contains('【')
+        || s.contains('|')
         || s.contains('…')
         || s.contains('·')
         || s.contains('.');

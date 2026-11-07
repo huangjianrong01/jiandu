@@ -177,6 +177,9 @@ fn ts_now() -> String {
 pub enum AppMode {
     Reader,
     Collation,
+    /// V2.0 影印双屏对照（L1 试水）。仅 `Root::dev_compare` 开启时可达，
+    /// 普通构建 / 普通用户永远进不到这里——不影响 V1.0 入口。
+    Compare,
 }
 
 /// 笺校工作台发回 Root 的事件（用于「返回阅读」）。

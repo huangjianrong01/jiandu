@@ -1390,13 +1390,9 @@ fn attr_in_tag(tag: &str, attr: &str) -> Option<String> {
 }
 
 fn decode_entities(s: &str) -> String {
-    s.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
+    // nav / NCX 的目录标题也会写数字实体（&#x4E2D;），与正文走同一份解码；
+    // 别再手抄一份只认 7 个具名实体的小表，否则章名会排成字面量。
+    crate::pipeline::decode_entities(s)
 }
 
 /// 从 HTML 里猜章名：<title> 优先，其次 <h1>/<h2>。
@@ -2071,6 +2067,61 @@ pub fn import_epub_into(path: &Path, sink: &mut dyn ChapterSink) -> Result<Book>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 五格式清洗缺口回归（v1.9.99.1）：每一项都是「纯减法」，
+    /// 断言同时钉住「脏东西没了」和「正文一个字没少」。
+    #[test]
+    fn five_format_cleaning_gaps_are_closed() {
+        // ① 通用：方向隔离符 / C1 / Unicode 空白家族不进正文，也不占字数。
+        let dirty = "道\u{2066}可\u{2069}道\u{2007}非\u{000B}常名\u{061C}";
+        let cleaned = crate::cleaner::denoise_text(dirty);
+        for c in ['\u{2066}', '\u{2069}', '\u{061C}', '\u{2007}', '\u{000B}'] {
+            assert!(!cleaned.contains(c), "隐形字符没清干净：U+{:04X}", c as u32);
+        }
+        assert!(cleaned.contains("道可道"), "正文汉字一个都不能少：{cleaned:?}");
+        assert_eq!(
+            crate::cleaner::body_char_count(dirty),
+            6,
+            "隐形字符不许算进字数"
+        );
+
+        // ② MD 表格：分隔行整行删、数据行去竖线；正文里的裸竖线不碰。
+        assert_eq!(
+            crate::residue::clean_md_table_line("| --- | :---: |").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            crate::residue::clean_md_table_line("| 甲 | 乙 |").as_deref(),
+            Some("甲 乙")
+        );
+        assert_eq!(crate::residue::clean_md_table_line("甲|乙|丙"), None);
+
+        // ③ MD 脚注：锚整枚删、定义行留注文；[一] 与注疏壳不许动。
+        assert_eq!(
+            crate::residue::strip_sup_marks("道可道[^1]。").as_deref(),
+            Some("道可道。")
+        );
+        assert_eq!(crate::residue::strip_sup_marks("卷[一]之末"), None);
+        let swept =
+            crate::residue::sweep_lines("道可道[^1]。\n[^1]: 河上公注").unwrap_or_default();
+        assert!(!swept.contains("[^1]"), "脚注标号要去掉：{swept:?}");
+        assert!(swept.contains("河上公注"), "脚注注文不能丢：{swept:?}");
+
+        // ④ EPUB 目录标题：数字实体与具名实体同解，章名不许排成字面量。
+        assert_eq!(decode_entities("&#x4E2D;&nbsp;&#x534E;"), "中 华");
+
+        // ⑤ core 链 MD 入口的两道闸（parse_markdown 开头直接调这两个纯函数）：
+        // 剪藏注释整段删、表格分隔行整行删，正文一个字不动。
+        assert_eq!(
+            crate::pipeline::strip_html_comments("<!-- 剪藏自 xx -->\n道可道"),
+            "\n道可道"
+        );
+        assert_eq!(
+            crate::residue::clean_md_tables("| 甲 | 乙 |\n|---|---|\n道可道").as_deref(),
+            Some("甲 乙\n道可道"),
+            "表格分隔行整行删、数据行去竖线"
+        );
+    }
 
     #[test]
     fn txt_chapters() {

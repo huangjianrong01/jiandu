@@ -538,8 +538,152 @@ const TITLE_HEAD_CELLS: f32 = 0.0;
 /// 一动才收回；② 触发带给足 10px、退出回差 16px，手抖也不会闪。
 /// 竹简目录的**分叉鱼尾**：五点多边形，底边 W 形（两枚垂尖 + 中央凹口）。
 /// 上下两枚严格镜像；纯几何手绘，不取字体字形、不用贝塞尔、不叠噪点。
-pub(crate) const TOC_FISH_TOP: &str = "M0 0 H34 V3 L19 10 L17 5 L15 10 L0 3 Z";
-pub(crate) const TOC_FISH_BOT: &str = "M0 10 V7 L15 0 L17 5 L19 0 L34 7 V10 Z";
+/// 【底部浮窗 · 竹简鱼尾几何】Canvas 专用高度（px）。
+///
+/// v1.9.99.2 起鱼尾一律 `PathBuilder` 手绘 Canvas，不再用 SVG path：
+/// 分叉的黑色倒三角严格按书签实测宽度铺满，SVG 的 preserveAspectRatio
+/// 会把两翼缩成窄尖（旧版实测事故）。
+pub(crate) const TOC_TAIL_H: f32 = 12.0;
+
+/// 【目录树】UI 层专用：把 core 的扁平 `TocEntry`（level 1/2/3）折成**真正的
+/// 父子树**。`Book.toc` 与排版引擎一字不改，只在渲染层建树。
+#[derive(Clone, Debug)]
+struct TocNode {
+    title: String,
+    chapter: usize,
+    /// 末级跳转用的 `start_char_index`（版面流全局字符下标）。
+    jump: Option<usize>,
+    children: Vec<TocNode>,
+}
+
+impl TocNode {
+    fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+    }
+}
+
+/// 迭代式折树：按 level 递归收束，越级 / 缺根都不吞条目。
+fn build_toc_tree(entries: &[TocEntry]) -> Vec<TocNode> {
+    fn gather(entries: &[TocEntry], i: &mut usize, level: usize) -> Vec<TocNode> {
+        let mut out = Vec::new();
+        while *i < entries.len() {
+            let lv = entries[*i].level.max(1);
+            if lv < level {
+                break; // 回到更浅层，本层收束
+            }
+            if lv > level {
+                // 容错：孤立的越级条目不吞、不乱挂。
+                *i += 1;
+                continue;
+            }
+            let e = &entries[*i];
+            *i += 1;
+            let children = if *i < entries.len() {
+                let child_lv = entries[*i].level.max(1);
+                if child_lv > level {
+                    gather(entries, i, child_lv)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            out.push(TocNode {
+                title: e.title.clone(),
+                chapter: e.chapter,
+                jump: e.start_char_index,
+                children,
+            });
+        }
+        out
+    }
+    let mut i = 0usize;
+    let first = entries.first().map(|e| e.level.max(1)).unwrap_or(1);
+    gather(entries, &mut i, first)
+}
+
+/// 【真·古籍鱼尾 · 按参考图抄作业】双层嵌套几何折线框，铺满书签端部。
+///
+/// 参考图里鱼尾不是字母 W/M，也不是孤立的实心三角，而是**嵌在竹简上下两端
+/// 的一枚横带**：上下各一道封边细线，中间一条 ∧ / ∨ 主折线从两翼向中央收尖，
+/// 尖上再叠一道平行细折线 —— 即「< 与 > 上下组合」的多层嵌套折线框。
+///
+/// 三条硬规矩：
+///   ① 全部 `PathBuilder::stroke`，**绝不 fill**，两道折线之间透出底色（中间镂空）；
+///   ② 纯直线，零贝塞尔，线条干净利落；粗 2.2px / 细 1.0px 造刻本粗细对比；
+///   ③ 上下两枚严格镜像（所有 y 走 `yy()`），铺满书签实测宽度，不缩成小尖。
+fn toc_fish_layer(top: bool, tail_h: f32) -> Div {
+    let mut layer = div()
+        .absolute()
+        .left(px(0.0))
+        .right(px(0.0))
+        .h(px(tail_h));
+    layer = if top {
+        layer.top(px(0.0))
+    } else {
+        layer.bottom(px(0.0))
+    };
+    layer.child(
+        canvas(
+            move |_b, _window, _cx| {},
+            move |b: Bounds<Pixels>, _s, window: &mut Window, _cx| {
+                let u = px(1.0);
+                let bw = b.size.width / u;
+                let bh = b.size.height / u;
+                if bw < 8.0 || bh < 4.0 {
+                    return;
+                }
+                let x0 = b.origin.x / u;
+                let y0 = b.origin.y / u;
+                // 底部鱼尾严格镜像：所有 y 走 yy() 翻一次。
+                let yy = |fy: f32| if top { fy } else { bh - fy };
+                let at = |fx: f32, fy: f32| point(px(x0 + fx), px(y0 + yy(fy)));
+                let l = 1.0;
+                let r = (bw - 1.0).max(l + 2.0);
+                let cx = bw * 0.5;
+                let ink = rgb(0x000000);
+
+                // ① 外封边：书签端部那一道细横线。
+                let mut edge = PathBuilder::stroke(px(1.0));
+                edge.move_to(at(l, 0.6));
+                edge.line_to(at(r, 0.6));
+                if let Ok(path) = edge.build() {
+                    window.paint_path(path, ink);
+                }
+
+                // ② 主折线（粗）：两翼直线内收、中央收尖的 ∧（底部镜像为 ∨）。
+                let tip = bh * 0.16;
+                let foot = bh - 0.8;
+                let mut main = PathBuilder::stroke(px(2.2));
+                main.move_to(at(l, foot));
+                main.line_to(at(cx, tip));
+                main.line_to(at(r, foot));
+                if let Ok(path) = main.build() {
+                    window.paint_path(path, ink);
+                }
+
+                // ③ 内层平行细折线：与主折线错开 3px 左右，双层嵌套、中间镂空。
+                let gap = (bh * 0.26).clamp(2.4, 3.6);
+                let mut inner = PathBuilder::stroke(px(1.0));
+                inner.move_to(at(l, foot - gap));
+                inner.line_to(at(cx, tip + gap * 0.72));
+                inner.line_to(at(r, foot - gap));
+                if let Ok(path) = inner.build() {
+                    window.paint_path(path, ink);
+                }
+
+                // ④ 内封边：鱼尾带与竖排题名之间的分隔细线。
+                let mut base = PathBuilder::stroke(px(1.0));
+                base.move_to(at(l, bh - 0.6));
+                base.line_to(at(r, bh - 0.6));
+                if let Ok(path) = base.build() {
+                    window.paint_path(path, ink);
+                }
+            },
+        )
+        .size_full(),
+    )
+}
 
 pub(crate) const BAR_H: f32 = 44.0;
 
@@ -2056,10 +2200,10 @@ impl Root {
         if self.lookup.is_some() && self.lookup_at.is_none() {
             root = root.child(self.render_dict_panel(cx));
         }
-        // 左侧栏（v1.79.0）：目录 / 书签 / 批注 三页合一，从左侧滑出。
-        // 替换掉了原先「底部竖排卷帘目录」与「底部书签抽屉」两套外壳。
+        // 底部居中目录浮窗（v1.9.99.2）：宽 = 版心 × 0.618、高 = (窗高 − 46) × 0.618，
+        // 从屏幕正下方升起；纯覆盖层，正文零重排零缩放，46px 状态栏安全区不遮。
         if self.show_side && !self.focus_mode {
-            root = root.child(self.render_toc_split_panel(cx));
+            root = root.child(self.render_toc_bottom_panel(cx));
         }
         // 版字面板浮层：点工具栏「样式」展开，宽度与单张页面一致，
         // 可盖住正文下部（像照片说明压在照片上），但全部样式内容完整显示。
@@ -3739,259 +3883,218 @@ impl Root {
     ///      的纸面打回现代界面。改以**竖排朱砂小印**切换——读法是「翻检签牌」
     ///      而非「切换标签页」，形制上更接近书耳与藏印。
     #[allow(non_snake_case)]
-    fn render_toc_split_panel(&mut self, cx: &mut Context<Self>) -> Div {
+    /// 【底部居中 · 黄金分割鱼尾目录浮窗】v1.9.99.2
+    ///
+    /// 最高指令的几何四条，逐条写死在这里，不许发挥：
+    ///   ① 宽 = 当帧正文版框的**实测绝对宽度**，左边界与右边界 1:1 卡在版框
+    ///      外沿；绝不乘 0.618、绝不用屏幕宽度百分比、绝不自己造第二套几何；
+    ///   ② 高 = (窗口总高 − 46px 状态栏安全区) × 0.618，再 min(650).max(350)；
+    ///   ③ 底部悬浮，下沿停在 46px 安全区上，绝不遮【进度 / 回到卷首】；
+    ///   ④ `side_slide` 逐帧 0 → 1，把整块从屏幕正下方推上来（Bottom-up）。
+    ///
+    /// 纯覆盖层：`viewport_w` / `content_w` / 正文字号 / 列数一概**只读不写**，
+    /// 排版引擎零重排、零缩放。捕获层兼作裁剪框，动画中间帧也绝不越进状态栏。
+    fn render_toc_bottom_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let vw = self.viewport_w;
         let vh = self.viewport_h;
-        let t = self.theme;
-        const HEAD_H: f32 = 34.0;
-        // 底部状态栏（页码 / 阅读进度 / 双击回到卷首）永远可见：右侧栏与
-        // 捕获层的下沿都抬到它之上，绝不覆盖这条保留带。
         const STATUS_RESERVE: f32 = 46.0;
-        // 黄金分割视口：栏宽 = vw × 0.37（上限 400 / 下限 260），左侧正文
-        // 自然留约 61.8% 可视区。纯覆盖层，不参与正文 flex 流 —— viewport_w /
-        // 字号 / 列数一概不动，排版引擎零重排、零缩放，只做视口裁剪。
-        let panel_w = (vw * 0.37).min(400.0).max(260.0);
-        let slide = self.side_slide.clamp(0.0, 1.0);
-        let off = -(1.0 - slide) * panel_w;
-        let zhu = sheet_zhu(t);
-        let ink_soft = t.ink_soft();
-        // 极简纯色：把纸色向白洗淡一档，绝不叠泛黄噪点 / 烘焙纹理。
-        let drawer_bg: u32 = (crate::theme::mix(t.paper(), 0xFFFFFF, 0.62) << 8) | 0xFD;
-        // 分隔界：纸 + 墨 10%，只用于「栏头」与「内容」之间那一道。
-        let sept: u32 = crate::theme::mix(t.paper(), t.ink(), 0.12);
-        let sept_soft: u32 = crate::theme::mix(t.paper(), t.ink(), 0.07);
-        let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
-        let cur_tab = self.side_tab;
+        // 面板内部顶栏高（目錄题名 + 錄/籤/批 + 卷首）。
+        let head_h = 30.0_f32;
 
-        // ── 右缘三枚朱砂小印（竖排）────────────────────────────────
-        //
-        // 印面 22×22：选中 = 朱砂底反白字（盖章），未选 = 朱砂细框淡字（刻而未
-        // 盖）。单字入印是形制所需——印面只刻得下一个字，也正因如此它读起来
-        // 像藏印而不像按钮。
-        let mut seals = div()
-            .w(px(30.0))
+        // ① 宽度与位置（参考图口径，v1.9.99.2 二改）：
+        //    **以版心为中心，宽 = 版心宽 × 0.618** —— 不是按屏幕百分比居中，
+        //    也不是铺满版框。版心矩形取渲染帧的 `page_rect`（导出 PNG / TTS
+        //    贴框胶囊同源）；首帧未就绪才退回 `self.content_w`。
+        let (_banxin_x, banxin_w) = match self.page_rect.get() {
+            Some((x, _, w, _))
+                if x.is_finite()
+                    && w.is_finite()
+                    && w > 1.0
+                    && x >= 0.0
+                    && x + w <= vw + 2.0 =>
+            {
+                (x, w)
+            }
+            _ => {
+                let cw = if self.content_w > 1.0 && self.content_w.is_finite() {
+                    self.content_w
+                } else {
+                    vw
+                };
+                ((vw - cw) * 0.5, cw)
+            }
+        };
+        // 最终定稿：外层大底板宽度 = 里面那排书签的总宽度，两者完全一致；
+        // 整块在屏幕下方**绝对水平居中**。旧版「版心×0.618 的外底 + 内嵌 60%
+        // 书签排」造成大浴缸，这里一次收掉，不再有双层留白。
+        let panel_w = banxin_w * 0.618 * 0.60;
+        let panel_x = (vw - panel_w) * 0.5;
+
+        // ② 高度：严格照公式，clamp 的先后顺序也照写（先 min 后 max）。
+        let panel_h = ((vh - STATUS_RESERVE) * 0.618).min(650.0).max(350.0);
+
+        // ④ Bottom-up：slide=0 时整块顶边正好落在裁剪框下沿之外（屏幕正
+        //    下方），slide=1 时底边正好压在状态栏上沿。逐帧推进，无跳变。
+        let slide = self.side_slide.clamp(0.0, 1.0);
+        let off = (1.0 - slide) * (panel_h + STATUS_RESERVE);
+        let panel_top = vh - STATUS_RESERVE - panel_h + off;
+
+        // 目录页走竹简书签；另两页仍用既有列表，三页合一的能力不丢。
+        // 高度链用**明确像素**钉死：GPUI 里 `h_full()` 套在非 flex 链上会
+        // 把百分比高度算成 0，浮窗就只剩一片空底（旧版事故）。
+        let body_h = (panel_h - head_h).max(80.0);
+        // 书签排与外层大底板严丝合缝、完全等宽；文字 / 鱼尾 / 高亮 /
+        // 高度 / Bottom-up / 状态栏安全区一律保持现状。
+        let strip_w = panel_w;
+        let content = match self.side_tab {
+            SideTab::Toc => div()
+                .w_full()
+                .h(px(body_h))
+                .mt(px(head_h))
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(strip_w))
+                        .h(px(body_h))
+                        .child(self.render_toc_bottom_strips(cx, body_h)),
+                ),
+            SideTab::Bookmark => div()
+                .w_full()
+                .h(px(body_h))
+                .mt(px(head_h))
+                .child(self.render_side_bookmark_list(cx)),
+            SideTab::Note => div()
+                .w_full()
+                .h(px(body_h))
+                .mt(px(head_h))
+                .child(self.render_side_note_list(cx)),
+        };
+
+        // ② 顶部内栏（参考图口径）：浮窗**内部**顶上一条 —— 左端「目錄」题名，
+        //    右端「錄 / 籤 / 批」三枚页签 + 「卷首」。不再悬在浮窗外侧，
+        //    也不占书签区高度之外的任何空白：书签区 = 面板高 − 这一行。
+        let cur_tab = self.side_tab;
+        let mut head = div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w_full()
+            .h(px(head_h))
+            .relative();
+        // 左：题名。用「錄」页名，与三枚小印同字源。
+        head = head.child(
+            div()
+                .absolute()
+                .left(px(12.0))
+                .top(px(0.0))
+                .h(px(head_h))
+                .flex()
+                .items_center()
+                .text_size(px(11.0))
+                .text_color(rgb(0x8A857C))
+                .child(SharedString::from(match cur_tab {
+                    SideTab::Toc => "目錄",
+                    SideTab::Bookmark => "書籤",
+                    SideTab::Note => "批註",
+                })),
+        );
+        // 右：三枚页签 + 卷首，全部落在面板内部顶上。
+        let mut head_btns = div()
+            .absolute()
+            .right(px(10.0))
+            .top(px(0.0))
+            .h(px(head_h))
             .flex()
-            .flex_col()
+            .flex_row()
             .items_center()
-            .gap(px(7.0))
-            .py(px(10.0))
-            .border_l_1()
-            .border_color(rgba(sept_soft));
-        for tab in [SideTab::Toc, SideTab::Bookmark, SideTab::Note] {
+            // 三印与卷首别黏成一坨：印与印 10px，卷首再单独让 6px。
+            .gap(px(10.0));
+        for (tab, word) in [
+            (SideTab::Toc, "錄"),
+            (SideTab::Bookmark, "籤"),
+            (SideTab::Note, "批"),
+        ] {
             let on = tab == cur_tab;
-            let seal = div()
-                .w(px(22.0))
-                .h(px(22.0))
+            head_btns = head_btns.child(
+                div()
+                    .w(px(22.0))
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(2.0))
+                    .border_1()
+                    .border_color(rgb(if on { 0xB0342C } else { 0xC9C6BE }))
+                    // 未选中：与面板同色的浅底（不是透明黑——`rgb(0x00000000)`
+                    // 会被当成纯黑，把「籤 / 批」两个白字吞掉，旧图事故）。
+                    .bg(rgb(if on { 0xB0342C } else { 0xFBFBF9 }))
+                    .text_size(px(11.0))
+                    .text_color(rgb(if on { 0xFFFFFF } else { 0x3D352F }))
+                    .cursor_pointer()
+                    .child(SharedString::from(word))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.side_tab = tab;
+                            this.toc_expand.clear();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        // 卷首：回到全书第一字（与双击状态栏叶码同一动作），跳完即收面板。
+        head_btns = head_btns.child(
+            div()
+                .ml(px(6.0))
+                .w(px(34.0))
+                .h(px(18.0))
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded(px(2.0))
                 .border_1()
-                .border_color(rgb(if on { zhu } else { sept }))
-                .bg(rgb(if on { zhu } else { 0 }))
-                .font_family(song.clone())
-                .text_size(px(13.0))
-                .text_color(rgb(if on { t.paper() } else { ink_soft }))
+                .border_color(rgb(0xC9C6BE))
+                .text_size(px(10.0))
+                .text_color(rgb(0x3D352F))
                 .cursor_pointer()
-                .hover(move |s| {
-                    if on {
-                        s
-                    } else {
-                        s.border_color(rgb(zhu)).text_color(rgb(zhu))
-                    }
-                })
-                .child(SharedString::from(tab.seal()))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        if this.side_tab == tab {
-                            return;
-                        }
-                        // 换印只换内容，**不重播滑入动画**——抽屉本来就开着。
-                        this.side_tab = tab;
-                        if tab == SideTab::Toc {
-                            this.toc_need_scroll = true;
-                        }
-                        if tab == SideTab::Note {
-                            this.reload_cards();
-                        }
-                        cx.notify();
-                    }),
-                );
-            seals = seals.child(seal);
-        }
-
-        // ── 栏头：题字 + 一枚小动作 ────────────────────────────────
-        let act: Div = match cur_tab {
-            SideTab::Toc => div()
-                .font_family(song.clone())
-                .text_size(px(10.5))
-                .text_color(rgb(zhu))
-                .cursor_pointer()
-                .hover(|s| s.text_color(rgb(t.ink())))
                 .child(SharedString::from("卷首"))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
-                        this.goto_char_index(0);
+                        this.jump_to_start();
+                        this.toc_expand.clear();
                         this.close_side();
                         cx.notify();
                     }),
                 ),
-            SideTab::Bookmark => div()
-                .font_family(song.clone())
-                .text_size(px(10.5))
-                .text_color(rgb(zhu))
-                .cursor_pointer()
-                .hover(|s| s.text_color(rgb(t.ink())))
-                .child(SharedString::from("＋ 收此葉"))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.add_bookmark_current();
-                        cx.notify();
-                    }),
-                ),
-            SideTab::Note => div()
-                .font_family(song.clone())
-                .text_size(px(10.5))
-                .text_color(rgb(zhu))
-                .cursor_pointer()
-                .hover(|s| s.text_color(rgb(t.ink())))
-                .child(SharedString::from("匯出"))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.export_margin_notes(cx);
-                        cx.notify();
-                    }),
-                ),
-        };
-        let head = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .w_full()
-            .h(px(HEAD_H))
-            .px(px(10.0))
-            .border_b_1()
-            .border_color(rgba(sept))
-            .child(
-                div()
-                    .font_family(song.clone())
-                    .text_size(px(12.5))
-                    .text_color(rgb(zhu))
-                    .child(SharedString::from(cur_tab.title())),
-            )
-            .child(act);
+        );
+        let tabs = head.child(head_btns);
 
-        // ── 内容：三印各一片 ──────────────────────────────────────
-        let body = match cur_tab {
-            SideTab::Toc => self.render_toc_split_list(cx, panel_w),
-            SideTab::Bookmark => self.render_side_bookmark_list(cx),
-            SideTab::Note => self.render_side_note_list(cx),
-        };
-
-        // ── 栏脚：一枚「笺校」小印 → 关于（v1.9.22）────────────────
-        //
-        // 为什么是一枚印而不是「关于本软件」一行字：这一栏通篇是书目与批注，
-        // 底下忽然冒出一行现代管理文字，整栏的气质就散了。印只认门，不解释
-        // ——与栏右那三枚「錄 / 籤 / 批」是同一套标记法。
-        let about_foot = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .py_2()
-            .border_t_1()
-            .border_color(rgba(sept))
-            .cursor_pointer()
-            .hover(|s| s.bg(rgba(((t.ink() & 0xFFFFFF) << 8) | 0x0A)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.close_side();
-                    this.open_about(cx);
-                }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(crate::shelf::seal_chip("笺校", 22.0))
-                    .child(
-                        div()
-                            .font_family(song.clone())
-                            .text_size(px(10.5))
-                            .text_color(rgb(t.ink_soft()))
-                            .child(SharedString::from("关于笺读")),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(px(9.5))
-                    .text_color(rgb(t.ink_soft()))
-                    .child(SharedString::from(format!(
-                        "v{}",
-                        env!("CARGO_PKG_VERSION")
-                    ))),
-            );
-
-        let drawer = div()
+        let sheet = div()
             .absolute()
-            .top(px(BAR_H))
-            .bottom(px(STATUS_RESERVE))
-            .right(px(off))
+            // 相对捕获层（top = BAR_H），故减回 BAR_H 还原成窗口坐标。
+            .top(px(panel_top - BAR_H))
+            .left(px(panel_x))
             .w(px(panel_w))
-            .flex()
-            .flex_row()
-            .bg(rgba(drawer_bg))
-            .border_l_1()
-            .border_color(rgba(sept))
-            .shadow(vec![gpui::BoxShadow {
-                color: gpui::hsla(0.0, 0.0, 0.0, 0.10),
-                offset: point(px(-2.0), px(0.0)),
-                blur_radius: px(14.0),
-                spread_radius: px(0.0),
-            }])
-            .overflow_hidden()
-            .font_family(song)
-            // ★ 阻断鼠标穿透（v1.80.0）：GPUI 的命中测试会把**所有**压在
-            //   这一点下的 hitbox 都算作 hovered，浮层即便自己 stop_propagation，
-            //   抬起事件仍会漏到正文那层去翻页。`.occlude()` 让命中栈在此截断，
-            //   正文那层从此「看不见」落在抽屉上的点击——这才是「浮层」该有的
-            //   样子（详见 `render_ai_panel` 同款注释）。
+            .h(px(panel_h))
+            // ⑨ 极简浅米白半透明：黑鱼尾与朱砂选中态对比清楚，绝不发暗。
+            .bg(rgba(0xFBFBF9FA))
+            .border_1()
+            .border_color(rgba(0x00000028))
             .occlude()
-            // 栏内不冒泡：否则一点列表，外层「点纸面收栏」就把栏收了。
+            // 栏内不冒泡：否则一点书签，外层「点纸面收栏」就把浮窗收了。
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _, _, cx| {
                     cx.stop_propagation();
                 }),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .flex()
-                    .flex_col()
-                    .child(head)
-                    .child(body)
-                    .child(about_foot),
-            )
-            .child(seals);
+            .child(tabs)
+            .child(content);
 
-        // 透明捕获层：**只垫在顶栏以下**（顶栏那排钮要留着能点，否则「再点一次
-        // 目录收起」就成了空话）。点栏外的纸面即收，且不会穿透到正文去翻页。
         div()
             .absolute()
             .top(px(BAR_H))
@@ -3999,6 +4102,9 @@ impl Root {
             .w(px(vw))
             .h(px((vh - BAR_H - STATUS_RESERVE).max(0.0)))
             .bg(rgba(0x00000000))
+            // ③ 兼作裁剪框：升起动线一律裁在 46px 安全区之上，底部状态栏的
+            //    页码 / 进度 / 双击回到卷首全程可见、全程可点。
+            .overflow_hidden()
             .occlude()
             .on_mouse_down(
                 MouseButton::Left,
@@ -4008,8 +4114,9 @@ impl Root {
                     cx.notify();
                 }),
             )
-            .child(drawer)
+            .child(sheet)
     }
+
 
     /// 目录里的**两枚标记**：哪些章折过角（有书签）、哪些章批过字（有批注）。
     ///
@@ -4054,196 +4161,264 @@ impl Root {
         (bm, nt)
     }
 
-/// 【右侧窄栏 · 竹简鱼尾目录】v1.9.98
-///
-/// 每一条目录项都是一枚竹简：上鱼尾 ─ 竖排层级签 + 题名 ─ 下鱼尾。
-/// 卷 / 章 / 节用缩进分档，当前在读那一级朱砂底 + 朱砂描边；点任意一条
-/// 都按 `start_char_index` 精准跳转，末级自然落在字上。
-///
-/// 这一层是纯覆盖层：`viewport_w`、正文字号、列数一概不碰，排版引擎
-/// 零重排零缩放；栏与捕获层的下沿都停在 `STATUS_RESERVE` 之上，底部
-/// 状态栏的页码 / 进度 / 双击回到卷首永远可见、永远可点。
-#[allow(non_snake_case)]
-fn render_toc_split_list(
-    &mut self,
-    cx: &mut Context<Self>,
-    panel_w: f32,
-) -> Stateful<Div> {
-    let t = self.theme;
-    let zhu = sheet_zhu(t);
-    let ink = t.ink();
-    let sept: u32 = crate::theme::mix(t.paper(), t.ink(), 0.16);
-    let hover_bg: u32 = crate::theme::mix(t.paper(), t.ink(), 0.05);
-    let cur_bg: u32 = crate::theme::mix(t.paper(), zhu, 0.13);
-    let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
+    /// 【目录树 · 逐层横向展开】v1.9.99.2
+    ///
+    /// 与几何四条缝在同一层：宽 = 版心 × 0.618、高 = (窗高 − 46) × 0.618、
+    /// 底部居中、Bottom-up 升起。这里只负责**里面装什么**：
+    ///   ② 默认只有第 0 列（根卷）；
+    ///   ③ 点非末级书签，就在它左侧长出一列子节点，带 220ms 滑入动画；
+    ///   ④ 子级书签挂 `>` 层级标识 + 逐层缩进（竹简仍 100% 高，绝不缩短）；
+    ///   ⑤ 点末级按 `start_char_index` 精准跳转并自动收起面板。
+    fn render_toc_bottom_strips(
+        &mut self,
+        cx: &mut Context<Self>,
+        panel_h: f32,
+    ) -> Stateful<Div> {
+        // ② 字号按最高指令放大 1.5 倍：13 → 19.5，古籍章节名一眼可读。
+        const FS: f32 = 19.5;
+        let tail_h = TOC_TAIL_H;
+        let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
 
-    let toc: Vec<TocEntry> = match self.book.as_ref() {
-        Some(b) => b.toc.iter().filter(|e| e.level <= 3).cloned().collect(),
-        None => Vec::new(),
-    };
-    let cur_chapter = self.current_chapter;
-    let (marked_bm, marked_note) = self.chapter_marks();
-
-    // 开栏自动滚到在读那一章；翻章了也只跟一次，不抢用户手动滚的位置。
-    if self.toc_need_scroll || self.side_follow != Some(cur_chapter) {
-        let pos = toc
-            .iter()
-            .position(|e| e.chapter == cur_chapter)
-            .unwrap_or(0);
-        self.toc_scroll.scroll_to_item(pos);
-        self.toc_need_scroll = false;
-        self.side_follow = Some(cur_chapter);
-    }
-
-    let mut list = div()
-        .id(SharedString::from("toc-split-list"))
-        .flex()
-        .flex_col()
-        .w_full()
-        .flex_1()
-        .min_h(px(0.0))
-        .overflow_y_scroll()
-        .scrollbar_width(px(3.0))
-        .track_scroll(&self.toc_scroll)
-        .py(px(6.0));
-
-    if toc.is_empty() {
-        list = list.child(
-            div()
-                .w_full()
-                .flex()
-                .justify_center()
-                .pt(px(18.0))
-                .font_family(song.clone())
-                .text_size(px(12.0))
-                .text_color(rgb(t.ink_soft()))
-                .child(SharedString::from("这本书没有目录")),
-        );
-    }
-
-    for e in toc.iter() {
-        let cur = e.chapter == cur_chapter;
-        let jump = e.start_char_index.unwrap_or(0);
-        let indent = 10.0 + ((e.level.saturating_sub(1).min(2)) as f32) * 14.0;
-        let fs = match e.level {
-            1 => 13.5,
-            2 => 12.5,
-            _ => 12.0,
+        let entries: Vec<TocEntry> = match self.book.as_ref() {
+            Some(b) => b.toc.iter().filter(|e| e.level <= 3).cloned().collect(),
+            None => Vec::new(),
         };
-        let room = ((panel_w - indent - 58.0) / (fs * 0.98)).floor() as usize;
-        let shown = clip_chars(&Self::toc_label(&e.title, room.max(4)), room.max(4));
-        let fish = if cur { zhu } else { sept };
-        let level_word = match e.level {
-            1 => "卷",
-            2 => "章",
-            _ => "節",
+        // ① 真树，不是扁平列表。
+        let roots = build_toc_tree(&entries);
+        let cur_chapter = self.current_chapter;
+        let expand = self.toc_expand.clone();
+        let text_h = (panel_h - 2.0 * (tail_h + 8.0)).max(24.0);
+        let max_chars = ((text_h / (FS * 1.18)).floor() as usize).max(2).min(16);
+
+        // ② 默认只显示第一层级；expand 有几项，就往左长出几列。
+        let mut cols: Vec<Vec<TocNode>> = vec![roots];
+        let mut opened: Vec<usize> = Vec::new();
+        for depth in 0..expand.len() {
+            let idx = expand[depth];
+            let kids = cols
+                .get(depth)
+                .and_then(|c| c.get(idx))
+                .filter(|n| !n.is_leaf())
+                .map(|n| (n.chapter, n.children.clone()));
+            match kids {
+                Some((ch, children)) => {
+                    opened.push(ch);
+                    cols.push(children);
+                }
+                None => break, // 路径失效（换书 / 越界）：停在最后有效的一列
+            }
+        }
+
+        // 与正文列节奏同源：书签间隙 / 两侧呼吸都从正文字格宽派生，
+        // 竖排目录因此和上面的正文是同一套「列距」，不另造一套网格。
+        let col_w = if self.col_w.is_finite() && self.col_w > 2.0 {
+            self.col_w
+        } else {
+            28.0
         };
-
-        // 上鱼尾：分叉两尖朝下。
-        let slip = div().w_full().flex().flex_col().items_center().child(
-            div()
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    svg()
-                        .path(SharedString::from(TOC_FISH_TOP.to_string()))
-                        .w(px(34.0))
-                        .h(px(10.0))
-                        .text_color(rgb(fish)),
-                ),
-        );
-
+        // 列宽严格对齐正文：一根书签 = 正文字格宽（`col_w`），书签之间只留
+        // 1px 呼吸。不再按面板宽均分——均分会让目录的列距与正文各说一套。
+        let slip_gap = 1.0_f32;
+        let slip_side = 1.0_f32;
         let mut row = div()
-            .w_full()
-            .h(px(28.0))
+            .id(SharedString::from("toc-bottom-strips"))
             .flex()
-            .flex_row()
-            .items_center()
-            .pl(px(indent))
-            .pr(px(10.0))
-            .gap(px(6.0));
-        if cur {
-            row = row
-                .bg(rgb(cur_bg))
-                .border_1()
-                .border_color(rgb(zhu))
-                .rounded(px(2.0));
-        }
-        row = row
-            .child(
-                // 竖排层级签：单字一列，卷 / 章 / 節 一眼分档。
+            // ⑤ 列与列、书签与书签，统统从右向左。
+            .flex_row_reverse()
+            .w_full()
+            // 明确像素高 = 浮窗 100%，不让百分比高度链塌成 0。
+            .h(px(panel_h))
+            .gap(px(slip_gap))
+            .px(px(slip_side))
+            .overflow_x_scroll();
+
+        if cols[0].is_empty() {
+            return row.child(
                 div()
-                    .flex_shrink_0()
-                    .w(px(13.0))
+                    .h(px(panel_h))
+                    .w_full()
                     .flex()
-                    .flex_col()
                     .items_center()
-                    .font_family(song.clone())
-                    .text_size(px(10.0))
-                    .text_color(rgb(if cur { zhu } else { t.ink_soft() }))
-                    .child(SharedString::from(level_word.to_string())),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .font_family(song.clone())
-                    .text_size(px(fs))
-                    .when(cur, |d| d.font_weight(FontWeight::BOLD))
-                    .text_color(rgb(if cur { zhu } else { ink }))
-                    .child(SharedString::from(shown.clone())),
-            );
-        if marked_bm.get(e.chapter).copied().unwrap_or(false) {
-            row = row.child(
-                div()
-                    .flex_shrink_0()
-                    .font_family(song.clone())
-                    .text_size(px(10.0))
-                    .text_color(rgb(zhu))
-                    .child(SharedString::from("籤")),
-            );
-        }
-        if marked_note.get(e.chapter).copied().unwrap_or(false) {
-            row = row.child(
-                div()
-                    .flex_shrink_0()
-                    .w(px(4.0))
-                    .h(px(4.0))
-                    .rounded(px(2.0))
-                    .bg(rgb(zhu)),
+                    .justify_center()
+                    .font_family(song)
+                    .text_size(px(14.0))
+                    .text_color(rgb(0x2B2622))
+                    .child(SharedString::from("這本書沒有目錄")),
             );
         }
 
-        // 下鱼尾：与上鱼尾严格镜像。
-        let slip = slip.child(row).child(
-            div()
-                .w_full()
+        for (depth, nodes) in cols.iter().enumerate() {
+            let mut col = div()
+                .id(SharedString::from(format!("toc-col-{depth}")))
                 .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    svg()
-                        .path(SharedString::from(TOC_FISH_BOT.to_string()))
-                        .w(px(34.0))
-                        .h(px(10.0))
-                        .text_color(rgb(fish)),
-                ),
-        );
-        let slip = slip.cursor_pointer().hover(move |s| s.bg(rgb(hover_bg)));
-        list = list.child(slip.id(SharedString::from(format!("toc-split-{}", e.chapter))).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.goto_char_index(jump);
-                this.close_side();
-                cx.notify();
-            }),
-        ));
+                .flex_row_reverse()
+                // ⑥ 列 100% 高，列内每根竹简也 100% 高。
+                .h(px(panel_h))
+                .flex_1()
+                .min_w(px(32.0))
+                .gap(px(1.0));
+            for (idx, node) in nodes.iter().enumerate() {
+                let cur = node.chapter == cur_chapter || opened.contains(&node.chapter);
+                col = col.child(self.render_toc_slip(
+                    cx, node, depth, idx, cur, max_chars, panel_h, col_w,
+                ));
+            }
+
+            // ③ 平滑展开：新列从右侧父书签方向向左滑入 + 淡入。
+            //    id 带完整路径，路径一变就重播（GPUI 0.2.2 只认 id 变化）。
+            //    opacity 留 30% 下限，动画万一没推进也绝不整列透明。
+            if depth > 0 && std::env::var("JIANDU_TOC_EXPAND").is_err() {
+                let key = expand[..depth.min(expand.len())]
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("-");
+                let anim_id = SharedString::from(format!("toc-col-in-{depth}-{key}"));
+                row = row.child(col.with_animation(
+                    anim_id,
+                    Animation::new(Duration::from_millis(220)),
+                    move |el, delta| {
+                        el.opacity(0.30 + 0.70 * delta)
+                            .ml(px((1.0 - delta) * 14.0))
+                    },
+                ));
+            } else {
+                row = row.child(col);
+            }
+        }
+        row
     }
-    list
-}
+
+    /// 一根竹简：上下两枚 Canvas 黑色分叉倒三角 + 放大后的竖排题名 +
+    /// `>` 层级标识 + 选中朱砂。高度恒 `h_full()`（100%）。
+    fn render_toc_slip(
+        &mut self,
+        cx: &mut Context<Self>,
+        node: &TocNode,
+        depth: usize,
+        idx: usize,
+        cur: bool,
+        max_chars: usize,
+        panel_h: f32,
+        col_w: f32,
+    ) -> Div {
+        const ZHU: u32 = 0xB0342C;
+        const INK: u32 = 0x2B2622;
+        const EDGE: u32 = 0xE8E6E0;
+        const FS: f32 = 19.5; // 放大 1.5 倍
+        let tail_h = TOC_TAIL_H;
+        let song = crate::fonts::family_for(FontChoice::SongTi, Script::Ancient);
+        let leaf = node.is_leaf();
+        let jump = node.jump;
+        // ① 书签的「正文」= 完整章节题名。旧版走 `toc_label()`：它专为
+        //    一格宽的简条写的，会把第一个括注之后的文字整段砍掉，遇上
+        //    「卷一·周紀」这类标题只剩一个「卷」字。这里改用 `toc_label_full()`
+        //    ——同一套竖排字形映射，但不砍内容、只按可容纳字数收尾。
+        //    中点/省略号一并换成竖排形，竖着读才不别扭。
+        let label = clip_chars(&Self::toc_label_full(&node.title), max_chars);
+        let mut chars: Vec<char> = label
+            .chars()
+            .map(|c| match c {
+                '·' | '・' => '・',
+                '…' | '⋯' => '︙',
+                _ => c,
+            })
+            .collect();
+        // 兜底：标题若被清洗/裁切削成空串，退回原始标题；再空也留一个字。
+        // 绝不许出现「上下两排鱼尾都在、中间一个字也没有」的空书签。
+        if chars.is_empty() {
+            chars = node.title.chars().take(max_chars.max(2)).collect();
+        }
+        if chars.is_empty() {
+            chars.push('卷');
+        }
+        // ② 逐字绝对定位，从鱼尾正下方第一格起排：不再把整段字
+        //    `justify_center()` 在 100% 高的竹简里。旧写法既让 GPUI 的裸
+        //    div 在 flex 链上塌成 0 高（实际只画得出第一个字），又把仅剩
+        //    的一行字飘在竹简正中，与上方页签/鱼尾之间空出一大片。
+        let line_h = FS * 1.18;
+        let text_top = tail_h + 5.0 + (depth as f32) * 6.0;
+        let _ = panel_h; // 高度只用于竹简本体，题名逐字钉像素，不参与撑高
+
+        // ⑦ 两枚独立的 Canvas 鱼尾，各带明确像素高，绝非边框线。
+        let fish_top = toc_fish_layer(true, tail_h);
+        let fish_bot = toc_fish_layer(false, tail_h);
+
+        // 竹简本体：100% 高、朱砂选中态、两枚鱼尾，一概保持原样。
+        let mut slip = div()
+            .relative()
+            .h_full()
+            .flex_1()
+            // 容器收到 60% 后，单根下限同步降到「容得下一个字」的宽度，
+            // 保证所有书签仍排得下，绝不被横向滚动裁掉任何一个章节名。
+            .min_w(px((col_w * 0.42).max(24.0)))
+            // ⑧ 选中：朱砂全框 + 淡朱底；未选中：只留左右两道极淡竖界，
+            //    **绝无上下横线**，黑鱼尾与朱砂态因此清清楚楚。
+            .when(cur, |d| d.border_1().border_color(rgb(ZHU)))
+            .when(!cur, |d| {
+                d.border_l_1().border_r_1().border_color(rgb(EDGE))
+            })
+            .bg(rgb(if cur { 0xF6E2DE } else { 0xF2F1ED }))
+            .cursor_pointer()
+            .child(fish_top)
+            .child(fish_bot);
+
+        // ④ 层级标识：挂在鱼尾下沿的右上角，不占竖排正文的第一格。
+        if depth > 0 {
+            slip = slip.child(
+                div()
+                    .absolute()
+                    .top(px(tail_h + 1.0))
+                    .right(px(2.0))
+                    .font_family(song.clone())
+                    .text_size(px(10.0))
+                    .text_color(rgb(ZHU))
+                    .child(SharedString::from(">".repeat(depth.min(3)))),
+            );
+        }
+        // 每个字一枚绝对定位的方格：y 由序号 × 行高钉死，字号恒定放大、
+        // 不缩放、不参与 flex 计算。章节正文因此一字不丢，且从鱼尾正下方
+        // 起排 —— 上方页签、鱼尾、题名三者挨着，中间不再有空荡的留白。
+        for (i, c) in chars.iter().enumerate() {
+            slip = slip.child(
+                div()
+                    .absolute()
+                    .top(px(text_top + (i as f32) * line_h))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .h(px(line_h))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .font_family(song.clone())
+                    .text_size(px(FS))
+                    .text_color(rgb(if cur { ZHU } else { INK }))
+                    .when(cur, |d| d.font_weight(FontWeight::BOLD))
+                    .child(SharedString::from(c.to_string())),
+            );
+        }
+
+        slip.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            if leaf {
+                // ⑤ 末级：按 start_char_index 精准跳转，然后自动收起面板。
+                this.goto_char_index(jump.unwrap_or(0));
+                this.toc_expand.clear();
+                this.close_side();
+            } else {
+                // ③ 非末级：在左侧横向展开子节点；再点同枚即收起该层。
+                let mut next: Vec<usize> =
+                    this.toc_expand.iter().take(depth).copied().collect();
+                if this.toc_expand.get(depth) == Some(&idx) {
+                    this.toc_expand = next;
+                } else {
+                    next.push(idx);
+                    this.toc_expand = next;
+                }
+            }
+            cx.notify();
+        }))
+    }
 
     /// 左侧栏 · **目录页**（「錄」印）：全卷篇目，按层级缩进；当前在读那一章
     /// 淡朱底 + 左侧朱线；折过角的章右侧一枚朱「籤」，批过字的章一枚朱点。

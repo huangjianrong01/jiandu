@@ -10,6 +10,42 @@ use super::*;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// app 链（实际书架导入）补的两道闸：整行广告减法 + DOCX 容器跳过。
+#[test]
+fn app_chain_drops_piracy_lines_and_docx_containers() {
+    let raw = "更多精品小说请访问 www.xx.com\n道可道，非常道。\n扫码关注微信公众号：某某书局";
+    let cleaned = cleaner::clean(raw);
+    assert!(cleaned.contains("道可道"), "正文必须保留：{cleaned:?}");
+    assert!(!cleaned.contains("www.xx.com"), "网址广告行必须删：{cleaned:?}");
+    assert!(!cleaned.contains("扫码关注"), "扫码行必须删：{cleaned:?}");
+
+    let xml = concat!(
+        "<w:document><w:body>",
+        "<w:p><w:r><w:t>道可道</w:t></w:r></w:p>",
+        "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>表格脏字</w:t></w:r></w:p></w:tc></w:tr></w:tbl>",
+        "<w:p><w:r><w:t>hello</w:t><w:br/><w:t>world</w:t></w:r></w:p>",
+        "<w:p><w:r><w:drawing><w:txbxContent><w:t>眉批</w:t></w:txbxContent></w:drawing></w:r></w:p>",
+        "</w:body></w:document>"
+    );
+    let text = docx_parser::extract_docx_text(xml);
+    assert!(text.contains("道可道"), "正文不能丢：{text:?}");
+    // 表格文字按既有口径必须保留（不可整表丢），文本框 / 绘图照旧跳过。
+    assert!(text.contains("表格脏字"), "表格单元文字不可遗失：{text:?}");
+    assert!(!text.contains("眉批"), "文本框不该进正文：{text:?}");
+    assert!(text.contains("hello world"), "西文软回车该补空格：{text:?}");
+
+    // 相邻单元格不再粘成一句。
+    let two = concat!(
+        "<w:document><w:body><w:tbl><w:tr>",
+        "<w:tc><w:p><w:r><w:t>甲</w:t></w:r></w:p></w:tc>",
+        "<w:tc><w:p><w:r><w:t>乙</w:t></w:r></w:p></w:tc>",
+        "</w:tr></w:tbl></w:body></w:document>"
+    );
+    let cells = docx_parser::extract_docx_text(two);
+    assert!(cells.contains("甲") && cells.contains("乙"), "单元格字不能丢：{cells:?}");
+    assert!(!cells.contains("甲乙"), "相邻单元格不该粘成一句：{cells:?}");
+}
+
 /// 一个测试专用的临时目录（进程号 + 用例名，互不干扰）。
 fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("jiandu-import-{}-{tag}", std::process::id()));
@@ -826,4 +862,7 @@ fn probe_real_books_integrity() {
             eprintln!("  垃圾章检测: 无");
         }
     }
+
+    // 五格式清洗补强的 app 侧回归放在文件顶层（与下面的端到端样本同级），
+    // 确保默认 cargo test 一定编译并执行，不依赖任何条件模块。
 }
