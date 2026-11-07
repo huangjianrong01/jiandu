@@ -1378,6 +1378,9 @@ pub(crate) enum MoreAct {
     Analysis,
     /// 导出 MD：全书正文 + `[^n]` 脚注。
     Md,
+    /// 导出 TEI/XML：标准数字人文 P5 格式，正文 / 夹注 / 批注三路分离，
+    /// 实体用 `<persName>`/`<placeName>`/`<title>` 等专用标签（B 端古籍机构交付）。
+    Tei,
     /// 說明页。
     Help,
     /// 激活 / 已激活回执（商店版不挂）。
@@ -5472,6 +5475,7 @@ impl Root {
                     sub = sub
                         .child(aitem(cx, "more-analysis", "文本分析", MoreAct::Analysis))
                         .child(aitem(cx, "export-md", "导出 MD", MoreAct::Md))
+                        .child(aitem(cx, "export-tei", "导出 TEI/XML", MoreAct::Tei))
                         .child(aitem(cx, "more-jodu", "AI 句读（断句）", MoreAct::Jodu))
                         .child(aitem(cx, "more-help", "說明", MoreAct::Help));
                     // 商店版不挂「激活」：App Review 2.4.5(vi) 禁止 licence
@@ -5778,6 +5782,7 @@ impl Root {
                 self.open_analysis(scope, cx);
             }
             MoreAct::Md => guarded!(|| self.export_markdown_file(cx)),
+            MoreAct::Tei => guarded!(|| self.export_tei_book(cx)),
             MoreAct::Help => {
                 self.set_ui_state(AppUIState::Help, cx);
                 cx.notify();

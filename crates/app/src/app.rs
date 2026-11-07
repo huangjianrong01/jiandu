@@ -6206,6 +6206,156 @@ impl Root {
         .detach();
     }
 
+    /// 『导出 TEI/XML』按钮：把当前书按 `IrBook::from_book` 转成标准 TEI P5，
+    /// 三路分离（正文 / 夹注 / 批注）+ 实体专用标签，弹系统保存对话框落盘。
+    /// B 端古籍机构 / 图书馆交付格式（v2.0 商业化模块）。
+    pub fn export_tei_book(&mut self, cx: &mut Context<Self>) {
+        let Some(book) = self.book.clone() else {
+            self.notice = "尚未打开书籍，无法导出 TEI".to_string();
+            cx.notify();
+            return;
+        };
+        // 连点两次不该弹两个保存框。
+        if !self.export_begin(cx) {
+            return;
+        }
+        let stem = crate::exporter::safe_file_stem(&book.title);
+        let default = format!("{stem}_tei.xml");
+        cx.spawn(
+            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    // rfd 保存框必须前台直调（v1.52.4 铁律，与导出 MD / Anki 同一条）：
+                    // 走 background executor 会被 GPUI 主循环挤掉、静默返回 None。
+                    let picked = crate::exporter::pick_save_path(
+                        "导出 TEI/XML",
+                        &default,
+                        "TEI XML 文档",
+                        &["xml", "tei"],
+                    );
+                    // 取消 / 成功 / 失败三态在**同一处收口**：提示先算成值，
+                    // 最后只做一次 update——闸门复位与提示落地绑在一起，杜绝锁死。
+                    let msg = match picked {
+                        None => "已取消导出".to_string(),
+                        Some(dest) => {
+                            let ir = jiandu_core::ir::IrBook::from_book(
+                                &book,
+                                jiandu_core::ir::IrSource::Xml,
+                            );
+                            let xml = jiandu_core::exporter::export_tei(&ir);
+                            match crate::exporter::save_bytes(dest, "xml", xml.as_bytes()) {
+                                Ok(p) => format!("已导出 TEI/XML：{}", p.display()),
+                                Err(e) => format!("写入失败：{e}"),
+                            }
+                        }
+                    };
+                    this.update(&mut cx, |this, cx| {
+                        this.export_busy = false;
+                        this.notice = msg;
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// 『保存对照图』按钮（Compare Mode 顶部操作栏专用）：把当前双屏对照
+    /// （左图扫描件 + 右文竖排 + 红框高亮）离屏合成一张高清 PNG，弹系统保存
+    /// 对话框落盘。复用 `share_paint::render_compare_png`（CG 离屏管线）与
+    /// `exporter::save_bytes`——绝不碰 reader 排版引擎，只服务 Compare Mode。
+    pub fn save_compare_image(&mut self, cx: &mut Context<Self>) {
+        let img = match self.compare_img.clone() {
+            Some(p) => p,
+            None => {
+                self.notice = "未进入对照模式或缺少左图，无法保存对照图".to_string();
+                cx.notify();
+                return;
+            }
+        };
+        if !self.export_begin(cx) {
+            return; // 连点两次不该弹两个保存框。
+        }
+        // 屏幕同源文本：优先坐标 JSON 的 `text`（与 glyph.target 全局对齐）；
+        // 无 JSON 时回退本书正文（此时无命中联动，但照样能出图）。
+        let glyphs: Vec<crate::share_paint::CompareGlyphSpec> = self
+            .compare_glyphs
+            .iter()
+            .map(|g| crate::share_paint::CompareGlyphSpec {
+                x: g.x as f64,
+                y: g.y as f64,
+                w: g.w as f64,
+                h: g.h as f64,
+                target: g.target,
+            })
+            .collect();
+        let text = if !self.compare_text.is_empty() {
+            self.compare_text.clone()
+        } else {
+            self.book
+                .as_ref()
+                .map(|b| {
+                    b.chapters
+                        .iter()
+                        .flat_map(|c| c.paragraphs.iter().map(|p| p.text.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let hit = self.compare_hit;
+        let default = "对照图.png".to_string();
+        cx.spawn(
+            move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    // 离屏合成（CG + CoreText，主线程毫秒级，绝不卡死）。
+                    let png = match crate::share_paint::render_compare_png(
+                        &img,
+                        &glyphs,
+                        &text,
+                        hit,
+                        2.0,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            this.update(&mut cx, |this, cx| {
+                                this.export_busy = false;
+                                this.notice = format!("对照图渲染失败：{e}");
+                                cx.notify();
+                            })
+                            .ok();
+                            return;
+                        }
+                    };
+                    // rfd 保存框必须前台直调（v1.52.4 铁律，与 Anki / TEI 同一条）：
+                    // 走 background executor 会被 GPUI 主循环挤掉、静默返回 None。
+                    let picked = crate::exporter::pick_save_path(
+                        "保存对照图",
+                        &default,
+                        "PNG 图片 (*.png)",
+                        &["png"],
+                    );
+                    // 取消 / 成功 / 失败三态在同一处收口：闸门复位与提示落地绑定。
+                    let msg = match picked {
+                        None => "已取消保存对照图".to_string(),
+                        Some(dest) => match crate::exporter::save_bytes(dest, "png", &png) {
+                            Ok(p) => format!("已保存对照图：{}", p.display()),
+                            Err(e) => format!("写入失败：{e}"),
+                        },
+                    };
+                    this.update(&mut cx, |this, cx| {
+                        this.export_busy = false;
+                        this.notice = msg;
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+    }
+
 /// 往 CSV 里追加一张卡片（`[from, to)` 是段内字符区间）。
 ///
 /// 短于两字的碎片（孤立的标点、空行）不成卡。注释 / 朱批都按**字符区间**
@@ -10904,6 +11054,17 @@ impl Root {
                         .text_size(px(fs))
                         .font_family(family.clone())
                         .text_color(rgb(if is_hit { 0xE02020 } else { t.ink() }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                // 反向联动：右文点击某字（cidx）→ 该 idx 即 AlignmentStore
+                                // 的 target 键；左图渲染按 `glyph.target == compare_hit`
+                                // 在该 glyph 的 x/y 区域画红框高亮（见左栏 img_box 循环）。
+                                // 滚动/平移露字留待后续，先保证高亮生效。
+                                this.compare_hit = Some(cidx);
+                                cx.notify();
+                            }),
+                        )
                         .child(SharedString::from(ch.to_string()));
                     if is_hit {
                         cell = cell.border_1().border_color(rgb(0xE02020));
@@ -10940,13 +11101,58 @@ impl Root {
                     .child(text_row),
             );
 
+        // ── 顶部操作栏（仅 Compare Mode 专属，绝不污染普通阅读界面）──
+        let bar = div()
+            .h(px(40.0))
+            .flex()
+            .items_center()
+            .px(px(12.0))
+            .gap(px(10.0))
+            .bg(rgb(t.paper()))
+            .border_1()
+            .border_color(rgb(t.rule()))
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .font_family(family.clone())
+                    .text_color(rgb(t.ink()))
+                    .child(SharedString::from("双屏对照")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(26.0))
+                    .px(px(12.0))
+                    .rounded(px(4.0))
+                    .bg(rgb(0xE02020))
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xFFFFFF))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.save_compare_image(cx);
+                        }),
+                    )
+                    .child(SharedString::from("保存对照图")),
+            );
+
         div()
             .size_full()
             .flex()
-            .flex_row()
+            .flex_col()
             .bg(rgb(t.paper()))
-            .child(left_pane)
-            .child(div().w(px(2.0)).h_full().bg(rule))
-            .child(right_pane)
+            .child(bar)
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_row()
+                    .bg(rgb(t.paper()))
+                    .child(left_pane)
+                    .child(div().w(px(2.0)).h_full().bg(rule))
+                    .child(right_pane),
+            )
     }
 }

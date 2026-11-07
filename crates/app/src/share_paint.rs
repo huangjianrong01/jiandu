@@ -327,6 +327,223 @@ fn encode_png(ctx: &mut CGContext, w: usize, h: usize) -> Result<Vec<u8>, String
     Ok(png)
 }
 
+/// 双屏对照图（Compare Mode）的**离屏合成**输入：一个字的原图像素坐标 + 它的
+/// 全局 `target`（`CharIndex` 对齐键，与右文 idx 一一对应）。
+///
+/// 它就是「AlignmentStore」的最小原型——`target` 是左图字形与右文同一字符的
+/// 共同主键，本函数靠它把左图红框与右文红字钉在同一字符上。
+pub struct CompareGlyphSpec {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub target: usize,
+}
+
+/// 把**当前双屏对照**（左图扫描件 + 右文竖排 + 红框高亮）离屏合成一张高清 PNG。
+///
+/// 复用本模块 CG 位图 + CoreText 逐字落笔 + [`encode_png`]，与分享卡同一套管线；
+/// 左图扫描件用 [`image`] 解码后**按缓冲行序（顶行 = 0）**手工 blit——绕开
+/// `core_graphics` 0.24 没有 `draw_image`/`CGImage` 的坑。本模块位图缓冲本就是
+/// 「行 0 = 顶」（见 [`draw_card`] 防雷说明），与扫描件左上原点天然同序，
+/// **无需全局 Y 翻转**；每个元素落笔前用 [`draw_card`] 同款的镜像换算，字形恒正向。
+///
+/// `scale` 是设备像素倍增（Retina）：2.0 ≈ @2x，3.0 ≈ @3x，杜绝放大马赛克。
+pub fn render_compare_png(
+    img_path: &std::path::Path,
+    glyphs: &[CompareGlyphSpec],
+    text: &str,
+    hit: Option<usize>,
+    scale: f64,
+) -> Result<Vec<u8>, String> {
+    let s = scale.max(1.0);
+
+    // ── 左图扫描件 ──
+    let scan = image::open(img_path)
+        .map_err(|e| format!("对照左图打不开：{e}"))?
+        .to_rgba8();
+    let (nw, nh) = (scan.width() as f64, scan.height() as f64);
+
+    // ── 逻辑布局（CSS 像素，最后统一 ×s）──
+    let pad: f64 = 28.0;
+    let left_w: f64 = 520.0;
+    let dw = left_w;
+    let dh = if nw > 0.0 { dw / nw * nh } else { left_w };
+    let gap: f64 = 44.0;
+    let fs: f64 = 26.0; // 右文字号
+    let cell_w = fs;
+    let cell_h = fs * 1.15;
+    let col_gap: f64 = 12.0;
+    let per_col = 30usize;
+    let chars: Vec<char> = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+    let cols = ((chars.len() + per_col - 1) / per_col).max(1);
+    let right_w = cols as f64 * (cell_w + col_gap);
+    let right_text_h = (per_col as f64) * cell_h;
+    let total_w = pad + dw + gap + right_w + pad;
+    let total_h = pad + dh.max(right_text_h) + pad;
+
+    // ── 设备像素 ──
+    let w = (total_w * s).round() as usize;
+    let h = (total_h * s).round() as usize;
+    let hf = h as f64;
+    let pad_d = pad * s;
+    let dw_d = dw * s;
+    let dh_d = dh * s;
+    let gap_d = gap * s;
+    let cell_w_d = cell_w * s;
+    let cell_h_d = cell_h * s;
+    let col_gap_d = col_gap * s;
+    let fs_d = fs * s;
+
+    let space = CGColorSpace::create_device_rgb();
+    let mut ctx = CGContext::create_bitmap_context(None, w, h, 8, w * 4, &space, BITMAP_INFO);
+
+    // 背景：纸色，与阅读界面同调。
+    let (pr, pg, pb) = rgb(0xF7F0DC);
+    ctx.set_rgb_fill_color(pr, pg, pb, 1.0);
+    ctx.fill_rect(CGRect::new(
+        &CGPoint::new(0.0, 0.0),
+        &CGSize::new(w as f64, h as f64),
+    ));
+    ctx.set_allows_antialiasing(true);
+    ctx.set_should_antialias(true);
+
+    // 屏幕坐标（左上原点）→ CG 坐标（左下原点）：只镜像，不翻 CTM（防字形倒置）。
+    let cg_top = |y_top: f64, hgt: f64| hf - y_top - hgt;
+    let cg_base = |y: f64| hf - y;
+
+    // ── 左图：解码 → 缩放 → 按缓冲行序（顶 = 0）手工 blit ──
+    let disp = image::imageops::resize(
+        &scan,
+        dw_d as u32,
+        dh_d as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    {
+        let stride = ctx.bytes_per_row();
+        let data = ctx.data();
+        let (pw, ph) = (disp.width() as usize, disp.height() as usize);
+        let ox = pad_d as usize;
+        let oy = pad_d as usize;
+        for y in 0..ph {
+            let dy = oy + y;
+            if dy >= h {
+                break;
+            }
+            for x in 0..pw {
+                let dx = ox + x;
+                if dx >= w {
+                    break;
+                }
+                let p = disp.get_pixel(x as u32, y as u32);
+                let di = dy * stride + dx * 4;
+                data[di] = p[0];
+                data[di + 1] = p[1];
+                data[di + 2] = p[2];
+                data[di + 3] = 255;
+            }
+        }
+    }
+
+    // ── 左图高亮框（AlignmentStore：target → x/y/w/h）──
+    // CG 位图是 `AlphaNoneSkipLast`（忽略 alpha），填充会被当成不透明，故命中框
+    // 只用**实心粗红描边**标出（不填充，避免盖住字形）；静态导出无需 UI 可点蓝框。
+    for g in glyphs {
+        let gx = pad_d + (g.x / nw) * dw_d;
+        let gy = pad_d + (g.y / nh) * dh_d;
+        let gw = (g.w / nw) * dw_d;
+        let gh = (g.h / nh) * dh_d;
+        let rect = CGRect::new(&CGPoint::new(gx, cg_top(gy, gh)), &CGSize::new(gw, gh));
+        if hit == Some(g.target) {
+            let (r, gg, b) = rgb(0xE02020);
+            ctx.set_rgb_stroke_color(r, gg, b, 1.0);
+            ctx.set_line_width(3.0 * s);
+            ctx.stroke_rect(rect);
+        }
+    }
+
+    // ── 右文竖排（CoreText 逐字落笔，宋体，字形恒正向）──
+    let font = pick_font(ShareFont::Song, fs_d).map_err(|e| format!("右文字体缺失：{e}"))?;
+    let asc = baseline_drop(fs_d, &font);
+    let right_x0 = pad_d + dw_d + gap_d;
+    for (i, ch) in chars.iter().enumerate() {
+        let col = i / per_col;
+        let row = i % per_col;
+        let cell_top = pad_d + row as f64 * cell_h_d;
+        let x = right_x0 + col as f64 * (cell_w_d + col_gap_d) + cell_w_d * 0.5 - fs_d * 0.5;
+        let baseline = cell_top + asc;
+        let cx0 = right_x0 + col as f64 * (cell_w_d + col_gap_d);
+        if hit == Some(i) {
+            // 命中字：红框 + 淡红填充（与左图红框呼应）。
+            let rect = CGRect::new(
+                &CGPoint::new(cx0, cg_top(cell_top, cell_h_d)),
+                &CGSize::new(cell_w_d + col_gap_d, cell_h_d),
+            );
+            let (r, gg, b, a) = rgba(0xE02020_22);
+            ctx.set_rgb_fill_color(r, gg, b, a);
+            ctx.fill_rect(rect);
+            let (r, gg, b) = rgb(0xE02020);
+            ctx.set_rgb_stroke_color(r, gg, b, 1.0);
+            ctx.set_line_width(2.0 * s);
+            ctx.stroke_rect(rect);
+        }
+        let mut unit: [u16; 1] = [0];
+        ch.encode_utf16(&mut unit);
+        let mut glyph: core_graphics::font::CGGlyph = 0;
+        let ok = unsafe { font.get_glyphs_for_characters(unit.as_ptr(), &mut glyph, 1) };
+        if !ok {
+            continue; // 该字体无此字形（生僻字）：跳过，绝不崩整张图。
+        }
+        if hit == Some(i) {
+            let (r, gg, b) = rgb(0xE02020);
+            ctx.set_rgb_fill_color(r, gg, b, 1.0);
+        } else {
+            let (r, gg, b) = rgb(0x2B2620);
+            ctx.set_rgb_fill_color(r, gg, b, 1.0);
+        }
+        paint_glyph(&ctx, &font, *ch, glyph, x, cg_base(baseline), false);
+    }
+
+    encode_png(&mut ctx, w, h)
+}
+
+#[cfg(test)]
+mod compare_tests {
+    use super::*;
+
+    /// 闭环核验：用真实对照样例（左图 + 坐标 JSON）离屏合成对照图，写到
+    /// `/tmp/jiandu_compare_export.png`，断言产物是合法非空 PNG。方向 / 字体 /
+    /// 红框是否到位，肉眼在 `/tmp` 那张图上一眼可辨。
+    #[test]
+    fn compare_image_smoke() {
+        let img = std::path::Path::new("/tmp/jiandu_compare_scan.png");
+        let json = std::path::Path::new("/tmp/jiandu_compare.json");
+        if !img.exists() || !json.exists() {
+            return; // 样例未生成时静默跳过，不拖慢常规测试。
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(json).unwrap()).unwrap();
+        let text = v["text"].as_str().unwrap_or("").to_string();
+        let mut glyphs = Vec::new();
+        if let Some(arr) = v["glyphs"].as_array() {
+            for g in arr {
+                glyphs.push(CompareGlyphSpec {
+                    x: g["x"].as_f64().unwrap_or(0.0),
+                    y: g["y"].as_f64().unwrap_or(0.0),
+                    w: g["w"].as_f64().unwrap_or(0.0),
+                    h: g["h"].as_f64().unwrap_or(0.0),
+                    target: g["target"].as_u64().unwrap_or(0) as usize,
+                });
+            }
+        }
+        // 预置命中 #100（落在左图中部、不在通栏右缘），验证「左图红框 + 右文红字」同框。
+        let png = render_compare_png(img, &glyphs, &text, Some(100), 2.0).unwrap();
+        std::fs::write("/tmp/jiandu_compare_export.png", &png).unwrap();
+        assert!(png.len() > 1000, "对照图 PNG 太小，疑似渲染失败");
+        assert_eq!(&png[0..4], b"\x89PNG", "产物不是 PNG");
+    }
+}
+
 // ── PDF：同一套版式，矢量落盘（A4 / A3）───────────────────────────────
 //
 // 「Markdown 与 A3 导出的翻译层」的最后一环：版式层只认 `w / h`，所以 A3 不需要
