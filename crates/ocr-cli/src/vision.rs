@@ -119,8 +119,14 @@ impl OcrProvider for VisionOcrProvider {
             let req: *mut AnyObject = msg_send![req_cls, new];
             let req = Retained::from_raw(req).context("创建 VNRecognizeTextRequest 失败")?;
 
-            // 0 = VNRequestTextRecognitionLevelAccurate（高精度，非实时场景）
-            let _: () = msg_send![&*req, setRecognitionLevel: 0usize];
+            // 0 = VNRequestTextRecognitionLevelAccurate（高精度，非实时场景）。
+            // ⚠️ 必须是【有符号】NSInteger（编码 'q'）。传 0usize 被编码成 'Q'、0i64 虽同宽
+            //    但不是 NSInteger 的精确对应类型——用 0isize：在 64 位 macOS 上 NSInteger
+            //    = c_long = isize，编码恰为 'q'，与框架 selector 严格匹配。
+            // ✅ 已核对相邻的 setUsesLanguageCorrection: true（BOOL）：objc2 的 bool 编码为 'B'，
+            //    现代 Apple SDK 的 BOOL 即 C99 bool（同样 'B'），实测整条 recognize() 跑通、
+            //    返回 19 字无 panic，无需改。
+            let _: () = msg_send![&*req, setRecognitionLevel: 0isize];
             let _: () = msg_send![&*req, setUsesLanguageCorrection: true];
 
             // 语言：NSMutableArray + addObject:（避免变参 arrayWithObjects:）

@@ -1,0 +1,21 @@
+[package]
+name = "pdf-cli"
+version.workspace = true
+edition.workspace = true
+description = "笺读 L7 · PDF 流式光栅化 PoC（CoreGraphics 光栅 + 逐页释放 + 可选 OCR 子进程）"
+
+[[bin]]
+name = "pdf-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+
+# 仅 macOS 目标编译：平台相关依赖只准出现在这里（core 纯洁铁律）。
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"
+foreign-types = "0.5"
+# 只用来把位图编码成 PNG（关掉默认 feature，不引解码器 / rayon）。
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde_json.workspace = true

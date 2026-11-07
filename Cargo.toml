@@ -15,7 +15,7 @@
 # 有 CI 级的 grep 校验（`scripts/check_core_purity.sh`）。
 # ─────────────────────────────────────────────────────────────────────────────
 [workspace]
-members = ["crates/core", "crates/app", "crates/eval", "crates/ocr-cli"]
+members = ["crates/core", "crates/app", "crates/eval", "crates/ocr-cli", "crates/pdf-cli"]
 resolver = "2"
 
 # 版本 / 元数据统一在一处，两个 crate 用 `version.workspace = true` 继承，

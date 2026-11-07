@@ -3997,6 +3997,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdf-cli"
+version = "1.9.99"
+dependencies = [
+ "anyhow",
+ "core-foundation 0.10.0",
+ "core-graphics 0.24.0",
+ "foreign-types",
+ "image",
+ "serde_json",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

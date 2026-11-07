@@ -57,7 +57,7 @@ CREATE INDEX IF NOT EXISTS idx_glyphs_page_xy   ON glyphs(page_id, x, y);
 
 /// 打开（或创建）SQLite 库并设定安全 PRAGMA。
 pub fn open_db(path: &Path) -> Result<Connection> {
-    let mut conn = Connection::open(path)
+    let conn = Connection::open(path)
         .with_context(|| format!("打开 SQLite 失败：{}", path.display()))?;
     // WAL：崩溃 / 断电安全，且允许并发读；NORMAL：WAL 下已足够安全又更快。
     conn.pragma_update(None, "journal_mode", "WAL")
