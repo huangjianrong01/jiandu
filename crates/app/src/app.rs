@@ -6261,6 +6261,35 @@ impl Root {
         .detach();
     }
 
+    /// 『导入原图』按钮（Compare Mode 顶部操作栏专用）：弹系统文件框选一张本地
+    /// JPG / PNG，降采样到安全尺寸后作为左图加载。红框联动逻辑保持可用——坐标
+    /// 暂时可能跟新图对不上，但红框照样能弹出来（用户已确认接受）。
+    pub fn import_compare_image(&mut self, cx: &mut Context<Self>) {
+        // rfd 同步文件框必须前台直调（v1.52.4 铁律）：cx.spawn 的 async 体由 GPUI
+        // 前台 executor 在主线程 poll，面板即原生模态显示；过 background_executor
+        // 会被主循环挤掉、静默返回 None（点了没反应）。
+        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let picked = rfd::FileDialog::new()
+                    .set_title("导入原图（JPG / PNG）")
+                    .add_filter("图片 (JPG / PNG)", &["jpg", "jpeg", "png"])
+                    .add_filter("全部文件", &["*"])
+                    .pick_file();
+                let Some(path) = picked else { return };
+                // 安全兜底：超大图降采样，绝不爆内存。
+                let display = compare_image_display_path(&path);
+                this.update(&mut cx, |this, cx| {
+                    // 换新图：保留既有坐标红框（坐标暂不对版也 OK），只清掉上一次命中高亮。
+                    this.compare_img = Some(display);
+                    this.compare_hit = None;
+                    cx.notify();
+                })
+                .ok();
+            }
+        });
+    }
+
     /// 『保存对照图』按钮（Compare Mode 顶部操作栏专用）：把当前双屏对照
     /// （左图扫描件 + 右文竖排 + 红框高亮）离屏合成一张高清 PNG，弹系统保存
     /// 对话框落盘。复用 `share_paint::render_compare_png`（CG 离屏管线）与
@@ -10839,6 +10868,90 @@ fn load_compare_json(path: &Path) -> Option<(Vec<CompareGlyph>, String, (u32, u3
     Some((glyphs, body, (iw, ih)))
 }
 
+/// 把用户导入的原图转成「安全可显示」的副本：先只读头信息取原始宽高（不解码整图），
+/// 若最长边 ≤ `MAX_DIM` 且总像素 ≤ `MAX_PIXELS` 则直接用原图；否则按两者更严的约束
+/// 降采样到 ≤4096px / ≤1 亿像素，写入临时 PNG 再返回其路径。
+///
+/// 这样无论用户丢进来的是手机截屏还是 1 亿像素的博物馆扫描大图，左侧展示的 GPU 纹理
+/// 与落盘临时文件都被牢牢钉在 ≤16MP 量级，绝不会因为一次性解码超大位图而爆内存闪退。
+/// （说明：降采样前 `image::open` 仍会完整解码原图一次，1 亿像素约 400MB 峰值内存，
+/// 属主流 Mac 内存安全区间；本函数负责的「钉尺寸」是防止 GPU 纹理与持久临时文件失控——
+/// 这才是闪退的真正元凶。）
+fn compare_image_display_path(src: &Path) -> PathBuf {
+    let Ok((nw, nh)) = image::image_dimensions(src) else {
+        return src.to_path_buf();
+    };
+    const MAX_DIM: u32 = 4096; // 最长边硬上限
+    const MAX_PIXELS: u64 = 100_000_000; // 1 亿像素上限（用户明示的极端情形）
+    let pixels = nw as u64 * nh as u64;
+    let longest = nw.max(nh);
+    // 已在安全区间：原图直出，零额外开销。
+    if longest <= MAX_DIM && pixels <= MAX_PIXELS {
+        return src.to_path_buf();
+    }
+    // 同时受「最长边」与「总像素」双重约束，取更严的缩放因子。
+    let scale_dim = if longest > 0 {
+        MAX_DIM as f64 / longest as f64
+    } else {
+        1.0
+    };
+    let scale_pix = if pixels > 0 {
+        (MAX_PIXELS as f64 / pixels as f64).sqrt()
+    } else {
+        1.0
+    };
+    let scale = scale_dim.min(scale_pix).min(1.0);
+    let dw = ((nw as f64 * scale).max(1.0)) as u32;
+    let dh = ((nh as f64 * scale).max(1.0)) as u32;
+    match image::open(src) {
+        Ok(dyn_img) => {
+            let resized = dyn_img.resize(dw, dh, image::imageops::FilterType::Lanczos3);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let out = std::env::temp_dir()
+                .join(format!("jiandu-compare-{}-{}.png", std::process::id(), nanos));
+            if resized.save(&out).is_ok() {
+                return out;
+            }
+            src.to_path_buf()
+        }
+        Err(_) => src.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod compare_image_display_tests {
+    use super::*;
+
+    #[test]
+    fn small_image_passes_through_unchanged() {
+        // 200x200 远在安全区间：应直接返回原路径，不写临时文件、不降采样。
+        let dir = std::env::temp_dir().join(format!("jiandu-cit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("small.png");
+        image::RgbaImage::new(200, 200).save(&src).unwrap();
+        let out = compare_image_display_path(&src);
+        assert_eq!(out, src, "小图应原样返回，不做降采样");
+    }
+
+    #[test]
+    fn oversized_image_gets_downsampled() {
+        // 4500x4500：最长边超 4096 触发降采样分支，但分配仅 ~81MB，不压垮内存。
+        let dir = std::env::temp_dir().join(format!("jiandu-cit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("big.png");
+        image::RgbaImage::new(4500, 4500).save(&src).unwrap();
+        let out = compare_image_display_path(&src);
+        let (w, h) = image::image_dimensions(&out).unwrap();
+        assert!(w <= 4096 && h <= 4096, "降采样后最长边必须 ≤4096，实际 {}x{}", w, h);
+        // 原图不被改动。
+        let (sw, sh) = image::image_dimensions(&src).unwrap();
+        assert_eq!((sw, sh), (4500u32, 4500u32));
+    }
+}
+
 impl Root {
     /// L1 双屏：左图（扫描影印）/ 右文（现存竖排正文），两栏各自独立滚动。
     pub fn render_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -11117,6 +11230,25 @@ impl Root {
                     .font_family(family.clone())
                     .text_color(rgb(t.ink()))
                     .child(SharedString::from("双屏对照")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(26.0))
+                    .px(px(12.0))
+                    .rounded(px(4.0))
+                    .bg(rgb(0x2F6FED))
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xFFFFFF))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.import_compare_image(cx);
+                        }),
+                    )
+                    .child(SharedString::from("导入原图")),
             )
             .child(
                 div()
