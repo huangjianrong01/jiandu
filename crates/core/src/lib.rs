@@ -83,6 +83,10 @@ pub mod jsonkit;
 /// **统一书稿模型 IR**（v1.54.0）：解析与排版之间的中间表示。
 /// 各格式先「断头」剥壳 → 清洗 → 落进 IR，引擎只认这一份数据。
 pub mod ir;
+/// **结构化数据导出（TEI / XML）**（V2.0 · B 端商业化模块）：把 IR 序列化成
+/// 标准 TEI P5 —— 正文 `<p>` / 夹注 `<note type="gloss">` / 批注 `<note type="annotation">`
+/// / 实体 `<persName>` `<placeName>` `<title>`，三路严格分离。零 UI 依赖，详见 `exporter.rs`。
+pub mod exporter;
 pub mod library;
 /// **授权**（v1.81.0 · 模块六）：离线 key，自带校验位，**不绑机器**。
 /// 只防随手转发与手抄错字，不做加密对抗——真要对抗得靠服务器或 App Store
