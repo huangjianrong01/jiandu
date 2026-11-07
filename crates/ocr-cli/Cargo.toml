@@ -1,0 +1,17 @@
+[package]
+name = "jiandu-ocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jiandu-ocr"
+path = "src/main.rs"
+
+# 离线预处理 CLI：扫描图 → JSON（V2.0 影印对照 L4 对齐契约的 seed）。
+# 注意：本 crate 不属于 crates/core，使用 `image` 不违反 core 纯洁红线。
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }

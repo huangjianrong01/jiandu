@@ -20,7 +20,7 @@ use jiandu_core::ai::{
 };
 use jiandu_core::store::{begin_bulk, end_bulk, load_chapter, put_chapter};
 use gpui::{
-    div, px, rgb, rgba, AppContext, AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement,
+    div, px, rgb, rgba, img, AppContext, AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement, StatefulInteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
     Styled, Subscription, WeakEntity, Window,
 };
@@ -468,6 +468,13 @@ pub struct Root {
     /// 当前书在书架中的下标。
     pub current: usize,
     pub book: Option<Book>,
+    /// V2.0 影印双屏对照（L1）开发开关：默认关闭，**绝不**进 V1.0 入口。
+    ///
+    /// 仅当启动环境变量 `JIANDU_DEV_COMPARE` 存在时置 true，且自动切到
+    /// `AppMode::Compare`——普通构建 / 普通用户既看不到入口、也走不进渲染分支。
+    dev_compare: bool,
+    /// 对照模式左图用的测试扫描图路径（由 `JIANDU_COMPARE_IMG` 注入；缺省 None）。
+    compare_img: Option<PathBuf>,
     pub script: Script,
     /// 参数化网格排版配置：列数 / 方向 / 留白（驱动竖排与横排两套渲染）。
     pub grid: GridConfig,
@@ -564,6 +571,9 @@ pub struct Root {
     /// 只在「当前章变了」这一刻才推一次滚动，绝不每帧 / 每像素滚动都推——
     /// 否则翻页快时列表会一路乱滚、还会把用户手动滚的位置抢回去。
     pub side_follow: Option<usize>,
+    /// 目录树的**展开路径**：`toc_expand[d]` = 第 d 列里被展开的兄弟下标。
+    /// 空 = 只显示第一层级（刚呼出面板时的默认态）。纯 UI 状态，不落库。
+    pub toc_expand: Vec<usize>,
     /// **后台导入任务**（v1.50.0）：不为空表示「正在刻印」。
     ///
     /// 百万字的丛书解析要跑几秒，绝不能堵在主线程上；进度与结果都放在
@@ -1588,6 +1598,8 @@ impl Root {
             screen: Screen::Shelf,
             current: 0,
             book: None,
+            dev_compare: std::env::var("JIANDU_DEV_COMPARE").is_ok(),
+            compare_img: std::env::var("JIANDU_COMPARE_IMG").ok().map(PathBuf::from),
             script: Script::Ancient,
             grid: GridConfig::default(),
             content_w: 0.0,
@@ -1628,6 +1640,7 @@ impl Root {
             toc_scroll: ScrollHandle::new(),
             toc_need_scroll: false,
             side_follow: None,
+            toc_expand: Vec::new(),
             import_job: None,
             shelf_birth: std::collections::HashMap::new(),
             batch: None,
@@ -1872,7 +1885,11 @@ impl Root {
             shelf_batch_confirm: false,
             close_hook_set: false,
             export_menu: false,
-            mode: AppMode::Reader,
+            mode: if std::env::var("JIANDU_DEV_COMPARE").is_ok() {
+                AppMode::Compare
+            } else {
+                AppMode::Reader
+            },
             collation,
             collation_sub,
             notice: if count == 0 {
@@ -2166,6 +2183,14 @@ impl Root {
             root.side_slide = 1.0;
             root.side_animating = false;
             root.toc_need_scroll = true;
+        }
+        // 开发用：JIANDU_TOC_EXPAND=0,1 直接摆出「卷 → 章 → 节」展开态，
+        // 便于截图核对树状层级（不影响正常逻辑）。
+        if let Ok(v) = std::env::var("JIANDU_TOC_EXPAND") {
+            root.toc_expand = v
+                .split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .collect();
         }
         // 开发用：直接浮出笔记编辑框，便于截图核对浮层版式。
         if std::env::var("JIANDU_NOTE_EDIT").is_ok() {
@@ -6865,6 +6890,8 @@ fn anki_push_card(
         // 而不是永远从第一卷起手。
         self.toc_need_scroll = true;
         self.side_follow = None;
+        // 每次呼出都从第一层级起手，绝不带着上次的展开路径。
+        self.toc_expand.clear();
     }
 
     /// 收起左侧栏（向左侧滑出）。
@@ -8855,6 +8882,11 @@ impl Render for Root {
             self.poll_ai(cx);
             return self.collation.clone().into_any_element();
         }
+        // V2.0 影印双屏对照（L1 试水）：仅 dev_compare 开启且处于 Compare 态时进入，
+        // 对普通阅读 / 笺校**零影响**（普通用户走不到这里）。
+        if self.dev_compare && self.mode == AppMode::Compare {
+            return self.render_compare(window, cx).into_any_element();
+        }
         if std::env::var("JIANDU_IME_DEBUG").is_ok() {
             use std::sync::atomic::{AtomicBool, Ordering};
             static PROBED: AtomicBool = AtomicBool::new(false);
@@ -10540,5 +10572,187 @@ mod tests {
             "[bench] 冷跳到半程 #{} {:?}　命中={}",
             half, t3.elapsed(), hit3
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V2.0 影印双屏对照 · L1 试水（仅在 `Root::dev_compare` 开启时可达）
+//
+// 三条铁律的落地：
+//   ① 绝对隔离：外层 `render` 已用 `dev_compare` 闸门拦死，普通用户进不来，
+//      也没有任何菜单/快捷键入口；
+//   ② 极简拼装：左 `RenderImage`（真实扫描图，独立滚动）、右复用本书正文
+//      （同字体竖排，独立滚动）；不做 LinkArbiter、不做坐标对齐；
+//   ③ 死守排版：本视图**完全不触碰 reader.rs**，现存竖排排版零影响——
+//      若将来发现引入 RenderImage 导致正文偏移，回滚本文件即可。
+// ─────────────────────────────────────────────────────────────────────────────
+impl Root {
+    /// L1 双屏：左图（扫描影印）/ 右文（现存竖排正文），两栏各自独立滚动。
+    pub fn render_compare(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> Div {
+        let t: Theme = self.theme;
+        let family = self.main_family();
+        let vp = window.viewport_size();
+        // `Pixels` 字段对外部 crate 私有，借 `px(1.0)` 除一下取出 f32（与下方
+        // 阅读视图取视口尺寸的写法同源，安全、不碰 Pixels 私有字段）。
+        let unit = px(1.0);
+        let vw = vp.width / unit;
+        let vh = vp.height / unit;
+        let rule = rgba(((t.rule() & 0xFFFFFF) << 8) | 0x66);
+        let fs = 22.0; // 右文试水字号（与读者主字独立，不影响读者排版）
+
+        // ── 左栏：扫描原图（RenderImage，独立滚动）──
+        let left_w = (vw * 0.5).max(200.0);
+        let mut left_scroll = div()
+            .id("compare-left")
+            .flex()
+            .flex_col()
+            .items_center()
+            .p(px(16.0));
+        match &self.compare_img {
+            Some(path) => {
+                if let Ok((nw, nh)) = image::image_dimensions(path) {
+                    let fit = left_w - 32.0;
+                    let scale = if nw > 0 { fit / nw as f32 } else { 1.0 };
+                    let dw = fit;
+                    let dh = nh as f32 * scale;
+                    // ⚠️ 宽高必须**同时**写死（v1.9.76 同款铁律）：
+                    // 只给 .w() 会让 Img 把高度填成位图像素高，盒子比页面高一截。
+                    left_scroll = left_scroll.child(img(path.clone()).w(px(dw)).h(px(dh)));
+                } else {
+                    left_scroll = left_scroll.child(
+                        div()
+                            .text_size(px(14.0))
+                            .text_color(rgb(t.ink_soft()))
+                            .child(SharedString::from("无法读取测试扫描图")),
+                    );
+                }
+            }
+            None => {
+                left_scroll = left_scroll.child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(rgb(t.ink_soft()))
+                        .child(SharedString::from("未设置 JIANDU_COMPARE_IMG")),
+                );
+            }
+        }
+        let left_pane = div()
+            .flex()
+            .flex_col()
+            .w(px(left_w))
+            .h_full()
+            .child(
+                div()
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .px(px(12.0))
+                    .text_size(px(13.0))
+                    .font_family(family.clone())
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from("左 · 扫描影印原图")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .id("left_image_scroll")
+                    .overflow_y_scroll()
+                    .bg(rgb(t.paper()))
+                    .child(left_scroll),
+            );
+
+        // ── 右栏：本书正文（竖排，复用字体；独立滚动）──
+        // 极简试水：抽本书全部段落文本，按原有竖排写法（一字一格）排成右起多列。
+        // 这是「复用字体/正文数据」的最小形态；完整 LayoutCache 列排版（与读者
+        // 逐字同位）是 L4 对齐阶段的事，本步不碰。
+        let paragraphs: Vec<String> = self
+            .book
+            .as_ref()
+            .map(|b| {
+                b.chapters
+                    .iter()
+                    .flat_map(|c| c.paragraphs.iter().map(|p| p.text.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut text_row = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .p(px(20.0));
+        let mut budget: usize = 0;
+        if paragraphs.is_empty() {
+            text_row = text_row.child(
+                div()
+                    .text_size(px(14.0))
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from(
+                        "（未打开书籍 · 用 JIANDU_AUTO_READ 开一本书）",
+                    )),
+            );
+        } else {
+            for para in &paragraphs {
+                if budget >= 2200 {
+                    break;
+                }
+                let mut col = div().flex().flex_col();
+                for ch in para.chars() {
+                    if ch == '\n' || ch == '\r' {
+                        continue;
+                    }
+                    budget += 1;
+                    if budget > 2200 {
+                        break;
+                    }
+                    col = col.child(
+                        div()
+                            .h(px(fs * 1.15))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(fs))
+                            .font_family(family.clone())
+                            .text_color(rgb(t.ink()))
+                            .child(SharedString::from(ch.to_string())),
+                    );
+                }
+                text_row = text_row.child(col);
+            }
+        }
+        let right_pane = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .child(
+                div()
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .px(px(12.0))
+                    .text_size(px(13.0))
+                    .font_family(family.clone())
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from("右 · 现存竖排正文")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .id("right_text_scroll")
+                    .overflow_y_scroll()
+                    .bg(rgb(t.paper()))
+                    .child(text_row),
+            );
+
+        div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .bg(rgb(t.paper()))
+            .child(left_pane)
+            .child(div().w(px(2.0)).h_full().bg(rule))
+            .child(right_pane)
     }
 }

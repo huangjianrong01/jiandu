@@ -2983,6 +2983,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jiandu-ocr"
+version = "1.9.99"
+dependencies = [
+ "anyhow",
+ "image",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "jobserver"
 version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
