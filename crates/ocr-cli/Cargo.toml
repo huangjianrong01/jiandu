@@ -15,3 +15,9 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
+# L4 真实引擎：macOS 原生 Vision FFI（零模型、离线、走 Neural Engine）。
+# 只在 ocr-cli（独立 crate）里接，绝不进 jiandu-core（core 纯洁红线）。
+jiandu-core = { path = "../core" }
+objc2 = { version = "0.5", features = ["std"] }
+objc2-foundation = { version = "0.2", features = ["all"] }
+objc2-vision = "0.2"

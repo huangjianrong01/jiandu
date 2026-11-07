@@ -18,6 +18,10 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+// L4 真实引擎：macOS Vision FFI（仅 macOS 编译；其他平台此模块为空壳）。
+#[cfg(target_os = "macos")]
+mod vision;
+
 const SCHEMA_ID: &str = "jiandu.image-ocr.draft-1";
 
 #[derive(Serialize)]
@@ -150,6 +154,31 @@ struct Link {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
+
+    // ── L4 子命令：vision <图片> [-o 输出] ── 真实 macOS Vision OCR
+    #[cfg(target_os = "macos")]
+    if let Some("vision") = args.get(1).map(|s| s.as_str()) {
+        let mut img: Option<String> = None;
+        let mut out: Option<String> = None;
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-o" | "--output" => {
+                    i += 1;
+                    out = args.get(i).cloned();
+                }
+                s => {
+                    if img.is_none() {
+                        img = Some(s.to_string());
+                    }
+                }
+            }
+            i += 1;
+        }
+        let img = img.context("缺少输入图像路径（用法：jiandu-ocr vision <图片> [-o 输出]）")?;
+        return vision::run_vision_cli(Path::new(&img), out.as_deref().map(Path::new));
+    }
+
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
     let mut book = String::from("unknown");

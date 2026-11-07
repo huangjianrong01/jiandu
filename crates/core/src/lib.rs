@@ -29,6 +29,11 @@ pub mod batch;
 /// **批量识别队列**（v1.9.25）：一次选中的多个 PDF / 图片排队等 OCR。
 /// 纯队列状态机，零引擎依赖——接 API 时只写消费循环，UI 不动。
 pub mod ocr;
+/// **L4 对齐层 · OCR 提供者契约**（V2.0）：`OcrProvider` trait + `OcrResult` /
+/// `OcrGlyph` + `MockOcrProvider` + `AlignmentStore`（把 OCR 结果翻译成与
+/// `app.rs::load_compare_json` 逐字节兼容的对照 JSON，并支持正 / 反向坐标查询）。
+/// 纯内核、零平台绑定，真实引擎（Vision / PaddleOCR）放独立 crate `impl` 即可。
+pub mod ocr_provider;
 /// **问小笺**（v1.76.0 · V2.0 模块二）：AI 伴读的纯逻辑层——服务商预设 /
 /// 提示词组装 / SSE 增量解析。零网络依赖（HTTP 在 UI 层 `src/ai.rs`）。
 pub mod ai;
