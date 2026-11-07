@@ -477,6 +477,9 @@ pub struct Root {
     compare_img: Option<PathBuf>,
     /// L2 坐标 JSON 路径（由 `JIANDU_COMPARE_JSON` 注入；缺省 `/tmp/jiandu_compare.json`）。
     compare_json_path: Option<PathBuf>,
+    /// L6 Step1：SQLite 数据源（数据库路径, pages.id）。优先于 JSON；
+    /// 启动经 `JIANDU_COMPARE_DB=path|page_id` 注入（缺省 page_id=1）。
+    compare_db: Option<(PathBuf, i64)>,
     /// L2 从坐标 JSON 解析出的字形命中矩形（图像坐标系）。
     compare_glyphs: Vec<CompareGlyph>,
     /// L2 与左图同源的右侧文本（每字全局 index 与 glyph.target 对齐）。
@@ -1628,6 +1631,15 @@ impl Root {
                 std::env::var("JIANDU_COMPARE_JSON")
                     .unwrap_or_else(|_| "/tmp/jiandu_compare.json".to_string()),
             )),
+            compare_db: std::env::var("JIANDU_COMPARE_DB")
+                .ok()
+                .and_then(|s| {
+                    let (path, page) = match s.split_once('|') {
+                        Some((p, n)) => (p.to_string(), n.parse::<i64>().unwrap_or(1)),
+                        None => (s.clone(), 1),
+                    };
+                    Some((PathBuf::from(path), page))
+                }),
             compare_glyphs: Vec::new(),
             compare_text: String::new(),
             compare_img_dims: (0u32, 0u32),
@@ -10901,6 +10913,50 @@ fn load_compare_json(path: &Path) -> Option<(Vec<CompareGlyph>, String, (u32, u3
     Some((glyphs, body, (iw, ih)))
 }
 
+/// L6 Step1 · 从 SQLite 读取对照数据（生产数据源，替代 load_compare_json）。
+/// 经 `idx_glyphs_page_char(page_id, char_index)` 覆盖查询+排序，逐字灌进
+/// CompareGlyph（target = char_index）与 HitTester；空格行 is_space=1 已排除
+/// （零框，与 JSON 行为一致）。返回 (字形列表, 同源文本, 图像尺寸)。
+fn load_compare_from_db(db_path: &Path, page_id: i64)
+    -> Option<(Vec<CompareGlyph>, String, (u32, u32))> {
+    use rusqlite::Connection;
+    let conn = Connection::open(db_path).ok()?;
+
+    // 页元信息（图像尺寸 + 同源文本）
+    let (iw, ih, text) = {
+        let mut stmt = conn
+            .prepare("SELECT image_width, image_height, text FROM pages WHERE id = ?1")
+            .ok()?;
+        let mut rows = stmt.query(rusqlite::params![page_id]).ok()?;
+        let row = rows.next().ok()??;
+        (
+            row.get::<_, i64>(0).ok()?,
+            row.get::<_, i64>(1).ok()?,
+            row.get::<_, String>(2).unwrap_or_default(),
+        )
+    };
+
+    // L6：用 idx_glyphs_page_char(page_id, char_index) 覆盖查询 + 排序（索引命中）
+    let mut stmt = conn
+        .prepare(
+            "SELECT char_index, x, y, w, h FROM glyphs \
+             WHERE page_id = ?1 AND is_space = 0 \
+             ORDER BY char_index",
+        )
+        .ok()?;
+    let mut rows = stmt.query(rusqlite::params![page_id]).ok()?;
+    let mut glyphs = Vec::new();
+    while let Some(row) = rows.next().ok()? {
+        let target = row.get::<_, i64>(0).ok()? as usize;
+        let x = row.get::<_, f64>(1).ok()? as f32;
+        let y = row.get::<_, f64>(2).ok()? as f32;
+        let w = row.get::<_, f64>(3).ok()? as f32;
+        let h = row.get::<_, f64>(4).ok()? as f32;
+        glyphs.push(CompareGlyph { x, y, w, h, target });
+    }
+    Some((glyphs, text, (iw as u32, ih as u32)))
+}
+
 /// 把用户导入的原图转成「安全可显示」的副本：先只读头信息取原始宽高（不解码整图），
 /// 若最长边 ≤ `MAX_DIM` 且总像素 ≤ `MAX_PIXELS` 则直接用原图；否则按两者更严的约束
 /// 降采样到 ≤4096px / ≤1 亿像素，写入临时 PNG 再返回其路径。
@@ -11005,22 +11061,28 @@ impl Root {
         let fs = 22.0; // 右文试水字号（与读者主字独立，不影响读者排版）
         let per_line = 30usize; // 横排每行字数（仅 JIANDU_COMPARE_HORIZONTAL 生效）
 
-        // L2 懒加载坐标 JSON（仅一次）：glyph 坐标 + 右侧同源文本 + HitTester。
+        // L6 Step1：数据源切换——优先 SQLite（生产），回退 JSON（兼容导入本地图）。
+        // 两者都把 glyph 灌进 CompareGlyph + HitTester，右栏用同一份 text 逐字渲染。
         if self.compare_glyphs.is_empty() {
-            if let Some(p) = &self.compare_json_path {
-                if let Some((g, txt, dims)) = load_compare_json(p) {
-                    self.compare_img_dims = dims;
-                    self.compare_text = txt;
-                    self.compare_hit_tester = HitTester::new(g.clone());
-                    self.compare_glyphs = g;
-                    // 演示钩子（可选、一次性）：`JIANDU_COMPARE_HIT=<idx>` 预置命中，
-                    // 让静态截图也能展示「左点 → 右亮红框」的联动结果；真实点击
-                    // 会覆盖它（见左侧 overlay 的 on_mouse_down）。
-                    if self.compare_hit.is_none() {
-                        if let Ok(s) = std::env::var("JIANDU_COMPARE_HIT") {
-                            if let Ok(idx) = s.parse::<usize>() {
-                                self.compare_hit = Some(idx);
-                            }
+            let loaded = if let Some((db, page_id)) = &self.compare_db {
+                load_compare_from_db(db, *page_id)
+            } else if let Some(p) = &self.compare_json_path {
+                load_compare_json(p)
+            } else {
+                None
+            };
+            if let Some((g, txt, dims)) = loaded {
+                self.compare_img_dims = dims;
+                self.compare_text = txt;
+                self.compare_hit_tester = HitTester::new(g.clone());
+                self.compare_glyphs = g;
+                // 演示钩子（可选、一次性）：`JIANDU_COMPARE_HIT=<idx>` 预置命中，
+                // 让静态截图也能展示「左点 → 右亮红框」的联动结果；真实点击
+                // 会覆盖它（见左侧 overlay 的 on_mouse_down）。
+                if self.compare_hit.is_none() {
+                    if let Ok(s) = std::env::var("JIANDU_COMPARE_HIT") {
+                        if let Ok(idx) = s.parse::<usize>() {
+                            self.compare_hit = Some(idx);
                         }
                     }
                 }
