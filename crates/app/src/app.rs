@@ -22,7 +22,7 @@ use jiandu_core::store::{begin_bulk, end_bulk, load_chapter, put_chapter};
 use gpui::{
     div, px, rgb, rgba, img, AppContext, AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement, StatefulInteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
-    Styled, Subscription, WeakEntity, Window,
+    Styled, Subscription, WeakEntity, Window, MouseDownEvent,
 };
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -475,6 +475,18 @@ pub struct Root {
     dev_compare: bool,
     /// 对照模式左图用的测试扫描图路径（由 `JIANDU_COMPARE_IMG` 注入；缺省 None）。
     compare_img: Option<PathBuf>,
+    /// L2 坐标 JSON 路径（由 `JIANDU_COMPARE_JSON` 注入；缺省 `/tmp/jiandu_compare.json`）。
+    compare_json_path: Option<PathBuf>,
+    /// L2 从坐标 JSON 解析出的字形命中矩形（图像坐标系）。
+    compare_glyphs: Vec<CompareGlyph>,
+    /// L2 与左图同源的右侧文本（每字全局 index 与 glyph.target 对齐）。
+    compare_text: String,
+    /// 左图原始像素尺寸（点击坐标 → 图像坐标换算用）。
+    compare_img_dims: (u32, u32),
+    /// 当前命中的右侧字符 index（点击左图某字后填充，驱动右侧红框）。
+    compare_hit: Option<usize>,
+    /// L2 HitTester 实例（按 y 排序，O(log n) 命中）。
+    compare_hit_tester: HitTester,
     pub script: Script,
     /// 参数化网格排版配置：列数 / 方向 / 留白（驱动竖排与横排两套渲染）。
     pub grid: GridConfig,
@@ -1600,6 +1612,15 @@ impl Root {
             book: None,
             dev_compare: std::env::var("JIANDU_DEV_COMPARE").is_ok(),
             compare_img: std::env::var("JIANDU_COMPARE_IMG").ok().map(PathBuf::from),
+            compare_json_path: Some(PathBuf::from(
+                std::env::var("JIANDU_COMPARE_JSON")
+                    .unwrap_or_else(|_| "/tmp/jiandu_compare.json".to_string()),
+            )),
+            compare_glyphs: Vec::new(),
+            compare_text: String::new(),
+            compare_img_dims: (0u32, 0u32),
+            compare_hit: None,
+            compare_hit_tester: HitTester { rows: Vec::new() },
             script: Script::Ancient,
             grid: GridConfig::default(),
             content_w: 0.0,
@@ -10586,9 +10607,91 @@ mod tests {
 //   ③ 死守排版：本视图**完全不触碰 reader.rs**，现存竖排排版零影响——
 //      若将来发现引入 RenderImage 导致正文偏移，回滚本文件即可。
 // ─────────────────────────────────────────────────────────────────────────────
+// V2.0 L2 · HitTester（点击命中检测，O(log n)）：把左侧图片上的字形坐标
+// （图像像素坐标系）与右侧文本的字符索引关联起来。蓝图 L4 的 AlignmentStore
+// 是同一思想的「落库 + 双向」版，这里先在内存里跑通点击联动。
+#[derive(Clone, Copy)]
+struct CompareGlyph {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    target: usize,
+}
+
+/// L2 命中探测器：glyph 按「y 主、x 次」排序；命中时二分定位候选行，再在
+/// 候选行内线性校验 x 与精确 y——平均复杂度 O(log n + k)，k 为同行字数（极小）。
+struct HitTester {
+    rows: Vec<CompareGlyph>,
+}
+impl HitTester {
+    fn new(mut g: Vec<CompareGlyph>) -> Self {
+        g.sort_by(|a, b| {
+            a.y.partial_cmp(&b.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        Self { rows: g }
+    }
+    fn hit(&self, px: f32, py: f32) -> Option<usize> {
+        // 二分：找第一个 y > py 的下标 lo，再从 lo-1 向前回扫，直到 y+h < py。
+        let mut lo = 0usize;
+        let mut hi = self.rows.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.rows[mid].y > py {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let mut i = lo;
+        while i > 0 {
+            i -= 1;
+            let r = &self.rows[i];
+            if r.y + r.h < py {
+                break; // 已越过 py 所在行上方，更高的字不可能命中
+            }
+            if px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h {
+                return Some(r.target);
+            }
+        }
+        None
+    }
+}
+
+/// 从坐标 JSON 解析 glyph 列表、右侧同源文本、图片原始尺寸。缺省路径
+/// `/tmp/jiandu_compare.json`；文件不存在或解析失败返回 None（render 回退原行为）。
+fn load_compare_json(path: &Path) -> Option<(Vec<CompareGlyph>, String, (u32, u32))> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let iw = v.get("image_width")?.as_u64()? as u32;
+    let ih = v.get("image_height")?.as_u64()? as u32;
+    let body = v
+        .get("text")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut glyphs = Vec::new();
+    if let Some(arr) = v.get("glyphs").and_then(|a| a.as_array()) {
+        for g in arr {
+            let x = g.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let y = g.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let w = g.get("w").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let h = g.get("h").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let target = g
+                .get("target")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            glyphs.push(CompareGlyph { x, y, w, h, target });
+        }
+    }
+    Some((glyphs, body, (iw, ih)))
+}
+
 impl Root {
     /// L1 双屏：左图（扫描影印）/ 右文（现存竖排正文），两栏各自独立滚动。
-    pub fn render_compare(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> Div {
+    pub fn render_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let t: Theme = self.theme;
         let family = self.main_family();
         let vp = window.viewport_size();
@@ -10600,7 +10703,30 @@ impl Root {
         let rule = rgba(((t.rule() & 0xFFFFFF) << 8) | 0x66);
         let fs = 22.0; // 右文试水字号（与读者主字独立，不影响读者排版）
 
-        // ── 左栏：扫描原图（RenderImage，独立滚动）──
+        // L2 懒加载坐标 JSON（仅一次）：glyph 坐标 + 右侧同源文本 + HitTester。
+        if self.compare_glyphs.is_empty() {
+            if let Some(p) = &self.compare_json_path {
+                if let Some((g, txt, dims)) = load_compare_json(p) {
+                    self.compare_img_dims = dims;
+                    self.compare_text = txt;
+                    self.compare_hit_tester = HitTester::new(g.clone());
+                    self.compare_glyphs = g;
+                    // 演示钩子（可选、一次性）：`JIANDU_COMPARE_HIT=<idx>` 预置命中，
+                    // 让静态截图也能展示「左点 → 右亮红框」的联动结果；真实点击
+                    // 会覆盖它（见左侧 overlay 的 on_mouse_down）。
+                    if self.compare_hit.is_none() {
+                        if let Ok(s) = std::env::var("JIANDU_COMPARE_HIT") {
+                            if let Ok(idx) = s.parse::<usize>() {
+                                self.compare_hit = Some(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let hit = self.compare_hit;
+
+        // ── 左栏：扫描原图（RenderImage，独立滚动）+ 命中层 ──
         let left_w = (vw * 0.5).max(200.0);
         let mut left_scroll = div()
             .id("compare-left")
@@ -10615,9 +10741,61 @@ impl Root {
                     let scale = if nw > 0 { fit / nw as f32 } else { 1.0 };
                     let dw = fit;
                     let dh = nh as f32 * scale;
-                    // ⚠️ 宽高必须**同时**写死（v1.9.76 同款铁律）：
-                    // 只给 .w() 会让 Img 把高度填成位图像素高，盒子比页面高一截。
-                    left_scroll = left_scroll.child(img(path.clone()).w(px(dw)).h(px(dh)));
+                    // 命中层与图片同尺寸：每个 glyph 画半透明描边框（蓝/命中红），
+                    // 顶层透明 overlay 捕获点击 → 换算到图像坐标 → HitTester。
+                    let mut img_box = div()
+                        .relative()
+                        .w(px(dw))
+                        .h(px(dh))
+                        .child(img(path.clone()).w(px(dw)).h(px(dh)));
+                    for g in &self.compare_glyphs {
+                        let gx = g.x / nw as f32 * dw;
+                        let gy = g.y / nh as f32 * dh;
+                        let gw = g.w / nw as f32 * dw;
+                        let gh = g.h / nh as f32 * dh;
+                        let is_hit = hit == Some(g.target);
+                        let mut gbox = div()
+                            .absolute()
+                            .top(px(gy))
+                            .left(px(gx))
+                            .w(px(gw))
+                            .h(px(gh));
+                        if is_hit {
+                            // 命中：醒目红框 + 淡红填充，标示「左图被点中的字」。
+                            gbox = gbox
+                                .border_2()
+                                .border_color(rgb(0xE02020))
+                                .bg(rgba(0xE0202022));
+                        } else {
+                            // 非命中：可见淡蓝框，标示字形可点区域。
+                            gbox = gbox.border_1().border_color(rgba(0x2F6FED88));
+                        }
+                        img_box = img_box.child(gbox);
+                    }
+                    let cap_dw = dw;
+                    let cap_dh = dh;
+                    let cap_nw = nw as f32;
+                    let cap_nh = nh as f32;
+                    img_box = img_box.child(
+                        div()
+                            .absolute()
+                            .top(px(0.0))
+                            .left(px(0.0))
+                            .w(px(dw))
+                            .h(px(dh))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                                    let ox = ev.position.x / unit;
+                                    let oy = ev.position.y / unit;
+                                    let img_x = ox / cap_dw * cap_nw;
+                                    let img_y = oy / cap_dh * cap_nh;
+                                    this.compare_hit = this.compare_hit_tester.hit(img_x, img_y);
+                                    cx.notify();
+                                }),
+                            ),
+                    );
+                    left_scroll = left_scroll.child(img_box);
                 } else {
                     left_scroll = left_scroll.child(
                         div()
@@ -10662,27 +10840,48 @@ impl Root {
                     .child(left_scroll),
             );
 
-        // ── 右栏：本书正文（竖排，复用字体；独立滚动）──
-        // 极简试水：抽本书全部段落文本，按原有竖排写法（一字一格）排成右起多列。
-        // 这是「复用字体/正文数据」的最小形态；完整 LayoutCache 列排版（与读者
-        // 逐字同位）是 L4 对齐阶段的事，本步不碰。
-        let paragraphs: Vec<String> = self
-            .book
-            .as_ref()
-            .map(|b| {
-                b.chapters
-                    .iter()
-                    .flat_map(|c| c.paragraphs.iter().map(|p| p.text.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // ── 右栏：与左图同源的文本（L2 联动）──
+        // 优先用坐标 JSON 里的 `text`（与左图 glyph.target 全局对齐）；无坐标
+        // JSON 时回退本书正文（此时无命中联动）。每字带全局 idx，左侧点击命中
+        // glyph.target == idx 时，右侧该字亮红框（L4 才做真实书对齐）。
+        let right_src: Vec<String> = if !self.compare_text.is_empty() {
+            vec![self.compare_text.clone()]
+        } else {
+            self.book
+                .as_ref()
+                .map(|b| {
+                    b.chapters
+                        .iter()
+                        .flat_map(|c| c.paragraphs.iter().map(|p| p.text.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let mut text_row = div()
             .flex()
-            .flex_col()
-            .gap(px(2.0))
+            .flex_row()
+            .flex_row_reverse()
+            .gap(px(6.0))
             .p(px(20.0));
-        let mut budget: usize = 0;
-        if paragraphs.is_empty() {
+        let per_col = 30usize;
+        let mut idx: usize = 0;
+        let mut cur_col: Vec<char> = Vec::new();
+        let mut cols: Vec<Vec<char>> = Vec::new();
+        for para in &right_src {
+            for ch in para.chars() {
+                if ch == '\n' || ch == '\r' {
+                    continue;
+                }
+                cur_col.push(ch);
+                if cur_col.len() >= per_col {
+                    cols.push(std::mem::take(&mut cur_col));
+                }
+            }
+        }
+        if !cur_col.is_empty() {
+            cols.push(cur_col);
+        }
+        if cols.is_empty() {
             text_row = text_row.child(
                 div()
                     .text_size(px(14.0))
@@ -10692,32 +10891,27 @@ impl Root {
                     )),
             );
         } else {
-            for para in &paragraphs {
-                if budget >= 2200 {
-                    break;
-                }
-                let mut col = div().flex().flex_col();
-                for ch in para.chars() {
-                    if ch == '\n' || ch == '\r' {
-                        continue;
+            for col in &cols {
+                let mut column = div().flex().flex_col();
+                for ch in col {
+                    let cidx = idx;
+                    let is_hit = hit == Some(cidx);
+                    let mut cell = div()
+                        .h(px(fs * 1.15))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(fs))
+                        .font_family(family.clone())
+                        .text_color(rgb(if is_hit { 0xE02020 } else { t.ink() }))
+                        .child(SharedString::from(ch.to_string()));
+                    if is_hit {
+                        cell = cell.border_1().border_color(rgb(0xE02020));
                     }
-                    budget += 1;
-                    if budget > 2200 {
-                        break;
-                    }
-                    col = col.child(
-                        div()
-                            .h(px(fs * 1.15))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(fs))
-                            .font_family(family.clone())
-                            .text_color(rgb(t.ink()))
-                            .child(SharedString::from(ch.to_string())),
-                    );
+                    column = column.child(cell);
+                    idx += 1;
                 }
-                text_row = text_row.child(col);
+                text_row = text_row.child(column);
             }
         }
         let right_pane = div()
