@@ -1168,7 +1168,17 @@ pub fn strip_orphan_lines(s: &str) -> Option<String> {
 ///
 /// 半角 `"` `'` **只在紧邻汉字时才动**：`don't`、`it's` 这类西文缩写里的
 /// 撇号两侧都是拉丁字母，一个都不碰。
+/// 横排跳过：当 `dir == Horizontal` 时直接返回 `None`，保留 `“”` `‘’` 等现代弯引号原样，
+/// 不做竖排角括号（「」『』）转换。竖排（默认）行为完全不变。
 pub fn normalize_quotes(s: &str) -> Option<String> {
+    normalize_quotes_dir(s, crate::grid::GridDir::Vertical)
+}
+
+fn normalize_quotes_dir(s: &str, dir: crate::grid::GridDir) -> Option<String> {
+    if matches!(dir, crate::grid::GridDir::Horizontal) {
+        // 横排：现代弯引号已是横排世界的标准形，无需翻成竖排角括号。
+        return None;
+    }
     let cs: Vec<char> = s.chars().collect();
     // 快筛：没有引号就一个字节都不动（古籍正文里 `"` `'` 出现率极低）。
     if !cs

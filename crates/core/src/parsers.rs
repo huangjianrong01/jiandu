@@ -337,7 +337,9 @@ pub fn cleanup_ancient_text(text: &str) -> String {
     // 4.6) 落单的书名号：跨段截断的《》删掉（成对的转 ︽︾，见工序 5）。
     let s = crate::cleaner::strip_orphan_title_marks(&s);
     // 5) 标点竖排化 + 书名号 / 省略号：只对标记之外的文本跑（标记保护）。
-    let s = crate::vclean::map_outside_markers(&s, cleanup_punct_inner);
+    let s = crate::vclean::map_outside_markers(&s, |seg| {
+        cleanup_punct_inner(seg, crate::grid::GridDir::Vertical)
+    });
     // 5.5) 现代括号（`〔…〕` / `【…】` / `[…]`）一律不许进正文流：短的转
     // 夹注、长的剥壳（见 `purge_bracket_marks`）。放在标点化之后——先让
     // 正文的标点定形，再把括注整段摘成夹注。
@@ -535,18 +537,27 @@ fn take_own_marker(cs: &[char], i: usize) -> (String, usize) {
 }
 
 /// 工序 5（标记之外的那一段）：半角 / 全角现代标点竖排化 + 书名号 / 省略号。
-fn cleanup_punct_inner(seg: &str) -> String {
+///
+/// `dir == Horizontal`（横排简体）时跳过全部竖排专用变换，保留 `“”` `《》` `（）` `……`
+/// 等现代标点原样——这些本就是横排世界的标准形，无需翻成竖排角括号 / 竖点 / 竖线。
+/// `dir == Vertical`（默认）行为完全不变，既有测试零影响。
+fn cleanup_punct_inner(seg: &str, dir: crate::grid::GridDir) -> String {
     // 半角 → 全角（`，。？！；：（）`；数字里的 `.`/`,` 内部已在 numcn 处理过，
-    // fullwidth_punct 自身也会跳过数字串里的标点，不会把 `3.14` 掰断）。
+    // fullwidth_punct 自身也会跳过数字串里的标点，不会把 `3.14` 掰断）。横竖排都跑。
     let s = crate::pipeline::fullwidth_punct(seg);
-    // 书名号 → 竖排专用形（刻本不用横排的《》）。
-    let s = s.replace('《', "︽").replace('》', "︾");
-    // 现代括号 → 直角引号（竖排里（）开口朝错方向，且这本就是「引用 / 括注」的语义）。
-    let s = s.replace('（', "「").replace('）', "」");
-    // 省略号 → 竖排省略号（…… 是横排躺倒的两点，竖排该是居中的竖点）。
-    let s = s.replace("……", "︙").replace('…', "︙");
-    // 破折号 → 竖排竖线（与 `vclean::classic_punct` 同一道，两条链路同源）。
-    crate::vclean::dash_to_vertical(&s)
+    if matches!(dir, crate::grid::GridDir::Vertical) {
+        // 书名号 → 竖排专用形（刻本不用横排的《》）。
+        let s = s.replace('《', "︽").replace('》', "︾");
+        // 现代括号 → 直角引号（竖排里（）开口朝错方向，且这本就是「引用 / 括注」的语义）。
+        let s = s.replace('（', "「").replace('）', "」");
+        // 省略号 → 竖排省略号（…… 是横排躺倒的两点，竖排该是居中的竖点）。
+        let s = s.replace("……", "︙").replace('…', "︙");
+        // 破折号 → 竖排竖线（与 `vclean::classic_punct` 同一道，两条链路同源）。
+        crate::vclean::dash_to_vertical(&s)
+    } else {
+        // 横排：保留现代标点原样（半角→全角已由 `fullwidth_punct` 完成）。
+        s
+    }
 }
 
 // ------------------------------------------------------------------

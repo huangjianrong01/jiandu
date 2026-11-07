@@ -10985,7 +10985,12 @@ impl Root {
     /// L1 双屏：左图（扫描影印）/ 右文（现存竖排正文），两栏各自独立滚动。
     pub fn render_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let t: Theme = self.theme;
-        let family = self.main_family();
+        let horizontal = std::env::var("JIANDU_COMPARE_HORIZONTAL").is_ok();
+        let family = if horizontal {
+            crate::fonts::family_for(self.font_modern, crate::types::Script::Modern)
+        } else {
+            self.main_family()
+        };
         let vp = window.viewport_size();
         // `Pixels` 字段对外部 crate 私有，借 `px(1.0)` 除一下取出 f32（与下方
         // 阅读视图取视口尺寸的写法同源，安全、不碰 Pixels 私有字段）。
@@ -10994,6 +10999,7 @@ impl Root {
         let vh = vp.height / unit;
         let rule = rgba(((t.rule() & 0xFFFFFF) << 8) | 0x66);
         let fs = 22.0; // 右文试水字号（与读者主字独立，不影响读者排版）
+        let per_line = 30usize; // 横排每行字数（仅 JIANDU_COMPARE_HORIZONTAL 生效）
 
         // L2 懒加载坐标 JSON（仅一次）：glyph 坐标 + 右侧同源文本 + HitTester。
         if self.compare_glyphs.is_empty() {
@@ -11182,31 +11188,51 @@ impl Root {
                 })
                 .unwrap_or_default()
         };
-        let mut text_row = div()
-            .flex()
-            .flex_row()
-            .flex_row_reverse()
-            .gap(px(6.0))
-            .p(px(20.0));
+        // 右文绘制：竖排（默认，右起列）/ 横排（JIANDU_COMPARE_HORIZONTAL=1，上→下行流式）。
+        // 两模式共用同一套「单字 cell」绘制（含反向联动 on_mouse_down），仅容器方向不同。
+        // 注：对照模式右栏是独立的 dev 渲染器，本分支只是把"30 字切列竖排"翻成"段落流式横排"，
+        // 不触碰主阅读器 grid.rs / reader.rs，V1.0 纯净不受影响（竖排默认行为完全不变）。
         let per_col = 30usize;
         let mut idx: usize = 0;
-        let mut cur_col: Vec<char> = Vec::new();
-        let mut cols: Vec<Vec<char>> = Vec::new();
-        for para in &right_src {
-            for ch in para.chars() {
-                if ch == '\n' || ch == '\r' {
-                    continue;
-                }
-                cur_col.push(ch);
-                if cur_col.len() >= per_col {
-                    cols.push(std::mem::take(&mut cur_col));
+        let mut rows: Vec<Vec<char>> = Vec::new();
+        if horizontal {
+            // 横排：按段落('\n')切分，长行按 per_line 折行，每段生成若干「行」(左→右)。
+            for para in &right_src {
+                let para = para.replace('\r', "");
+                for line in para.split('\n') {
+                    let chars: Vec<char> = line.chars().collect();
+                    if chars.is_empty() {
+                        continue;
+                    }
+                    for chunk in chars.chunks(per_line) {
+                        rows.push(chunk.to_vec());
+                    }
                 }
             }
+        } else {
+            // 竖排（原逻辑）：每 30 字切成一列，右起排布。
+            let mut cur_col: Vec<char> = Vec::new();
+            for para in &right_src {
+                for ch in para.chars() {
+                    if ch == '\n' || ch == '\r' {
+                        continue;
+                    }
+                    cur_col.push(ch);
+                    if cur_col.len() >= per_col {
+                        rows.push(std::mem::take(&mut cur_col));
+                    }
+                }
+            }
+            if !cur_col.is_empty() {
+                rows.push(cur_col);
+            }
         }
-        if !cur_col.is_empty() {
-            cols.push(cur_col);
-        }
-        if cols.is_empty() {
+        let mut text_row = if horizontal {
+            div().flex().flex_col().gap(px(4.0)).p(px(20.0))
+        } else {
+            div().flex().flex_row().flex_row_reverse().gap(px(6.0)).p(px(20.0))
+        };
+        if rows.is_empty() {
             text_row = text_row.child(
                 div()
                     .text_size(px(14.0))
@@ -11216,9 +11242,13 @@ impl Root {
                     )),
             );
         } else {
-            for col in &cols {
-                let mut column = div().flex().flex_col();
-                for ch in col {
+            for row in &rows {
+                let mut line_box = if horizontal {
+                    div().flex().flex_row().gap(px(2.0))
+                } else {
+                    div().flex().flex_col()
+                };
+                for ch in row {
                     let cidx = idx;
                     let is_hit = hit == Some(cidx);
                     let mut cell = div()
@@ -11244,10 +11274,10 @@ impl Root {
                     if is_hit {
                         cell = cell.border_1().border_color(rgb(0xE02020));
                     }
-                    column = column.child(cell);
+                    line_box = line_box.child(cell);
                     idx += 1;
                 }
-                text_row = text_row.child(column);
+                text_row = text_row.child(line_box);
             }
         }
         let right_pane = div()
@@ -11264,7 +11294,11 @@ impl Root {
                     .text_size(px(13.0))
                     .font_family(family.clone())
                     .text_color(rgb(t.ink_soft()))
-                    .child(SharedString::from("右 · 现存竖排正文")),
+                    .child(SharedString::from(if horizontal {
+                        "右 · 横排正文"
+                    } else {
+                        "右 · 现存竖排正文"
+                    })),
             )
             .child(
                 div()
