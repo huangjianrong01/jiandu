@@ -20,8 +20,8 @@ use jiandu_core::ai::{
 };
 use jiandu_core::store::{begin_bulk, end_bulk, load_chapter, put_chapter};
 use gpui::{
-    div, px, rgb, rgba, img, AppContext, AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement, StatefulInteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
+    div, px, rgb, rgba, img, AppContext, AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement, Point, StatefulInteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, ScrollWheelEvent, SharedString,
     Styled, Subscription, WeakEntity, Window, MouseDownEvent,
 };
 use std::cell::Cell;
@@ -487,6 +487,16 @@ pub struct Root {
     compare_hit: Option<usize>,
     /// L2 HitTester 实例（按 y 排序，O(log n) 命中）。
     compare_hit_tester: HitTester,
+    /// L2 LinkArbiter：双屏对照滚动同步的两个独立句柄（左图栏 / 右文栏）。
+    compare_img_scroll: ScrollHandle,
+    compare_text_scroll: ScrollHandle,
+    /// 防死锁时间锁：最近一次「程序化驱动」的目标侧与时刻（见 `compare_on_wheel`）。
+    link_arbiter_state: Option<(LinkSide, std::time::Instant)>,
+    /// 镜像侧平滑补间的目标 offset.y（负向）与是否在补间中。
+    compare_tween_img: Option<f32>,
+    compare_tween_text: Option<f32>,
+    compare_anim_img: bool,
+    compare_anim_text: bool,
     pub script: Script,
     /// 参数化网格排版配置：列数 / 方向 / 留白（驱动竖排与横排两套渲染）。
     pub grid: GridConfig,
@@ -1621,6 +1631,13 @@ impl Root {
             compare_img_dims: (0u32, 0u32),
             compare_hit: None,
             compare_hit_tester: HitTester { rows: Vec::new() },
+            compare_img_scroll: ScrollHandle::new(),
+            compare_text_scroll: ScrollHandle::new(),
+            link_arbiter_state: None,
+            compare_tween_img: None,
+            compare_tween_text: None,
+            compare_anim_img: false,
+            compare_anim_text: false,
             script: Script::Ancient,
             grid: GridConfig::default(),
             content_w: 0.0,
@@ -10839,6 +10856,18 @@ impl HitTester {
     }
 }
 
+/// L2 LinkArbiter 仲裁侧标识：左图栏 / 右文栏。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkSide {
+    Left,
+    Right,
+}
+
+/// 一次性演示钩子（dev only，与 `JIANDU_COMPARE_HIT` 同级）：环境变量
+/// `JIANDU_COMPARE_SCROLL_TEST` 置位时，启动 ~0.9s 后把左图栏滚到 ~45% 并镜像
+/// 右文栏，用于自动化截图证明「左右联动」。仅调试用，普通启动零影响。
+static COMPARE_DEMO_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 从坐标 JSON 解析 glyph 列表、右侧同源文本、图片原始尺寸。缺省路径
 /// `/tmp/jiandu_compare.json`；文件不存在或解析失败返回 None（render 回退原行为）。
 fn load_compare_json(path: &Path) -> Option<(Vec<CompareGlyph>, String, (u32, u32))> {
@@ -10989,6 +11018,35 @@ impl Root {
         }
         let hit = self.compare_hit;
 
+        // ── dev 演示钩子（JIANDU_COMPARE_SCROLL_TEST）：UI 渲染就绪（max_offset>1）后，
+        //    把左图栏滚到 ~45% 并镜像右文栏，供自动化截图证明 LinkArbiter 联动。
+        //    同步在 render 内执行：render 返回后本帧 layout 即读取两个 ScrollHandle 的
+        //    offset 并滚动——天然解决「时序(等布局就绪) / 重绘(本帧生效) / 同实例(直接改字段)」
+        //    三个坑。仅 env 置位时生效，普通启动零影响。
+        if std::env::var("JIANDU_COMPARE_SCROLL_TEST").is_ok()
+            && !COMPARE_DEMO_DONE.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let unit = px(1.0);
+            let lmax = self.compare_img_scroll.max_offset().height / unit;
+            let rmax = self.compare_text_scroll.max_offset().height / unit;
+            if lmax > 1.0 {
+                // 左图栏滚到 ~45%，按相同比例镜像右文栏（与 on_wheel 镜像公式一致）。
+                let ltarget = -(lmax * 0.45);
+                let cur = self.compare_img_scroll.offset();
+                self.compare_img_scroll.set_offset(Point::new(cur.x, px(ltarget)));
+                let ratio = if lmax > 0.0 { ltarget / lmax } else { 0.0 };
+                let rtarget = rmax * ratio;
+                let rcur = self.compare_text_scroll.offset();
+                self.compare_text_scroll.set_offset(Point::new(rcur.x, px(rtarget)));
+                // 不缓冲地写盘标记（确诊是否执行 + 看 max 值），便于排错。
+                let _ = std::fs::write(
+                    "/tmp/demo_scrolled.txt",
+                    format!("lmax={:.1} rmax={:.1}", lmax, rmax),
+                );
+                COMPARE_DEMO_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
         // ── 左栏：扫描原图（RenderImage，独立滚动）+ 命中层 ──
         let left_w = (vw * 0.5).max(200.0);
         let mut left_scroll = div()
@@ -11099,6 +11157,10 @@ impl Root {
                     .h_full()
                     .id("left_image_scroll")
                     .overflow_y_scroll()
+                    .track_scroll(&self.compare_img_scroll)
+                    .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _window, cx| {
+                        this.compare_on_wheel(LinkSide::Left, ev, cx);
+                    }))
                     .bg(rgb(t.paper()))
                     .child(left_scroll),
             );
@@ -11210,6 +11272,10 @@ impl Root {
                     .h_full()
                     .id("right_text_scroll")
                     .overflow_y_scroll()
+                    .track_scroll(&self.compare_text_scroll)
+                    .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _window, cx| {
+                        this.compare_on_wheel(LinkSide::Right, ev, cx);
+                    }))
                     .bg(rgb(t.paper()))
                     .child(text_row),
             );
@@ -11282,9 +11348,165 @@ impl Root {
                     .flex()
                     .flex_row()
                     .bg(rgb(t.paper()))
-                    .child(left_pane)
-                    .child(div().w(px(2.0)).h_full().bg(rule))
-                    .child(right_pane),
+                .child(left_pane)
+                .child(div().w(px(2.0)).h_full().bg(rule))
+                .child(right_pane),
             )
     }
+
+    /// L2 LinkArbiter 核心：任一侧滚轮 → 物理侧 1:1 瞬时跟随 + 镜像对侧按比例平滑补间。
+    ///
+    /// 防死锁：若 `side` 刚刚被程序化驱动过（落在 100ms 回声窗内），其滚轮事件直接
+    /// 忽略——既抑制镜像回声，也阻尼「左→右→左」的反向抖动。物理侧本侧 1:1 落位后
+    /// 掐断内建滚轮处理（`stop_propagation`）防止双滚；对侧只记目标 + 打时间锁，真正的
+    /// 写入交给 `compare_start_tween` 的补间任务（经 `entity.update` 触碰句柄，绝不裸持
+    /// `&mut self` 同时碰两个 `ScrollHandle`——借用检查器防呆）。
+    pub fn compare_on_wheel(&mut self, side: LinkSide, ev: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        // 回声 / 抖动抑制窗：最近刚程序化驱动过 `side`，这 100ms 内的滚轮视为镜像回声。
+        if let Some((g_side, g_time)) = self.link_arbiter_state {
+            if g_side == side && now.saturating_duration_since(g_time) < std::time::Duration::from_millis(100) {
+                return;
+            }
+        }
+        // 物理输入优先：取消本侧可能正在跑的补间，本侧由用户手感完全接管。
+        match side {
+            LinkSide::Left => {
+                self.compare_anim_img = false;
+                self.compare_tween_img = None;
+            }
+            LinkSide::Right => {
+                self.compare_anim_text = false;
+                self.compare_tween_text = None;
+            }
+        }
+        // ── 只读两侧几何（offset / max_offset 均为 `&self` 方法，零冲突）──
+        let unit = px(1.0);
+        let (self_y, self_max, other_max) = match side {
+            LinkSide::Left => (
+                self.compare_img_scroll.offset().y / unit,
+                self.compare_img_scroll.max_offset().height / unit,
+                self.compare_text_scroll.max_offset().height / unit,
+            ),
+            LinkSide::Right => (
+                self.compare_text_scroll.offset().y / unit,
+                self.compare_text_scroll.max_offset().height / unit,
+                self.compare_img_scroll.max_offset().height / unit,
+            ),
+        };
+        // 本侧滚轮增量（与 collation forward_wheel 同口径：向下滚 offset.y 变负）。
+        let dy = ev.delta.pixel_delta(px(1.0)).y / unit;
+        let next_y = (self_y + dy).clamp(-self_max.max(0.0), 0.0);
+        // 落本侧（1:1 物理跟随），掐断内建处理防止双滚。
+        match side {
+            LinkSide::Left => {
+                let cur = self.compare_img_scroll.offset();
+                self.compare_img_scroll.set_offset(Point::new(cur.x, px(next_y)));
+            }
+            LinkSide::Right => {
+                let cur = self.compare_text_scroll.offset();
+                self.compare_text_scroll.set_offset(Point::new(cur.x, px(next_y)));
+            }
+        }
+        cx.stop_propagation();
+        // 镜像对侧：按比例换算目标，打时间锁 + 平滑补间（对侧句柄只在补间任务里经 entity.update 触碰）。
+        let ratio = if self_max > 0.0 { next_y / self_max } else { 0.0 };
+        let other_target = other_max * ratio;
+        let other_side = match side {
+            LinkSide::Left => LinkSide::Right,
+            LinkSide::Right => LinkSide::Left,
+        };
+        self.link_arbiter_state = Some((other_side, std::time::Instant::now()));
+        cx.notify();
+        self.compare_start_tween(other_side, other_target, cx);
+    }
+
+    /// 平滑补间：把 `side` 镜像侧缓动到 `target_y`（指数缓动，每帧移动剩余 35%）。
+    ///
+    /// 已在本侧补间中则只更新目标（避免叠加多个任务互相拉扯）；否则标记并 spawn 一个
+    /// 前台补间任务。⚠️ 补间任务里对 `ScrollHandle` 的写入一律经 `entity.update(...)`，
+    /// 绝不在同一个可变借用里同时拿两个句柄（借用检查器防呆，见用户铁律）。
+    pub fn compare_start_tween(&mut self, side: LinkSide, target_y: f32, cx: &mut Context<Self>) {
+        match side {
+            LinkSide::Left => self.compare_tween_img = Some(target_y),
+            LinkSide::Right => self.compare_tween_text = Some(target_y),
+        }
+        let animating = match side {
+            LinkSide::Left => self.compare_anim_img,
+            LinkSide::Right => self.compare_anim_text,
+        };
+        if animating {
+            return; // 已有补间在跑，仅更新目标即可。
+        }
+        match side {
+            LinkSide::Left => self.compare_anim_img = true,
+            LinkSide::Right => self.compare_anim_text = true,
+        }
+        let weak = cx.entity().downgrade();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                loop {
+                    // 取目标与当前 offset（经 entity.update，绝不裸持 &mut self 句柄）。
+                    let (target, cur_y) = {
+                        let ent = match weak.upgrade() {
+                            Some(e) => e,
+                            None => break,
+                        };
+                        match ent.update(&mut cx, |this, _cx| {
+                            let (h, tgt) = match side {
+                                LinkSide::Left => (&this.compare_img_scroll, this.compare_tween_img),
+                                LinkSide::Right => (&this.compare_text_scroll, this.compare_tween_text),
+                            };
+                            (tgt, h.offset().y / px(1.0))
+                        }) {
+                            Ok(v) => v,
+                            Err(_) => break,
+                        }
+                    };
+                    let target = match target {
+                        Some(t) => t,
+                        None => break,
+                    };
+                    let diff = target - cur_y;
+                    if diff.abs() < 0.5 {
+                        // 抵达：精确落位并结束补间。
+                        if let Some(ent) = weak.upgrade() {
+                            ent.update(&mut cx, |this, cx| {
+                                let h = match side {
+                                    LinkSide::Left => &this.compare_img_scroll,
+                                    LinkSide::Right => &this.compare_text_scroll,
+                                };
+                                let cur = h.offset();
+                                h.set_offset(Point::new(cur.x, px(target)));
+                                match side {
+                                    LinkSide::Left => this.compare_anim_img = false,
+                                    LinkSide::Right => this.compare_anim_text = false,
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                        break;
+                    }
+                    // 指数缓动：每帧移动剩余 35%，丝滑收敛。
+                    let next = cur_y + diff * 0.35;
+                    if let Some(ent) = weak.upgrade() {
+                        ent.update(&mut cx, |this, cx| {
+                            let h = match side {
+                                LinkSide::Left => &this.compare_img_scroll,
+                                LinkSide::Right => &this.compare_text_scroll,
+                            };
+                            let cur = h.offset();
+                            h.set_offset(Point::new(cur.x, px(next)));
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                    gpui::Timer::after(std::time::Duration::from_millis(12)).await;
+                }
+            }
+        })
+        .detach();
+}
 }
