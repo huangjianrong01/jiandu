@@ -11179,12 +11179,26 @@ impl Root {
                         let gw = g.w / nw as f32 * dw;
                         let gh = g.h / nh as f32 * dh;
                         let is_hit = hit == Some(g.target);
+                        // 把点击命中直接挂到「每个字形框」上：点哪个字就用该字形自带的
+                        // `target` 赋值，根本不经过「窗口坐标 → 图像坐标」换算。
+                        // 原因：GPUI 的 MouseDownEvent.position 是【窗口坐标】，若在覆盖层
+                        // 上直接除 scale 会带进图像在窗口里的偏移，命中错位 / 命中相邻字
+                        // （点 測 却命中 試）。逐字框直挂 target 彻底杜绝该偏移，且与静态框
+                        // 完全重合（红框=底库 BBox 原封不动）。
+                        let tgt = g.target; // 复制到局部，避免 move 闭包捕获 &self 引用（需 'static）
                         let mut gbox = div()
                             .absolute()
                             .top(px(gy))
                             .left(px(gx))
                             .w(px(gw))
-                            .h(px(gh));
+                            .h(px(gh))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                    this.compare_hit = Some(tgt);
+                                    cx.notify();
+                                }),
+                            );
                         if is_hit {
                             // 命中：醒目红框 + 淡红填充，标示「左图被点中的字」。
                             gbox = gbox
@@ -11197,29 +11211,10 @@ impl Root {
                         }
                         img_box = img_box.child(gbox);
                     }
-                    let cap_dw = dw;
-                    let cap_dh = dh;
-                    let cap_nw = nw as f32;
-                    let cap_nh = nh as f32;
-                    img_box = img_box.child(
-                        div()
-                            .absolute()
-                            .top(px(0.0))
-                            .left(px(0.0))
-                            .w(px(dw))
-                            .h(px(dh))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
-                                    let ox = ev.position.x / unit;
-                                    let oy = ev.position.y / unit;
-                                    let img_x = ox / cap_dw * cap_nw;
-                                    let img_y = oy / cap_dh * cap_nh;
-                                    this.compare_hit = this.compare_hit_tester.hit(img_x, img_y);
-                                    cx.notify();
-                                }),
-                            ),
-                    );
+                    // 注：左图整图覆盖层的「窗口坐标 → 图像坐标」命中换算已移除——
+                    // 其 MouseDownEvent.position 是窗口坐标，直接除 scale 会带进图像在
+                    // 窗口里的偏移，导致命中错位 / 命中相邻字。现改为「逐字框直接挂 target」
+                    // （见上方 glyph 循环），零坐标换算、零偏移、与静态框完全重合。
                     left_scroll = left_scroll.child(img_box);
                 } else {
                     left_scroll = left_scroll.child(
