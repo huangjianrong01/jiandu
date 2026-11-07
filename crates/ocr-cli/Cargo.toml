@@ -21,3 +21,5 @@ jiandu-core = { path = "../core" }
 objc2 = { version = "0.5", features = ["std"] }
 objc2-foundation = { version = "0.2", features = ["all"] }
 objc2-vision = "0.2"
+# L5 落库：SQLite 持久化（纯 Rust 绑定；dev 验证用系统 lib，生产可加 features=["bundled"] 自带源码）
+rusqlite = "0.32"

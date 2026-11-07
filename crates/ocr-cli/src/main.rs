@@ -22,6 +22,9 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 mod vision;
 
+// L5 落库：SQLite 持久化适配（跨平台，不依赖 macOS）。
+mod db;
+
 const SCHEMA_ID: &str = "jiandu.image-ocr.draft-1";
 
 #[derive(Serialize)]
@@ -154,6 +157,11 @@ struct Link {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
+
+    // ── L5 子命令：db <sqlite.db> <json文件|目录>... ── 把对照 JSON 落库到 SQLite
+    if let Some("db") = args.get(1).map(|s| s.as_str()) {
+        return run_db_cli(&args[2..]);
+    }
 
     // ── L4 子命令：vision <图片> [-o 输出] ── 真实 macOS Vision OCR
     #[cfg(target_os = "macos")]
@@ -308,6 +316,56 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// L5 落库 CLI：把对照 JSON 写进 SQLite（文档 / 页 / 字形 三层）。
+fn run_db_cli(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("用法：jiandu-ocr db <sqlite.db> <json文件或目录> [更多...]");
+    }
+    let db_path = Path::new(&args[0]);
+    let mut conn = db::open_db(db_path)?;
+    db::create_schema(&conn)?;
+    eprintln!("✓ SQLite 已打开并建表：{}", db_path.display());
+    eprintln!("  （建表 SQL 见 db.rs 的 SCHEMA_SQL：documents / pages / glyphs + 两索引）");
+
+    let mut page_no = 0i64;
+    let mut total = 0usize;
+    let mut total_box = 0usize;
+    for a in &args[1..] {
+        let p = Path::new(a);
+        // 目录则扫其下 *.json，文件则直接落库
+        let files: Vec<std::path::PathBuf> = if p.is_dir() {
+            fs::read_dir(p)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                .collect()
+        } else {
+            vec![p.to_path_buf()]
+        };
+        for f in files {
+            let stem = f
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("page")
+                .to_string();
+            let (rows, with_box) = db::ingest_json_file(&mut conn, &stem, page_no, &f)?;
+            eprintln!(
+                "Inserted {} records for {} ({} with bbox)",
+                rows, stem, with_box
+            );
+            total += rows;
+            total_box += with_box;
+            page_no += 1;
+        }
+    }
+    eprintln!(
+        "✅ L5 落库完成：共 {} 条字形记录（{} 含真实框）写入 {}",
+        total,
+        total_box,
+        db_path.display()
+    );
     Ok(())
 }
 

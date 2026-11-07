@@ -23,10 +23,11 @@
 //! - 跨平台兜底 PaddleOCR：`rust-paddle-ocr`（MNN 后端，纯 Rust，支持竖排 / 繁体
 //!   / PP-OCRv5）或 `paddle-ocr-rs`（ONNX Runtime），需下载模型、~400MB 内存。
 
+use anyhow::Context;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// OCR 入参：支持「文件路径」或「内存字节」（后者便于测试与内嵌资源）。
 #[derive(Debug, Clone)]
@@ -138,6 +139,9 @@ pub struct AlignmentStore {
     pub glyphs: Vec<OcrGlyph>,
     /// 来源引擎名。
     pub provider: String,
+    /// 该对齐来源图像（路径或内容哈希），便于落库后回查属于哪张扫描图。
+    /// 落 JSON 时存在 `source` 键，旧 app 加载器会忽略未知键，零冲突。
+    pub source_image: Option<String>,
     /// glyph 索引按 (y, x) 升序，供 `glyph_at` 二分。
     sorted: Vec<usize>,
 }
@@ -152,6 +156,7 @@ impl AlignmentStore {
             text: result.text,
             glyphs: result.glyphs,
             provider: result.provider,
+            source_image: None,
             sorted,
         }
     }
@@ -217,6 +222,10 @@ impl AlignmentStore {
             text,
             glyphs,
             provider: "json".to_string(),
+            source_image: v
+                .get("source")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
             sorted,
         })
     }
@@ -256,6 +265,115 @@ impl AlignmentStore {
         self.glyphs
             .get(idx)
             .map(|g| (g.x, g.y, g.w, g.h))
+    }
+
+    /// L5 落库：把对齐仓库序列化到磁盘（JSON 文件）。
+    ///
+    /// 文件格式 = [`to_compare_json`] 的完整形状（与 `app.rs::load_compare_json`
+    /// **逐字节兼容**）再附加 `source` / `provider` / `format_version` 三个元数据键
+    /// —— 旧加载器忽略未知键，混合使用零冲突。纯 `std::fs`，不碰任何平台 / UI，
+    /// 符合 core 纯洁红线。
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let mut v = self.to_compare_json();
+        v["source"] = serde_json::json!(self.source_image);
+        v["provider"] = serde_json::json!(self.provider);
+        v["format_version"] = serde_json::json!(1u32);
+        let s = serde_json::to_string_pretty(&v)?;
+        std::fs::write(path.as_ref(), s)
+            .with_context(|| format!("写对齐文件失败：{}", path.as_ref().display()))?;
+        Ok(())
+    }
+
+    /// L5 入库：从 [`save`] 写出的对齐文件重建对齐仓库（`source` / `provider`
+    /// 一并还原）。文件不存在 / 格式非法返回错误。
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let p = path.as_ref();
+        let raw = std::fs::read_to_string(p)
+            .with_context(|| format!("读对齐文件失败：{}", p.display()))?;
+        let v: serde_json::Value = serde_json::from_str(&raw)?;
+        let mut store = Self::from_compare_json(&v)
+            .ok_or_else(|| anyhow::anyhow!("对齐文件格式不合法：{}", p.display()))?;
+        store.source_image = v
+            .get("source")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+        store.provider = v
+            .get("provider")
+            .and_then(|s| s.as_str())
+            .unwrap_or("json")
+            .to_string();
+        Ok(store)
+    }
+}
+
+/// L5 对齐库：把多张扫描图的对齐仓库按 key 落盘到一个目录，便于整本书的对照
+/// 数据随工程一起保存 / 重载。纯 `std::fs`，不依赖任何平台或 UI，符合 core
+/// 纯洁红线——壳子（macOS / Windows / Linux）只要持有一个目录路径即可复用。
+pub struct AlignmentLibrary {
+    /// 库目录（`.align.json` 文件的容器）。
+    dir: PathBuf,
+}
+
+impl AlignmentLibrary {
+    /// 打开（或创建）一个对齐库目录。
+    pub fn open<P: Into<PathBuf>>(dir: P) -> Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("创建对齐库目录失败：{}", dir.display()))?;
+        Ok(Self { dir })
+    }
+
+    /// 把 key 安全化为文件名（去除路径分隔符，避免越界写）。
+    fn file_of(&self, key: &str) -> PathBuf {
+        let safe: String = key
+            .chars()
+            .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+            .collect();
+        self.dir.join(format!("{}.align.json", safe))
+    }
+
+    /// 写入一条对齐（key 一般用源图文件名 stem 或内容哈希）。
+    pub fn insert(&self, key: &str, store: &AlignmentStore) -> Result<()> {
+        store.save(self.file_of(key))
+    }
+
+    /// 读取一条对齐；不存在返回 `Ok(None)`。
+    pub fn get(&self, key: &str) -> Result<Option<AlignmentStore>> {
+        let p = self.file_of(key);
+        if !p.exists() {
+            return Ok(None);
+        }
+        Ok(Some(AlignmentStore::load(p)?))
+    }
+
+    /// 删除一条对齐；不存在返回 `Ok(false)`。
+    pub fn remove(&self, key: &str) -> Result<bool> {
+        let p = self.file_of(key);
+        if p.exists() {
+            std::fs::remove_file(&p)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// 列出库内所有 key（即所有 `*.align.json` 的文件名 stem，已排序）。
+    pub fn list(&self) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = name.strip_suffix(".align.json") {
+                keys.push(stem.to_string());
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// key 是否存在于库内。
+    pub fn contains(&self, key: &str) -> bool {
+        self.file_of(key).exists()
     }
 }
 
@@ -414,5 +532,48 @@ mod tests {
         for k in ["x", "y", "w", "h", "target"] {
             assert!(gk.contains(&&k.to_string()), "对照 JSON glyph 缺键 {k}");
         }
+    }
+
+    #[test]
+    fn l5_save_load_roundtrip_preserves_everything() {
+        let p = sample();
+        let r = p.recognize(&OcrInput::from_bytes(vec![])).unwrap();
+        let mut store = AlignmentStore::from_ocr(r);
+        store.source_image = Some("page001.jpeg".to_string());
+        let tmp = std::env::temp_dir().join("jiandu_align_rt.json");
+        store.save(&tmp).unwrap();
+        let loaded = AlignmentStore::load(&tmp).unwrap();
+        assert_eq!(loaded.text, store.text);
+        assert_eq!(loaded.glyphs.len(), store.glyphs.len());
+        assert_eq!(loaded.glyphs[0].x, store.glyphs[0].x);
+        assert_eq!(loaded.source_image, store.source_image);
+        assert_eq!(loaded.provider, store.provider);
+        // 排序索引重建后，正向/反向查询结果与落库前一致
+        let g = &store.glyphs[3];
+        assert_eq!(
+            loaded.glyph_at(g.x + g.w / 2.0, g.y + g.h / 2.0),
+            Some(g.char_index)
+        );
+        assert_eq!(loaded.char_box(3), Some((g.x, g.y, g.w, g.h)));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn l5_alignment_library_insert_get_list_remove() {
+        let tmp = std::env::temp_dir().join("jiandu_align_lib");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let lib = AlignmentLibrary::open(&tmp).unwrap();
+        let p = sample();
+        let store = AlignmentStore::from_ocr(p.recognize(&OcrInput::from_bytes(vec![])).unwrap());
+        lib.insert("page001", &store).unwrap();
+        assert!(lib.contains("page001"));
+        let got = lib.get("page001").unwrap().unwrap();
+        assert_eq!(got.text, store.text);
+        assert_eq!(got.glyphs.len(), store.glyphs.len());
+        assert_eq!(lib.list().unwrap(), vec!["page001".to_string()]);
+        assert!(lib.remove("page001").unwrap());
+        assert!(!lib.contains("page001"));
+        assert!(lib.get("page001").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

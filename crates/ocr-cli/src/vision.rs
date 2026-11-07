@@ -25,6 +25,7 @@ use objc2::runtime::{AnyClass, AnyObject};
 use objc2_foundation::CGRect;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[cfg(target_os = "macos")]
 use image::{Rgba, RgbaImage};
@@ -287,6 +288,13 @@ pub fn run_vision_cli(input: &Path, output: Option<&Path>, overlay: Option<&Path
 }
 
 /// 批量目录模式：取一层目录内的图像文件，逐张产出 JSON + 红框 overlay，并打印统计。
+/// 批量目录模式：取一层目录内的图像文件，逐张产出 JSON + 红框 overlay，并打印统计。
+///
+/// ⚠️ 进程隔离（L4 收尾加固）：苹果 Vision 在**同一进程内第二个** `performRequests`
+/// 必现失败（底层 GPU/ANE 状态跨调用不释放），而**单进程单图** 100% 成功。因此批量
+/// 逐张 fork 独立子进程（即 `jiandu-ocr vision <单图>`），父进程只收集结果落库。
+/// 这是确定性的「逐个处理并释放」，不依赖任何玄学重试。子进程若不可用，则回退到
+/// 进程内单图识别（同一进程只跑这一张，成功率同样高）。
 fn run_vision_dir(dir: &Path) -> Result<()> {
     let provider = VisionOcrProvider::default();
     let mut entries: Vec<_> = std::fs::read_dir(dir)
@@ -297,33 +305,93 @@ fn run_vision_dir(dir: &Path) -> Result<()> {
         .filter(|p| is_image_ext(p))
         .collect();
     entries.sort();
-    eprintln!("▶ 批量 Vision OCR：{} 共 {} 张图", dir.display(), entries.len());
+    eprintln!(
+        "▶ 批量 Vision OCR：{} 共 {} 张图（逐张独立子进程隔离）",
+        dir.display(),
+        entries.len()
+    );
+    // L5 落库：把每张图的对齐仓库按文件名 stem 落进 <dir>/.jiandu_align/ 目录库，
+    // 便于整批扫描后按 key 重载 / 检索（纯 core，ocr-cli 仅调用，不破纯洁红线）。
+    let lib = jiandu_core::ocr_provider::AlignmentLibrary::open(dir.join(".jiandu_align"))?;
+    // 当前可执行文件自身作为子进程镜像（单图模式会写 JSON + overlay 后退出）。
+    let exe = std::env::current_exe().ok();
+
     let mut total = 0usize;
     let mut failed = 0usize;
     for p in &entries {
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("page");
         let json_path = dir.join(format!("{}.json", stem));
         let ov_path = dir.join(format!("{}._overlay.png", stem));
-        // 单张图最多重试一次：Vision 在同进程连续跑 handler 时偶发 performRequests 失败，
-        // 重试通常即可恢复；最终失败则跳过该图，不让整批中断（用户可能一次丢几十张扫描页）。
-        let result = match recognize_with_retry(&provider, p, 2) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("  ⚠️ {} 识别失败（跳过）：{:#}", stem, e);
-                failed += 1;
-                continue;
-            }
+
+        // ── 主路径：独立子进程跑单图（Vision 跨进程状态彻底隔离）──
+        let ran_subprocess = match &exe {
+            Some(exe) => matches!(
+                Command::new(exe)
+                    .arg("vision")
+                    .arg(p)
+                    .arg("-o")
+                    .arg(&json_path)
+                    .arg("--overlay")
+                    .arg(&ov_path)
+                    .status(),
+                Ok(s) if s.success()
+            ),
+            None => false,
         };
-        let store = jiandu_core::ocr_provider::AlignmentStore::from_ocr(result);
-        total += store.glyphs.len();
-        std::fs::write(&json_path, serde_json::to_string_pretty(&store.to_compare_json())?)?;
-        draw_overlay(p, &store, &ov_path)?;
-        let (oob, ymin, ymax) = glyph_stats(&store);
-        eprintln!(
-            "  ✓ {} → {} 字, oob={}, y∈[{:.0},{:.0}] (+overlay)",
-            stem, store.glyphs.len(), oob, ymin, ymax
-        );
+
+        if ran_subprocess {
+            // 子进程已写好 JSON + overlay；父进程读回用于落库与统计。
+            match std::fs::read_to_string(&json_path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| jiandu_core::ocr_provider::AlignmentStore::from_compare_json(&v))
+            {
+                Some(mut store) => {
+                    store.source_image = Some(p.display().to_string());
+                    total += store.glyphs.len();
+                    if let Err(e) = lib.insert(stem, &store) {
+                        eprintln!("  ⚠️ {} 落库失败（不影响 JSON/overlay）：{:#}", stem, e);
+                    }
+                    let (oob, ymin, ymax) = glyph_stats(&store);
+                    eprintln!(
+                        "  ✓ {} → {} 字, oob={}, y∈[{:.0},{:.0}] (+overlay)",
+                        stem, store.glyphs.len(), oob, ymin, ymax
+                    );
+                }
+                None => {
+                    eprintln!("  ⚠️ {} 子进程成功但 JSON 读回失败（跳过）", stem);
+                    failed += 1;
+                }
+            }
+        } else {
+            // ── 回退：进程内单图识别（该进程只跑这一张，规避同进程多 handler 的坑）──
+            match provider.recognize(&OcrInput::from_path(p)) {
+                Ok(r) => {
+                    let mut store = jiandu_core::ocr_provider::AlignmentStore::from_ocr(r);
+                    store.source_image = Some(p.display().to_string());
+                    total += store.glyphs.len();
+                    std::fs::write(
+                        &json_path,
+                        serde_json::to_string_pretty(&store.to_compare_json())?,
+                    )?;
+                    draw_overlay(p, &store, &ov_path)?;
+                    if let Err(e) = lib.insert(stem, &store) {
+                        eprintln!("  ⚠️ {} 落库失败（不影响 JSON/overlay）：{:#}", stem, e);
+                    }
+                    let (oob, ymin, ymax) = glyph_stats(&store);
+                    eprintln!(
+                        "  ✓ {} → {} 字, oob={}, y∈[{:.0},{:.0}] (+overlay 回退)",
+                        stem, store.glyphs.len(), oob, ymin, ymax
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  ⚠️ {} 识别失败（跳过）：{:#}", stem, e);
+                    failed += 1;
+                }
+            }
+        }
     }
+    let keys = lib.list().unwrap_or_default();
     eprintln!(
         "✅ 批量完成：{} 张图，成功 {} 张，跳过 {} 张，共 {} 字",
         entries.len(),
@@ -331,25 +399,12 @@ fn run_vision_dir(dir: &Path) -> Result<()> {
         failed,
         total
     );
+    eprintln!(
+        "📚 对齐库已落库 {} 条 → {}/.jiandu_align/",
+        keys.len(),
+        dir.display()
+    );
     Ok(())
-}
-
-/// 带重试的识别（见 `run_vision_dir` 注释：规避 Vision 连续 handler 的偶发失败）。
-fn recognize_with_retry(
-    provider: &VisionOcrProvider,
-    path: &Path,
-    attempts: usize,
-) -> Result<OcrResult> {
-    let mut last = None;
-    for _ in 0..attempts.max(1) {
-        match provider.recognize(&OcrInput::from_path(path)) {
-            Ok(r) => return Ok(r),
-            Err(e) => {
-                last = Some(e);
-            }
-        }
-    }
-    Err(last.unwrap_or_else(|| anyhow!("未知识别错误")))
 }
 
 /// 常见扫描图扩展名（批量模式据此挑文件）。
