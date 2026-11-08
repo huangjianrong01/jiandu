@@ -5915,6 +5915,7 @@ impl Root {
         let inner = if self.layout_dir == crate::app::LayoutDir::Horizontal {
             self.render_ancient_horizontal(
                 &glyphs,
+                &columns,
                 back,
                 start,
                 idx,
@@ -6350,6 +6351,7 @@ impl Root {
     fn render_ancient_horizontal(
         &self,
         glyphs: &[Glyph],
+        columns: &[Vec<Piece>],
         back: bool,
         _start_chapter: bool,
         _idx: usize,
@@ -6362,70 +6364,120 @@ impl Root {
         let fs = geo.fs;
         let cell_w = geo.cell_w;
         let cell_h = geo.cell_h;
+        let row_h = cell_h * 1.5; // 横排行高：比竖排字格略松，保留阅读呼吸
         let paper = if back { t.paper_back() } else { t.paper() };
         let ink = if back { t.ink_soft() } else { self.palette.ink(t) };
-        // 横向流动容器：按字格宽高逐字排、满行回折（flex_wrap）。
+        let ink_gloss = t.ink_soft(); // 夹注：深灰，浅于正文墨色
+        let fs_gloss = fs * 0.59;     // 夹注字号：明显小于正文
+        // 列升序 = 竖排右→左读序；列内自上而下，得到正文 / 夹注交错序列。
+        // 横排无列（纯正文页）时退回 glyphs，至少不丢正文。
+        let synthetic: Vec<Vec<Piece>> = if columns.is_empty() {
+            vec![glyphs.iter().map(|g| Piece::Main(*g)).collect()]
+        } else {
+            Vec::new()
+        };
+        let cols: &[Vec<Piece>] = if columns.is_empty() { &synthetic } else { columns };
+        // 横向流动容器：逐字排、满行回折（flex_wrap），底部对齐做基线感。
         let mut flow = div()
             .flex()
             .flex_row()
             .flex_wrap()
-            .items_start()
+            .items_end()
             .justify_start()
             .w(px(self.content_w.max(80.0)))
             .bg(rgb(paper));
         let mut last_para: Option<usize> = None;
-        for g in glyphs.iter() {
-            // 段首缩进占位：横排里给两个空字格的缩进（对齐现代段落首行缩进）。
-            if g.is_indent() {
-                flow = flow
-                    .child(div().w(px(cell_w * 2.0)).h(px(cell_h)))
-                    .child(div().w(px(cell_w * 2.0)).h(px(cell_h)));
-                continue;
-            }
-            // 段落切换：插入一条「整行宽的细缝」强制回折，模拟分段（不画可见线）。
-            if let Some(p) = last_para {
-                if p != g.para && g.kind == jiandu_core::types::GlyphKind::Char {
-                    flow = flow.child(
-                        div()
-                            .w(px(self.content_w.max(80.0)))
-                            .h(px(cell_h * 0.35)),
-                    );
+        let mut first = true;
+        for col in cols.iter() {
+            for piece in col.iter() {
+                match piece {
+                    Piece::Gap => {}
+                    Piece::Main(g) => {
+                        // 段落切换：段间留白 + 首行缩进 2 字（首段同样缩进）。
+                        if let Some(p) = last_para {
+                            if p != g.para {
+                                flow = flow.child(
+                                    div().w(px(self.content_w.max(80.0))).h(px(cell_h * 0.6)),
+                                );
+                                flow = flow.child(div().w(px(cell_w * 2.0)).h(px(row_h)));
+                            }
+                        } else if first {
+                            flow = flow.child(div().w(px(cell_w * 2.0)).h(px(row_h)));
+                        }
+                        last_para = Some(g.para);
+                        first = false;
+                        if g.is_indent() {
+                            continue; // 缩进占位由段首统一处理，跳过
+                        }
+                        // 显示字符（繁简开关 + 数字转汉）：与竖排同口径。
+                        let mut s = self.shown_glyph(*g).to_string();
+                        if self.han_digits {
+                            s = crate::west::digits_to_han(&s, false);
+                        }
+                        let ch = s.chars().next().unwrap_or(' ');
+                        let drawn = match ch {
+                            '︵' => '（',
+                            '︶' => '）',
+                            '︷' => '〔',
+                            '︸' => '〕',
+                            '︽' | '︿' => '《',
+                            '︾' | '﹀' => '》',
+                            '﹁' => '「',
+                            '﹂' => '」',
+                            '﹃' => '『',
+                            '﹄' => '』',
+                            other => other,
+                        };
+                        let pick =
+                            crate::font_fallback::body(self.font_ancient, self.script, drawn, cx);
+                        if is_punct(drawn) {
+                            // 标点挤压：占宽压到 0.45 + 右对齐，紧贴前一字右下角，
+                            // 绝不占一个全角空格。
+                            flow = flow.child(
+                                div()
+                                    .w(px(cell_w * 0.45))
+                                    .h(px(row_h))
+                                    .flex()
+                                    .items_end()
+                                    .justify_end()
+                                    .text_size(px(fs))
+                                    .font_family(pick.family.clone())
+                                    .text_color(rgb(ink))
+                                    .child(SharedString::from(drawn.to_string())),
+                            );
+                        } else {
+                            flow = flow.child(
+                                div()
+                                    .w(px(cell_w))
+                                    .h(px(row_h))
+                                    .flex()
+                                    .items_end()
+                                    .justify_center()
+                                    .text_size(px(fs))
+                                    .font_family(pick.family.clone())
+                                    .text_color(rgb(ink))
+                                    .child(SharedString::from(drawn.to_string())),
+                            );
+                        }
+                    }
+                    Piece::Gloss(txt, _src, _host) => {
+                        // 行内夹注：小字 + 深灰 + 括号包裹；底部对齐正文大字（基线感）。
+                        let note: String = format!("（{}）", txt);
+                        let pick =
+                            crate::font_fallback::body(self.font_ancient, self.script, '注', cx);
+                        flow = flow.child(
+                            div()
+                                .h(px(row_h))
+                                .flex()
+                                .items_end()
+                                .text_size(px(fs_gloss))
+                                .font_family(pick.family.clone())
+                                .text_color(rgb(ink_gloss))
+                                .child(SharedString::from(note)),
+                        );
+                    }
                 }
             }
-            last_para = Some(g.para);
-            // 显示字符（繁简开关 + 数字转汉）：与竖排同口径，绝不另起一套。
-            let mut s = self.shown_glyph(*g).to_string();
-            if self.han_digits {
-                s = crate::west::digits_to_han(&s, false);
-            }
-            // 竖排专用呈现形 → 横排正形（括号 / 引号 / 书名号），其余标点原样。
-            let ch = s.chars().next().unwrap_or(' ');
-            let drawn = match ch {
-                '︵' => '（',
-                '︶' => '）',
-                '︷' => '〔',
-                '︸' => '〕',
-                '︽' | '︿' => '《',
-                '︾' | '﹀' => '》',
-                '﹁' => '「',
-                '﹂' => '」',
-                '﹃' => '『',
-                '﹄' => '』',
-                other => other,
-            };
-            let pick = crate::font_fallback::body(self.font_ancient, self.script, drawn, cx);
-            flow = flow.child(
-                div()
-                    .w(px(cell_w))
-                    .h(px(cell_h))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(fs))
-                    .font_family(pick.family.clone())
-                    .text_color(rgb(ink))
-                    .child(SharedString::from(drawn.to_string())),
-            );
         }
         flow
     }

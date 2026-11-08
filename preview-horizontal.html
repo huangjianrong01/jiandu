@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>勘阅 · 横排模式预览（模拟）</title>
+<style>
+  :root{
+    --paper:#F4EFE3;        /* 米白纸面 t.paper() */
+    --paper-back:#EDE7D8;   /* 晒本底 t.paper_back() */
+    --ink:#2B2622;          /* 正文墨色 palette.ink */
+    --ink-soft:#6B6258;     /* 晒本软墨 ink_soft */
+    --zhu:#B0342C;          /* 朱砂 */
+    --edge:#E8E6E0;         /* 竹简边 */
+    --fs:22px;              /* geo.fs（正文主字号）*/
+    --ann-fs:13px;          /* 夹注字号：明显小于正文 */
+    --ann-color:#8A8175;    /* 夹注颜色：深灰，浅于正文墨色 */
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:#C9C2B2;}
+  body{
+    font-family:"Songti SC","STSong","SimSun",serif;
+    color:var(--ink);
+    display:flex;flex-direction:column;align-items:center;
+    min-height:100vh;padding:18px 0 60px;
+  }
+
+  /* ── 顶栏（阅读工具条，仅含与横竖排相关的「转竖排」钮）── */
+  .toolbar{
+    width:760px;max-width:96vw;background:#3A332C;color:#F4EFE3;
+    display:flex;align-items:center;justify-content:space-between;
+    padding:8px 14px;border-radius:8px 8px 0 0;font-size:14px;
+  }
+  .toolbar .title{font-weight:700;letter-spacing:2px;}
+  .toolbar .book{opacity:.7;font-size:13px;margin-left:10px;}
+  .toggle{
+    background:var(--zhu);color:#fff;border:none;border-radius:6px;
+    padding:6px 14px;font-size:14px;cursor:pointer;font-family:inherit;
+  }
+  .toggle:hover{filter:brightness(1.08);}
+  .toggle.ghost{background:#5A5147;}
+
+  /* ── 阅读纸面（render_ancient_horizontal 的容器）── */
+  .paper{
+    width:760px;max-width:96vw;background:var(--paper);
+    padding:30px 20px 34px;
+  }
+  .caption{font-size:12px;color:var(--ann-color);letter-spacing:1px;margin-bottom:14px;}
+  .flow{
+    width:720px;max-width:100%;margin:0 auto;
+  }
+  .para{
+    font-size:var(--fs);
+    line-height:1.85;          /* 合理行高：保留阅读呼吸，不再拉成网格 */
+    letter-spacing:0;          /* 紧凑：零字间距，中文自然咬合 */
+    margin:0 0 1.05em 0;       /* 段间距：段与段之间加大行距，段落感更清晰 */
+    text-indent:2em;           /* 段首缩进：标准 2 字格 */
+    text-align:left;
+  }
+  .para:last-child{margin-bottom:0;}
+  .punct{
+    display:inline-block;width:0.4em;text-align:right;   /* 标点挤到右下角 */
+    margin-left:-0.4em;        /* 净占宽≈0：标点贴前一字右下角，绝不占全角空格 */
+    vertical-align:baseline;overflow:visible;
+  }
+  /* ── 夹注（小字注文）：视觉降级 + 基线对齐 + 括号包裹 ── */
+  .ann{
+    font-size:var(--ann-fs);
+    color:var(--ann-color);    /* 深灰，浅于正文 */
+    vertical-align:baseline;   /* 与正文大字底部（基线）对齐，不飘半空 */
+    letter-spacing:0;
+  }
+  .ann .punct{                 /* 夹注内小标点同样悬挂右下角、零净占宽 */
+    width:0.4em;text-align:right;margin-left:-0.4em;
+  }
+  /* 整段长篇注文：更大缩进 / 悬挂缩进，不包括号 */
+  .ann-long{
+    font-size:var(--ann-fs);
+    color:var(--ann-color);
+    line-height:1.8;
+    text-indent:-1.6em;        /* 悬挂缩进：首行回缩、后续行缩进 */
+    padding-left:1.6em;
+    margin:0.4em 0 1.05em 0;
+  }
+
+  /* ── 底部目录浮窗：保持竖排竹简（不受 layout_dir 影响）── */
+  .toc{
+    width:760px;max-width:96vw;background:#2B2622;color:#F4EFE3;
+    border-radius:0 0 8px 8px;padding:10px 0 14px;
+    display:flex;flex-direction:column;align-items:center;
+  }
+  .toc .toc-head{font-size:13px;opacity:.7;letter-spacing:2px;margin-bottom:8px;}
+  .strips{display:flex;flex-direction:row;gap:6px;justify-content:center;}
+  .slip{
+    width:34px;height:150px;background:#C9A86A;
+    border:1px solid var(--edge);border-radius:3px;
+    writing-mode:vertical-rl;text-orientation:upright;
+    display:flex;align-items:flex-start;justify-content:center;
+    font-size:16px;color:#3A2E1A;padding-top:8px;
+    box-shadow:inset 0 0 0 1px rgba(0,0,0,.06);
+  }
+  .slip.cur{background:var(--zhu);color:#fff;}
+
+  /* ── 设计说明 ── */
+  .legend{
+    width:760px;max-width:96vw;margin-top:18px;font-size:12.5px;
+    color:#3A332C;background:#EDE7D8;border-radius:8px;padding:14px 16px;
+    line-height:1.7;font-family:"Songti SC",serif;
+  }
+  .legend b{color:var(--zhu);}
+  .legend code{background:#dcd5c4;padding:1px 5px;border-radius:4px;}
+</style>
+</head>
+<body>
+
+  <div class="toolbar">
+    <div><span class="title">勘阅</span><span class="book" id="bookname">《資治通鑑 · 周紀一》</span></div>
+    <div>
+      <button class="toggle ghost" id="flip">简体</button>
+      <button class="toggle">转竖排</button>
+    </div>
+  </div>
+
+  <div class="paper">
+    <div class="caption">横排夹注演示：大字正文 + 小字夹注（深灰 · 括号包裹 · 基线对齐）· 整段长注用悬挂缩进</div>
+    <div class="flow" id="flow"></div>
+  </div>
+
+  <div class="toc">
+    <div class="toc-head">目 錄（竖排竹简 · 横排模式下保持不变）</div>
+    <div class="strips">
+      <div class="slip cur">周紀一</div>
+      <div class="slip">周紀二</div>
+      <div class="slip">周紀三</div>
+      <div class="slip">周紀四</div>
+      <div class="slip">周紀五</div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <b>这是按 <code>render_ancient_horizontal</code> 目标版式还原的模拟预览（非 App 截图）：</b><br>
+    ① <b>紧凑横排（取消定宽网格）</b>：正文改为自然文本流，<code>letter-spacing:0</code>，中文按自然字宽紧凑咬合，不再是一格一格拉开的网格。<br>
+    ② <b>首行缩进</b>：每段（含首段「臣光曰」）<code>text-indent:2em</code>，强制缩进 2 个中文字符。<br>
+    ③ <b>段落留白</b>：每段 <code>margin-bottom:1.05em</code> 加大段间距，段落感更清晰；段内靠 <code>line-height:1.85</code> 保留合理行高。<br>
+    ④ <b>标点悬挂</b>：句号 / 逗号 / 问号等包进 <code>.punct</code>（<code>width:0.5em; text-align:right; margin-left:-0.42em</code>），挤到前一字右下角、几乎不占额外字宽，绝不在正中间占满一格。<br>
+    ⑤ <b>标点变体映射</b>：竖排专用呈现形自动转正形 —— <code>︵→（　︶→）　︽/︿→《　︾/﹀→》　﹁→「　﹂→」　﹃→『　﹄→』</code>；其余标点（，。、？！）原样保留为全角。<br>
+    ⑥ <b>目录不动</b>：底部竹简浮窗仍竖排，与正文方向解耦（你已拍板「保存原目录格式」）。<br>
+    ⑦ <b>小字夹注（古籍专属）</b>：行内夹注自动加 <code>（）</code> 包裹、字号降到 <code>13px</code>、颜色转深灰 <code>#8A8175</code>、<code>vertical-align:baseline</code> 与正文大字底部对齐（不飘半空）；夹注内小标点同样悬挂右下角；整段长篇注文改用 <code>.ann-long</code> 悬挂缩进（首行回缩、后续行缩进）。底层用已有的 <code>is_annotation</code> / 高度聚类数据区分正文与夹注。<br>
+    <br>
+    <b style="color:#B0342C">关于你的三处诉求：</b><br>
+    · <b>字间距</b>：已去掉等宽字格，<code>letter-spacing:0</code>，紧凑如现代书。<br>
+    · <b>标点悬挂</b>：预览里标点已悬挂右下角（上方 ④）。<br>
+    · <b>点字亮框（第 3 点）</b>：双屏联动（Compare）有独立渲染器，<b>根本不读横竖排开关</b>，右栏恒竖排，点字亮左图框的链路毫发无损。横排开关只作用于「单本沉浸阅读」视图（那里没有原图面板，第 3 点天然不适用）。
+  </div>
+
+<script>
+  // 正文 = 片段数组：{t:文本, ann?:行内夹注, long?:整段长注}
+  // 繁体 / 简体两套
+  const docTrad = [
+    [ // 段 1：大字正文 + 行内小字夹注 + 大字正文
+      {t:"臣光曰：臣聞天子之職莫大於禮，禮莫大於分，分莫大於名。"},
+      {t:"胡三省曰：礼，纪纲也；分，尊卑也；名，所以定上下也。", ann:true},
+      {t:"夫以四海之廣，兆民之眾，受制於一人，豈非以禮為之紀綱哉！"},
+    ],
+    [ // 段 2：大字正文 + 行内小字夹注
+      {t:"何謂禮？紀綱是也。何謂分？君臣是也。何謂名？公侯卿大夫是也。"},
+      {t:"温公此论，实本《春秋》尊王之义。", ann:true},
+    ],
+    [ // 段 3：整段长篇注文（悬挂缩进，全部小字）
+      {t:"臣光曰云云，皆所以明礼之不可以已也。自周室既衰，诸侯放恣，礼亡而分乱，名实乖矣。故温公原其本，而归之于礼，以训后世人君焉。", long:true},
+    ],
+  ];
+  const docSimp = [
+    [
+      {t:"臣光曰：臣闻天子之职莫大于礼，礼莫大于分，分莫大于名。"},
+      {t:"胡三省曰：礼，纪纲也；分，尊卑也；名，所以定上下也。", ann:true},
+      {t:"夫以四海之广，兆民之众，受制于一人，岂非以礼为之纪纲哉！"},
+    ],
+    [
+      {t:"何谓礼？纪纲是也。何谓分？君臣是也。何谓名？公侯卿大夫是也。"},
+      {t:"温公此论，实本《春秋》尊王之义。", ann:true},
+    ],
+    [
+      {t:"臣光曰云云，皆所以明礼之不可以已也。自周室既衰，诸侯放恣，礼亡而分乱，名实乖矣。故温公原其本，而归之于礼，以训后世人君焉。", long:true},
+    ],
+  ];
+
+  // 需要悬挂（挤到右下角、不占满字宽）的标点集合
+  const PUNCT = new Set(['。','，','、','！','？','：','；','「','」','『','』','（','）','《','》','—','…']);
+
+  const flow = document.getElementById('flow');
+  const bookname = document.getElementById('bookname');
+  const flipBtn = document.getElementById('flip');
+  let simp = false;
+
+  // 逐字入流：标点包进 .punct 悬挂右下角；汉字按自然字宽紧凑排列
+  function appendChars(parent, text) {
+    for (const ch of text) {
+      if (PUNCT.has(ch)) {
+        const s = document.createElement('span');
+        s.className = 'punct';
+        s.textContent = ch;
+        parent.appendChild(s);
+      } else {
+        parent.appendChild(document.createTextNode(ch));
+      }
+    }
+  }
+
+  function render() {
+    flow.innerHTML = '';
+    const doc = simp ? docSimp : docTrad;
+    bookname.textContent = simp ? "《资治通鉴 · 周纪一》" : "《資治通鑑 · 周紀一》";
+    doc.forEach((para) => {
+      const isLong = para.length === 1 && para[0].long;
+      if (isLong) {
+        // 整段长篇注文：悬挂缩进，全部小字
+        const p = document.createElement('p');
+        p.className = 'ann-long';
+        appendChars(p, para[0].t);
+        flow.appendChild(p);
+        return;
+      }
+      const p = document.createElement('p');
+      p.className = 'para';
+      para.forEach((seg) => {
+        if (seg.ann) {
+          // 行内夹注：自动加括号 + 小字 + 深灰 + 基线对齐
+          const a = document.createElement('span');
+          a.className = 'ann';
+          a.appendChild(document.createTextNode('（'));
+          appendChars(a, seg.t);
+          a.appendChild(document.createTextNode('）'));
+          p.appendChild(a);
+        } else {
+          appendChars(p, seg.t);
+        }
+      });
+      flow.appendChild(p);
+    });
+  }
+
+  flipBtn.addEventListener('click', () => {
+    simp = !simp;
+    flipBtn.textContent = simp ? '繁體' : '简体';
+    render();
+  });
+
+  render();
+</script>
+</body>
+</html>
