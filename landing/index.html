@@ -98,6 +98,11 @@
   .cta span{font-size:17px;line-height:1;}
   .meta{margin-top:20px;font-size:12px;color:var(--ink-faint);letter-spacing:.1em;}
 
+  /* ── 首屏双屏示意图：纯内联 SVG，零外部资源 ── */
+  .mock{max-width:1000px;margin:72px auto 0;}
+  .mock svg{width:100%;height:auto;display:block;filter:drop-shadow(0 22px 54px rgba(44,44,44,.12));}
+  .mock figcaption{margin-top:20px;font-size:11.5px;color:var(--ink-faint);letter-spacing:.2em;}
+
   /* ── 分节标题 ── */
   .sec{padding:96px 0;}
   .sec-head{text-align:center;margin-bottom:64px;}
@@ -203,6 +208,72 @@
     <p class="tagline reveal d3">你的本地数字古籍书房 · 为阅读创造极致环境</p>
     <a class="cta reveal d4" href="#" id="download">下载 Mac 版 DMG <span>↓</span></a>
     <p class="meta reveal d5">macOS 12+ · Apple Silicon &amp; Intel · 约 60 MB</p>
+
+    <!-- 首屏示意图：双屏勘校。纯内联 SVG，不依赖任何图片资源 -->
+    <figure class="mock reveal d5">
+      <svg viewBox="0 0 1000 540" role="img" aria-labelledby="mockTitle mockDesc" xmlns="http://www.w3.org/2000/svg">
+        <title id="mockTitle">勘阅双屏勘校界面示意</title>
+        <desc id="mockDesc">左侧是影印原图，右侧是竖排校订文本；原图上的一处字与右文对应字以朱砂描边同时框出，顶栏右侧显示质检检出数。</desc>
+
+        <!-- 窗口底板 -->
+        <rect x="20" y="10" width="960" height="520" rx="10" fill="#FFFDF9" stroke="rgba(44,44,44,.12)" stroke-width="1"/>
+        <!-- 顶栏 -->
+        <path d="M20 20a10 10 0 0 1 10-10h920a10 10 0 0 1 10 10v32H20z" fill="#F2EEE4"/>
+        <line x1="20" y1="52" x2="980" y2="52" stroke="rgba(44,44,44,.10)"/>
+        <rect x="38" y="18" width="22" height="22" rx="4" fill="#9E3B2E"/>
+        <text x="49" y="34" font-family="Songti SC,STSong,serif" font-size="13" fill="#F7F5F0" text-anchor="middle">勘</text>
+        <text x="72" y="33" font-family="Songti SC,STSong,serif" font-size="13" fill="#2C2C2C" letter-spacing="2">勘阅 · 双屏勘校</text>
+        <text x="196" y="33" font-family="-apple-system,PingFang SC,sans-serif" font-size="11" fill="#9A9384" letter-spacing="1">資治通鑑 · 卷第一</text>
+        <rect x="852" y="16" width="70" height="24" rx="12" fill="rgba(158,59,46,.10)"/>
+        <text x="887" y="32" font-family="-apple-system,PingFang SC,sans-serif" font-size="11" fill="#9E3B2E" text-anchor="middle">質檢 3</text>
+        <rect x="930" y="16" width="34" height="24" rx="12" fill="rgba(44,44,44,.06)"/>
+        <text x="947" y="32" font-family="-apple-system,PingFang SC,sans-serif" font-size="11" fill="#6B6558" text-anchor="middle">注</text>
+
+        <!-- 左栏：影印原图 -->
+        <rect x="20" y="52" width="460" height="478" fill="#EFE9DB"/>
+        <rect x="56" y="86" width="384" height="404" fill="#E7E0D0" stroke="#D6CCB6"/>
+        <g fill="#C6BBA2">
+          <g id="colA">
+            <rect x="0" y="0" width="26" height="5" rx="1"/><rect x="0" y="26" width="26" height="5" rx="1"/>
+            <rect x="0" y="52" width="26" height="5" rx="1"/><rect x="0" y="78" width="26" height="5" rx="1"/>
+            <rect x="0" y="104" width="26" height="5" rx="1"/><rect x="0" y="130" width="26" height="5" rx="1"/>
+            <rect x="0" y="156" width="26" height="5" rx="1"/><rect x="0" y="182" width="26" height="5" rx="1"/>
+            <rect x="0" y="208" width="26" height="5" rx="1"/><rect x="0" y="234" width="26" height="5" rx="1"/>
+            <rect x="0" y="260" width="26" height="5" rx="1"/><rect x="0" y="286" width="26" height="5" rx="1"/>
+          </g>
+          <use href="#colA" x="84" y="112"/><use href="#colA" x="134" y="112"/>
+          <use href="#colA" x="184" y="112"/><use href="#colA" x="234" y="112"/>
+          <use href="#colA" x="284" y="112"/><use href="#colA" x="334" y="112"/>
+          <use href="#colA" x="384" y="112"/>
+        </g>
+        <!-- 朱砂联动框（左） -->
+        <rect x="228" y="158" width="38" height="86" fill="rgba(158,59,46,.08)" stroke="#9E3B2E" stroke-width="1.5"/>
+        <text x="56" y="516" font-family="Songti SC,STSong,serif" font-size="11" fill="#9A9384" letter-spacing="3">影 印 原 圖</text>
+
+        <!-- 中缝 -->
+        <line x1="480" y1="52" x2="480" y2="530" stroke="rgba(44,44,44,.12)"/>
+
+        <!-- 右栏：竖排校订文本 -->
+        <g font-family="Songti SC,STSong,serif" font-size="19" fill="#2C2C2C" text-anchor="middle">
+          <text x="920" y="120"><tspan x="920" dy="0">臣</tspan><tspan x="920" dy="26">光</tspan><tspan x="920" dy="26">曰</tspan><tspan x="920" dy="26">：</tspan><tspan x="920" dy="26">臣</tspan><tspan x="920" dy="26">聞</tspan><tspan x="920" dy="26">天</tspan><tspan x="920" dy="26">子</tspan><tspan x="920" dy="26">之</tspan><tspan x="920" dy="26">職</tspan></text>
+          <text x="872" y="120"><tspan x="872" dy="0">莫</tspan><tspan x="872" dy="26">大</tspan><tspan x="872" dy="26">於</tspan><tspan x="872" dy="26">禮</tspan><tspan x="872" dy="26">，</tspan><tspan x="872" dy="26">禮</tspan><tspan x="872" dy="26">莫</tspan><tspan x="872" dy="26">大</tspan><tspan x="872" dy="26">於</tspan><tspan x="872" dy="26">分</tspan></text>
+          <text x="824" y="120"><tspan x="824" dy="0">分</tspan><tspan x="824" dy="26">，</tspan><tspan x="824" dy="26">分</tspan><tspan x="824" dy="26">莫</tspan><tspan x="824" dy="26">大</tspan><tspan x="824" dy="26">於</tspan><tspan x="824" dy="26">名</tspan><tspan x="824" dy="26">。</tspan><tspan x="824" dy="26">何</tspan><tspan x="824" dy="26">謂</tspan></text>
+          <text x="776" y="120"><tspan x="776" dy="0">禮</tspan><tspan x="776" dy="26">？</tspan><tspan x="776" dy="26">紀</tspan><tspan x="776" dy="26">綱</tspan><tspan x="776" dy="26">是</tspan><tspan x="776" dy="26">也</tspan><tspan x="776" dy="26">。</tspan><tspan x="776" dy="26">何</tspan><tspan x="776" dy="26">謂</tspan><tspan x="776" dy="26">分</tspan></text>
+          <text x="728" y="120"><tspan x="728" dy="0">？</tspan><tspan x="728" dy="26">君</tspan><tspan x="728" dy="26">臣</tspan><tspan x="728" dy="26">是</tspan><tspan x="728" dy="26">也</tspan><tspan x="728" dy="26">。</tspan><tspan x="728" dy="26">何</tspan><tspan x="728" dy="26">謂</tspan><tspan x="728" dy="26">名</tspan><tspan x="728" dy="26">？</tspan></text>
+          <text x="680" y="120"><tspan x="680" dy="0">公</tspan><tspan x="680" dy="26">侯</tspan><tspan x="680" dy="26">卿</tspan><tspan x="680" dy="26">大</tspan><tspan x="680" dy="26">夫</tspan><tspan x="680" dy="26">是</tspan><tspan x="680" dy="26">也</tspan><tspan x="680" dy="26">。</tspan></text>
+          <text x="632" y="120"><tspan x="632" dy="0">夫</tspan><tspan x="632" dy="26">以</tspan><tspan x="632" dy="26">四</tspan><tspan x="632" dy="26">海</tspan><tspan x="632" dy="26">之</tspan><tspan x="632" dy="26">廣</tspan><tspan x="632" dy="26">，</tspan><tspan x="632" dy="26">兆</tspan><tspan x="632" dy="26">民</tspan><tspan x="632" dy="26">之</tspan></text>
+          <text x="584" y="120"><tspan x="584" dy="0">眾</tspan><tspan x="584" dy="26">受</tspan><tspan x="584" dy="26">制</tspan><tspan x="584" dy="26">於</tspan><tspan x="584" dy="26">一</tspan><tspan x="584" dy="26">人</tspan><tspan x="584" dy="26">。</tspan></text>
+        </g>
+        <!-- 朱砂联动框（右）：与左图同源字 -->
+        <rect x="810" y="104" width="30" height="112" fill="rgba(158,59,46,.07)" stroke="#9E3B2E" stroke-width="1.5"/>
+
+        <!-- 朱砂印 + 叶码 -->
+        <rect x="884" y="424" width="36" height="36" rx="5" fill="#9E3B2E"/>
+        <text x="902" y="450" font-family="Songti SC,STSong,serif" font-size="20" fill="#F7F5F0" text-anchor="middle">勘</text>
+        <text x="500" y="516" font-family="Songti SC,STSong,serif" font-size="11" fill="#9A9384" letter-spacing="3">校 訂 文 本 · 第 一 葉</text>
+      </svg>
+      <figcaption>示意图 · 实际界面以 App 为准</figcaption>
+    </figure>
   </section>
 
   <!-- ── 核心卖点 ── -->

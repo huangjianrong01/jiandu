@@ -2246,6 +2246,11 @@ impl Root {
                 let ws = root.collation.clone();
                 ws.update(cx, |w, cx| w.dev_setup_highlight_demo(cx));
             }
+            // V2.1：截图核对用——直接拉开质检抽屉（等稿子装完再开，否则扫的是空串）。
+            if std::env::var("JIANDU_QC").is_ok() {
+                let ws = root.collation.clone();
+                ws.update(cx, |w, cx| w.dev_open_qc(cx));
+            }
         }
         // 开发用：JIANDU_SOURCE=<path> 直接把一张原图 / 一页 PDF 灌进工作台左栏
         // （左栏的 scale / 居中是纯几何，合成点击过不了 TCC，只能靠环境变量摆位）。
@@ -5574,7 +5579,7 @@ impl Root {
             .book
             .as_ref()
             .map(|b| b.title.clone())
-            .unwrap_or_else(|| "笺读".to_string());
+            .unwrap_or_else(|| "勘阅".to_string());
         let default = format!(
             "勘阅_{}_第{}叶.png",
             crate::exporter::safe_file_stem(&title),
@@ -13346,16 +13351,24 @@ impl Root {
         );
 
         // L9 · 现代 macOS 极简风：浅灰工作台 + 纯白圆角面板 + 极轻阴影。
-        // 顶栏常驻：模式 Tab 是用户切回【阅读】/【原文对照】的**唯一退路**，
-        // 空态若把整条栏藏起来，用户进得来出不去（旧版靠环境变量强跳才有
-        // 这个问题，现在必须常驻）。会话专属控件仍按各自条件浮现。
+        //
+        // **空态不出工具栏**（用户 2026-11-08 定稿）：还没导入任何文件时，
+        // 阅读 / 原文对照 / 双屏联动 三个 Tab 全是死路，导入与导出也无对象——
+        // 一排点了没反应的按钮最伤高级感。整条栏留到导入之后再浮现。
+        //
+        // 唯一的代价是「没有出口」：空态本来是靠那三个 Tab 回阅读 / 书阁的。
+        // 故在左上角留一枚极淡的「← 书阁」（见下），它不是工具栏，是退路。
+        let empty_state =
+            self.current_pdf_path.is_none() && self.compare_img.is_none() && !self.is_processing;
         let mut view = div()
             .size_full()
             .relative()
             .flex()
             .flex_col()
-            .bg(rgb(0xF5F5F7))
-            .child(bar);
+            .bg(rgb(0xF5F5F7));
+        if !empty_state {
+            view = view.child(bar);
+        }
         view = view.child(
             div()
                 .flex_1()
@@ -13368,38 +13381,69 @@ impl Root {
                 .child(right_pane),
         );
 
-        // ── L9 · 欢迎主页（空闲态覆盖层；只盖内容区，顶栏按钮照常可用）──
-        // 用覆盖层而非替换整棵视图，是为了不移动 `bar`、不触碰任何已有联动代码。
-        // `top(48)` 精确让开常驻顶栏：模式 Tab 与【导入】在空态下照样可点。
-        if self.current_pdf_path.is_none() && self.compare_img.is_none() && !self.is_processing {
+        // ── L9 · 欢迎主页（空闲态覆盖层）──
+        // 空态下顶栏整条不再渲染，所以覆盖层从 y=0 起，整屏只留这张卡片
+        // 与右上角那枚 Free。
+        if empty_state {
             view = view.child(
                 div()
                     .absolute()
-                    .top(px(48.0))
+                    .top_0()
                     .left_0()
                     .right_0()
                     .bottom_0()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgb(0xF5F5F7))
+                    .bg(rgb(0xF7F5F0))
+                    // 退路：空态没有工具栏了，这里给一条极淡的「回书阁」。
+                    // 11px、纸灰、无底无边——它是逃生口，不是按钮。
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(14.0))
+                            .left(px(18.0))
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .text_size(px(11.5))
+                            .font_family(family.clone())
+                            .text_color(rgb(0x9C9489))
+                            .hover(|s| s.bg(rgb(0xE8E2D6)).text_color(rgb(0x5A5348)))
+                            .child(SharedString::from("← 书阁"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                    this.compare_editing = false;
+                                    this.mode = AppMode::Reader;
+                                    cx.notify();
+                                }),
+                            ),
+                    )
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .items_center()
-                            .gap(px(14.0))
-                            .px(px(72.0))
-                            .py(px(52.0))
+                            .gap(px(9.0))
+                            // 卡片尺寸跟着内容收：去掉大字「勘阅」后，原来的
+                            // 76×46 留白会显得空，收到 52×32。
+                            .px(px(52.0))
+                            .py(px(32.0))
                             .rounded(px(16.0))
-                            .bg(rgb(0xFFFFFF))
+                            // 宣纸白，不是系统纯白：比背景暖一档，才像纸不像网页 div。
+                            .bg(rgb(0xFDFBF6))
+                            .border_1()
+                            .border_color(rgba(0x8A7A5E1F))
+                            // 0 10px 30px rgba(0,0,0,0.05)：薄薄一层，浮起来但不抢戏。
                             .shadow(vec![gpui::BoxShadow {
-                                color: rgba(0x00000014).into(),
-                                offset: gpui::Point::new(px(0.0), px(8.0)),
-                                blur_radius: px(32.0),
+                                color: rgba(0x0000000D).into(),
+                                offset: gpui::Point::new(px(0.0), px(10.0)),
+                                blur_radius: px(30.0),
                                 spread_radius: px(0.0),
                             }])
-                            // 整张卡片可点（内部蓝色按钮只是视觉，避免双触发弹两个文件框）。
+                            // 整张卡片可点（内部按钮只是视觉，避免双触发弹两个文件框）。
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
@@ -13408,53 +13452,53 @@ impl Root {
                             )
                             .child(
                                 div()
-                                    .text_size(px(42.0))
+                                    .text_size(px(11.5))
                                     .font_family(family.clone())
-                                    .text_color(rgb(0xA8332A))
-                                    .child(SharedString::from("勘阅")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.0))
-                                    .font_family(family.clone())
-                                    .text_color(rgb(0x86868B))
+                                    .text_color(rgb(0xA8A29A))
                                     .child(SharedString::from("影印古籍 · 双屏对照 · 本地识别")),
                             )
+                            // 主行动句：加粗一档、字号抬一档，与下面的说明拉开层级。
                             .child(
                                 div()
-                                    .text_size(px(19.0))
+                                    .mt(px(8.0))
+                                    .text_size(px(20.0))
                                     .font_family(family.clone())
-                                    .text_color(rgb(0x1D1D1F))
+                                    .font_weight(gpui::FontWeight(600.0))
+                                    .text_color(rgb(0x2C2C2C))
                                     .child(SharedString::from("点击或拖入 PDF")),
                             )
                             .child(
                                 div()
-                                    .text_size(px(13.0))
+                                    .text_size(px(12.0))
                                     .font_family(family.clone())
-                                    .text_color(rgb(0x86868B))
+                                    .text_color(rgb(0xB5AFA6))
                                     .child(SharedString::from(
                                         "支持多页 PDF 与 JPG / PNG 扫描页 · 按需识别，绝不一次载入整本",
                                     )),
                             )
+                            // 朱砂红主按钮：中式高级感的关键一枚。系统亮蓝在这张纸上
+                            // 是刺眼的（用户原话：「严重违和」）。
                             .child(
                                 div()
+                                    .mt(px(6.0))
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .h(px(36.0))
-                                    .px(px(28.0))
-                                    .rounded(px(8.0))
-                                    .bg(rgb(0x2F6FED))
+                                    .h(px(38.0))
+                                    .px(px(30.0))
+                                    .rounded(px(9.0))
+                                    .bg(rgb(0x8B2500))
+                                    .hover(|s| s.bg(rgb(0x761F00)))
                                     .text_size(px(14.0))
                                     .font_family(family.clone())
-                                    .text_color(rgb(0xFFFFFF))
+                                    .text_color(rgb(0xFFFDF8))
                                     .child(SharedString::from("选择 PDF / 图片")),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(px(10.5))
                                     .font_family(family.clone())
-                                    .text_color(rgb(0xAEAEB2))
+                                    .text_color(rgb(0xC6C0B6))
                                     .child(SharedString::from(
                                         "Apple Vision OCR · 全程本地处理，文件不上传",
                                     )),

@@ -1415,6 +1415,13 @@ pub struct CollationWorkspace {
     /// **清洗审计卡片的缓存**（v1.9.70）：`None` = 还没算（或换了书）。
     /// 只随 `raw_text` 失效，**不随打字失效**——它比的是「导入毛坯 vs 清洗后」。
     sanitize_card: Option<SanitizeCard>,
+    /// **质检面板**（V2.1）：右侧抽屉开关。只读，不碰稿子、不碰光标。
+    show_qc_panel: bool,
+    /// 质检结果缓存：`None` = 没算过（或文本已变）。开面板 / 稿子变了才重算，
+    /// 绝不在 `render` 里跑全量扫描（百万字稿子会卡死界面）。
+    qc_report: Option<jiandu_core::qc::QcReport>,
+    /// 缓存对应的文本代际：与 `text_gen` 对不上就作废。
+    qc_gen: u64,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -1872,6 +1879,9 @@ impl CollationWorkspace {
             saved_gen: 0,
             saved_cursor: usize::MAX,
             sanitize_card: None,
+            show_qc_panel: false,
+            qc_report: None,
+            qc_gen: 0,
         };
         // ── v1.9.66：退出前强存（Exit Flush）────────────────────────────
         //
@@ -2370,6 +2380,45 @@ impl CollationWorkspace {
         if self.show_sanitize_panel && self.sanitize_card.is_none() {
             self.sanitize_card = Some(self.compute_sanitize_card());
         }
+        cx.notify();
+    }
+
+    // ── 质检面板（V2.1）────────────────────────────────────────────────
+    //
+    // 把 `core` 里早就写好的六类判据（残留 / 符号 / 繁简 / 标点 / 重复 /
+    // 罕用）变成用户眼前**可点击的待办**。只读：扫的是当前正文，一个字都不改，
+    // 也不碰排版引擎、不改光标以外的任何状态。
+
+    /// 开关质检抽屉。开着的时候顺手算一遍（之后靠 `qc_gen` 判断要不要重算）。
+    fn toggle_qc_panel(&mut self, cx: &mut Context<Self>) {
+        self.show_qc_panel = !self.show_qc_panel;
+        if self.show_qc_panel {
+            self.refresh_qc_report();
+        }
+        cx.notify();
+    }
+
+    /// 开发用：环境变量 `JIANDU_QC` 直接把质检抽屉摆好（截图核对用）。
+    pub fn dev_open_qc(&mut self, cx: &mut Context<Self>) {
+        self.show_qc_panel = true;
+        self.refresh_qc_report();
+        cx.notify();
+    }
+
+    /// 重算质检结果。**只在文本代际变了 / 手动刷新时**调用——
+    /// `core::qc::scan` 是 O(全文) 的，放渲染里会把百万字稿子拖死。
+    fn refresh_qc_report(&mut self) {
+        if self.qc_report.is_some() && self.qc_gen == self.text_gen {
+            return;
+        }
+        self.qc_report = Some(jiandu_core::qc::scan(&self.text));
+        self.qc_gen = self.text_gen;
+    }
+
+    /// 点清单条目 → 光标落到那个字并滚到眼前。**不选中、不改字**。
+    fn goto_qc_issue(&mut self, ch: usize, cx: &mut Context<Self>) {
+        let total = self.text.chars().count();
+        self.move_cursor_to(ch.min(total), false, cx);
         cx.notify();
     }
 
@@ -3001,6 +3050,246 @@ impl CollationWorkspace {
                             }, cx)),
                     ),
             )
+    }
+
+    /// **质检抽屉**（V2.1）：一列可点击的待办，右侧贴边滑出。
+    ///
+    /// 与【清洗日志】同壳不同心：那边回答「清洗动了哪些字」，这边回答
+    /// 「还有哪些地方要人看一眼」。清单**只读缓存**，绝不在渲染里扫全文。
+    fn render_qc_panel(&self, vh: f32, cx: &mut Context<Self>) -> Stateful<Div> {
+        let song = crate::fonts::family_for(
+            crate::types::FontChoice::WenJinMincho,
+            crate::types::Script::Ancient,
+        );
+        let report = self.qc_report.clone().unwrap_or_default();
+        let total_issues: usize = report.counts.iter().sum();
+        // 正文口径的字数：剔除 `[注]` 标签与空白，与阅读器那颗字数同一把尺子。
+        let body_chars = jiandu_core::cleaner::body_char_count(&self.text);
+        // 尺寸口径：**窄而小**。质检是「扫一眼就走」的辅助面板，不该抢正文。
+        // 300 是上限——再宽就压到右栏的字了；窗口窄时按右栏实宽收。
+        let panel_w = (self.viewport_w - self.left_col_w(self.viewport_w) - 24.0).clamp(264.0, 300.0);
+        // 面板内边距（左右之和）——格宽与所有留白都从这里推，改一处即可。
+        const PAD: f32 = 13.0;
+
+        // 分类计数：一行三格、两行铺满，固定格宽——GPUI 0.2.2 里 `flex_wrap`
+        // 遇上不定的子宽会把文字挤成一团（首版截图就是这么糊掉的），故显式给宽。
+        // 再减 2px：3×格宽 + 2×间隙必须**严格小于**可用宽，否则第三格会被
+        // 挤到下一行（首版正是每行只落两格）。
+        let cell_w = (((panel_w - PAD * 2.0) - 10.0) / 3.0).floor() - 2.0;
+        let mut summary = div().flex().flex_row().flex_wrap().gap(px(5.0)).mb(px(11.0));
+        for kind in jiandu_core::qc::QcKind::ALL {
+            let n = report.counts[kind.index()];
+            // 零命中的整格压成纸灰，有命中的才落墨——一眼扫过去就知道哪里要动手。
+            let fg = if n == 0 {
+                0xA79E90
+            } else if kind.is_error() {
+                0x8c2b22
+            } else {
+                0x3F3A32
+            };
+            summary = summary.child(
+                div()
+                    .w(px(cell_w))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(4.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .bg(rgba(0x2B26200A))
+                    .text_size(px(10.0))
+                    .text_color(rgb(fg))
+                    .child(SharedString::from(kind.label()))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(fg))
+                            .child(SharedString::from(format!("{n}"))),
+                    ),
+            );
+        }
+
+        // 清单：**按窗口高度算得出几条就摆几条**。
+        //
+        // GPUI 0.2.2 里 `top` + `bottom` 不会把绝对定位元素撑开，面板会按内容
+        // 长高——几十条待办就能一路长出屏幕。而写死 `.h()` 又会让面板变成一根
+        // 从顶到底的奶油色空柱（内容只占三分之一，剩下全是空底）。
+        // 所以取第三条路：**卡片按内容高**，但内容本身限高——
+        // 行高约 62px（标签行 + 摘录 + 说明 + 间距），可用高 = vh − 顶栏 −
+        // 标题区 − 上下留白，除一下就是能摆几条。
+        let row_h = 62.0;
+        let usable = (vh - HEADER_H - 196.0).max(row_h);
+        let rows = ((usable / row_h).floor() as usize).clamp(1, 40);
+        let shown = report.issues.len().min(rows);
+        let mut list = div().flex().flex_col().gap(px(4.0));
+        for issue in report.issues.iter().take(rows) {
+            let fg = if issue.kind.is_error() {
+                0x8c2b22
+            } else {
+                0x4a4335
+            };
+            let ch = issue.ch;
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .p(px(7.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .bg(rgba(0x2B262008))
+                    .hover(|s| s.bg(rgba(0x8C2B2214)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |c, _, _, cx| {
+                            cx.stop_propagation();
+                            c.goto_qc_issue(ch, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(
+                                div()
+                                    .px(px(4.0))
+                                    .py(px(1.0))
+                                    .rounded(px(3.0))
+                                    .bg(rgba(0x2B262010))
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(fg))
+                                    .child(SharedString::from(issue.kind.label())),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(rgb(0x9A9184))
+                                    .child(SharedString::from(format!(
+                                        "第 {} 行",
+                                        issue.line + 1
+                                    ))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgb(0x2b2620))
+                            .child(SharedString::from(issue.excerpt.clone())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(0x9A9184))
+                            .child(SharedString::from(issue.detail.clone())),
+                    ),
+            );
+        }
+        if report.issues.is_empty() {
+            list = list.child(
+                div()
+                    .py(px(16.0))
+                    .text_size(px(11.5))
+                    .text_color(rgb(0x9A9184))
+                    .child(SharedString::from("这一本没有检出问题。")),
+            );
+        } else if report.issues.len() > shown {
+            list = list.child(
+                div()
+                    .pt(px(6.0))
+                    .text_size(px(10.0))
+                    .text_color(rgb(0xA79E90))
+                    .child(SharedString::from(format!(
+                        "另有 {} 处未列出",
+                        report.issues.len() - shown
+                    ))),
+            );
+        }
+
+        div()
+            .absolute()
+            .id(SharedString::from("collation-qc-panel"))
+            .top(px(HEADER_H + 10.0))
+            .right(px(10.0))
+            .w(px(panel_w))
+            // 卡片按内容撑高（显式给 h 会变成一根空奶油柱）；内容已按窗口限过条数。
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .p(px(PAD))
+            // 宣纸底**不透明**（0.97 仍会透出竖排正文，与清单「穿模」）：
+            // 一块干净的暖白纸，靠 1px 细边 + 一层柔影浮起来，比半透更耐看。
+            .bg(rgb(0xF7F1E4))
+            .border_1()
+            .border_color(rgba(0x9A6B4F4D))
+            .rounded(px(10.0))
+            .font_family(song.clone())
+            .shadow(vec![gpui::BoxShadow {
+                color: gpui::hsla(0.09, 0.30, 0.20, 0.16),
+                offset: gpui::point(px(-4.0), px(2.0)),
+                blur_radius: px(18.0),
+                spread_radius: px(-2.0),
+            }])
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .mb(px(1.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.0))
+                            .font_family(song.clone())
+                            .text_color(rgb(0x2b2620))
+                            .child(SharedString::from("质检")),
+                    )
+                    .child(
+                        div()
+                            .size(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(9.0))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xB0A695))
+                            .hover(|s| s.bg(rgba(0x2B26200F)).text_color(rgb(0x8c2b22)))
+                            .child(SharedString::from("✕"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|c, _, _, cx| {
+                                    cx.stop_propagation();
+                                    c.show_qc_panel = false;
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .mb(px(10.0))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x9A9184))
+                            .child(SharedString::from(format!(
+                                "正文 {body_chars} 字 · 检出 {total_issues} 处"
+                            ))),
+                    ),
+            )
+            .child(summary)
+            .child(list)
     }
 
     /// **选区旁的悬浮钮**（v1.9.54 立项，v1.9.69 重定位）。
@@ -4300,6 +4589,45 @@ impl CollationWorkspace {
             })
     }
 
+    /// 「质检」入口（V2.1）：右侧抽屉列出全书待复核项，零自动改字。
+    ///
+    /// 与【原文对照】是两条正交的路：那边比的是「毛坯 vs 清洗后」，这边查的是
+    /// 「留下的字里还有哪些不一致」。所以它**不依赖毛坯**，纯文本模式照样能用。
+    fn qc_chip(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let on = self.show_qc_panel;
+        let n: usize = self
+            .qc_report
+            .as_ref()
+            .map(|r| r.counts.iter().sum())
+            .unwrap_or(0);
+        let label = if self.show_qc_panel && n > 0 {
+            format!("质检 {n}")
+        } else {
+            "质检".to_string()
+        };
+        div()
+            .px(px(11.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(if on { 0x8c2b22 } else { 0x4a4335 }))
+            .bg(if on {
+                rgba(0x8C2B221A)
+            } else {
+                rgba(0x2B26200A)
+            })
+            .hover(|s| s.bg(rgba(0x2B26201A)))
+            .child(SharedString::from(label))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|c, _, _, cx| {
+                    cx.stop_propagation();
+                    c.toggle_qc_panel(cx);
+                }),
+            )
+    }
+
     /// **次级按钮**（v1.9.24）：无边框，只留一层几乎看不见的纸灰底。
     ///
     /// 给【打开文件】【导入 MD】这类「入口」用——它们是渠道，不是动作的高潮。
@@ -4670,6 +4998,9 @@ impl CollationWorkspace {
             .child(self.linked_chip(cx))
             // 「清洗日志」（v1.9.60）：生成 sanitize_report.md 并在访达中打开。
             .child(self.clean_log_chip(cx))
+            // 「质检」（V2.1）：右侧抽屉列一遍全书待复核项（残留 / 符号 / 繁简 /
+            // 标点 / 重复 / 罕用），点条目光标直接落过去。只读，不改字。
+            .child(self.qc_chip(cx))
             // 【AI 句读】（v1.9.95 脚手架）：毛笔图标 + 文字，Pro 专属。
             // 未激活点它会直接弹激活窗（见 `ai_punctuate` 与
             // `CollationEvent::RequestActivation`）。
@@ -9621,6 +9952,12 @@ impl Render for CollationWorkspace {
         // 清洗日志内嵌面板：压在最上（与覆盖确认同级），点遮罩或 ✕ 收。
         if self.show_sanitize_panel {
             root = root.child(self.render_sanitize_panel(cx));
+        }
+        // 质检抽屉（V2.1）：与清洗日志同层，两个都开着时它压在上面。
+        if self.show_qc_panel {
+            // 稿子改过就重算一次；`qc_gen` 对得上时这里只是一次整数比较。
+            self.refresh_qc_report();
+            root = root.child(self.render_qc_panel(vh, cx));
         }
         // 查找条（v1.9.68）：压在正文之上、帮助卡之下。
         if self.find_open {

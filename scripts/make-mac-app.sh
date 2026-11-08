@@ -21,8 +21,8 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP_NAME="勘阅"
 BUNDLE_ID="com.jiandu.app"
-VERSION="1.9.99.83"
-BUILD_NUM="322"
+VERSION="1.9.99.85"
+BUILD_NUM="324"
 MIN_MACOS="12.0"
 ARCH="${ARCH:-native}"
 
@@ -458,8 +458,8 @@ fi
 # 用 `ditto` 而不是 `cp -R`：前者保留资源叉、xattr 与符号链接本身，
 # 后者会把签名相关的扩展属性丢掉（装完打不开就是这么来的）。
 if [ "${DMG:-0}" = "1" ]; then
-    # v2.0 正式版：DMG 用产品代际名（内部 CFBundleVersion 仍按四段号递增）。
-    DMG_OUT="$DIST/${APP_NAME}-v2.0.dmg"
+    # V2.1：DMG 用产品代际名（内部 CFBundleVersion 仍按四段号递增）。
+    DMG_OUT="$DIST/${APP_NAME}-V2.1.dmg"
     STAGE="$(mktemp -d)/dmg"
     mkdir -p "$STAGE"
     ditto "$APP" "$STAGE/${APP_NAME}.app"

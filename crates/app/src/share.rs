@@ -12,7 +12,7 @@
 //!   3. 两种文字方向：竖排右起（复古，默认）/ 横排居中（现代）；
 //!   4. 四套模板只换数据（背景 / 正文 / 落款 / 点缀四色 + 装饰式样），
 //!      渲染逻辑完全共用；
-//!   5. 左下角恒有一枚朱砂「笺讀」印——软件签名。
+//!   5. 左下角恒有一枚朱砂「勘閱」印——软件签名。
 //!
 //! # 防崩溃铁律（用户 v1.53.0 明令）
 //!
@@ -343,7 +343,7 @@ impl ShareSeal {
     }
 }
 
-/// 印文：取书名前两个有效字；书名空则回退「笺讀」。
+/// 印文：取书名前两个有效字；书名空则回退「勘閱」。
 pub fn seal_chars(book: &str) -> String {
     let s: String = book
         .chars()
@@ -351,7 +351,7 @@ pub fn seal_chars(book: &str) -> String {
         .take(2)
         .collect();
     if s.is_empty() {
-        "笺讀".to_string()
+        "勘閱".to_string()
     } else {
         s
     }
@@ -836,7 +836,7 @@ pub fn seal_div(kind: ShareSeal, paper: u32, size: f32, text: &str, family: Shar
     let red = CINNABAR;
     let ground = paper;
     let chars: Vec<char> = if text.is_empty() {
-        "笺讀".chars().collect()
+        "勘閱".chars().collect()
     } else {
         text.chars().take(2).collect()
     };
@@ -1431,5 +1431,46 @@ mod tests {
         assert_eq!(StampStyle::Plain.next(), StampStyle::Off);
         // 默认档是古风（对着一叶古籍，落个公历反而不搭）。
         assert_eq!(StampStyle::default(), StampStyle::Classic);
+    }
+}
+
+#[cfg(test)]
+mod quote_card_tests {
+    use super::*;
+    use crate::share_layout::ShareFont;
+
+    /// **金句卡闭环**：一段真字 → `share_layout::layout` → `share_paint::render_png`，
+    /// 落一张 `/tmp/jiandu_quote_card.png`。断言是合法非空 PNG；底色、竖排、
+    /// 朱砂鱼尾印是否到位，用眼睛在那张图上验（与 `compare_image_smoke` 同一套路）。
+    #[test]
+    fn quote_card_renders_png() {
+        let text = "天地玄黃，宇宙洪荒。日月盈昃，辰宿列張。寒來暑往，秋收冬藏。";
+        let body: Vec<char> = text.chars().collect();
+        let red = vec![false; body.len()];
+        let spec = crate::share_layout::LayoutSpec {
+            body: &body,
+            red: &red,
+            md: &[],
+            note: "",
+            show_notes: false,
+            sign: "千字文",
+            show_sign: true,
+            date: "丙午年",
+            show_date: true,
+            columns: 8,
+            bg: ShareBg::Xuan,
+            frame: ShareFrame::Red,
+            seal: ShareSeal::Twin,
+            seal_text: "勘閱",
+            font: ShareFont::Song,
+            stamp: "",
+            w: 1080.0,
+            h: 1920.0,
+        };
+        let l = crate::share_layout::layout(&spec);
+        let png = crate::share_paint::render_png(&l).expect("金句卡离屏出图失败");
+        std::fs::write("/tmp/jiandu_quote_card.png", &png).expect("写 PNG 失败");
+        assert!(png.len() > 1000, "金句卡 PNG 太小，疑似渲染失败");
+        assert_eq!(&png[0..4], b"\x89PNG", "产物不是 PNG");
     }
 }

@@ -5952,7 +5952,7 @@ impl Root {
             } else {
                 self.theme.paper()
             };
-            let colophon = "丙午年 笺读重梓";
+            let colophon = "丙午年 勘阅重梓";
             wrap = wrap.child(
                 div()
                     .absolute()
@@ -12163,7 +12163,7 @@ impl Root {
         // 用户最关心「要不要权限」「清晰度由什么定」「提示怎么收」。
         list = list.child(help_row("导出当前页图片", "存本叶高清 PNG（长边 2160，离屏重绘）", t));
         list = list.child(help_row("同上 · 清晰度", "与窗口大小无关，不需「屏幕录制」权限", t));
-        list = list.child(help_row("同上 · 文件名", "笺读_书名_第N叶（保存框里可改）", t));
+        list = list.child(help_row("同上 · 文件名", "勘阅_书名_第N叶（保存框里可改）", t));
         list = list.child(help_row("导出提示条", "点「关」· 按 Esc · 点纸面任一处，皆可收起", t));
 
         list = list.child(help_sec("叶与页", t));
@@ -13108,7 +13108,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             .book
             .as_ref()
             .map(|b| crate::exporter::safe_file_stem(&b.title))
-            .unwrap_or_else(|| "笺读".to_string());
+            .unwrap_or_else(|| "勘阅".to_string());
         let mut done = 0usize;
         for (n, page) in leaves.iter().copied().enumerate() {
             if let Ok(png) = self.render_leaf_png_at(page) {
@@ -13152,7 +13152,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
             bg,
             frame,
             seal: crate::share::ShareSeal::Twin,
-            seal_text: "笺讀",
+            seal_text: "勘閱",
             font: self.share_font_kind(),
             // 分享卡的日期已是版心内左侧那一竖列（`show_date`），此处不再
             // 叠一份右下时间戳——同一张纸上出现两遍日期最叫人出戏。
@@ -13179,9 +13179,9 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         };
         self.show_share_panel = false;
         let default = format!(
-            "笺读分享_{}.png",
+            "勘阅分享_{}.png",
             crate::exporter::safe_file_stem(if self.share_book.is_empty() {
-                "笺读"
+                "勘阅"
             } else {
                 &self.share_book
             }),
@@ -15135,7 +15135,7 @@ fn share_seal(t: Theme) -> Div {
             div()
                 .text_size(px(10.5))
                 .text_color(rgb(0xF5EFE2))
-                .child(SharedString::from("笺讀")),
+                .child(SharedString::from("勘閱")),
         )
 }
 
