@@ -53,7 +53,7 @@ use gpui::{
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::path::{Path, PathBuf};
 
 /// Pixels → f32：gpui 的 `Pixels` 字段在 jiandu crate 不可见，用「除 1px」取数值。

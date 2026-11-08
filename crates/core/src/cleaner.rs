@@ -2289,8 +2289,8 @@ pub fn clean_chapters(chapters: &[RawChapter], source: IrSource) -> Vec<RawChapt
         .collect()
 }
 
-/// 单段文本清洗的复用缓冲区：两块 `String` 乒乓，避免每段都重新分配。
-/// 分两个独立的线程局部单元，规避 `RefMut` 同帧多重可变借用的限制。
+// 单段文本清洗的复用缓冲区：两块 `String` 乒乓，避免每段都重新分配。
+// 分两个独立的线程局部单元，规避 `RefMut` 同帧多重可变借用的限制。
 thread_local! {
     static CLEAN_A: RefCell<String> = RefCell::new(String::new());
     static CLEAN_B: RefCell<String> = RefCell::new(String::new());

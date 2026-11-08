@@ -435,7 +435,9 @@ pub const MARKER_INSET: f32 = 0.5;
 /// 格宽 / 格高连续收敛。
 pub fn marker_font_size(fs: f32, cell_w: f32, cell_h: f32, chars: usize) -> f32 {
     let n = chars.max(1) as f32;
-    let want = (fs * 0.30).max(6.5);
+    // V2.1：系数 0.30 → 0.22（角标整体缩小），下限 6.5 → 5.5（大字号本
+    // 仍随 fs 连续收敛，不再被高下限托住）。
+    let want = (fs * 0.22).max(5.5);
     // 半角数字宽约 0.62em；整枚角标不许宽过一格、高过 1/3 格。
     want.min(cell_w / (n * 0.62)).min(cell_h * 0.34).max(0.5)
 }

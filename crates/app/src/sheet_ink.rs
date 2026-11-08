@@ -31,7 +31,7 @@
 //! 否则 GPUI 的绝对定位会以 padding box 为原点，整层偏移一个内衬。
 
 use gpui::{
-    canvas, div, point, prelude::*, px, rgb, size, App, Bounds, Div, ParentElement, PathBuilder,
+    canvas, div, point, px, rgb, size, App, Bounds, Div, ParentElement, PathBuilder,
     Styled, Window,
 };
 

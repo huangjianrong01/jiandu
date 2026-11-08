@@ -14027,7 +14027,7 @@ impl Root {
             LinkSide::Right => self.compare_anim_text = true,
         }
         let weak = cx.entity().downgrade();
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+        cx.spawn(move |_this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 loop {

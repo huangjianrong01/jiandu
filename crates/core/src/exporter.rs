@@ -23,7 +23,6 @@
 
 use crate::ir::{IrBlock, IrBook, IrJuan, IrNoteKind, IrSource, IrSpan};
 use crate::types::Chapter;
-use std::fmt::Write as _;
 
 // ------------------------------------------------------------------
 // 一、导出器（带配置）

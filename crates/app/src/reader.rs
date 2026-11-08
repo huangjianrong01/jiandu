@@ -7,7 +7,7 @@
 //!   * 段落分隔 —— 段首空两格（首行缩进），不再放置任何段落标记符。
 
 use crate::app::{
-    AppUIState, Root, Screen, SideTab, ANCIENT_EDGE, ANCIENT_TITLE_COL,
+    AppUIState, Root, Screen, SideTab, ANCIENT_TITLE_COL,
 };
 use crate::dict;
 use crate::gloss::{Page, Piece};
@@ -1598,6 +1598,62 @@ impl Root {
         //   必须挂在**纸面这一层**上：它的原点就是 `page_rect` 的左上角，
         //   眉批的 `u/v` × 当帧天头带 = 屏幕坐标，拖窗口 / 换留白档自动跟随。
         stage = stage.child(self.render_head_notes(cx));
+
+        // ── 听书播放图标（V2.1 顶栏瘦身：从顶栏移到底部版心正下方）──
+        //
+        // 仅竖向排版时显示：一枚极简圆形朱砂细圈按钮，横置于版心正下方，
+        // 与外框线留 1px 呼吸感；点一下切换 TTS（⌘⌥Y 仍可达）。朗读中显
+        // 暂停双竖条，未朗读显播放三角。命中即 stop_propagation，绝不穿透
+        // 触发底层翻页 / 眉批。
+        if self.layout_dir == crate::app::LayoutDir::Vertical {
+            let tts_on = self.show_tts;
+            let zhu = sheet_zhu(t);
+            let play_glyph = if tts_on {
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(3.0))
+                    .items_center()
+                    .child(div().w(px(2.5)).h(px(10.0)).bg(rgb(zhu)))
+                    .child(div().w(px(2.5)).h(px(10.0)).bg(rgb(zhu)))
+            } else {
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(zhu))
+                    .child(SharedString::from("▶"))
+            };
+            stage = stage.child(
+                div()
+                    .absolute()
+                    .bottom(px(2.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id(SharedString::from("tts-play"))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(rgba((zhu << 8) | 0xCC))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.set_tts_active(!this.show_tts, cx);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(play_glyph),
+                    ),
+            );
+        }
 
         // 正文区：单页 / 对开舞台居中铺满。版字面板改为浮层（见下方 root.overlay），
         // 允许盖住正文下部，因此这里不再为它预留高度。
@@ -5081,15 +5137,9 @@ impl Root {
         ));
         // 目录（v1.79.0）：左栏入口。再点一次收起；点纸面任一处也收起。
         // 「书签」与「批注」已作为页签收进这枚左栏，顶栏不再单列。
-        left = left.child(item("目录", self.show_side).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.toggle_side();
-                cx.notify();
-            }),
-        ));
         // （v1.37.0：此处原有一枚「封面」，已删——见本函数头注释。）
+        // 目录（卷目）入口已移出顶栏（V2.1 顶栏瘦身）：改走「书阁」浮窗内的
+        // 卷目检索，或 ⌘L 直开侧栏——顶栏只留天天点的那几件。
         left = left.child(sep());
 
         // ---- 中组：版字（列数 / 字体 / 字级 / 留白 / 纸墨 / 标注） / 专注 ----
@@ -5125,27 +5175,11 @@ impl Root {
             }),
         ));
         mid = mid.child(sep());
-        // ── 「注」：一键显隐注释（v1.9.25 · 用户点名要的沉浸式阅读）──────
-        //
-        // 一枚单字、与「版字」相邻——它是版式的近亲（看什么 vs 怎么看），
-        // 但**必须是一级入口**：读书时想「清净一下」不该翻两层面板。
-        //
-        // 亮朱砂 = 注释开着（与其它钮「此门已开」同一套语义）；点一下转墨
-        // = 全纸只剩正文。它切的是 `notes_shown`，**从不**碰 `show_notes`
-        // ——后者是「这本书要不要注释」的书的属性，不该被一次点击改掉。
-        //
-        // ⚠️ v1.9.37：`notes_shown` 现在**参与分页**（夹注退出列流、正文补位），
-        // 所以点它会重排、页数会变。位置由 `resort_keeping_place` 用字锚点
-        // 扣住，读者不会跳页；但「同一叶的页码」确实会变，这是重排的应有之义。
-        mid = mid.child(item("注", self.notes_shown).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.toggle_notes_shown();
-                cx.notify();
-            }),
-        ));
-        mid = mid.child(sep());
+        // ── 「注」入口已移入「版字」面板（V2.1 顶栏瘦身）──────
+        // 一键显隐注释不再占顶栏常驻空间：在「版字」面板顶部新增一枚「注」
+        // 芯片开关（`toggle_notes_shown`），并保留 ⌘N 键盘可达。详见
+        // `render_style_sheet` 内 `ink_option("注", …)`。它切的是 `notes_shown`，
+        // 从不碰 `show_notes`（书的属性），分页语义与 v1.9.37 一致。
 
         // ---- 右组：检索 / 问笺 ｜ 印製 ｜ 更多 ----
         //
@@ -5165,25 +5199,11 @@ impl Root {
                 cx.notify();
             }),
         ));
-        // 问小笺（v1.76.0 · V2.0 模块二）：框一句原文问他，或在此直接发问。
-        right = right.child(tight("问笺", self.show_ai).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, window, cx| {
-                cx.stop_propagation();
-                this.toggle_ai(window, cx);
-            }),
-        ));
-        // 聽書：開始／暫停朗讀（v1.9.96）。原「聽」字孤立小字与贴底胶囊已撤，
-        // 入口老老实实落在顶栏，与检索 / 问笺同组；TTS 引擎一字未动。
-        let tts_on = self.show_tts;
-        right = right.child(tight(if tts_on { "停聽" } else { "聽書" }, tts_on).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.set_tts_active(!this.show_tts, cx);
-                cx.notify();
-            }),
-        ));
+        // 问小笺（V2.0 模块二）与 聽書（TTS）入口已移出顶栏（V2.1 顶栏瘦身）：
+        // ・问小笺：保留 ⌘⇧A 键盘可达，不占顶栏常驻空间；
+        // ・聽書：改为竖排版心（鱼尾）正下方一枚极简播放图标，与外框线留 1px
+        //   呼吸感；保留 ⌘⌥Y 键盘可达（见 `render_stage` 底部播放钮）。
+        right = right.child(sep());
         // v1.80.0：**更多**下拉。原先散在底部状态栏的六条导出、以及一年点
         // 几次的「帮助」，现在都住在这一枚里——顶栏只需留「天天点的那几件」。
         // 点哪条都直接弹系统保存对话框；菜单本体与旧的「导出」同形同构，
@@ -5397,11 +5417,8 @@ impl Root {
         //
         // 估宽：一字 ≈ 字号宽（CJK 全角），印製 11px 二字另加 1px 双边。
         let est = |chars: f32, fs: f32, pad: f32| chars * fs + pad * 2.0;
-        let bar_w = est(2.0, 13.0, 14.0) * 3.0  // 书阁 / 目录 / 版字
-            + est(1.0, 13.0, 14.0)              // 注（单字钮，v1.9.25）
-            + est(2.0, 13.0, 9.0) * 3.0         // 检索 / 问笺 / 聽書
-            + est(2.0, 11.0, 9.0) + 2.0         // 印製
-            + est(2.0, 13.0, 14.0)              // 更多
+        let bar_w = est(2.0, 13.0, 14.0) * 4.0  // 书阁 / 版字 / 转横排 / 更多
+            + est(2.0, 13.0, 9.0)               // 检索（tight）
             + 3.0 * (1.0 + 44.0);               // 三道界行（1px + 左右各 22）
         let room_right = (self.viewport_w - bar_w) * 0.5 - 6.0;
         let to_right = room_right >= 134.0 + 4.0 + 142.0 + 6.0;
@@ -5972,10 +5989,11 @@ impl Root {
                     .absolute()
                     .top(px(2.0))
                     .right(px(2.0))
-                    .w(px(9.0))
-                    .h(px(9.0))
-                    .rounded(px(5.0))
-                    .bg(rgb(self.theme.accent())),
+                    // V2.1：9 → 7px 缩小，朱砂 alpha 0xFF → 0xCC 调淡。
+                    .w(px(7.0))
+                    .h(px(7.0))
+                    .rounded(px(4.0))
+                    .bg(rgba((self.theme.accent() << 8) | 0xCC)),
             );
         }
         // 牌记：书末最后一页（idx == 末页）加一枚方框，内竖排「某年某刻」，
@@ -8966,7 +8984,7 @@ impl Root {
         // 下空当里，骑在两字之间的那道 7px 字缝正中。**它不占正文一寸空间**，
         // 主字照样居格心、照样正文字号，整列基线一笔不歪。
         //
-        // 字号由 `ruby::layout` 的 min() 链收口（≤主字 26%、≤86% 格宽），
+        // 字号由 `ruby::layout` 的 min() 链收口（≤主字 22%、≤86% 格宽），
         // 墨色**朱砂**，逐字真字体排版（不是位图，缩放不糊）。
         if let Some(rl) = ruby_layout {
             if let Some(py) = rare_py.as_deref() {
@@ -8992,9 +9010,10 @@ impl Root {
                         // 两三像素——框高只在 8 列这种宽格里才有富余。
                         .line_height(px(rl.fs))
                         // 同句读：压在实色块上时，注音也换成块的前景色。
+                        // 墨色 alpha 由 0xF2 调淡到 0xCC（V2.1：拼音整体更隐）。
                         .text_color(match a11y_ink {
-                            Some(c) => rgba((c << 8) | 0xF2),
-                            None => rgba((crate::ruby::RUBY_INK << 8) | 0xF2),
+                            Some(c) => rgba((c << 8) | 0xCC),
+                            None => rgba((crate::ruby::RUBY_INK << 8) | 0xCC),
                         })
                         .child(SharedString::from(py.to_string())),
                 );
@@ -9220,7 +9239,8 @@ impl Root {
                         .bottom(px(crate::punct::MARKER_INSET))
                         .text_size(px(mfs))
                         .line_height(px(mfs * 1.2))
-                        .text_color(rgb(t.accent()))
+                        // V2.1：朱砂 alpha 0xFF → 0xCC 调淡。
+                        .text_color(rgba((t.accent() << 8) | 0xCC))
                         .child(SharedString::from(marker)),
                 );
             }
@@ -11735,7 +11755,7 @@ impl Root {
             .shadow_lg()
             .font_family(crate::fonts::note_family(self.note_font()))
             .occlude()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+            .on_mouse_down(MouseButton::Left, cx.listener(|_this, _, _, cx| {
                 cx.stop_propagation();
             }))
             .child(body)
@@ -14052,6 +14072,35 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
         }
         body = body.child(tabs);
 
+        // ── 「注」一键显隐（V2.1 顶栏瘦身：原顶栏「注」钮移入此处）──
+        //
+        // 提升到版字面板顶部、恒可见（不随页签切换而隐藏），与「式 / 列 / 字」
+        // 同级醒目。切的是 `notes_shown`、**不动** `show_notes`（书的属性，
+        // 不该被一次点击改掉）；保留 ⌘N 键盘可达。原 标注 行里的「注释」芯片
+        // 已移至此，避免两处控同一状态。
+        let note_toggle = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(14.0))
+            .child(
+                ink_option("注释", self.notes_shown, t).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_notes_shown();
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from("⌘N")),
+            );
+        body = body.child(style_row("注", note_toggle, t));
+
         // ---- 样式预设（v1.9.10）：一句记住一整套版式 ----
         //
         // 内建四套（灯下 / 雨窗 / 仿刻 / 素笺）+ 三个用户槽位。**空槽点一下
@@ -14533,7 +14582,7 @@ pub(crate) fn png_size_for_ratio(ratio: usize) -> Option<(f32, f32)> {
                 // 它牵动分页的半格账与出图落字，物理删除风险太大。将来要
                 // 恢复入口，取消本行注释即可，不必改任何底层代码。
                 // ("数字汉字", self.han_digits, StyleAct::Han),
-                ("注释", self.notes_shown, StyleAct::Notes),
+                // 「注释」已提升到面板顶部「注」行（见 tabs 之后），此处不再重复。
             ],
             cx,
         );

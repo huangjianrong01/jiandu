@@ -458,8 +458,8 @@ fi
 # 用 `ditto` 而不是 `cp -R`：前者保留资源叉、xattr 与符号链接本身，
 # 后者会把签名相关的扩展属性丢掉（装完打不开就是这么来的）。
 if [ "${DMG:-0}" = "1" ]; then
-    # 本次交付按用户明确指令命名为 V2.0（内部 CFBundleVersion 仍按四段号递增）。
-    DMG_OUT="$DIST/${APP_NAME}-V2.0.dmg"
+    # 最终交付按用户明确指令命名为「勘阅.dmg」（内部 CFBundleVersion 仍按四段号递增）。
+    DMG_OUT="$DIST/${APP_NAME}.dmg"
     STAGE="$(mktemp -d)/dmg"
     mkdir -p "$STAGE"
     ditto "$APP" "$STAGE/${APP_NAME}.app"

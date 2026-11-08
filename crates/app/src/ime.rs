@@ -29,7 +29,7 @@ use crate::app::Root;
 use gpui::{
     div, App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Point,
-    SharedString, UTF16Selection, Window, px,
+    UTF16Selection, Window, px,
 };
 use std::ops::Range;
 
