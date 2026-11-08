@@ -500,6 +500,10 @@ pub struct Root {
     compare_tween_text: Option<f32>,
     compare_anim_img: bool,
     compare_anim_text: bool,
+    /// L8 · 对照模式缩放系数（触控板捏合 / Ctrl+滚轮）。1.0 = 原始 fit 尺寸。
+    compare_zoom: f32,
+    /// L8 · 缩放后左图水平平移偏移（视口内手动水平移动，补足 overflow_x_scroll 缺失）。
+    compare_pan_x: f32,
     /// L3 瓦片渲染缓存：左图按视口懒加载切片 + LRU，零侵入 L1/L2。
     compare_tiles: crate::compare_tiles::TileCache,
     pub script: Script,
@@ -1652,6 +1656,8 @@ impl Root {
             compare_tween_text: None,
             compare_anim_img: false,
             compare_anim_text: false,
+            compare_zoom: 1.0,
+            compare_pan_x: 0.0,
             compare_tiles: crate::compare_tiles::TileCache::new(512, 96),
             script: Script::Ancient,
             grid: GridConfig::default(),
@@ -11058,7 +11064,7 @@ impl Root {
         let vw = vp.width / unit;
         let vh = vp.height / unit;
         let rule = rgba(((t.rule() & 0xFFFFFF) << 8) | 0x66);
-        let fs = 22.0; // 右文试水字号（与读者主字独立，不影响读者排版）
+        let fs = 22.0 * self.compare_zoom.max(0.05); // L8：右文随缩放系数同步放大/缩小（与读者主字独立）
         let per_line = 30usize; // 横排每行字数（仅 JIANDU_COMPARE_HORIZONTAL 生效）
 
         // L6 Step1：数据源切换——优先 SQLite（生产），回退 JSON（兼容导入本地图）。
@@ -11131,21 +11137,25 @@ impl Root {
             Some(path) => {
                 if let Ok((nw, nh)) = image::image_dimensions(path) {
                     let fit = left_w - 32.0;
-                    let scale = if nw > 0 { fit / nw as f32 } else { 1.0 };
-                    let dw = fit;
+                    let base_scale = if nw > 0 { fit / nw as f32 } else { 1.0 };
+                    let zoom = self.compare_zoom.max(0.05);
+                    let scale = base_scale * zoom; // 实际渲染缩放 = fit × 缩放系数
+                    let dw = nw as f32 * scale;
                     let dh = nh as f32 * scale;
+                    // L8：缩放后水平平移（补足 overflow_x_scroll 缺失），钳制在视口内。
+                    let pan_x = if dw <= fit { 0.0 } else { self.compare_pan_x.clamp(fit - dw, 0.0) };
                     // L3 瓦片渲染：按当前滚动 offset + 缩放(scale) 算视口可见切片，只裁切
                     // /渲染可见范围，命中 LRU 复用，避免重复解码；边缘瓦片按真实剩余尺寸
                     // 裁切，绝不越界、不闪退。零侵入 L1/L2（联动、滚动补间）。
                     let disp = compare_image_display_path(path);
                     let max_off = self.compare_img_scroll.max_offset().height / unit;
                     let viewport_h = if max_off > 0.0 { (dh - max_off).max(0.0) } else { dh };
-                    let ox = self.compare_img_scroll.offset().x / unit;
+                    let ox = -pan_x; // L8：水平平移后，视口左沿对应的内容坐标（用于瓦片剔除）
                     let oy = self.compare_img_scroll.offset().y / unit;
                     let ts = self.compare_tiles.tile_size();
                     let (c0, r0, c1, r1) =
                         crate::compare_tiles::TileCache::visible_range(nw, nh, ts, scale, ox, oy, dw, viewport_h);
-                    let mut img_box = div().relative().w(px(dw)).h(px(dh));
+                    let mut img_box = div().relative().left(px(pan_x)).w(px(dw)).h(px(dh));
                     let mut tiled = false;
                     for row in r0..=r1 {
                         for col in c0..=c1 {
@@ -11257,8 +11267,8 @@ impl Root {
                     .id("left_image_scroll")
                     .overflow_y_scroll()
                     .track_scroll(&self.compare_img_scroll)
-                    .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _window, cx| {
-                        this.compare_on_wheel(LinkSide::Left, ev, cx);
+                    .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
+                        this.compare_on_wheel(LinkSide::Left, ev, window, cx);
                     }))
                     .bg(rgb(t.paper()))
                     .child(left_scroll),
@@ -11400,8 +11410,8 @@ impl Root {
                     .id("right_text_scroll")
                     .overflow_y_scroll()
                     .track_scroll(&self.compare_text_scroll)
-                    .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _window, cx| {
-                        this.compare_on_wheel(LinkSide::Right, ev, cx);
+                    .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
+                        this.compare_on_wheel(LinkSide::Right, ev, window, cx);
                     }))
                     .bg(rgb(t.paper()))
                     .child(text_row),
@@ -11488,7 +11498,52 @@ impl Root {
     /// 掐断内建滚轮处理（`stop_propagation`）防止双滚；对侧只记目标 + 打时间锁，真正的
     /// 写入交给 `compare_start_tween` 的补间任务（经 `entity.update` 触碰句柄，绝不裸持
     /// `&mut self` 同时碰两个 `ScrollHandle`——借用检查器防呆）。
-    pub fn compare_on_wheel(&mut self, side: LinkSide, ev: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    pub fn compare_on_wheel(
+        &mut self,
+        side: LinkSide,
+        ev: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // ── L8：Ctrl+滚轮 / 触控板捏合 → 缩放（图片 + 红框 + 右文同步放大缩小）──
+        // 苹果底层把 Pinch 映射为 Control + 滚轮事件（NSControlKeyMask），由 `ev.modifiers.control` 识别。
+        // 仅当光标在左图栏（side==Left）时触发，避免右文栏捏合把水平平移算飞。
+        if ev.modifiers.control && side == LinkSide::Left {
+            let unit = px(1.0);
+            // 滚轮上滚(dy<0)→放大，下滚(dy>0)→缩小；指数平滑、区间钳制 0.2×–8×。
+            let dy = ev.delta.pixel_delta(px(1.0)).y / unit;
+            let new_zoom = (self.compare_zoom * (-dy * 0.003).exp()).clamp(0.2, 8.0);
+            let r = if self.compare_zoom > 0.0 {
+                new_zoom / self.compare_zoom
+            } else {
+                1.0
+            };
+            // 缩放时取消左图可能正在跑的补间，避免被拉回。
+            self.compare_anim_img = false;
+            self.compare_tween_img = None;
+            // 以光标为锚：垂直方向用滚动 offset（左图视口上沿 = 顶栏 40 + 左栏头 30）；
+            // 水平方向用 compare_pan_x，使指尖/光标下的字在缩放后原地不动。
+            let cur_off = self.compare_img_scroll.offset();
+            let vp_top = 40.0_f32 + 30.0_f32;
+            let sy = (ev.position.y / unit) - vp_top;
+            let oy = cur_off.y / unit;
+            let new_oy = (oy + sy) * r - sy;
+            self.compare_img_scroll
+                .set_offset(Point::new(cur_off.x, px(new_oy)));
+            let pad_x = 16.0_f32; // 左图容器内左边距，锚点换算需扣除
+            let sx = ev.position.x / unit;
+            let new_pan_x = (self.compare_pan_x + sx - pad_x) * r - sx + pad_x;
+            // 钳制水平平移，避免把图拖出视口（dw = fit × zoom）。
+            let left_w = (window.viewport_size().width / unit) * 0.5;
+            let fit = left_w - 32.0;
+            let dw = fit * new_zoom;
+            let min_pan = if dw > fit { fit - dw } else { 0.0 };
+            self.compare_pan_x = new_pan_x.clamp(min_pan, 0.0);
+            self.compare_zoom = new_zoom;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         let now = std::time::Instant::now();
         // 回声 / 抖动抑制窗：最近刚程序化驱动过 `side`，这 100ms 内的滚轮视为镜像回声。
         if let Some((g_side, g_time)) = self.link_arbiter_state {
@@ -11523,6 +11578,17 @@ impl Root {
         };
         // 本侧滚轮增量（与 collation forward_wheel 同口径：向下滚 offset.y 变负）。
         let dy = ev.delta.pixel_delta(px(1.0)).y / unit;
+        // L8：水平双指滑动 / Shift+滚轮 → 左图水平平移（补足 overflow_x_scroll 缺失）。
+        if side == LinkSide::Left {
+            let dx = ev.delta.pixel_delta(px(1.0)).x / unit;
+            if dx.abs() > 0.0 {
+                let left_w = (window.viewport_size().width / unit) * 0.5;
+                let fit = left_w - 32.0;
+                let dw = fit * self.compare_zoom.max(0.05);
+                let min_pan = if dw > fit { fit - dw } else { 0.0 };
+                self.compare_pan_x = (self.compare_pan_x - dx).clamp(min_pan, 0.0);
+            }
+        }
         let next_y = (self_y + dy).clamp(-self_max.max(0.0), 0.0);
         // 落本侧（1:1 物理跟随），掐断内建处理防止双滚。
         match side {
