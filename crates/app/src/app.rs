@@ -8,6 +8,14 @@ use crate::fonts;
 use crate::grid::{GridConfig, GridDir, LayoutConfig};
 use crate::library::{Bookmark, Library};
 use crate::menubar::{MenuData, MenuIntent};
+/// 沉浸阅读界面的排版方向（V2.1 新增，仅阅读界面、绝不波及工作台）：
+/// - `Vertical`：古籍竖排（默认，原有竖排引擎一字未动）；
+/// - `Horizontal`：现代横排（从左到右、从上到下，走 `reader` 里独立的横排渲染分支）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LayoutDir {
+    Vertical,
+    Horizontal,
+}
 use crate::theme::{InkPalette, Theme};
 use crate::types::{
     Book, Chapter, Duplex, FontChoice, FontPreset, Glyph, GlyphHit, GlyphKey, GlyphKind,
@@ -1242,6 +1250,8 @@ pub struct Root {
     /// `duplex` 是它推导出的**当帧铺法**。
     /// 自动模式下 `auto_duplex` 只在对开 ⇄ 单叶之间来回。
     pub layout_mode: crate::grid::LayoutMode,
+    /// 沉浸阅读排版方向（V2.1）：竖排 / 横排。仅阅读界面生效，工作台与双屏联动零影响。
+    pub layout_dir: LayoutDir,
     /// 窗口内容区尺寸（每帧由 render 写入，供铺满屏计算）。
     pub viewport_w: f32,
     pub viewport_h: f32,
@@ -1782,6 +1792,7 @@ impl Root {
             layout_key: LayoutConfig::default_key(),
             duplex: Duplex::Single,
             layout_mode: crate::grid::LayoutMode::Facing,
+            layout_dir: LayoutDir::Vertical,
             // v1.84.0：正文出厂清刻本悦宋（见上 `default_ancient`）、
             // 批注出厂霞鹜文楷——刻本里「正文匠体、注文手写体」的层次。
             font_ancient: default_ancient,
@@ -2245,6 +2256,14 @@ impl Root {
             if std::env::var("JIANDU_HL_DEMO").is_ok() {
                 let ws = root.collation.clone();
                 ws.update(cx, |w, cx| w.dev_setup_highlight_demo(cx));
+            }
+            // V2.1 截图核对：批注工具条（U/~/[]）+ 预置三态批注（下划线 / 波浪线 / 矩形框）。
+            // 直接切到笺校工作台、但「不」走 enter_collation —— store_id 保持 None，
+            // new() 里的预置三态批注才不会被换稿清空；再摆一段选区让 U/~/[] 工具条浮出。
+            if std::env::var("JIANDU_ANN_DEMO").is_ok() {
+                root.mode = AppMode::Collation;
+                let ws = root.collation.clone();
+                ws.update(cx, |w, cx| w.dev_seed_annotation_demo(cx));
             }
             // V2.1：截图核对用——直接拉开质检抽屉（等稿子装完再开，否则扫的是空串）。
             if std::env::var("JIANDU_QC").is_ok() {
@@ -3691,6 +3710,18 @@ impl Root {
             mode.hint(),
             self.grid.columns
         );
+        self.persist();
+    }
+
+    /// 沉浸阅读排版方向切换（V2.1）：竖排 ⇄ 横排。**仅阅读界面生效**，
+    /// 工作台与双屏联动共享的竖排引擎一字未动——这里只翻一个枚举，
+    /// `render_leaf` 据此在 `render_ancient`（竖排）与 `render_ancient_horizontal`
+    /// （横排，独立分支）之间二选一，零互相污染。
+    pub fn set_layout_dir(&mut self, dir: LayoutDir) {
+        if self.layout_dir == dir {
+            return;
+        }
+        self.layout_dir = dir;
         self.persist();
     }
 

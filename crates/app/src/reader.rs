@@ -5101,6 +5101,25 @@ impl Root {
                 cx.notify();
             }),
         ));
+        // ── 「转横排 / 转竖排」：沉浸阅读排版方向切换（V2.1）──
+        // 仅阅读界面生效，工作台与双屏联动的竖排引擎一字未动。
+        let dir_label = match self.layout_dir {
+            crate::app::LayoutDir::Vertical => "转横排",
+            crate::app::LayoutDir::Horizontal => "转竖排",
+        };
+        let target_dir = match self.layout_dir {
+            crate::app::LayoutDir::Vertical => crate::app::LayoutDir::Horizontal,
+            crate::app::LayoutDir::Horizontal => crate::app::LayoutDir::Vertical,
+        };
+        mid = mid.child(item(dir_label, false).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.set_layout_dir(target_dir);
+                cx.notify();
+            }),
+        ));
+        mid = mid.child(sep());
         // ── 「注」：一键显隐注释（v1.9.25 · 用户点名要的沉浸式阅读）──────
         //
         // 一枚单字、与「版字」相邻——它是版式的近亲（看什么 vs 怎么看），
@@ -5891,18 +5910,32 @@ impl Root {
             .iter()
             .filter_map(|&c| self.chapter_stat(c))
             .collect();
-        // 现只保留古籍竖笺（现代横笺已移除）：一律走竖排渲染。
-        let inner = self.render_ancient(
-            &glyphs,
-            &columns,
-            back,
-            start,
-            idx,
-            edge,
-            &stats,
-            LeafGeo::current(self),
-            cx,
-        );
+        // 横竖排切换（V2.1）：横排走独立分支 `render_ancient_horizontal`，
+        // 竖排仍走原 `render_ancient`——两套互不污染，竖排引擎一字未动。
+        let inner = if self.layout_dir == crate::app::LayoutDir::Horizontal {
+            self.render_ancient_horizontal(
+                &glyphs,
+                back,
+                start,
+                idx,
+                edge,
+                &stats,
+                LeafGeo::current(self),
+                cx,
+            )
+        } else {
+            self.render_ancient(
+                &glyphs,
+                &columns,
+                back,
+                start,
+                idx,
+                edge,
+                &stats,
+                LeafGeo::current(self),
+                cx,
+            )
+        };
         // 最小字号保护：窄屏 + 高列数（12/14）触发最小字号后，纸面可能超出
         // 视口高度——这里把该面包进一个限高（=内容区高）的滚动容器，允许
         // 单页内上下滑动查看，而不是把字压到更小或裁掉。
@@ -6301,6 +6334,100 @@ impl Root {
                 self.note_focus.clone(),
                 cx.entity(),
             ))
+    }
+
+    // ── 横排渲染分支（V2.1，独立、零污染竖排引擎）─────────────────────────
+    /// 沉浸阅读界面的**横排**模式（从左到右、从上到下）：现代阅读排版。
+    ///
+    /// 与竖排 `render_ancient` 完全独立——消费同一份 `glyphs` 读序，但把字按固定
+    /// 字格（`cell_w × cell_h`）从左到右流动、满行回折；标点直接落字库字形
+    /// （横排本就该用字库标点，不再手绘竖排角标），句读 / 书名号走「竖排呈现形 →
+    /// 横排正形」的轻量映射。竖排引擎（`layout_book` / `render_ancient` /
+    /// `ancient_cell`）一字未动，故横排是纯 additive 分支。
+    ///
+    /// 取舍（首版）：横排只读正文 + 标点 + 繁简 / 数字转汉，不复制竖排的 TTS 高亮 /
+    /// 注音 ruby / 专名线 / 眉批——那些是校对 / 朗读场景，横排首版先交付「干净阅读」。
+    fn render_ancient_horizontal(
+        &self,
+        glyphs: &[Glyph],
+        back: bool,
+        _start_chapter: bool,
+        _idx: usize,
+        _edge: LeafHalf,
+        _stats: &[ChapStat],
+        geo: LeafGeo,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let t = self.theme;
+        let fs = geo.fs;
+        let cell_w = geo.cell_w;
+        let cell_h = geo.cell_h;
+        let paper = if back { t.paper_back() } else { t.paper() };
+        let ink = if back { t.ink_soft() } else { self.palette.ink(t) };
+        // 横向流动容器：按字格宽高逐字排、满行回折（flex_wrap）。
+        let mut flow = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .justify_start()
+            .w(px(self.content_w.max(80.0)))
+            .bg(rgb(paper));
+        let mut last_para: Option<usize> = None;
+        for g in glyphs.iter() {
+            // 段首缩进占位：横排里给两个空字格的缩进（对齐现代段落首行缩进）。
+            if g.is_indent() {
+                flow = flow
+                    .child(div().w(px(cell_w * 2.0)).h(px(cell_h)))
+                    .child(div().w(px(cell_w * 2.0)).h(px(cell_h)));
+                continue;
+            }
+            // 段落切换：插入一条「整行宽的细缝」强制回折，模拟分段（不画可见线）。
+            if let Some(p) = last_para {
+                if p != g.para && g.kind == jiandu_core::types::GlyphKind::Char {
+                    flow = flow.child(
+                        div()
+                            .w(px(self.content_w.max(80.0)))
+                            .h(px(cell_h * 0.35)),
+                    );
+                }
+            }
+            last_para = Some(g.para);
+            // 显示字符（繁简开关 + 数字转汉）：与竖排同口径，绝不另起一套。
+            let mut s = self.shown_glyph(*g).to_string();
+            if self.han_digits {
+                s = crate::west::digits_to_han(&s, false);
+            }
+            // 竖排专用呈现形 → 横排正形（括号 / 引号 / 书名号），其余标点原样。
+            let ch = s.chars().next().unwrap_or(' ');
+            let drawn = match ch {
+                '︵' => '（',
+                '︶' => '）',
+                '︷' => '〔',
+                '︸' => '〕',
+                '︽' | '︿' => '《',
+                '︾' | '﹀' => '》',
+                '﹁' => '「',
+                '﹂' => '」',
+                '﹃' => '『',
+                '﹄' => '』',
+                other => other,
+            };
+            let pick = crate::font_fallback::body(self.font_ancient, self.script, drawn, cx);
+            flow = flow.child(
+                div()
+                    .w(px(cell_w))
+                    .h(px(cell_h))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(fs))
+                    .font_family(pick.family.clone())
+                    .text_color(rgb(ink))
+                    .child(SharedString::from(drawn.to_string())),
+            );
+        }
+        flow
     }
 
     fn render_ancient(

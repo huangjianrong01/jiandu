@@ -7560,6 +7560,22 @@ impl CollationWorkspace {
         cx.notify();
     }
 
+    /// **开发用**（V2.1，`JIANDU_ANN_DEMO=1`）：开机把工作台摆成「预置三态批注
+    /// （下划线 / 波浪线 / 矩形框）+ U/~/[] 工具条浮出」的目标状态，供 `screencapture`
+    /// 核对文本划线批注的灵魂。与 `dev_setup_highlight_demo` 同一套路——合成点击
+    /// 过不了 TCC，只能靠环境变量把界面摆到位。
+    ///
+    /// `new()` 里已按 `store_id`/`text_file` 双 None 预置了 `0..8` 下划线 / `9..17`
+    /// 矩形框 / `18..26` 波浪线三条样张；这里只补一段选区让 U/~/[] 工具条浮出，
+    /// **不碰** `annotations`，也不改正文、不污染书库。
+    pub fn dev_seed_annotation_demo(&mut self, cx: &mut Context<Self>) {
+        self.store_id = None;
+        self.selection = Some(60..72);
+        self.anchor = 60;
+        self.cursor = 72;
+        cx.notify();
+    }
+
     /// **开发用**（v1.9.94，`JIANDU_FIND_DEMO=1`）：开机把工作台摆成
     /// 「宣纸毛玻璃查找浮条 + 暖黄全命中 + 朱砂当前命中 + 异体提示」的目标状态，
     /// 供 `screencapture` 核对 Find & Replace 的灵魂。与 `dev_setup_highlight_demo`
