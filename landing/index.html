@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>勘阅 KanYue · 你的本地数字古籍书房</title>
+<meta name="description" content="勘阅 KanYue —— 纯本地运行的影印古籍阅读与双屏勘校工具。铁砚凝古意，乌丝入新篇。" />
+<style>
+  /* ── 宣纸底 / 墨色字：一套变量管全局 ── */
+  :root{
+    --paper:#F7F5F0;
+    --paper-deep:#F1EDE3;
+    --ink:#2C2C2C;
+    --ink-soft:#6B6558;
+    --ink-faint:#9A9384;
+    --zhu:#9E3B2E;
+    --hair:rgba(44,44,44,.12);
+    --serif:"Songti SC","STSong","Source Han Serif SC","Noto Serif CJK SC","SimSun",serif;
+    --kai:"Kaiti SC","STKaiti","KaiTi",var(--serif);
+    --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:var(--sans);
+    -webkit-font-smoothing:antialiased;
+    line-height:1.85;
+    /* 极淡的纸纹：两道几乎看不见的斜向丝，只在近处才能察觉 */
+    background-image:
+      repeating-linear-gradient(0deg, rgba(44,44,44,.012) 0 1px, transparent 1px 4px),
+      radial-gradient(120% 80% at 50% 0%, #FBF9F5 0%, var(--paper) 45%, var(--paper-deep) 100%);
+  }
+
+  /* ── 版心：留白优先 ── */
+  .wrap{max-width:1080px;margin:0 auto;padding:0 32px;}
+  .narrow{max-width:760px;}
+
+  /* ── 顶栏：只有一枚名字，一条细线 ── */
+  header{
+    position:sticky;top:0;z-index:20;
+    backdrop-filter:saturate(120%) blur(8px);
+    background:rgba(247,245,240,.72);
+    border-bottom:1px solid var(--hair);
+  }
+  header .wrap{display:flex;align-items:baseline;justify-content:space-between;height:64px;}
+  .wordmark{font-family:var(--serif);font-size:19px;letter-spacing:.28em;color:var(--ink);}
+  .wordmark em{font-style:normal;font-family:var(--serif);font-size:11px;letter-spacing:.2em;color:var(--ink-faint);margin-left:12px;}
+  header nav a{color:var(--ink-soft);text-decoration:none;font-size:13px;margin-left:26px;letter-spacing:.06em;}
+  header nav a:hover{color:var(--zhu);}
+
+  /* ── 首屏 ── */
+  .hero{padding:132px 0 108px;text-align:center;}
+  .seal{
+    width:44px;height:44px;margin:0 auto 34px;
+    background:var(--zhu);border-radius:7px;
+    display:flex;align-items:center;justify-content:center;
+    color:#F7F5F0;font-family:var(--serif);font-size:23px;line-height:1;
+    box-shadow:0 6px 18px rgba(158,59,46,.18);
+  }
+  h1{
+    font-family:var(--serif);
+    font-weight:400;
+    font-size:clamp(46px,7vw,82px);
+    letter-spacing:.24em;
+    margin:0 0 18px;
+    text-indent:.24em; /* 让字距在视觉上居中 */
+  }
+  h1 small{
+    display:block;
+    font-family:var(--serif);
+    font-size:13px;letter-spacing:.42em;text-indent:.42em;
+    color:var(--ink-faint);margin-top:20px;font-weight:400;
+  }
+  .sub{
+    font-family:var(--kai);
+    font-size:clamp(16px,2.2vw,20px);
+    color:var(--ink-soft);
+    letter-spacing:.1em;
+    margin:0 auto 12px;
+    max-width:640px;
+  }
+  .sub .zhu{color:var(--zhu);}
+  .tagline{font-size:14px;color:var(--ink-faint);letter-spacing:.14em;margin-bottom:46px;}
+
+  .cta{
+    display:inline-flex;align-items:center;gap:12px;
+    padding:16px 38px;
+    background:var(--ink);color:var(--paper);
+    text-decoration:none;border-radius:4px;
+    font-size:15px;letter-spacing:.12em;
+    transition:transform .35s cubic-bezier(.2,.8,.2,1), background .35s, box-shadow .35s;
+    box-shadow:0 10px 28px rgba(44,44,44,.14);
+  }
+  .cta:hover{transform:translateY(-2px);background:#1b1b1b;box-shadow:0 16px 36px rgba(44,44,44,.2);}
+  .cta span{font-size:17px;line-height:1;}
+  .meta{margin-top:20px;font-size:12px;color:var(--ink-faint);letter-spacing:.1em;}
+
+  /* ── 分节标题 ── */
+  .sec{padding:96px 0;}
+  .sec-head{text-align:center;margin-bottom:64px;}
+  .sec-head h2{
+    font-family:var(--serif);font-weight:400;font-size:26px;letter-spacing:.22em;
+    margin:0 0 14px;text-indent:.22em;
+  }
+  .sec-head p{margin:0;color:var(--ink-faint);font-size:13px;letter-spacing:.12em;}
+  .rule{width:44px;height:1px;background:var(--hair);margin:0 auto 24px;}
+
+  /* ── 卖点卡片 ── */
+  .cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:26px;}
+  .card{
+    padding:38px 36px 40px;
+    background:rgba(255,255,255,.42);
+    border:1px solid var(--hair);
+    border-radius:6px;
+    transition:background .4s, transform .5s cubic-bezier(.2,.8,.2,1), border-color .4s;
+  }
+  .card:hover{background:rgba(255,255,255,.72);transform:translateY(-3px);border-color:rgba(44,44,44,.2);}
+  .card .num{font-family:var(--serif);font-size:12px;letter-spacing:.28em;color:var(--zhu);}
+  .card h3{
+    font-family:var(--serif);font-weight:400;font-size:20px;letter-spacing:.1em;
+    margin:16px 0 12px;
+  }
+  .card p{margin:0;color:var(--ink-soft);font-size:14px;line-height:1.95;}
+
+  /* ── 视觉展示：截图占位 ── */
+  .shots{display:grid;gap:34px;}
+  figure{margin:0;}
+  .shot{
+    position:relative;
+    border:1px dashed rgba(44,44,44,.22);
+    border-radius:8px;
+    background:
+      linear-gradient(0deg, rgba(44,44,44,.028), rgba(44,44,44,.028)),
+      repeating-linear-gradient(90deg, transparent 0 27px, rgba(44,44,44,.05) 27px 28px);
+    aspect-ratio:16/9;
+    display:flex;align-items:center;justify-content:center;
+    overflow:hidden;
+  }
+  .shot img{width:100%;height:100%;object-fit:cover;display:block;border-radius:7px;}
+  .shot .hint{
+    text-align:center;color:var(--ink-faint);font-size:13px;letter-spacing:.14em;line-height:2;
+  }
+  .shot .hint b{display:block;font-family:var(--serif);font-size:15px;color:var(--ink-soft);letter-spacing:.2em;margin-bottom:6px;font-weight:400;}
+  figcaption{margin-top:16px;font-size:12px;color:var(--ink-faint);letter-spacing:.12em;text-align:center;}
+
+  /* ── 页脚 ── */
+  footer{border-top:1px solid var(--hair);padding:56px 0 64px;}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:14px;align-items:baseline;justify-content:space-between;}
+  footer .l{font-family:var(--serif);font-size:13px;letter-spacing:.14em;color:var(--ink-soft);}
+  footer .r{font-size:12px;color:var(--ink-faint);letter-spacing:.1em;}
+
+  /* ── 淡入：一屏一屏地显影，像宣纸上洇开的墨 ── */
+  @keyframes ink-in{
+    from{opacity:0;transform:translateY(14px);filter:blur(3px);}
+    to{opacity:1;transform:none;filter:none;}
+  }
+  .reveal{opacity:0;animation:ink-in .95s cubic-bezier(.22,.8,.24,1) forwards;}
+  .d1{animation-delay:.10s;}
+  .d2{animation-delay:.26s;}
+  .d3{animation-delay:.42s;}
+  .d4{animation-delay:.58s;}
+  .d5{animation-delay:.74s;}
+
+  /* 滚动进入再显影（不支持 IntersectionObserver 时兜底为直接显示） */
+  .on-scroll{opacity:0;transform:translateY(18px);transition:opacity .9s ease, transform .9s cubic-bezier(.22,.8,.24,1);}
+  .on-scroll.in{opacity:1;transform:none;}
+
+  @media (prefers-reduced-motion:reduce){
+    .reveal,.on-scroll{animation:none!important;transition:none!important;opacity:1!important;transform:none!important;filter:none!important;}
+  }
+
+  @media (max-width:760px){
+    .wrap{padding:0 22px;}
+    .hero{padding:96px 0 72px;}
+    .cards{grid-template-columns:1fr;}
+    .sec{padding:72px 0;}
+    header nav{display:none;}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="wordmark">勘 閱<em>KANYUE</em></div>
+    <nav>
+      <a href="#features">功能</a>
+      <a href="#shots">界面</a>
+      <a href="#download">下载</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <!-- ── 首屏 ── -->
+  <section class="hero wrap">
+    <div class="seal reveal d1">勘</div>
+    <h1 class="reveal d2">勘 阅<small>K A N Y U E</small></h1>
+    <p class="sub reveal d3">铁砚凝古意，<span class="zhu">乌丝</span>入新篇。</p>
+    <p class="tagline reveal d3">你的本地数字古籍书房 · 为阅读创造极致环境</p>
+    <a class="cta reveal d4" href="#" id="download">下载 Mac 版 DMG <span>↓</span></a>
+    <p class="meta reveal d5">macOS 12+ · Apple Silicon &amp; Intel · 约 60 MB</p>
+  </section>
+
+  <!-- ── 核心卖点 ── -->
+  <section class="sec wrap" id="features">
+    <div class="sec-head on-scroll">
+      <div class="rule"></div>
+      <h2>四 件 事 ， 做 到 底</h2>
+      <p>不堆功能，只把「读」与「校」这两件事做到没有摩擦</p>
+    </div>
+
+    <div class="cards">
+      <article class="card on-scroll">
+        <div class="num">壹</div>
+        <h3>双屏勘校</h3>
+        <p>左图右文，毫秒级双向坐标联动。点左图任一影印字，右文即亮；在右文敲字改正，左图同源字同步框出。光标打字校对如丝般顺滑。</p>
+      </article>
+
+      <article class="card on-scroll">
+        <div class="num">贰</div>
+        <h3>绝对隐私</h3>
+        <p>纯本地离线运行，识别走苹果原生 Vision 引擎，全文与影像不出本机。涉密古籍、未刊稿本，不上传任何云端。</p>
+      </article>
+
+      <article class="card on-scroll">
+        <div class="num">叁</div>
+        <h3>专业排版引擎</h3>
+        <p>竖排右起、双叶镜像、天头地脚三分，正文与双行夹注严格分离。目录复刻版心黄金分割，字格与界栏分毫不让。</p>
+      </article>
+
+      <article class="card on-scroll">
+        <div class="num">肆</div>
+        <h3>7 种无损导出</h3>
+        <p>行业天花板级双层可搜索 PDF：底图之上叠一层隐形文字，页页可检索可复制。另支持图书馆级 TEI P5 / ALTO XML 与 DOCX、纯文本等格式。</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── 界面展示 ── -->
+  <section class="sec wrap" id="shots">
+    <div class="sec-head on-scroll">
+      <div class="rule"></div>
+      <h2>纸 上 见</h2>
+      <p>影印原图与校订文本，同屏对读</p>
+    </div>
+
+    <div class="shots">
+      <figure class="on-scroll">
+        <div class="shot">
+          <!-- 把双屏联动截图命名为 screenshot-compare.png 放到同一目录即可 -->
+          <img src="screenshot-compare.png" alt="勘阅 · 双屏勘校界面"
+               onerror="this.style.display='none';this.nextElementSibling.style.display='block';" />
+          <div class="hint" style="display:none">
+            <b>双 屏 勘 校</b>
+            把截图存为 screenshot-compare.png<br />放在本页同一目录
+          </div>
+        </div>
+        <figcaption>双屏勘校 · 左影印原图 / 右竖排校订文本</figcaption>
+      </figure>
+
+      <figure class="on-scroll">
+        <div class="shot">
+          <!-- 沉浸阅读截图命名为 screenshot-reader.png -->
+          <img src="screenshot-reader.png" alt="勘阅 · 沉浸阅读界面"
+               onerror="this.style.display='none';this.nextElementSibling.style.display='block';" />
+          <div class="hint" style="display:none">
+            <b>沉 浸 阅 读</b>
+            把截图存为 screenshot-reader.png<br />放在本页同一目录
+          </div>
+        </div>
+        <figcaption>沉浸阅读 · 竖排双叶 / 竹简书签 / 底部目録</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ── 行动号召 ── -->
+  <section class="sec wrap narrow" style="text-align:center;padding-top:24px;padding-bottom:120px;">
+    <div class="on-scroll">
+      <p class="sub" style="margin-bottom:34px;">一方砚，一卷书，一台不联网的机器。</p>
+      <a class="cta" href="#">下载 Mac 版 DMG <span>↓</span></a>
+      <p class="meta">安装包约 60 MB · 首次打开若被 Gatekeeper 拦住，右键 → 打开即可</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="l">© 2026 勘阅 KanYue</div>
+    <div class="r">纯血 Rust 驱动</div>
+  </div>
+</footer>
+
+<script>
+  // 滚动显影：进入视口才洇开；一个元素只播一次。
+  (function () {
+    var els = document.querySelectorAll('.on-scroll');
+    if (!('IntersectionObserver' in window)) {
+      els.forEach(function (el) { el.classList.add('in'); });
+      return;
+    }
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) {
+          e.target.classList.add('in');
+          io.unobserve(e.target);
+        }
+      });
+    }, { threshold: 0.14, rootMargin: '0px 0px -8% 0px' });
+    els.forEach(function (el) { io.observe(el); });
+  })();
+</script>
+</body>
+</html>

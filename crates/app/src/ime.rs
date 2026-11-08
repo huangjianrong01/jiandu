@@ -29,7 +29,7 @@ use crate::app::Root;
 use gpui::{
     div, App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Point,
-    SharedString, UTF16Selection, Window,
+    SharedString, UTF16Selection, Window, px,
 };
 use std::ops::Range;
 
@@ -150,6 +150,10 @@ pub enum InputTarget {
     /// 只认「焦点元素登记的那个 Entity」——登记的是 `Root`，故 Root 收到字
     /// 后转交给面板（见 `Root::ai_ime_*`）。
     Ai,
+    /// **Task 1 · 双屏对照右栏的笺校编辑器**（v2.0）：整页正文可编辑，
+    /// 草稿就是 `compare_text`，I/O 全走 `Root::compare_ime_*`。
+    /// 与上面几个单行输入框不同，它是多行、带绝对字符下标联动的编辑器。
+    Compare,
 }
 
 impl Root {
@@ -193,6 +197,24 @@ impl Root {
     /// 此刻哪个输入框该接字：重命名框 → 笔记框 → 书架搜索 → 阅读页检索；
     /// 都没有则 None（IME 接口收到 None 即不接管，键盘走普通 keydown）。
     pub fn input_target(&self) -> Option<InputTarget> {
+        // Task 1 · 双屏笺校编辑器。
+        // ⚠️ **绝不抢 V1.0 的既有输入框**：问小笺（Ai）、浮签 / 批注（Note）、
+        // 书名重命名、全文检索、书架检索只要有一个开着，就整条让位回原来的
+        // if/else 链，派发顺序与优先级一字未改。这是「问小笺与浮签原样可用」
+        // 的硬保证，不能图省事把 Compare 无条件放最前面。
+        // 另：不受 beta_ok 闸门影响——对照模式是独立渲染分支，邀请码那一屏
+        // 根本画不到它；若被闸门挡掉，中文输入会整条静默失效（中文不走
+        // keydown，全靠 InputHandler 回传）。
+        if self.compare_editing
+            && self.mode == crate::collation::AppMode::Compare
+            && !self.show_ai
+            && !self.note_editing
+            && self.rename_idx.is_none()
+            && !self.show_search
+            && !(self.shelf_searching && self.screen == crate::app::Screen::Shelf)
+        {
+            return Some(InputTarget::Compare);
+        }
         // 闸门没过时：整个界面只有「邀请码」那一张纸（`Render::render` 岔开，
         // 见 `beta.rs` 顶部），其余输入框都不存在——此时不接 IME 是对的：
         // 那张纸只收英数 keydown，接了会叠字（实测 `abc123` → `ABCABC112233`）。
@@ -258,7 +280,10 @@ impl Root {
             // 问小笺的草稿住在另一个 Entity 里，动它要 `Window`/`Context`
             // ——那条路仍走 `EntityInputHandler`（见本文件下方）。这里不
             // 硬塞一个静默的空实现：宁可显式留白，也别让人以为字打进去了。
-            Some(InputTarget::Ai) | None => {}
+            // Compare 编辑器需要 `Context`（撤销 / 重映射 / 落库都在上屏路径里），
+            // 这条无 cx 的旧 InputSink 通道不代劳，统一交给下方
+            // `EntityInputHandler::replace_text_in_range`。
+            Some(InputTarget::Ai) | Some(InputTarget::Compare) | None => {}
         }
     }
 
@@ -297,7 +322,10 @@ impl Root {
                 self.search_marked = Some(start..end);
                 self.search_cursor = utf16_to_char(&self.search_draft, end);
             }
-            Some(InputTarget::Ai) | None => {}
+            // Compare 编辑器需要 `Context`（撤销 / 重映射 / 落库都在上屏路径里），
+            // 这条无 cx 的旧 InputSink 通道不代劳，统一交给下方
+            // `EntityInputHandler::replace_text_in_range`。
+            Some(InputTarget::Ai) | Some(InputTarget::Compare) | None => {}
         }
     }
 
@@ -308,7 +336,10 @@ impl Root {
             Some(InputTarget::Note) => self.note_marked = None,
             Some(InputTarget::ShelfSearch) => self.shelf_query_marked = None,
             Some(InputTarget::Search) => self.search_marked = None,
-            Some(InputTarget::Ai) | None => {}
+            // Compare 编辑器需要 `Context`（撤销 / 重映射 / 落库都在上屏路径里），
+            // 这条无 cx 的旧 InputSink 通道不代劳，统一交给下方
+            // `EntityInputHandler::replace_text_in_range`。
+            Some(InputTarget::Ai) | Some(InputTarget::Compare) | None => {}
         }
     }
 }
@@ -462,6 +493,8 @@ impl EntityInputHandler for Root {
             InputTarget::Search => utf16_slice(&self.search_draft, range),
             InputTarget::Note => utf16_slice(&self.note_draft, range),
             InputTarget::ShelfSearch => utf16_slice(&self.shelf_query, range),
+            // Task 1：整页正文即上下文，区间由输入法指定，原样回读。
+            InputTarget::Compare => utf16_slice(&self.compare_text, range),
             // 小笺：草稿住在面板里，转交（见 `Root::ai_ime_*`）。
             InputTarget::Ai => return self.ai_ime_text_for_range(range, _window, _cx),
         })
@@ -480,6 +513,8 @@ impl EntityInputHandler for Root {
             InputTarget::Search => char_to_utf16(&self.search_draft, self.search_cursor),
             InputTarget::Note => char_to_utf16(&self.note_draft, self.note_cursor),
             InputTarget::ShelfSearch => char_to_utf16(&self.shelf_query, self.shelf_query_cursor),
+            // Task 1：零长选区 = 绝对字符光标（IME 按 UTF-16 计位）。
+            InputTarget::Compare => char_to_utf16(&self.compare_text, self.compare_cursor),
             InputTarget::Ai => return self.ai_ime_selected_range(_window, _cx),
         };
         Some(UTF16Selection {
@@ -500,6 +535,7 @@ impl EntityInputHandler for Root {
             InputTarget::Search => self.search_marked.clone(),
             InputTarget::Note => self.note_marked.clone(),
             InputTarget::ShelfSearch => self.shelf_query_marked.clone(),
+            InputTarget::Compare => self.compare_marked.clone(),
             InputTarget::Ai => return self.ai_ime_marked_range(_window, _cx),
         }
     }
@@ -511,6 +547,8 @@ impl EntityInputHandler for Root {
             Some(InputTarget::Search) => self.search_marked = None,
             Some(InputTarget::Note) => self.note_marked = None,
             Some(InputTarget::ShelfSearch) => self.shelf_query_marked = None,
+            // Task 1：放弃组字时整段恢复组字前快照，拼音绝不留在正文里。
+            Some(InputTarget::Compare) => self.compare_ime_unmark(_cx),
             Some(InputTarget::Ai) => self.ai_ime_unmark(_window, _cx),
             None => {}
         }
@@ -540,6 +578,10 @@ impl EntityInputHandler for Root {
         match target {
             InputTarget::Ai => {
                 self.ai_ime_replace(range, text, _window, cx);
+            }
+            // Task 1 · 汉字上屏：顶掉整段拼音 → 一步撤销 → 坐标重映射 → 落库。
+            InputTarget::Compare => {
+                self.compare_ime_commit(range, text, cx);
             }
             InputTarget::Rename => {
                 let eff = effective_replace_range(range, &self.rename_marked);
@@ -593,6 +635,7 @@ impl EntityInputHandler for Root {
                     InputTarget::Search => &self.search_marked,
                     InputTarget::Note => &self.note_marked,
                     InputTarget::ShelfSearch => &self.shelf_query_marked,
+                    InputTarget::Compare => &self.compare_marked,
                     // 小笺的组字区间在面板里，这里拿不到——只写日志、不借用。
                     InputTarget::Ai => &None,
                 },
@@ -602,6 +645,10 @@ impl EntityInputHandler for Root {
         match target {
             InputTarget::Ai => {
                 self.ai_ime_replace_mark(range, new_text, new_selected_range, _window, cx);
+            }
+            // Task 1 · 拼音组字中：看得见但不进撤销栈、不重映射、不落库。
+            InputTarget::Compare => {
+                self.compare_ime_mark(range, new_text, new_selected_range, cx);
             }
             InputTarget::Rename => {
                 let eff = effective_replace_range(range, &self.rename_marked);
@@ -649,6 +696,12 @@ impl EntityInputHandler for Root {
     }
 
     /// 候选词面板的锚定位置：书名很短，锚整个输入框即可。
+    ///
+    /// **Task 1 例外**：双屏右栏是几百字、可滚动的整页正文。若把整个
+    /// `element_bounds` 交出去，macOS 会把候选框钉在滚动内容顶端，
+    /// 光标往下走时候选框就「飘」在屏幕另一头。这里改成只返回本帧
+    /// 计算好的光标小矩形（见 `compare_caret_anchor`），并钳制在元素内，
+    /// 于是候选框始终贴着光标、随滚动一起走。
     fn bounds_for_range(
         &mut self,
         _range_utf16: Range<usize>,
@@ -656,6 +709,21 @@ impl EntityInputHandler for Root {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        // 判据复用 `input_target()`：只有真正派发到 Compare 时才换锚点，
+        // 问小笺 / 浮签等原有输入框一律走下面的 `Some(element_bounds)` 老路。
+        if self.input_target() == Some(InputTarget::Compare) {
+            let (ax, ay, aw, ah) = self.compare_caret_anchor;
+            let ew = element_bounds.size.width / px(1.0);
+            let eh = element_bounds.size.height / px(1.0);
+            let x = ax.max(0.0).min((ew - aw).max(0.0));
+            let y = ay.max(0.0).min((eh - ah).max(0.0));
+            let mut b = element_bounds;
+            b.origin.x = b.origin.x + px(x);
+            b.origin.y = b.origin.y + px(y);
+            b.size.width = px(aw);
+            b.size.height = px(ah);
+            return Some(b);
+        }
         Some(element_bounds)
     }
 

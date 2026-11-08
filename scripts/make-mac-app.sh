@@ -9,7 +9,7 @@
 #   SANDBOX=1 ./scripts/make-mac-app.sh      # ad-hoc 签名也带上沙盒 entitlements
 #                                            # → 本地即可真跑沙盒，验证导入/导出路径
 #
-# 产出：dist/笺读.app（可直接拖到「应用程序」文件夹）
+# 产出：dist/勘阅.app（可直接拖到「应用程序」文件夹）
 #
 # v1.71.0：ARCH=universal 会各编一份 aarch64 / x86_64 再用 lipo 合成，
 #          一份 .app 同时支持 Apple Silicon 与 Intel Mac。
@@ -19,10 +19,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
-APP_NAME="笺读"
+APP_NAME="勘阅"
 BUNDLE_ID="com.jiandu.app"
-VERSION="1.9.99.77"
-BUILD_NUM="316"
+VERSION="1.9.99.83"
+BUILD_NUM="322"
 MIN_MACOS="12.0"
 ARCH="${ARCH:-native}"
 
@@ -30,7 +30,7 @@ DIST="$ROOT/dist"
 APP="$DIST/${APP_NAME}.app"
 
 echo "==============================================="
-echo "  笺读 · macOS App 打包"
+echo "  勘阅 · macOS App 打包"
 echo "==============================================="
 
 # ---- 1) 编译 release 二进制 ----
@@ -89,9 +89,27 @@ fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
+# ---- 2.2) （已废弃）v2.0 双屏入口标记 ----
+# 旧版靠 `Resources/.jiandu_v2_compare` + `compare_mode_enabled()` 强切双屏；
+# v2.0 已改为**用户自己点**顶栏【笺校 → 双屏联动】，出厂启动一律是 V1.0
+# 书架 / 阅读态。这里的 marker 已无人读取，直接不再生成。
+
 # ---- 3) 放入可执行文件 ----
 cp "$BIN" "$APP/Contents/MacOS/jiandu"
 chmod +x "$APP/Contents/MacOS/jiandu"
+
+# ---- 3.2) v2.0：L7 流水线 helper 随包 ----
+# app 内 helper_bin() 第②步会在主程序同目录找这两个「免疫名」二进制，
+# 名字不含 jiandu 字样，既避开宿主钩子，也让双击安装的用户零配置即可导入 PDF。
+HELPER_SRC="${CARGO_TARGET_DIR:-$ROOT/target}/release"
+if [ -f "$HELPER_SRC/pdf-cli" ] && [ -f "$HELPER_SRC/jiandu-ocr" ]; then
+    cp "$HELPER_SRC/pdf-cli"     "$APP/Contents/MacOS/compare_pdf_helper"
+    cp "$HELPER_SRC/jiandu-ocr"  "$APP/Contents/MacOS/compare_ocr_helper"
+    chmod +x "$APP/Contents/MacOS/compare_pdf_helper" "$APP/Contents/MacOS/compare_ocr_helper"
+    echo "✓ 已随包两个 L7 helper（compare_pdf_helper / compare_ocr_helper）"
+else
+    echo "⚠️ 未找到 release helper：请先 cargo build --release --workspace（否则安装包内导入 PDF 会失败）"
+fi
 
 # ---- 4) 随包资源：字体（可选） ----
 if [ -d "$ROOT/crates/core/resources/fonts" ] && ls "$ROOT/crates/core/resources/fonts"/*.otf "$ROOT/crates/core/resources/fonts"/*.ttf "$ROOT/crates/core/resources/fonts"/*.ttc >/dev/null 2>&1; then
@@ -140,7 +158,7 @@ fi
 # v1.82.0：v1.0.0-beta 起改成了 Cargo Workspace，资产整体挪进 crates/app/assets，
 # 而脚本里这条路径还指着旧的 `$ROOT/assets/`——打出来的包会**没有图标**，
 # 甚至在这里直接中断。故按新位置优先、旧位置兜底。
-ICON_SRC="$ROOT/crates/app/assets/icon_1024.png"
+ICON_SRC="$ROOT/crates/app/assets/kanyue_1024.png"
 if [ ! -f "$ICON_SRC" ] && [ -f "$ROOT/assets/icon_1024.png" ]; then
     ICON_SRC="$ROOT/assets/icon_1024.png"
 fi
@@ -207,7 +225,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleDisplayName</key>
-    <string>笺读</string>
+    <string>勘阅</string>
     <key>CFBundleExecutable</key>
     <string>jiandu</string>
     <key>CFBundleIconFile</key>
@@ -217,7 +235,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>笺读</string>
+    <string>勘阅</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -225,7 +243,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key>
     <string>${BUILD_NUM}</string>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright © 2026 Jiandu. All rights reserved.</string>
+    <string>Copyright © 2026 KanYue. All rights reserved.</string>
     <!-- **文件权限的「说明书」**（v1.9.75）：用户从「文稿 / 下载 / 桌面」导入
          古籍、或把 PDF 导出到这些目录时，系统会弹一次 TCC 授权框。没有这三条
          说明，弹框里只有干巴巴的「笺读 想访问你的「下载」文件夹」；有了它，
@@ -436,11 +454,12 @@ fi
 # 「应用程序」**的东西，而不是一个 zip——zip 解压出来的 app 少了那层
 # 「用户主动拖拽」的授权语境，Gatekeeper 更容易直接拒绝。
 #
-# 布局：卷里左「笺读.app」右「Applications」软链，经典拖拽式。
+# 布局：卷里左「勘阅.app」右「Applications」软链，经典拖拽式。
 # 用 `ditto` 而不是 `cp -R`：前者保留资源叉、xattr 与符号链接本身，
 # 后者会把签名相关的扩展属性丢掉（装完打不开就是这么来的）。
 if [ "${DMG:-0}" = "1" ]; then
-    DMG_OUT="$DIST/${APP_NAME}-${VERSION}.dmg"
+    # v2.0 正式版：DMG 用产品代际名（内部 CFBundleVersion 仍按四段号递增）。
+    DMG_OUT="$DIST/${APP_NAME}-v2.0.dmg"
     STAGE="$(mktemp -d)/dmg"
     mkdir -p "$STAGE"
     ditto "$APP" "$STAGE/${APP_NAME}.app"
@@ -471,7 +490,7 @@ echo "       在图标上右键 → 打开 → 再点「打开」即可；"
 echo "    2) 或拖到「应用程序」文件夹；"
 echo "    3) 之后就能像普通 App 一样从启动台 / Dock 打开。"
 echo ""
-echo "  卸载：把「笺读.app」拖进废纸篓即可；"
+echo "  卸载：把「勘阅.app」拖进废纸篓即可；"
 echo "  用户数据在 ~/Library/Application Support/com.jiandu.app/"
 echo "  （书架索引、章节库、阅读进度、自备字库都在里，卸载后可留可删）；"
 echo "  v1.69 及更早版本的 ~/.jiandu/ 旧库会被**只读**挂载取回，不会删除。"

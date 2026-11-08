@@ -43,6 +43,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "align-db"
+version = "1.9.99"
+dependencies = [
+ "anyhow",
+ "jiandu-core",
+ "rusqlite",
+ "serde_json",
+]
+
+[[package]]
 name = "aligned"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2995,6 +3005,7 @@ dependencies = [
 name = "jiandu-ocr"
 version = "1.9.99"
 dependencies = [
+ "align-db",
  "anyhow",
  "image",
  "jiandu-core",
@@ -4000,11 +4011,13 @@ dependencies = [
 name = "pdf-cli"
 version = "1.9.99"
 dependencies = [
+ "align-db",
  "anyhow",
  "core-foundation 0.10.0",
  "core-graphics 0.24.0",
  "foreign-types",
  "image",
+ "jiandu-core",
  "serde_json",
 ]
 

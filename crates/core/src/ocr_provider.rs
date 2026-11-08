@@ -103,6 +103,110 @@ pub trait OcrProvider {
     fn recognize(&self, input: &OcrInput) -> Result<OcrResult>;
 }
 
+// ── 正注分离 · 字高双峰聚类（L9）────────────────────────────────────────────
+/// 逐字排版层级，落 SQLite `glyphs.span_kind` 与对照 JSON `span_kinds`。
+pub const KIND_BODY: u8 = 0;
+pub const KIND_GLOSS: u8 = 1;
+pub const KIND_TAG: u8 = 2;
+
+/// 用字形框高度 `h` 做**一维 Otsu 双峰聚类**，分出大字正文 / 小字夹注。
+///
+/// 为什么必须保守：古籍刻本的夹注是双行小字，字高约为正文的一半，双峰极清晰；
+/// 但现代排印本正文与注文常常同字号，且 Vision 拿不到逐字框时会把**行级
+/// boundingBox 均分**给该行每个字（同一行 h 全等，行与行之间只有几 px 噪声）。
+/// 若无条件硬切一刀，就会把噪声当字号、把正文随机染成小字——比不分层更糟。
+///
+/// 只有同时满足下面三条才判双峰，否则整页返回 `KIND_BODY`，把判断权交给
+/// 上层的文本体例规则：
+///   ① 小簇均值 / 大簇均值 ≤ 0.70（小字至少小 30%）；
+///   ② 小簇占比 ∈ [5%, 60%]，且两簇样本都 ≥ 8；
+///   ③ 有效样本 ≥ 16。
+pub fn classify_height_kinds(heights: &[f32]) -> Vec<u8> {
+    let n = heights.len();
+    let mut out = vec![KIND_BODY; n];
+    if n < 16 {
+        return out;
+    }
+    let mut vals: Vec<f32> = heights
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .collect();
+    if vals.len() < 16 {
+        return out;
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let m = vals.len();
+    let total: f64 = vals.iter().map(|v| *v as f64).sum();
+
+    // 前缀和 → O(n) 枚举所有切分点，取类间方差最大的 Otsu 阈值。
+    let mut prefix = vec![0f64; m + 1];
+    for i in 0..m {
+        prefix[i + 1] = prefix[i] + vals[i] as f64;
+    }
+    let mut best: Option<(f64, usize)> = None;
+    for k in 1..m {
+        let w0 = k as f64 / m as f64;
+        let w1 = 1.0 - w0;
+        if w0 < 0.05 || w1 < 0.05 || k < 8 || m - k < 8 {
+            continue;
+        }
+        let mean0 = prefix[k] / k as f64;
+        let mean1 = (total - prefix[k]) / (m - k) as f64;
+        let between = w0 * w1 * (mean0 - mean1) * (mean0 - mean1);
+        if best.map_or(true, |(bv, _)| between > bv) {
+            best = Some((between, k));
+        }
+    }
+    let Some((_, k)) = best else { return out };
+    let mean0 = prefix[k] / k as f64;
+    let mean1 = (total - prefix[k]) / (m - k) as f64;
+    let (small_mean, big_mean, small_count) = if mean0 < mean1 {
+        (mean0, mean1, k)
+    } else {
+        (mean1, mean0, m - k)
+    };
+    let small_ratio = small_count as f64 / m as f64;
+    if big_mean <= 0.0
+        || small_mean / big_mean > 0.70
+        || !(0.05..=0.60).contains(&small_ratio)
+    {
+        return out;
+    }
+
+    // 阈值取 Otsu 分界处相邻两值的中点，避免把边界值算进大字簇。
+    let threshold = vals[k - 1] + (vals[k] - vals[k - 1]) * 0.5;
+    for (i, h) in heights.iter().enumerate() {
+        if h.is_finite() && *h > 0.0 && *h <= threshold {
+            out[i] = KIND_GLOSS;
+        }
+    }
+    out
+}
+
+/// 把「按 glyph 顺序」的高度层级表，映射成「按 text 字符下标」的层级表。
+/// `char_index` 越界一律忽略：OCR 与文本长度不一致时绝不 panic。
+pub fn kinds_for_text(
+    text: &str,
+    glyphs: &[OcrGlyph],
+    glyph_kinds: &[u8],
+) -> Vec<u8> {
+    let mut out = vec![KIND_BODY; text.chars().count()];
+    for (i, g) in glyphs.iter().enumerate() {
+        if glyph_kinds.get(i).copied() == Some(KIND_GLOSS) && g.char_index < out.len() {
+            out[g.char_index] = KIND_GLOSS;
+        }
+    }
+    out
+}
+
+/// 从 OCR 结果直接算出逐字层级表（高度聚类 + 下标映射）。
+pub fn span_kinds_from_ocr(result: &OcrResult) -> Vec<u8> {
+    let hs: Vec<f32> = result.glyphs.iter().map(|g| g.h).collect();
+    let by_glyph = classify_height_kinds(&hs);
+    kinds_for_text(&result.text, &result.glyphs, &by_glyph)
+}
+
 /// 把一组成员的 (y, x) 升序索引算出来，供 [`AlignmentStore::glyph_at`] 二分命中。
 fn build_sorted(glyphs: &[OcrGlyph]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..glyphs.len()).collect();
@@ -137,6 +241,10 @@ pub struct AlignmentStore {
     pub text: String,
     /// 逐字几何 + 置信。
     pub glyphs: Vec<OcrGlyph>,
+    /// 逐字排版层级（0 正文大字 / 1 夹注小字 / 2 结构标签），长度 ==
+    /// `text.chars().count()`，下标与 `glyphs[i].char_index`、`target` 同坐标系。
+    /// 由字高双峰聚类得出；无大小字差异时全 0，交给上层文体规则。
+    pub span_kinds: Vec<u8>,
     /// 来源引擎名。
     pub provider: String,
     /// 该对齐来源图像（路径或内容哈希），便于落库后回查属于哪张扫描图。
@@ -150,11 +258,13 @@ impl AlignmentStore {
     /// 从 OCR 结果直接构建（自动计算排序索引）。
     pub fn from_ocr(result: OcrResult) -> Self {
         let sorted = build_sorted(&result.glyphs);
+        let span_kinds = span_kinds_from_ocr(&result);
         Self {
             image_width: result.image_width,
             image_height: result.image_height,
             text: result.text,
             glyphs: result.glyphs,
+            span_kinds,
             provider: result.provider,
             source_image: None,
             sorted,
@@ -170,6 +280,8 @@ impl AlignmentStore {
             "image_width": self.image_width,
             "image_height": self.image_height,
             "text": self.text,
+            // 新键：旧加载器忽略未知键，混合使用零冲突。
+            "span_kinds": self.span_kinds,
             "glyphs": self.glyphs.iter().map(|g| serde_json::json!({
                 "x": g.x,
                 "y": g.y,
@@ -216,11 +328,27 @@ impl AlignmentStore {
             }
         }
         let sorted = build_sorted(&glyphs);
+        // 老 JSON 没有 span_kinds：按 h 现算一次，保证旧会话重开也能分层。
+        let span_kinds = if let Some(arr) = v.get("span_kinds").and_then(|a| a.as_array()) {
+            let mut k: Vec<u8> = arr
+                .iter()
+                .map(|x| x.as_u64().unwrap_or(0).min(2) as u8)
+                .collect();
+            let want = text.chars().count();
+            k.resize(want, KIND_BODY);
+            k.truncate(want);
+            k
+        } else {
+            let hs: Vec<f32> = glyphs.iter().map(|g| g.h).collect();
+            let by_glyph = classify_height_kinds(&hs);
+            kinds_for_text(&text, &glyphs, &by_glyph)
+        };
         Some(Self {
             image_width: iw,
             image_height: ih,
             text,
             glyphs,
+            span_kinds,
             provider: "json".to_string(),
             source_image: v
                 .get("source")
@@ -575,5 +703,93 @@ mod tests {
         assert!(!lib.contains("page001"));
         assert!(lib.get("page001").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── L9 · 字高双峰聚类 ──────────────────────────────────────────
+    #[test]
+    fn height_clustering_splits_real_small_gloss() {
+        // 古籍刻本：正文 24px × 100，双行夹注 12px × 60。
+        let mut h = vec![24.0f32; 100];
+        h.extend(std::iter::repeat(12.0f32).take(60));
+        let k = classify_height_kinds(&h);
+        assert_eq!(k.len(), h.len());
+        let gloss = k.iter().filter(|&&v| v == KIND_GLOSS).count();
+        assert_eq!(gloss, 60, "小字簇必须被整簇标成夹注");
+        assert_eq!(k[0], KIND_BODY);
+        assert_eq!(*k.last().unwrap(), KIND_GLOSS);
+    }
+
+    #[test]
+    fn height_clustering_refuses_line_box_noise() {
+        // 《道德经王弼注》实测：Vision 行级 bbox 均分，h 在 18~26 之间连续抖动，
+        // 正注同字号。这种「伪双峰」绝不能被当成大小字。
+        let mut h = Vec::new();
+        for v in [18.0f32, 20.0, 22.0, 23.5, 24.0, 24.2, 25.7, 26.0] {
+            h.extend(std::iter::repeat(v).take(40));
+        }
+        let k = classify_height_kinds(&h);
+        assert!(
+            k.iter().all(|&v| v == KIND_BODY),
+            "行框噪声必须保守退回全正文，禁止硬切"
+        );
+    }
+
+    #[test]
+    fn height_clustering_refuses_uniform_and_tiny_samples() {
+        assert!(classify_height_kinds(&vec![22.0; 200])
+            .iter()
+            .all(|&v| v == KIND_BODY));
+        assert!(classify_height_kinds(&[24.0, 24.0, 12.0])
+            .iter()
+            .all(|&v| v == KIND_BODY));
+        assert!(classify_height_kinds(&[]).is_empty());
+    }
+
+    #[test]
+    fn height_clustering_refuses_tiny_outlier_cluster() {
+        // 只有 3 个离群小点：占比 < 5%，不能让整页出现零星小字。
+        let mut h = vec![24.0f32; 200];
+        h.extend_from_slice(&[3.0, 4.0, 5.0]);
+        assert!(classify_height_kinds(&h)
+            .iter()
+            .all(|&v| v == KIND_BODY));
+    }
+
+    #[test]
+    fn kinds_for_text_maps_by_char_index_and_clamps() {
+        let g = vec![
+            OcrGlyph { char_index: 0, ch: String::new(), x: 0.0, y: 0.0, w: 1.0, h: 24.0, confidence: 1.0 },
+            OcrGlyph { char_index: 2, ch: String::new(), x: 0.0, y: 0.0, w: 1.0, h: 12.0, confidence: 1.0 },
+            OcrGlyph { char_index: 99, ch: String::new(), x: 0.0, y: 0.0, w: 1.0, h: 12.0, confidence: 1.0 },
+        ];
+        let k = kinds_for_text("甲乙丙", &g, &[KIND_BODY, KIND_GLOSS, KIND_GLOSS]);
+        assert_eq!(k, vec![KIND_BODY, KIND_BODY, KIND_GLOSS]);
+    }
+
+    #[test]
+    fn compare_json_roundtrip_keeps_span_kinds() {
+        let r = OcrResult {
+            image_width: 100,
+            image_height: 100,
+            text: "甲乙丙丁".to_string(),
+            glyphs: (0..4)
+                .map(|i| OcrGlyph {
+                    char_index: i,
+                    ch: String::new(),
+                    x: i as f32,
+                    y: 0.0,
+                    w: 1.0,
+                    h: if i >= 2 { 12.0 } else { 24.0 },
+                    confidence: 1.0,
+                })
+                .collect(),
+            provider: "test".into(),
+        };
+        let s = AlignmentStore::from_ocr(r);
+        let v = s.to_compare_json();
+        assert!(v.get("span_kinds").is_some(), "层级表必须落进对照 JSON");
+        let back = AlignmentStore::from_compare_json(&v).unwrap();
+        assert_eq!(back.span_kinds, s.span_kinds);
+        assert_eq!(back.span_kinds.len(), 4);
     }
 }

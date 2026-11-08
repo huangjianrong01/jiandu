@@ -1,12 +1,19 @@
 //! 笺读 L7 · PDF 流式光栅化 PoC
 //!
 //! 三约定（用户硬指标）：
-//!   1. **强制 Resize 降采样**：长边压到 `--target`（默认 1200px ≈ 把 300dpi 扫描压到 ~150dpi）。
+//!   1. **强制 Resize 降采样**：长边压到 `--target`（默认 1754px ≈ 把 300dpi 扫描压到 ~150dpi）。
 //!   2. **坚决无视自带破碎文本层**：只走 CoreGraphics 光栅化，绝不读 PDFKit 文本层。
 //!   3. **逐页释放内存**：光栅 →（可选 OCR 子进程）→ 立刻 drop 位图 + 删临时 PNG，下一页重新分配，绝不累积。
 //!
 //! 架构：每页独立 `CGPDFDocumentCreateWithURL` 打开→取该页→栅格化到 RGBA 位图→（写盘给 OCR 子进程）→释放。
 //! 全程不把整本 PDF 的位图同时驻留内存——正是为了扛住 168 页《資治通鑑》。
+//!
+//! UI 懒加载接线（v2.0 外壳）：
+//!   - `--count`：仅打印 PDF 总页数并退出（UI 先探规模，不解码）。
+//!   - `--page P`：只处理第 P 页（1-based），供「点下一页实时光栅化 + OCR」。
+//!   - `--out DIR`：PNG / OCR JSON 输出目录（默认系统临时目录）。
+//!   - `--db PATH`：每页 OCR 后落库 SQLite（L5 AlignmentStore，doc_title=PDF 文件名，
+//!     page_index=PDF 页码），与 `app.rs::load_compare_from_db` 直接兼容，天然支撑懒加载读库。
 
 use anyhow::{Context, Result};
 use std::env;
@@ -104,9 +111,20 @@ mod raster {
         pub total: usize,
     }
 
-    /// 光栅化单页：纯像素，绝不碰文本层。`target_px` 为长边目标像素。
-    pub fn rasterize(path: &Path, page_no: usize, target_px: f32) -> Result<PageRaster, String> {
+    /// 仅取 PDF 总页数（不开位图、不解码，极快），供 UI 懒加载前先探明页规模。
+    pub fn count_pages(path: &Path) -> Result<usize, String> {
         let url = CFURL::from_path(path, false).ok_or_else(|| format!("无法解析路径：{:?}", path))?;
+        let doc = unsafe { CGPDFDocumentCreateWithURL(url.as_concrete_TypeRef()) };
+        if doc.is_null() {
+            return Err(format!("无法打开 PDF：{:?}", path));
+        }
+        let total = unsafe { CGPDFDocumentGetNumberOfPages(doc) };
+        unsafe { CGPDFDocumentRelease(doc) };
+        Ok(total)
+    }
+
+    /// 光栅化单页：纯像素，绝不碰文本层。`target_px` 为长边目标像素。
+    pub fn rasterize(path: &Path, page_no: usize, target_px: f32) -> Result<PageRaster, String> {        let url = CFURL::from_path(path, false).ok_or_else(|| format!("无法解析路径：{:?}", path))?;
         let doc = unsafe { CGPDFDocumentCreateWithURL(url.as_concrete_TypeRef()) };
         if doc.is_null() {
             return Err(format!("无法打开 PDF：{:?}", path));
@@ -205,9 +223,13 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut pdf_path: Option<PathBuf> = None;
     let mut target_px: f32 = 1754.0; // 长边目标像素 ≈ 本 300dpi 扫描的 150dpi；--target 2339 ≈ 200dpi
-    let mut limit: Option<usize> = None;
+    let mut limit: Option<usize> = None; // --pages N：只处理前 N 页
+    let mut single_page: Option<usize> = None; // --page P：只处理第 P 页（1-based，懒加载用）
     let mut do_ocr = false;
     let mut keep = false;
+    let mut out_dir: Option<PathBuf> = None; // --out DIR：PNG / OCR JSON 输出目录
+    let mut db_path: Option<PathBuf> = None; // --db PATH：每页 OCR 后落库 SQLite
+    let mut just_count = false; // --count：仅打印页数并退出
     let mut ocr_bin =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/jiandu-ocr");
 
@@ -222,12 +244,28 @@ fn main() -> Result<()> {
                 limit = args.get(i + 1).and_then(|s| s.parse().ok());
                 i += 2;
             }
+            "--page" => {
+                single_page = args.get(i + 1).and_then(|s| s.parse().ok());
+                i += 2;
+            }
             "--ocr" => {
                 do_ocr = true;
                 i += 1;
             }
             "--keep" => {
                 keep = true;
+                i += 1;
+            }
+            "--out" => {
+                out_dir = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "--db" => {
+                db_path = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "--count" => {
+                just_count = true;
                 i += 1;
             }
             "--ocr-bin" => {
@@ -244,7 +282,17 @@ fn main() -> Result<()> {
         }
     }
 
-    let pdf_path = pdf_path.context("用法：pdf-cli <pdf路径> [--target 1200] [--pages N] [--ocr]")?;
+    let pdf_path =
+        pdf_path.context("用法：pdf-cli <pdf路径> [--count] [--page N] [--pages N] [--ocr] [--out DIR] [--db PATH]")?;
+
+    // ── 仅探页数：UI 懒加载前先问规模，不开位图、不解码 ──
+    if just_count {
+        let total = raster::count_pages(&pdf_path)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{}", total);
+        return Ok(());
+    }
+
     println!("▶ PDF      : {:?}", pdf_path);
     println!(
         "▶ 降采样    : 长边目标 {}px（降采样、绝不升采样）；忽略自带文本层，纯光栅化",
@@ -258,36 +306,52 @@ fn main() -> Result<()> {
         eprintln!("  ⚠ 未找到 OCR 子进程 {:?}，--ocr 时该页将跳过 OCR", ocr_bin);
     }
 
-    let tmp_dir = std::env::temp_dir().join("jiandu_pdf_poc");
-    std::fs::create_dir_all(&tmp_dir)?;
-    let aln_dir = tmp_dir.join("alignment"); // 落库目录：每页 OCR JSON 落盘，下一阶段接 L5 AlignmentStore
-    std::fs::create_dir_all(&aln_dir).ok();
+    // 输出目录：默认临时目录（与旧行为一致）；--out 时落到用户指定目录。
+    let out_dir = out_dir.unwrap_or_else(|| std::env::temp_dir().join("jiandu_pdf_poc"));
+    std::fs::create_dir_all(&out_dir)?;
+
+    // 总页数（一次打开，不开位图）。
+    let total = raster::count_pages(&pdf_path).map_err(|e| anyhow::anyhow!(e))?;
+    if total == 0 {
+        anyhow::bail!("PDF 页数为 0，无法处理");
+    }
+
+    // 计算本次要处理的页码列表（懒加载 = 单页；批量 = 前 N 页或全本）。
+    let pages: Vec<usize> = if let Some(p) = single_page {
+        vec![p.clamp(1, total)]
+    } else if let Some(n) = limit {
+        (1..=n.min(total)).collect()
+    } else {
+        (1..=total).collect()
+    };
+    println!("▶ 总页数    : {}，本次处理 {} 页", total, pages.len());
+
+    // 可选 SQLite 落库：一次打开、建表，逐页写（WAL 防锁）。
+    let doc_title = pdf_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("document")
+        .to_string();
+    let mut conn = if let Some(db) = &db_path {
+        let mut c = align_db::open_db(db)?;
+        align_db::create_schema(&c)?;
+        println!("▶ 落库 SQLite: {}（doc_title={}）", db.display(), doc_title);
+        Some(c)
+    } else {
+        None
+    };
+
     let mut total_glyphs: usize = 0;
-
     let started = Instant::now();
-    let mut total: usize = 0;
-    let mut limit = limit.unwrap_or(usize::MAX);
-    let mut page = 0usize;
 
-    loop {
-        page += 1;
-        if page > limit {
-            break;
-        }
+    for &page in &pages {
         let t0 = Instant::now();
         let r = raster::rasterize(&pdf_path, page, target_px).map_err(|e| anyhow::anyhow!(e))?;
-        if total == 0 {
-            total = r.total;
-            if limit == usize::MAX {
-                limit = total;
-            }
-            println!("▶ 总页数    : {}，本次处理前 {} 页", total, limit);
-        }
         let (w, h) = (r.img.width() as usize, r.img.height() as usize);
         let mb = (w * h * 4) as f64 / 1e6;
 
         // 写临时 PNG（OCR 子进程需读盘；不开 OCR 也落盘便于人工抽检）。
-        let png_path = tmp_dir.join(format!("page_{:04}.png", page));
+        let png_path = out_dir.join(format!("page_{:04}.png", page));
         image::DynamicImage::from(r.img)
             .save(&png_path)
             .context("写 PNG 失败")?;
@@ -301,11 +365,9 @@ fn main() -> Result<()> {
                 .output()
             {
                 if out.status.success() {
-                    // 落库：原始 OCR JSON 按页存盘（L5 AlignmentStore 的 SQLite 落库在下一阶段接入）。
-                    let _ = std::fs::write(
-                        aln_dir.join(format!("page_{:04}.ocr.json", page)),
-                        &out.stdout,
-                    );
+                    // 落盘 OCR JSON（便于人工抽检 / App 回退读取）。
+                    let json_path = out_dir.join(format!("page_{:04}.ocr.json", page));
+                    let _ = std::fs::write(&json_path, &out.stdout);
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
                         glyphs = v
                             .get("glyphs")
@@ -314,6 +376,37 @@ fn main() -> Result<()> {
                             .unwrap_or(0);
                     }
                     total_glyphs += glyphs;
+
+                    // ★ 落库 SQLite（L5 AlignmentStore，与 app 的 load_compare_from_db 兼容）。
+                    if let Some(conn) = conn.as_mut() {
+                        match serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                            Ok(v) => {
+                                if let Some(store) =
+                                    jiandu_core::ocr_provider::AlignmentStore::from_compare_json(&v)
+                                {
+                                    match align_db::ingest_store(conn, &doc_title, page as i64, &store) {
+                                        Ok((rows, with_box)) => {
+                                            if with_box == 0 {
+                                                eprintln!(
+                                                    "  ⚠ page {} OCR 返回 0 个字（已落库空页，App 右栏将提示未识别）",
+                                                    page
+                                                );
+                                            } else {
+                                                eprintln!(
+                                                    "  ✓ page {} 落库 {} 字形（{} 含框）",
+                                                    page, rows, with_box
+                                                );
+                                            }
+                                        }
+                                        Err(e) => eprintln!("  ⚠ page {} 落库失败：{}", page, e),
+                                    }
+                                } else {
+                                    eprintln!("  ⚠ page {} OCR JSON 形状不合法，跳过落库", page);
+                                }
+                            }
+                            Err(e) => eprintln!("  ⚠ page {} OCR JSON 解析失败：{}", page, e),
+                        }
+                    }
                 } else {
                     eprintln!("  ⚠ OCR 失败（page {}）", page);
                 }
@@ -324,16 +417,18 @@ fn main() -> Result<()> {
         //   下一页重新分配位图，绝不累积 → 内存应随页数【不增长】（看活动监视器）。
         if !keep {
             std::fs::remove_file(&png_path).ok();
+            // OCR JSON 仅调试用，落库后（或不开 OCR）一并清掉，避免几百个文件堆积。
+            let _ = std::fs::remove_file(out_dir.join(format!("page_{:04}.ocr.json", page)));
         }
 
         let dt = t0.elapsed().as_secs_f64() * 1000.0;
-        let pct = page as f64 / limit as f64 * 100.0;
+        let pct = ((page - pages[0] + 1) as f64 / pages.len() as f64) * 100.0;
         let filled = (pct / 2.0) as usize;
         let bar: String = (0..50).map(|b| if b < filled { '█' } else { '░' }).collect();
         println!(
             "  [{:>3}/{}] {} {:5.1}%  {}×{}px({}x{}pt) {:6.1}MB  {:6.1}ms{}",
-            r.page,
-            limit,
+            page,
+            total,
             bar,
             pct,
             w,
@@ -352,12 +447,12 @@ fn main() -> Result<()> {
 
     println!(
         "✅ 完成 {} 页，总耗时 {:.1}s；累计落库字形 {} 个",
-        limit,
+        pages.len(),
         started.elapsed().as_secs_f64(),
         total_glyphs
     );
     if do_ocr {
-        println!("✅ 每页 OCR JSON 已落库：{}", aln_dir.display());
+        println!("✅ 每页 OCR JSON 已落库：{}", out_dir.display());
     }
     println!("✅ 每页位图在循环末尾 drop + 临时 PNG 删除：内存应随页数【不增长】——盯着活动监视器看本进程 RSS。");
     Ok(())

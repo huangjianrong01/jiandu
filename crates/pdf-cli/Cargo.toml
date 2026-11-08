@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+# L5 落库：复用与 ocr-cli 共享的 SQLite 适配（不进 core，core 纯洁红线）。
+jiandu-core = { path = "../core" }
+align-db = { path = "../align-db" }
 
 # 仅 macOS 目标编译：平台相关依赖只准出现在这里（core 纯洁铁律）。
 [target.'cfg(target_os = "macos")'.dependencies]

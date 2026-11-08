@@ -177,8 +177,9 @@ fn ts_now() -> String {
 pub enum AppMode {
     Reader,
     Collation,
-    /// V2.0 影印双屏对照（L1 试水）。仅 `Root::dev_compare` 开启时可达，
-    /// 普通构建 / 普通用户永远进不到这里——不影响 V1.0 入口。
+    /// 笺校工作台子模式②：V2.0 影印双屏联动（图↔文坐标对照）。
+    /// 由工作台顶栏原生 Tab 切换进入，出厂启动仍是 Reader；
+    /// 与 `Collation`（文本↔文本原文对照）并列，互不合并。
     Compare,
 }
 
@@ -189,6 +190,10 @@ pub enum CollationEvent {
     Exit,
     /// 【AI 句读】未激活用户点击 → 请求 Root 弹激活浮层（Pro 收费站的解耦触发）。
     RequestActivation,
+    /// 顶栏【双屏联动】→ 切到笺校工作台的另一个子模式（图↔文对照）。
+    /// 只发一个模式切换事件，工作台自身的稿子 / 清洗状态 / show_diff 全不
+    /// 动，切回来还是原来那一屏——两个维度绝不硬合并。
+    OpenCompare,
 }
 
 // ── 视觉常量（骨架阶段，先写死；接入主题系统前不改）──
@@ -4233,6 +4238,31 @@ impl CollationWorkspace {
             })
     }
 
+    /// 「双屏联动」入口（v2.0）：切到笺校工作台的另一个子模式（图↔文）。
+    ///
+    /// 与【原文对照】是**并列的两个维度**：文本对照找错字、图文对照找坐标，
+    /// 绝不硬合并。这里只发一个模式切换事件，本工作台的稿子、清洗记录、
+    /// `show_diff`、光标位置一律不动——切回来还是原来那一屏。
+    fn linked_chip(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .px(px(11.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(0x8c2b22))
+            .bg(rgba(0x8C2B221A))
+            .hover(|s| s.bg(rgba(0x8C2B2230)))
+            .child(SharedString::from("双屏联动"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_c, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(CollationEvent::OpenCompare);
+                }),
+            )
+    }
+
     /// 「清洗日志」入口（v1.9.60）：弹出内嵌极简面板，展示本次清洗的三类统计。
     /// 无毛坯时禁用——日志必以 Raw 为基准。
     fn clean_log_chip(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -4635,6 +4665,9 @@ impl CollationWorkspace {
             // 「原文对照」（v1.9.60）：左栏切到导入毛坯、右栏保留清洗后正文，
             // 逐字比对防误杀。无毛坯（如「打开文件」手选）时按钮变灰禁用。
             .child(self.diff_chip(cx))
+            // 「双屏联动」（v2.0）：并列子模式，图↔文坐标对照。只切模式，
+            // 不改本工作台任何既有功能（见 linked_chip）。
+            .child(self.linked_chip(cx))
             // 「清洗日志」（v1.9.60）：生成 sanitize_report.md 并在访达中打开。
             .child(self.clean_log_chip(cx))
             // 【AI 句读】（v1.9.95 脚手架）：毛笔图标 + 文字，Pro 专属。
@@ -4836,7 +4869,7 @@ impl CollationWorkspace {
                             .flex_1()
                             .text_size(px(14.0))
                             .text_color(rgb(0x2B2622))
-                            .child(SharedString::from("笺读 · 使用帮助")),
+                            .child(SharedString::from("勘阅 · 使用帮助")),
                     )
                     .child(
                         div()

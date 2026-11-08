@@ -1,0 +1,13 @@
+[package]
+name = "align-db"
+version.workspace = true
+edition.workspace = true
+description = "笺读 L5 · SQLite 对齐落库（documents/pages/glyphs 三层 + 两索引；WAL 防锁）"
+
+# 共享落库层：ocr-cli 与 pdf-cli 共用，刻意保持独立 crate，
+# 不进 jiandu-core（core 纯洁红线：SQLite 绝不进内核）。
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+jiandu-core = { path = "../core" }
+rusqlite.workspace = true

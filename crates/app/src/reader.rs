@@ -2203,10 +2203,15 @@ impl Root {
         if self.lookup.is_some() && self.lookup_at.is_none() {
             root = root.child(self.render_dict_panel(cx));
         }
-        // 底部居中目录浮窗（v1.9.99.2）：宽 = 版心 × 0.618、高 = (窗高 − 46) × 0.618，
-        // 从屏幕正下方升起；纯覆盖层，正文零重排零缩放，46px 状态栏安全区不遮。
+        // 底部居中目录浮窗（v1.9.99.2 原版，**保持不变**）：宽 = 版心 × 0.618、
+        // 高 = (窗高 − 46) × 0.618，从屏幕正下方升起；纯覆盖层，正文零重排零缩放。
         if self.show_side && !self.focus_mode {
             root = root.child(self.render_toc_bottom_panel(cx));
+        }
+        // 右缘竹简书签：宽度严格等于正文单列宽 col_w，默认半隐藏，悬停滑出。
+        // 只在沉浸阅读态挂，专注模式 / 卷首 / 工作台一律不出现。
+        if self.screen == Screen::Reading && !self.focus_mode {
+            root = root.child(self.render_bamboo_bookmark(cx));
         }
         // 版字面板浮层：点工具栏「样式」展开，宽度与单张页面一致，
         // 可盖住正文下部（像照片说明压在照片上），但全部样式内容完整显示。
@@ -3897,6 +3902,7 @@ impl Root {
     ///
     /// 纯覆盖层：`viewport_w` / `content_w` / 正文字号 / 列数一概**只读不写**，
     /// 排版引擎零重排、零缩放。捕获层兼作裁剪框，动画中间帧也绝不越进状态栏。
+    #[allow(dead_code)]
     fn render_toc_bottom_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let vw = self.viewport_w;
         let vh = self.viewport_h;
@@ -4172,6 +4178,7 @@ impl Root {
     ///   ③ 点非末级书签，就在它左侧长出一列子节点，带 220ms 滑入动画；
     ///   ④ 子级书签挂 `>` 层级标识 + 逐层缩进（竹简仍 100% 高，绝不缩短）；
     ///   ⑤ 点末级按 `start_char_index` 精准跳转并自动收起面板。
+    #[allow(dead_code)]
     fn render_toc_bottom_strips(
         &mut self,
         cx: &mut Context<Self>,
@@ -4294,6 +4301,7 @@ impl Root {
 
     /// 一根竹简：上下两枚 Canvas 黑色分叉倒三角 + 放大后的竖排题名 +
     /// `>` 层级标识 + 选中朱砂。高度恒 `h_full()`（100%）。
+    #[allow(dead_code)]
     fn render_toc_slip(
         &mut self,
         cx: &mut Context<Self>,
@@ -4430,7 +4438,7 @@ impl Root {
     /// 折过——目录本身就是一张**带批注的书根**，把「我读过 / 我折过 / 我批过」
     /// 三层信息压进同一行。
     #[allow(dead_code)]
-    fn render_side_toc_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
+    pub(crate) fn render_side_toc_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = self.theme;
         let zhu = sheet_zhu(t);
         let ink = t.ink();
@@ -4597,7 +4605,7 @@ impl Root {
 
     /// 左侧栏 · **书签页**（「籤」印）：折起的那些叶，按阅读顺序；点一行跳回，
     /// 点「删」移除。
-    fn render_side_bookmark_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
+    pub(crate) fn render_side_bookmark_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = self.theme;
         let zhu = sheet_zhu(t);
         let ink = t.ink();
@@ -4753,7 +4761,7 @@ impl Root {
     /// 同一类东西——**我留下来的字**——一个长在书里、一个汇在匣里，分作两个
     /// 抽屉、两枚顶栏钮，还得互斥，是纯粹的自我折磨。现在同页上下两截，
     /// 顶栏也因此少一枚。
-    fn render_side_note_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
+    pub(crate) fn render_side_note_list(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = self.theme;
         let zhu = sheet_zhu(t);
         let ink = t.ink();
@@ -5061,6 +5069,7 @@ impl Root {
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
+                this.close_side();
                 this.back_to_shelf();
                 cx.notify();
             }),
@@ -11931,15 +11940,15 @@ impl Root {
                     .bg(rgba(((zhu & 0xFFFFFF) << 8) | 0x99)),
             )
             .child(div().h(px(26.0)))
-            // 那枚「笺校」小印：书包上的印，认门用。
-            .child(crate::shelf::seal_chip("笺校", 46.0))
+            // 那枚小印：书包上的印，认门用。
+            .child(crate::shelf::seal_chip("勘校", 46.0))
             .child(div().h(px(18.0)))
             .child(
                 div()
                     .text_size(px(40.0))
                     .font_family(self.main_family())
                     .text_color(rgb(t.ink()))
-                    .child(SharedString::from("笺 讀")),
+                    .child(SharedString::from("勘 閱")),
             )
             .child(div().h(px(10.0)))
             .child(
@@ -11950,12 +11959,15 @@ impl Root {
                     .child(SharedString::from(format!("版本 {version}"))),
             )
             .child(div().h(px(20.0)))
+            // 关于 slogan（用户 2026-11-08 定稿）：「铁砚凝古意，乌丝入新篇」。
+            // 铁砚 = 苦读不磨穿的那方砚；乌丝 = 乌丝栏，古籍版心的界行。
+            // 一句里把「古意」与「新篇」对上，正是这软件干的事。
             .child(
                 div()
                     .text_size(px(12.0))
                     .font_family(song.clone())
                     .text_color(rgb(zhu))
-                    .child(SharedString::from("一方砚台，半卷残书")),
+                    .child(SharedString::from("铁砚凝古意，乌丝入新篇")),
             )
             // 第三方署名（v1.9.23 · 版权合规）：齐伋体是 OFL 1.1 字体、說文数据
             // 是 Apache-2.0，两份许可都要求「让人看得见版权声明」。许可全文另

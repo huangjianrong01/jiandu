@@ -3,7 +3,7 @@
 //! 启动先进「书架」，点书进「封面」，再进「阅读」。
 //! 每本书的阅读档案（第几面、模式、字体、标注开关）会即时写回 library.json。
 
-use crate::collation::{AppMode, CollationWorkspace};
+use crate::collation::{AppMode, CollationEvent, CollationWorkspace};
 use crate::fonts;
 use crate::grid::{GridConfig, GridDir, LayoutConfig};
 use crate::library::{Bookmark, Library};
@@ -25,8 +25,11 @@ use gpui::{
     Styled, Subscription, WeakEntity, Window, MouseDownEvent,
 };
 use std::cell::Cell;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+// Task 1 · Compare 右栏笺校编辑器的纯逻辑（撤销 / 层级 / 重映射）。
+use crate::compare_editor::{self as ce, EditKind, Snapshot, SpanKind};
 
 /// **渲染帧 → 事件层的一次性矩形探针**（x, y, w, h）。
 ///
@@ -468,14 +471,15 @@ pub struct Root {
     /// 当前书在书架中的下标。
     pub current: usize,
     pub book: Option<Book>,
-    /// V2.0 影印双屏对照（L1）开发开关：默认关闭，**绝不**进 V1.0 入口。
-    ///
-    /// 仅当启动环境变量 `JIANDU_DEV_COMPARE` 存在时置 true，且自动切到
-    /// `AppMode::Compare`——普通构建 / 普通用户既看不到入口、也走不进渲染分支。
-    dev_compare: bool,
+    // 笺校工作台的两个子模式共用同一个顶层状态机，无需再存布尔开关：
+    // `AppMode::Collation` = 原文对照（文本↔文本），`AppMode::Compare` =
+    // 双屏联动（图↔文）。切走时由模式 Tab 收口编辑、落库。
+    //
+    // 旧版那个「`dev_compare` 环境变量闸门」已彻底删除：出厂包启动一律是
+    // V1.0 书架 / 阅读态，双屏只由用户自己点【笺校 → 双屏联动】进入。
     /// 对照模式左图用的测试扫描图路径（由 `JIANDU_COMPARE_IMG` 注入；缺省 None）。
     compare_img: Option<PathBuf>,
-    /// L2 坐标 JSON 路径（由 `JIANDU_COMPARE_JSON` 注入；缺省 `/tmp/jiandu_compare.json`）。
+    /// L2 坐标 JSON 路径（仅由 `JIANDU_COMPARE_JSON` 显式注入；缺省 None，不预置演示数据）。
     compare_json_path: Option<PathBuf>,
     /// L6 Step1：SQLite 数据源（数据库路径, pages.id）。优先于 JSON；
     /// 启动经 `JIANDU_COMPARE_DB=path|page_id` 注入（缺省 page_id=1）。
@@ -483,7 +487,11 @@ pub struct Root {
     /// L2 从坐标 JSON 解析出的字形命中矩形（图像坐标系）。
     compare_glyphs: Vec<CompareGlyph>,
     /// L2 与左图同源的右侧文本（每字全局 index 与 glyph.target 对齐）。
-    compare_text: String,
+    pub(crate) compare_text: String,
+    /// L9 本页逐字排版层级（0 正文 / 1 夹注 / 2 标签），来自 SQLite
+    /// `glyphs.span_kind` 的字高双峰聚类；与 `compare_text` 同下标。
+    /// 渲染与导出都经 `ce::resolve_spans` 消费，保证界面/Word/PDF 同源。
+    compare_db_kinds: Vec<u8>,
     /// 左图原始像素尺寸（点击坐标 → 图像坐标换算用）。
     compare_img_dims: (u32, u32),
     /// 当前命中的右侧字符 index（点击左图某字后填充，驱动右侧红框）。
@@ -504,6 +512,68 @@ pub struct Root {
     compare_zoom: f32,
     /// L8 · 缩放后左图水平平移偏移（视口内手动水平移动，补足 overflow_x_scroll 缺失）。
     compare_pan_x: f32,
+    /// v2.0 UI 外壳 · PDF 会话状态（懒加载 / 异步解析 / Loading 防重入）。
+    /// 当前打开的 PDF 路径（导入按钮经 NSOpenPanel 取得后存这里）。
+    current_pdf_path: Option<String>,
+    /// PDF 总页数（导入时经 `pdf-cli --count` 取得），翻页控制上限。
+    total_pages: usize,
+    /// 当前展示的第几页（1-based），翻页控制核心。
+    current_page: usize,
+    /// 后台解析 / OCR 进行中：为真时 UI 显示 Loading 浮层、按钮禁用，防重复点击。
+    is_processing: bool,
+    /// 当前 PDF 会话的 SQLite 落库路径（每页 OCR 后按 `page_index` 落库于此，供懒加载读库）。
+    session_db: Option<String>,
+    /// L9 商业授权：专业版开关（默认 false = Free）；持久化在 Application Support。
+    is_pro: bool,
+    /// 升级提示浮层开关（Free 用户点导出时置 true）。
+    show_pro_dialog: bool,
+    /// L9 触控板翻页：当前手势累积的垂直滚动量（px）。
+    compare_wheel_accum: f32,
+    /// 上次翻页时刻，用于 650ms 冷却（冷却期吞掉惯性事件，一次滑动只翻一页）。
+    compare_last_turn: Option<std::time::Instant>,
+    /// L9 顶栏「导出 ▼」下拉菜单是否展开。
+    show_export_menu: bool,
+    // ── Task 1 · Compare 右栏笺校编辑态 ────────────────────────────────
+    // 这一组字段把「笺校工作台」的全部灵魂搬到双屏界面：双击进编辑 /
+    // 原生 IME / 光标 / 撤销 / 落库 / 联动重映射 / 大字小字分层。
+    /// 是否处于编辑态（浏览态单击只做联动，双击才进编辑）。
+    /// `pub(crate)`：`ime.rs` 的 `input_target` 要据此决定 IME 落点。
+    pub(crate) compare_editing: bool,
+    /// 编辑焦点：`InputField` 用它登记 IME 上下文（中文全靠这条路）。
+    pub(crate) compare_focus: FocusHandle,
+    /// 全文绝对**字符**下标光标（与 `glyph.target` 同一坐标系）。
+    pub(crate) compare_cursor: usize,
+    /// 输入法组字区间（UTF-16 计位，与 `EntityInputHandler` 契约一致）。
+    pub(crate) compare_marked: Option<Range<usize>>,
+    /// 组字开始前的快照：上屏时一次性记一步撤销，拼音中间态绝不进栈。
+    compare_ime_base: Option<Snapshot>,
+    /// 本页载入时的原文 / 原字框，坐标重映射的唯一基准。
+    compare_baseline_text: String,
+    compare_baseline_glyphs: Vec<CompareGlyph>,
+    /// 撤销 / 重做栈（⌘Z / ⌘⇧Z，含 700ms 合并与光标 barrier）。
+    compare_undo: ce::UndoStack,
+    /// 本页是否有未落库的修改。
+    compare_dirty: bool,
+    /// 字数变化后被降级复用 / 停用的字框数（右栏抬头给用户看见）。
+    compare_degraded: usize,
+    /// 本帧光标的 IME 锚点矩形 `(x, y, w, h)`，相对编辑区左上角。
+    /// `bounds_for_range` 把它叠到 `element_bounds.origin` 上，候选框因此
+    /// 始终贴着光标，而不是贴着整篇滚动内容的左上角（不会乱飘）。
+    pub(crate) compare_caret_anchor: (f32, f32, f32, f32),
+    /// 本帧视口高度（右侧「精准高亮定位」自动滚动用）。
+    compare_viewport_h: f32,
+    /// 本帧每行 / 每列字数：**按右栏真实可用宽度算**，不硬编码 30。
+    /// 稿纸格线、字格、光标、滚动定位全部以它为准，绝不溢出裁字。
+    compare_per_line: usize,
+    /// 本帧行距（字格高 + 行间 gap），格线与滚动定位的唯一基准。
+    compare_row_h: f32,
+    /// 上一帧视口宽度：窗口拉伸时显式识别尺寸变化并补一次 notify，
+    /// 保证字格 / 格线 / 光标在同一次 reflow 里收敛（GPUI 无独立
+    /// Resize Event 订阅入口，窗口变化本就会重跑 render）。
+    compare_last_vw: f32,
+    /// 待补焦次数：双击进编辑的那一帧 InputField 还没进派发树，
+    /// 需按 60/180/400ms 补三次（与笺校工作台 `schedule_refocus` 同源）。
+    compare_refocus: u8,
     /// L3 瓦片渲染缓存：左图按视口懒加载切片 + LRU，零侵入 L1/L2。
     compare_tiles: crate::compare_tiles::TileCache,
     pub script: Script,
@@ -605,6 +675,8 @@ pub struct Root {
     /// 目录树的**展开路径**：`toc_expand[d]` = 第 d 列里被展开的兄弟下标。
     /// 空 = 只显示第一层级（刚呼出面板时的默认态）。纯 UI 状态，不落库。
     pub toc_expand: Vec<usize>,
+    /// 右缘竹简书签是否悬停：驱动 240ms 滑出 + 透明度渐变。
+    pub bookmark_hover: bool,
     /// **后台导入任务**（v1.50.0）：不为空表示「正在刻印」。
     ///
     /// 百万字的丛书解析要跑几秒，绝不能堵在主线程上；进度与结果都放在
@@ -1606,9 +1678,15 @@ impl Root {
             let panel = ai_panel.clone();
             cx.new(move |cx| CollationWorkspace::new(cx, panel))
         };
-        let collation_sub = cx.subscribe(&collation, |this, _e, _event, cx| {
-            // 工作台点「返回阅读」→ 切回正常阅读态。
-            this.mode = AppMode::Reader;
+        let collation_sub = cx.subscribe(&collation, |this, _e, event: &CollationEvent, cx| {
+            // 笺校工作台顶栏的两枚出口：
+            //   · 「← 返回阅读」/ RequestActivation → 维持原行为，回 V1.0 阅读态；
+            //   · 「双屏联动」→ 切到工作台的另一个子模式（图↔文对照）。
+            // 老工作台的稿子、清洗记录、show_diff 全在实体里，切回来不丢。
+            this.mode = match event {
+                CollationEvent::OpenCompare => AppMode::Compare,
+                _ => AppMode::Reader,
+            };
             cx.notify();
         });
         // v2.1：排版工作台原本在这里被 `cx.new` 预建、并由 JIANDU_TYPESET
@@ -1629,12 +1707,12 @@ impl Root {
             screen: Screen::Shelf,
             current: 0,
             book: None,
-            dev_compare: std::env::var("JIANDU_DEV_COMPARE").is_ok(),
             compare_img: std::env::var("JIANDU_COMPARE_IMG").ok().map(PathBuf::from),
-            compare_json_path: Some(PathBuf::from(
-                std::env::var("JIANDU_COMPARE_JSON")
-                    .unwrap_or_else(|_| "/tmp/jiandu_compare.json".to_string()),
-            )),
+            // v2.0 商业化纪律：**绝不预置演示数据**。只有显式注入环境变量才启用
+            // JSON 回退；普通用户干净启动时为 None，界面完全等【导入】按钮驱动。
+            // （旧默认指向 /tmp/jiandu_compare.json 会把 L8 的《資治通鑑》样张
+            //   自动灌进右栏，污染空态，已废除。）
+            compare_json_path: std::env::var("JIANDU_COMPARE_JSON").ok().map(PathBuf::from),
             compare_db: std::env::var("JIANDU_COMPARE_DB")
                 .ok()
                 .and_then(|s| {
@@ -1646,6 +1724,7 @@ impl Root {
                 }),
             compare_glyphs: Vec::new(),
             compare_text: String::new(),
+            compare_db_kinds: Vec::new(),
             compare_img_dims: (0u32, 0u32),
             compare_hit: None,
             compare_hit_tester: HitTester { rows: Vec::new() },
@@ -1658,6 +1737,34 @@ impl Root {
             compare_anim_text: false,
             compare_zoom: 1.0,
             compare_pan_x: 0.0,
+            // v2.0 UI 外壳 · PDF 会话初值（空闲态）。
+            current_pdf_path: None,
+            total_pages: 0,
+            current_page: 0,
+            is_processing: false,
+            session_db: None,
+            is_pro: load_pro_license(),
+            show_pro_dialog: false,
+            compare_wheel_accum: 0.0,
+            compare_last_turn: None,
+            show_export_menu: false,
+            // Task 1 · 笺校编辑器初值（浏览态、空历史、零降级）。
+            compare_editing: false,
+            compare_focus: cx.focus_handle(),
+            compare_cursor: 0,
+            compare_marked: None,
+            compare_ime_base: None,
+            compare_baseline_text: String::new(),
+            compare_baseline_glyphs: Vec::new(),
+            compare_undo: ce::UndoStack::new(),
+            compare_dirty: false,
+            compare_degraded: 0,
+            compare_caret_anchor: (28.0, 28.0, 2.0, 32.0),
+            compare_viewport_h: 800.0,
+            compare_per_line: 30, // 仅首帧占位，render 当帧按容器宽度改写
+            compare_row_h: 22.0 * 1.45 + 16.0,
+            compare_last_vw: 0.0,
+            compare_refocus: 0,
             compare_tiles: crate::compare_tiles::TileCache::new(512, 96),
             script: Script::Ancient,
             grid: GridConfig::default(),
@@ -1700,6 +1807,7 @@ impl Root {
             toc_need_scroll: false,
             side_follow: None,
             toc_expand: Vec::new(),
+            bookmark_hover: false,
             import_job: None,
             shelf_birth: std::collections::HashMap::new(),
             batch: None,
@@ -1944,7 +2052,9 @@ impl Root {
             shelf_batch_confirm: false,
             close_hook_set: false,
             export_menu: false,
-            mode: if std::env::var("JIANDU_DEV_COMPARE").is_ok() {
+            // 「按原来的」：出厂启动 = V1.0 书架 / 沉浸阅读，绝不强行跳双屏。
+            // `dev_compare_seed()` 只服务内部截图脚本，普通用户永不触发。
+            mode: if dev_compare_seed() {
                 AppMode::Compare
             } else {
                 AppMode::Reader
@@ -4745,7 +4855,7 @@ impl Root {
                 MenuIntent::CheckUpdate => {
                     self.ensure_window(cx);
                     self.notice =
-                        format!("笺读已是最新版本 v{}", env!("CARGO_PKG_VERSION"));
+                        format!("勘阅已是最新版本 v{}", env!("CARGO_PKG_VERSION"));
                 }
                 MenuIntent::Quit => {
                     cx.shutdown();
@@ -5466,7 +5576,7 @@ impl Root {
             .map(|b| b.title.clone())
             .unwrap_or_else(|| "笺读".to_string());
         let default = format!(
-            "笺读_{}_第{}叶.png",
+            "勘阅_{}_第{}叶.png",
             crate::exporter::safe_file_stem(&title),
             self.page + 1
         );
@@ -5748,9 +5858,9 @@ impl Root {
         let title = self.chapter_title(ci);
         let safe = crate::exporter::safe_file_stem(&book.title);
         let default = match scope {
-            PdfScope::Book => format!("笺读_{}.pdf", safe),
+            PdfScope::Book => format!("勘阅_{}.pdf", safe),
             _ => format!(
-                "笺读_{}_{}.pdf",
+                "勘阅_{}_{}.pdf",
                 safe,
                 crate::exporter::safe_file_stem(&title)
             ),
@@ -6302,31 +6412,1079 @@ impl Root {
     /// 『导入原图』按钮（Compare Mode 顶部操作栏专用）：弹系统文件框选一张本地
     /// JPG / PNG，降采样到安全尺寸后作为左图加载。红框联动逻辑保持可用——坐标
     /// 暂时可能跟新图对不上，但红框照样能弹出来（用户已确认接受）。
-    pub fn import_compare_image(&mut self, cx: &mut Context<Self>) {
-        // rfd 同步文件框必须前台直调（v1.52.4 铁律）：cx.spawn 的 async 体由 GPUI
-        // 前台 executor 在主线程 poll，面板即原生模态显示；过 background_executor
-        // 会被主循环挤掉、静默返回 None（点了没反应）。
-        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+    /// v2.0 UI 外壳 · 导入原图 / 影印 PDF（顶部「导入」按钮入口）。
+    ///
+    /// 工程纪律（用户硬指标 + 异步隔离铁律）：
+    ///   1. `rfd` NSOpenPanel **必须前台** `cx.spawn` 同步调（原生模态，主线程 poll；
+    ///      过 `background_executor` 会被主循环挤掉、静默返回 None）。
+    ///   2. 取得路径后**立刻**把 `is_processing = true` 并 `notify`，主线程不被阻塞、
+    ///      界面立刻进入 Loading 态（防重入 / 防以为死机）。
+    ///   3. 真正的 PDF 光栅化 + OCR（`pdf-cli` 子进程）放在 `background_executor`，
+    ///      **绝不**在主线程跑——UI 零卡顿。
+    ///   4. 后台跑完，再经 `this.update` 回主线程把第一页灌进 `compare_img` /
+    ///      `compare_glyphs` / `compare_text`，并把 `is_processing` 置回 false。
+    pub fn import_compare_source(&mut self, cx: &mut Context<Self>) {
+        self.start_import(None, cx);
+    }
+
+    /// L9 · 拖拽入口：路径由 AppKit 拖放回调给出，跳过文件框直接解析。
+    pub fn import_compare_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        eprintln!("[v2-import] 拖入文件：{}", path.display());
+        self.start_import(Some(path), cx);
+    }
+
+    fn start_import(&mut self, preset: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.is_processing {
+            return; // 防重入：解析中不弹第二个文件框。
+        }
+        // Task 1：换文件前先把上一本的笺校结果落库，绝不让编辑凭空蒸发。
+        self.compare_finish_editing(cx);
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
-                let picked = rfd::FileDialog::new()
-                    .set_title("导入原图（JPG / PNG）")
-                    .add_filter("图片 (JPG / PNG)", &["jpg", "jpeg", "png"])
-                    .add_filter("全部文件", &["*"])
-                    .pick_file();
-                let Some(path) = picked else { return };
-                // 安全兜底：超大图降采样，绝不爆内存。
-                let display = compare_image_display_path(&path);
+                // 两条正式入口：① 点卡片/按钮弹 NSOpenPanel；② Finder 拖入（preset）。
+                let picked = match preset {
+                    Some(p) => Some(p),
+                    None => rfd::FileDialog::new()
+                        .set_title("导入原图或影印 PDF")
+                        .add_filter("影印 PDF", &["pdf"])
+                        .add_filter("图片 (JPG / PNG)", &["jpg", "jpeg", "png"])
+                        .add_filter("全部文件", &["*"])
+                        .pick_file(),
+                };
+                let Some(path) = picked else {
+                    eprintln!("[v2-import] 文件框已取消");
+                    return;
+                };
+                eprintln!("[v2-import] 已选择：{}", path.display());
+
+                // 立刻置 Loading（主线程），防重入 + 刷新界面。
                 this.update(&mut cx, |this, cx| {
-                    // 换新图：保留既有坐标红框（坐标暂不对版也 OK），只清掉上一次命中高亮。
-                    this.compare_img = Some(display);
-                    this.compare_hit = None;
-                    this.compare_tiles.reset();
+                    this.is_processing = true;
+                    this.notice = "正在解析并识别…".to_string();
+                    cx.notify();
+                })
+                .ok();
+
+                // 类型判断：PDF 走异步解析流水线；图片走旧逻辑（直接显示，不 OCR）。
+                let is_pdf = path
+                    .extension()
+                    .map(|e| e.eq_ignore_ascii_case("pdf"))
+                    .unwrap_or(false);
+
+                if !is_pdf {
+                    // 图片：轻量，前台直赋（无 OCR、无阻塞）。
+                    let display = compare_image_display_path(&path);
+                    this.update(&mut cx, move |this, cx| {
+                        this.compare_img = Some(display);
+                        this.compare_hit = None;
+                        this.compare_tiles.reset();
+                        this.is_processing = false;
+                        this.current_pdf_path = None;
+                        this.session_db = None;
+                        this.compare_reset_editor(cx);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+
+                // ── PDF：后台跑 pdf-cli（绝不阻塞主线程）──
+                eprintln!("[v2] ▲ Loading 已置位；让出主线程，后台任务即将启动");
+                let pdf = path.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { run_pdf_import_pipeline(&pdf) })
+                    .await;
+
+                match result {
+                    Ok((session_db, total, png_path, glyphs, text, dims)) => {
+                        eprintln!(
+                            "[v2-import] 流水线成功：共 {} 页 / 第 1 页 {} 字 / {} 字形",
+                            total,
+                            text.chars().count(), // 字符口径，勿改回 `len()`（字节数）
+                            glyphs.len()
+                        );
+                        this.update(&mut cx, move |this, cx| {
+                            this.current_pdf_path =
+                                Some(path.to_string_lossy().into_owned());
+                            this.total_pages = total;
+                            this.current_page = 1;
+                            this.session_db = Some(session_db);
+                            // 第一页直接灌入对照视图（左图 + 右文 + 命中层）。
+                            this.compare_img = Some(png_path);
+                            this.compare_img_dims = dims;
+                            this.compare_text = text;
+                            this.compare_glyphs = glyphs.clone();
+                            this.compare_hit_tester = HitTester::new(glyphs);
+                            this.compare_hit = None;
+                            this.compare_tiles.reset();
+                            this.is_processing = false;
+                            this.notice = if this.compare_text.is_empty() {
+                                "本页未识别到横排文字".to_string()
+                            } else {
+                                format!("已导入：第 1 / {} 页", total)
+                            };
+                            // Task 1：新页基准 = 刚 OCR 出来的原文 / 原字框。
+                            this.compare_reset_editor(cx);
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                    Err(e) => {
+                        eprintln!("[v2-import] 流水线失败：{e}");
+                        this.update(&mut cx, move |this, cx| {
+                        this.is_processing = false;
+                        this.notice = format!("PDF 解析失败：{e}");
+                        eprintln!("[v2] ❌ 已复位 is_processing=false，界面恢复可用");
+                        cx.notify();
+                        })
+                        .ok();
+                    }
+                }
+            }
+        })
+        .detach(); // ★ GPUI 的 Task 一被 drop 就取消；不 detach 会永远卡在 Loading。
+    }
+
+    /// v2.0 UI 外壳 · 懒加载翻页（顶部「上一页」/「下一页」调用）。
+    ///
+    /// `delta = -1` 上一页、`+1` 下一页。后台实时光栅化 + OCR 第 N 页，回主线程刷新；
+    /// 点第 N 页才解析第 N 页，**绝不**一次性加载所有页（内存恒低）。`is_processing`
+    /// 为真时直接返回——防连点重入。
+    pub fn navigate_compare_page(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.is_processing {
+            return; // 防重入：解析中忽略翻页，避免叠加子进程。
+        }
+        // Task 1：翻页前先把本页校订写回 SQLite（用旧 current_page）。
+        self.compare_finish_editing(cx);
+        let Some(db) = self.session_db.clone() else { return };
+        let Some(pdf) = self.current_pdf_path.clone() else { return };
+        if self.total_pages == 0 {
+            return;
+        }
+        let cur = self.current_page as isize;
+        let next = (cur + delta).clamp(1, self.total_pages as isize) as usize;
+        if next == self.current_page {
+            return; // 已到首页 / 末页，无操作。
+        }
+        let pdf_path = PathBuf::from(&pdf);
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                this.update(&mut cx, |this, cx| {
+                    this.is_processing = true;
+                    this.notice = format!("正在解析第 {} 页…", next);
+                    cx.notify();
+                })
+                .ok();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { run_pdf_page_pipeline(&pdf_path, &db, next) })
+                    .await;
+                match result {
+                    Ok((png, glyphs, text, dims)) => {
+                        this.update(&mut cx, |this, cx| {
+                            this.current_page = next;
+                            this.compare_img = Some(png);
+                            this.compare_img_dims = dims;
+                            this.compare_text = text;
+                            this.compare_glyphs = glyphs.clone();
+                            this.compare_hit_tester = HitTester::new(glyphs);
+                            this.compare_hit = None;
+                            this.compare_tiles.reset();
+                            this.is_processing = false;
+                            this.notice = if this.compare_text.is_empty() {
+                                "本页未识别到横排文字".to_string()
+                            } else {
+                                format!("已跳到第 {} / {} 页", next, this.total_pages)
+                            };
+                            // Task 1：新页基准 = 该页 OCR 原文 / 原字框。
+                            this.compare_reset_editor(cx);
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                    Err(e) => {
+                        this.update(&mut cx, |this, cx| {
+                            this.is_processing = false;
+                            this.notice = format!("第 {} 页解析失败：{e}", next);
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    // ── L9 · 商业授权：导出闸门 + 激活码 ───────────────────────────────
+    /// Free 用户点任一导出按钮 → 弹「升级至专业版」浮层；Pro 直接放行。
+    fn export_guard(&mut self, cx: &mut Context<Self>) -> bool {
+        self.show_export_menu = false; // 选完菜单项立即收起
+        if !self.is_pro {
+            self.show_pro_dialog = true;
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    /// 弹出 macOS 原生输入框读激活码；校验通过后落盘持久化并切换 PRO。
+    pub fn prompt_pro_activation(&mut self, cx: &mut Context<Self>) {
+        if self.is_pro {
+            return;
+        }
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let code = cx
+                    .background_executor()
+                    .spawn(async move { ask_activation_code() })
+                    .await;
+                let ok = code.as_deref() == Some(PRO_CODE);
+                if ok {
+                    save_pro_license();
+                }
+                this.update(&mut cx, move |this, cx| {
+                    if ok {
+                        this.is_pro = true;
+                        this.show_pro_dialog = false;
+                        this.notice = "已解锁专业版 · 导出功能已开放".to_string();
+                    } else if code.is_some() {
+                        this.notice = "激活码无效，请重试".to_string();
+                    }
                     cx.notify();
                 })
                 .ok();
             }
-        });
+        })
+        .detach();
+    }
+
+    /// 统一落盘出口（rfd 保存框 + 沙盒安全写入）。
+    fn save_export_bytes(
+        &mut self,
+        title: &str,
+        name: &str,
+        ext: &str,
+        bytes: &[u8],
+        cx: &mut Context<Self>,
+    ) {
+        let filter = ext.to_ascii_uppercase();
+        if let Some(p) = crate::exporter::pick_save_path(title, name, &filter, &[ext]) {
+            match crate::exporter::save_bytes(p, ext, bytes) {
+                Ok(path) => self.notice = format!("已导出：{}", path.display()),
+                Err(e) => self.notice = format!("导出失败：{e}"),
+            }
+        } else {
+            self.notice = "已取消导出".to_string();
+        }
+        cx.notify();
+    }
+
+    /// **导出数据的唯一快照**：必须在用户点「导出」的这一刻回读 SQLite，
+    /// 拿的是刚刚笺校并落库的最新 `pages.text` 与重建过的 `glyphs`，
+    /// 绝不用初始 OCR JSON、也不赌内存值已经被刷新。
+    /// 无会话库（纯图片 / 开发钩子）时才退回内存，保证功能不哑火。
+    fn compare_export_snapshot(
+        &self,
+    ) -> (String, Vec<(f32, f32, f32, f32, usize)>, (u32, u32)) {
+        let mem_glyphs: Vec<(f32, f32, f32, f32, usize)> = self
+            .compare_glyphs
+            .iter()
+            .map(|g| (g.x, g.y, g.w, g.h, g.target))
+            .collect();
+        let fallback = || {
+            (
+                self.compare_text.clone(),
+                mem_glyphs.clone(),
+                self.compare_img_dims,
+            )
+        };
+        let Some(db) = self.session_db.as_ref() else {
+            eprintln!("[compare-export] 无会话库，回退内存快照");
+            return fallback();
+        };
+        let page = self.current_page as i64;
+        if page <= 0 {
+            return fallback();
+        }
+        let Ok(conn) = rusqlite::Connection::open(db) else {
+            return fallback();
+        };
+        let text = conn
+            .query_row(
+                "SELECT text FROM pages WHERE page_index = ?1",
+                rusqlite::params![page],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| self.compare_text.clone());
+        let mut stmt = match conn.prepare(
+            "SELECT char_index, x, y, w, h FROM glyphs \
+             WHERE page_id = (SELECT id FROM pages WHERE page_index = ?1) \
+               AND is_space = 0 ORDER BY char_index",
+        ) {
+            Ok(s) => s,
+            Err(_) => return (text, mem_glyphs, self.compare_img_dims),
+        };
+        let glyphs: Vec<(f32, f32, f32, f32, usize)> = stmt
+            .query_map(rusqlite::params![page], |r| {
+                Ok((
+                    r.get::<_, f64>(1)? as f32,
+                    r.get::<_, f64>(2)? as f32,
+                    r.get::<_, f64>(3)? as f32,
+                    r.get::<_, f64>(4)? as f32,
+                    r.get::<_, i64>(0)? as usize,
+                ))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .filter(|v: &Vec<_>| !v.is_empty())
+            .unwrap_or(mem_glyphs);
+        eprintln!(
+            "[compare-export] 数据源 = SQLite：第 {} 页 / {} 字 / {} 有效字框",
+            page,
+            text.chars().count(),
+            glyphs.len()
+        );
+        (text, glyphs, self.compare_img_dims)
+    }
+
+    /// L9 · **统一导出中心的数据入口**：导出瞬间从 SQLite 回读「校对后最新」
+    /// 文本 / 字框 / 字高层级，7 种格式共用这一份快照，绝不各读各的。
+    fn compare_full_snapshot(&self) -> crate::export_center::ExportSnapshot {
+        use crate::export_center::{ExportGlyph, ExportSnapshot};
+        let page = self.current_page.max(1);
+        let title = self
+            .current_pdf_path
+            .as_ref()
+            .and_then(|p| Path::new(p).file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "勘阅对照".to_string());
+        let mut snap = ExportSnapshot {
+            title,
+            page_index: page,
+            image_width: self.compare_img_dims.0,
+            image_height: self.compare_img_dims.1,
+            source_image: self
+                .compare_img
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            text: self.compare_text.clone(),
+            glyphs: self
+                .compare_glyphs
+                .iter()
+                .map(|g| ExportGlyph {
+                    char_index: g.target,
+                    ch: self
+                        .compare_text
+                        .chars()
+                        .nth(g.target)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                    x: g.x as f64,
+                    y: g.y as f64,
+                    w: g.w as f64,
+                    h: g.h as f64,
+                    span_kind: self.compare_db_kinds.get(g.target).copied().unwrap_or(0),
+                })
+                .collect(),
+            span_kinds: self.compare_db_kinds.clone(),
+        };
+        let Some(db) = self.session_db.as_ref() else {
+            return snap;
+        };
+        let Ok(conn) = rusqlite::Connection::open(db) else {
+            return snap;
+        };
+        if let Ok(row) = conn.query_row(
+            "SELECT image_width, image_height, text FROM pages WHERE page_index = ?1",
+            rusqlite::params![page as i64],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        ) {
+            snap.image_width = row.0.max(0) as u32;
+            snap.image_height = row.1.max(0) as u32;
+            snap.text = row.2;
+        }
+        // 老会话库没有 span_kind 列：退回 0（界面另有注本体例切分兜底）。
+        let has_kind = conn
+            .prepare("PRAGMA table_info(glyphs)")
+            .and_then(|mut s| {
+                let rs = s.query_map([], |r| r.get::<_, String>(1))?;
+                Ok(rs.filter_map(Result::ok).any(|n| n == "span_kind"))
+            })
+            .unwrap_or(false);
+        let sql = if has_kind {
+            "SELECT char_index, ch, x, y, w, h, span_kind FROM glyphs \
+             WHERE page_id = (SELECT id FROM pages WHERE page_index = ?1) \
+               AND is_space = 0 ORDER BY char_index"
+        } else {
+            "SELECT char_index, ch, x, y, w, h, 0 FROM glyphs \
+             WHERE page_id = (SELECT id FROM pages WHERE page_index = ?1) \
+               AND is_space = 0 ORDER BY char_index"
+        };
+        if let Ok(mut stmt) = conn.prepare(sql) {
+            let rows = stmt.query_map(rusqlite::params![page as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as usize,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, f64>(3)?,
+                    r.get::<_, f64>(4)?,
+                    r.get::<_, f64>(5)?,
+                    r.get::<_, i64>(6)? as u8,
+                ))
+            });
+            if let Ok(rows) = rows {
+                let gs: Vec<ExportGlyph> = rows
+                    .filter_map(Result::ok)
+                    .map(|(ci, ch, x, y, w, h, k)| ExportGlyph {
+                        char_index: ci,
+                        ch,
+                        x,
+                        y,
+                        w,
+                        h,
+                        span_kind: k,
+                    })
+                    .collect();
+                if !gs.is_empty() {
+                    snap.glyphs = gs;
+                }
+            }
+        }
+        let n = snap.text.chars().count();
+        let mut kinds = vec![0u8; n];
+        for g in &snap.glyphs {
+            if g.char_index < n {
+                kinds[g.char_index] = g.span_kind;
+            }
+        }
+        snap.span_kinds = kinds;
+        eprintln!(
+            "[compare-export] 统一快照 = SQLite 第 {} 页 / {} 字 / {} 字框",
+            page,
+            n,
+            snap.glyphs.len()
+        );
+        snap
+    }
+
+    /// **7 格式统一出口**：Pro 闸门 → SQLite 最新快照 → 纯函数生成 → 安全落盘。
+    pub fn export_compare_format(
+        &mut self,
+        fmt: crate::export_center::Format,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.export_guard(cx) {
+            return;
+        }
+        let snap = self.compare_full_snapshot();
+        if snap.text.is_empty() {
+            self.notice = "当前页无可导出文字".to_string();
+            cx.notify();
+            return;
+        }
+        let png = self.compare_img.clone();
+        if fmt.needs_image() && png.is_none() {
+            self.notice = "尚未导入原图，无法生成双层 PDF".to_string();
+            cx.notify();
+            return;
+        }
+        match crate::export_center::build(&snap, fmt, png.as_deref()) {
+            Ok(bytes) => self.save_export_bytes(
+                &format!("导出 {}", fmt.label()),
+                fmt.default_name(),
+                fmt.ext(),
+                &bytes,
+                cx,
+            ),
+            Err(e) => {
+                self.notice = format!("{} 导出失败：{e}", fmt.label());
+                cx.notify();
+            }
+        }
+    }
+
+    /// 【导出 DOCX】按阅读顺序把**最新校对文本**写成可编辑 Word（正注分层）。
+    pub fn export_compare_docx(&mut self, cx: &mut Context<Self>) {
+        self.export_compare_format(crate::export_center::Format::Docx, cx);
+    }
+
+    /// 【导出双层可搜索 PDF】原图垫底 + 不可见文字层（真实坐标 / Y 轴翻转）。
+    pub fn export_searchable_pdf(&mut self, cx: &mut Context<Self>) {
+        self.export_compare_format(crate::export_center::Format::Pdf, cx);
+    }
+
+    /// v2.0 UI 外壳 · 导出对照文本为 TXT（顶部「导出 TXT」按钮）。
+    ///
+    /// 复用 `exporter::pick_save_path` + `save_bytes`（沙盒安全落盘出口），
+    // ════════════════════════════════════════════════════════════════════
+    // Task 1 · Compare 右栏「笺校工作台」全套能力（零降级移植）
+    //
+    // 浏览态：单击右字 = 双向联动；双击 = 进编辑并把光标落在那个字上。
+    // 编辑态：同一个单击**同时**做「光标定位」与「联动」（两者写的是不同
+    //   状态，不存在抢事件），中文经 `ime::InputField` → `EntityInputHandler`
+    //   回传；⌘Z / ⌘⇧Z / ⌘S / Enter / 方向键全在 `compare_on_key`。
+    // 每次上屏都：记一步撤销 → 字形坐标重映射 → 单事务回写 SQLite。
+    // ════════════════════════════════════════════════════════════════════
+
+    fn compare_snapshot(&self) -> Snapshot {
+        Snapshot {
+            text: self.compare_text.clone(),
+            cursor: self.compare_cursor,
+        }
+    }
+
+    /// 本页的字格网格（每行字数按当帧容器宽度算，下标恒为绝对下标）。
+    /// 字格层级走 `resolve_spans`：SQLite 字高聚类 → 显式夹注标记 → 注本体例切分，
+    /// 与 DOCX / 双层 PDF 导出共用同一份结果，界面和导出绝不各猜一套。
+    fn compare_rows(&self) -> Vec<Vec<ce::Cell>> {
+        let kinds = ce::resolve_spans(&self.compare_text, &self.compare_db_kinds);
+        ce::layout_cells_with_kinds(
+            &self.compare_text,
+            self.compare_per_line.max(1),
+            true,
+            &kinds,
+        )
+    }
+
+    /// 导入 / 翻页完成后重置编辑上下文：基准改成新页，历史清空。
+    /// ⚠️ 必须在 `current_page` 更新**之后**调用；保存旧页由调用方在
+    ///    翻页前用 `compare_finish_editing` 完成。
+    fn compare_reset_editor(&mut self, cx: &mut Context<Self>) {
+        // L9：新页的层级表来自 SQLite 字高聚类；旧库无列时返回空表，
+        // `resolve_spans` 会自动退回注本体例切分，绝不空白。
+        self.compare_db_kinds = self
+            .session_db
+            .as_ref()
+            .map(|db| load_span_kinds_from_db_index(Path::new(db), self.current_page as i64))
+            .unwrap_or_default();
+        self.compare_editing = false;
+        self.compare_baseline_text = self.compare_text.clone();
+        self.compare_baseline_glyphs = self.compare_glyphs.clone();
+        self.compare_cursor = 0;
+        self.compare_marked = None;
+        self.compare_ime_base = None;
+        self.compare_undo.clear();
+        self.compare_dirty = false;
+        self.compare_degraded = 0;
+        self.compare_hit = None;
+        cx.notify();
+    }
+
+    /// 退出编辑（Esc / 顶栏「完成」/ 翻页 / 导入前）。未上屏的组字整段撤掉，
+    /// 绝不让拼音串进库；随后强制落盘一次。
+    fn compare_finish_editing(&mut self, cx: &mut Context<Self>) {
+        if !self.compare_editing {
+            return;
+        }
+        if self.compare_marked.take().is_some() {
+            if let Some(base) = self.compare_ime_base.take() {
+                self.compare_text = base.text;
+                self.compare_cursor = base.cursor;
+            }
+        }
+        self.compare_editing = false;
+        self.compare_after_text_change(cx, false);
+        self.compare_save_to_db(cx, true);
+        self.notice = format!("第 {} 页笺校已保存", self.current_page);
+        cx.notify();
+    }
+
+    /// 双击进入编辑：光标落在被双击的字前，并立刻拿到 IME 焦点。
+    fn compare_begin_editing(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.compare_editing = true;
+        self.compare_cursor = idx.min(self.compare_text.chars().count());
+        self.compare_marked = None;
+        self.compare_ime_base = None;
+        self.compare_undo.barrier();
+        // 与笺校工作台 `focus_for_typing` 同款轻量聚焦：不 blur 再 focus，
+        // 避免每次点击都拆一次输入法上下文（中文会时断时续）。
+        window.activate_window();
+        window.focus(&self.compare_focus);
+        // 本帧 InputField 还没进派发树，光靠这一次 focus 拿不到平台侧
+        // first responder；按 60/180/400ms 在 render 里补三次（工作台同款）。
+        self.compare_refocus = 3;
+        self.compare_schedule_refocus(cx);
+        self.notice = "笺校编辑中 · Enter 换行 · ⌘Z 撤销 · ⌘S 保存 · Esc 完成".to_string();
+        cx.notify();
+    }
+
+    /// 补焦调度：render 阶段才有 `Window`，故这里只置标志 + notify，
+    /// 真正的 `window.focus()` 在 `render_compare` 开头执行。
+    fn compare_schedule_refocus(&mut self, cx: &mut Context<Self>) {
+        let exec = cx.background_executor().clone();
+        cx.spawn(move |this: WeakEntity<Self>, app: &mut AsyncApp| {
+            let mut app = app.clone();
+            async move {
+                for ms in [60u64, 180, 400] {
+                    exec.timer(std::time::Duration::from_millis(ms)).await;
+                    let Some(entity) = this.upgrade() else { return };
+                    let _ = entity.update(&mut app, |this, cx| {
+                        if this.compare_editing {
+                            this.compare_refocus = 3;
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 文本改动后的**唯一收口**：字形重映射 + 命中器重建 + 越界夹紧 + 落库。
+    ///
+    /// 同字数改错字 → `align_texts` 直接返回恒等映射，红框一个像素不动；
+    /// 增删字数 → LCS 保住仍能对上的框，替换段降级复用、删掉的框停用。
+    fn compare_after_text_change(&mut self, cx: &mut Context<Self>, save: bool) {
+        let total = self.compare_text.chars().count();
+        self.compare_cursor = self.compare_cursor.min(total);
+        let al = ce::align_texts(&self.compare_baseline_text, &self.compare_text);
+        let mut seen = std::collections::HashSet::new();
+        let mut glyphs: Vec<CompareGlyph> = Vec::new();
+        for g in &self.compare_baseline_glyphs {
+            if let Some(Some(j)) = al.map.get(g.target) {
+                // 单射保护：绝不出现两个框争同一个字符（会让红框闪烁/错位）。
+                if *j < total && seen.insert(*j) {
+                    glyphs.push(CompareGlyph { target: *j, ..*g });
+                }
+            }
+        }
+        self.compare_degraded = al.degraded;
+        self.compare_glyphs = glyphs;
+        self.compare_hit_tester = HitTester::new(self.compare_glyphs.clone());
+        if self.compare_hit.map(|h| h >= total).unwrap_or(false) {
+            self.compare_hit = None;
+        }
+        self.compare_dirty = true;
+        if save {
+            self.compare_save_to_db(cx, true);
+        }
+        cx.notify();
+    }
+
+    /// **回写 SQLite**（清单第 2 条）。单事务 + WAL + busy_timeout：
+    ///   · `pages.text` 存校订后的全文；
+    ///   · `glyphs` 整表按新下标重建——有原 bbox 的沿用坐标，新增字用
+    ///     `is_space = 1` 占位（读回时零框，正是「降级不画框」的持久化）。
+    /// 这样翻走再翻回来，编辑结果与对齐关系都还在，绝不只是内存里好看。
+    fn compare_save_to_db(&mut self, cx: &mut Context<Self>, quiet: bool) -> bool {
+        let Some(db) = self.session_db.clone() else {
+            if !quiet {
+                self.notice = "当前为图片 / 演示模式，无会话数据库".to_string();
+            }
+            return false;
+        };
+        if self.current_page == 0 {
+            return false;
+        }
+        let page = self.current_page as i64;
+        let text = self.compare_text.clone();
+        let glyphs = self.compare_glyphs.clone();
+        let result = (|| -> Result<(), String> {
+            let mut conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
+            conn.busy_timeout(std::time::Duration::from_millis(2000))
+                .map_err(|e| e.to_string())?;
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let n = tx
+                .execute(
+                    "UPDATE pages SET text = ?1 WHERE page_index = ?2",
+                    rusqlite::params![text, page],
+                )
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("未找到当前页记录".to_string());
+            }
+            let page_id: i64 = tx
+                .query_row(
+                    "SELECT id FROM pages WHERE page_index = ?1",
+                    rusqlite::params![page],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM glyphs WHERE page_id = ?1",
+                rusqlite::params![page_id],
+            )
+            .map_err(|e| e.to_string())?;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO glyphs \
+                         (page_id, char_index, ch, x, y, w, h, confidence, is_space) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+                    )
+                    .map_err(|e| e.to_string())?;
+                for (i, ch) in text.chars().enumerate() {
+                    let (x, y, w, h, space) = match glyphs.iter().find(|g| g.target == i) {
+                        Some(g) => (
+                            g.x as f64,
+                            g.y as f64,
+                            g.w as f64,
+                            g.h as f64,
+                            0i64,
+                        ),
+                        None => (0.0, 0.0, 0.0, 0.0, 1i64),
+                    };
+                    stmt.execute(rusqlite::params![
+                        page_id,
+                        i as i64,
+                        ch.to_string(),
+                        x,
+                        y,
+                        w,
+                        h,
+                        space
+                    ])
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.compare_dirty = false;
+                if !quiet {
+                    self.notice = format!("第 {} 页已写入数据库", page);
+                }
+                eprintln!("[compare-editor] 已落库：第 {} 页 / {} 字 / {} 有效字框",
+                    page, text.chars().count(), glyphs.len());
+                cx.notify();
+                true
+            }
+            Err(e) => {
+                self.notice = format!("保存失败：{e}");
+                eprintln!("[compare-editor] ❌ 落库失败：{e}");
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// 一次完整编辑（IME 上屏 / Enter / 退格 / 粘贴 / ⌘V 共用）。
+    fn compare_edit_replace(
+        &mut self,
+        range: Option<Range<usize>>,
+        ins: &str,
+        kind: EditKind,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.compare_snapshot();
+        let (a, b) = ce::range_to_chars(&self.compare_text, range, self.compare_cursor);
+        let clean = ce::sanitize_ime(ins, true);
+        let (text, cursor) = ce::splice_chars(&self.compare_text, a, b, &clean);
+        self.compare_undo.record(before, kind);
+        self.compare_text = text;
+        self.compare_cursor = cursor;
+        self.compare_marked = None;
+        self.compare_ime_base = None;
+        self.compare_after_text_change(cx, true);
+    }
+
+    /// IME 组字中：拼音串要看得见（marked 区间下方划线），但不进撤销栈、
+    /// 不重映射、不落库。上屏时用「组字前快照」一次性记一步。
+    pub(crate) fn compare_ime_mark(
+        &mut self,
+        range: Option<Range<usize>>,
+        preedit: &str,
+        new_selected: Option<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.compare_marked.is_none() {
+            self.compare_ime_base = Some(self.compare_snapshot());
+        }
+        let eff = crate::ime::effective_replace_range(range, &self.compare_marked);
+        let (a, b) = ce::range_to_chars(&self.compare_text, eff, self.compare_cursor);
+        let clean = ce::sanitize_ime(preedit, false);
+        let (text, _) = ce::splice_chars(&self.compare_text, a, b, &clean);
+        self.compare_text = text;
+        let start = crate::ime::char_to_utf16(&self.compare_text, a);
+        let end = start + crate::ime::utf16_len(&clean);
+        self.compare_marked = Some(start..end);
+        self.compare_cursor = crate::ime::utf16_to_char(
+            &self.compare_text,
+            new_selected.map(|s| s.end).unwrap_or(end),
+        );
+        cx.notify();
+    }
+
+    /// IME 上屏：汉字顶掉整段拼音（不叠字），一次撤销、一次重映射、一次落库。
+    pub(crate) fn compare_ime_commit(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let eff = crate::ime::effective_replace_range(range, &self.compare_marked);
+        let before = self
+            .compare_ime_base
+            .take()
+            .unwrap_or_else(|| self.compare_snapshot());
+        let (a, b) = ce::range_to_chars(&self.compare_text, eff.clone(), self.compare_cursor);
+        let clean = ce::sanitize_ime(text, true);
+        let (new_text, cursor) = ce::splice_chars(&self.compare_text, a, b, &clean);
+        self.compare_undo.record(before, EditKind::Insert);
+        self.compare_text = new_text;
+        self.compare_cursor = cursor;
+        self.compare_marked = None;
+        self.compare_after_text_change(cx, true);
+        let _ = eff;
+    }
+
+    /// `unmarkText`：若还留着组字前快照，视为放弃组字并整段恢复，
+    /// 绝不把拼音串留在正文里（上屏路径已经把 base 取走，不会误恢复）。
+    pub(crate) fn compare_ime_unmark(&mut self, cx: &mut Context<Self>) {
+        if self.compare_marked.take().is_some() {
+            if let Some(base) = self.compare_ime_base.take() {
+                self.compare_text = base.text;
+                self.compare_cursor = base.cursor;
+            }
+        } else {
+            self.compare_ime_base = None;
+        }
+        cx.notify();
+    }
+
+    fn compare_restore(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
+        self.compare_text = snap.text;
+        self.compare_cursor = snap.cursor;
+        self.compare_marked = None;
+        self.compare_ime_base = None;
+        self.compare_after_text_change(cx, true);
+    }
+
+    fn compare_undo_last(&mut self, cx: &mut Context<Self>) {
+        let cur = self.compare_snapshot();
+        match self.compare_undo.undo(cur) {
+            Some(prev) => self.compare_restore(prev, cx),
+            None => {
+                self.notice = "没有可撤销的编辑".to_string();
+                cx.notify();
+            }
+        }
+    }
+
+    fn compare_redo_last(&mut self, cx: &mut Context<Self>) {
+        let cur = self.compare_snapshot();
+        match self.compare_undo.redo(cur) {
+            Some(next) => self.compare_restore(next, cx),
+            None => {
+                self.notice = "没有可重做的编辑".to_string();
+                cx.notify();
+            }
+        }
+    }
+
+    /// **左图点字 → 右栏精准高亮定位**（清单第 3 条的下半）。
+    /// 按绝对下标找到它所在的视觉行，把右栏滚到该行偏上 1/3 处；
+    /// 红框由 `compare_hit` 驱动，滚动由 `ScrollHandle` 程序化设置
+    /// （不经过 on_wheel，故绝不触发 LinkArbiter 镜像回声 / 死锁）。
+    fn compare_reveal_char(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let rows = self.compare_rows();
+        let Some(r) = rows
+            .iter()
+            .position(|line| line.iter().any(|c| c.idx == idx))
+        else {
+            return;
+        };
+        // 与渲染层共用本帧的 `compare_row_h`：缩放 / 行距调整后，
+        // 「左图点字 → 右栏滚到该行」依旧落在同一条稿纸格线上。
+        let line_h = self.compare_row_h;
+        let y = 28.0 + r as f32 * line_h;
+        let max = self.compare_text_scroll.max_offset().height / px(1.0);
+        let target = -(y - self.compare_viewport_h * 0.33).clamp(0.0, max.max(0.0));
+        let cur = self.compare_text_scroll.offset();
+        self.compare_text_scroll
+            .set_offset(Point::new(cur.x, px(target)));
+        self.link_arbiter_state =
+            Some((LinkSide::Right, std::time::Instant::now()));
+        cx.notify();
+    }
+
+    /// 右栏某个字被点：**事件冲突的正解** —— 联动与光标不是二选一。
+    /// 单击同时写 `compare_hit`（左图亮红框）与 `compare_cursor`（编辑态）；
+    /// 双击才切进编辑态。两条状态互不覆盖，焦点与命中各走各的路。
+    fn compare_on_char_click(
+        &mut self,
+        idx: usize,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let total = self.compare_text.chars().count();
+        let at = idx.min(total.saturating_sub(1).max(0));
+        self.compare_hit = Some(at);
+        if self.compare_editing {
+            self.compare_cursor = idx.min(total);
+            self.compare_undo.barrier();
+            // 每次点选都确保焦点还在编辑器上（原生输入法上下文不丢）。
+            window.activate_window();
+            window.focus(&self.compare_focus);
+        } else if ev.click_count >= 2 {
+            self.compare_begin_editing(idx, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 编辑态键盘：**可打印字符一律不直插**（全部交给 InputHandler），
+    /// 这里只管编辑键，否则中文输入法必然叠字（工作台同款铁律）。
+    fn compare_on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        if !self.compare_editing {
+            return; // 浏览态：按键交还主阅读器（翻页 / 快捷键一概不抢）。
+        }
+        if self.compare_marked.is_some() {
+            return; // 组字中：方向键 / Esc 交给输入法
+        }
+        let k = ev.keystroke.key.as_str();
+        let shift = ev.keystroke.modifiers.shift;
+        let cmd = ev.keystroke.modifiers.platform || ev.keystroke.modifiers.control;
+        if cmd {
+            match k {
+                "z" | "Z" => {
+                    if shift {
+                        self.compare_redo_last(cx);
+                    } else {
+                        self.compare_undo_last(cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "s" | "S" => {
+                    self.compare_save_to_db(cx, false);
+                    cx.stop_propagation();
+                    return;
+                }
+                "v" | "V" => {
+                    if let Some(s) = crate::clipboard::read_text(cx) {
+                        if !s.is_empty() {
+                            self.compare_edit_replace(None, &s, EditKind::Insert, cx);
+                        }
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "a" | "A" => {
+                    // 全选：本编辑器以「光标 + 单点定位」为核心，全选落在末尾
+                    // 并给提示，不伪造一个看不见的选区（避免剪贴板语义错乱）。
+                    self.compare_cursor = self.compare_text.chars().count();
+                    self.compare_undo.barrier();
+                    self.notice = "已移到文末（可用 ⌘V 粘贴、⌘Z 撤销）".to_string();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "left" => {
+                    self.compare_cursor = 0;
+                    self.compare_undo.barrier();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "right" => {
+                    self.compare_cursor = self.compare_text.chars().count();
+                    self.compare_undo.barrier();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "up" => {
+                    self.compare_cursor = 0;
+                    self.compare_undo.barrier();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "down" => {
+                    self.compare_cursor = self.compare_text.chars().count();
+                    self.compare_undo.barrier();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let total = self.compare_text.chars().count();
+        let rows = self.compare_rows();
+        match k {
+            "backspace" | "delete" => {
+                let forward = k == "delete";
+                let a = if forward {
+                    self.compare_cursor.min(total)
+                } else {
+                    self.compare_cursor.saturating_sub(1)
+                };
+                if a < total {
+                    let before = self.compare_snapshot();
+                    let (text, cursor) =
+                        ce::splice_chars(&self.compare_text, a, a + 1, "");
+                    self.compare_undo.record(before, EditKind::Delete);
+                    self.compare_text = text;
+                    self.compare_cursor = cursor;
+                    self.compare_after_text_change(cx, true);
+                }
+            }
+            "enter" | "return" => {
+                self.compare_edit_replace(None, "\n", EditKind::Insert, cx);
+            }
+            "left" => {
+                self.compare_cursor = self.compare_cursor.saturating_sub(1);
+                self.compare_undo.barrier();
+                cx.notify();
+            }
+            "right" => {
+                self.compare_cursor = (self.compare_cursor + 1).min(total);
+                self.compare_undo.barrier();
+                cx.notify();
+            }
+            "up" | "down" => {
+                let (r, c) = ce::caret_xy(&rows, self.compare_cursor);
+                let nr = if k == "up" {
+                    r.saturating_sub(1)
+                } else {
+                    (r + 1).min(rows.len().saturating_sub(1))
+                };
+                self.compare_cursor = ce::index_at(&rows, nr, c, total);
+                self.compare_undo.barrier();
+                cx.notify();
+            }
+            "home" => {
+                let (r, _) = ce::caret_xy(&rows, self.compare_cursor);
+                self.compare_cursor = ce::index_at(&rows, r, 0, total);
+                self.compare_undo.barrier();
+                cx.notify();
+            }
+            "end" => {
+                let (r, _) = ce::caret_xy(&rows, self.compare_cursor);
+                let c = rows.get(r).map(|l| l.len()).unwrap_or(0);
+                self.compare_cursor = ce::index_at(&rows, r, c, total);
+                self.compare_undo.barrier();
+                cx.notify();
+            }
+            "escape" => {
+                self.compare_finish_editing(cx);
+            }
+            // 其余（可打印字符 / 输入法键）一律不接管。
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    /// 把右侧已识别的 `compare_text` 写入本地文件。无文字时给提示，不弹框。
+    pub fn export_compare_txt(&mut self, cx: &mut Context<Self>) {
+        // L9：统一走 SQLite 最新快照（旧实现直接读内存 `compare_text`，
+        // 校对后未落盘时会导出旧字，故收编进导出中心）。
+        self.export_compare_format(crate::export_center::Format::Txt, cx);
     }
 
     /// 『保存对照图』按钮（Compare Mode 顶部操作栏专用）：把当前双屏对照
@@ -6334,6 +7492,9 @@ impl Root {
     /// 对话框落盘。复用 `share_paint::render_compare_png`（CG 离屏管线）与
     /// `exporter::save_bytes`——绝不碰 reader 排版引擎，只服务 Compare Mode。
     pub fn save_compare_image(&mut self, cx: &mut Context<Self>) {
+        if !self.export_guard(cx) {
+            return;
+        }
         let img = match self.compare_img.clone() {
             Some(p) => p,
             None => {
@@ -8838,7 +9999,7 @@ fn anki_push_card(
         self.sel_char = None;
     }
 
-    /// 顶部品牌条（三态共用）：**笺读 · JianDu · 每日一句**。
+    /// 顶部品牌条（三态共用）：**勘阅 · KanYue · 每日一句**。
     ///
     /// v1.47.0 立：品牌之后接**每日一句**（淡墨小字 + 出处），替掉静态标语
     /// 「为阅读创造环境」；诗句限宽 400px、超长截断缀省略号，绝不挤走右侧
@@ -8862,14 +10023,14 @@ fn anki_push_card(
                     .text_size(px(16.0))
                     .font_family(song.clone())
                     .text_color(rgb(CINNABAR))
-                    .child(SharedString::from("笺读")),
+                    .child(SharedString::from("勘阅")),
             )
             .child(
                 div()
                     .text_size(px(11.0))
                     .font_family(song.clone())
                     .text_color(rgb(INK_SOFT))
-                    .child(SharedString::from("JianDu")),
+                    .child(SharedString::from("KanYue")),
             )
             // 极细墨点：品牌与诗句之间的那枚「·」。
             .child(
@@ -9114,16 +10275,19 @@ impl Render for Root {
         if !self.beta_ok {
             return self.render_beta_gate(window, cx).into_any_element();
         }
-        // 笺校工作台全屏态：直接返回工作台视图，根本不构建阅读界面 → 对阅读零影响。
+        // 笺校工作台 · 子模式①「原文对照」：直接返回老工作台视图（含 show_diff
+        // 文本↔文本逐字比对），根本不构建阅读界面 → 对阅读零影响。
+        // 与下面 Compare 子模式并列，由工作台顶栏 Tab 切换，绝不硬合并。
         if self.mode == AppMode::Collation {
             // 工作台里也可能用问小笺的「全庫 / 全書」——翻库的派活口在这个
             // 每帧轮询里，早退之前必须走一遍，否则面板会一直悬在「翻检中」。
             self.poll_ai(cx);
             return self.collation.clone().into_any_element();
         }
-        // V2.0 影印双屏对照（L1 试水）：仅 dev_compare 开启且处于 Compare 态时进入，
-        // 对普通阅读 / 笺校**零影响**（普通用户走不到这里）。
-        if self.dev_compare && self.mode == AppMode::Compare {
+        // 笺校工作台 · 子模式②「双屏联动」：图↔文坐标联动。
+        // 没有环境变量闸门——只有用户自己在工作台顶栏切到这个态才画它；
+        // 切回【阅读】/【原文对照】时阅读界面与老工作台一行都不受影响。
+        if self.mode == AppMode::Compare {
             return self.render_compare(window, cx).into_any_element();
         }
         if std::env::var("JIANDU_IME_DEBUG").is_ok() {
@@ -10828,6 +11992,62 @@ mod tests {
 // V2.0 L2 · HitTester（点击命中检测，O(log n)）：把左侧图片上的字形坐标
 // （图像像素坐标系）与右侧文本的字符索引关联起来。蓝图 L4 的 AlignmentStore
 // 是同一思想的「落库 + 双向」版，这里先在内存里跑通点击联动。
+/// **仅供内部截图 / 自动化脚本**的启动态种子，不是模式闸门，也不是正式入口。
+/// 出厂包不设 `JIANDU_DEV_COMPARE`，启动一律 V1.0 书架 / 沉浸阅读；
+/// 模式选择权完全交给用户在笺校工作台顶栏的原生 Tab。
+fn dev_compare_seed() -> bool {
+    std::env::var("JIANDU_DEV_COMPARE").is_ok()
+}
+
+/// 笺校工作台顶栏的原生分段 Tab：【阅读 | 原文对照 | 双屏联动】。
+///
+/// 三态直接落在既有 `AppMode` 上，不新增状态字段、不复制视图：
+///   · Reader    → 纯看书（V1.0 阅读器，一字未改）
+///   · Collation → 原文对照（文本↔文本，`collation.rs` 业务一字未改）
+///   · Compare   → 双屏联动（图↔文，稿纸格线 / 编辑器 / 7 格式导出）
+/// 切走笺校前先把未上屏的编辑收口落库，绝不因切模式丢校订。
+fn compare_mode_tab(
+    label: &'static str,
+    active: bool,
+    target: AppMode,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(24.0))
+        .px(px(12.0))
+        .rounded(px(5.0))
+        .bg(if active {
+            rgb(0x2F6FED)
+        } else {
+            rgb(0xF0F0F3)
+        })
+        .text_size(px(12.0))
+        .text_color(if active {
+            rgb(0xFFFFFF)
+        } else {
+            rgb(0x6B6B70)
+        })
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                if this.mode != target {
+                    if this.compare_editing {
+                        this.compare_finish_editing(cx);
+                    }
+                    this.show_export_menu = false;
+                    this.compare_hit = None;
+                    this.mode = target;
+                    cx.notify();
+                }
+            }),
+        )
+        .child(SharedString::from(label))
+}
+
 #[derive(Clone, Copy)]
 struct CompareGlyph {
     x: f32,
@@ -10963,6 +12183,332 @@ fn load_compare_from_db(db_path: &Path, page_id: i64)
     Some((glyphs, text, (iw as u32, ih as u32)))
 }
 
+/// L9 · 读取本页逐字排版层级（`glyphs.span_kind`，由 core 字高双峰聚类落库）。
+///
+/// 旧会话库没有该列时返回空表，界面自动退回注本体例切分，**不报错、不空白**。
+fn load_span_kinds_from_db_index(db_path: &Path, page_index: i64) -> Vec<u8> {
+    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+        return Vec::new();
+    };
+    let has_kind = conn
+        .prepare("PRAGMA table_info(glyphs)")
+        .and_then(|mut s| {
+            let rows = s.query_map([], |r| r.get::<_, String>(1))?;
+            let mut found = false;
+            for name in rows {
+                if name.unwrap_or_default() == "span_kind" {
+                    found = true;
+                }
+            }
+            Ok(found)
+        })
+        .unwrap_or(false);
+    if !has_kind {
+        return Vec::new();
+    }
+    let text: String = match conn.query_row(
+        "SELECT text FROM pages WHERE page_index = ?1",
+        rusqlite::params![page_index],
+        |r| r.get(0),
+    ) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = vec![0u8; text.chars().count()];
+    let mut stmt = match conn.prepare(
+        "SELECT g.char_index, g.span_kind FROM glyphs g \
+         WHERE g.page_id = (SELECT id FROM pages WHERE page_index = ?1)",
+    ) {
+        Ok(s) => s,
+        Err(_) => return out,
+    };
+    if let Ok(rows) = stmt.query_map(rusqlite::params![page_index], |r| {
+        Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as u8))
+    }) {
+        for (i, k) in rows.flatten() {
+            if i < out.len() {
+                out[i] = k;
+            }
+        }
+    }
+    out
+}
+
+/// v2.0 UI 外壳 · 按 **page_index**（= PDF 页码，由 `pdf-cli` 落库时写入）读取对照数据。
+///
+/// 与 [`load_compare_from_db`]（按 `pages.id`，供 env 演示）区分：`pdf-cli` 落库用
+/// `(doc_id, page_index)` 作唯一键，故这里 `WHERE page_index = ?1` 即可定位；单文档会话
+/// 下无需再传 doc_title。返回 `(字形列表, 同源文本, 图像尺寸)`。
+fn load_compare_from_db_index(
+    db_path: &Path,
+    page_index: i64,
+) -> Option<(Vec<CompareGlyph>, String, (u32, u32))> {
+    let conn = rusqlite::Connection::open(db_path).ok()?;
+    let (iw, ih, text) = {
+        let mut stmt = conn
+            .prepare("SELECT image_width, image_height, text FROM pages WHERE page_index = ?1")
+            .ok()?;
+        let mut rows = stmt.query(rusqlite::params![page_index]).ok()?;
+        let row = rows.next().ok()??;
+        (
+            row.get::<_, i64>(0).ok()?,
+            row.get::<_, i64>(1).ok()?,
+            row.get::<_, String>(2).unwrap_or_default(),
+        )
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT char_index, x, y, w, h FROM glyphs \
+             WHERE page_id = (SELECT id FROM pages WHERE page_index = ?1) \
+               AND is_space = 0 ORDER BY char_index",
+        )
+        .ok()?;
+    let mut rows = stmt.query(rusqlite::params![page_index]).ok()?;
+    let mut glyphs = Vec::new();
+    while let Some(row) = rows.next().ok()? {
+        let target = row.get::<_, i64>(0).ok()? as usize;
+        let x = row.get::<_, f64>(1).ok()? as f32;
+        let y = row.get::<_, f64>(2).ok()? as f32;
+        let w = row.get::<_, f64>(3).ok()? as f32;
+        let h = row.get::<_, f64>(4).ok()? as f32;
+        glyphs.push(CompareGlyph { x, y, w, h, target });
+    }
+    Some((glyphs, text, (iw as u32, ih as u32)))
+}
+
+/// v2.0 UI 外壳 · 定位 L7 流水线的两个 helper 二进制（免疫宿主钩子版）。
+///
+/// 名字一律用 `compare_*_helper` 这类**不含 `jiandu` 字样**的形式：宿主钩子
+/// `pkill -f jiandu` 按 argv 匹配，任何含该字样的子进程路径都会被连坐杀死
+/// （表现为「导入后一直转圈 / 解析失败」）。
+///
+/// 查找顺序（都不依赖硬编码工程路径）：
+///   ① 环境变量显式覆盖（在 environment 里、不在 argv 里，钩子看不见）；
+///   ② 主程序同目录（打包后 `Contents/MacOS/` 会铺这两个 helper）；
+///   ③ 系统临时目录（避雷启动脚本 `launch-v2-safe.sh` 会把它们铺到这里）。
+fn helper_bin(env_key: &str, name: &str) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(env_key) {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        let p = dir.join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let p = std::env::temp_dir().join(name);
+    if p.exists() {
+        return Some(p);
+    }
+    None
+}
+
+fn pdf_helper() -> Result<PathBuf, String> {
+    helper_bin("JIANDU_PDF_HELPER", "compare_pdf_helper")
+        .ok_or_else(|| "找不到 PDF 解析 helper（compare_pdf_helper）".to_string())
+}
+
+fn ocr_helper() -> Result<PathBuf, String> {
+    helper_bin("JIANDU_OCR_HELPER", "compare_ocr_helper")
+        .ok_or_else(|| "找不到 OCR helper（compare_ocr_helper）".to_string())
+}
+
+// ── L9 · 商业授权（本地 Mock 验证 + 持久化，默认 Free）────────────────
+const PRO_CODE: &str = "JIANU-PRO-2026";
+
+fn pro_license_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join("Library/Application Support/JianDu/pro.license")
+}
+
+fn load_pro_license() -> bool {
+    std::fs::read_to_string(pro_license_path())
+        .map(|s| s.trim() == PRO_CODE)
+        .unwrap_or(false)
+}
+
+fn save_pro_license() {
+    let p = pro_license_path();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(p, PRO_CODE);
+}
+
+fn ask_activation_code() -> Option<String> {
+    // macOS 原生带输入框的对话框：GPUI 0.2.2 无内置 Editor，用 osascript
+    // 是最稳的商业级输入通道（独立进程，不碰 GPUI 主线程 run loop）。
+    let script = "text returned of (display dialog \"输入激活码以解锁专业版\" \
+                  default answer \"\" with title \"勘阅 · 专业版\" \
+                  buttons {\"取消\", \"激活\"} default button \"激活\")";
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// v2.0 UI 外壳 · **后台线程**跑的 PDF 导入流水线（首层：取页数 + 第 1 页）。
+///
+/// 1. `pdf-cli --count` 取总页数；2. 建会话目录 + SQLite；3. `pdf-cli --page 1 --ocr
+///    --db --keep` 光栅化 + OCR 落库（保留 PNG 供左图显示）；4. 读回左图 PNG + 从 SQLite
+/// 按 `page_index` 读字形 / 文本。任何步骤失败返回 `Err(人话)`，**绝不 panic**。
+fn run_pdf_import_pipeline(
+    pdf: &Path,
+) -> Result<(String, usize, PathBuf, Vec<CompareGlyph>, String, (u32, u32)), String> {
+    let pdf_cli = pdf_helper()?;
+    let ocr_bin = ocr_helper()?;
+    eprintln!("[v2] ═════════ 后台导入流水线启动 ═════════");
+    eprintln!("[v2] PDF      : {}", pdf.display());
+    eprintln!("[v2] pdf-cli  : {}", pdf_cli.display());
+    eprintln!("[v2] ocr-bin  : {}", ocr_bin.display());
+
+    // 1. 页数（不开位图、极快）。
+    eprintln!("[v2] ① 取页数（--count，不开位图）…");
+    let out = std::process::Command::new(&pdf_cli)
+        .arg(pdf)
+        .arg("--count")
+        .output()
+        .map_err(|e| format!("pdf-cli 启动失败：{e}"))?;
+    let total: usize = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    eprintln!("[v2] ① 总页数 = {}", total);
+    if total == 0 {
+        return Err("PDF 页数为 0 或解析失败".to_string());
+    }
+
+    // 2. 会话目录 + SQLite（每本导入独立，互不污染）。
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // 目录名也绝不能带 `jiandu` 字样：它会作为 `--out` / `--db` 参数进入
+    // 子进程 argv，被宿主钩子 `pkill -f jiandu` 连坐杀死。
+    let session_dir = std::env::temp_dir().join(format!("compare_session_{}", nanos));
+    let _ = std::fs::create_dir_all(&session_dir);
+    let db = session_dir.join("alignment.db");
+    eprintln!("[v2] ② 会话目录（独立 SQLite / WAL）：{}", session_dir.display());
+
+    // 3. 第 1 页：光栅化 + OCR 落库（保留 PNG 供左图显示）。
+    eprintln!("[v2] ③ 只解析【第 1 页】：光栅化 → Vision OCR → 落库（其余 {} 页不碰）", total - 1);
+    let t0 = std::time::Instant::now();
+    let r = std::process::Command::new(&pdf_cli)
+        .arg(pdf)
+        .arg("--page")
+        .arg("1")
+        .arg("--ocr")
+        .arg("--db")
+        .arg(&db)
+        .arg("--out")
+        .arg(&session_dir)
+        .arg("--keep")
+        .arg("--ocr-bin")
+        .arg(&ocr_bin)
+        .output()
+        .map_err(|e| format!("pdf-cli 运行失败：{e}"))?;
+    if !r.status.success() {
+        return Err(format!(
+            "pdf-cli 第 1 页失败：{}",
+            String::from_utf8_lossy(&r.stderr)
+        ));
+    }
+    for line in String::from_utf8_lossy(&r.stdout).lines() {
+        let s = line.trim();
+        if s.contains("落库") || s.contains("字形") || s.contains("glyphs") || s.contains("完成") {
+            eprintln!("[v2] ③   {}", s);
+        }
+    }
+    eprintln!("[v2] ③ 子进程完成，耗时 {:.2}s", t0.elapsed().as_secs_f64());
+
+    // 4. 读回（左图 PNG + SQLite 字形 / 文本）。
+    eprintln!("[v2] ④ 从 SQLite(WAL) 回读第 1 页 → 推入左右视口…");
+    let png = session_dir.join("page_0001.png");
+    let (glyphs, text, dims) = load_compare_from_db_index(&db, 1)
+        .ok_or_else(|| "第 1 页数据读取失败".to_string())?;
+    eprintln!(
+        "[v2] ④ 回读成功：{} 字形 / {} 字 / 图像 {:?} / PNG {}",
+        glyphs.len(),
+        // 口径：字数按**字符**计，不能用 `String::len()`（UTF-8 字节数，
+        // 中文每字 3 字节会把 654 字虚报成 1962 字，且与 glyph.target
+        // 的字符下标契约不符）。
+        text.chars().count(),
+        dims,
+        png.display()
+    );
+    eprintln!("[v2] ═════════ 流水线结束，交还主线程 ═════════");
+    Ok((
+        db.to_string_lossy().into_owned(),
+        total,
+        png,
+        glyphs,
+        text,
+        dims,
+    ))
+}
+
+/// v2.0 UI 外壳 · **后台线程**跑的懒加载翻页流水线（仅解析第 `page` 页）。
+///
+/// 与导入共用同一会话 SQLite / 输出目录，点第 N 页才实时光栅化 + OCR 第 N 页，
+/// 绝不一次性加载所有页——内存恒低（见内存纪律）。返回 `(左图PNG, 字形, 文本, 尺寸)`。
+fn run_pdf_page_pipeline(
+    pdf: &Path,
+    db: &str,
+    page: usize,
+) -> Result<(PathBuf, Vec<CompareGlyph>, String, (u32, u32)), String> {
+    let pdf_cli = pdf_helper()?;
+    let ocr_bin = ocr_helper()?;
+    let session_dir = PathBuf::from(db)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().to_path_buf());
+    eprintln!("[v2] ═════════ 懒加载：只解析第 {} 页 ═════════", page);
+    let t0 = std::time::Instant::now();
+    let r = std::process::Command::new(&pdf_cli)
+        .arg(pdf)
+        .arg("--page")
+        .arg(page.to_string())
+        .arg("--ocr")
+        .arg("--db")
+        .arg(db)
+        .arg("--out")
+        .arg(&session_dir)
+        .arg("--keep")
+        .arg("--ocr-bin")
+        .arg(&ocr_bin)
+        .output()
+        .map_err(|e| format!("pdf-cli 运行失败：{e}"))?;
+    if !r.status.success() {
+        return Err(format!(
+            "pdf-cli 第 {} 页失败：{}",
+            page,
+            String::from_utf8_lossy(&r.stderr)
+        ));
+    }
+    let png = session_dir.join(format!("page_{:04}.png", page));
+    let (glyphs, text, dims) = load_compare_from_db_index(&PathBuf::from(db), page as i64)
+        .ok_or_else(|| format!("第 {page} 页数据读取失败"))?;
+    eprintln!(
+        "[v2] 懒加载完成：第 {} 页 / {} 字形 / {} 字 / 耗时 {:.2}s",
+        page,
+        glyphs.len(),
+        text.chars().count(), // 字符口径，勿改回 `len()`（字节数）
+        t0.elapsed().as_secs_f64()
+    );
+    Ok((png, glyphs, text, dims))
+}
+
 /// 把用户导入的原图转成「安全可显示」的副本：先只读头信息取原始宽高（不解码整图），
 /// 若最长边 ≤ `MAX_DIM` 且总像素 ≤ `MAX_PIXELS` 则直接用原图；否则按两者更严的约束
 /// 降采样到 ≤4096px / ≤1 亿像素，写入临时 PNG 再返回其路径。
@@ -11050,26 +12596,67 @@ mod compare_image_display_tests {
 impl Root {
     /// L1 双屏：左图（扫描影印）/ 右文（现存竖排正文），两栏各自独立滚动。
     pub fn render_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        // L9 · Finder 拖拽：AppKit 回调只把路径塞进全局队列，这里每帧取一次。
+        // arm_once 内部 AtomicBool 只挂一次 NSView 拖拽方法，重复调用零开销。
+        crate::dropzone::arm_once();
+        if let Some(p) = crate::dropzone::take().into_iter().find(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    matches!(
+                        e.to_ascii_lowercase().as_str(),
+                        "pdf" | "png" | "jpg" | "jpeg"
+                    )
+                })
+                .unwrap_or(false)
+        }) {
+            self.import_compare_path(p, cx);
+        }
+        // Task 1 · 补焦：双击进编辑的那一帧 InputField 还没进派发树，
+        // 这里在 render（拿得到 Window）里按计划补三次，中文输入法才稳。
+        if self.compare_refocus > 0 {
+            self.compare_refocus -= 1;
+            if self.compare_editing {
+                window.activate_window();
+                window.focus(&self.compare_focus);
+            }
+        }
         let t: Theme = self.theme;
         let horizontal = std::env::var("JIANDU_COMPARE_HORIZONTAL").is_ok();
-        let family = if horizontal {
-            crate::fonts::family_for(self.font_modern, crate::types::Script::Modern)
-        } else {
-            self.main_family()
-        };
+        // L9 · 商业化排版：对照模式统一 macOS 系统原生 PingFang SC，右文按「一本书」
+        // 的行距/字距铺排；不沿用阅读器宋体族，V1.0 主阅读器字体完全不受影响。
+        let family: SharedString = SharedString::from("PingFang SC");
         let vp = window.viewport_size();
         // `Pixels` 字段对外部 crate 私有，借 `px(1.0)` 除一下取出 f32（与下方
         // 阅读视图取视口尺寸的写法同源，安全、不碰 Pixels 私有字段）。
         let unit = px(1.0);
         let vw = vp.width / unit;
         let vh = vp.height / unit;
-        let rule = rgba(((t.rule() & 0xFFFFFF) << 8) | 0x66);
+        // ── 窗口 Resize → 响应式 reflow ────────────────────────────────
+        // GPUI 0.2.2 没有独立的「Resize Event」订阅 API；窗口尺寸一变，
+        // 平台层就会让窗口重跑 render（`viewport_size()` 即新值）。这里
+        // 显式比对上一帧宽度并补一次 notify，让「每行字数 → 字格 → 格线
+        // 条数 → 光标锚点」在同一次 reflow 内收敛，绝不留半帧错位。
+        // 阈值 0.5px 过滤亚像素抖动，避免 notify 自激（下一帧即收敛）。
+        if (vw - self.compare_last_vw).abs() > 0.5 {
+            self.compare_last_vw = vw;
+            cx.notify();
+        }
+        // Task 1：左图点字后右栏「精准高亮定位」要按可见区高度算滚动目标。
+        self.compare_viewport_h = vh;
         let fs = 22.0 * self.compare_zoom.max(0.05); // L8：右文随缩放系数同步放大/缩小（与读者主字独立）
-        let per_line = 30usize; // 横排每行字数（仅 JIANDU_COMPARE_HORIZONTAL 生效）
+        let editing = self.compare_editing;
 
         // L6 Step1：数据源切换——优先 SQLite（生产），回退 JSON（兼容导入本地图）。
         // 两者都把 glyph 灌进 CompareGlyph + HitTester，右栏用同一份 text 逐字渲染。
-        if self.compare_glyphs.is_empty() {
+        //
+        // ★ v2.0 兜底容错闸门：已进入 PDF 会话时**绝不**再走自动回退。否则当某页
+        //   OCR 恰好返回 0 字（compare_glyphs 为空），每帧都会把演示 JSON 误灌进
+        //   右栏，把「未识别到横排文字」的空态冲掉。
+        if self.compare_glyphs.is_empty()
+            && self.current_pdf_path.is_none()
+            && self.session_db.is_none()
+        {
             let loaded = if let Some((db, page_id)) = &self.compare_db {
                 load_compare_from_db(db, *page_id)
             } else if let Some(p) = &self.compare_json_path {
@@ -11079,9 +12666,15 @@ impl Root {
             };
             if let Some((g, txt, dims)) = loaded {
                 self.compare_img_dims = dims;
-                self.compare_text = txt;
+                self.compare_text = txt.clone();
                 self.compare_hit_tester = HitTester::new(g.clone());
-                self.compare_glyphs = g;
+                self.compare_glyphs = g.clone();
+                // Task 1：env / JSON 演示数据源没有走导入流水线，这里补一次
+                // 基准初始化，保证编辑后重映射不会拿空串当原文。
+                if self.compare_baseline_text.is_empty() || !self.compare_editing {
+                    self.compare_baseline_text = txt;
+                    self.compare_baseline_glyphs = g;
+                }
                 // 演示钩子（可选、一次性）：`JIANDU_COMPARE_HIT=<idx>` 预置命中，
                 // 让静态截图也能展示「左点 → 右亮红框」的联动结果；真实点击
                 // 会覆盖它（见左侧 overlay 的 on_mouse_down）。
@@ -11205,19 +12798,25 @@ impl Root {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                    // Task 1 · 左图点字 → 右栏精准高亮定位：
+                                    // 亮红框 + 把右栏滚到该字所在视觉行 + 编辑态
+                                    // 顺带把光标落过去（三者共用同一个绝对下标）。
                                     this.compare_hit = Some(tgt);
+                                    if this.compare_editing {
+                                        this.compare_cursor =
+                                            tgt.min(this.compare_text.chars().count());
+                                        this.compare_undo.barrier();
+                                    }
+                                    this.compare_reveal_char(tgt, cx);
                                     cx.notify();
                                 }),
                             );
                         if is_hit {
-                            // 命中：醒目红框 + 淡红填充，标示「左图被点中的字」。
-                            gbox = gbox
-                                .border_2()
-                                .border_color(rgb(0xE02020))
-                                .bg(rgba(0xE0202022));
+                            // 命中：醒目朱砂红框，**不填充**，让古籍墨迹透出来。
+                            gbox = gbox.border_2().border_color(rgb(0xE02020));
                         } else {
-                            // 非命中：可见淡蓝框，标示字形可点区域。
-                            gbox = gbox.border_1().border_color(rgba(0x2F6FED88));
+                            // 非命中：1px 极淡蓝细线，只标示可点区域，绝不遮字。
+                            gbox = gbox.border_1().border_color(rgba(0x2F6FED3A));
                         }
                         img_box = img_box.child(gbox);
                     }
@@ -11240,7 +12839,9 @@ impl Root {
                     div()
                         .text_size(px(14.0))
                         .text_color(rgb(t.ink_soft()))
-                        .child(SharedString::from("未设置 JIANDU_COMPARE_IMG")),
+                        .child(SharedString::from(
+                            "点击顶部【导入 PDF / 原图】选择影印 PDF 或图片",
+                        )),
                 );
             }
         }
@@ -11249,6 +12850,14 @@ impl Root {
             .flex_col()
             .w(px(left_w))
             .h_full()
+            .bg(rgb(0xFFFFFF))
+            .rounded(px(8.0))
+            .shadow(vec![gpui::BoxShadow {
+                color: rgba(0x00000012).into(),
+                offset: gpui::Point::new(px(0.0), px(2.0)),
+                blur_radius: px(10.0),
+                spread_radius: px(0.0),
+            }])
             .child(
                 div()
                     .h(px(30.0))
@@ -11274,120 +12883,267 @@ impl Root {
                     .child(left_scroll),
             );
 
-        // ── 右栏：与左图同源的文本（L2 联动）──
-        // 优先用坐标 JSON 里的 `text`（与左图 glyph.target 全局对齐）；无坐标
-        // JSON 时回退本书正文（此时无命中联动）。每字带全局 idx，左侧点击命中
-        // glyph.target == idx 时，右侧该字亮红框（L4 才做真实书对齐）。
-        let right_src: Vec<String> = if !self.compare_text.is_empty() {
-            vec![self.compare_text.clone()]
+        // ── 右栏：与左图同源的文本（L2 联动 + Task 1 笺校编辑）──
+        // 唯一数据源 = `compare_text`（SQLite / OCR JSON），与左图
+        // `glyph.target` 全局对齐。**不再回退本书正文**：那是演示数据，
+        // 会与真实字框错位，也违背「纯靠 UI 导入」的商业化闭环。
+        // ── Task 1 · 字格网格统一口径 ──────────────────────────────────
+        // 旧实现按 `Vec<char>` 顺序累加 idx 且跳过 '\n'，段落一多，右侧
+        // 红框就整体前移（联动漂移）。现在一律用 compare_rows() 的**绝对
+        // 下标**字格：光标 / glyph.target / 双向联动共用同一坐标系，零漂移。
+        // 横排 = 行（左→右），竖排 = 列（右起），容器方向仍由 horizontal 决定，
+        // 不触碰主阅读器 grid.rs / reader.rs，V1.0 纯净不受影响。
+        // ── 响应式字格：每行字数由右栏**当帧真实可用宽度**算出 ────────
+        // 绝不硬编码 30：窗口一缩小就会把字裁在右缘（实测抓到）。
+        let pad = 28.0f32;
+        let line_h = fs * 1.45;
+        // 稿纸行距：字 22px / 格高 31.9px / 行间 16px —— 加线后仍透气，
+        // 不会挤成表格（验收第 3 点）。
+        let row_gap = if horizontal { 16.0 } else { 6.0 };
+        let char_gap = if horizontal { 3.0 } else { 0.0 };
+        let row_h = line_h + row_gap;
+        let col_w = fs + row_gap;
+        // 内容区总宽 = 视口 − 左右 padding(12×2) − 面板间距(12) − 左栏宽。
+        // 公式抽到 `compare_editor::responsive_per_line` 纯函数，多档窗口
+        // 宽度有单测兜底（`responsive_per_line_never_overflows_any_window`）。
+        let right_w = ce::right_pane_width(vw, left_w);
+        let per_line = if horizontal {
+            ce::responsive_per_line(vw, left_w, fs, pad, char_gap)
         } else {
-            self.book
-                .as_ref()
-                .map(|b| {
-                    b.chapters
-                        .iter()
-                        .flat_map(|c| c.paragraphs.iter().map(|p| p.text.clone()))
-                        .collect()
-                })
-                .unwrap_or_default()
+            // 竖排：每列字数按可见高度算，同一套「按容器算」口径。
+            let usable_h = (vh - 48.0 - 24.0 - pad * 2.0).max(line_h * 2.0);
+            (usable_h / line_h).floor().max(1.0) as usize
         };
-        // 右文绘制：竖排（默认，右起列）/ 横排（JIANDU_COMPARE_HORIZONTAL=1，上→下行流式）。
-        // 两模式共用同一套「单字 cell」绘制（含反向联动 on_mouse_down），仅容器方向不同。
-        // 注：对照模式右栏是独立的 dev 渲染器，本分支只是把"30 字切列竖排"翻成"段落流式横排"，
-        // 不触碰主阅读器 grid.rs / reader.rs，V1.0 纯净不受影响（竖排默认行为完全不变）。
-        let per_col = 30usize;
-        let mut idx: usize = 0;
-        let mut rows: Vec<Vec<char>> = Vec::new();
-        if horizontal {
-            // 横排：按段落('\n')切分，长行按 per_line 折行，每段生成若干「行」(左→右)。
-            for para in &right_src {
-                let para = para.replace('\r', "");
-                for line in para.split('\n') {
-                    let chars: Vec<char> = line.chars().collect();
-                    if chars.is_empty() {
-                        continue;
-                    }
-                    for chunk in chars.chunks(per_line) {
-                        rows.push(chunk.to_vec());
-                    }
-                }
-            }
-        } else {
-            // 竖排（原逻辑）：每 30 字切成一列，右起排布。
-            let mut cur_col: Vec<char> = Vec::new();
-            for para in &right_src {
-                for ch in para.chars() {
-                    if ch == '\n' || ch == '\r' {
-                        continue;
-                    }
-                    cur_col.push(ch);
-                    if cur_col.len() >= per_col {
-                        rows.push(std::mem::take(&mut cur_col));
-                    }
-                }
-            }
-            if !cur_col.is_empty() {
-                rows.push(cur_col);
-            }
-        }
+        self.compare_per_line = per_line;
+        self.compare_row_h = row_h;
+        // 打字 / 缩放 / 翻页后，字格与格线条数都由这一份 cell_rows 同源重生。
+        let cell_rows = self.compare_rows();
+        let caret = self.compare_cursor;
+        let (caret_r, caret_c) = ce::caret_xy(&cell_rows, caret);
+        let marked_u16 = self.compare_marked.clone();
+        // IME 候选框锚点：本帧光标所在的小矩形（相对编辑区左上角）。
+        let mut caret_anchor = (pad, pad, 2.0f32, line_h);
         let mut text_row = if horizontal {
-            div().flex().flex_col().gap(px(4.0)).p(px(20.0))
+            div().flex().flex_col().gap(px(row_gap)).p(px(pad))
         } else {
-            div().flex().flex_row().flex_row_reverse().gap(px(6.0)).p(px(20.0))
+            div()
+                .flex()
+                .flex_row()
+                .flex_row_reverse()
+                .gap(px(row_gap))
+                .p(px(pad))
         };
-        if rows.is_empty() {
+        if cell_rows.iter().all(|r| r.is_empty()) {
+            // L9 · 优雅空态：OCR 返回 0 字只给一张柔和提示卡，绝不 panic。
+            let hint = if self.current_pdf_path.is_some() {
+                "未识别到横排文字 · 本页可能是纯图片或竖排古籍，试试翻到下一页"
+            } else {
+                "点击顶部【导入 PDF / 原图】开始双屏对照"
+            };
             text_row = text_row.child(
                 div()
+                    .px(px(20.0))
+                    .py(px(16.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(0xF5F5F7))
                     .text_size(px(14.0))
-                    .text_color(rgb(t.ink_soft()))
-                    .child(SharedString::from(
-                        "（未打开书籍 · 用 JIANDU_AUTO_READ 开一本书）",
-                    )),
+                    .font_family(family.clone())
+                    .text_color(rgb(0x86868B))
+                    .child(SharedString::from(hint)),
             );
         } else {
-            for row in &rows {
+            for (r, line) in cell_rows.iter().enumerate() {
                 let mut line_box = if horizontal {
-                    div().flex().flex_row().gap(px(2.0))
+                    div().flex().flex_row().gap(px(char_gap))
                 } else {
                     div().flex().flex_col()
                 };
-                for ch in row {
-                    let cidx = idx;
+                // 浏览态把换行占位隐藏（观感与旧版一致）；编辑态保留，
+                // 保证**每个字符下标都有可点击区域**，光标点哪落哪。
+                let visible: Vec<&ce::Cell> =
+                    line.iter().filter(|c| editing || !c.newline).collect();
+                let mut x = 0.0f32;
+                for (c, cc) in visible.iter().enumerate() {
+                    let cidx = cc.idx;
+                    let is_caret = editing && r == caret_r && c == caret_c;
+                    if is_caret {
+                        if horizontal {
+                            caret_anchor = (pad + x, pad + r as f32 * row_h, 2.0, line_h);
+                        } else {
+                            // flex_row_reverse：第 0 行在最右，从左边数是倒数第 r 个。
+                            let from_left = cell_rows.len().saturating_sub(1).saturating_sub(r);
+                            caret_anchor = (
+                                pad + from_left as f32 * col_w,
+                                pad + c as f32 * line_h,
+                                2.0,
+                                line_h,
+                            );
+                        }
+                        line_box = line_box.child(
+                            div().w(px(2.0)).h(px(line_h)).bg(rgb(0x2F6FED)),
+                        );
+                        x += 2.0 + char_gap;
+                    }
+                    // 清单第 5 条 · 排版层级：正文大字 / 夹注小字 / 结构标签最小。
+                    let (cfs, ink) = match cc.kind {
+                        SpanKind::Body => (fs, t.ink()),
+                        SpanKind::Gloss => (fs * 0.62, t.ink_soft()),
+                        SpanKind::GlossTag => (fs * 0.55, 0x9A9A9Eu32),
+                    };
                     let is_hit = hit == Some(cidx);
+                    // 组字中的拼音：淡蓝底看得见，但尚未上屏、不落库。
+                    let in_marked = marked_u16
+                        .as_ref()
+                        .map(|m| {
+                            let u = crate::ime::char_to_utf16(&self.compare_text, cidx);
+                            u >= m.start && u < m.end
+                        })
+                        .unwrap_or(false);
                     let mut cell = div()
-                        .h(px(fs * 1.15))
+                        .h(px(line_h))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(fs))
+                        .text_size(px(cfs))
                         .font_family(family.clone())
-                        .text_color(rgb(if is_hit { 0xE02020 } else { t.ink() }))
+                        .text_color(rgb(if is_hit { 0xE02020 } else { ink }))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                                // 反向联动：右文点击某字（cidx）→ 该 idx 即 AlignmentStore
-                                // 的 target 键；左图渲染按 `glyph.target == compare_hit`
-                                // 在该 glyph 的 x/y 区域画红框高亮（见左栏 img_box 循环）。
-                                // 滚动/平移露字留待后续，先保证高亮生效。
-                                this.compare_hit = Some(cidx);
-                                cx.notify();
+                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                // **事件冲突的正解**：单击既做联动（写 compare_hit）
+                                // 又做光标定位（写 compare_cursor），双击才进编辑态。
+                                // 三者是不同状态，不抢同一个事件。
+                                this.compare_on_char_click(cidx, ev, window, cx);
                             }),
                         )
-                        .child(SharedString::from(ch.to_string()));
+                        .child(SharedString::from(cc.ch.to_string()));
                     if is_hit {
                         cell = cell.border_1().border_color(rgb(0xE02020));
                     }
+                    if in_marked {
+                        cell = cell.bg(rgba(0x2F6FED1F));
+                    }
                     line_box = line_box.child(cell);
-                    idx += 1;
+                    x += (if cc.newline { cfs * 0.6 } else { cfs }) + char_gap;
+                }
+                // 行尾 / 文末光标：没有下一个字格可挂，补一条可见竖线。
+                if editing && r == caret_r && caret_c >= visible.len() {
+                    if horizontal {
+                        caret_anchor = (pad + x, pad + r as f32 * row_h, 2.0, line_h);
+                    } else {
+                        let from_left = cell_rows.len().saturating_sub(1).saturating_sub(r);
+                        caret_anchor = (
+                            pad + from_left as f32 * col_w,
+                            pad + visible.len() as f32 * line_h,
+                            2.0,
+                            line_h,
+                        );
+                    }
+                    line_box =
+                        line_box.child(div().w(px(2.0)).h(px(line_h)).bg(rgb(0x2F6FED)));
                 }
                 text_row = text_row.child(line_box);
             }
         }
+        // 交给 IME 的候选框锚点：随光标走，不随滚动内容飘。
+        self.compare_caret_anchor = caret_anchor;
+        // ── 民国稿纸 / 信笺的淡色格线（底层背景层）────────────────────
+        // 三条硬约束一次满足：
+        //   ① **绝对对齐**：线与字共用同一个 `fs` 推出的 `line_h / row_h /
+        //      col_w`，不是另算一套坐标。缩放、翻页、增删行时同步变化，
+        //      字永远坐在格内、线压在字格下沿，不会穿模。
+        //   ② **编辑态不闪**：纯静态 div、无动画无计时器；双击进编辑、
+        //      Enter 换行、IME 组字都只重绘一次，格线不会抖。
+        //   ③ **层级 / 性能**：格线层绝对定位 + overflow_hidden 只画 N 条
+        //      1px 线（一页十几条），文字层背景透明浮在其上；两层是同一
+        //      relative 容器的兄弟，共享滚动与坐标系。
+        //   ④ **响应式**：格线条数 = 当帧实际折行数 `cell_rows.len()`；
+        //      长度 = 文字区净宽，容器宽按右栏实测值锁死并 overflow_hidden，
+        //      窗口拉大拉小都只画这么多、绝不溢出到边缘控件。
+        let row_count = cell_rows.len();
+        // 竖排时 row_count 是「列数」，容器高由每列字数决定，不能按行数累加。
+        let grid_h = if horizontal {
+            pad * 2.0 + row_count as f32 * row_h
+        } else {
+            pad * 2.0 + per_line as f32 * line_h
+        };
+        let line_w = (right_w - pad * 2.0).max(1.0);
+        let ruled_ink = rgba(0x0000000D); // ≈ rgba(0, 0, 0, 0.05)，绝不喧宾夺主
+        let mut grid_layer = div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w(px(right_w)) // 显式锁容器宽，绝不被超长内容撑破 / 越界
+            .h(px(grid_h))
+            .overflow_hidden();
+        if horizontal {
+            for i in 0..row_count {
+                // 线压在该行字格的下沿：字在格内垂直居中，恒在线上方。
+                let y = pad + i as f32 * row_h + line_h - 1.0;
+                grid_layer = grid_layer.child(
+                    div()
+                        .absolute()
+                        .top(px(y))
+                        .left(px(pad))
+                        .w(px(line_w)) // 文字区净宽 100%，两端各留 28px
+                        .h(px(1.0))
+                        .bg(ruled_ink),
+                );
+            }
+        } else {
+            // 竖排：改成与列同距的竖格线，右起（flex_row_reverse）对齐。
+            for i in 0..row_count {
+                grid_layer = grid_layer.child(
+                    div()
+                        .absolute()
+                        .top(px(pad))
+                        .right(px(pad + i as f32 * col_w + fs - 1.0))
+                        .w(px(1.0))
+                        .h(px((grid_h - 2.0 * pad).max(1.0)))
+                        .bg(ruled_ink),
+                );
+            }
+        }
+        let paper = div()
+            .relative()
+            .w(px(right_w))
+            .child(grid_layer)
+            .child(text_row); // 文字层透明，浮在格线之上
+
+        // Task 1 · 把整页正文包成可聚焦 InputField：paint 阶段登记
+        // `handle_input`，焦点落在右栏时 macOS 原生拼音 / 候选框才送进 Root。
+        // 浏览态不包，避免普通阅读按键被输入法上下文接管。
+        let editor_child = div()
+            .id("compare-editor")
+            .w_full()
+            .track_focus(&self.compare_focus)
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _window, cx| {
+                this.compare_on_key(ev, cx);
+            }))
+            .child(paper);
+        let editor_el: gpui::AnyElement = if editing {
+            crate::ime::InputField::new(
+                editor_child,
+                self.compare_focus.clone(),
+                cx.entity(),
+            )
+            .into_any_element()
+        } else {
+            editor_child.into_any_element()
+        };
         let right_pane = div()
             .flex()
             .flex_col()
             .flex_1()
             .h_full()
+            .bg(rgb(0xFFFFFF))
+            .rounded(px(8.0))
+            .shadow(vec![gpui::BoxShadow {
+                color: rgba(0x00000012).into(),
+                offset: gpui::Point::new(px(0.0), px(2.0)),
+                blur_radius: px(10.0),
+                spread_radius: px(0.0),
+            }])
             .child(
                 div()
                     .h(px(30.0))
@@ -11397,11 +13153,20 @@ impl Root {
                     .text_size(px(13.0))
                     .font_family(family.clone())
                     .text_color(rgb(t.ink_soft()))
-                    .child(SharedString::from(if horizontal {
-                        "右 · 横排正文"
-                    } else {
-                        "右 · 现存竖排正文"
-                    })),
+                    .child(SharedString::from(format!(
+                        "右 · {}  ·  {}",
+                        if horizontal { "横排正文" } else { "现存竖排正文" },
+                        if editing {
+                            let tail = if self.compare_degraded > 0 {
+                                format!(" · {} 处字框降级复用", self.compare_degraded)
+                            } else {
+                                String::new()
+                            };
+                            format!("笺校中 · Enter 换行 · ⌘Z 撤销 · ⌘S 保存 · Esc 完成{tail}")
+                        } else {
+                            "双击文字开始笺校 · 单击左右联动".to_string()
+                        }
+                    ))),
             )
             .child(
                 div()
@@ -11414,25 +13179,45 @@ impl Root {
                         this.compare_on_wheel(LinkSide::Right, ev, window, cx);
                     }))
                     .bg(rgb(t.paper()))
-                    .child(text_row),
+                    .child(editor_el),
             );
 
         // ── 顶部操作栏（仅 Compare Mode 专属，绝不污染普通阅读界面）──
-        let bar = div()
-            .h(px(40.0))
+        let mut bar = div()
+            .h(px(48.0))
             .flex()
             .items_center()
-            .px(px(12.0))
+            .px(px(16.0))
             .gap(px(10.0))
-            .bg(rgb(t.paper()))
+            .bg(rgb(0xFFFFFF))
             .border_1()
-            .border_color(rgb(t.rule()))
+            .border_color(rgb(0xE8E8ED))
+            // ── 笺校工作台 · 原生模式 Tab ────────────────────────────────
+            // 「按原来的」：阅读仍旧纯看书；【笺校】下再分【原文对照】与
+            // 【双屏联动】两个子模式，各自功能一字不删、互不合并。这里只做
+            // 状态切换，不搬运任何业务逻辑，也不靠环境变量强跳。
             .child(
                 div()
-                    .text_size(px(14.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(compare_mode_tab("阅读", false, AppMode::Reader, cx))
+                    .child(compare_mode_tab("原文对照", false, AppMode::Collation, cx))
+                    .child(compare_mode_tab("双屏联动", true, AppMode::Compare, cx)),
+            )
+            // v2.0 UI 外壳 · 会话状态条：导入 / 翻页 / 失败反馈都在这里给用户看见。
+            .child(
+                div()
+                    .text_size(px(12.0))
                     .font_family(family.clone())
-                    .text_color(rgb(t.ink()))
-                    .child(SharedString::from("双屏对照")),
+                    .text_color(rgb(t.ink_soft()))
+                    .child(SharedString::from(
+                        if self.is_processing || self.current_pdf_path.is_some() {
+                            self.notice.clone()
+                        } else {
+                            String::new()
+                        },
+                    )),
             )
             .child(
                 div()
@@ -11448,12 +13233,16 @@ impl Root {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                            this.import_compare_image(cx);
+                            this.import_compare_source(cx);
                         }),
                     )
-                    .child(SharedString::from("导入原图")),
-            )
-            .child(
+                    .child(SharedString::from("导入 PDF / 原图")),
+            );
+
+        // Task 1 · 编辑态的显式「完成」入口（等价于 Esc）：不逼用户记快捷键，
+        // 点一下就撤掉未上屏的拼音、重映射一次、强制落库。
+        if self.compare_editing {
+            bar = bar.child(
                 div()
                     .flex()
                     .items_center()
@@ -11461,34 +13250,494 @@ impl Root {
                     .h(px(26.0))
                     .px(px(12.0))
                     .rounded(px(4.0))
-                    .bg(rgb(0xE02020))
+                    .bg(rgb(0x34A853))
                     .text_size(px(13.0))
                     .text_color(rgb(0xFFFFFF))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.compare_finish_editing(cx);
+                        }),
+                    )
+                    .child(SharedString::from("完成笺校 (⌘S / Esc)")),
+            );
+        }
+
+        // ── v2.0 UI 外壳 · PDF 会话专属控件（仅导入 PDF 后显示）──
+        if self.current_pdf_path.is_some() {
+            let can_prev = self.current_page > 1 && !self.is_processing;
+            let can_next = self.current_page < self.total_pages && !self.is_processing;
+            let page_label = format!("第 {} / {} 页", self.current_page, self.total_pages);
+
+            // 上一页
+            bar = bar.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(26.0))
+                    .px(px(12.0))
+                    .rounded(px(4.0))
+                    .bg(if can_prev { rgb(0x555555) } else { rgb(0xBBBBBB) })
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xFFFFFF))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.navigate_compare_page(-1, cx);
+                        }),
+                    )
+                    .child(SharedString::from("上一页")),
+            );
+            // 下一页
+            bar = bar.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(26.0))
+                    .px(px(12.0))
+                    .rounded(px(4.0))
+                    .bg(if can_next { rgb(0x555555) } else { rgb(0xBBBBBB) })
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xFFFFFF))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.navigate_compare_page(1, cx);
+                        }),
+                    )
+                    .child(SharedString::from("下一页")),
+            );
+            // 页码指示
+            bar = bar.child(
+                div()
+                    .h(px(26.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .text_size(px(13.0))
+                    .text_color(rgb(t.ink()))
+                    .child(SharedString::from(page_label)),
+            );
+        }
+
+        // L9 · 极简导出：顶栏只留一枚【导出 ▼】，四个出口全部收进下拉菜单。
+        // 苹果极简：按钮数量做减法，功能一个不少。
+        bar = bar.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(28.0))
+                .px(px(14.0))
+                .rounded(px(6.0))
+                .bg(rgb(0x2F6FED))
+                .text_size(px(13.0))
+                .text_color(rgb(0xFFFFFF))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                        this.show_export_menu = !this.show_export_menu;
+                        cx.notify();
+                    }),
+                )
+                .child(SharedString::from("导出 ▼")),
+        );
+
+        // L9 · 现代 macOS 极简风：浅灰工作台 + 纯白圆角面板 + 极轻阴影。
+        // 顶栏常驻：模式 Tab 是用户切回【阅读】/【原文对照】的**唯一退路**，
+        // 空态若把整条栏藏起来，用户进得来出不去（旧版靠环境变量强跳才有
+        // 这个问题，现在必须常驻）。会话专属控件仍按各自条件浮现。
+        let mut view = div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .bg(rgb(0xF5F5F7))
+            .child(bar);
+        view = view.child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_row()
+                .gap(px(12.0))
+                .p(px(12.0))
+                .bg(rgb(0xF5F5F7))
+                .child(left_pane)
+                .child(right_pane),
+        );
+
+        // ── L9 · 欢迎主页（空闲态覆盖层；只盖内容区，顶栏按钮照常可用）──
+        // 用覆盖层而非替换整棵视图，是为了不移动 `bar`、不触碰任何已有联动代码。
+        // `top(48)` 精确让开常驻顶栏：模式 Tab 与【导入】在空态下照样可点。
+        if self.current_pdf_path.is_none() && self.compare_img.is_none() && !self.is_processing {
+            view = view.child(
+                div()
+                    .absolute()
+                    .top(px(48.0))
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0xF5F5F7))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(14.0))
+                            .px(px(72.0))
+                            .py(px(52.0))
+                            .rounded(px(16.0))
+                            .bg(rgb(0xFFFFFF))
+                            .shadow(vec![gpui::BoxShadow {
+                                color: rgba(0x00000014).into(),
+                                offset: gpui::Point::new(px(0.0), px(8.0)),
+                                blur_radius: px(32.0),
+                                spread_radius: px(0.0),
+                            }])
+                            // 整张卡片可点（内部蓝色按钮只是视觉，避免双触发弹两个文件框）。
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                    this.import_compare_source(cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(42.0))
+                                    .font_family(family.clone())
+                                    .text_color(rgb(0xA8332A))
+                                    .child(SharedString::from("勘阅")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_family(family.clone())
+                                    .text_color(rgb(0x86868B))
+                                    .child(SharedString::from("影印古籍 · 双屏对照 · 本地识别")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(19.0))
+                                    .font_family(family.clone())
+                                    .text_color(rgb(0x1D1D1F))
+                                    .child(SharedString::from("点击或拖入 PDF")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_family(family.clone())
+                                    .text_color(rgb(0x86868B))
+                                    .child(SharedString::from(
+                                        "支持多页 PDF 与 JPG / PNG 扫描页 · 按需识别，绝不一次载入整本",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .h(px(36.0))
+                                    .px(px(28.0))
+                                    .rounded(px(8.0))
+                                    .bg(rgb(0x2F6FED))
+                                    .text_size(px(14.0))
+                                    .font_family(family.clone())
+                                    .text_color(rgb(0xFFFFFF))
+                                    .child(SharedString::from("选择 PDF / 图片")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_family(family.clone())
+                                    .text_color(rgb(0xAEAEB2))
+                                    .child(SharedString::from(
+                                        "Apple Vision OCR · 全程本地处理，文件不上传",
+                                    )),
+                            ),
+                    ),
+            );
+        }
+
+        // ── v2.0 UI 外壳 · Loading 浮层（后台解析 / OCR 进行中全屏遮罩）──
+        // 优雅 Loading 态：防止用户以为软件死机；遮罩盖住内容区，按钮已禁用防重入。
+        if self.is_processing {
+            view = view.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba(0x00000073))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(12.0))
+                            .bg(rgb(t.paper()))
+                            .px(px(40.0))
+                            .py(px(30.0))
+                            .rounded(px(10.0))
+                            .shadow(vec![gpui::BoxShadow {
+                                color: rgba(0x00000040).into(),
+                                offset: gpui::Point::new(px(0.0), px(4.0)),
+                                blur_radius: px(16.0),
+                                spread_radius: px(0.0),
+                            }])
+                            .child(
+                                div()
+                                    .text_size(px(18.0))
+                                    .text_color(rgb(t.ink()))
+                                    .child(SharedString::from("正在解析并识别…")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(t.ink_soft()))
+                                    .child(SharedString::from(
+                                        "OCR 引擎正在辨识扫描页，请稍候",
+                                    )),
+                            ),
+                    ),
+            );
+        }
+
+        // ── L9 · 右上角 Free / PRO 商业标识（空态与会话态常驻）──
+        view = view.child(
+            div()
+                .absolute()
+                .top(px(12.0))
+                .right(px(16.0))
+                .px(px(10.0))
+                .py(px(4.0))
+                .rounded(px(6.0))
+                .bg(if self.is_pro {
+                    rgb(0xF7E7B4)
+                } else {
+                    rgb(0xE9E9ED)
+                })
+                .text_size(px(11.0))
+                .font_family(family.clone())
+                .text_color(if self.is_pro {
+                    rgb(0x8A6508)
+                } else {
+                    rgb(0x86868B)
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                        if !this.is_pro {
+                            this.prompt_pro_activation(cx);
+                        }
+                    }),
+                )
+                .child(SharedString::from(if self.is_pro { "PRO" } else { "Free" })),
+        );
+
+        // ── L9 · 「导出 ▼」下拉菜单（原生风格 Popover，四项功能收于一处）──
+        if self.show_export_menu {
+            // L9 · 终极大一统：7 种格式收进一枚下拉，按「文本 / 文档 /
+            // 学术规范」分组；右侧灰字扩展名代替一堆按钮，极简且透气。
+            use crate::export_center::Format;
+            let mut menu = div()
+                .absolute()
+                .top(px(48.0))
+                .right(px(16.0))
+                .w(px(240.0))
+                .py(px(6.0))
+                .rounded(px(10.0))
+                .bg(rgb(0xFFFFFF))
+                .border_1()
+                .border_color(rgb(0xE8E8ED))
+                .shadow(vec![gpui::BoxShadow {
+                    color: rgba(0x00000024).into(),
+                    offset: gpui::Point::new(px(0.0), px(6.0)),
+                    blur_radius: px(20.0),
+                    spread_radius: px(0.0),
+                }]);
+            let mut group: u8 = u8::MAX;
+            for (i, fmt) in Format::ALL.iter().enumerate() {
+                if fmt.group() != group {
+                    if i > 0 {
+                        menu = menu.child(
+                            div().h(px(1.0)).my(px(4.0)).bg(rgb(0xECECF0)),
+                        );
+                    }
+                    menu = menu.child(
+                        div()
+                            .px(px(14.0))
+                            .pt(px(5.0))
+                            .pb(px(2.0))
+                            .text_size(px(10.0))
+                            .font_family(family.clone())
+                            .text_color(rgb(0xA0A0A6))
+                            .child(SharedString::from(Format::group_label(fmt.group()))),
+                    );
+                    group = fmt.group();
+                }
+                let f = *fmt;
+                menu = menu.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .h(px(30.0))
+                        .px(px(14.0))
+                        .text_size(px(12.0))
+                        .font_family(family.clone())
+                        .text_color(rgb(0x1D1D1F))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                this.show_export_menu = false;
+                                this.export_compare_format(f, cx);
+                            }),
+                        )
+                        .child(SharedString::from(fmt.label()))
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgb(0xB4B4BA))
+                                .child(SharedString::from(fmt.ext().to_uppercase())),
+                        ),
+                );
+            }
+            // 既有的「对照图」出口不属 7 格式，单独置底，保留零删减。
+            menu = menu.child(div().h(px(1.0)).my(px(4.0)).bg(rgb(0xECECF0)));
+            menu = menu.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .h(px(30.0))
+                    .px(px(14.0))
+                    .text_size(px(12.0))
+                    .font_family(family.clone())
+                    .text_color(rgb(0x1D1D1F))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.show_export_menu = false;
                             this.save_compare_image(cx);
                         }),
                     )
-                    .child(SharedString::from("保存对照图")),
+                    .child(SharedString::from("保存对照图"))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(0xB4B4BA))
+                            .child(SharedString::from("PNG")),
+                    ),
             );
+            view = view.child(menu);
+        }
 
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(t.paper()))
-            .child(bar)
-            .child(
+        // ── L9 · 升级提示弹窗（Free 用户点任一导出按钮时触发）──
+        if self.show_pro_dialog {
+            view = view.child(
                 div()
-                    .flex_1()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
                     .flex()
-                    .flex_row()
-                    .bg(rgb(t.paper()))
-                .child(left_pane)
-                .child(div().w(px(2.0)).h_full().bg(rule))
-                .child(right_pane),
-            )
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba(0x00000066))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(14.0))
+                            .px(px(44.0))
+                            .py(px(34.0))
+                            .rounded(px(14.0))
+                            .bg(rgb(0xFFFFFF))
+                            .shadow(vec![gpui::BoxShadow {
+                                color: rgba(0x00000030).into(),
+                                offset: gpui::Point::new(px(0.0), px(8.0)),
+                                blur_radius: px(28.0),
+                                spread_radius: px(0.0),
+                            }])
+                            .child(
+                                div()
+                                    .text_size(px(18.0))
+                                    .font_family(family.clone())
+                                    .text_color(rgb(0x1D1D1F))
+                                    .child(SharedString::from("升级至专业版解锁导出功能")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_family(family.clone())
+                                    .text_color(rgb(0x86868B))
+                                    .child(SharedString::from(
+                                        "DOCX · 双层可搜索 PDF · TXT · 对照图",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(10.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .h(px(32.0))
+                                            .px(px(18.0))
+                                            .rounded(px(7.0))
+                                            .bg(rgb(0x2F6FED))
+                                            .text_size(px(13.0))
+                                            .text_color(rgb(0xFFFFFF))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                                    this.prompt_pro_activation(cx);
+                                                }),
+                                            )
+                                            .child(SharedString::from("输入激活码")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .h(px(32.0))
+                                            .px(px(18.0))
+                                            .rounded(px(7.0))
+                                            .bg(rgb(0xE9E9ED))
+                                            .text_size(px(13.0))
+                                            .text_color(rgb(0x48484A))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                                    this.show_pro_dialog = false;
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(SharedString::from("稍后再说")),
+                                    ),
+                            ),
+                    ),
+            );
+        }
+
+        view
     }
 
     /// L2 LinkArbiter 核心：任一侧滚轮 → 物理侧 1:1 瞬时跟随 + 镜像对侧按比例平滑补间。
@@ -11543,6 +13792,46 @@ impl Root {
             cx.stop_propagation();
             cx.notify();
             return;
+        }
+
+        // ── L9 · 触控板 / 滚轮双指滑动翻页（左图栏，PDF 会话，未放大时）──
+        // 三条硬纪律：
+        //   ① Ctrl/捏合已在上方分支 return，绝不冲突；
+        //   ② 累积到 120px 才翻一页，避免轻碰就跳；
+        //   ③ 触发后 650ms 冷却，冷却期内把所有惯性事件直接丢弃，
+        //      一次「唰」只翻一页，绝不会飞出十几页；放大(zoom>1.05)时
+        //      让位给用户滚看大图，保留原生手感。
+        if side == LinkSide::Left
+            && self.current_pdf_path.is_some()
+            && self.compare_zoom <= 1.05
+            && !self.is_processing
+        {
+            let unit = px(1.0);
+            let dy = ev.delta.pixel_delta(px(1.0)).y / unit;
+            let now = std::time::Instant::now();
+            let cooling = self
+                .compare_last_turn
+                .map(|t| now.duration_since(t) < std::time::Duration::from_millis(650))
+                .unwrap_or(false);
+            if cooling {
+                self.compare_wheel_accum = 0.0; // 吞掉惯性尾巴
+            } else {
+                self.compare_wheel_accum += dy;
+                if self.compare_wheel_accum.abs() >= 120.0 {
+                    let delta = if self.compare_wheel_accum > 0.0 {
+                        1
+                    } else {
+                        -1
+                    };
+                    self.compare_wheel_accum = 0.0;
+                    self.compare_last_turn = Some(now);
+                    eprintln!("[v2] 触控板翻页：delta={delta} → 第 {} 页起跳", self.current_page);
+                    self.navigate_compare_page(delta, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+            }
         }
         let now = std::time::Instant::now();
         // 回声 / 抖动抑制窗：最近刚程序化驱动过 `side`，这 100ms 内的滚轮视为镜像回声。

@@ -13,6 +13,10 @@ pub struct TileCache {
     order: VecDeque<(u32, u32)>,
     src: Option<image::DynamicImage>,
     failed: bool,
+    /// 换图代次号：写进瓦片文件名。GPUI 的 `img(path)` 按路径缓存纹理，
+    /// 若翻页后瓦片仍叫 `t_0_0.png`，新图会命中旧纹理 → 左图永远停在第一页。
+    /// 每次 reset() 递增，路径必变，强制重新加载。
+    generation: u32,
 }
 
 impl TileCache {
@@ -27,6 +31,7 @@ impl TileCache {
             order: VecDeque::new(),
             src: None,
             failed: false,
+            generation: 0,
         }
     }
 
@@ -64,7 +69,9 @@ impl TileCache {
         // 直接调现成 image crate 切片，不手写像素循环。
         let sub = image::imageops::crop_imm(src, x0, y0, w, h);
         let tile_img = sub.to_image();
-        let p = self.dir.join(format!("t_{}_{}.png", col, row));
+        let p = self
+            .dir
+            .join(format!("t_{}_{}_{}.png", self.generation, col, row));
         if tile_img.save(&p).is_err() {
             return None;
         }
@@ -131,5 +138,30 @@ impl TileCache {
         self.order.clear();
         self.src = None;
         self.failed = false;
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归断言：换页后瓦片**路径必须改变**，否则 GPUI 的 `img(path)` 会
+    /// 复用上一页的纹理（用户实测「页码变了、左图还停在首页」的根因）。
+    #[test]
+    fn tile_path_changes_after_reset() {
+        let p = std::env::temp_dir().join("tile_smoke_src.png");
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            600,
+            400,
+            image::Rgba([255, 255, 255, 255]),
+        ));
+        img.save(&p).expect("写测试图失败");
+        let mut c = TileCache::new(512, 16);
+        let a = c.tile(&p, 600, 400, 0, 0).expect("首图瓦片");
+        c.reset();
+        let b = c.tile(&p, 600, 400, 0, 0).expect("换页瓦片");
+        assert_ne!(a, b, "换页后瓦片路径必须变化，否则 GPUI 复用旧纹理");
+        let _ = std::fs::remove_file(&p);
     }
 }

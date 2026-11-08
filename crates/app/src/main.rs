@@ -65,6 +65,13 @@ mod conv;
 /// 的 NSView 补上 `performDragOperation:`——不加任何新依赖（纪律同 `sound`）。
 mod dropzone;
 mod exporter;
+/// L9 · 商业导出引擎（DOCX / 双层可搜索 PDF，零新增依赖）。
+mod commerce;
+/// L9 · 统一导出中心：7 种格式共吃同一份 SQLite 校对快照，纯函数可单测。
+mod export_center;
+/// Task 1 · Compare Mode 右栏笺校编辑器的纯逻辑（撤销 / 夹注层级 /
+/// 字格下标 / 字形坐标重映射）。零 GPUI 依赖，可脱离窗口单测。
+mod compare_editor;
 /// **逐字字体回退**（v1.9.25）：首选古籍字体缺字时，只许回退到系统 CJK
 /// 字库（西文字体一律不许），全系统无解则画占位符并打 Warning。
 /// 只挑字体、不参与几何——字格宽高恒由网格引擎给（见 `font_fallback` 头注）。
@@ -105,6 +112,9 @@ mod pager;
 mod pdf;
 mod punct;
 mod reader;
+/// 阅读主界面 · 悬浮目录抽屉（暖宣纸毛玻璃 / 黄金分割竖排 / 折叠重排）、
+/// 卷首主页、右缘竹简书签。纯几何与树状态在文件上半部，可单测。
+mod bookmark;
 // v1.9.53：注音回归「汉字正上方横排」，GPUI 原生文字排版即可胜任，
 // 原先为竖排/旋转服务的 CoreGraphics 离屏位图（`ruby_glyph`）已整体删除。
 mod share;
@@ -507,7 +517,7 @@ fn zen_window_options(bounds: Bounds<gpui::Pixels>) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
-            title: Some("笺读 · JianDu".into()),
+            title: Some("勘阅 · KanYue".into()),
             // 不写这一项（None）= 系统标准位置；要微调才给坐标。
             traffic_light_position: None,
             ..Default::default()
