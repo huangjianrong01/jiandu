@@ -32,6 +32,8 @@
 use crate::ime::{
     char_to_utf16, effective_replace_range, utf16_len, utf16_slice, utf16_to_char,
 };
+// 文本划线批注：覆盖式数据（文档键 + 字符下标 + 类型 + 颜色），与排版引擎零耦合。
+use crate::annotations::{self, AnnKind, Annotation};
 // 竖排预览：复用阅读引擎的「纯数据版式 + CoreGraphics 离屏光栅」链路，与 reader
 // 解耦（本模块绝不 import reader）。这三条都是 crate 内模块，reader 同款用法。
 use crate::share::{ShareBg, ShareFrame, ShareSeal};
@@ -707,6 +709,50 @@ fn line_highlights(
                     kind: HlKind::Selection,
                 });
             }
+        }
+    }
+    out
+}
+
+/// **批注绘制描述**：相对行盒左上角的物理矩形 + 类型 + 颜色，交给 Canvas 手绘。
+/// 与 [`line_highlights`] 同源（同一套 `visual_spans` + `adv` + `LINE_H`），
+/// 区别只是多带 `kind`——下划线 / 波浪线 / 矩形框三种画法各自取用。
+struct AnnDraw {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    kind: AnnKind,
+}
+
+/// 把一批批注裁到「本行窗口」内，按视觉行拆成绘制描述（可单测）。
+///
+/// 与 [`line_highlights`] 同一真相：字符下标 → 固定字宽 `adv` + 软折行 `cpl`
+/// → 物理矩形。批注是覆盖层，绝不进排版引擎——这里只是算坐标。
+fn line_annotation_spans(
+    anns: &[Annotation],
+    line_start: usize,
+    line_end: usize,
+    cpl: usize,
+    adv: f32,
+    box_top: f32,
+    box_h: f32,
+) -> Vec<AnnDraw> {
+    let mut out = Vec::new();
+    for a in anns {
+        let s = a.start.max(line_start).min(line_end);
+        let e = a.end.max(line_start).min(line_end);
+        if e <= s {
+            continue;
+        }
+        for (k, sa, sb) in visual_spans(s, e, cpl) {
+            out.push(AnnDraw {
+                x: (sa - k * cpl) as f32 * adv,
+                y: box_top + k as f32 * LINE_H,
+                w: (sb - sa) as f32 * adv,
+                h: box_h,
+                kind: a.kind,
+            });
         }
     }
     out
@@ -1422,6 +1468,14 @@ pub struct CollationWorkspace {
     qc_report: Option<jiandu_core::qc::QcReport>,
     /// 缓存对应的文本代际：与 `text_gen` 对不上就作废。
     qc_gen: u64,
+    /// **文本划线批注**（v2.1）：覆盖式，内存态。每条约 =
+    /// (起止字符下标, 类型, 颜色)，渲染时按索引在画线循环里还原，**绝不**
+    /// 写进正文 / 排版引擎 / 富文本（见 `annotations.rs` 头注）。
+    ///
+    /// 落库走 `annotations` 模块的**瞬开连接**（每次操作现开现关），不在实体里
+    /// 持有 `rusqlite::Connection`——GPUI 实体要求 `Send + Sync`，而 `Connection`
+    /// 非 `Sync`，存进结构体编译不过。
+    annotations: Vec<Annotation>,
 }
 
 /// **快捷标点栏**的一枚动作（v1.9.25）。
@@ -1882,6 +1936,8 @@ impl CollationWorkspace {
             show_qc_panel: false,
             qc_report: None,
             qc_gen: 0,
+            // v2.1：文本划线批注（覆盖式，绝不进排版引擎）。内存态 + SQLite 落库。
+            annotations: Vec::new(),
         };
         // ── v1.9.66：退出前强存（Exit Flush）────────────────────────────
         //
@@ -1907,6 +1963,33 @@ impl CollationWorkspace {
         // 启动补扫）。只认本应用自己的命名前缀，且只删「够旧」的，绝不误伤另开的
         // 一个笺读实例正在用的图。
         sweep_stale_temp_pngs();
+        // v2.1 演示样张预置批注（仅 demo 文档、内存态）：让首启动就能直接看到
+        // 下划线 / 波浪线 / 矩形框三种画法的真实效果，无需先手动选区。
+        if me.text_file.is_none() && me.store_id.is_none() {
+            me.annotations = vec![
+                Annotation {
+                    id: -1,
+                    start: 0,
+                    end: 8,
+                    kind: AnnKind::Underline,
+                    color: annotations::default_color(AnnKind::Underline),
+                },
+                Annotation {
+                    id: -1,
+                    start: 9,
+                    end: 17,
+                    kind: AnnKind::Box,
+                    color: annotations::default_color(AnnKind::Box),
+                },
+                Annotation {
+                    id: -1,
+                    start: 18,
+                    end: 26,
+                    kind: AnnKind::Wavy,
+                    color: annotations::default_color(AnnKind::Wavy),
+                },
+            ];
+        }
         me
     }
 
@@ -3333,8 +3416,9 @@ impl CollationWorkspace {
         let col_in_visual = col % cpl;
         // 唯一原点（含 left_col_w / 顶栏 / 状态条 / 滚动偏移）。
         let (ox, oy) = self.editor_origin(vw);
-        const BAR_W: f32 = 66.0;
-        const BAR_H: f32 = 24.0;
+        // 浮条加宽：三枚批注钮（U / ~ / []）+ 分隔 + 问小笺。
+        const BAR_W: f32 = 158.0;
+        const BAR_H: f32 = 26.0;
         let panel_l = self.left_col_w(vw);
         let panel_t = HEADER_H + self.head_band_h();
         // 贴选区末行的**下一行**；越界一律夹进右栏矩形（见 `clamp_bar_pos`）。
@@ -3345,28 +3429,40 @@ impl CollationWorkspace {
                 .absolute()
                 .left(px(x))
                 .top(px(y))
-                // `occlude`：这一小块必须挡住下面的编辑器，否则点「问小笺」
-                // 会先落一次光标、把选区清掉，随后的 ask_ai 就拿到空选区。
+                // `occlude`：这一小块必须挡住下面的编辑器，否则点钮
+                // 会先落一次光标、把选区清掉，随后的批注就拿到空选区。
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_c, _, _, cx| cx.stop_propagation()),
                 )
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(1.0))
+                .px(px(5.0))
+                .py(px(3.0))
+                .rounded(px(13.0))
+                .bg(rgb(CHROME))
+                .border_1()
+                .border_color(rgba(0x8C2B2255))
+                .shadow(vec![BoxShadow {
+                    color: gpui::hsla(0.0, 0.0, 0.0, 0.10),
+                    offset: gpui::point(px(0.0), px(2.0)),
+                    blur_radius: px(6.0),
+                    spread_radius: px(0.0),
+                }])
+                // v2.1：三枚划线钮——点一下把当前选区存成对应批注。
+                .child(Self::ann_tool_button("U", AnnKind::Underline, cx))
+                .child(Self::ann_tool_button("~", AnnKind::Wavy, cx))
+                .child(Self::ann_tool_button("[]", AnnKind::Box, cx))
+                .child(div().w(px(1.0)).h(px(14.0)).bg(rgba(0x8C2B2255)))
                 .child(
                     div()
-                        .px(px(11.0))
-                        .py(px(5.0))
-                        .rounded(px(14.0))
-                        .bg(rgb(CHROME))
-                        .border_1()
-                        .border_color(rgba(0x8C2B2255))
-                        .shadow(vec![BoxShadow {
-                            color: gpui::hsla(0.0, 0.0, 0.0, 0.10),
-                            offset: gpui::point(px(0.0), px(2.0)),
-                            blur_radius: px(6.0),
-                            spread_radius: px(0.0),
-                        }])
                         .cursor_pointer()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(8.0))
                         .text_size(px(11.5))
                         .text_color(rgb(0x8C2B22))
                         .hover(|s| s.bg(rgba(0xF3EBD4FF)))
@@ -3380,6 +3476,33 @@ impl CollationWorkspace {
                         ),
                 ),
         )
+    }
+
+    /// 选区浮条上的一枚**划线钮**（U / ~ / []）：点击把当前选区存成对应批注。
+    ///
+    /// 它只响应「明确点击」，绝不响应拖拽——拖拽仍走 `extend_selection_from_drag`
+    /// 选区，与这里零冲突（见 `render_selection_bar` 头注）。
+    fn ann_tool_button(
+        label: &'static str,
+        kind: AnnKind,
+        cx: &mut Context<CollationWorkspace>,
+    ) -> Div {
+        div()
+            .cursor_pointer()
+            .px(px(7.0))
+            .py(px(2.0))
+            .rounded(px(7.0))
+            .text_size(px(12.0))
+            .text_color(rgb(0x8C2B22))
+            .hover(|s| s.bg(rgba(0xF3EBD4FF)))
+            .child(SharedString::from(label))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |c, _, _, cx| {
+                    cx.stop_propagation();
+                    c.add_annotation(kind, cx);
+                }),
+            )
     }
 
     /// 快捷标点栏落子：三类动作统一走这里，**只有一处**决定「插还是包」。
@@ -6717,11 +6840,81 @@ impl CollationWorkspace {
         self.text_file = Some(path);
         self.text_note = Some(note);
         self.text_err = false;
+        // v2.1：换稿即按新文档键重载批注（见 `reload_annotations`）。
+        self.reload_annotations();
         // 原生对话框刚关 → **分几次**把焦点交回来。
         self.schedule_refocus(cx);
         cx.notify();
         // v1.9.64：换稿 / 改稿后标脏，1.5 秒防抖落盘（覆盖全文快照）。
         self.touch(cx);
+    }
+
+    // ── 文本划线批注（v2.1，覆盖式）─────────────────────────────────────
+    //
+    // 事件分发：**完全复用既有选区机制**，不新增任何拖拽手势——
+    //   · 单击 = 落光标 + 双屏联动（click_line / place_caret_from_click）
+    //   · 双击 = 选句（编辑预备）         三击 = 选整段
+    //   · 左键按住移动 >3px = 选区（extend_selection_from_drag，带 3px 死区）
+    // 选区一旦存在，就弹出**已有的选区浮条**；批注三枚按钮只是挂到那条浮条上，
+    // 点击才落批注 → 与单击联动 / 双击编辑 / 拖拽选区天然隔离，绝无「手抖误触」。
+
+    /// 当前文档键：优先文件路径，其次 store_id，最后 demo 样张。
+    fn ann_doc_key(&self) -> String {
+        if let Some(p) = &self.text_file {
+            p.to_string_lossy().to_string()
+        } else if let Some(s) = &self.store_id {
+            format!("store:{}", s)
+        } else {
+            "demo".to_string()
+        }
+    }
+
+    /// 换稿 / 进文档时调用：按新文档键重载批注（瞬开连接，用后即弃）。
+    fn reload_annotations(&mut self) {
+        if let Some(conn) = annotations::open_db() {
+            let key = self.ann_doc_key();
+            self.annotations = annotations::list(&conn, &key);
+        }
+    }
+
+    /// 把当前选区转成一条批注并落库（不清除选区，便于连续叠加）。
+    fn add_annotation(&mut self, kind: AnnKind, cx: &mut Context<Self>) {
+        let Some(sel) = self.selection.clone() else {
+            return;
+        };
+        if sel.start == sel.end {
+            return;
+        }
+        let a = Annotation {
+            id: -1,
+            start: sel.start.min(sel.end),
+            end: sel.start.max(sel.end),
+            kind,
+            color: annotations::default_color(kind),
+        };
+        let key = self.ann_doc_key();
+        if let Some(conn) = annotations::open_db() {
+            if let Some(id) = annotations::insert(&conn, &key, &a) {
+                let mut a = a;
+                a.id = id;
+                self.annotations.push(a);
+            }
+        } else {
+            // 无库也允许内存态（演示 / 落盘失败兜底），不丢用户的操作。
+            self.annotations.push(a);
+        }
+        cx.notify();
+    }
+
+    /// 删除一条批注（按内存下标）。
+    fn remove_annotation_at(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(a) = self.annotations.get(idx).cloned() {
+            if let Some(conn) = annotations::open_db() {
+                annotations::delete(&conn, a.id);
+            }
+            self.annotations.remove(idx);
+            cx.notify();
+        }
     }
 
     /// **把文件拖进工作台**（v1.9.71）：一份文件顶两条入口。
@@ -8580,6 +8773,17 @@ impl CollationWorkspace {
             box_h,
         );
 
+        // v2.1：本行命中的批注（覆盖式，按字符下标算物理矩形，与选区同源）。
+        let ann_draws = line_annotation_spans(
+            &self.annotations,
+            line_start,
+            line_end,
+            cpl,
+            adv,
+            box_top,
+            box_h,
+        );
+
         let mut row = div()
             .relative()
             .min_h(px(LINE_H))
@@ -8677,6 +8881,91 @@ impl CollationWorkspace {
                     .w(px(2.0))
                     .h(px(box_h))
                     .bg(rgb(0x8c2b22)),
+            );
+        }
+
+        // ③ **批注覆盖层**（v2.1）：下划线 / 波浪线 / 矩形框。画在字之上，
+        //    与选区高亮同机制——按索引算矩形，用 `paint_quad` / `paint_path`
+        //    手绘，**绝不**改任何排版 / 富文本。零 hitbox（Canvas 不注册命中盒），
+        //    也不会抢编辑器的点击 / 拖选 / 光标。
+        if !ann_draws.is_empty() {
+            row = row.child(
+                gpui::canvas(
+                    move |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        let o = bounds.origin;
+                        for d in &ann_draws {
+                            let color = match d.kind {
+                                AnnKind::Box => rgba(0x992B4C7E), // 淡墨蓝
+                                _ => rgba(0x998C2B22),          // 淡朱砂红
+                            };
+                            let x = o.x + px(d.x);
+                            let y = o.y + px(d.y);
+                            let w = px(d.w);
+                            let h = px(d.h);
+                            match d.kind {
+                                AnnKind::Underline => {
+                                    // 字身底部一条极细实线。
+                                    let uy = y + h - px(1.0);
+                                    window.paint_quad(
+                                        gpui::fill(
+                                            Bounds {
+                                                origin: gpui::point(x, uy),
+                                                size: gpui::size(w, px(1.6)),
+                                            },
+                                            color,
+                                        ),
+                                    );
+                                }
+                                AnnKind::Box => {
+                                    // 矩形框：四边细线（围绕字身区域）。
+                                    let t = px(1.4);
+                                    window.paint_quad(gpui::fill(
+                                        Bounds { origin: gpui::point(x, y), size: gpui::size(w, t) },
+                                        color,
+                                    ));
+                                    window.paint_quad(gpui::fill(
+                                        Bounds { origin: gpui::point(x, y + h - t), size: gpui::size(w, t) },
+                                        color,
+                                    ));
+                                    window.paint_quad(gpui::fill(
+                                        Bounds { origin: gpui::point(x, y), size: gpui::size(t, h) },
+                                        color,
+                                    ));
+                                    window.paint_quad(gpui::fill(
+                                        Bounds { origin: gpui::point(x + w - t, y), size: gpui::size(t, h) },
+                                        color,
+                                    ));
+                                }
+                                AnnKind::Wavy => {
+                                    // 波浪线：沿字身底部画折线（朱砂）。
+                                    let base = y + h - px(1.0);
+                                    let amp = px(2.0);
+                                    let step = px(4.0);
+                                    let mut b = gpui::PathBuilder::stroke(px(1.6));
+                                    let mut x0 = x;
+                                    b.move_to(gpui::point(x0, base));
+                                    let mut up = true;
+                                    while x0 < x + w {
+                                        let nx = (x0 + step).min(x + w);
+                                        let ny = if up { base - amp } else { base + amp };
+                                        b.line_to(gpui::point(nx, ny));
+                                        x0 = nx;
+                                        up = !up;
+                                    }
+                                    if let Ok(p) = b.build() {
+                                        window.paint_path(p, color);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                )
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0)),
             );
         }
         row
@@ -10819,6 +11108,62 @@ mod tests {
         let r = line_highlights(None, &[], None, Some(0), 5, 17.0, 4.0, 24.0);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].kind, HlKind::ActiveLine);
+    }
+
+    /// **批注几何**（v2.1）：与 `line_highlights` 同源，按字符下标 → 物理矩形，
+    /// 跨软折行拆成多段；类型透传、坐标口径一致。
+    #[test]
+    fn annotation_spans_map_char_range_to_pixel_rects() {
+        let adv = 17.0;
+        let box_top = 4.0;
+        let box_h = 24.0;
+        let cpl = 5usize;
+        let anns = vec![
+            Annotation {
+                id: 1,
+                start: 2,
+                end: 12,
+                kind: AnnKind::Underline,
+                color: annotations::default_color(AnnKind::Underline),
+            },
+            Annotation {
+                id: 2,
+                start: 0,
+                end: 3,
+                kind: AnnKind::Box,
+                color: annotations::default_color(AnnKind::Box),
+            },
+        ];
+        // 本行覆盖全局 [0, 13)，应截出 [0, 12)。
+        let draws = line_annotation_spans(&anns, 0, 13, cpl, adv, box_top, box_h);
+        // 下划线 (2..12) 跨三视觉行：2..5 / 5..10 / 10..12。
+        let ul: Vec<_> = draws.iter().filter(|d| d.kind == AnnKind::Underline).collect();
+        assert_eq!(ul.len(), 3);
+        assert_eq!((ul[0].x, ul[0].y, ul[0].w), (2.0 * adv, box_top, 3.0 * adv));
+        assert_eq!((ul[1].x, ul[1].y, ul[1].w), (0.0, box_top + LINE_H, 5.0 * adv));
+        assert_eq!((ul[2].x, ul[2].y, ul[2].w), (0.0, box_top + 2.0 * LINE_H, 2.0 * adv));
+        // 矩形框 (0..3) 只占第一视觉行。
+        let bx: Vec<_> = draws.iter().filter(|d| d.kind == AnnKind::Box).collect();
+        assert_eq!(bx.len(), 1);
+        assert_eq!((bx[0].x, bx[0].w), (0.0, 3.0 * adv));
+        // 越界裁剪：本行 [5, 9) 时，下划线只截到 [5, 9)。
+        let draws2 = line_annotation_spans(&anns, 5, 9, cpl, adv, box_top, box_h);
+        let ul2: Vec<_> = draws2.iter().filter(|d| d.kind == AnnKind::Underline).collect();
+        assert_eq!(ul2.len(), 1);
+        assert_eq!((ul2[0].x, ul2[0].y, ul2[0].w), (0.0, box_top + LINE_H, 4.0 * adv));
+    }
+
+    /// 空批注 / 终点越界不产生绘制描述。
+    #[test]
+    fn annotation_spans_empty_when_no_overlap() {
+        let anns = vec![Annotation {
+            id: 1,
+            start: 100,
+            end: 110,
+            kind: AnnKind::Underline,
+            color: annotations::default_color(AnnKind::Underline),
+        }];
+        assert!(line_annotation_spans(&anns, 0, 13, 5, 17.0, 4.0, 24.0).is_empty());
     }
 
     /// **异体字联动**：搜「群」必须标到原文里的「羣」，且 `has_variant` 为真。

@@ -13430,17 +13430,17 @@ impl Root {
                             // 卡片尺寸跟着内容收：去掉大字「勘阅」后，原来的
                             // 76×46 留白会显得空，收到 52×32。
                             .px(px(52.0))
-                            .py(px(32.0))
+                            .py(px(36.0))
                             .rounded(px(16.0))
                             // 宣纸白，不是系统纯白：比背景暖一档，才像纸不像网页 div。
                             .bg(rgb(0xFDFBF6))
+                            // v2.1：极弱灰边框 + 淡阴影，让卡片像悬浮桌面的一块玉简 / 宣纸。
                             .border_1()
-                            .border_color(rgba(0x8A7A5E1F))
-                            // 0 10px 30px rgba(0,0,0,0.05)：薄薄一层，浮起来但不抢戏。
+                            .border_color(rgb(0xEAEAEA))
                             .shadow(vec![gpui::BoxShadow {
-                                color: rgba(0x0000000D).into(),
-                                offset: gpui::Point::new(px(0.0), px(10.0)),
-                                blur_radius: px(30.0),
+                                color: rgba(0x0000000F).into(),
+                                offset: gpui::Point::new(px(0.0), px(8.0)),
+                                blur_radius: px(28.0),
                                 spread_radius: px(0.0),
                             }])
                             // 整张卡片可点（内部按钮只是视觉，避免双触发弹两个文件框）。
@@ -13449,6 +13449,15 @@ impl Root {
                                 cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
                                     this.import_compare_source(cx);
                                 }),
+                            )
+                            // 灵魂主标题：大号、朱砂红、压在「影印古籍」之上。
+                            .child(
+                                div()
+                                    .text_size(px(30.0))
+                                    .font_family(family.clone())
+                                    .font_weight(gpui::FontWeight(700.0))
+                                    .text_color(rgb(0x8B2500))
+                                    .child(SharedString::from("《勘阅》")),
                             )
                             .child(
                                 div()
@@ -13500,7 +13509,7 @@ impl Root {
                                     .font_family(family.clone())
                                     .text_color(rgb(0xC6C0B6))
                                     .child(SharedString::from(
-                                        "Apple Vision OCR · 全程本地处理，文件不上传",
+                                        "纯本地引擎驱动 · 您的古籍绝不离开这台 Mac",
                                     )),
                             ),
                     ),

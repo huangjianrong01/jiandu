@@ -137,6 +137,10 @@ mod revive;
 mod unlock;
 mod tts;
 mod zen_kit;
+/// **文本划线批注**（v2.1）：覆盖式批注的 SQLite 持久化层。只记「文档键 +
+/// 起止字符下标 + 类型 + 颜色」，绝不进排版引擎 / 富文本——渲染时由
+/// `collation` 的画线循环按索引还原（见 annotations.rs 头注）。
+mod annotations;
 
 // 纯逻辑核心（v1.47.0 解耦）：`grid` / `parsers` / `dict` 等 17 个模块已
 // 独立为 `jiandu-core` crate（零 GPUI 依赖，见 core/）。这里把它们再导出
