@@ -1252,6 +1252,16 @@ pub struct Root {
     pub layout_mode: crate::grid::LayoutMode,
     /// 沉浸阅读排版方向（V2.1）：竖排 / 横排。仅阅读界面生效，工作台与双屏联动零影响。
     pub layout_dir: LayoutDir,
+    /// 竖排「防串行」：鼠标悬停 / 光标所在的（叶索引, 列索引）。
+    /// None = 无高亮。仅竖排模式使用；命中时给该列加极淡底色 + 侧边引导线，零 Reflow。
+    pub hover_col: Option<(usize, usize)>,
+    /// 竖排侧批（旁注）数据：键 = (叶索引, 列索引)，值 = 侧批内容。
+    /// 纯应用层数据，core 排版引擎零感知、零改动。
+    pub sidenotes: std::collections::HashMap<(usize, usize), crate::types::SideNote>,
+    /// 已展开（点击后显示全文）的侧批键集合；默认极简只显示圆点，点击才展开。
+    pub sidenote_expanded: std::collections::HashSet<(usize, usize)>,
+    /// 开发闸门：JIANDU_SIDENOTE_DEMO=1 时注入示例侧批，便于截图核对。
+    pub demo_sidenotes: bool,
     /// 窗口内容区尺寸（每帧由 render 写入，供铺满屏计算）。
     pub viewport_w: f32,
     pub viewport_h: f32,
@@ -1793,6 +1803,10 @@ impl Root {
             duplex: Duplex::Single,
             layout_mode: crate::grid::LayoutMode::Facing,
             layout_dir: LayoutDir::Vertical,
+            hover_col: None,
+            sidenotes: std::collections::HashMap::new(),
+            sidenote_expanded: std::collections::HashSet::new(),
+            demo_sidenotes: false,
             // v1.84.0：正文出厂清刻本悦宋（见上 `default_ancient`）、
             // 批注出厂霞鹜文楷——刻本里「正文匠体、注文手写体」的层次。
             font_ancient: default_ancient,
@@ -2264,6 +2278,10 @@ impl Root {
                 root.mode = AppMode::Collation;
                 let ws = root.collation.clone();
                 ws.update(cx, |w, cx| w.dev_seed_annotation_demo(cx));
+            }
+            // V2.1 竖排侧批截图核对：注入示例侧批（按叶合成），供 screencapture 核对。
+            if std::env::var("JIANDU_SIDENOTE_DEMO").is_ok() {
+                root.demo_sidenotes = true;
             }
             // V2.1：截图核对用——直接拉开质检抽屉（等稿子装完再开，否则扫的是空串）。
             if std::env::var("JIANDU_QC").is_ok() {

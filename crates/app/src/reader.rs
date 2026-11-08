@@ -146,6 +146,11 @@ pub const HEAD_BAND_MIN: f32 = 10.0;
 /// 故字格坐标要加这一个常数才能对齐——天头眉批的**绝对锚定**就差这一步。
 pub const FRAME_OFF: f32 = 4.0;
 
+/// 竖排侧批（旁注）轨宽（v2.1）：版框外侧余白里挂一枚极简旁注轨，
+/// 内含一列细朱砂引导线 + 每条例项的朱砂圆点；点击圆点展开全文。
+/// 仅当本叶确有侧批时才占用这份余白，正文行格零改动。
+pub(crate) const SIDENOTE_RAIL_W: f32 = 22.0;
+
 /// 天头眉批画布的**一次绘制清单**：整份搬进 paint 闭包，闭包里不再碰 `self`
 /// （paint 阶段拿不到 `&mut Self`，也本就不该在绘制时改状态）。
 struct MarginPaint {
@@ -6520,6 +6525,15 @@ impl Root {
         // 卷首题署预留行数：与 layout_book 收到的 reserve_rows 同源
         // （按本帧实际行数算——晒本长图行数与阅读视图不同）。
         let reserve = crate::gloss::inscription_reserve(self.chapter_inscription_need(), rows);
+        // ── 竖排侧批（旁注）数据合成（v2.1）─────────────────────────────
+        // 真实数据来自 `self.sidenotes`（应用层挂载）；开发闸门
+        // `JIANDU_SIDENOTE_DEMO` 时按本叶合成示例侧批，便于截图核对。
+        let mut sn_map: HashMap<(usize, usize), crate::types::SideNote> = self.sidenotes.clone();
+        if self.demo_sidenotes {
+            for (k, v) in self.demo_sidenotes_for(idx, text_cols) {
+                sn_map.entry(k).or_insert(v);
+            }
+        }
         // 列已由 gloss::layout_book 切好（含双行夹注的跨列流转），直接排。
 
         // 地脚高度：先算出来，交给每一列一起加高——界行（乌丝栏）才能
@@ -6616,6 +6630,8 @@ impl Root {
                     top_skip,
                     &note_index,
                     geo.interactive,
+                    idx,
+                    i,
                     cx,
                 ));
             } else {
@@ -6785,7 +6801,13 @@ impl Root {
 
         // 墨线在下、文字在上：`relative` 容器没有任何 padding，画布的
         // `top(0)/left(0)` 就是版框外缘——两层共用同一个原点。
-        let leaf = div()
+        // ── 竖排侧批（旁注）轨（v2.1）──────────────────────────────────
+        // 仅当本叶确有侧批时，在版框外侧余白挂一枚极简旁注轨：
+        // 细朱砂引导线 + 每条例项圆点，点击圆点展开全文。正文行格零改动。
+        let rail = self.render_sidenote_rail(&sn_map, idx, frame_w, frame_h, text_cols, edge, cx);
+        let has_rail = rail.is_some();
+
+        let mut leaf = div()
             .relative()
             .w(px(frame_w))
             .h(px(frame_h))
@@ -6796,7 +6818,18 @@ impl Root {
                 t.grain(),
                 t.ink(),
             ))
-            .child(frame);
+            .child(frame)
+            // 「防串行」清除：鼠标移出任意正文列（落到版框余白 / 墨线 / 地脚），
+            // 清掉列高亮。落在列上时被列自身 stop_propagation 拦下，不会误清。
+            .on_mouse_move(cx.listener(|this, _event, _window, cx| {
+                if this.hover_col.is_some() {
+                    this.hover_col = None;
+                    cx.notify();
+                }
+            }));
+        if let Some(r) = rail {
+            leaf = leaf.child(r);
+        }
 
         // 纸面留白：对开时内侧（贴纸心那一侧）收掉，两半才能拼成一张纸。
         // `relative`：书耳 / 地脚牌记用绝对定位挂在纸面角上。
@@ -6810,7 +6843,14 @@ impl Root {
         let top_margin = if geo.interactive { self.margin_top } else { pad };
         let bot_margin = if geo.interactive { self.margin_bot } else { pad };
         // 左右留白走 `sheet_side_pads`（Invariant 2：左右叶镜像 → 等宽）。
-        let (pl, pr) = sheet_side_pads(edge, pad);
+        let (mut pl, mut pr) = sheet_side_pads(edge, pad);
+        // 侧批轨占用版框外侧余白：把对应一侧的纸面留白加宽，正文居中不受影响。
+        if has_rail {
+            match edge {
+                LeafHalf::Left => pl += SIDENOTE_RAIL_W,
+                _ => pr += SIDENOTE_RAIL_W,
+            }
+        }
         let mut sheet = div()
             .relative()
             .flex()
@@ -6941,17 +6981,37 @@ impl Root {
         note_index: &NoteIndex,
         // 字格 / 注块是否挂鼠标交互（晒本预览传 false：纯展示）。
         interactive: bool,
+        // 防串行：本列所在的（叶索引, 列索引），供 hover 高亮命中。
+        leaf_idx: usize,
+        col_idx: usize,
         cx: &mut Context<Self>,
     ) -> Div {
         let t = self.theme;
-        // 列盒高度固定，与邻列对齐；顶部预留带用内边距把正文内容压到带下，
-        // 预留带内仍是空白纸面，留给卷首题署叠绘。
+        let col_h = cell_h * rows as f32 + foot_h;
+        // 防串行（v2.1）：命中 hover 时给整列加极淡底色 + 右侧细朱砂引导线，
+        // 既不遮字、也不触发 Reflow（只换底色 / 叠一条绝对定位细线）。
+        let hovered = self.hover_col == Some((leaf_idx, col_idx));
         let mut col = div()
+            .relative()
             .w(px(cell_w))
-            .h(px(cell_h * rows as f32 + foot_h))
+            .h(px(col_h))
             .flex()
             .flex_col()
             .items_center();
+        if hovered {
+            col = col.bg(rgba(0x0000000A));
+        }
+        if interactive {
+            col = col.on_mouse_move(cx.listener(move |this, _event: &MouseMoveEvent, _window, cx| {
+                let k = (leaf_idx, col_idx);
+                if this.hover_col != Some(k) {
+                    this.hover_col = Some(k);
+                    cx.notify();
+                }
+                // 拦住事件，避免冒泡到 leaf 的「清除」处理器把刚点的高亮抹掉。
+                cx.stop_propagation();
+            }));
+        }
         let mut content = div().w_full().flex().flex_col().items_center();
         // ── v1.56.0 顶格对齐 ──────────────────────────────────────────
         // 列的**起始绘制一律锚定 `grid::top_baseline`**（不再就地写
@@ -7115,7 +7175,164 @@ impl Root {
                 }
             }
         }
-        col.child(content)
+        let col = col.child(content);
+        // 防串行：命中时右侧叠一道极细朱砂引导线（不挤占文字、零 Reflow）。
+        if hovered {
+            col.child(
+                div().absolute()
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .w(px(1.5))
+                    .h(px(col_h))
+                    .bg(rgb(t.accent())),
+            )
+        } else {
+            col
+        }
+    }
+
+    /// 竖排侧批（旁注）轨渲染（v2.1）：版框外侧余白里挂一枚极简旁注轨。
+    ///
+    /// 轨内含一道细朱砂引导线 + 每个（叶, 列）侧批一枚朱砂圆点（按列索引
+    /// 在轨上均匀落位）；圆点可点击，点一下展开该条侧批全文（纸色小卡、
+    /// 朱砂字），再点收起。绝不挤占正文行格，也不进 `columns`。
+    fn render_sidenote_rail(
+        &self,
+        sn_map: &std::collections::HashMap<(usize, usize), crate::types::SideNote>,
+        leaf_idx: usize,
+        frame_w: f32,
+        frame_h: f32,
+        text_cols: usize,
+        edge: LeafHalf,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let t = self.theme;
+        // 本叶的侧批：按列索引排序，保证圆点落位稳定。
+        let mut entries: Vec<(usize, String)> = sn_map
+            .iter()
+            .filter(|((li, _), _)| *li == leaf_idx)
+            .map(|((_, col), sn)| (*col, sn.text.clone()))
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        entries.sort_by_key(|(c, _)| *c);
+
+        let right_side = !matches!(edge, LeafHalf::Left);
+        let rail_w = SIDENOTE_RAIL_W;
+        let marker_r = 3.0;
+        // 圆点落位：按列索引在整叶高度上均匀铺开（0 = 最右读序首列）。
+        let y_of = |col: usize| -> f32 {
+            ((col as f32 + 0.5) / text_cols.max(1) as f32) * frame_h
+        };
+
+        let mut rail = div()
+            .absolute()
+            .top(px(0.0))
+            .h(px(frame_h))
+            .w(px(rail_w));
+        rail = if right_side {
+            rail.left(px(frame_w + 2.0))
+        } else {
+            rail.right(px(frame_w + 2.0))
+        };
+        // 细朱砂引导线：轨中央一道 1px 竖线作「旁注轨」视觉锚。
+        rail = rail.child(
+            div().absolute()
+                .top(px(0.0))
+                .left(px(rail_w / 2.0 - 0.5))
+                .w(px(1.0))
+                .h(px(frame_h))
+                .bg(rgb(sheet_zhu(t))),
+        );
+
+        for (col_ref, text) in &entries {
+            let col = *col_ref;
+            let y = y_of(col);
+            let expanded = self.sidenote_expanded.contains(&(leaf_idx, col));
+            // 朱砂圆点（可点击展开 / 收起）。
+            let marker = div()
+                .absolute()
+                .top(px(y - marker_r))
+                .left(px(rail_w / 2.0 - marker_r))
+                .w(px(marker_r * 2.0))
+                .h(px(marker_r * 2.0))
+                .rounded_full()
+                .bg(rgb(sheet_zhu(t)))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        let k = (leaf_idx, col);
+                        if this.sidenote_expanded.contains(&k) {
+                            this.sidenote_expanded.remove(&k);
+                        } else {
+                            this.sidenote_expanded.insert(k);
+                        }
+                        cx.notify();
+                    }),
+                );
+            rail = rail.child(marker);
+
+            // 展开全文：纸色小卡 + 朱砂字，向版框外侧飘出，绝不压正文。
+            if expanded {
+                let popup = div()
+                    .absolute()
+                    .top(px((y - 8.0).max(0.0)))
+                    .w(px(150.0))
+                    .px(px(6.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .bg(rgb(t.paper()))
+                    .border_1()
+                    .border_color(rgb(t.rule()))
+                    .text_size(px(11.0))
+                    .text_color(rgb(sheet_zhu(t)))
+                    .child(SharedString::from(text.clone()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _, _, cx| {
+                            cx.stop_propagation();
+                        }),
+                    );
+                rail = rail.child(if right_side {
+                    popup.left(px(frame_w + 2.0 + rail_w + 4.0))
+                } else {
+                    popup.right(px(frame_w + 2.0 + rail_w + 4.0))
+                });
+            }
+        }
+        Some(rail)
+    }
+
+    /// 开发示例侧批（JIANDU_SIDENOTE_DEMO）：按本叶列数在版框外侧合成几条
+    /// 仿古朱批，便于截图核对「侧批轨」的默认极简态与展开态。
+    fn demo_sidenotes_for(
+        &self,
+        leaf: usize,
+        text_cols: usize,
+    ) -> Vec<((usize, usize), crate::types::SideNote)> {
+        let samples = [
+            "此處疑脫一字，諸本皆同。",
+            "版本異文：「曰」一作「謂」。",
+            "朱筆：先儒以此段為後人竄入。",
+            "校：監本「已」誤「己」，今正。",
+            "眉上原批：此節當與上章參看。",
+        ];
+        let step = (text_cols / samples.len().max(1)).max(1);
+        let mut out = Vec::new();
+        for (i, s) in samples.iter().enumerate() {
+            let col = (text_cols.saturating_sub(1)).saturating_sub(i * step);
+            out.push((
+                (leaf, col),
+                crate::types::SideNote {
+                    col,
+                    text: s.to_string(),
+                },
+            ));
+        }
+        out
     }
 
     /// 一串连续数字（`223` / `1980`）的竖排渲染：**整串成组、每字半格**。
